@@ -10,23 +10,26 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   work item has a result *for the PR's current head sha* but whose PR head
   has no marker yet, parse the agent's own ``VERDICT: ACCEPT|REJECT`` /
   ``HEAD_SHA: <sha>`` lines from the result text. On ACCEPT, post the
-  ``ACCEPTANCE: ACCEPT <sha>`` marker as a comment-type PR review
-  (``gh pr review --comment``) -- the exact string ``merge_once`` scans for.
-  The original design named a separate control-plane app (voyn-acceptance)
-  for this, deliberately kept out of this process so its credential never
-  entered the worker; that app's GitHub installation did not survive the
-  2026-08-20 org migration (installations are not carried over by a
-  repository transfer) and was never reconnected. The field it would have
-  used (``ReviewConfig.marker_tool``) was declared but never actually
-  invoked anywhere -- this function had no implementation at all until
-  VOYN-W0-AICC-MISSING-MARKER-PUBLISHER (2026-08-21), so no review verdict,
-  however produced, ever reached GitHub and ``merge_once`` could not merge a
-  single PR autonomously start to finish. Posting as a *comment*-type
-  review, not an approval, is deliberate: GitHub refuses self-approval for
-  the PR's own author (this pipeline's author and merger are the same
-  account), but a comment-type review from the author is permitted and
-  still lands in the ``reviews[]`` array ``merge_once`` reads — verified
-  live against voyn88/aios#273 before writing this.
+  ``ACCEPTANCE: ACCEPT <sha>`` marker as a comment-type PR review under the
+  independent acceptance App's identity (``_post_marker_as_bot``,
+  ``voyn88-acceptance-gate[bot]``) -- the exact string ``merge_once`` scans
+  for, from a login it checks is not the PR's own author.
+
+  This function's original implementation (VOYN-W0-AICC-MISSING-MARKER-
+  PUBLISHER, 2026-08-21) posted that same marker under the pipeline's own
+  ambient ``gh`` credential -- the App's installation had not survived the
+  2026-08-20 org migration and was never reconnected, so a same-identity
+  marker was the only way any verdict ever reached GitHub at all. Live-
+  confirmed 2026-08-22 as a real self-approval bypass, not a theoretical
+  one: PRs #354 and #355 were both merged by the same account that had
+  posted their own marker, while the real GitHub Actions Acceptance gate
+  reported FAILURE on both (excluded from ``_pr_is_mergeable``'s required-
+  checks list for the same reason -- see that function's docstring). The
+  App is reconnected now (``VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE``);
+  this function requires its credentials (``VOYN_ACCEPTANCE_APP_ID`` /
+  ``_INSTALLATION_ID`` / ``_PRIVATE_KEY_PATH``) and skips loudly rather than
+  falling back to the retired same-identity path, which can no longer
+  satisfy ``_pr_is_mergeable`` under any circumstance.
 
   On REJECT, dispatches a new, linked remediation task (see
   ``_remediate_rejection``) instead of leaving the task stuck forever: the
@@ -57,11 +60,17 @@ already-merged PR closes the task once.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+from command_center.orchestrator import github_app_auth
 
 __all__ = [
     "LoopReport",
@@ -99,6 +108,66 @@ def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _acceptance_app_credentials() -> github_app_auth.GitHubAppCredentials | None:
+    """The independent acceptance identity's credentials, gated on env
+    the same way `VOYN_LEASE_DSN` gates the writer lease elsewhere in this
+    codebase: a host with none of the three set has no bot identity to
+    post as. Unlike the lease gate, though, there is nothing safe to fall
+    back to here -- `publish_review_verdicts` skips loudly
+    (`acceptance_bot_not_configured`) rather than posting a same-identity
+    marker that can no longer satisfy `_pr_is_mergeable`'s different-author
+    check. All three or none; a partial set is a misconfiguration, reported
+    as a skip reason rather than silently guessed at."""
+    app_id = os.environ.get("VOYN_ACCEPTANCE_APP_ID", "")
+    installation_id = os.environ.get("VOYN_ACCEPTANCE_INSTALLATION_ID", "")
+    key_path = os.environ.get("VOYN_ACCEPTANCE_PRIVATE_KEY_PATH", "")
+    if not (app_id and installation_id and key_path):
+        return None
+    return github_app_auth.GitHubAppCredentials(app_id, installation_id, Path(key_path))
+
+
+def _post_marker_as_bot(
+    creds: github_app_auth.GitHubAppCredentials, pr_url: str, decision: str, sha: str
+) -> tuple[bool, str]:
+    """Post the ACCEPTANCE marker as a comment-type review under the
+    acceptance App's own identity (`voyn88-acceptance-gate[bot]`,
+    live-verified 2026-08-22) -- the review `.github/workflows/
+    acceptance-gate.yml` and `scripts/assert_independent_acceptance.py`
+    check for. Comment-type (never approval): GitHub refuses an actual
+    approval from the PR's own author, but the App reviewing is not
+    self-review in the first place -- it never opens or authors anything,
+    only ever posts this one marker. First line only, matching
+    `assert_independent_acceptance.py`'s own stricter parse (this
+    module's own `_accept_marker_on_latest_review` is more permissive for
+    the local fast-path check, but the marker itself is written to satisfy
+    the strict contract, not the loose one)."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return False, f"no_repo_route: {pr_url!r}"
+    owner, repo, number = parsed
+    try:
+        token = github_app_auth.installation_token(creds)
+    except github_app_auth.AppAuthError as exc:
+        return False, f"app_auth_failed: {exc}"
+    body = f"ACCEPTANCE: {decision} {sha}"
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews",
+        method="POST",
+        data=json.dumps({"body": body, "event": "COMMENT"}).encode(),
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15):
+            pass
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+        return False, f"marker_post_failed: {exc}"
+    return True, ""
+
+
 def _rows(factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
     with factory() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
@@ -129,7 +198,7 @@ _REVIEW_PROMPT = (
 _MAX_DIFF_CHARS = 60_000
 
 
-_PR_URL = re.compile(r"^https://github\.com/[^/]+/([^/]+)/pull/(\d+)$")
+_PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 
 # Bumped whenever _REVIEW_PROMPT's contract changes in a way that makes an
 # old verdict untrustworthy under the new policy (e.g. what the agent is
@@ -143,7 +212,17 @@ _REVIEW_POLICY_VERSION = "v1"
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
     match = _PR_URL.match(pr_url)
-    return match.group(1) if match else None
+    return match.group(2) if match else None
+
+
+def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
+    """(owner, repo, pr_number) for the GitHub REST API path -- unlike
+    `_repo_from_pr_url` (only the repo name, for the review-cycle key), the
+    bot-identity marker post below needs the owner too."""
+    match = _PR_URL.match(pr_url)
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
 
 
 def _review_key(task_id: str, pr_url: str, head_sha: str) -> str | None:
@@ -167,7 +246,7 @@ def _review_key(task_id: str, pr_url: str, head_sha: str) -> str | None:
     match = _PR_URL.match(pr_url)
     if match is None:
         return None
-    pr_number = match.group(2)
+    pr_number = match.group(3)
     return f"review:{task_id}:{pr_number}:{head_sha}:{_REVIEW_POLICY_VERSION}"
 
 
@@ -325,17 +404,36 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
     return json.loads(payload) if isinstance(payload, str) else payload
 
 
-def _accept_marker_on_latest_review(reviews: list[dict[str, Any]], head: str) -> bool:
+def _accept_marker_on_latest_review(
+    reviews: list[dict[str, Any]], head: str, pr_author_login: str | None
+) -> bool:
     """Whether the marker stands on the MOST RECENT review, not merely
     somewhere in the array. A superseded/earlier review carrying the marker
     text must not count once a later review exists -- otherwise a stale
     ACCEPT from before a rejected re-review (or before a dismissed review)
     would still authorize merge. `submittedAt` is ISO 8601, so lexical max
-    is chronological max; a missing timestamp sorts first (never wins)."""
+    is chronological max; a missing timestamp sorts first (never wins).
+
+    `pr_author_login` closes VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE
+    (found live 2026-08-22: PRs #354/#355 both merged by the same account
+    that had posted their own ACCEPT marker): a marker whose review author
+    is the SAME login as the PR's own author does not count, matching
+    `scripts/assert_independent_acceptance.py`'s own comparison exactly
+    (login against the pull request's author login, not text alone --
+    that script's docstring explains why `authorAssociation` is the wrong
+    field). None (author unknown/unfetched) skips this check rather than
+    refusing everything -- callers that cannot supply it keep prior
+    behavior; `_pr_is_mergeable` and `_has_accept_marker` below always can
+    and always do."""
     if not reviews:
         return False
     latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
-    return f"ACCEPTANCE: ACCEPT {head}" in (latest.get("body") or "")
+    if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
+        return False
+    if pr_author_login is None:
+        return True
+    reviewer_login = (latest.get("author") or {}).get("login")
+    return reviewer_login is not None and reviewer_login != pr_author_login
 
 
 def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
@@ -343,13 +441,14 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
     job). Returns (has_marker, head_sha)."""
     view = _gh(
-        ["pr", "view", pr_url, "--json", "reviews,headRefOid"], repo_path
+        ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
     )
     if view.returncode != 0:
         return False, ""
     data = json.loads(view.stdout or "{}")
     head = data.get("headRefOid", "")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head)
+    author_login = (data.get("author") or {}).get("login")
+    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     return accept, head
 
 
@@ -498,12 +597,27 @@ def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | No
             else:
                 report.skipped.append((task_id, "review_verdict_reject_remediation_already_dispatched"))
             continue
-        posted = _gh(
-            ["pr", "review", pr_url, "--comment", "--body", f"ACCEPTANCE: ACCEPT {sha}"],
-            repo_path,
-        )
-        if posted.returncode != 0:
-            report.skipped.append((task_id, f"marker_post_failed: {posted.stderr.strip()[:120]}"))
+        creds = _acceptance_app_credentials()
+        if creds is None:
+            # No acceptance-bot credentials configured on this host.
+            # VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE (2026-08-22)
+            # tightened `_accept_marker_on_latest_review` to require the
+            # marker's reviewer login differ from the PR's own author login
+            # -- so a same-identity marker posted under the old ambient
+            # `gh` credential can no longer satisfy `_pr_is_mergeable`
+            # under any circumstance; posting one would just be a review
+            # comment that goes nowhere. Skip loudly instead, so an
+            # operator sees exactly why nothing merges on this host rather
+            # than a silently-ineffective marker.
+            report.skipped.append((task_id, "acceptance_bot_not_configured"))
+            continue
+        # The independent identity: posts as `voyn88-acceptance-gate[bot]`,
+        # never the operational identity that authored and will merge this
+        # PR -- closes the self-issued-marker gap live-confirmed on PRs
+        # #354/#355 (same account posted the marker AND merged).
+        ok, reason = _post_marker_as_bot(creds, pr_url, "ACCEPT", sha)
+        if not ok:
+            report.skipped.append((task_id, reason))
             continue
         report.reviewed.append((task_id, pr_url))
     return report
@@ -535,10 +649,24 @@ def _check_is_green(check: dict[str, Any]) -> bool:
 
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
-    marker stands on the head. `gh pr view` gives both in one call."""
+    marker -- from a reviewer login that is NOT the PR's own author -- stands
+    on the head. `gh pr view` gives all of it in one call.
+
+    The GitHub Actions "Acceptance gate" check (`.github/workflows/
+    acceptance-gate.yml`) used to be excluded here by a `"cceptance" not in
+    name` substring match, because before VOYN-W0-AICC-MARKER-REVIEWER-
+    INDEPENDENCE (2026-08-22) that check could never pass: the acceptance
+    bot's GitHub App installation did not survive the 2026-08-20 org
+    migration, so no marker ever carried a genuinely independent reviewer
+    login, and requiring the check would have deadlocked every merge
+    forever. The bot is reconnected now (`voyn88-acceptance-gate[bot]`,
+    live-verified) and `publish_review_verdicts` posts under its identity,
+    so that check reflects reality again and is required like any other --
+    removing the exclusion is not a relaxation, it is retiring a workaround
+    whose reason to exist is gone."""
     view = _gh(
         ["pr", "view", pr_url, "--json",
-         "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid"],
+         "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author"],
         repo_path,
     )
     if view.returncode != 0:
@@ -547,14 +675,12 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     if data.get("state") != "OPEN":
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head)
+    author_login = (data.get("author") or {}).get("login")
+    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     if not accept:
         return False, "no_accept_marker_on_head"
     rollup = data.get("statusCheckRollup") or []
-    bad = [
-        c.get("name", "?") for c in rollup
-        if not _check_is_green(c) and "cceptance" not in c.get("name", "")
-    ]
+    bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
         return False, f"checks_not_green: {bad[:3]}"
     return True, head
