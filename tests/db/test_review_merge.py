@@ -181,6 +181,96 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
         assert cur.fetchone()[0] == "DONE"
 
 
+def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):  # noqa: F811
+    """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: a marker whose reviewer
+    login is the SAME as the PR's own author must not authorize merge --
+    live-confirmed as a real gap on PRs #354/#355, both merged by the
+    account that had posted their own marker."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1B", "https://github.com/x/y/pull/21")
+    head = "f" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": "dimastov-lab"}}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1B", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1B",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):  # noqa: F811, E501
+    """The positive case of the same check: a genuinely independent
+    reviewer login (the acceptance bot's, in production) does authorize
+    merge."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1C", "https://github.com/x/y/pull/22")
+    head = "1" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "author": {"login": "dimastov-lab"},
+                "reviews": [{
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "author": {"login": "voyn88-acceptance-gate[bot]"},
+                }],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "merge"]:
+            return subprocess.CompletedProcess(argv, 0, "merged", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1C", head) in report.merged
+
+
+def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):  # noqa: F811
+    """The `"cceptance" not in name` exclusion is gone: a red Acceptance
+    gate check blocks merge like any other required check, now that the
+    bot behind it is reconnected and the check can genuinely reflect an
+    independent verdict rather than being permanently, structurally red."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1D", "https://github.com/x/y/pull/23")
+    head = "2" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            }],
+            "statusCheckRollup": [
+                {"name": "CI", "conclusion": "SUCCESS"},
+                {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "FAILURE"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert any(
+        task_id == "VOYN-W0-M1D" and reason.startswith("checks_not_green")
+        for task_id, reason in report.skipped
+    )
+
+
 def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
 
     app_factory, store, _ = rig
@@ -279,11 +369,14 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
     assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
 
 
-def test_publish_verdict_posts_the_marker_gh_pr_review_reads(rig, monkeypatch):  # noqa: F811
-    """VOYN-W0-AICC-MISSING-MARKER-PUBLISHER: the agent's own ACCEPT verdict
-    must reach GitHub as the exact `ACCEPTANCE: ACCEPT <sha>` comment-review
-    body merge_once's _pr_is_mergeable scans for -- proven end to end here,
-    not just that some gh call happened."""
+def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: the agent's own ACCEPT
+    verdict must reach GitHub as the exact `ACCEPTANCE: ACCEPT <sha>`
+    comment-review body, posted under the independent acceptance bot's
+    identity -- not the same ambient `gh` credential that authored and will
+    merge the PR (the self-issued marker VOYN-W0-AICC-MISSING-MARKER-
+    PUBLISHER's own test used to accept, live-confirmed on PRs #354/#355 as
+    a real self-approval bypass)."""
     app_factory, store, worker = rig
     head = "d" * 40
     pr_url = "https://github.com/x/y/pull/11"
@@ -293,26 +386,56 @@ def test_publish_verdict_posts_the_marker_gh_pr_review_reads(rig, monkeypatch): 
         f"Reviewed the diff, found nothing wrong.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
     )
 
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({"headRefOid": head, "reviews": []})
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
     posted = []
+
+    def fake_post(creds, pr_url_arg, decision, sha):
+        posted.append((pr_url_arg, decision, sha))
+        return True, ""
+
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot", fake_post)
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-P1", "https://github.com/x/y/pull/11") in report.reviewed
+    assert posted == [("https://github.com/x/y/pull/11", "ACCEPT", head)]
+
+
+def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: F811, E501
+    """A host with no acceptance-bot credentials must not fall back to the
+    old same-identity marker -- that marker can never satisfy
+    `_pr_is_mergeable`'s different-author check any more, so posting one
+    would just be silent, ineffective noise. Skip loudly instead."""
+    app_factory, store, worker = rig
+    head = "e" * 40
+    pr_url = "https://github.com/x/y/pull/12"
+    _ready(store, app_factory, "VOYN-W0-P1B", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-P1B", pr_url, head,
+        f"Looks fine.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
 
     def fake_gh(argv, repo):
         import subprocess
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({"headRefOid": head, "reviews": []})
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "review"]:
-            posted.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_acceptance_app_credentials", lambda: None)
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert ("VOYN-W0-P1", "https://github.com/x/y/pull/11") in report.reviewed
-    assert len(posted) == 1
-    assert posted[0][:3] == ["pr", "review", "https://github.com/x/y/pull/11"]
-    assert "--comment" in posted[0]
-    body_index = posted[0].index("--body") + 1
-    assert posted[0][body_index] == f"ACCEPTANCE: ACCEPT {head}"
+    assert not report.reviewed
+    assert ("VOYN-W0-P1B", "acceptance_bot_not_configured") in report.skipped
 
 
 def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkeypatch):  # noqa: F811
