@@ -211,12 +211,23 @@ def main(argv: list[str] | None = None) -> int:
                 report = BacklogStore(lambda: nullcontext(conn)).import_markdown(text)
                 print(
                     f"inserted {report.inserted}, updated {report.updated}, "
-                    f"unchanged {report.unchanged}"
+                    f"unchanged {report.unchanged}, "
+                    f"status-forced {len(report.status_forced)}"
                 )
                 for task_id, reason in report.refused:
                     print(f"REFUSED {task_id}: {reason}")
                 for line_no, reason, excerpt in report.unparsed:
                     print(f"UNPARSED line {line_no}: {reason} :: {excerpt}")
+                # The graduation criterion for the importer's direct-status
+                # exemption, printed rather than merely counted: these are the
+                # tasks whose status the file overruled after the machine model
+                # had taken them. Deliberately NOT an error and NOT in the exit
+                # code — it is expected traffic during the migration, and a red
+                # run would train operators to ignore it. "status-forced 0" over
+                # the canonical file is the signal that the exemption can be
+                # narrowed away.
+                for task_id, stored, incoming in report.status_forced:
+                    print(f"STATUS-FORCED {task_id}: {stored} -> {incoming}")
                 # Refused records are a defect of the file or the vocabulary;
                 # surface them in the exit code so a timer/CI run goes red.
                 return 1 if report.refused else 0

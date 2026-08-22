@@ -15,6 +15,20 @@ moves through ``backlog_transition`` and its machine model. Dependencies are
 NOT imported: the file records them as prose ("Связи: …"), and prose is
 exactly what the no-substring rule forbids acting on; edges enter through
 ``add_dependency`` (cycle-checked) as BO-S2 formalizes them.
+
+Graduating that exemption, recorded as a query rather than a judgement call:
+the direct-status power is load-bearing only while an import still
+contradicts the machine model about a task the machine model already owns —
+one carrying queue history, i.e. a ``work_item`` under its ``task_id``.
+``import_markdown`` counts exactly those into ``ImportReport.status_forced``,
+so the retirement condition is read off a run instead of argued: when a full
+import of the current file reports ``status_forced == []``, nothing depends
+on the exemption any more and ``backlog_upsert_task`` can be narrowed to
+reconciling wave/priority/kind/title/body/repo, leaving ``status`` to
+``backlog_transition`` alone. Until then the list names which tasks are
+holding it open — the remaining migration work, itemised rather than
+estimated. A count that only ever said "some tasks have queue history" would
+never reach zero and so would never be a criterion at all.
 """
 
 from __future__ import annotations
@@ -35,6 +49,12 @@ class ImportReport:
     refused: list[tuple[str, str]] = field(default_factory=list)
     #: (line_no, reason, excerpt) — straight from the parser; never dropped.
     unparsed: list[tuple[int, str, str]] = field(default_factory=list)
+    #: (task_id, stored_status, file_status) — the migration-period
+    #: direct-status exemption, measured: an import overruling the machine
+    #: model on a task that already has queue history. Empty over a full
+    #: import of the canonical file IS the graduation criterion (see the
+    #: module docstring); it is not an error while the migration is running.
+    status_forced: list[tuple[str, str, str]] = field(default_factory=list)
 
     @property
     def changed(self) -> int:
@@ -240,20 +260,55 @@ class BacklogStore:
                 )
                 return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
 
+    def machine_governed_statuses(self) -> dict[str, str]:
+        """Stored status of every task the machine model has already taken
+        responsibility for.
+
+        Queue history is the marker: a ``work_item`` under the ``task_id``
+        means something after import moved this task, so an import that
+        disagrees is overwriting a decision rather than ingesting current
+        truth. One query, not one per task — the importer walks the whole
+        file and a per-row probe would turn reconciliation into N round
+        trips for a number it only reports.
+        """
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT t.task_id, t.status FROM backlog_task t "
+                    "WHERE EXISTS (SELECT 1 FROM work_item w "
+                    "WHERE w.task_id = t.task_id)"
+                )
+                return {str(task_id): str(status) for task_id, status in cur.fetchall()}
+
     # -- the importer ---------------------------------------------------------
 
     def import_markdown(self, text: str) -> ImportReport:
         """Reconcile the Markdown projection. Idempotent by construction:
         ``backlog_upsert_task`` reports ``changed=false`` for an identical
         record, so a second run over the same text yields ``changed == 0`` —
-        measurable, not hoped for."""
+        measurable, not hoped for.
+
+        The run also measures the direct-status exemption it is spending:
+        every task whose stored status this text contradicts *and* which
+        already has queue history lands in ``report.status_forced``, the
+        graduation criterion the module docstring names. Statuses are read
+        once, BEFORE the first upsert — read after, they would already be
+        the file's own values and the measurement would report zero forever,
+        which is the one wrong answer that looks like success.
+        """
         parsed = parse_backlog(text)
         report = ImportReport(unparsed=list(parsed.unparsed))
+        governed = self.machine_governed_statuses()
         for task in parsed.tasks:
             ok, reason, changed = self.upsert_task(task)
             if not ok:
+                # A refused record set nothing, so it spent no exemption.
                 report.refused.append((task.task_id, reason))
-            elif not changed:
+                continue
+            stored = governed.get(task.task_id)
+            if stored is not None and stored != task.status:
+                report.status_forced.append((task.task_id, stored, task.status))
+            if not changed:
                 report.unchanged += 1
             elif reason == "inserted":
                 report.inserted += 1

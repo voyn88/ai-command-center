@@ -210,6 +210,63 @@ def test_import_is_idempotent_and_loses_nothing(store) -> None:
     assert store.get_task("VOYN-W0-G1")["kind"] == "gate"
 
 
+def test_import_measures_the_status_exemption_it_spends(store, admin_conn) -> None:
+    """The graduation criterion has to be able to reach zero AND to leave it.
+
+    A criterion nobody can evaluate is the defect this measurement exists to
+    fix, so both directions are proved here: reconciling tasks the machine
+    model has never touched spends no exemption, and the moment a dispatch
+    moves a task the file still calls OPEN, the same text names it. A
+    ``status_forced`` that only ever came back empty would read as graduated
+    on day one, which is the one wrong answer that looks like success.
+    """
+    text = (
+        "- **VOYN-W0-AICC-FORCED** | Wave 0 | OPEN | P0 | Platform | "
+        "`forced` | Dispatched, then re-imported.\n"
+        "- **VOYN-W0-AICC-QUIET** | Wave 0 | OPEN | P0 | Platform | "
+        "`quiet` | Never dispatched.\n"
+    )
+
+    # Nothing has queue history yet, so reconciling current truth is ingest
+    # and ingest overrules nobody.
+    first = store.import_markdown(text)
+    assert first.refused == [] and first.inserted == 2
+    assert first.status_forced == []
+
+    # Dispatch is the machine model taking the task: a work_item under its
+    # task_id, and IN_PROGRESS reached through backlog_transition.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM backlog_dispatch(%s, %s, 3600, 4, %s::jsonb, 3)",
+            ("VOYN-W0-AICC-FORCED", "planner-exemption", '{"kind": "agent_run"}'),
+        )
+        ok, reason, work_item_id, _revision = cur.fetchone()
+    assert ok, reason
+    assert work_item_id
+
+    # The file still says OPEN. Re-importing it overrules the machine model —
+    # which the exemption permits, and which is now visible rather than silent.
+    second = store.import_markdown(text)
+    assert second.status_forced == [("VOYN-W0-AICC-FORCED", "IN_PROGRESS", "OPEN")]
+    assert store.get_task("VOYN-W0-AICC-FORCED")["status"] == "OPEN", (
+        "the exemption really did set status directly; the report names a "
+        "write that happened, not one it merely predicted"
+    )
+    # Read after the upserts instead of before, the stored status would already
+    # be the file's own value and the count would be zero here.
+
+    # It is the DISAGREEMENT that is measured, not the queue history. The
+    # second run left the store agreeing with the file, so a third run over
+    # the same text forces nothing even though the work_item is still there:
+    # the criterion can return to zero instead of latching on first dispatch.
+    third = store.import_markdown(text)
+    assert third.changed == 0 and third.status_forced == []
+    assert store.machine_governed_statuses() == {"VOYN-W0-AICC-FORCED": "OPEN"}, (
+        "queue history alone is not the criterion — VOYN-W0-AICC-QUIET has "
+        "none and is absent, and FORCED's presence did not force anything"
+    )
+
+
 def test_import_reports_a_record_the_schema_refuses(store) -> None:
     """The parser and the CHECKs are two fences; a record that leaps the
     first must still be caught, reported and not half-written by the second."""
