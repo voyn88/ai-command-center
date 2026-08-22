@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -765,6 +766,15 @@ def _own_start(pid: int) -> str:
     return stat[stat.rindex(")") + 2 :].split()[19]
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="reads /proc/<pid>/stat directly, the same seamless-fallback shape "
+    "worktree_lease._process_start itself uses in production (fails soft to "
+    "None off Linux, never crashes there) -- but this test's own fixture "
+    "helper, _own_start, has no such fallback, so it must skip rather than "
+    "fail where /proc does not exist. Linux CI (the real deployment target) "
+    "keeps full coverage; see VOYN-W0-AICC-LEASE-TEST-PROC-MACOS-SKIP.",
+)
 def test_a_lease_held_by_our_own_supervisor_does_not_block(
     handler, lease_tool, tmp_path
 ) -> None:

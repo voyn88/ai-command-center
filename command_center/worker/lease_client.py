@@ -53,13 +53,35 @@ def lease_argv(identity: LeaseIdentity, verb: str, repo_path: Path) -> list[str]
     working directory the tool resolves to a repository (and, for
     ``install-hooks``, to that repository's common git dir -- shared by
     every worktree of the clone); the identity flags are what ``verify``
-    checks a push's on-disk hook state against."""
-    return [
+    checks a push's on-disk hook state against.
+
+    ``acquire`` alone also carries ``--auto-takeover`` (VOYN-W0-AICC-LEASE-
+    STUCK-EXPIRED-NO-RECLAIM, found live 2026-08-22): a holder whose process
+    died without releasing -- the common case for a killed/OOM'd worker or a
+    task that hit its timeout -- leaves an expired-but-present row that
+    every later ``acquire`` for that repository refused forever with
+    ``VOYN_LEASE_REFUSED expired requires dead-process confirmation``,
+    since nothing in this pipeline ever supplied the confirmation
+    ``acquire``'s own CLI exposes for exactly this case. One repository-wide
+    stuck row blocks every task routed to that repository, not just the one
+    that died holding it -- traced live to 173 of 216 DEFER_TO_USER
+    escalations on 2026-08-22, the large majority not being genuine task
+    failures or ambiguity, but this. ``--auto-takeover`` asks the lease
+    authority itself to verify the recorded holder is actually dead before
+    granting the takeover (the same dead-process discipline
+    ``worktree_lease._held_by_our_own_line`` already applies locally, kept
+    server-side here since the authority, not this process, holds the
+    other host's process state) -- never an unconditional override of a
+    lease a live process still holds."""
+    argv = [
         identity.lease_tool, "--repo", str(repo_path), verb,
         "--repository", identity.repository, "--owner", identity.owner,
         "--session", identity.session, "--task", identity.task,
         "--pid", str(os.getpid()), "--process-start", process_start(),
     ]
+    if verb == "acquire":
+        argv.append("--auto-takeover")
+    return argv
 
 
 def run_lease(
