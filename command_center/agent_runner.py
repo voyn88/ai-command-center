@@ -113,6 +113,20 @@ CLAUDE_BINARY = "claude"
 CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
 COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
 
+# Codex 0.149.0 on worker-01 can exit zero after its vendor bwrap fails to
+# create loopback inside the network namespace. This exact, two-part signature
+# is an executor-host failure, not a task result.
+_CODEX_BWRAP_LOOPBACK_SIGNATURE = (
+    "bwrap: loopback:",
+    "failed rtm_newaddr: operation not permitted",
+)
+_CODEX_PREFLIGHT_PROMPT = (
+    "This is a sandbox capability probe. Do not edit files, run tools, or inspect "
+    "the repository. Reply with exactly: AICC_CODEX_WORKSPACE_WRITE_OK"
+)
+_codex_workspace_write_preflight_lock = threading.Lock()
+_codex_workspace_write_preflight_result: tuple[bool, str] | None = None
+
 # --------------------------------------------------------------------------
 # Execution profiles — named, testable single source of truth for "what can
 # this run touch". Every `claude` invocation this project makes (v1 sync
@@ -316,6 +330,66 @@ def claude_cli_preflight(binary: str | None = None) -> tuple[bool, str]:
         "старта агента. Установите Claude Code (`npm install -g @anthropic-ai/claude-code`) "
         "и убедитесь, что бинарник доступен в PATH, либо выберите другой execution provider."
     )
+
+
+def codex_workspace_write_preflight() -> tuple[bool, str]:
+    """Probe the exact workspace-write launch path once per worker.
+
+    Version/help probes cannot discover the worker's AppArmor/user-namespace
+    refusal: it happens only when Codex starts bwrap. The probe uses a
+    disposable git workspace, never a task repository. A negative result is
+    cached, so later tasks skip Codex instead of consuming another attempt.
+    """
+    global _codex_workspace_write_preflight_result
+    with _codex_workspace_write_preflight_lock:
+        if _codex_workspace_write_preflight_result is not None:
+            return _codex_workspace_write_preflight_result
+        if shutil.which(CODEX_BINARY) is None:
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"Codex CLI {CODEX_BINARY!r} is not available on PATH",
+            )
+            return _codex_workspace_write_preflight_result
+
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="aicc-codex-preflight-") as raw_probe:
+            probe = Path(raw_probe)
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(probe)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if initialized.returncode != 0:
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"cannot create disposable Codex probe workspace: {initialized.stderr.strip()}",
+                )
+                return _codex_workspace_write_preflight_result
+            run = run_claude_code(
+                repository_path=probe,
+                prompt=_CODEX_PREFLIGHT_PROMPT,
+                task_type="implementation",
+                timeout_seconds=MIN_TIMEOUT_SECONDS,
+                executor="codex",
+            )
+        diagnostic = "\n".join(part for part in (run.stdout, run.stderr) if part)
+        if run.is_executor_sandbox_error:
+            detail = diagnostic[-400:] or "bwrap loopback namespace setup was denied"
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"Codex workspace-write sandbox unavailable: {detail}",
+            )
+        elif run.status != "completed":
+            detail = diagnostic[-400:] or f"exit_code={run.exit_code!r}"
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"Codex workspace-write preflight failed: {detail}",
+            )
+        else:
+            _codex_workspace_write_preflight_result = (True, "")
+        return _codex_workspace_write_preflight_result
 
 
 def validate_repository(project_id: str, repository_path: str) -> Path:
@@ -662,6 +736,12 @@ class RunResult:
         """
         return (self.is_error and self.api_error_status is not None) or self.terminal_reason == "api_error"
 
+    @property
+    def is_executor_sandbox_error(self) -> bool:
+        """Whether the sandbox launcher reported its known loopback failure."""
+        diagnostic = "\n".join((self.stdout, self.stderr)).lower()
+        return all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
+
 
 # How often the mid-run poll loop wakes to re-check `cancel_event` and the
 # deadline. Short enough that a lease-loss signal turns into a SIGTERM within
@@ -901,7 +981,12 @@ def run_claude_code(
             started_at=started_at,
             completed_at=models.iso_now(),
         )
-    status = "completed" if exit_code == 0 else "failed"
+    diagnostic = "\n".join((stdout, stderr)).lower()
+    status = (
+        "failed"
+        if all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
+        else "completed" if exit_code == 0 else "failed"
+    )
     return RunResult(
         status=status,
         exit_code=exit_code,
