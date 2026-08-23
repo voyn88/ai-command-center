@@ -101,6 +101,7 @@ def _identity(cfg: WriterLeaseConfig) -> lease_client.LeaseIdentity:
         owner=cfg.owner,
         session=cfg.session,
         task=cfg.task,
+        ttl=cfg.ttl,
     )
 
 

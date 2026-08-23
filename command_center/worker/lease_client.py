@@ -32,6 +32,19 @@ class LeaseIdentity:
     owner: str
     session: str
     task: str
+    # VOYN-W0-AICC-LEASE-TTL-CONTRACT-BROKEN (found live 2026-08-23): every
+    # caller declares its own `ttl` config field (`WriterLeaseConfig.ttl`,
+    # `PublishConfig.ttl`, both defaulting to 600) but `lease_argv` never
+    # forwarded it to `--ttl` -- the external `voyn-lease` CLI silently used
+    # its own default (180s) instead. `writer_lease.py`'s renewal thread
+    # schedules its first renewal at `ttl/3` = 200s against the CONFIGURED
+    # 600s, which is 20s AFTER the row actually expired under the CLI's
+    # real 180s default -- live-confirmed causing real lease cancellations
+    # (VOYN_LEASE_REFUSED expired, lease process is still alive) on working
+    # agent runs, discarding their output. Defaults to 600 to match the
+    # value every caller already declared as its intent, not the CLI's own
+    # undeclared 180s.
+    ttl: int = 600
 
 
 def process_start(pid: int | None = None) -> str:
@@ -81,6 +94,10 @@ def lease_argv(identity: LeaseIdentity, verb: str, repo_path: Path) -> list[str]
     ]
     if verb == "acquire":
         argv.append("--auto-takeover")
+        # See LeaseIdentity.ttl's docstring: this was missing entirely --
+        # the CLI silently granted its own default TTL instead of the one
+        # every caller believed it had configured.
+        argv.extend(["--ttl", str(identity.ttl)])
     return argv
 
 

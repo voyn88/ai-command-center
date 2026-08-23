@@ -96,6 +96,7 @@ def _lease_argv(cfg: PublishConfig, verb: str, repo_path: Path) -> list[str]:
     identity = lease_client.LeaseIdentity(
         lease_tool=cfg.lease_tool, repository=cfg.repository,
         owner=cfg.owner, session=cfg.session, task=cfg.task,
+        ttl=cfg.ttl,
     )
     return lease_client.lease_argv(identity, verb, repo_path)
 

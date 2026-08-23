@@ -88,6 +88,10 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     assert " acquire " in log and " release " in log  # lease taken and freed
     assert " install-hooks " in log  # hook's on-disk identity kept fresh
     assert log.index("acquire") < log.index("install-hooks") < log.index("create")
+    # VOYN-W0-AICC-LEASE-TTL-CONTRACT-BROKEN: --ttl was never forwarded to
+    # the CLI at all, so acquire silently got the tool's own default
+    # instead of PublishConfig.ttl's declared 600.
+    assert "--ttl 600" in log
 
 
 def test_release_lease_false_never_calls_release(repo, monkeypatch):
