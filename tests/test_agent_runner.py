@@ -322,6 +322,26 @@ def test_run_claude_code_handles_nonzero_exit(monkeypatch, tmp_path):
     assert "boom" in result.stderr
 
 
+def test_run_claude_code_classifies_bwrap_loopback_as_failed_even_with_zero_exit(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
+            "import sys; sys.stderr.write("
+            "'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted'); "
+            "sys.exit(0)"
+        ),
+    )
+    result = agent_runner.run_claude_code(
+        repository_path=tmp_path, prompt="hello", task_type="implementation", timeout_seconds=5
+    )
+    assert result.status == "failed"
+    assert result.exit_code == 0
+    assert result.is_executor_sandbox_error
+
+
 def test_run_claude_code_handles_missing_binary(monkeypatch, tmp_path):
     monkeypatch.setattr(
         agent_runner, "build_command",

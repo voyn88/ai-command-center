@@ -215,10 +215,18 @@ def _run_agent(
         # item's own max_attempts.
         return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
 
-    available, detail = agent_runner.claude_cli_preflight()
+    if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
+        available, detail = agent_runner.codex_workspace_write_preflight()
+        unavailable_reason = "codex workspace-write sandbox unavailable"
+    elif executor == "codex":
+        available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
+        unavailable_reason = "codex cli unavailable"
+    else:
+        available, detail = agent_runner.claude_cli_preflight()
+        unavailable_reason = "claude cli unavailable"
     if not available:
         return HandlerOutcome(
-            ok=False, reason=f"claude cli unavailable: {detail}", retryable=True
+            ok=False, reason=f"{unavailable_reason}: {detail}", retryable=True
         )
 
     if lease_lost.is_set():
@@ -509,6 +517,18 @@ def _run_agent(
             return HandlerOutcome(
                 ok=False,
                 reason=f"executor infrastructure failure (api_error_status present in CLI output): {_tail(result_text)}",
+                retryable=True,
+            )
+        if run.is_executor_sandbox_error:
+            # bwrap failed before Codex could enter the sandbox or run tools.
+            if isolated_workspace is not None:
+                workspace_provisioning.remove_workspace(isolated_workspace, repository)
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    "executor infrastructure failure (Codex workspace-write "
+                    f"sandbox): {_tail(run.stderr or result_text)}"
+                ),
                 retryable=True,
             )
         # BO-S3b: a successful mutating run publishes its commits as a PR so

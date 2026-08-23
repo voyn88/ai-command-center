@@ -71,7 +71,7 @@ def handler(monkeypatch, tmp_path):
     monkeypatch.setattr(
         agent_runner, "validate_repository", lambda project_id, path: tmp_path
     )
-    monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda: (True, "ok"))
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda binary=None: (True, "ok"))
     runs: list[dict] = []
 
     def fake_run(**kwargs):
@@ -275,6 +275,39 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch
     assert "executor infrastructure failure" in outcome.reason
     assert "session limit" in outcome.reason
 
+
+
+def test_bwrap_loopback_result_is_retryable_infrastructure_failure(handler, monkeypatch):
+    run_agent, _ = handler
+
+    def bwrap_failure(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=0,
+            stdout="",
+            stderr="bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+            duration_seconds=0.01,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", bwrap_failure)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "Codex workspace-write sandbox" in outcome.reason
+
+
+def test_codex_workspace_preflight_refuses_before_task_run(handler, monkeypatch):
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "codex"
+    payload["cascade"][0]["task_type"] = "implementation"
+    monkeypatch.setattr(agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap"))
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "codex workspace-write sandbox unavailable" in outcome.reason
+    assert runs == []
 
 def test_genuine_task_failure_with_error_flavoured_text_still_ok(handler, monkeypatch) -> None:
     """Regression guard for the fix above: a run that genuinely executed and
