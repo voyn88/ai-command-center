@@ -18,6 +18,7 @@ import yaml
 
 from scripts.assert_independent_acceptance import (
     AcceptanceError,
+    _merge_group_numbers,
     assert_accepted,
     evaluate,
     parse_marker,
@@ -54,7 +55,9 @@ def test_a_verdict_from_a_different_identity_on_the_current_head_passes() -> Non
 
 
 def test_a_verdict_may_carry_its_reasoning_below_the_marker() -> None:
-    body = f"ACCEPTANCE: ACCEPT {HEAD}\n\nChecked the migration and the rollback path.\n"
+    body = (
+        f"ACCEPTANCE: ACCEPT {HEAD}\n\nChecked the migration and the rollback path.\n"
+    )
     assert evaluate([review(body)], HEAD, AUTHOR) == REVIEWER
 
 
@@ -150,7 +153,9 @@ def test_an_unsubmitted_draft_verdict_does_not_accept() -> None:
 
 def test_an_unattributable_verdict_cannot_establish_independence() -> None:
     with pytest.raises(AcceptanceError, match="no acceptance verdict"):
-        evaluate([{"body": f"ACCEPTANCE: ACCEPT {HEAD}", "state": "COMMENTED"}], HEAD, AUTHOR)
+        evaluate(
+            [{"body": f"ACCEPTANCE: ACCEPT {HEAD}", "state": "COMMENTED"}], HEAD, AUTHOR
+        )
 
 
 @pytest.mark.parametrize("head", [None, "", "not-a-sha", HEAD[:39], 12345])
@@ -186,7 +191,7 @@ def test_a_missing_token_refuses_instead_of_passing_unverified(tmp_path: Path) -
 def test_an_event_without_a_pull_request_is_refused(tmp_path: Path) -> None:
     event = tmp_path / "event.json"
     event.write_text('{"ref": "refs/heads/main"}', encoding="utf-8")
-    with pytest.raises(AcceptanceError, match="carries no pull request"):
+    with pytest.raises(AcceptanceError, match="unsupported event"):
         assert_accepted(
             {
                 "GITHUB_REPOSITORY": "dimastov-lab/ai-command-center",
@@ -232,12 +237,17 @@ def test_the_gate_re_runs_when_the_verdict_arrives_after_ci() -> None:
     just given.
     """
     workflow = _workflow()
-    assert set(workflow["on"]) == {"pull_request", "pull_request_review"}
+    assert set(workflow["on"]) == {
+        "pull_request",
+        "pull_request_review",
+        "merge_group",
+    }
     assert set(workflow["on"]["pull_request_review"]["types"]) == {
         "submitted",
         "edited",
         "dismissed",
     }
+    assert workflow["on"]["merge_group"]["types"] == ["checks_requested"]
     # `edited` and `dismissed` matter as much as `submitted`: a verdict body
     # edited into a rejection, or an acceptance dismissed, must re-judge.
 
@@ -266,7 +276,9 @@ def test_the_gate_runs_under_a_shell_that_aborts_and_says_so_explicitly() -> Non
 
 def test_the_gate_has_a_deliberate_failure_canary() -> None:
     steps = _workflow()["jobs"]["acceptance-gate"]["steps"]
-    (canary,) = [step for step in steps if step.get("name") == "Deliberate failure canary"]
+    (canary,) = [
+        step for step in steps if step.get("name") == "Deliberate failure canary"
+    ]
     assert "release-gate-canary-acceptance" in canary["if"]
     assert canary["run"].strip() == "exit 1"
 
@@ -283,3 +295,117 @@ def test_the_gate_runs_the_verifier_that_exists() -> None:
         step.get("run", "") for step in _workflow()["jobs"]["acceptance-gate"]["steps"]
     )
     assert "scripts/assert_independent_acceptance.py" in commands
+
+
+# --------------------------------------------------------------------------
+# Merge-group resolution
+# --------------------------------------------------------------------------
+
+
+BASE = "1111111111111111111111111111111111111111"  # pragma: allowlist secret
+SYNTHETIC_ONE = "2222222222222222222222222222222222222222"  # pragma: allowlist secret
+SYNTHETIC_TWO = "3333333333333333333333333333333333333333"  # pragma: allowlist secret
+FINAL_HEAD = "4444444444444444444444444444444444444444"  # pragma: allowlist secret
+
+
+def merge_group_payload(number: int = 12) -> dict:
+    return {
+        "merge_group": {
+            "base_sha": BASE,
+            "head_sha": SYNTHETIC_TWO,
+            "base_ref": "refs/heads/main",
+            "head_ref": (f"refs/heads/gh-readonly-queue/main/pr-{number}-{FINAL_HEAD}"),
+        }
+    }
+
+
+def comparison(commits: list[dict]) -> dict:
+    return {
+        "ahead_by": len(commits),
+        "total_commits": len(commits),
+        "merge_base_commit": {"sha": BASE},
+        "commits": commits,
+    }
+
+
+def synthetic(sha: str, parent: str, number: int) -> dict:
+    return {
+        "sha": sha,
+        "parents": [{"sha": parent}],
+        "commit": {"message": f"Queued change (#{number})\n\nDetails"},
+    }
+
+
+def test_a_batch_merge_group_resolves_every_pull_request(monkeypatch) -> None:
+    response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._api", lambda _path, _env: response
+    )
+
+    numbers, base, final_head = _merge_group_numbers(
+        merge_group_payload(), "dimastov-lab/ai-command-center", {"GITHUB_TOKEN": "x"}
+    )
+
+    assert numbers == [11, 12]
+    assert base == "main"
+    assert final_head == FINAL_HEAD
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: value.update(total_commits=3), "incomplete"),
+        (
+            lambda value: value["commits"][1].update(parents=[{"sha": BASE}]),
+            "discontinuous",
+        ),
+        (
+            lambda value: value["commits"][1]["commit"].update(message="No PR suffix"),
+            "no unambiguous pull request number",
+        ),
+    ],
+)
+def test_an_ambiguous_merge_group_is_refused(monkeypatch, mutate, message) -> None:
+    response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+    mutate(response)
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._api", lambda _path, _env: response
+    )
+
+    with pytest.raises(AcceptanceError, match=message):
+        _merge_group_numbers(
+            merge_group_payload(),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_a_merge_group_that_disagrees_with_the_queue_ref_is_refused(
+    monkeypatch,
+) -> None:
+    response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._api", lambda _path, _env: response
+    )
+
+    with pytest.raises(AcceptanceError, match="disagrees with its queue ref"):
+        _merge_group_numbers(
+            merge_group_payload(number=13),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
