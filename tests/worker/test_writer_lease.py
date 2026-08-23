@@ -20,10 +20,12 @@ from command_center.worker.writer_lease import (
 )
 
 
-def _cfg(tool: str, ttl: int = 600) -> WriterLeaseConfig:
+def _cfg(
+    tool: str, ttl: int = 600, repository: str = "ai-command-center"
+) -> WriterLeaseConfig:
     return WriterLeaseConfig(
         lease_tool=tool,
-        repository="ai-command-center",
+        repository=repository,
         owner="server-worker",
         session="s1",
         task="VOYN-W0-TEST",
@@ -38,7 +40,7 @@ def _install_lease_tool(tmp_path, body: str):
     return binary
 
 
-def test_hold_acquires_and_installs_hooks_then_releases_on_exit(tmp_path):
+def test_hold_acquires_then_releases_on_exit(tmp_path):
     calls = tmp_path / "calls.log"
     tool = _install_lease_tool(
         tmp_path, f'echo "$*" >> {calls}\nexit 0\n'
@@ -50,13 +52,28 @@ def test_hold_acquires_and_installs_hooks_then_releases_on_exit(tmp_path):
 
     log = calls.read_text()
     assert " acquire " in log
-    assert " install-hooks " in log
     assert " release " in log
-    # acquire/install-hooks happen before release, matching publish_run's own
-    # acquire -> install-hooks -> ... -> release ordering.
     assert log.index(" acquire ") < log.index(" release ")
-    assert log.index(" install-hooks ") < log.index(" release ")
     assert not lease_lost.is_set()
+
+
+def test_hold_never_touches_the_clone_wide_hook_identity_file(tmp_path):
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK: this lease is task-scoped, but
+    `install-hooks` writes `voyn-lease.env` in the clone's COMMON git dir,
+    shared by every worktree. Running it here -- on a renewal timer, under a
+    task-scoped identity -- would race `publish_run`'s own repository-scoped
+    install-hooks and could flip the file mid-push, making `verify` refuse a
+    correctly-authorised push. Only `publish_run` provisions that file, and
+    it does so immediately before the push, which is the only moment it is
+    read."""
+    calls = tmp_path / "calls.log"
+    tool = _install_lease_tool(tmp_path, f'echo "$*" >> {calls}\nexit 0\n')
+    lease_lost = threading.Event()
+
+    with hold(tmp_path, _cfg(str(tool)), lease_lost):
+        pass
+
+    assert "install-hooks" not in calls.read_text()
 
 
 def test_hold_raises_when_initial_acquire_fails(tmp_path):
@@ -73,27 +90,29 @@ def test_hold_raises_when_initial_acquire_fails(tmp_path):
     assert not lease_lost.is_set()
 
 
-def test_hold_raises_when_install_hooks_fails_after_a_successful_acquire(tmp_path):
+def test_a_task_scoped_lease_does_not_block_a_different_task(tmp_path):
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK, the whole point of the change: the
+    scope key is what `handlers._task_lease_scope` supplies, so two DIFFERENT
+    tasks acquire two DIFFERENT lease rows and never refuse each other.
+    Measured before the fix: 96 of 115 returns-to-pool in three hours were
+    `VOYN_LEASE_REFUSED active` -- tasks blocking each other for no physical
+    reason, since #346 gave each its own worktree."""
     calls = tmp_path / "calls.log"
-    tool = _install_lease_tool(
-        tmp_path,
-        f'echo "$*" >> {calls}\n'
-        'case "$3" in\n'
-        "  install-hooks) exit 1 ;;\n"
-        "  *) exit 0 ;;\n"
-        "esac\n",
-    )
+    tool = _install_lease_tool(tmp_path, f'echo "$*" >> {calls}\nexit 0\n')
     lease_lost = threading.Event()
 
-    with pytest.raises(WriterLeaseUnavailable, match="install_hooks_failed"):
-        hold(tmp_path, _cfg(str(tool)), lease_lost)
+    with hold(tmp_path, _cfg(str(tool)), lease_lost):
+        pass
+    with hold(tmp_path, _cfg(str(tool), repository="ai-command-center:OTHER-TASK"), lease_lost):
+        pass
 
     log = calls.read_text()
-    assert " acquire " in log
-    assert " install-hooks " in log
-    assert " release " not in log  # nothing to release: acquire's own row
-    # is left for the tool's own TTL/verify semantics, matching publish.py's
-    # documented handling of a failed install-hooks after a real acquire.
+    scopes = {
+        line.split("--repository ", 1)[1].split()[0]
+        for line in log.splitlines()
+        if "--repository " in line
+    }
+    assert len(scopes) == 2, f"both holds used the same lease row: {scopes}"
 
 
 def test_a_renewal_failure_sets_lease_lost_and_forces_cancellation(tmp_path):

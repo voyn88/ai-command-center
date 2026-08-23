@@ -107,8 +107,20 @@ def _identity(cfg: WriterLeaseConfig) -> lease_client.LeaseIdentity:
 
 def _acquire_and_provision_hooks(repo_path: Path, cfg: WriterLeaseConfig) -> str | None:
     """Acquire (or, for an identity that already holds it, renew) the writer
-    lease and refresh the pre-push hook's on-disk identity file under it.
-    Returns ``None`` on success, a bounded failure reason otherwise."""
+    lease. Returns ``None`` on success, a bounded failure reason otherwise.
+
+    Deliberately does NOT run ``install-hooks`` (VOYN-W0-AICC-LEASE-SCOPE-
+    PER-TASK). It used to, "to keep the pre-push hook's on-disk identity
+    file fresh for the whole run" -- but that file lives in the clone's
+    COMMON git dir, shared by every worktree, while this lease is now
+    task-scoped (see `WriterLeaseConfig.repository`). Writing a task-scoped
+    identity into a clone-wide file, on a renewal timer, would race
+    `publish_run`'s own repository-scoped `install-hooks` and could flip the
+    file mid-push, making `verify` refuse a push that was correctly
+    authorised. The freshness this bought is not needed either: nothing
+    pushes during the agent run, and `publish_run` re-provisions the hook
+    identity immediately before its own push (#351), which is the only
+    moment the file is actually read."""
     identity = _identity(cfg)
     acquire = lease_client.run_lease(
         lease_client.lease_argv(identity, "acquire", repo_path), repo_path
@@ -116,12 +128,6 @@ def _acquire_and_provision_hooks(repo_path: Path, cfg: WriterLeaseConfig) -> str
     if acquire.returncode != 0:
         detail = (acquire.stderr or acquire.stdout).strip()[:200]
         return f"acquire_failed: {detail}"
-    hooks = lease_client.run_lease(
-        lease_client.lease_argv(identity, "install-hooks", repo_path), repo_path
-    )
-    if hooks.returncode != 0:
-        detail = (hooks.stderr or hooks.stdout).strip()[:200]
-        return f"install_hooks_failed: {detail}"
     return None
 
 

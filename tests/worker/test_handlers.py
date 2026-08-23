@@ -897,15 +897,51 @@ def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
         return max(i for i, line in enumerate(lines) if line.split()[2:3] == [verb])
 
     assert _first("acquire") >= 1
-    assert _first("install-hooks") >= 1
     assert _first("release") >= 1
-    assert 0 < _first("acquire") < _first("install-hooks"), (
-        "the writer lease is acquired, and the hook identity provisioned "
-        "under it, before provisioning/running the agent"
+    assert 0 < _first("acquire") < _first("release"), (
+        "the writer lease is acquired before provisioning/running the agent "
+        "and released only once the dispatch is fully done"
     )
-    assert _last("install-hooks") < _first("release"), (
-        "the lease must still be held while the hook identity is current, "
-        "released only once the dispatch is fully done"
+    # VOYN-W0-AICC-LEASE-SCOPE-PER-TASK: the hook identity file lives in the
+    # clone's COMMON git dir, so a task-scoped lease must not write it --
+    # only `publish_run` does, immediately before its push. See
+    # `test_hold_never_touches_the_clone_wide_hook_identity_file`.
+    assert not any(line.split()[2:3] == ["install-hooks"] for line in lines), (
+        "the full-lifecycle lease must not provision the clone-wide hook "
+        "identity file"
+    )
+
+
+def test_the_full_lifecycle_lease_is_scoped_to_the_task_not_the_repository(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK. Measured 2026-08-23: 96 of 115
+    returns-to-pool in three hours were `VOYN_LEASE_REFUSED active` -- tasks
+    refusing each other because the lease keyed on the repository, even
+    though #346 gave each task its own worktree and they share no mutable
+    state during the agent run. The scope must carry the task id."""
+    run_agent, _runs = handler
+    calls = tmp_path / "lease-calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(f'#!/bin/sh\necho "$*" >> {calls}\necho \'[]\'\nexit 0\n')
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED"),
+        _event(),
+    )
+    assert outcome.ok, outcome.reason
+
+    scopes = {
+        line.split("--repository ", 1)[1].split()[0]
+        for line in calls.read_text().splitlines()
+        if "--repository " in line
+    }
+    assert scopes, "no identity-bearing lease call was made"
+    assert all("VOYN-W0-SCOPED" in scope for scope in scopes), (
+        f"the lease scope must name the task, got {scopes}"
     )
 
 

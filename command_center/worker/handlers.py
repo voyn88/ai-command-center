@@ -92,6 +92,25 @@ def _isolated_workspace_path(repository: Path, branch: str) -> Path:
     return repository.parent / f"{repository.name}{_WORKTREE_PARENT_SUFFIX}" / slug
 
 
+def _task_lease_scope(request: Any) -> str:
+    """The full-lifecycle writer lease's scope key (VOYN-W0-AICC-LEASE-SCOPE-
+    PER-TASK): one lease per TASK, not per repository.
+
+    Namespaced by project so two repositories cannot collide on a shared
+    task id, and falling back to `project_id` when a payload carries no
+    backlog task id keeps the pre-BO-S2a shape working -- such a payload has
+    no task identity to scope by, so repository scope is the honest (and
+    historical) answer for it.
+
+    `VOYN_LEASE_REPOSITORY`, when set, is still honoured as the project half:
+    it is how an operator points a host at a differently-named lease
+    namespace, and silently ignoring it here would break that.
+    """
+    project = os.environ.get("VOYN_LEASE_REPOSITORY") or request.project_id
+    task = getattr(request, "backlog_task_id", None)
+    return f"{project}:{task}" if task else str(project)
+
+
 def _provision_lock(key: str) -> threading.Lock:
     """One lock per resolved workspace path, so two in-process deliveries
     that both compute the same new path cannot both pass
@@ -307,9 +326,30 @@ def _run_agent(
             if os.environ.get("VOYN_LEASE_DSN"):
                 lease_cfg = writer_lease.WriterLeaseConfig(
                     lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
-                    repository=os.environ.get(
-                        "VOYN_LEASE_REPOSITORY", request.project_id
-                    ),
+                    # TASK-scoped, not repository-scoped
+                    # (VOYN-W0-AICC-LEASE-SCOPE-PER-TASK). This lease's stated
+                    # purpose -- see `_provision_lock`'s docstring, which
+                    # names it as the thing that closes the gap -- is to stop
+                    # a SECOND PROCESS redelivering THE SAME TASK while a
+                    # first attempt is still running. Keying it on the
+                    # repository made it also block every OTHER task in that
+                    # repository, which since #346 gave each task its own
+                    # worktree is contention with nothing: two tasks in two
+                    # worktrees share no mutable state during the agent run.
+                    #
+                    # Measured 2026-08-23, three hours after the executor
+                    # cascade fix removed the quota bottleneck: 96 of 115
+                    # returns-to-pool were `VOYN_LEASE_REFUSED active` -- 83%
+                    # of all failures were tasks refusing each other for no
+                    # physical reason. Two attempts of the SAME task still
+                    # collide, which is correct: they share one worktree by
+                    # design.
+                    #
+                    # Push serialization is unaffected: `publish_run` keeps
+                    # its own repository-scoped lease around the push itself,
+                    # which is the operation that genuinely needs one clone-
+                    # wide writer at a time.
+                    repository=_task_lease_scope(request),
                     owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
                     session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
                     task=backlog_task,
