@@ -13,6 +13,11 @@ banner and per-surface captions say so, and the page never imports
 `data/tasks.json`. Local task creation (the Create page, Kanban) is untouched by
 this slice. The store's location is configuration (`AICC_MASTER_BACKLOG`); when it
 is unset or missing, the page explains how to connect it instead of erroring.
+
+Every way of *under-showing* the backlog is called out rather than rendered as a
+smaller number: a store that could not be read stops the page with the reason
+instead of drawing zero counts, unparsable lines get their own expander, and a
+truncated queue table says it was truncated.
 """
 
 from __future__ import annotations
@@ -25,6 +30,11 @@ from command_center import backlog_client
 
 # Sentinel for the "no filter" choice in each facet selectbox.
 _ALL = "Все"
+
+#: Rows of the execution queue rendered at once. The queue is a preview of what the
+#: Backlog Engine hands executors next, not a working list, so it is capped — but
+#: the cap is always stated, never silently applied.
+QUEUE_PREVIEW_ROWS = 50
 
 
 def _format_freshness(mtime: float | None) -> str:
@@ -57,6 +67,25 @@ def render_master_backlog_page(path: str | None = None) -> None:
     )
 
     projection = backlog_client.load_projection(path)
+
+    # Tested before `exists`: an unreadable store *is* there, and its empty
+    # `records` means "not read", never "no tasks". Drawing the metrics below for
+    # it would report an empty backlog with a straight face.
+    if projection.read_error is not None:
+        st.error(
+            ":material/error: Мастер-бэклог найден, но **не прочитан** — "
+            f"{projection.read_error}. Показанных записей нет потому, что чтение "
+            "не удалось, а не потому, что бэклог пуст.",
+            icon=None,
+        )
+        st.caption(f"Файл: `{projection.source_path}`")
+        st.caption(
+            "Последняя запись файла (mtime): "
+            f"{_format_freshness(projection.source_mtime)}. Если она только что "
+            "изменилась, чтение могло попасть на незавершённую запись мастер-стора "
+            "— обновите страницу."
+        )
+        return
 
     if not projection.exists:
         st.warning(
@@ -123,11 +152,16 @@ def render_master_backlog_page(path: str | None = None) -> None:
                 "задача": rec.title,
                 "домен": rec.parallel_domain,
             }
-            for rec in queue[:50]
+            for rec in queue[:QUEUE_PREVIEW_ROWS]
         ],
         width="stretch",
         hide_index=True,
     )
+    if len(queue) > QUEUE_PREVIEW_ROWS:
+        st.caption(
+            f"Показаны первые {QUEUE_PREVIEW_ROWS} из {len(queue)} — "
+            "остальные ниже, в таблице всех записей."
+        )
 
     # --- Searchable / filterable rows --------------------------------------
     st.subheader(":material/table_rows: Все записи")

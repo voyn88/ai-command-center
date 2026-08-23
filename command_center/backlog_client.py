@@ -34,11 +34,21 @@ runtime location — an explicit argument, else the ``AICC_MASTER_BACKLOG``
 environment variable, else nothing. An unconfigured or missing file is not an
 error: it yields an empty-but-usable projection (``exists=False``), so ACC renders
 "backlog not connected" rather than throwing.
+
+A store that is *present but unreadable* is a third state, distinct from both. The
+projection is live — re-read on every page open — while the Backlog Engine rewrites
+the same file, so a read can legitimately land on a torn write (invalid UTF-8
+mid-sequence), on a file whose mode changed, or on a path that is no longer a
+regular file. None of those may raise: the read reports ``read_error`` and the UI
+says "the store is there and could not be read", because the one outcome this
+module must never produce is a *silent* empty projection that reads as "the master
+backlog has no tasks".
 """
 
 from __future__ import annotations
 
 import os
+import stat as stat_module
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,6 +152,15 @@ class Projection:
     ``source_mtime`` is the file's modification time at read; the caller re-reads
     to get a fresh projection, which is what makes the view "live" without ACC
     ever holding its own copy of the truth.
+
+    The three states a caller must tell apart, in the order it should test them:
+
+    - ``read_error`` set — the store is there and could not be read. ``records`` is
+      empty because nothing was read, *not* because the backlog is empty, so a UI
+      must show the failure instead of rendering zeros.
+    - ``exists=False`` — nothing is configured, or nothing is at that path. An
+      empty-but-usable projection; the UI explains how to connect the store.
+    - otherwise — a good read; ``records`` and ``errors`` describe the file.
     """
 
     records: list[BacklogRecommendation] = field(default_factory=list)
@@ -149,6 +168,7 @@ class Projection:
     source_path: Path | None = None
     source_mtime: float | None = None
     exists: bool = False
+    read_error: str | None = None
 
 
 def _is_record_line(stripped: str) -> bool:
@@ -212,18 +232,54 @@ def resolve_backlog_path(path: str | os.PathLike[str] | None = None) -> Path | N
     return Path(override) if override else None
 
 
+def _read_failure_reason(exc: Exception) -> str:
+    """A short operator-readable *why* for a store that could not be read."""
+    if isinstance(exc, UnicodeDecodeError):
+        return f"not valid UTF-8: {exc.reason} at byte {exc.start}"
+    return getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+
+
 def load_projection(path: str | os.PathLike[str] | None = None) -> Projection:
-    """Read and project the master backlog. Absence is empty, never an error."""
+    """Read and project the master backlog. Absence is empty; failure is reported.
+
+    Never raises for the store itself: absence yields ``exists=False`` and any
+    failure to read yields ``read_error``. ``source_mtime`` is taken *before* the
+    read, so a projection can only ever look staler than its content, and so an
+    unreadable store still carries the freshness that says whether it was being
+    rewritten underneath us.
+    """
     resolved = resolve_backlog_path(path)
-    if resolved is None or not resolved.is_file():
+    if resolved is None:
+        return Projection(source_path=None, exists=False)
+
+    mtime: float | None = None
+    try:
+        stat_result = resolved.stat()
+        mtime = stat_result.st_mtime
+        # Guarded before the read, not after: reading a FIFO or device would block
+        # the page forever, which is worse than the crash this whole branch exists
+        # to prevent.
+        if not stat_module.S_ISREG(stat_result.st_mode):
+            raise OSError("not a regular file")
+        text = resolved.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # Includes a broken symlink and a store deleted between resolve and read —
+        # indistinguishable from "never connected", and handled the same way.
         return Projection(source_path=resolved, exists=False)
-    text = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return Projection(
+            source_path=resolved,
+            source_mtime=mtime,
+            exists=True,
+            read_error=_read_failure_reason(exc),
+        )
+
     result = parse_recommendations(text)
     return Projection(
         records=result.records,
         errors=result.errors,
         source_path=resolved,
-        source_mtime=resolved.stat().st_mtime,
+        source_mtime=mtime,
         exists=True,
     )
 

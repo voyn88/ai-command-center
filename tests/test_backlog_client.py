@@ -5,10 +5,16 @@ The Backlog Engine is the single owner of the `Task` entity; ACC is only a
 *reader* of its `VOYN_RECOMMENDATION` master store (engine plan invariant #5:
 "Локальные tasks.json, очереди и UI-модели являются только проекциями"). These
 tests pin that contract: the client parses the machine lines, never writes, and
-degrades to an empty-but-usable projection when the master store is absent.
+degrades to a reported projection — empty-but-usable when the master store is
+absent, `read_error` when it is there and unreadable — instead of raising.
+
+The page built on it is covered in `test_master_backlog_panel.py`.
 """
 
 from __future__ import annotations
+
+import errno
+import os
 
 import pytest
 
@@ -113,6 +119,78 @@ def test_unconfigured_backlog_is_empty_projection(monkeypatch):
     assert proj.records == []
 
 
+# --- The store is there and cannot be read ---------------------------------
+#
+# The projection is re-read live while the Backlog Engine rewrites the same file,
+# so these are operating states, not corrupt-input trivia. Each one used to raise
+# out of `load_projection` and take the page down with a traceback.
+
+
+def test_non_utf8_store_is_reported_not_raised(tmp_path):
+    # A torn read of a half-written store, or one saved as cp1251 — the master
+    # store is authored in Russian, so a bad byte is a byte, not a hypothetical.
+    f = tmp_path / "torn.md"
+    f.write_bytes("- VOYN_RECOMMENDATION | задача".encode("cp1251"))
+    proj = bc.load_projection(f)
+    assert proj.read_error is not None
+    assert "UTF-8" in proj.read_error
+    assert proj.exists is True, "the store is present; it is the read that failed"
+    assert proj.records == []
+    # Freshness survives the failure: it is the evidence for "read mid-write".
+    assert proj.source_mtime == pytest.approx(f.stat().st_mtime)
+
+
+def test_unreadable_store_is_never_a_silently_empty_backlog(tmp_path):
+    f = tmp_path / "torn.md"
+    f.write_bytes(b"\xff\xfe not utf-8")
+    proj = bc.load_projection(f)
+    # The one confusion this state must not allow: zero records reading as
+    # "the master backlog is empty".
+    assert bc.summarize(proj).total == 0 and proj.read_error is not None
+    assert bc.execution_queue(proj) == []
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root reads through mode 000, so the failure cannot be provoked",
+)
+def test_permission_denied_store_is_reported_not_raised(tmp_path):
+    f = tmp_path / "locked.md"
+    f.write_text(_REC, encoding="utf-8")
+    f.chmod(0o000)
+    try:
+        proj = bc.load_projection(f)
+    finally:
+        f.chmod(0o600)  # so tmp_path teardown can remove it
+    assert proj.exists is True
+    # `strerror` comes from libc and is localised under a non-C LC_MESSAGES, so
+    # pin the errno rather than the English sentence.
+    assert proj.read_error and proj.read_error == os.strerror(errno.EACCES)
+
+
+def test_a_directory_is_reported_unreadable_rather_than_missing(tmp_path):
+    # Misconfiguration pointing at the containing folder: "not found" would send
+    # the operator looking for a file that is right there.
+    proj = bc.load_projection(tmp_path)
+    assert proj.exists is True
+    assert proj.read_error is not None
+    assert proj.records == []
+
+
+def test_a_broken_symlink_is_missing_not_unreadable(tmp_path):
+    link = tmp_path / "backlog.md"
+    link.symlink_to(tmp_path / "gone.md")
+    proj = bc.load_projection(link)
+    assert proj.exists is False, "nothing is there — this is 'not connected'"
+    assert proj.read_error is None
+
+
+def test_a_good_read_carries_no_read_error(tmp_path):
+    f = tmp_path / "b.md"
+    f.write_text(_REC, encoding="utf-8")
+    assert bc.load_projection(f).read_error is None
+
+
 def test_approved_recommendations_filters_to_executable(tmp_path):
     draft = _REC.replace("PO-Approved", "AI-Reco").replace("VOYN-W1-UI", "DRAFT-1")
     f = tmp_path / "b.md"
@@ -171,56 +249,3 @@ def test_filter_records_search_and_facets():
     assert [r.issue_id for r in bc.filter_records(records, query="login")] == ["OTHER"]
     assert [r.issue_id for r in bc.filter_records(records, domain="ux")] == ["VOYN-W1-UI"]
     assert bc.filter_records(records, query="dashboard", domain="api") == []
-
-
-# --- UI page (Streamlit AppTest) -------------------------------------------
-
-
-def _backlog_fixture(tmp_path):
-    f = tmp_path / "VOYN_TASKS_BACKLOG.md"
-    draft = _REC.replace("VOYN-W1-UI", "DRAFT-1").replace("PO-Approved", "AI-Reco")
-    f.write_text("\n".join([_TEMPLATE, _REC, draft]), encoding="utf-8")
-    return f
-
-
-def _page_script() -> None:
-    # Re-exec'd standalone by AppTest: path comes from the env var, not a closure.
-    import os
-
-    from command_center.ui import master_backlog_panel
-
-    master_backlog_panel.render_master_backlog_page(os.environ.get("AICC_MASTER_BACKLOG"))
-
-
-def _run_page(monkeypatch, path):
-    from streamlit.testing.v1 import AppTest
-
-    monkeypatch.setenv("AICC_MASTER_BACKLOG", str(path))
-    return AppTest.from_function(_page_script, default_timeout=30).run()
-
-
-def test_page_renders_connected_projection_with_counts(monkeypatch, tmp_path):
-    at = _run_page(monkeypatch, _backlog_fixture(tmp_path))
-    assert not at.exception
-    body = " ".join(str(m.value) for m in at.markdown) + " ".join(
-        str(c.value) for c in at.caption
-    )
-    assert "Master Backlog" in " ".join(str(t.value) for t in at.title)
-    # Read-only / master authority labelling is present.
-    assert any("read-only" in str(c.value).lower() for c in at.caption)
-    assert any("master" in str(i.value).lower() for i in at.info)
-    # Totals: 2 records, 1 approved.
-    metric_values = {m.label: m.value for m in at.metric}
-    assert metric_values["Всего записей"] == "2"
-    assert metric_values["Approved"] == "1"
-    # Freshness/source surfaced.
-    assert "master store" in [m.value for m in at.metric]
-    assert body  # smoke
-
-
-def test_page_explains_when_backlog_not_connected(monkeypatch, tmp_path):
-    at = _run_page(monkeypatch, tmp_path / "missing.md")
-    assert not at.exception
-    assert any(bc.MASTER_BACKLOG_ENV in str(w.value) for w in at.warning)
-    # An unconnected page must not have rendered the records table metrics.
-    assert "Всего записей" not in [m.label for m in at.metric]
