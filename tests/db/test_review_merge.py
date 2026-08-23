@@ -805,6 +805,47 @@ def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("newer_conclusion", "expected_ready"),
+    [("SUCCESS", True), ("FAILURE", False)],
+)
+def test_mergeability_uses_timestamps_not_rollup_array_order(
+    monkeypatch, newer_conclusion, expected_ready
+):
+    """GitHub does not promise chronological rollup order.  Put the newer
+    run first so taking the last array element would produce the wrong result."""
+    import subprocess
+
+    head = "1" * 40
+    older_conclusion = "FAILURE" if newer_conclusion == "SUCCESS" else "SUCCESS"
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN",
+            "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": [
+                {
+                    "name": "Acceptance gate",
+                    "conclusion": newer_conclusion,
+                    "startedAt": "2026-08-23T05:25:43Z",
+                },
+                {
+                    "name": "Acceptance gate",
+                    "conclusion": older_conclusion,
+                    "startedAt": "2026-08-23T04:29:29Z",
+                },
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    ready, _ = review_merge._pr_is_mergeable(
+        "/tmp", "https://github.com/x/y/pull/10"
+    )
+    assert ready is expected_ready
+
+
+@pytest.mark.parametrize(
     "checks",
     [
         [
