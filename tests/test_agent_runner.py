@@ -679,3 +679,104 @@ def test_timeout_for_task_is_200pct_of_estimate():
     assert agent_runner.timeout_for_task(None) == agent_runner.DEFAULT_TIMEOUT_SECONDS
     # huge estimate clamps to the max
     assert agent_runner.timeout_for_task({"estimate_hours": 10}) == agent_runner.MAX_TIMEOUT_SECONDS
+
+
+# --------------------------------------------------------------------------
+# Codex executor (VOYN-W0-AICC-EXECUTOR-CODEX)
+#
+# The same two execution profiles Claude resolves must hold for Codex, or the
+# cascade's escalation link would quietly run with different authority than
+# the link it escalates from. Claude enforces the read-only profile with
+# `--tools` (tool-set replacement); Codex enforces it with `--sandbox`. These
+# tests pin the mapping so a future edit cannot widen one executor's authority
+# without the other's.
+
+
+def _sandbox_argument(command: list[str]) -> str:
+    assert "--sandbox" in command, command
+    return command[command.index("--sandbox") + 1]
+
+
+@pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
+def test_codex_read_only_task_types_get_a_read_only_sandbox(task_type):
+    command = agent_runner.build_codex_command("review this", task_type=task_type)
+    assert _sandbox_argument(command) == "read-only"
+
+
+@pytest.mark.parametrize("task_type", sorted(agent_runner.MUTATING_TASK_TYPES))
+def test_codex_mutating_task_types_get_workspace_write_not_full_access(task_type):
+    command = agent_runner.build_codex_command("implement this", task_type=task_type)
+    assert _sandbox_argument(command) == "workspace-write"
+
+
+def test_codex_never_requests_full_disk_access_or_bypasses_approvals():
+    """`danger-full-access` and `--dangerously-bypass-approvals-and-sandbox`
+    remove the boundary the profiles exist to draw. Neither may appear for any
+    task type, ever."""
+    for task_type in sorted(
+        agent_runner.READ_ONLY_TASK_TYPES | agent_runner.MUTATING_TASK_TYPES
+    ):
+        command = agent_runner.build_codex_command("x", task_type=task_type)
+        joined = " ".join(command)
+        assert "danger-full-access" not in joined, task_type
+        assert "--dangerously-bypass-approvals-and-sandbox" not in joined, task_type
+        assert "--dangerously-bypass-hook-trust" not in joined, task_type
+
+
+def test_codex_prompt_is_a_single_argv_element_never_shell_interpreted():
+    prompt = "fix it; rm -rf / #$(whoami)`id`"
+    command = agent_runner.build_codex_command(prompt, task_type="implementation")
+    assert prompt in command, "the prompt must be one argv element, not spliced"
+    assert command[-1] == prompt, "codex exec takes the prompt positionally, last"
+
+
+def test_codex_runs_exec_the_non_interactive_subcommand():
+    """`codex` with no subcommand opens an interactive TUI, which would hang a
+    worker forever behind its timeout instead of producing a result."""
+    command = agent_runner.build_codex_command("x", task_type="review")
+    assert command[1] == "exec", command
+
+
+def test_command_builders_table_covers_every_wired_executor():
+    """The worker gates on this table (`handlers._run_agent`), and the routing
+    matrix's own test derives its allowed set from it, so an entry here is the
+    single act that makes an executor real."""
+    assert set(agent_runner.COMMAND_BUILDERS) == {"claude", "codex", "copilot"}
+    for name in agent_runner.COMMAND_BUILDERS:
+        command = agent_runner._command_builder(name)("x", task_type="review")
+        assert isinstance(command, list) and command, name
+        assert all(isinstance(part, str) for part in command), name
+
+
+@pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
+def test_copilot_read_only_task_types_get_no_write_or_shell_tool(task_type):
+    command = agent_runner.build_copilot_command("review this", task_type=task_type)
+    allowed = [
+        command[i + 1] for i, part in enumerate(command) if part == "--allow-tool"
+    ]
+    assert allowed == ["read"], allowed
+    assert "write" not in allowed and "shell" not in allowed
+
+
+@pytest.mark.parametrize("task_type", sorted(agent_runner.MUTATING_TASK_TYPES))
+def test_copilot_mutating_task_types_can_write_but_never_push(task_type):
+    command = agent_runner.build_copilot_command("implement this", task_type=task_type)
+    allowed = [
+        command[i + 1] for i, part in enumerate(command) if part == "--allow-tool"
+    ]
+    denied = [command[i + 1] for i, part in enumerate(command) if part == "--deny-tool"]
+    assert {"read", "write", "shell"} <= set(allowed), allowed
+    # Publishing belongs to publish_run (which holds the writer lease), never
+    # to the agent -- the same boundary GIT_WRITE_DISALLOWED_TOOLS draws for
+    # Claude, expressed in Copilot's own tool syntax.
+    assert "shell(git push)" in denied, denied
+
+
+def test_copilot_never_grants_blanket_permissions():
+    for task_type in sorted(
+        agent_runner.READ_ONLY_TASK_TYPES | agent_runner.MUTATING_TASK_TYPES
+    ):
+        joined = " ".join(agent_runner.build_copilot_command("x", task_type=task_type))
+        assert "--allow-all" not in joined, task_type
+        assert "--allow-all-paths" not in joined, task_type
+        assert "--allow-all-tools" not in joined, task_type

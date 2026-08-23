@@ -545,16 +545,42 @@ def test_cascade_clamps_at_the_tail(handler) -> None:
 def test_unavailable_executor_is_a_routing_signal_not_a_task_error(handler) -> None:
     """BO-S2a decision: a link naming an executor this host cannot run is a
     RETRYABLE refusal — the attempt returns to the pool and the next delivery
-    selects the next link. Nothing may have executed."""
+    selects the next link. Nothing may have executed.
+
+    Uses a deliberately never-real name: `codex` used to stand in for
+    "unavailable" here, but it became a genuinely wired executor
+    (VOYN-W0-AICC-EXECUTOR-CODEX), so reusing it would silently invert what
+    this test asserts -- the very kind of stale-example rot that makes a
+    green test meaningless."""
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "no-such-executor"
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert "executor_unavailable" in outcome.reason
+    assert "no-such-executor" in outcome.reason
+    assert runs == [], "an unavailable executor must not execute anything"
+    # The same payload on attempt 2 runs the second (available) link.
+    assert run_agent(payload, _event(), 2).ok
+
+
+def test_a_wired_executor_is_dispatched_under_its_own_name(handler) -> None:
+    """VOYN-W0-AICC-EXECUTOR-CODEX: an executor present in
+    `agent_runner.COMMAND_BUILDERS` must actually RUN (and be recorded as
+    itself in the result), not be refused as unavailable. Without this the
+    escalation link is inert and every task still funnels into the one
+    account whose quota exhaustion this route exists to escape."""
     run_agent, runs = handler
     payload = _cascade_payload()
     payload["cascade"][0]["executor"] = "codex"
     outcome = run_agent(payload, _event(), 1)
-    assert not outcome.ok and outcome.retryable is True
-    assert "executor_unavailable" in outcome.reason and "codex" in outcome.reason
-    assert runs == [], "an unavailable executor must not execute anything"
-    # The same payload on attempt 2 runs the second (available) link.
-    assert run_agent(payload, _event(), 2).ok
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1, "the wired executor must actually execute"
+    assert runs[0]["executor"] == "codex", (
+        "the executor must be passed through to the runner, not silently "
+        "defaulted to claude"
+    )
+    assert outcome.result["executor"] == "codex"
 
 
 def test_malformed_cascade_is_a_non_retryable_payload_defect(handler) -> None:
