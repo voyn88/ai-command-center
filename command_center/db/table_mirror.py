@@ -255,6 +255,11 @@ def divergence_against(spec: MirroredTable, doc: str | None = None) -> Any:
     that reconciliation takes the *stored* reader. The warning has to be
     readable where the mistake is made, which is a REPL at cutover time, not a
     source file.
+
+    So `doc` is the only place a reconciliation's prose belongs. A `#:` comment
+    above the assignment is the same words in the one place the runtime cannot
+    reach, and `tests/db/test_reconciliation_docstrings.py` refuses it rather
+    than leaving the next table to remember.
     """
 
     def divergence(authority_rows: Iterable[dict], mirror: Any) -> list[dict]:
@@ -264,6 +269,12 @@ def divergence_against(spec: MirroredTable, doc: str | None = None) -> Any:
 
     divergence.__name__ = f"{spec.table}_divergence"
     divergence.__qualname__ = divergence.__name__
+    # What this closure reconciles, carried as the declaration itself rather
+    # than as a name to be parsed back. The docstring gate asks this of every
+    # module attribute, so a reconciliation built through an aliased import or
+    # any other spelling of the call is still found as one — the shape of rule
+    # slice 10's acceptance walked around three separate ways.
+    divergence.mirrored_table = spec  # type: ignore[attr-defined]
     divergence.__doc__ = doc or (
         f"Rows where the SQLite authority and a mirror disagree on `{spec.table}` — "
         "see `mirror_support.divergence` for what each reported shape means."

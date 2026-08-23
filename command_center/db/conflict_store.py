@@ -81,6 +81,4 @@ class PostgresConflictMirror(PostgresTableMirror):
     spec = CONFLICT
 
 
-#: Rows where the SQLite authority and a mirror disagree — see
-#: `mirror_support.divergence` for what each reported shape means.
 divergence = divergence_against(CONFLICT)

@@ -121,7 +121,6 @@ class PostgresModelEventMirror(PostgresTableMirror):
     spec = MODEL_EVENT
 
 
-#: Rows where the SQLite authority and a mirror disagree on `model_entry`.
 entry_divergence = divergence_against(MODEL_ENTRY)
 
 event_divergence = divergence_against(

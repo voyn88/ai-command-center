@@ -152,17 +152,19 @@ class PostgresInvitationMirror(PostgresTableMirror):
     spec = INVITATION
 
 
-#: Rows where the SQLite authority and a mirror disagree on `contact`.
 contact_divergence = divergence_against(CONTACT)
 
-#: Rows where the SQLite authority and a mirror disagree on
-#: `networking_invitation`.
 invitation_divergence = divergence_against(INVITATION)
 
-#: Rows where the SQLite authority and a mirror disagree on `message`.
-#:
-#: Reported per table, not per relationship: a message missing because its
-#: contact never reached the mirror shows up here as a missing row, and the
-#: contact shows up in `contact_divergence` as a missing row too. Two true
-#: reports of one cause beats one report that guesses at the cause.
-message_divergence = divergence_against(MESSAGE)
+message_divergence = divergence_against(
+    MESSAGE,
+    """Rows where the SQLite authority and a mirror disagree on `message`.
+
+    Reported per table, not per relationship: a message missing because its
+    contact never reached the mirror shows up here as a missing row, and the
+    contact shows up in `contact_divergence` as a missing row too. Two true
+    reports of one cause beats one report that guesses at the cause.
+
+    See `mirror_support.divergence` for what each reported shape means.
+    """,
+)

@@ -68,6 +68,4 @@ class PostgresOwnerItemMirror(PostgresTableMirror):
     spec = OWNER_ITEM
 
 
-#: Rows where the SQLite authority and a mirror disagree — see
-#: `mirror_support.divergence` for what each reported shape means.
 divergence = divergence_against(OWNER_ITEM)
