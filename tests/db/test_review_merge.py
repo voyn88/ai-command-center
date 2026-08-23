@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 
 from tests.db.test_backlog_planner import _test_repo_routes, rig  # noqa: F401 — pytest fixtures
 from command_center.orchestrator import review_merge
@@ -758,6 +759,125 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     assert any(t == "VOYN-W0-M3" and "checks_not_green" in r for t, r in report.skipped)
+
+
+def test_mergeability_uses_latest_check_rerun(monkeypatch):
+    import subprocess
+
+    head = "d" * 40
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": [
+                {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T04:29:29Z"},
+                {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T05:25:43Z"},
+                {"name": "CI", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:27Z"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10") == (True, head)
+
+
+def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
+    import subprocess
+
+    head = "e" * 40
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": [
+                {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:29Z"},
+                {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T05:25:43Z"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    ready, reason = review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10")
+    assert not ready
+    assert reason == "checks_not_green: ['Acceptance gate']"
+
+
+@pytest.mark.parametrize(
+    ("newer_conclusion", "expected_ready"),
+    [("SUCCESS", True), ("FAILURE", False)],
+)
+def test_mergeability_uses_timestamps_not_rollup_array_order(
+    monkeypatch, newer_conclusion, expected_ready
+):
+    """GitHub does not promise chronological rollup order.  Put the newer
+    run first so taking the last array element would produce the wrong result."""
+    import subprocess
+
+    head = "1" * 40
+    older_conclusion = "FAILURE" if newer_conclusion == "SUCCESS" else "SUCCESS"
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN",
+            "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": [
+                {
+                    "name": "Acceptance gate",
+                    "conclusion": newer_conclusion,
+                    "startedAt": "2026-08-23T05:25:43Z",
+                },
+                {
+                    "name": "Acceptance gate",
+                    "conclusion": older_conclusion,
+                    "startedAt": "2026-08-23T04:29:29Z",
+                },
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    ready, _ = review_merge._pr_is_mergeable(
+        "/tmp", "https://github.com/x/y/pull/10"
+    )
+    assert ready is expected_ready
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        [
+            {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T05:25:43Z"},
+            {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T05:25:43Z"},
+        ],
+        [
+            {"name": "Acceptance gate", "conclusion": "FAILURE"},
+            {"name": "Acceptance gate", "conclusion": "SUCCESS"},
+        ],
+    ],
+)
+def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, checks):
+    import subprocess
+
+    head = "f" * 40
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN",
+            "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": checks,
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    ready, reason = review_merge._pr_is_mergeable(
+        "/tmp", "https://github.com/x/y/pull/10"
+    )
+    assert not ready
+    assert reason == "checks_not_green: ['Acceptance gate']"
 
 
 def test_repo_from_pr_url():
