@@ -56,6 +56,7 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         {"executor": "copilot", "task_type": "implementation"},
     ],
     "review": [
+        {"executor": "copilot", "task_type": "review"},
         {"executor": "claude", "task_type": "review"},
     ],
 }

@@ -120,6 +120,24 @@ _CODEX_BWRAP_LOOPBACK_SIGNATURE = (
     "bwrap: loopback:",
     "failed rtm_newaddr: operation not permitted",
 )
+_COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
+    "ai credit usage limit",
+    "rate limit",
+    "not logged in",
+    "authentication required",
+    "authentication failed",
+    "unauthorized",
+    "forbidden",
+    "failed during startup",
+    "service unavailable",
+    "temporarily unavailable",
+    "network error",
+    "connection refused",
+    "too many requests",
+    "could not authenticate",
+    "getaddrinfo",
+    "econnreset",
+)
 _CODEX_PREFLIGHT_PROMPT = (
     "This is a sandbox capability probe. Do not edit files, run tools, or inspect "
     "the repository. Reply with exactly: AICC_CODEX_WORKSPACE_WRITE_OK"
@@ -584,7 +602,18 @@ def build_copilot_command(
     exactly the boundary these profiles draw.
     """
     profile = profile_for_task_type(task_type)
-    command = [COPILOT_BINARY, "-p", prompt, "--no-color"]
+    command = [
+        COPILOT_BINARY,
+        "-p",
+        prompt,
+        "--no-color",
+        "--silent",
+        "--no-remote",
+        "--no-remote-export",
+        "--disable-builtin-mcps",
+        "--no-custom-instructions",
+        "--no-ask-user",
+    ]
     if profile == PROFILE_READ_ONLY:
         # Grant reads only. Absent `write`/`shell`, mutation is unreachable.
         command += ["--allow-tool", "read"]
@@ -735,6 +764,24 @@ class RunResult:
         behavior rather than guess.
         """
         return (self.is_error and self.api_error_status is not None) or self.terminal_reason == "api_error"
+
+    def is_executor_provider_error(self, executor: str) -> bool:
+        """Whether the selected CLI positively reports a provider failure.
+
+        Claude exposes structured API fields; Copilot 1.0.x reports its
+        pre-task auth/quota/network failures on stderr. Copilot free-text is
+        considered only for a failed, non-zero process, so a successful
+        review that merely discusses a rate limit cannot trigger a retry.
+        """
+        if self.is_executor_api_error:
+            return True
+        if executor != "copilot" or self.status != "failed" or not self.exit_code:
+            return False
+        diagnostic = "\n".join((self.stdout, self.stderr)).lower()
+        return any(
+            signature in diagnostic
+            for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
+        )
 
     @property
     def is_executor_sandbox_error(self) -> bool:

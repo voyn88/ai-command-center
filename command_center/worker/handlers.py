@@ -221,6 +221,11 @@ def _run_agent(
     elif executor == "codex":
         available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
         unavailable_reason = "codex cli unavailable"
+    elif executor == "copilot":
+        available, detail = agent_runner.claude_cli_preflight(
+            agent_runner.COPILOT_BINARY
+        )
+        unavailable_reason = "copilot cli unavailable"
     else:
         available, detail = agent_runner.claude_cli_preflight()
         unavailable_reason = "claude cli unavailable"
@@ -500,7 +505,12 @@ def _run_agent(
                 reason=_tail(run.stderr) or "runner failed to start",
                 retryable=True,
             )
-        if run.is_executor_api_error:
+        read_only_copilot_failure = (
+            executor == "copilot"
+            and task_type in agent_runner.READ_ONLY_TASK_TYPES
+            and run.status != "completed"
+        )
+        if run.is_executor_provider_error(executor) or read_only_copilot_failure:
             # Incident 2026-08-21 16:09 UTC: the CLI process itself started
             # (exit code 1, non-empty stdout) but the *account*, not the
             # task, failed -- a rate limit / auth / overload response the
@@ -516,7 +526,10 @@ def _run_agent(
                 workspace_provisioning.remove_workspace(isolated_workspace, repository)
             return HandlerOutcome(
                 ok=False,
-                reason=f"executor infrastructure failure (api_error_status present in CLI output): {_tail(result_text)}",
+                reason=(
+                    "executor infrastructure failure "
+                    f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
+                ),
                 retryable=True,
             )
         if run.is_executor_sandbox_error:

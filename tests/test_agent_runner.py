@@ -778,6 +778,18 @@ def test_copilot_read_only_task_types_get_no_write_or_shell_tool(task_type):
     assert "write" not in allowed and "shell" not in allowed
 
 
+def test_copilot_uses_noninteractive_local_read_only_controls():
+    command = agent_runner.build_copilot_command("review this", task_type="review")
+    assert {
+        "--silent",
+        "--no-remote",
+        "--no-remote-export",
+        "--disable-builtin-mcps",
+        "--no-custom-instructions",
+        "--no-ask-user",
+    } <= set(command)
+
+
 @pytest.mark.parametrize("task_type", sorted(agent_runner.MUTATING_TASK_TYPES))
 def test_copilot_mutating_task_types_can_write_but_never_push(task_type):
     command = agent_runner.build_copilot_command("implement this", task_type=task_type)

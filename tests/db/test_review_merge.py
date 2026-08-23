@@ -71,16 +71,22 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
-    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)), "/tmp")
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        "/tmp",
+    )
     assert ("VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7") in report.reviewed
     assert len(calls) == 1
-    q, key, payload, task_id = calls[0]
+    q, key, payload, task_id, max_attempts = calls[0]
     # task + PR number + exact head sha + review policy version -- not just
     # the task_id -- so a later push to the same PR (remediation, or an
     # ordinary second push while still IN_PROGRESS) gets its own fresh
     # review instead of being permanently deduped against this one.
-    assert key == f"review:VOYN-W0-R1:7:{head}:v1"
+    assert key == f"review:VOYN-W0-R1:7:{head}:v2"
     assert task_id == "VOYN-W0-R1"
+    assert [link["executor"] for link in payload["cascade"]] == ["copilot", "claude"]
+    assert max_attempts == len(payload["cascade"]) == 2
     assert payload["task_type"] == "review" and "pull/7" in payload["prompt"]
     # The diff is embedded in the prompt directly -- the orchestrator fetches
     # it, not the review agent -- so the agent needs no Bash/gh access of its
@@ -105,7 +111,11 @@ def test_review_skips_a_pr_whose_repo_has_no_route(rig):  # noqa: F811
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R2", "https://github.com/x/unrouted-repo/pull/9")
     calls = []
-    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)), "/tmp")
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        "/tmp",
+    )
     assert not calls
     assert any(
         task_id == "VOYN-W0-R2" and reason.startswith("no_repo_route")
@@ -123,7 +133,11 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
-    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)), "/tmp")
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        "/tmp",
+    )
     assert not calls
     assert any(
         task_id == "VOYN-W0-R3" and reason.startswith("pr_diff_fetch_failed")
@@ -147,7 +161,11 @@ def test_review_skips_a_diff_over_the_size_cap(rig, _test_repo_routes, monkeypat
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
-    report = review_once(app_factory, lambda q, k, p, tid: calls.append((q, k, p, tid)), "/tmp")
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        "/tmp",
+    )
     assert not calls
     assert any(
         task_id == "VOYN-W0-R4" and reason.startswith("diff_too_large")
@@ -922,7 +940,9 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
-    enqueue = lambda q, k, p, tid: calls.append((q, k, p, tid))  # noqa: E731
+    enqueue = lambda q, k, p, tid, attempts: calls.append(  # noqa: E731
+        (q, k, p, tid, attempts)
+    )
 
     current_head = iter(["a" * 40])
     review_once(app_factory, enqueue, "/tmp")
@@ -930,6 +950,6 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
     review_once(app_factory, enqueue, "/tmp")
 
     assert len(calls) == 2
-    keys = {key for _q, key, _p, _tid in calls}
+    keys = {key for _q, key, _p, _tid, _attempts in calls}
     assert len(keys) == 2  # two distinct review-cycle identities, not deduped
     assert all(k.startswith("review:VOYN-W0-R5:20:") for k in keys)

@@ -71,6 +71,7 @@ from pathlib import Path
 from typing import Any
 
 from command_center.orchestrator import github_app_auth
+from command_center.orchestrator.routing import cascade_for
 
 __all__ = [
     "LoopReport",
@@ -207,7 +208,7 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # incrementing this constant, forcing every task to be re-reviewed under the
 # new contract rather than silently reusing a verdict given for an older,
 # looser policy.
-_REVIEW_POLICY_VERSION = "v1"
+_REVIEW_POLICY_VERSION = "v2"
 
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
@@ -275,12 +276,17 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> tuple[str, str] | None:
 
 
 def review_once(
-    factory: Any, enqueue: Any, repo_path: str, cfg: ReviewConfig | None = None
+    factory: Any,
+    enqueue: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
 ) -> LoopReport:
     """Enqueue a review run for each READY_TO_REVIEW task with a pr and no
-    review queued yet. ``enqueue(queue, key, payload, task_id)`` is the queue
-    writer (control-plane privilege); passing it in keeps this composable and
-    testable without a live queue. The task_id is passed through to the
+    review queued yet. ``enqueue(queue, key, payload, task_id, max_attempts)``
+    is the queue writer (control-plane privilege); passing it in keeps this
+    composable and testable without a live queue. The task_id is passed through to the
     enqueue call (not just embedded in the payload/prompt) so
     publish_review_verdicts can look the result back up by
     ``work_item.task_id`` -- omitting it left that column NULL for every
@@ -304,17 +310,23 @@ def review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    # Idempotency is the queue's: enqueue keys on review:<task>, so a task
-    # already under review returns the same work item, never a second run.
+    where_task = " AND t.task_id = %s" if task_id is not None else ""
+    params: tuple[Any, ...] = (
+        (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
+    )
     tasks = _rows(
         factory,
         "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' "
+        "WHERE t.status = 'READY_TO_REVIEW'" + where_task + " "
         "ORDER BY t.task_id LIMIT %s",
-        (cfg.max_per_tick,),
+        params,
     )
+    cascade = cascade_for("review")
     for task_id, pr_url in tasks:
+        if not cascade:
+            report.skipped.append((task_id, "no_review_executor_route"))
+            continue
         repo = _repo_from_pr_url(pr_url)
         route = repo_route(repo) if repo else None
         if route is None:
@@ -342,8 +354,9 @@ def review_once(
                 pr=pr_url, task=task_id, head_sha=head_sha, diff=diff
             ),
             "timeout_seconds": cfg.review_timeout, "untrusted": False,
+            "cascade": cascade,
         }
-        enqueue(cfg.queue, key, payload, task_id)
+        enqueue(cfg.queue, key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
     return report
 
@@ -543,7 +556,13 @@ def _remediate_rejection(
             conn.autocommit = True
 
 
-def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
+def publish_review_verdicts(
+    factory: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
+) -> LoopReport:
     """For each READY_TO_REVIEW task whose review run has a result *for the
     PR's current head sha*, publish the ACCEPT marker merge_once looks for,
     or -- on REJECT -- dispatch a linked remediation task (see
@@ -551,12 +570,17 @@ def publish_review_verdicts(factory: Any, repo_path: str, cfg: ReviewConfig | No
     marker already posted for the current head are skips, not errors."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    where_task = " AND t.task_id = %s" if task_id is not None else ""
+    params: tuple[Any, ...] = (
+        (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
+    )
     tasks = _rows(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at LIMIT %s",
-        (cfg.max_per_tick,),
+        "WHERE t.status = 'READY_TO_REVIEW'" + where_task
+        + " ORDER BY t.updated_at LIMIT %s",
+        params,
     )
     for task_id, pr_url in tasks:
         already, current_head = _has_accept_marker(repo_path, pr_url)
