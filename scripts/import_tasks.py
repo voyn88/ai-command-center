@@ -16,9 +16,11 @@ Usage:
         counts, errors, warnings, per-task table). Never writes to disk.
 
     python scripts/import_tasks.py PACKAGE.(json|yaml|md|txt) --apply
-        Same validation, then commits the new tasks in a single write.
-        Refuses to run (exit code 2) if the package has any blocking
-        validation error, including a `depends_on` id that resolves to
+        Same validation, then commits the new tasks — one locked write per
+        task, not a single transaction, so an import that fails part-way
+        leaves the tasks it already wrote in the store (the error message
+        lists them). Refuses to run (exit code 2) if the package has any
+        blocking validation error, including a `depends_on` id that resolves to
         neither the package nor the current store (the default policy —
         see --allow-unresolved-dependencies).
 

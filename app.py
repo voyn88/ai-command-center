@@ -2064,11 +2064,15 @@ elif page_key == "create":
                 try:
                     import_result = task_import.apply_task_package(ROOT, parsed_package, import_validation)
                 except task_import.TaskImportError as exc:
-                    # Re-checked fresh under lock inside `apply_task_package` — can
-                    # still fail here even though the preview above looked clean,
+                    # Re-derived fresh inside `apply_task_package` — can still
+                    # fail here even though the preview above looked clean,
                     # e.g. a concurrent import claimed a dependency's id, or the
-                    # lock timed out. Surfaced as an ordinary page error, never an
-                    # uncaught exception; nothing was written in either case.
+                    # lock timed out. Surfaced as an ordinary page error, never
+                    # an uncaught exception. The import is *not* one
+                    # transaction (one locked write per task), so a failure
+                    # part-way leaves earlier tasks written — `imported_ids`
+                    # says which, and the message repeats it, so the operator
+                    # is never told "nothing happened" when something did.
                     st.error(f"Импорт не выполнен: {exc}")
                 else:
                     # Flashed (not rendered inline) because the `st.rerun()`

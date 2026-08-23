@@ -10,12 +10,13 @@ through this module, never through a second store or by touching the JSON
 file directly.
 
 Every *write* to `tasks.json` — creating a task, changing its status,
-deleting it, a manual launch-status toggle, a batch package import
-(`command_center.task_import.apply_task_package`), any future bulk
-operation — must go through `mutate_tasks` (or one of the verb-named
-helpers below that are themselves built on it), never a hand-rolled
-`load_tasks()` ... mutate ... `save_tasks()` sequence. `save_tasks`'s
-`tempfile` + `os.replace` makes a single write atomic, but does nothing to
+deleting it, a manual launch-status toggle, each task of a batch package
+import (`command_center.task_import.apply_task_package`, which calls
+`create()` once per new task), any future bulk operation — must go through
+`mutate_tasks` (or one of the verb-named helpers below that are themselves
+built on it), never a hand-rolled `load_tasks()` ... mutate ...
+`save_tasks()` sequence. `save_tasks`'s `tempfile` + `os.replace` makes a
+single write atomic, but does nothing to
 prevent a *lost update* across a read-modify-write cycle: two callers that
 each `load_tasks()` before either `save_tasks()`s will silently discard one
 another's change, whichever writes last "winning" with a snapshot that
@@ -27,6 +28,12 @@ advisory `fcntl.flock`/`msvcrt.locking` lock — see `storage.file_lock`'s
 docstring) across the *entire* load-mutate-save cycle, for every write path
 in this application, so no two writers can ever interleave their read and
 write halves.
+
+That guarantee is per `mutate_tasks` *call*. It does not extend across a
+caller that makes several of them: `apply_task_package` issues one `create()`
+per new task, so a concurrent writer can interleave between two tasks of the
+same package even though neither individual write is ever lost. See
+`docs/audits/TASK_IMPORT_LOCK_REVIEW.md`.
 """
 
 from __future__ import annotations
@@ -229,7 +236,9 @@ def tasks_lock(root: Path, *, timeout: float = TASKS_LOCK_TIMEOUT_SECONDS):
     shared by every mutation helper in this module and by
     `command_center.task_import.apply_task_package` (never a second,
     import-specific lock file), so a manual Kanban edit/creation and a
-    package import can never race each other and lose an update. See
+    single task-create from a package import can never race each other and
+    lose an update. Holding it for one cycle does not make a *multi-call*
+    caller atomic — see `apply_task_package`'s docstring. See
     `storage.file_lock`'s docstring for the underlying `fcntl`/`msvcrt`
     mechanism and why `save_tasks`'s own atomic write is not, by itself,
     sufficient."""

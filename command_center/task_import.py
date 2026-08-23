@@ -39,21 +39,32 @@ Pipeline
 `build_import_preview` — `(root, parsed, validation)` -> `ImportPreview`: reads
     the current store once (read-only) to classify each valid task as new or
     an id-duplicate. Never writes.
-`apply_task_package` — `(root, parsed, validation)` -> `ImportResult`: the
-    entire load -> re-derive duplicates/dependencies -> merge -> save cycle
-    runs inside `tasks_repository.mutate_tasks` — the *same* shared lock
-    (`tasks_repository.tasks_lock`, never a second, import-specific one)
-    every other write path in this application holds for its own
-    load-mutate-save cycle (task creation, status change, deletion, manual
-    launch-status toggles — see `tasks_repository`'s module docstring). A
-    package import and a manual Kanban edit happening at the same instant
-    can therefore never race each other and lose an update, any more than
-    two concurrent imports can. Never trusts a caller-held `ImportPreview` —
-    a store mutated between preview and apply, by another process or a
-    concurrent writer of any kind, is still seen fresh. Refuses to run at
-    all (raises `TaskImportError`) if `validation.errors` is non-empty — a
-    package with any structural/field error is rejected in full, never
-    partially applied.
+`apply_task_package` — `(root, parsed, validation)` -> `ImportResult`:
+    re-derives duplicates and dependencies against its own fresh read of the
+    store, then persists one `get_repository(root).create()` call per new
+    task. Each `create()` holds `tasks_repository.tasks_lock` — the *same*
+    shared lock (never a second, import-specific one) every other write path
+    holds for its own load-mutate-save cycle (task creation, status change,
+    deletion, manual launch-status toggles — see `tasks_repository`'s module
+    docstring) — so no *individual* write can lose an update against a
+    concurrent Kanban edit.
+
+    **The import as a whole is not one transaction.** N new tasks means N
+    separate lock cycles, and the up-front duplicate/dependency read is taken
+    *without* the lock. Another writer can therefore interleave between two
+    tasks of the same package, and a failure part-way through leaves the
+    tasks already created in the store — `TaskImportError.imported_ids` says
+    which. This is the deliberate trade-off that lets the AIOS backend
+    (which has no batch-write primitive) share this code path; it is a
+    narrowing of the original single-`mutate_tasks` behavior, and
+    `docs/audits/TASK_IMPORT_LOCK_REVIEW.md` records the reasoning and what
+    it costs.
+
+    Never trusts a caller-held `ImportPreview` — a store mutated between
+    preview and apply, by another process or a concurrent writer of any
+    kind, is still seen fresh. Refuses to run at all (raises
+    `TaskImportError`) if `validation.errors` is non-empty — a package with
+    any structural/field error is rejected in full, before any write.
 """
 
 from __future__ import annotations
@@ -100,8 +111,9 @@ SUPPORTED_IMPORT_SUFFIXES: tuple[str, ...] = tuple(sorted(s.lstrip(".") for s in
 # `tasks_repository.tasks_lock` (shared with every other task-store write
 # path), not a dedicated one for imports. Kept as a distinct name here only
 # because import batches may legitimately want a longer timeout than a
-# single interactive edit; still just forwarded to `tasks_repository.
-# mutate_tasks`'s own `timeout` parameter.
+# single interactive edit; forwarded as the `timeout` of each per-task
+# `create()` call, so it bounds every individual lock wait, not the import
+# as a whole (an N-task package can wait up to N * this in the worst case).
 IMPORT_LOCK_TIMEOUT_SECONDS = tasks_repository.TASKS_LOCK_TIMEOUT_SECONDS
 
 # Literal field list from the import spec: every task in a package must carry
@@ -135,7 +147,31 @@ _KNOWN_TASK_FIELDS: frozenset[str] = frozenset(
 class TaskImportError(Exception):
     """Raised for input the caller cannot recover from: malformed JSON, an
     unrecognized package root shape, or calling `apply_task_package` on a
-    `ValidationResult` that still has blocking errors."""
+    `ValidationResult` that still has blocking errors.
+
+    `imported_ids` carries the ids `apply_task_package` had already
+    committed when it failed part-way through its per-task create loop. It
+    is empty for every failure raised before the first write — which is
+    every other raise site in this module. Because the store is *not*
+    rolled back (see `apply_task_package`'s "Partial import" note), a
+    caller that needs to report or clean up the real post-failure state can
+    read this instead of diffing the store itself.
+    """
+
+    def __init__(self, *args: object, imported_ids: tuple[str, ...] = ()) -> None:
+        super().__init__(*args)
+        self.imported_ids = imported_ids
+
+
+def _partial_import_note(imported: list[dict]) -> str:
+    """Human-readable tail for an import that failed part-way through the
+    create loop. Tasks already committed are *not* rolled back, so the
+    message says so explicitly rather than leaving the operator to assume a
+    clean abort and re-run the package blind."""
+    if not imported:
+        return "Ни одна задача не была записана."
+    ids = ", ".join(str(task.get("id")) for task in imported)
+    return f"Уже записано задач: {len(imported)} ({ids}) — они остаются в хранилище."
 
 
 @dataclass(frozen=True)
@@ -616,12 +652,15 @@ def apply_task_package(
     Re-importing already-imported ids is a no-op for those ids
     (`skipped_duplicate_ids`), not a second copy.
 
-    **Partial-import on lock timeout:** if `storage.LockTimeoutError` is
-    raised during the create loop (i.e. after at least one successful
-    `create()` but before all tasks are written), the tasks already
-    persisted remain in the store. The `TaskImportError` that is raised
-    does not carry a count of how many tasks succeeded — the caller should
-    reload the store to determine actual state.
+    **Partial import:** the create loop is not rolled back. If it fails
+    after at least one successful `create()` but before all tasks are
+    written — either `storage.LockTimeoutError`, or the store refusing a
+    record because a concurrent writer claimed that id in the window since
+    the `load_all()` above — the tasks already persisted stay in the store.
+    Both cases are raised as `TaskImportError` (never a raw `ValueError`,
+    which would escape the CLI/UI handlers as an uncaught traceback), and
+    the exception's `imported_ids` lists exactly what was committed, so the
+    caller can report real state without diffing the store.
 
     Raises `TaskImportError` if a lock cannot be acquired within
     `lock_timeout` seconds (default 30s) — surfaced to the UI/CLI as an
@@ -632,6 +671,7 @@ def apply_task_package(
 
     skipped: list[str] = []
     warnings = list(validation.warnings)
+    imported: list[dict] = []
 
     try:
         _repo = tasks_repository.get_repository(root)
@@ -650,10 +690,27 @@ def apply_task_package(
 
         now = models.iso_now()
         new_records = [_build_task_record(item, parsed, now) for item in new_items]
-        imported = [_repo.create(task_dict, timeout=lock_timeout) for task_dict in new_records]
+        for task_dict in new_records:
+            try:
+                imported.append(_repo.create(task_dict, timeout=lock_timeout))
+            except ValueError as exc:
+                # The store refused the record under its own lock — in
+                # practice a concurrent writer that claimed this id in the
+                # window between our unlocked `load_all()` above and this
+                # `create()`. That is an ordinary, recoverable import
+                # failure, so it must reach the CLI/UI as `TaskImportError`
+                # like every other one; letting the raw `ValueError` escape
+                # would surface as an uncaught traceback instead.
+                raise TaskImportError(
+                    f"импорт прерван на задаче {task_dict.get('id')!r}: хранилище отклонило запись "
+                    f"({exc}). {_partial_import_note(imported)}",
+                    imported_ids=tuple(str(t.get("id")) for t in imported),
+                ) from exc
     except storage.LockTimeoutError as exc:
         raise TaskImportError(
-            f"не удалось получить блокировку импорта задач за {lock_timeout:.0f}с: {tasks_repository.tasks_lock_path(root)}"
+            f"не удалось получить блокировку импорта задач за {lock_timeout:.0f}с: "
+            f"{tasks_repository.tasks_lock_path(root)}. {_partial_import_note(imported)}",
+            imported_ids=tuple(str(t.get("id")) for t in imported),
         ) from exc
 
     return ImportResult(

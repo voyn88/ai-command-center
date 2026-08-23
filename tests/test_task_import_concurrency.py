@@ -341,3 +341,90 @@ def test_a_crashed_lock_holder_never_permanently_blocks_a_later_import(tmp_path)
     elapsed = time.monotonic() - start
     assert result.imported_ids == ["AFTER-CRASH-1"]
     assert elapsed < 5.0, "import after a crashed lock holder should not need to wait out the full timeout"
+
+
+# --------------------------------------------------------------------------
+# The window the per-task-`create()` refactor (14c13b8) opened, and which no
+# existing test covered: `apply_task_package` reads the store *once, without
+# the lock*, decides which ids are new, and only then starts its create loop.
+# Another writer that claims one of those ids in between is caught by
+# `JSONTasksRepository.create`'s own under-lock collision guard — so no
+# duplicate is ever written — but that guard raises a bare `ValueError`,
+# which is not what the CLI (`scripts/import_tasks.py`) or the Create Task
+# page (`app.py`) catch. The tests below pin the two things that must hold:
+# the failure arrives as `TaskImportError`, and it tells the truth about the
+# tasks the loop had already committed before it hit the collision.
+#
+# `tests/test_task_import.py`'s
+# `test_apply_does_not_duplicate_a_task_written_concurrently_between_validate_
+# and_apply` covers the *earlier* window (before `apply_task_package`'s own
+# read); this covers the one after it.
+# --------------------------------------------------------------------------
+
+
+def _claim_id_during_create(monkeypatch, claimed_id: str) -> None:
+    """Make the first `create()` of an import be preceded by another writer
+    committing `claimed_id` through the ordinary locked path — i.e. exactly
+    the interleaving a second process can produce, made deterministic."""
+    real_create = tasks_repository.JSONTasksRepository.create
+    fired: list[bool] = []
+
+    def racing_create(self, task_dict, *, timeout=tasks_repository.TASKS_LOCK_TIMEOUT_SECONDS):
+        if not fired:
+            fired.append(True)
+            real_create(self, _task(claimed_id), timeout=timeout)
+        return real_create(self, task_dict, timeout=timeout)
+
+    monkeypatch.setattr(tasks_repository.JSONTasksRepository, "create", racing_create)
+
+
+def test_id_claimed_between_read_and_create_raises_task_import_error(tmp_path, monkeypatch):
+    parsed, validation = _package("WINDOW-A", "WINDOW-B")
+    _claim_id_during_create(monkeypatch, "WINDOW-B")
+
+    with pytest.raises(ti.TaskImportError) as excinfo:
+        ti.apply_task_package(tmp_path, parsed, validation)
+
+    # Names the task that could not be written, so the operator can tell this
+    # apart from a lock timeout without reading a traceback.
+    assert "WINDOW-B" in str(excinfo.value)
+
+
+def test_partial_import_failure_reports_the_tasks_it_already_committed(tmp_path, monkeypatch):
+    parsed, validation = _package("WINDOW-A", "WINDOW-B")
+    _claim_id_during_create(monkeypatch, "WINDOW-B")
+
+    with pytest.raises(ti.TaskImportError) as excinfo:
+        ti.apply_task_package(tmp_path, parsed, validation)
+
+    # WINDOW-A was committed before the collision and is NOT rolled back;
+    # the exception must say so rather than imply a clean abort.
+    assert excinfo.value.imported_ids == ("WINDOW-A",)
+    assert "WINDOW-A" in str(excinfo.value)
+
+    stored_ids = {t["id"] for t in tasks_repository.load_tasks(tmp_path)}
+    assert stored_ids == {"WINDOW-A", "WINDOW-B"}
+
+
+def test_collision_on_the_first_task_reports_an_empty_committed_list(tmp_path, monkeypatch):
+    parsed, validation = _package("WINDOW-ONLY")
+    _claim_id_during_create(monkeypatch, "WINDOW-ONLY")
+
+    with pytest.raises(ti.TaskImportError) as excinfo:
+        ti.apply_task_package(tmp_path, parsed, validation)
+
+    assert excinfo.value.imported_ids == ()
+
+
+def test_task_import_error_defaults_to_no_committed_ids(tmp_path):
+    """Every raise site that fires before the create loop leaves
+    `imported_ids` empty — nothing was written, and callers can rely on
+    that without special-casing which failure they caught."""
+    parsed = ti.parse_task_package(json.dumps([_task("VALIDATION-FAIL", status="Не бывает")]))
+    validation = ti.validate_task_package(parsed)
+    assert validation.errors != []
+
+    with pytest.raises(ti.TaskImportError) as excinfo:
+        ti.apply_task_package(tmp_path, parsed, validation)
+
+    assert excinfo.value.imported_ids == ()
