@@ -182,13 +182,13 @@ curl http://localhost:8501/_stcore/health
 
 | Файл тестов | Модуль | Тестов |
 |-------------|--------|--------|
-| `tests/test_phase1_alerts.py` | Alert Store | — |
-| `tests/test_phase2_customer_risk.py` | Customer + Risk | — |
+| `tests/test_alert_store.py` | Alert Store | 23 |
+| `tests/test_phase2_customer_risk.py` | Customer + Risk | 21 |
 | `tests/test_phase3_rules_evidence.py` | Rule Engine + Evidence | 37 |
 | `tests/test_phase4_cases.py` | Case Store | 29 |
 | `tests/test_phase5_sar.py` | SAR Store | 44 |
 | `tests/test_phase6_compliance.py` | Compliance Store | 28 |
-| `tests/test_phase7_docker.py` | Entrypoint + Dockerfile | — |
+| `tests/test_phase7_docker.py` | Entrypoint + Dockerfile | 14 |
 
 Запуск тестов:
 ```bash
