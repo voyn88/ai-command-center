@@ -153,6 +153,60 @@ python -m command_center.db status
 python -m command_center.db downgrade --to 0 --yes-i-understand-this-drops-data
 ```
 
+### Correcting a migration's prose
+
+The checksum is over the file's bytes, so a migration's **comments are as
+immutable as its statements**. These files carry long headers arguing why the
+schema is shaped the way it is, and when one of those arguments turns out to be
+wrong it cannot be edited in place — the correction lives here, and the
+machine-checkable half lives in `tests/architecture/test_placement_claims.py`.
+
+**Correction 1 — the "WHERE THIS LIVES" block of `0002_queue_claim.up.sql`.**
+It offers three pieces of evidence and all three are dead:
+
+1. "``grep -rn repo_lease`` over both AICC checkouts returns nothing." **A
+   working-tree search is not evidence of placement.** It reads whatever is on
+   disk, which includes files no ref contains — and tool caches are the worst
+   of them. `__pycache__`, `.ruff_cache`, `.mypy_cache` and `.pytest_cache`
+   went on naming a since-deleted `repo_lease_store.py` for as long as they
+   were not swept, so the search answered *"AICC has a repository-lease
+   store"*: the exact opposite of what the repository says. It inverts the
+   other way too — the token appears in the comment making the claim, so the
+   grep now matches the sentence asserting it matches nothing.
+2. "`principal` exists in NO database today ... returns 0." True when 0002 was
+   written; false from 0003 (`VOYN-W0-AICC-SRV-03`) onwards, which creates
+   `principal`, `principal_credential` and `principal_event` in this schema. A
+   claim pinned to *today* measures nothing a week later.
+3. "Measured by `tests/db/test_queue_claim.py`, whose whole suite runs against
+   a database holding 0001 and 0002 and nothing else." That suite calls
+   `migrations.upgrade(conn)` with no `target`, which applies **every**
+   migration, so the schema it runs against stopped being minimal when 0003
+   landed.
+
+**The rule that replaces them: decide placement against a git ref, never
+against the working tree.** `git grep <ref>` and `git show <ref>:<path>` read
+tracked content at a commit; a cache, an untracked scratch file and a stale
+editor buffer are all invisible to them. What 0002's block was reaching for,
+stated so a machine re-derives it:
+
+```bash
+# AICC names no repository-lease table and no code that reads one.
+git grep -n repo_lease HEAD -- '*.py'
+git grep -nE 'CREATE +TABLE +(IF +NOT +EXISTS +)?repo_lease' HEAD
+
+# The queue-claim protocol itself depends on none of SRV-02/03/04a: with
+# `--` comments stripped, its executable SQL names none of the three.
+git show HEAD:command_center/db/sql/0002_queue_claim.up.sql
+```
+
+`tests/architecture/test_placement_claims.py` runs exactly those probes on
+every CI run, with a positive control on the comment stripper and a negative
+control that rebuilds the stale-cache situation in a throwaway repository and
+shows the filesystem and the ref giving opposite answers. The `repo_lease`
+half of the original claim — that the table lives in the AIOS platform
+database — is a statement about *another* repository and is not provable from
+here; probe it against an AIOS ref if you need it.
+
 ### Types
 
 The PostgreSQL schema is not a transliteration of the SQLite one. SQLite has no
