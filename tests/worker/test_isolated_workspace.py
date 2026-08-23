@@ -67,7 +67,20 @@ def _fake_run(*, commit: bool = True, status: str = "completed", exit_code: int 
     actually writes and commits into the `repository_path` it is given, so a
     test can observe which physical directory received the work."""
 
-    def run(*, repository_path, prompt, task_type, timeout_seconds, model=None, cancel_event=None):
+    def run(
+        *,
+        repository_path,
+        prompt,
+        task_type,
+        timeout_seconds,
+        model=None,
+        cancel_event=None,
+        # Accepted and ignored: these tests are about WHICH DIRECTORY the work
+        # lands in, not which executor produced it, so they stay indifferent to
+        # the routing argument rather than pinning one value.
+        executor="claude",
+        termination_grace_seconds=None,
+    ):
         if commit:
             target = Path(repository_path)
             (target / "change.txt").write_text(f"work: {prompt}\n")

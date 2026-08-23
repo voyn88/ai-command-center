@@ -165,9 +165,12 @@ def _run_agent(
     link = _cascade_link(request, attempt_no)
     task_type = request.task_type
     model = request.model
+    # A payload with no cascade at all (pre-BO-S2a shape, or a direct
+    # enqueue) keeps the historical behaviour: Claude, unchanged.
+    executor = "claude"
     if link is not None:
         executor = str(link.get("executor"))
-        if executor != "claude":
+        if executor not in agent_runner.COMMAND_BUILDERS:
             # Executor unavailability is a ROUTING signal, not a task error
             # (approved BO-S2a decision): a retryable refusal returns the
             # attempt to the pool and the next delivery selects the next
@@ -391,6 +394,7 @@ def _run_agent(
             timeout_seconds=request.timeout_seconds,
             model=model,
             cancel_event=lease_lost,
+            executor=executor,
         )
 
         if lease_lost.is_set():

@@ -95,6 +95,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -106,6 +107,11 @@ RUNS_FILE = DATA_DIR / "runs.jsonl"
 RUNS_EXAMPLE_FILE = ROOT / "data" / "runs.example.jsonl"
 
 CLAUDE_BINARY = "claude"
+# Overridable because the worker service's own PATH is not a login shell's:
+# the CLI is installed under `~/.local/bin` on worker-01 (no root needed --
+# the service already runs as that user), which systemd does not add for it.
+CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
+COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
 
 # --------------------------------------------------------------------------
 # Execution profiles — named, testable single source of truth for "what can
@@ -415,6 +421,139 @@ def build_command(
     return command
 
 
+def build_codex_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """The `codex exec` argv, mapped onto the SAME two execution profiles
+    `build_command` resolves for Claude (VOYN-W0-AICC-EXECUTOR-CODEX).
+
+    Why a second executor at all: the fleet's Claude credential is a Max
+    *subscription*, whose 5-hour rolling window is a hard cap no amount of
+    retrying gets past -- live-measured 2026-08-23 as the single largest
+    cause of parked work (142 of 167 `task_status_failed` tasks were
+    literally "You've hit your session limit", not a task defect). Codex
+    bills against a different account entirely, so it is capacity the
+    Claude cap cannot consume, not merely a second attempt at the same
+    exhausted pool. That is also why it belongs on the implementation
+    cascade's ESCALATION link specifically (see `routing.ROUTING_MATRIX`),
+    replacing what was previously a duplicate `claude` entry that could
+    only ever re-hit the same limit.
+
+    Profile mapping, deliberately equivalent rather than merely similar:
+
+    * `PROFILE_READ_ONLY`   -> `--sandbox read-only`. The sandbox is the
+      enforcement, exactly as `--tools` is for Claude: a read-only sandbox
+      cannot write the tree no matter what the model decides to attempt.
+    * `PROFILE_TRUSTED_DEVELOPMENT` -> `--sandbox workspace-write`, which
+      confines writes to the working root `--cd` names. `danger-full-
+      access` is never used: it removes the boundary this profile exists
+      to draw.
+
+    `--skip-git-repo-check` is NOT passed: every dispatch runs inside a
+    real git worktree (`workspace_provisioning`), so the check is a free
+    assertion that we are where we think we are.
+
+    Output is left as plain text rather than `--json`: `extract_result_
+    text` already falls through to raw stdout for shapes it does not
+    recognise, and the pipeline's own contract with an agent is the
+    `HEAD_SHA:` / `VERDICT:` trailer in that text -- identical for either
+    executor, so nothing downstream has to learn a second format.
+    """
+    profile = profile_for_task_type(task_type)
+    sandbox = "read-only" if profile == PROFILE_READ_ONLY else "workspace-write"
+    command = [
+        CODEX_BINARY,
+        "exec",
+        "--sandbox",
+        sandbox,
+        "--color",
+        "never",
+    ]
+    if model:
+        command += ["--model", model]
+    # The prompt goes last and positionally: `codex exec [OPTIONS] [PROMPT]`.
+    command.append(prompt)
+    return command
+
+
+def build_copilot_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """The GitHub Copilot CLI argv, on the SAME two profiles as the others
+    (VOYN-W0-AICC-EXECUTOR-CODEX, second executor of the same change).
+
+    A third account, for the same reason Codex is a second one: Copilot bills
+    against a GitHub subscription, so it is capacity neither the Claude Max
+    5-hour window nor the Codex account can exhaust.
+
+    Profile mapping. Copilot's permission model is per-tool rather than a
+    named sandbox, so the profiles are expressed with `--allow-tool` /
+    `--deny-tool`:
+
+    * `PROFILE_READ_ONLY`   -> no write tool is allowed at all. Only the
+      read-side tools are granted, so the run cannot modify the tree even if
+      the model tries -- the same property `--tools` gives Claude and
+      `--sandbox read-only` gives Codex.
+    * `PROFILE_TRUSTED_DEVELOPMENT` -> write and shell are allowed, but the
+      git-write subcommands the prompts already forbid are denied explicitly
+      (`GIT_WRITE_DISALLOWED_TOOLS`'s intent, expressed in Copilot's own
+      `shell(git ...)` syntax). Publishing is the pipeline's job, never the
+      agent's.
+
+    `--allow-all` / `--allow-all-paths` are never passed: they would erase
+    exactly the boundary these profiles draw.
+    """
+    profile = profile_for_task_type(task_type)
+    command = [COPILOT_BINARY, "-p", prompt, "--no-color"]
+    if profile == PROFILE_READ_ONLY:
+        # Grant reads only. Absent `write`/`shell`, mutation is unreachable.
+        command += ["--allow-tool", "read"]
+    else:
+        command += [
+            "--allow-tool", "read",
+            "--allow-tool", "write",
+            "--allow-tool", "shell",
+            # The agent commits locally; pushing/PR-opening belongs to
+            # `publish_run`, which holds the writer lease. Denying the remote-
+            # mutating subcommands keeps that boundary technical, not advisory.
+            "--deny-tool", "shell(git push)",
+            "--deny-tool", "shell(git remote)",
+        ]
+    if model:
+        command += ["--model", model]
+    return command
+
+
+#: executor id -> the NAME of its argv builder in this module. The worker
+#: refuses any executor absent from this table (`handlers._run_agent`), so an
+#: unknown/unproven name can never silently burn a cascade attempt on a
+#: phantom link -- the failure mode `routing.py`'s module docstring warns
+#: about.
+#:
+#: Names, not function objects, and resolved via `globals()` at call time
+#: (`_command_builder`): binding the objects here would capture them at import
+#: and silently defeat `monkeypatch.setattr(agent_runner, "build_command", ...)`,
+#: which several existing tests rely on to stub the argv without launching a
+#: real CLI. Caught by exactly those tests when this was first written the
+#: other way.
+COMMAND_BUILDERS: dict[str, str] = {
+    "claude": "build_command",
+    "codex": "build_codex_command",
+    "copilot": "build_copilot_command",
+}
+
+
+def _command_builder(executor: str) -> Callable[..., list[str]] | None:
+    name = COMMAND_BUILDERS.get(executor)
+    return globals().get(name) if name else None
+
+
 def extract_result_text(stdout: str) -> str:
     """Extract the assistant's final report text from `claude -p --output-format json` stdout.
 
@@ -618,8 +757,18 @@ def run_claude_code(
     model: str | None = None,
     cancel_event: threading.Event | None = None,
     termination_grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
+    executor: str = "claude",
 ) -> RunResult:
-    """Execute Claude Code. Never raises for expected failure modes.
+    """Execute an agent CLI. Never raises for expected failure modes.
+
+    `executor` selects the argv builder from `COMMAND_BUILDERS`; everything
+    else in this function -- process-group isolation, the cancellation and
+    timeout polling loop, the escalating SIGTERM/SIGKILL teardown, the
+    deadlock-free output collection -- is executor-independent and is
+    deliberately NOT duplicated per executor. The function keeps its
+    historical name so the many existing callers (and the tests that
+    monkeypatch it) are untouched; `executor` defaults to `"claude"`, so
+    every one of them behaves exactly as before.
 
     Runs the CLI as its own process-group leader (`_popen_new_process_group_
     kwargs`) via `subprocess.Popen` rather than the blocking `subprocess.run`
@@ -640,7 +789,22 @@ def run_claude_code(
     mid-run now actually stops the subprocess instead of merely being noticed
     after the fact once it exits on its own.
     """
-    command = build_command(prompt, task_type=task_type, model=model)
+    builder = _command_builder(executor)
+    if builder is None:
+        # Refuse rather than silently falling back to Claude: a typo'd or
+        # unwired executor name must surface as a routing failure, not as a
+        # run that quietly consumed the very quota the route existed to
+        # avoid.
+        return RunResult(
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr=f"unknown executor {executor!r}; known: {sorted(COMMAND_BUILDERS)}",
+            duration_seconds=0.0,
+            started_at=models.iso_now(),
+            completed_at=models.iso_now(),
+        )
+    command = builder(prompt, task_type=task_type, model=model)
     started_at = models.iso_now()
     started_monotonic = time.monotonic()
 
