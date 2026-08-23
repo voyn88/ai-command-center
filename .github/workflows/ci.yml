@@ -189,6 +189,50 @@ jobs:
           python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
           pip install "$AICC_AIOS_DB_WHEEL"
 
+      # Narrows the REQUIRED pytest steps below to the impact-selected subset
+      # on pull_request only -- merge_group/push/workflow_dispatch always run
+      # the unabridged suite regardless of this step's output, unconditionally
+      # (the actual safety net: the exact set that lands on main is always
+      # fully verified there, whatever ran narrower on the PR that got it
+      # there). `scripts/ci/test_impact/select_tests.py` already backs the
+      # advisory `impact-fast-check` job below; this reuses the identical
+      # selector, not a second implementation, so the two can never disagree.
+      #
+      # Fail-open by construction, never fail-narrow: any outcome other than
+      # a clean `mode=subset` -- the selector erroring, a global/ambiguous
+      # file (conftest, lockfile, pyproject, CI config, or anything the
+      # selector cannot map) reporting `ALL`, or genuinely no first-party
+      # file changed -- runs the full suite. "Ambiguity widens the
+      # selection, never narrows it" (the selector's own module docstring)
+      # is the same rule this step defers to, not a second policy.
+      - name: Select impacted tests (pull_request only)
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "mode=all" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! python scripts/ci/test_impact/select_tests.py \
+              --base "$BASE_SHA" --format pytest --output selected-tests.txt; then
+            echo "::warning::test-impact selector failed; running the full suite"
+            echo "mode=all" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qx "tests" selected-tests.txt; then
+            mode=all   # trigger-all: a global/unmapped file changed
+          elif [ -s selected-tests.txt ]; then
+            mode=subset
+          else
+            mode=all   # no first-party file changed -- widen, never skip
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "----- test-impact selection: mode=$mode -----"
+          cat selected-tests.txt || true
+
       - name: Whitespace errors
         shell: bash
         env:
@@ -237,9 +281,17 @@ jobs:
           else
             COV_ARGS="--cov=command_center --cov-report=term --cov-report=xml"
           fi
-          pytest -q -m "not serial" -n auto --dist loadscope \
-            --durations=50 \
-            $COV_ARGS
+          if [ "${{ steps.select.outputs.mode }}" = "subset" ]; then
+            echo "Impact-selected subset ($(wc -l < selected-tests.txt) file(s)):"
+            cat selected-tests.txt
+            tr '\n' '\0' < selected-tests.txt \
+              | xargs -0 -r pytest -q -m "not serial" -n auto --dist loadscope \
+                  --durations=50 $COV_ARGS
+          else
+            pytest -q -m "not serial" -n auto --dist loadscope \
+              --durations=50 \
+              $COV_ARGS
+          fi
 
       # Small non-parallel tail: the `serial`-marked tests that rely on
       # process-global or cross-process shared state. Runs in a single worker
@@ -255,7 +307,12 @@ jobs:
           else
             COV_ARGS="--cov=command_center --cov-append --cov-report=term"
           fi
-          pytest -q -m serial -p no:xdist $COV_ARGS
+          if [ "${{ steps.select.outputs.mode }}" = "subset" ]; then
+            tr '\n' '\0' < selected-tests.txt \
+              | xargs -0 -r pytest -q -m serial -p no:xdist $COV_ARGS
+          else
+            pytest -q -m serial -p no:xdist $COV_ARGS
+          fi
           rc=$?
           if [ "$rc" -eq 5 ]; then
             echo "No serial-marked tests collected; nothing to run."
