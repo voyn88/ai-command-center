@@ -16,9 +16,7 @@ asserted in prose.
 
 from __future__ import annotations
 
-import ast
 import inspect
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -31,6 +29,7 @@ from command_center.db.conflict_store import (
     divergence,
 )
 from command_center.runtime.db import conflict as conflict_db
+from tests.db.source_reading import code_without_prose
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -53,28 +52,6 @@ def _row(conflict_id: str, **overrides: object) -> dict:
     }
     row.update(overrides)  # type: ignore[arg-type]
     return row
-
-
-def _code_without_prose(function: object) -> str:
-    """A function's executable code, with comments and docstrings removed.
-
-    The guard below greps for `postgres`; the source text also contains the
-    word in comments explaining why PostgreSQL is *not* consulted, so grepping
-    raw source made the test fail on its own explanation. Prose is stripped so
-    the assertion is about the code rather than about how it is described —
-    which is what the test claims to check.
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
-            if (
-                node.body
-                and isinstance(node.body[0], ast.Expr)
-                and isinstance(node.body[0].value, ast.Constant)
-                and isinstance(node.body[0].value.value, str)
-            ):
-                node.body.pop(0)
-    return ast.unparse(tree)  # comments never survive a parse/unparse round trip
 
 
 @pytest.fixture
@@ -116,7 +93,7 @@ def test_sqlite_remains_the_authority_for_conflicts() -> None:
         conflict_db.list_conflicts,
         conflict_db._conflict_transition,
     ):
-        code = _code_without_prose(function)
+        code = code_without_prose(function)
         for marker in ("postgres", "conflict_store", "list_records"):
             assert marker not in code.lower(), f"{function.__name__}: {marker}"
 

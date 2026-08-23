@@ -11,6 +11,7 @@ started rather than found inside it:
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from command_center.db.digest_item_store import (
     divergence,
 )
 from command_center.runtime.db import wave1
+from tests.db.source_reading import code_without_prose
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -378,23 +380,6 @@ def test_sqlite_remains_the_authority_for_digest_items() -> None:
     prose stripped, so it catches a direct read and not one added through a
     helper — the indirection the write itself uses.
     """
-    import ast
-    import inspect
-    import textwrap
-
-    def code_without_prose(function: object) -> str:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
-                if (
-                    node.body
-                    and isinstance(node.body[0], ast.Expr)
-                    and isinstance(node.body[0].value, ast.Constant)
-                    and isinstance(node.body[0].value.value, str)
-                ):
-                    node.body.pop(0)
-        return ast.unparse(tree)
-
     for function in (
         wave1.create_digest_item,
         wave1.delete_digest_items_for_day,

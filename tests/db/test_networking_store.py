@@ -14,9 +14,7 @@ retract.
 
 from __future__ import annotations
 
-import ast
 import inspect
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -32,6 +30,7 @@ from command_center.db.networking_store import (
     message_divergence,
 )
 from command_center.runtime.db import networking as net_db
+from tests.db.source_reading import code_without_prose
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -64,30 +63,6 @@ def _message(message_id: str, contact_id: str, **overrides: object) -> dict:
     }
     row.update(overrides)  # type: ignore[arg-type]
     return row
-
-
-def _code_without_prose(function: object) -> str:
-    """A function's executable code, with comments and docstrings removed.
-
-    Third copy of this helper, and it should be the last: slice 4's acceptance
-    found the second copy had already drifted from the first (a missing
-    `ClassDef`), which is the "every restatement is subtly different" failure
-    mode `mirror_support` exists to end, reproduced in the test suite. Hoisting
-    all three into a shared helper is `VOYN-W0-AICC-TEST-HELPER-DUPLICATION`;
-    this copy matches the slice-3 original exactly so the hoist is a move
-    rather than a reconciliation.
-    """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
-            if (
-                node.body
-                and isinstance(node.body[0], ast.Expr)
-                and isinstance(node.body[0].value, ast.Constant)
-                and isinstance(node.body[0].value.value, str)
-            ):
-                node.body.pop(0)
-    return ast.unparse(tree)
 
 
 @pytest.fixture
@@ -138,7 +113,7 @@ def test_sqlite_remains_the_authority_for_the_networking_family() -> None:
         net_db.list_contacts,
         net_db.list_messages,
     ):
-        code = _code_without_prose(function)
+        code = code_without_prose(function)
         for marker in ("postgres", "networking_store", "list_records"):
             assert marker not in code.lower(), f"{function.__name__}: {marker}"
 
