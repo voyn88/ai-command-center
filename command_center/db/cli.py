@@ -277,8 +277,9 @@ def main(argv: list[str] | None = None) -> int:
                 store = WorkQueueStore(lambda: _nc(conn))
                 report = review_once(
                     lambda: _nc(conn),
-                    lambda q, k, pl, tid: store.enqueue(
-                        q, idempotency_key=k, payload=pl, task_id=tid
+                    lambda q, k, pl, tid, prio=0: store.enqueue(
+                        q, idempotency_key=k, payload=pl, task_id=tid,
+                        priority=prio,
                     ),
                     args.repo_path,
                 )

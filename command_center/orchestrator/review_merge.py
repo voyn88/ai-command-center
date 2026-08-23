@@ -209,6 +209,22 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # looser policy.
 _REVIEW_POLICY_VERSION = "v1"
 
+#: Reviews outrank implementation work in the shared execution queue
+#: (VOYN-W0-AICC-REVIEW-STARVATION, measured live 2026-08-23). The queue is
+#: FIFO within one priority and the fleet claims two items at a time, so a
+#: review enqueued behind ~45 implementation items simply never ran: PR #366
+#: sat at `no_review_result_yet` for over 20 minutes across five ticks while
+#: its review work item stayed `ready` with `attempt_count = 0`. Nothing was
+#: broken -- the tail of the pipeline was starved, and no merge could happen
+#: until it was fed.
+#:
+#: Reviews deserve the higher lane on their own merits, not as a workaround:
+#: one is cheap (a bounded read-only run over a diff), it is the ONLY thing
+#: standing between finished work and a merge, and every tick it waits, the
+#: branch it reviews drifts further from main. Implementation work, by
+#: contrast, loses nothing by waiting a few minutes longer.
+_REVIEW_QUEUE_PRIORITY = 10
+
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
     match = _PR_URL.match(pr_url)
@@ -278,9 +294,11 @@ def review_once(
     factory: Any, enqueue: Any, repo_path: str, cfg: ReviewConfig | None = None
 ) -> LoopReport:
     """Enqueue a review run for each READY_TO_REVIEW task with a pr and no
-    review queued yet. ``enqueue(queue, key, payload, task_id)`` is the queue
-    writer (control-plane privilege); passing it in keeps this composable and
-    testable without a live queue. The task_id is passed through to the
+    review queued yet. ``enqueue(queue, key, payload, task_id, priority)`` is
+    the queue writer (control-plane privilege); passing it in keeps this
+    composable and testable without a live queue. The priority argument is
+    what keeps a review from starving behind implementation work -- see
+    ``_REVIEW_QUEUE_PRIORITY``. The task_id is passed through to the
     enqueue call (not just embedded in the payload/prompt) so
     publish_review_verdicts can look the result back up by
     ``work_item.task_id`` -- omitting it left that column NULL for every
@@ -343,7 +361,7 @@ def review_once(
             ),
             "timeout_seconds": cfg.review_timeout, "untrusted": False,
         }
-        enqueue(cfg.queue, key, payload, task_id)
+        enqueue(cfg.queue, key, payload, task_id, _REVIEW_QUEUE_PRIORITY)
         report.reviewed.append((task_id, pr_url))
     return report
 
