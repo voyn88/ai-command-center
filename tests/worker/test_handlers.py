@@ -974,9 +974,67 @@ def test_publish_does_not_release_a_lease_the_caller_still_holds(
 
     monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
 
+    # No `backlog_task_id`, so `_task_lease_scope` falls back to the bare
+    # project and the two leases ARE the same row -- the case where the
+    # caller's own release is the only correct one.
     outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert outcome.ok, outcome.reason
     assert captured and captured[0].release_lease is False
+
+
+def test_publish_releases_its_own_lease_when_the_scopes_differ(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK, caught in independent review before
+    merge: once the full-lifecycle lease became task-scoped
+    (`<project>:<task>`) while `publish_run` stayed repository-scoped
+    (`<project>`), they are two DIFFERENT lease rows. `release_lease=False`
+    -- correct while both keys were the repository -- would then leave
+    `<project>` held by nobody's `finally`: `writer_lease._release` only ever
+    releases its own `<project>:<task>`. The row would leak on the first
+    mutating task and refuse every later push with `VOYN_LEASE_REFUSED
+    active` for the worker process's whole lifetime, un-reapable because
+    `--auto-takeover` and `ops/lease_reap.sh` both require a DEAD recorded
+    holder and this one is alive.
+
+    So the flag must follow whether the two scopes name the same row, not
+    whether an outer lease merely exists."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text("#!/bin/sh\nif [ \"$1\" = \"list\" ]; then echo '[]'; fi\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED"),
+        _event(),
+        1,
+    )
+    assert outcome.ok, outcome.reason
+    assert captured, "publish_run was never called"
+    assert captured[0].release_lease is True, (
+        "publish holds a different lease row than the caller, so it must "
+        "release its own or the repository-scoped row leaks"
+    )
+    # And the two really are different rows -- otherwise this test would pass
+    # for the wrong reason.
+    assert captured[0].repository != handlers_module._task_lease_scope(
+        parse_agent_run(
+            _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED")
+        )
+    )
 
 
 def test_publish_releases_its_own_lease_when_no_full_lifecycle_lease_is_held(

@@ -514,27 +514,48 @@ def _run_agent(
         # BO-S3b: a successful mutating run publishes its commits as a PR so
         # the autonomous loop closes without a human. Opt-in by env
         # (AICC_PUBLISH_DEPLOY_KEY); unset = local commit only, review fleets
-        # unaffected. The lease inside publish_run enforces single-writer
-        # for the push itself when no outer lease is held; when the writer
-        # lease was entered into `stack` above, `release_lease=False` keeps
-        # `publish_run` from dropping it early -- only `stack.close()` in
-        # this function's own `finally` releases it, once, after this
-        # call's own post-publish work (below) and `remove_workspace`'s
-        # worktree cleanup have both finished.
+        # unaffected. `publish_run` takes a REPOSITORY-scoped lease around the
+        # push -- that is the operation which genuinely needs one clone-wide
+        # writer at a time, and it stays repository-scoped even though the
+        # full-lifecycle lease above is now task-scoped.
+        #
+        # `release_lease` therefore turns on whether the two are THE SAME LEASE
+        # ROW, not on whether an outer lease exists at all. It used to be
+        # `not full_lifecycle_lease_held`, which was correct only while both
+        # keys were the repository: publish must not drop a row its caller
+        # still holds, and `stack.close()` released it. Once
+        # VOYN-W0-AICC-LEASE-SCOPE-PER-TASK made the outer key
+        # `<project>:<task>`, that reasoning silently inverted -- the caller
+        # holds a DIFFERENT row, `writer_lease._release` only ever releases
+        # its own, and nothing would have released `<project>`. It would have
+        # leaked on the first mutating task and then refused every subsequent
+        # push with `VOYN_LEASE_REFUSED active` for the worker process's
+        # whole lifetime, un-reapable because `--auto-takeover` and
+        # `ops/lease_reap.sh` both require a DEAD recorded holder and this one
+        # is alive. Caught in independent review before merge.
+        #
+        # The comparison keeps the no-`backlog_task_id` fallback correct too:
+        # there `_task_lease_scope` returns the bare project, the two keys
+        # coincide, and `release_lease=False` is right again.
         deploy_key = os.environ.get("AICC_PUBLISH_DEPLOY_KEY", "")
         if task_type in agent_runner.MUTATING_TASK_TYPES and deploy_key:
+            publish_repository = os.environ.get(
+                "VOYN_LEASE_REPOSITORY", request.project_id
+            )
+            caller_holds_this_row = (
+                full_lifecycle_lease_held
+                and _task_lease_scope(request) == publish_repository
+            )
             pub = publish_run(
                 run_repository,
                 PublishConfig(
                     lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
-                    repository=os.environ.get(
-                        "VOYN_LEASE_REPOSITORY", request.project_id
-                    ),
+                    repository=publish_repository,
                     owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
                     session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
                     task=backlog_task,
                     deploy_key=deploy_key,
-                    release_lease=not full_lifecycle_lease_held,
+                    release_lease=not caller_holds_this_row,
                 ),
             )
             result["publish"] = {
