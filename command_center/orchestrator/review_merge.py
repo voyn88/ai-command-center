@@ -647,6 +647,34 @@ def _check_is_green(check: dict[str, Any]) -> bool:
     return False
 
 
+def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the latest run for every check name, failing closed on ambiguity.
+
+    GitHub retains reruns in ``statusCheckRollup``. A prior failure must not
+    block the latest successful run, and a prior success must not mask the
+    latest pending or failed run. Duplicate runs without timestamps cannot be
+    ordered safely, so they remain non-green.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    ambiguous: set[str] = set()
+    for check in rollup:
+        name = str(check.get("name") or "?")
+        previous = latest.get(name)
+        if previous is None:
+            latest[name] = check
+            continue
+        previous_at = previous.get("startedAt") or previous.get("completedAt")
+        current_at = check.get("startedAt") or check.get("completedAt")
+        if not previous_at or not current_at:
+            ambiguous.add(name)
+            continue
+        if str(current_at) > str(previous_at):
+            latest[name] = check
+    for name in ambiguous:
+        latest[name] = {"name": name, "conclusion": "AMBIGUOUS"}
+    return list(latest.values())
+
+
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
     marker -- from a reviewer login that is NOT the PR's own author -- stands
@@ -679,7 +707,7 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     if not accept:
         return False, "no_accept_marker_on_head"
-    rollup = data.get("statusCheckRollup") or []
+    rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
         return False, f"checks_not_green: {bad[:3]}"

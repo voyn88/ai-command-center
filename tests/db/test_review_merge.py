@@ -760,6 +760,49 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
     assert any(t == "VOYN-W0-M3" and "checks_not_green" in r for t, r in report.skipped)
 
 
+def test_mergeability_uses_latest_check_rerun(monkeypatch):
+    import subprocess
+
+    head = "d" * 40
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": [
+                {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T04:29:29Z"},
+                {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T05:25:43Z"},
+                {"name": "CI", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:27Z"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10") == (True, head)
+
+
+def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
+    import subprocess
+
+    head = "e" * 40
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": [
+                {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:29Z"},
+                {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T05:25:43Z"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    ready, reason = review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10")
+    assert not ready
+    assert reason == "checks_not_green: ['Acceptance gate']"
+
+
 def test_repo_from_pr_url():
     assert review_merge._repo_from_pr_url(
         "https://github.com/voyn88/aios/pull/273"
