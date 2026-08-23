@@ -172,6 +172,7 @@ def test_a_github_ssh_origin_is_pushed_over_https(repo, monkeypatch):
         f"#!/bin/sh\n"
         f"echo \"git $*\" >> {calls}\n"
         "case \"$1\" in\n"
+        "  ls-remote) exit 0 ;;\n"
         "  push) exit 0 ;;\n"
         f"  *) exec {real_git} \"$@\" ;;\n"
         "esac\n"
@@ -185,6 +186,44 @@ def test_a_github_ssh_origin_is_pushed_over_https(repo, monkeypatch):
     assert len(push_lines) == 1, log
     assert "https://github.com/voyn88/ai-command-center.git" in push_lines[0]
     assert "git@github.com" not in push_lines[0]
+    assert "--force-with-lease=refs/heads/backlog/VOYN-W0-TEST:" in push_lines[0]
+
+
+def test_a_github_https_update_uses_the_observed_remote_sha(repo, monkeypatch):
+    """An URL target has no remote-tracking ref for bare --force-with-lease.
+    Protect an update with the exact SHA observed immediately before push."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _git(work, "remote", "set-url", "origin", "https://github.com/voyn88/ai-command-center.git")
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+
+    import shutil
+
+    real_git = shutil.which("git")
+    expected = "a" * 40
+    git_shim = bin_ / "git"
+    git_shim.write_text(
+        f"#!/bin/sh\n"
+        f"echo \"git $*\" >> {calls}\n"
+        "case \"$1\" in\n"
+        f"  ls-remote) echo \"{expected} refs/heads/backlog/VOYN-W0-TEST\"; exit 0 ;;\n"
+        "  push) exit 0 ;;\n"
+        f"  *) exec {real_git} \"$@\" ;;\n"
+        "esac\n"
+    )
+    git_shim.chmod(0o755)
+
+    r = publish_run(work, _cfg(bin_))
+    assert r.ok, r.reason
+    log = calls.read_text()
+    push_lines = [line for line in log.splitlines() if line.startswith("git push")]
+    assert len(push_lines) == 1, log
+    assert (
+        f"--force-with-lease=refs/heads/backlog/VOYN-W0-TEST:{expected}"
+        in push_lines[0]
+    )
 
 
 def test_lease_refusal_does_not_push(repo, monkeypatch):
