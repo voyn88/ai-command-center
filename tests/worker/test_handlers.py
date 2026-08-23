@@ -897,15 +897,51 @@ def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
         return max(i for i, line in enumerate(lines) if line.split()[2:3] == [verb])
 
     assert _first("acquire") >= 1
-    assert _first("install-hooks") >= 1
     assert _first("release") >= 1
-    assert 0 < _first("acquire") < _first("install-hooks"), (
-        "the writer lease is acquired, and the hook identity provisioned "
-        "under it, before provisioning/running the agent"
+    assert 0 < _first("acquire") < _first("release"), (
+        "the writer lease is acquired before provisioning/running the agent "
+        "and released only once the dispatch is fully done"
     )
-    assert _last("install-hooks") < _first("release"), (
-        "the lease must still be held while the hook identity is current, "
-        "released only once the dispatch is fully done"
+    # VOYN-W0-AICC-LEASE-SCOPE-PER-TASK: the hook identity file lives in the
+    # clone's COMMON git dir, so a task-scoped lease must not write it --
+    # only `publish_run` does, immediately before its push. See
+    # `test_hold_never_touches_the_clone_wide_hook_identity_file`.
+    assert not any(line.split()[2:3] == ["install-hooks"] for line in lines), (
+        "the full-lifecycle lease must not provision the clone-wide hook "
+        "identity file"
+    )
+
+
+def test_the_full_lifecycle_lease_is_scoped_to_the_task_not_the_repository(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK. Measured 2026-08-23: 96 of 115
+    returns-to-pool in three hours were `VOYN_LEASE_REFUSED active` -- tasks
+    refusing each other because the lease keyed on the repository, even
+    though #346 gave each task its own worktree and they share no mutable
+    state during the agent run. The scope must carry the task id."""
+    run_agent, _runs = handler
+    calls = tmp_path / "lease-calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(f'#!/bin/sh\necho "$*" >> {calls}\necho \'[]\'\nexit 0\n')
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED"),
+        _event(),
+    )
+    assert outcome.ok, outcome.reason
+
+    scopes = {
+        line.split("--repository ", 1)[1].split()[0]
+        for line in calls.read_text().splitlines()
+        if "--repository " in line
+    }
+    assert scopes, "no identity-bearing lease call was made"
+    assert all("VOYN-W0-SCOPED" in scope for scope in scopes), (
+        f"the lease scope must name the task, got {scopes}"
     )
 
 
@@ -938,9 +974,67 @@ def test_publish_does_not_release_a_lease_the_caller_still_holds(
 
     monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
 
+    # No `backlog_task_id`, so `_task_lease_scope` falls back to the bare
+    # project and the two leases ARE the same row -- the case where the
+    # caller's own release is the only correct one.
     outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert outcome.ok, outcome.reason
     assert captured and captured[0].release_lease is False
+
+
+def test_publish_releases_its_own_lease_when_the_scopes_differ(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK, caught in independent review before
+    merge: once the full-lifecycle lease became task-scoped
+    (`<project>:<task>`) while `publish_run` stayed repository-scoped
+    (`<project>`), they are two DIFFERENT lease rows. `release_lease=False`
+    -- correct while both keys were the repository -- would then leave
+    `<project>` held by nobody's `finally`: `writer_lease._release` only ever
+    releases its own `<project>:<task>`. The row would leak on the first
+    mutating task and refuse every later push with `VOYN_LEASE_REFUSED
+    active` for the worker process's whole lifetime, un-reapable because
+    `--auto-takeover` and `ops/lease_reap.sh` both require a DEAD recorded
+    holder and this one is alive.
+
+    So the flag must follow whether the two scopes name the same row, not
+    whether an outer lease merely exists."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text("#!/bin/sh\nif [ \"$1\" = \"list\" ]; then echo '[]'; fi\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED"),
+        _event(),
+        1,
+    )
+    assert outcome.ok, outcome.reason
+    assert captured, "publish_run was never called"
+    assert captured[0].release_lease is True, (
+        "publish holds a different lease row than the caller, so it must "
+        "release its own or the repository-scoped row leaks"
+    )
+    # And the two really are different rows -- otherwise this test would pass
+    # for the wrong reason.
+    assert captured[0].repository != handlers_module._task_lease_scope(
+        parse_agent_run(
+            _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED")
+        )
+    )
 
 
 def test_publish_releases_its_own_lease_when_no_full_lifecycle_lease_is_held(

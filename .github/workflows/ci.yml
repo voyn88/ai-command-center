@@ -281,17 +281,33 @@ jobs:
           else
             COV_ARGS="--cov=command_center --cov-report=term --cov-report=xml"
           fi
+          # See the serial-tail step below for why this is not piped through
+          # `xargs`: it converts pytest's own exit codes into its 123, which
+          # hides the "no tests collected" 5 that a narrow subset can
+          # legitimately produce. Tolerated ONLY in subset mode -- in a full
+          # run, collecting nothing means collection itself is broken and
+          # must fail.
+          set +e
           if [ "${{ steps.select.outputs.mode }}" = "subset" ]; then
             echo "Impact-selected subset ($(wc -l < selected-tests.txt) file(s)):"
             cat selected-tests.txt
-            tr '\n' '\0' < selected-tests.txt \
-              | xargs -0 -r pytest -q -m "not serial" -n auto --dist loadscope \
-                  --durations=50 $COV_ARGS
-          else
+            set --
+            while IFS= read -r selected_test; do
+              [ -n "$selected_test" ] && set -- "$@" "$selected_test"
+            done < selected-tests.txt
             pytest -q -m "not serial" -n auto --dist loadscope \
-              --durations=50 \
-              $COV_ARGS
+              --durations=50 $COV_ARGS "$@"
+            rc=$?
+            if [ "$rc" -eq 5 ]; then
+              echo "Subset contains only serial-marked tests; the tail step runs them."
+              exit 0
+            fi
+            exit $rc
           fi
+          pytest -q -m "not serial" -n auto --dist loadscope \
+            --durations=50 \
+            $COV_ARGS
+          exit $?
 
       # Small non-parallel tail: the `serial`-marked tests that rely on
       # process-global or cross-process shared state. Runs in a single worker
@@ -307,9 +323,25 @@ jobs:
           else
             COV_ARGS="--cov=command_center --cov-append --cov-report=term"
           fi
+          # NOT piped through `xargs` (VOYN-W0-AICC-CI-SERIAL-TAIL-EXIT-5):
+          # this step's whole contract is that pytest's exit code 5 ("no
+          # tests collected") is a PASS -- an impact-selected subset very
+          # often contains no `serial`-marked test at all. `xargs` reports
+          # its own 123 for "the command exited non-zero", swallowing the 5
+          # before the check below could see it, so every such PR failed the
+          # required gate. Introduced by the impact-selection change (#363)
+          # and caught by the very next PR (#365).
+          #
+          # Reading the file into "$@" keeps each path a separate argv
+          # element without a shell-word-splitting hazard, and the `set --`
+          # form means an empty file yields no arguments at all, which the
+          # `mode == subset` guard already makes unreachable.
           if [ "${{ steps.select.outputs.mode }}" = "subset" ]; then
-            tr '\n' '\0' < selected-tests.txt \
-              | xargs -0 -r pytest -q -m serial -p no:xdist $COV_ARGS
+            set --
+            while IFS= read -r selected_test; do
+              [ -n "$selected_test" ] && set -- "$@" "$selected_test"
+            done < selected-tests.txt
+            pytest -q -m serial -p no:xdist $COV_ARGS "$@"
           else
             pytest -q -m serial -p no:xdist $COV_ARGS
           fi
