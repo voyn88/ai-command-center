@@ -668,7 +668,9 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
         if not previous_at or not current_at:
             ambiguous.add(name)
             continue
-        if str(current_at) > str(previous_at):
+        if str(current_at) == str(previous_at):
+            ambiguous.add(name)
+        elif str(current_at) > str(previous_at):
             latest[name] = check
     for name in ambiguous:
         latest[name] = {"name": name, "conclusion": "AMBIGUOUS"}
