@@ -125,6 +125,28 @@ def _https_push_target(repo_path: Path) -> str | None:
     return None
 
 
+def _remote_branch_sha(repo_path: Path, target: str, branch: str) -> tuple[bool, str]:
+    """Read the exact remote branch tip used by an explicit force lease.
+
+    An empty SHA is a valid observation: it means the branch did not exist,
+    and ``--force-with-lease=<ref>:`` then protects creation against another
+    writer racing us.  Any malformed or ambiguous answer fails closed.
+    """
+    ref = f"refs/heads/{branch}"
+    remote = _run(["git", "ls-remote", "--heads", target, ref], repo_path)
+    if remote.returncode != 0:
+        return False, ""
+    lines = [line.split() for line in remote.stdout.splitlines() if line.strip()]
+    if not lines:
+        return True, ""
+    if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != ref:
+        return False, ""
+    sha = lines[0][0]
+    if len(sha) != 40 or any(char not in "0123456789abcdefABCDEF" for char in sha):
+        return False, ""
+    return True, sha.lower()
+
+
 def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     """Acquire the lease, push a branch, open a PR. Idempotent on the branch
     name (``backlog/<task>``): a re-run force-updates the same branch and
@@ -170,9 +192,15 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     try:
         https_target = _https_push_target(repo_path)
         if https_target is not None:
+            observed, remote_sha = _remote_branch_sha(repo_path, https_target, branch)
+            if not observed:
+                return PublishResult(
+                    ok=False, reason="cannot_read_remote_branch_for_force_lease"
+                )
+            branch_ref = f"refs/heads/{branch}"
             push = _run(
-                ["git", "push", "--force-with-lease", https_target,
-                 f"HEAD:refs/heads/{branch}"],
+                ["git", "push", f"--force-with-lease={branch_ref}:{remote_sha}",
+                 https_target, f"HEAD:{branch_ref}"],
                 repo_path,
             )
         else:
