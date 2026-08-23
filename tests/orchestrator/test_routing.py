@@ -48,7 +48,13 @@ def test_every_cascade_is_non_empty_and_typed():
 def test_cascade_for_returns_copies_not_the_matrix():
     first = cascade_for("review")
     first[0]["executor"] = "mutated"
-    assert ROUTING_MATRIX["review"][0]["executor"] == "claude"
+    assert ROUTING_MATRIX["review"][0]["executor"] == "copilot"
+
+
+def test_review_uses_copilot_then_claude_once_each():
+    cascade = cascade_for("review")
+    assert [link["executor"] for link in cascade] == ["copilot", "claude"]
+    assert all(link["task_type"] == "review" for link in cascade)
 
 
 def test_unknown_task_class_falls_back_to_implementation():

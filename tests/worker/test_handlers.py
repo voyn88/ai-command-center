@@ -309,6 +309,98 @@ def test_codex_workspace_preflight_refuses_before_task_run(handler, monkeypatch)
     assert "codex workspace-write sandbox unavailable" in outcome.reason
     assert runs == []
 
+
+def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
+    run_agent, runs = handler
+    checked = []
+
+    def preflight(binary=None):
+        checked.append(binary)
+        return False, "not logged in"
+
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", preflight)
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "copilot cli unavailable" in outcome.reason
+    assert checked == [agent_runner.COPILOT_BINARY]
+    assert runs == []
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "AI credit usage limit reached",
+        "not logged in; authentication required",
+        "service unavailable",
+        "network error: connection refused",
+    ],
+)
+def test_copilot_provider_failure_retries_into_the_next_cascade_link(
+    handler, monkeypatch, diagnostic
+):
+    run_agent, runs = handler
+
+    def failed_copilot(**kwargs):
+        if kwargs["executor"] == "copilot":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=4,
+                stdout="",
+                stderr=diagnostic,
+                duration_seconds=0.1,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:01+00:00",
+            completed_at="2026-08-23T12:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "copilot", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    first = run_agent(payload, _event(), 1)
+    assert not first.ok and first.retryable
+    assert "executor infrastructure failure" in first.reason
+    second = run_agent(payload, _event(), 2)
+    assert second.ok and runs[-1]["executor"] == "claude"
+
+
+def test_unknown_copilot_failure_is_fail_closed_for_read_only_review(
+    handler, monkeypatch
+):
+    run_agent, _runs = handler
+
+    def failed_copilot(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=9,
+            stdout="",
+            stderr="unexpected provider-side failure",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "unexpected provider-side failure" in outcome.reason
+
+
 def test_genuine_task_failure_with_error_flavoured_text_still_ok(handler, monkeypatch) -> None:
     """Regression guard for the fix above: a run that genuinely executed and
     the agent's own report happens to mention "error"/"rate limit" in free
