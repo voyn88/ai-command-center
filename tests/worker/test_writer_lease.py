@@ -156,3 +156,49 @@ def test_argv_shape_matches_publish_pys_lease_calls(tmp_path):
     assert "--task VOYN-W0-TEST" in log
     assert "--pid " in log
     assert "--process-start " in log
+
+
+def test_acquire_carries_the_configured_ttl_not_the_clis_own_default(tmp_path):
+    """VOYN-W0-AICC-LEASE-TTL-CONTRACT-BROKEN (found live 2026-08-23):
+    `--ttl` was never forwarded at all, so every acquire silently got the
+    external CLI's own default (180s) instead of the 600s every config
+    declared -- and the renewal thread, scheduling its first attempt at
+    `ttl/3` against the CONFIGURED value, renewed 20s after the row had
+    actually already expired under the real default. Every `acquire` call
+    (initial and every renewal) must carry `--ttl <configured>`."""
+    calls = tmp_path / "calls.log"
+    tool = _install_lease_tool(tmp_path, f'echo "$*" >> {calls}\nexit 0\n')
+    lease_lost = threading.Event()
+
+    with hold(tmp_path, _cfg(str(tool), ttl=900), lease_lost):
+        pass
+
+    log = calls.read_text()
+    # The fake tool logs `$*`, which (unlike argv) does not include the
+    # tool's own path -- logged shape is `--repo <path> <verb> ...`, verb
+    # is the 3rd token.
+    acquire_lines = [ln for ln in log.splitlines() if ln.split()[2:3] == ["acquire"]]
+    assert acquire_lines, "no acquire call recorded"
+    for line in acquire_lines:
+        assert "--ttl 900" in line, f"acquire call missing configured --ttl: {line!r}"
+
+
+def test_renewal_is_scheduled_with_margin_before_the_granted_ttl_expires():
+    """The invariant the live incident violated: renew_after must be
+    comfortably less than the granted TTL, never merely close to it (a
+    renewal scheduled at exactly the TTL, or later, races network/
+    scheduling jitter and can lose every single time, not just under
+    contention). `_RENEW_FRACTION=3` gives a 2x safety margin -- renewal
+    at 1/3 of the TTL leaves 2/3 of it as slack before expiry."""
+    from command_center.worker.writer_lease import _MIN_RENEW_INTERVAL_SECONDS, _RENEW_FRACTION
+
+    for ttl in (60, 180, 600, 3600):
+        renew_after = max(ttl / _RENEW_FRACTION, _MIN_RENEW_INTERVAL_SECONDS)
+        assert renew_after < ttl, (
+            f"renew_after={renew_after} must be strictly less than ttl={ttl}"
+        )
+        # At least 2x margin (renewal happens with over half the TTL still
+        # to spare), not just "sometime before expiry".
+        assert renew_after <= ttl / 2, (
+            f"renew_after={renew_after} for ttl={ttl} leaves too little margin"
+        )
