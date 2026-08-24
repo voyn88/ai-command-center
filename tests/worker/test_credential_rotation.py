@@ -204,7 +204,7 @@ def test_long_jobs_do_not_delay_hot_credential_handoff(tmp_path: Path) -> None:
 
     def drain(unit: str) -> None:
         original_drain(unit)
-        systemd.status[unit] = "aicc-draining"
+        systemd.status[unit] = "aicc-drained"
 
     systemd.drain = drain  # type: ignore[method-assign]
     controller.rotate()
@@ -232,6 +232,62 @@ def test_tunnel_timeout_fails_before_any_drain_or_rotation(tmp_path: Path) -> No
     with pytest.raises(RotationError, match="tunnel readiness"):
         controller.rotate()
     assert not any(event[0] in {"drain", "rotate"} for event in events)
+
+
+def test_post_drain_prerequisite_failure_resumes_both_lanes_with_verified_auth(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, systemd, _ = _controller(tmp_path, events)
+    tunnel_checks = [0]
+
+    def state(unit: str) -> UnitState:
+        if unit == TUNNEL:
+            tunnel_checks[0] += 1
+            # Initial preflight succeeds; the post-drain proof fails.
+            systemd.tunnel_ready = tunnel_checks[0] == 1
+        return FakeSystemd.state(systemd, unit)
+
+    clock = [0.0]
+    systemd.state = state  # type: ignore[method-assign]
+    controller.config = replace(controller.config, prerequisite_timeout=2)
+    controller.monotonic = lambda: clock[0]
+    controller.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+
+    with pytest.raises(RotationError, match="tunnel readiness"):
+        controller.rotate()
+
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    for lane in (LANE_1, LANE_2):
+        assert ("reload", lane, 10) in events
+    assert not any(event[0] == "rotate" for event in events)
+
+
+def test_post_rotation_activation_failure_rolls_every_lane_to_verified_new_auth(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    failures_left = [1]
+    original_restart = systemd.restart
+
+    def restart(unit: str, timeout: float) -> None:
+        if unit == LANE_1 and failures_left[0]:
+            failures_left[0] -= 1
+            raise RotationError("transient restart failure")
+        original_restart(unit, timeout)
+
+    systemd.reload_fail.add(LANE_1)
+    systemd.restart = restart  # type: ignore[method-assign]
+
+    with pytest.raises(RotationError, match="transient restart failure"):
+        controller.rotate()
+
+    assert authority.current_password != OLD_PASSWORD
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    # One activation failure plus one rollback attempt; the latter proves the
+    # durable current credential before advertising ready.
+    assert events.count(("reload", LANE_2, 10)) >= 2
 
 
 def test_cli_returns_nonzero_and_audits_controller_failure(

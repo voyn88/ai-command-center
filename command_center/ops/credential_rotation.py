@@ -42,7 +42,7 @@ from command_center.worker.credential_file import (
     read_environment_file,
 )
 
-_DRAINED = "aicc-drain"
+_DRAINED = "aicc-drained"
 _READY = "aicc-ready"
 
 
@@ -316,7 +316,7 @@ class RotationController:
             for unit in self.config.worker_units:
 
                 def claim_gate_closed(current_unit: str = unit) -> bool:
-                    return self.systemd.state(current_unit).status.startswith(_DRAINED)
+                    return self.systemd.state(current_unit).status == _DRAINED
 
                 self._wait(
                     f"{unit} drain",
@@ -358,6 +358,20 @@ class RotationController:
         self.authority.probe(new_config)
         self.audit.emit("worker_credential_active", unit=unit, method=method)
 
+    def _resume_lanes(self, config: PostgresConfig) -> list[str]:
+        """Best-effort rollback, but call a lane ready only after auth proof."""
+        failures: list[str] = []
+        for unit in self.config.worker_units:
+            try:
+                self._activate_lane(unit, config)
+                self.audit.emit("worker_drain_rolled_back", unit=unit)
+            except Exception as error:  # noqa: BLE001 - audit every unsafe lane
+                failures.append(f"{unit}: {error}")
+                self.audit.emit(
+                    "worker_drain_rollback_failed", unit=unit, error=str(error)
+                )
+        return failures
+
     def rotate(self) -> None:
         if len(self.config.worker_units) < 2:
             raise RotationError("at least two worker lanes are required")
@@ -372,20 +386,29 @@ class RotationController:
         self.audit.emit("rotation_preflight_ok", lanes=len(self.config.worker_units))
         self._drain_all()
 
-        # Re-prove the prerequisite after both claim gates close; an in-flight
-        # job is deliberately still running and does not delay this step.
-        self._wait_tunnel()
-        self.authority.probe(current)
-        new_secret = secrets.token_hex(32)
         prepared: PreparedCredentialFile | None = None
         committed = False
         database_rotated = False
+        # Until PostgreSQL accepts a new verifier, the old file is durable and
+        # is the safe rollback source.  Between DB rotation and the atomic file
+        # commit there is deliberately no safe automatic resume: reloading the
+        # old file would advertise readiness with a dead credential.
+        resume_config: PostgresConfig | None = current
         try:
+            # Re-prove the prerequisite after both claim gates close; an in-flight
+            # job is deliberately still running and does not delay this step.
+            self._wait_tunnel()
+            self.authority.probe(current)
+            new_secret = secrets.token_hex(32)
             prepared = prepare_password_update(self.config.env_file, new_secret)
+            new_values = dict(values)
+            new_values["AICC_PG_PASSWORD"] = new_secret
+            new_config = _postgres_config(new_values)
             expires = self.authority.rotate(
                 current, new_secret, scram_verifier(new_secret)
             )
             database_rotated = True
+            resume_config = None
             try:
                 prepared.commit()
             except OSError as error:
@@ -396,8 +419,12 @@ class RotationController:
                     f"recovery file retained at {prepared.temporary}"
                 ) from error
             committed = True
-            new_values = read_environment_file(self.config.env_file)
-            new_config = _postgres_config(new_values)
+            resume_config = new_config
+            persisted = _postgres_config(read_environment_file(self.config.env_file))
+            if not hmac.compare_digest(persisted.password, new_config.password):
+                raise RotationError(
+                    "committed credential file does not contain new secret"
+                )
             self.authority.probe(new_config)
             self.audit.emit("credential_rotated", expires=str(expires))
 
@@ -412,6 +439,19 @@ class RotationController:
                     )
             if failures:
                 raise RotationError("; ".join(failures))
+        except Exception as error:
+            if resume_config is None:
+                self.audit.emit(
+                    "worker_resume_refused",
+                    error="current database credential is not durably published",
+                )
+                raise
+            rollback_failures = self._resume_lanes(resume_config)
+            if rollback_failures:
+                raise RotationError(
+                    f"{error}; drain rollback failed: {'; '.join(rollback_failures)}"
+                ) from error
+            raise
         finally:
             if prepared is not None and not committed and not database_rotated:
                 prepared.discard()

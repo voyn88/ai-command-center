@@ -106,6 +106,13 @@ class WorkerDaemon:
         self._config = config or WorkerConfig()
         self._stop = threading.Event()
         self._drain = threading.Event()
+        self._drain_closed = threading.Event()
+        self._drain_wakeup = threading.Event()
+        self._drain_stop = threading.Event()
+        # The coordinator and the claim loop meet at this lock.  The claim
+        # loop holds it from its final drain check through claim(), so a drain
+        # ACK cannot race ahead of an already-starting database claim.
+        self._claim_gate_lock = threading.Lock()
         self._reload_requested = threading.Event()
         self._reload_stop = threading.Event()
         # Injectable so tests drive time instead of waiting through it.
@@ -140,14 +147,30 @@ class WorkerDaemon:
 
     def request_drain(self) -> None:
         self._drain.set()
-        # The signal handler can acknowledge the claim gate immediately. A
-        # handler already in flight continues; its database checkouts remain
-        # valid while the pool generation is replaced in the background.
-        self._notify("STATUS=aicc-draining")
+        # Signal handlers must never block on a lock the interrupted main
+        # thread may already hold inside claim().  A dedicated coordinator
+        # closes the gate and emits the ACK only after it owns the same lock.
+        self._drain_wakeup.set()
 
     def request_reload(self) -> None:
         self._notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1_000}")
         self._reload_requested.set()
+
+    def _drain_coordinator_loop(self) -> None:
+        while not self._drain_stop.is_set():
+            if not self._drain_wakeup.wait(0.25):
+                continue
+            self._drain_wakeup.clear()
+            if self._drain_stop.is_set():
+                return
+            with self._claim_gate_lock:
+                if self._drain.is_set() and not self._drain_closed.is_set():
+                    self._drain_closed.set()
+                    # This is the protocol ACK consumed by the rotator.  At
+                    # this point claim() is not running and cannot begin until
+                    # the lock is released, after which the closed flag is
+                    # checked again before any claim.
+                    self._notify("STATUS=aicc-drained")
 
     def _credential_reload_loop(self) -> None:
         while not self._reload_stop.is_set():
@@ -162,10 +185,12 @@ class WorkerDaemon:
                 self._notify("STATUS=aicc-reload-failed")
                 self._reload_requested.clear()
                 continue
-            self._reload_requested.clear()
-            self._drain.clear()
-            self._notify("READY=1")
-            self._notify("STATUS=aicc-ready")
+            with self._claim_gate_lock:
+                self._reload_requested.clear()
+                self._drain.clear()
+                self._drain_closed.clear()
+                self._notify("READY=1")
+                self._notify("STATUS=aicc-ready")
 
     # -- the loop -------------------------------------------------------------
 
@@ -184,18 +209,32 @@ class WorkerDaemon:
             name="credential-reload",
             daemon=True,
         )
+        drain_thread = threading.Thread(
+            target=self._drain_coordinator_loop,
+            name="claim-gate-drain",
+            daemon=True,
+        )
         reload_thread.start()
+        drain_thread.start()
         try:
             while not self._stop.is_set():
                 if self._drain.is_set():
-                    self._notify("WATCHDOG=1\nSTATUS=aicc-drained")
+                    status = (
+                        "aicc-drained"
+                        if self._drain_closed.is_set()
+                        else "aicc-drain-requested"
+                    )
+                    self._notify(f"WATCHDOG=1\nSTATUS={status}")
                     self._sleep(min(self._config.idle_min_seconds, cap))
                     continue
-                self._notify("WATCHDOG=1")
-                claimed = self._store.claim(
-                    self._config.queue,
-                    visibility_seconds=self._config.visibility_seconds,
-                )
+                with self._claim_gate_lock:
+                    if self._drain.is_set() or self._drain_closed.is_set():
+                        continue
+                    self._notify("WATCHDOG=1")
+                    claimed = self._store.claim(
+                        self._config.queue,
+                        visibility_seconds=self._config.visibility_seconds,
+                    )
                 if isinstance(claimed, QueueRefusal):
                     if claimed.reason == "no_work":
                         self._sleep(min(idle + random.uniform(0, idle), cap))
@@ -211,7 +250,10 @@ class WorkerDaemon:
         finally:
             self._reload_stop.set()
             self._reload_requested.set()
+            self._drain_stop.set()
+            self._drain_wakeup.set()
             reload_thread.join(timeout=5)
+            drain_thread.join(timeout=5)
         # STOPPING=1 tells systemd the exit it is about to observe is ours,
         # not a crash — TimeoutStopSec pacing instead of watchdog action.
         self._notify("STOPPING=1")
