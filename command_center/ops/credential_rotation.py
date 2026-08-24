@@ -1364,6 +1364,19 @@ class RotationController:
                 new_config, "new credential"
             )
             if remaining < safe_post_rotation:
+                # Deliberately NOT a resume path (reviewed on 17ca910 and
+                # kept): resume_config is still None here, so the except
+                # block below neither resumes with the dead old password nor
+                # activates the fleet on a credential that would expire
+                # before the safe activation/rollback budget completes.
+                # It re-raises, leaving the lanes drained with the phase
+                # journal durable ("credential_committed") -- exactly the
+                # state recover_interrupted() is built for: it re-probes
+                # BOTH credential candidates and resumes on the one that
+                # actually authenticates and has usable lifetime. Assigning
+                # resume_config = new_config before this check would trade
+                # that audited recovery for an immediate fleet activation on
+                # a provably short-lived secret.
                 raise RotationError(
                     "issued credential expires before safe activation/rollback budget"
                 )
