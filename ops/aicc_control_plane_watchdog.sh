@@ -13,4 +13,3 @@ fi
 /bin/systemctl start aicc-control-plane-reconciler.timer
 /bin/systemctl start aicc-control-plane-reconciler.service
 "$PYTHON" -m command_center.db control-plane-health --max-age-seconds 180
-

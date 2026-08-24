@@ -960,9 +960,9 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
-    enqueue = lambda q, k, p, tid, attempts: calls.append(
-        (q, k, p, tid, attempts)
-    )
+
+    def enqueue(q, k, p, tid, attempts):
+        calls.append((q, k, p, tid, attempts))
 
     current_head = iter(["a" * 40])
     review_once(app_factory, enqueue, "/tmp")

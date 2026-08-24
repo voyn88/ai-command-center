@@ -21,4 +21,3 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-

@@ -10,4 +10,3 @@ Unit=voyn-findings-sync.service
 
 [Install]
 WantedBy=timers.target
-

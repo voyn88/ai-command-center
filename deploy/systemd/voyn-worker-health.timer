@@ -10,4 +10,3 @@ Unit=voyn-worker-health.service
 
 [Install]
 WantedBy=timers.target
-

@@ -10,4 +10,3 @@ Unit=aicc-control-plane-watchdog.service
 
 [Install]
 WantedBy=timers.target
-
