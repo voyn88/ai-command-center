@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from command_center import agent_runner
 from command_center.orchestrator import review_merge
 
 
@@ -14,7 +15,10 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        review_merge, "_pr_diff_and_head", lambda *args: ("diff", "a" * 40)
+        review_merge, "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create(
+            "diff", "b" * 40, "a" * 40
+        )
     )
     monkeypatch.setattr(
         "command_center.orchestrator.planner.repo_route",
@@ -30,11 +34,28 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     ]
     _queue, key, payload, task_id, max_attempts = calls[0]
     assert task_id == "VOYN-W0-X"
-    assert key.endswith(":v2")
+    assert ":v5:base:" in key and ":diff:" in key
     assert [link["executor"] for link in payload["cascade"]] == [
         "copilot",
         "claude",
     ]
+    assert payload["untrusted"] is True
+    assert payload["task_type"] == "independent_review"
+    assert all(
+        link["task_type"] == "independent_review"
+        and link["capability"] == "model_only"
+        for link in payload["cascade"]
+    )
+    for link in payload["cascade"]:
+        argv = agent_runner._command_builder(link["executor"])(
+            payload["prompt"], task_type=link["task_type"]
+        )
+        assert "--allow-all-tools" not in argv
+        assert "--allow-tool" not in argv
+        if link["executor"] == "copilot":
+            assert "--available-tools=" in argv
+        else:
+            assert argv[argv.index("--tools") + 1] == ""
     assert max_attempts == len(payload["cascade"]) == 2
 
 
