@@ -25,14 +25,17 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import socket
+import stat as stat_module
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -70,13 +73,14 @@ class UnitState:
 class RotationConfig:
     env_file: Path
     lock_file: Path
+    phase_file: Path
     audit_file: Path | None
     tunnel_unit: str
     tunnel_host: str
     tunnel_port: int
     worker_units: tuple[str, ...]
     prerequisite_timeout: float = 120.0
-    drain_timeout: float = 3660.0
+    drain_timeout: float = 180.0
     reload_timeout: float = 120.0
     restart_timeout: float = 3720.0
     controller_timeout: float = 7200.0
@@ -96,6 +100,8 @@ class Systemd(Protocol):
 
 class CredentialAuthority(Protocol):
     def probe(self, config: PostgresConfig) -> None: ...
+
+    def current_expiry(self, config: PostgresConfig) -> tuple[datetime, float]: ...
 
     def rotate(
         self, config: PostgresConfig, new_secret: str, verifier: str
@@ -127,6 +133,124 @@ class Audit:
             os.fsync(fd)
         finally:
             os.close(fd)
+
+
+_RECOVERABLE_PHASES = frozenset(
+    {
+        "draining",
+        "gates_closed",
+        "mutation_started",
+        "database_rotated",
+        "credential_committed",
+        "activating",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RotationPhase:
+    phase: str
+    recovery_file: Path | None = None
+
+
+class PhaseJournal:
+    """Atomic, fsynced recovery state for the privileged drain boundary."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def load(self) -> RotationPhase | None:
+        try:
+            fd = os.open(
+                self.path,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise RotationError(
+                f"cannot read rotation phase journal: {error}"
+            ) from error
+        try:
+            metadata = os.fstat(fd)
+            if not stat_module.S_ISREG(metadata.st_mode):
+                raise RotationError("rotation phase journal is not a regular file")
+            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+                raise RotationError("rotation phase journal ownership/mode is unsafe")
+            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                raw = stream.read(4097)
+            if len(raw) > 4096:
+                raise RotationError("rotation phase journal is unexpectedly large")
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        try:
+            document = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise RotationError("rotation phase journal is not valid JSON") from error
+        if not isinstance(document, dict) or set(document) != {
+            "phase",
+            "recovery_file",
+        }:
+            raise RotationError("rotation phase journal has an invalid shape")
+        phase = document["phase"]
+        recovery = document["recovery_file"]
+        if phase not in _RECOVERABLE_PHASES:
+            raise RotationError("rotation phase journal has an unknown phase")
+        if recovery is not None and not isinstance(recovery, str):
+            raise RotationError("rotation phase recovery path is invalid")
+        return RotationPhase(
+            phase=phase, recovery_file=Path(recovery) if recovery else None
+        )
+
+    def write(self, phase: str, recovery_file: Path | None = None) -> None:
+        if phase not in _RECOVERABLE_PHASES:
+            raise RotationError(f"refusing unknown rotation phase {phase!r}")
+        self.path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        document = json.dumps(
+            {
+                "phase": phase,
+                "recovery_file": str(recovery_file) if recovery_file else None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.", dir=self.path.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(document + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            self._sync_directory()
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def clear(self) -> None:
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return
+        self._sync_directory()
+
+    def _sync_directory(self) -> None:
+        directory_fd = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 class SubprocessSystemd:
@@ -198,6 +322,27 @@ class PsycopgCredentialAuthority:
         if row != (1,):
             raise RotationError("credential auth probe returned an unexpected result")
 
+    def current_expiry(self, config: PostgresConfig) -> tuple[datetime, float]:
+        with self._connect(config) as connection, connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM identity_current_credential(%s)", (config.password,)
+            )
+            row = cursor.fetchone()
+        if not row or len(row) != 3:
+            raise RotationError(
+                "credential expiry authority returned an invalid result"
+            )
+        expiry, server_now, refusal = row
+        if refusal is not None:
+            raise RotationError(f"credential expiry refused: {refusal}")
+        if not isinstance(expiry, datetime) or not isinstance(server_now, datetime):
+            raise RotationError(
+                "credential expiry authority returned invalid timestamps"
+            )
+        if expiry.tzinfo is None or server_now.tzinfo is None:
+            raise RotationError("credential expiry authority returned naive timestamps")
+        return expiry, (expiry - server_now).total_seconds()
+
     def rotate(self, config: PostgresConfig, new_secret: str, verifier: str) -> object:
         with self._connect(config) as connection, connection.cursor() as cursor:
             cursor.execute(
@@ -244,7 +389,6 @@ class RotationController:
         *,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
-        wall_clock: Callable[[], datetime] | None = None,
         port_probe: Callable[[str, int, float], None] | None = None,
     ) -> None:
         self.config = config
@@ -253,16 +397,39 @@ class RotationController:
         self.audit = audit
         self.monotonic = monotonic
         self.sleep = sleep
-        self.wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self.port_probe = port_probe or self._port_probe
+        self.phase_journal = PhaseJournal(config.phase_file)
         self._controller_deadline: float | None = None
-        self._credential_deadline: datetime | None = None
+        self._credential_deadline: float | None = None
         self._restart_fallback_allowed = False
 
     @staticmethod
     def _authority_timeout(config: PostgresConfig) -> float:
         """Upper bound for one connect plus one statement."""
         return config.connect_timeout + config.statement_timeout_ms / 1000.0
+
+    def _load_credential_deadline(
+        self, config: PostgresConfig, description: str
+    ) -> tuple[datetime, float]:
+        expiry, remaining = self.authority.current_expiry(config)
+        self._set_credential_deadline(expiry, remaining, description)
+        return expiry, remaining
+
+    def _set_credential_deadline(
+        self, expiry: datetime, remaining: float, description: str
+    ) -> None:
+        if expiry.tzinfo is None or not math.isfinite(remaining):
+            raise RotationError(f"{description} returned an invalid expiry")
+        usable = remaining - CREDENTIAL_SAFETY_MARGIN_SECONDS
+        if usable <= 0:
+            raise RotationError(f"{description} expires inside the safety margin")
+        self._credential_deadline = self.monotonic() + usable
+        self.audit.emit(
+            "credential_expiry_proved",
+            description=description,
+            expires=expiry.isoformat(),
+            remaining=remaining,
+        )
 
     def _post_rotation_budget(self, config: PostgresConfig) -> tuple[float, bool]:
         """Return the complete activation+rollback budget and restart policy.
@@ -293,6 +460,40 @@ class RotationController:
             "database credential TTL is below hot activation/rollback budget"
         )
 
+    def _resume_budget(self, config: PostgresConfig) -> float:
+        authority_timeout = self._authority_timeout(config)
+        return len(self.config.worker_units) * (
+            2 * self.config.reload_timeout + authority_timeout
+        )
+
+    def _current_pre_drain_budget(self, config: PostgresConfig) -> float:
+        authority_timeout = self._authority_timeout(config)
+        return (
+            self.config.drain_timeout
+            + self.config.prerequisite_timeout
+            + 2 * authority_timeout
+            + self._resume_budget(config)
+        )
+
+    def _require_current_pre_drain_budget(
+        self, current: PostgresConfig, remaining: float
+    ) -> None:
+        required = self._current_pre_drain_budget(current)
+        available = self._bounded_timeout(
+            required,
+            "current credential pre-drain recovery",
+            credential=True,
+        )
+        if available < required:
+            self.audit.emit(
+                "rotation_deferred_current_expiry",
+                remaining=remaining,
+                required=required + CREDENTIAL_SAFETY_MARGIN_SECONDS,
+            )
+            raise RotationError(
+                "current credential expires before drain/rotation recovery budget"
+            )
+
     def _bounded_timeout(
         self, requested: float, description: str, *, credential: bool = False
     ) -> float:
@@ -300,9 +501,7 @@ class RotationController:
         if self._controller_deadline is not None:
             budgets.append(self._controller_deadline - self.monotonic())
         if credential and self._credential_deadline is not None:
-            budgets.append(
-                (self._credential_deadline - self.wall_clock()).total_seconds()
-            )
+            budgets.append(self._credential_deadline - self.monotonic())
         timeout = min(budgets)
         if timeout <= 0:
             raise RotationError(f"no safe time budget remains for {description}")
@@ -344,7 +543,7 @@ class RotationController:
             and state.status.startswith(_READY)
         )
 
-    def _wait_tunnel(self) -> None:
+    def _wait_tunnel(self, *, credential: bool = False) -> None:
         def ready() -> bool:
             state = self.systemd.state(self.config.tunnel_unit)
             if state.active != "active" or state.sub != "running":
@@ -355,7 +554,9 @@ class RotationController:
         self._wait(
             "PostgreSQL tunnel readiness",
             self._bounded_timeout(
-                self.config.prerequisite_timeout, "PostgreSQL tunnel readiness"
+                self.config.prerequisite_timeout,
+                "PostgreSQL tunnel readiness",
+                credential=credential,
             ),
             ready,
         )
@@ -376,44 +577,27 @@ class RotationController:
             )
 
     def _drain_all(self) -> None:
-        signalled: list[str] = []
         drain_deadline = self.monotonic() + self._bounded_timeout(
-            self.config.drain_timeout, "worker claim-gate drain"
+            self.config.drain_timeout, "worker claim-gate drain", credential=True
         )
-        try:
-            for unit in self.config.worker_units:
-                self.systemd.drain(unit)
-                signalled.append(unit)
-                self.audit.emit("worker_drain_requested", unit=unit)
-            for unit in self.config.worker_units:
+        for unit in self.config.worker_units:
+            self.systemd.drain(unit)
+            self.audit.emit("worker_drain_requested", unit=unit)
+        for unit in self.config.worker_units:
 
-                def claim_gate_closed(current_unit: str = unit) -> bool:
-                    return self.systemd.state(current_unit).status == _DRAINED
+            def claim_gate_closed(current_unit: str = unit) -> bool:
+                return self.systemd.state(current_unit).status == _DRAINED
 
-                self._wait(
+            self._wait(
+                f"{unit} drain",
+                self._bounded_timeout(
+                    drain_deadline - self.monotonic(),
                     f"{unit} drain",
-                    self._bounded_timeout(
-                        drain_deadline - self.monotonic(), f"{unit} drain"
-                    ),
-                    claim_gate_closed,
-                )
-                self.audit.emit("worker_claim_gate_closed", unit=unit)
-        except Exception:
-            # No credential changed yet. Reloading the old file is the defined
-            # resume operation and prevents a partial preflight from parking a
-            # healthy lane in drain forever.
-            for unit in signalled:
-                try:
-                    timeout = self._bounded_timeout(
-                        self.config.reload_timeout, f"{unit} drain rollback"
-                    )
-                    self.systemd.reload(unit, timeout)
-                    self.audit.emit("worker_drain_rolled_back", unit=unit)
-                except Exception as error:  # noqa: BLE001 - audit all recovery failures
-                    self.audit.emit(
-                        "worker_drain_rollback_failed", unit=unit, error=str(error)
-                    )
-            raise
+                    credential=True,
+                ),
+                claim_gate_closed,
+            )
+            self.audit.emit("worker_claim_gate_closed", unit=unit)
 
     def _activate_lane(self, unit: str, new_config: PostgresConfig) -> None:
         try:
@@ -499,6 +683,98 @@ class RotationController:
                 )
         return failures
 
+    def _recovery_candidates(
+        self, phase: RotationPhase
+    ) -> list[tuple[Path, PostgresConfig]]:
+        paths = [self.config.env_file]
+        if phase.recovery_file is not None:
+            recovery = phase.recovery_file
+            expected_parent = self.config.env_file.parent.resolve()
+            if (
+                recovery.parent.resolve() != expected_parent
+                or not recovery.name.startswith(f".{self.config.env_file.name}.")
+            ):
+                raise RotationError(
+                    "phase journal recovery file is outside its boundary"
+                )
+            paths.append(recovery)
+
+        candidates: list[tuple[Path, PostgresConfig]] = []
+        seen_passwords: set[bytes] = set()
+        for path in paths:
+            try:
+                metadata = path.lstat()
+                if (
+                    not stat_module.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.geteuid()
+                    or metadata.st_mode & 0o022
+                ):
+                    raise RotationError(
+                        "rotation recovery credential ownership/mode is unsafe"
+                    )
+                config = _postgres_config(read_environment_file(path))
+            except FileNotFoundError:
+                continue
+            fingerprint = hashlib.sha256(config.password.encode()).digest()
+            if fingerprint in seen_passwords:
+                continue
+            seen_passwords.add(fingerprint)
+            candidates.append((path, config))
+        return candidates
+
+    def recover_interrupted(self) -> bool:
+        """Reopen claim gates from a durable interrupted-rotation phase."""
+        if self._controller_deadline is None:
+            self._controller_deadline = (
+                self.monotonic() + self.config.controller_timeout
+            )
+        phase = self.phase_journal.load()
+        if phase is None:
+            return False
+        self.audit.emit("rotation_recovery_started", phase=phase.phase)
+        # Recovery is also invoked by ExecStopPost during boot.  The tunnel
+        # unit can be active before its forwarded socket accepts connections,
+        # so keep the durable journal and wait through that bounded race before
+        # deciding that neither credential is usable.
+        self._wait_tunnel()
+        working: list[tuple[Path, PostgresConfig, datetime, float]] = []
+        for path, config in self._recovery_candidates(phase):
+            try:
+                expiry, remaining = self.authority.current_expiry(config)
+            except Exception as error:  # noqa: BLE001 - ambiguity must be audited
+                self.audit.emit(
+                    "rotation_recovery_candidate_refused",
+                    source="environment"
+                    if path == self.config.env_file
+                    else "recovery",
+                    error=str(error),
+                )
+                continue
+            working.append((path, config, expiry, remaining))
+        if len(working) != 1:
+            raise RotationError(
+                "interrupted rotation has no unique working credential candidate"
+            )
+
+        source, config, expiry, remaining = working[0]
+        if source != self.config.env_file:
+            PreparedCredentialFile(
+                target=self.config.env_file, temporary=source
+            ).commit()
+            self.audit.emit("rotation_recovery_credential_committed")
+        self._set_credential_deadline(
+            expiry, remaining, "interrupted rotation credential"
+        )
+        self._restart_fallback_allowed = False
+        failures = self._resume_lanes(config)
+        if failures:
+            raise RotationError(
+                "interrupted rotation failed to reopen lanes: " + "; ".join(failures)
+            )
+        self.phase_journal.clear()
+        self.audit.emit("rotation_recovery_succeeded", phase=phase.phase)
+        return True
+
     def rotate(self) -> None:
         if len(self.config.worker_units) < 2:
             raise RotationError("at least two worker lanes are required")
@@ -510,16 +786,31 @@ class RotationController:
         self._credential_deadline = None
         self._restart_fallback_allowed = False
 
-        self._wait_tunnel()
+        # A previous SIGTERM/SIGKILL is recovered as its own audited operation.
+        # Do not immediately drain the just-reopened workers a second time.
+        if self.recover_interrupted():
+            return
+
         values = read_environment_file(self.config.env_file)
         current = _postgres_config(values)
+        self._wait_tunnel()
         safe_post_rotation, restart_fallback_allowed = self._post_rotation_budget(
             current
         )
         authority_timeout = self._authority_timeout(current)
-        # From this point the controller still owes one current-auth probe,
-        # per-lane health checks, one shared drain, a second tunnel/auth proof,
-        # the rotation query and the complete post-rotation recovery budget.
+        _, current_remaining = self._load_credential_deadline(
+            current, "current credential"
+        )
+        # The current credential must remain valid through a shared claim-gate
+        # drain, post-drain tunnel/auth proof and the rotation statement. If any
+        # one fails, enough old-credential lifetime remains to reopen and prove
+        # every lane. The five-minute safety margin was already subtracted when
+        # the monotonic credential deadline was installed.
+        self._require_current_pre_drain_budget(current, current_remaining)
+
+        # From this point the controller still owes per-lane health checks, one
+        # shared drain, a second tunnel/expiry proof, the rotation query and the
+        # complete post-rotation recovery budget.
         remaining_protocol = (
             len(self.config.worker_units) * self.config.prerequisite_timeout
             + self.config.drain_timeout
@@ -531,10 +822,15 @@ class RotationController:
             remaining_protocol
         ):
             raise RotationError("controller budget is below complete rotation budget")
-        self.authority.probe(current)
         self._wait_workers_healthy()
+        # Worker readiness may legitimately consume most of its bounded wait.
+        # Refresh the server-clock proof immediately before the first gate is
+        # touched, then repeat the full mutation+reopen budget check.
+        _, current_remaining = self._load_credential_deadline(
+            current, "pre-drain current credential"
+        )
+        self._require_current_pre_drain_budget(current, current_remaining)
         self.audit.emit("rotation_preflight_ok", lanes=len(self.config.worker_units))
-        self._drain_all()
 
         prepared: PreparedCredentialFile | None = None
         committed = False
@@ -544,11 +840,14 @@ class RotationController:
         # commit there is deliberately no safe automatic resume: reloading the
         # old file would advertise readiness with a dead credential.
         resume_config: PostgresConfig | None = current
+        self.phase_journal.write("draining")
         try:
+            self._drain_all()
+            self.phase_journal.write("gates_closed")
             # Re-prove the prerequisite after both claim gates close; an in-flight
             # job is deliberately still running and does not delay this step.
-            self._wait_tunnel()
-            self.authority.probe(current)
+            self._wait_tunnel(credential=True)
+            self._load_credential_deadline(current, "post-drain current credential")
             # The credential mutation is the point of no return. Refuse it if
             # preflight/drain consumed so much of the controller deadline that
             # a full activation plus rollback no longer fits. This guarantees
@@ -561,41 +860,28 @@ class RotationController:
                 raise RotationError(
                     "controller budget exhausted before credential mutation"
                 )
+            current_mutation_budget = authority_timeout + self._resume_budget(current)
+            current_budget = self._bounded_timeout(
+                current_mutation_budget,
+                "current credential mutation rollback",
+                credential=True,
+            )
+            if current_budget < current_mutation_budget:
+                raise RotationError(
+                    "current credential budget exhausted before credential mutation"
+                )
             new_secret = secrets.token_hex(32)
             prepared = prepare_password_update(self.config.env_file, new_secret)
             new_values = dict(values)
             new_values["AICC_PG_PASSWORD"] = new_secret
             new_config = _postgres_config(new_values)
+            self.phase_journal.write("mutation_started", prepared.temporary)
             expires = self.authority.rotate(
                 current, new_secret, scram_verifier(new_secret)
             )
             database_rotated = True
             resume_config = None
-            try:
-                expiry = (
-                    expires
-                    if isinstance(expires, datetime)
-                    else datetime.fromisoformat(str(expires))
-                )
-                if expiry.tzinfo is None:
-                    raise ValueError("naive credential expiry")
-            except (TypeError, ValueError) as error:
-                raise RotationError(
-                    "credential authority returned invalid expiry after database "
-                    f"rotation; recovery file retained at {prepared.temporary}"
-                ) from error
-            remaining = (expiry - self.wall_clock()).total_seconds()
-            # Activation plus a complete rollback is four bounded reload /
-            # readiness phases per two-lane deployment. Validate the authority's
-            # actual returned expiry, not merely the configured expectation.
-            if remaining < safe_post_rotation:
-                raise RotationError(
-                    "issued credential expires before safe activation/rollback "
-                    f"budget; recovery file retained at {prepared.temporary}"
-                )
-            self._credential_deadline = expiry - timedelta(
-                seconds=CREDENTIAL_SAFETY_MARGIN_SECONDS
-            )
+            self.phase_journal.write("database_rotated", prepared.temporary)
             try:
                 prepared.commit()
             except OSError as error:
@@ -606,15 +892,27 @@ class RotationController:
                     f"recovery file retained at {prepared.temporary}"
                 ) from error
             committed = True
-            resume_config = new_config
-            self._restart_fallback_allowed = restart_fallback_allowed
+            self.phase_journal.write("credential_committed")
             persisted = _postgres_config(read_environment_file(self.config.env_file))
             if not hmac.compare_digest(persisted.password, new_config.password):
                 raise RotationError(
                     "committed credential file does not contain new secret"
                 )
-            self.authority.probe(new_config)
-            self.audit.emit("credential_rotated", expires=str(expires))
+            expiry, remaining = self._load_credential_deadline(
+                new_config, "new credential"
+            )
+            if remaining < safe_post_rotation:
+                raise RotationError(
+                    "issued credential expires before safe activation/rollback budget"
+                )
+            resume_config = new_config
+            self._restart_fallback_allowed = restart_fallback_allowed
+            self.phase_journal.write("activating")
+            self.audit.emit(
+                "credential_rotated",
+                expires=expiry.isoformat(),
+                authority_result=str(expires),
+            )
 
             failures: list[str] = []
             for unit in self.config.worker_units:
@@ -639,10 +937,12 @@ class RotationController:
                 raise RotationError(
                     f"{error}; drain rollback failed: {'; '.join(rollback_failures)}"
                 ) from error
+            self.phase_journal.clear()
             raise
         finally:
             if prepared is not None and not committed and not database_rotated:
                 prepared.discard()
+        self.phase_journal.clear()
         self.audit.emit("rotation_succeeded", lanes=len(self.config.worker_units))
 
 
@@ -650,13 +950,15 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--lock-file", type=Path, required=True)
+    parser.add_argument("--phase-file", type=Path, required=True)
     parser.add_argument("--audit-file", type=Path)
+    parser.add_argument("--recover-only", action="store_true")
     parser.add_argument("--tunnel-unit", required=True)
     parser.add_argument("--tunnel-host", default="127.0.0.1")
     parser.add_argument("--tunnel-port", type=int, default=5433)
     parser.add_argument("--worker-unit", action="append", required=True)
     parser.add_argument("--prerequisite-timeout", type=float, default=120.0)
-    parser.add_argument("--drain-timeout", type=float, default=3660.0)
+    parser.add_argument("--drain-timeout", type=float, default=180.0)
     parser.add_argument("--reload-timeout", type=float, default=120.0)
     parser.add_argument("--restart-timeout", type=float, default=3720.0)
     parser.add_argument("--controller-timeout", type=float, default=7200.0)
@@ -668,6 +970,7 @@ def main(argv: list[str] | None = None) -> int:
     config = RotationConfig(
         env_file=args.env_file,
         lock_file=args.lock_file,
+        phase_file=args.phase_file,
         audit_file=args.audit_file,
         tunnel_unit=args.tunnel_unit,
         tunnel_host=args.tunnel_host,
@@ -688,9 +991,13 @@ def main(argv: list[str] | None = None) -> int:
             audit.emit("rotation_refused", error="rotation already running")
             return 75
         try:
-            RotationController(
+            controller = RotationController(
                 config, SubprocessSystemd(), PsycopgCredentialAuthority(), audit
-            ).rotate()
+            )
+            if args.recover_only:
+                controller.recover_interrupted()
+            else:
+                controller.rotate()
         except Exception as error:  # noqa: BLE001 - CLI boundary, audited non-zero
             audit.emit("rotation_failed", error=str(error))
             return 1

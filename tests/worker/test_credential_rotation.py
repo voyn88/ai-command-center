@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import shlex
+import signal
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +15,7 @@ from command_center.ops.credential_rotation import (
     SELF_CREDENTIAL_TTL_SECONDS,
     SYSTEMD_EXIT_MARGIN_SECONDS,
     Audit,
+    PhaseJournal,
     RotationConfig,
     RotationController,
     RotationError,
@@ -51,13 +55,14 @@ def _config(tmp_path: Path, **changes) -> RotationConfig:
     config = RotationConfig(
         env_file=_environment(tmp_path / "worker.env"),
         lock_file=tmp_path / "rotation.lock",
+        phase_file=tmp_path / "phase.json",
         audit_file=None,
         tunnel_unit=TUNNEL,
         tunnel_host="127.0.0.1",
         tunnel_port=5433,
         worker_units=(LANE_1, LANE_2),
         prerequisite_timeout=10,
-        drain_timeout=3660,
+        drain_timeout=180,
         reload_timeout=10,
         restart_timeout=3720,
         poll_initial=1,
@@ -106,18 +111,31 @@ class FakeAuthority:
     def __init__(self, events: list[tuple]) -> None:
         self.events = events
         self.current_password = OLD_PASSWORD
+        self.now = lambda: NOW
+        self.current_expires_at = NOW + timedelta(hours=1)
 
     def probe(self, config) -> None:
         self.events.append(("probe", config.password))
         if config.password != self.current_password:
             raise RotationError("stale credential")
+        if self.now() >= self.current_expires_at:
+            raise RotationError("expired credential")
+
+    def current_expiry(self, config) -> tuple[datetime, float]:
+        self.events.append(("expiry", config.password))
+        if config.password != self.current_password:
+            raise RotationError("stale credential")
+        return self.current_expires_at, (
+            self.current_expires_at - self.now()
+        ).total_seconds()
 
     def rotate(self, config, new_secret: str, verifier: str):
         self.events.append(("rotate", config.password))
         assert config.password == self.current_password
         assert verifier.startswith("SCRAM-SHA-256$")
         self.current_password = new_secret
-        return NOW + timedelta(hours=1)
+        self.current_expires_at = self.now() + timedelta(hours=1)
+        return self.current_expires_at
 
 
 def _controller(tmp_path: Path, events: list[tuple]):
@@ -128,7 +146,6 @@ def _controller(tmp_path: Path, events: list[tuple]):
         systemd,
         authority,
         Audit(),
-        wall_clock=lambda: NOW,
         port_probe=lambda host, port, timeout: events.append(
             ("port", host, port, timeout)
         ),
@@ -242,6 +259,84 @@ def test_tunnel_timeout_fails_before_any_drain_or_rotation(tmp_path: Path) -> No
     assert not any(event[0] in {"drain", "rotate"} for event in events)
 
 
+def test_current_expiry_before_late_drain_ack_recovers_without_mutation(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    clock = [0.0]
+    controller.config = replace(
+        controller.config,
+        prerequisite_timeout=10,
+        drain_timeout=180,
+        reload_timeout=10,
+        poll_initial=10,
+        poll_max=10,
+    )
+    controller.monotonic = lambda: clock[0]
+    controller.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    authority.now = lambda: NOW + timedelta(seconds=clock[0])
+    authority.current_expires_at = NOW + timedelta(seconds=900)
+    original_state = systemd.state
+
+    def drain(unit: str) -> None:
+        events.append(("drain", unit))
+        systemd.status[unit] = "aicc-draining"
+
+    def state(unit: str) -> UnitState:
+        if unit in systemd.status and clock[0] >= 1000:
+            systemd.status[unit] = "aicc-drained"
+        return original_state(unit)
+
+    systemd.drain = drain  # type: ignore[method-assign]
+    systemd.state = state  # type: ignore[method-assign]
+
+    with pytest.raises(RotationError, match="timed out waiting"):
+        controller.rotate()
+
+    assert clock[0] == 180
+    assert clock[0] < 900
+    assert authority.current_password == OLD_PASSWORD
+    assert not any(event[0] == "rotate" for event in events)
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    assert not controller.config.phase_file.exists()
+
+
+def test_readiness_delay_refreshes_expiry_and_refuses_before_drain(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    clock = [0.0]
+    controller.config = replace(
+        controller.config,
+        prerequisite_timeout=400,
+        poll_initial=50,
+        poll_max=50,
+    )
+    controller.monotonic = lambda: clock[0]
+    controller.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    authority.now = lambda: NOW + timedelta(seconds=clock[0])
+    authority.current_expires_at = NOW + timedelta(seconds=1300)
+    original_state = systemd.state
+
+    def state(unit: str) -> UnitState:
+        if unit == LANE_1 and clock[0] < 300:
+            events.append(("state", unit))
+            return UnitState("activating", "start", "", 100)
+        return original_state(unit)
+
+    systemd.state = state  # type: ignore[method-assign]
+
+    with pytest.raises(RotationError, match="expires before drain"):
+        controller.rotate()
+
+    assert clock[0] == 300
+    assert not any(event[0] in {"drain", "rotate"} for event in events)
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    assert not controller.config.phase_file.exists()
+
+
 def test_post_drain_prerequisite_failure_resumes_both_lanes_with_verified_auth(
     tmp_path: Path,
 ) -> None:
@@ -320,7 +415,7 @@ def test_one_hour_expiry_bounds_both_lanes_and_rollback_before_long_restart(
         poll_max=1,
     )
     controller.monotonic = lambda: elapsed[0]
-    controller.wall_clock = lambda: NOW + timedelta(seconds=elapsed[0])
+    authority.now = lambda: NOW + timedelta(seconds=elapsed[0])
     original_reload = systemd.reload
 
     def reload(unit: str, timeout: float) -> None:
@@ -384,7 +479,7 @@ def test_controller_refuses_mutation_when_preflight_consumed_recovery_budget(
     assert not any(event[0] == "rotate" for event in events)
 
 
-def test_unexpected_short_expiry_retains_recovery_secret_and_keeps_lanes_drained(
+def test_unexpected_short_expiry_commits_recovery_secret_and_keeps_phase_durable(
     tmp_path: Path,
 ) -> None:
     events: list[tuple] = []
@@ -393,25 +488,99 @@ def test_unexpected_short_expiry_retains_recovery_secret_and_keeps_lanes_drained
 
     def rotate(config, new_secret: str, verifier: str):
         original_rotate(config, new_secret, verifier)
-        return NOW + timedelta(minutes=5)
+        authority.current_expires_at = NOW + timedelta(minutes=5)
+        return authority.current_expires_at
 
     authority.rotate = rotate  # type: ignore[method-assign]
 
-    with pytest.raises(RotationError, match="recovery file retained"):
+    with pytest.raises(RotationError, match="safety margin"):
         controller.rotate()
 
     assert authority.current_password != OLD_PASSWORD
     assert systemd.status == {LANE_1: "aicc-drained", LANE_2: "aicc-drained"}
     assert (
         read_environment_file(controller.config.env_file)["AICC_PG_PASSWORD"]
-        == OLD_PASSWORD
-    )
-    recovery = list(tmp_path.glob(".worker.env.*"))
-    assert len(recovery) == 1
-    assert (
-        read_environment_file(recovery[0])["AICC_PG_PASSWORD"]
         == authority.current_password
     )
+    assert PhaseJournal(controller.config.phase_file).load().phase == (
+        "credential_committed"
+    )
+
+
+def test_ambiguous_mutation_phase_promotes_only_working_secret_and_reopens_lanes(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    new_secret = "b" * 64
+    prepared = prepare_password_update(controller.config.env_file, new_secret)
+    controller.phase_journal.write("mutation_started", prepared.temporary)
+    authority.current_password = new_secret
+    systemd.status = {LANE_1: "aicc-drained", LANE_2: "aicc-drained"}
+
+    assert controller.recover_interrupted() is True
+
+    assert (
+        read_environment_file(controller.config.env_file)["AICC_PG_PASSWORD"]
+        == new_secret
+    )
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    assert not controller.config.phase_file.exists()
+
+
+def test_interrupted_recovery_waits_through_tunnel_boot_race(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, systemd, _ = _controller(tmp_path, events)
+    controller.phase_journal.write("gates_closed")
+    systemd.status = {LANE_1: "aicc-drained", LANE_2: "aicc-drained"}
+    clock = [0.0]
+    attempts = [0]
+
+    def state(unit: str) -> UnitState:
+        if unit == TUNNEL:
+            attempts[0] += 1
+            systemd.tunnel_ready = attempts[0] >= 3
+        return FakeSystemd.state(systemd, unit)
+
+    systemd.state = state  # type: ignore[method-assign]
+    controller.monotonic = lambda: clock[0]
+    controller.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+
+    assert controller.recover_interrupted() is True
+
+    assert attempts[0] >= 3
+    assert clock[0] <= controller.config.prerequisite_timeout
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    assert not controller.config.phase_file.exists()
+
+
+def test_sigterm_crash_phase_is_reopened_by_execstop_recovery(tmp_path: Path) -> None:
+    events: list[tuple] = []
+    controller, systemd, _ = _controller(tmp_path, events)
+    systemd.status = {LANE_1: "aicc-drained", LANE_2: "aicc-drained"}
+    script = (
+        "import os,signal,sys; "
+        "from pathlib import Path; "
+        "from command_center.ops.credential_rotation import PhaseJournal; "
+        "PhaseJournal(Path(sys.argv[1])).write('gates_closed'); "
+        "os.kill(os.getpid(), signal.SIGTERM)"
+    )
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(controller.config.phase_file)],
+        check=False,
+    )
+    assert crashed.returncode == -signal.SIGTERM
+    assert controller.config.phase_file.exists()
+
+    assert controller.recover_interrupted() is True
+
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    assert ("reload", LANE_1, 10) in events
+    assert ("reload", LANE_2, 10) in events
+    assert not controller.config.phase_file.exists()
 
 
 def test_cli_returns_nonzero_and_audits_controller_failure(
@@ -427,6 +596,8 @@ def test_cli_returns_nonzero_and_audits_controller_failure(
             str(_environment(tmp_path / "worker.env")),
             "--lock-file",
             str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
             "--tunnel-unit",
             TUNNEL,
             "--worker-unit",
@@ -438,6 +609,34 @@ def test_cli_returns_nonzero_and_audits_controller_failure(
 
     assert result == 1
     assert '"event":"rotation_failed"' in capsys.readouterr().out
+
+
+def test_missing_environment_is_audited_nonzero_not_silently_skipped(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(RotationController, "recover_interrupted", lambda self: False)
+    monkeypatch.setattr(RotationController, "_wait_tunnel", lambda self, **kwargs: None)
+    result = main(
+        [
+            "--env-file",
+            str(tmp_path / "missing-worker.env"),
+            "--lock-file",
+            str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
+            "--tunnel-unit",
+            TUNNEL,
+            "--worker-unit",
+            LANE_1,
+            "--worker-unit",
+            LANE_2,
+        ]
+    )
+
+    assert result == 1
+    output = capsys.readouterr().out
+    assert '"event":"rotation_failed"' in output
+    assert "cannot read credential file" in output
 
 
 def test_environment_update_preserves_unrelated_lines_and_mode(tmp_path: Path) -> None:
@@ -491,6 +690,9 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
         root / "deploy/systemd/voyn-aicc-credential-rotation.service"
     ).read_text()
     timer = (root / "deploy/systemd/voyn-aicc-credential-rotation.timer").read_text()
+    alert = (
+        root / "deploy/systemd/voyn-aicc-credential-rotation-alert@.service"
+    ).read_text()
 
     assert "Type=notify-reload" in worker
     assert "KillMode=mixed" in worker
@@ -500,8 +702,23 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     assert rotation.index("--worker-unit voyn-aicc-worker@1.service") < rotation.index(
         "--worker-unit voyn-aicc-worker@2.service"
     )
+    assert "ConditionPathExists" not in rotation
+    assert "OnFailure=voyn-aicc-credential-rotation-alert@%n.service" in rotation
+    assert "ExecStopPost=" in rotation
+    assert "--recover-only" in rotation
+    assert "--phase-file /var/lib/voyn-aicc-credential-rotation/phase.json" in rotation
+    assert "daemon.err" in alert
     lines = dict(line.split("=", 1) for line in rotation.splitlines() if "=" in line)
     argv = shlex.split(lines["ExecStart"])
+    recovery_argv = shlex.split(lines["ExecStopPost"])
+    assert [
+        recovery_argv[index + 1]
+        for index, value in enumerate(recovery_argv)
+        if value == "--worker-unit"
+    ] == [LANE_1, LANE_2]
+    assert [argument for argument in recovery_argv if argument != "--recover-only"] == (
+        argv
+    )
 
     def option(name: str) -> float:
         return float(argv[argv.index(name) + 1])
@@ -538,7 +755,38 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     rotate_function = enrollment.split("CREATE FUNCTION enroll_rotate_self", 1)[1]
     rotate_function = rotate_function.split("$$;", 1)[0]
     assert "p_new_scram_verifier, interval '1 hour'" in rotate_function
-    assert "OnUnitInactiveSec=30min" in timer
+    expiry_migration = (
+        root / "command_center/db/sql/0013_current_credential_expiry.up.sql"
+    ).read_text()
+    assert "v := identity_assert(p_secret)" in expiry_migration
+    assert "v_now := clock_timestamp()" in expiry_migration
+    assert "REVOKE ALL ON FUNCTION identity_current_credential(text) FROM PUBLIC" in (
+        expiry_migration
+    )
+    assert (
+        "GRANT EXECUTE ON FUNCTION identity_current_credential(text) TO aicc_worker"
+        in (expiry_migration)
+    )
+    assert "OnUnitInactiveSec=15min" in timer
+    resume_budget = lane_count * (2 * reload_timeout + authority_timeout)
+    current_pre_drain = (
+        drain_timeout + prerequisite_timeout + 2 * authority_timeout + resume_budget
+    )
+    prior_post_issue = 2 * authority_timeout + lane_count * (
+        2 * reload_timeout + authority_timeout
+    )
+    next_start_preflight = prerequisite_timeout + authority_timeout
+    retry_delay = 15 * 60
+    timer_slack = 60 + 15
+    assert (
+        prior_post_issue
+        + retry_delay
+        + timer_slack
+        + next_start_preflight
+        + current_pre_drain
+        + CREDENTIAL_SAFETY_MARGIN_SECONDS
+        <= SELF_CREDENTIAL_TTL_SECONDS
+    ), "timer cadence must leave a complete current-credential recovery budget"
     assert "OnUnitActiveSec" not in timer
     assert "10.20." not in worker
     assert (
