@@ -168,6 +168,7 @@ PROFILE_READ_ONLY = "read_only"
 PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
 
 READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
+MODEL_ONLY_TASK_TYPES = {"independent_review"}
 MUTATING_TASK_TYPES = {"implementation", "remediation"}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
@@ -498,7 +499,12 @@ def build_command(
         PERMISSION_MODE_BY_PROFILE[profile],
     ]
 
-    if profile == PROFILE_READ_ONLY:
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        # The exact PR diff is already embedded in the prompt by the trusted
+        # control plane. Giving this reviewer Read/Grep/Glob would add ambient
+        # repository authority it neither needs nor can bind to that exact SHA.
+        command += ["--tools", ""]
+    elif profile == PROFILE_READ_ONLY:
         # Tool-set replacement, not a permission-layer denial: Bash (and every
         # shell-reachable mutation) is not in this list, so it cannot be invoked by
         # this run at all. See the module docstring and READ_ONLY_ALLOWED_TOOLS.
@@ -614,7 +620,11 @@ def build_copilot_command(
         "--no-custom-instructions",
         "--no-ask-user",
     ]
-    if profile == PROFILE_READ_ONLY:
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        # Empty availability is stronger than a permission prompt: no Copilot
+        # tool is exposed to the model at all, including read and shell.
+        command += ["--available-tools="]
+    elif profile == PROFILE_READ_ONLY:
         # Grant reads only. Absent `write`/`shell`, mutation is unreachable.
         command += ["--allow-tool", "read"]
     else:

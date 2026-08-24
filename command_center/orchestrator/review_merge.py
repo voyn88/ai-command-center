@@ -225,7 +225,20 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # incrementing this constant, forcing every task to be re-reviewed under the
 # new contract rather than silently reusing a verdict given for an older,
 # looser policy.
-_REVIEW_POLICY_VERSION = "v3"
+_REVIEW_POLICY_VERSION = "v4"
+
+_MODEL_ONLY_REVIEW_EXECUTORS = frozenset({"copilot", "claude"})
+
+
+def _model_only_review_cascade() -> list[dict[str, Any]]:
+    """Only providers with an argv-enforced zero-tool profile may see PR data."""
+    route = cascade_for("review")
+    return [
+        {**link, "task_type": "independent_review", "capability": "model_only"}
+        for link in route
+        if isinstance(link, dict)
+        and link.get("executor") in _MODEL_ONLY_REVIEW_EXECUTORS
+    ]
 
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
@@ -496,24 +509,38 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> tuple[str, str] | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
     prompt (rather than granting the agent its own `gh`/Bash access to fetch
-    it) keeps a review run on the original zero-Bash Read/Grep/Glob profile
+    it) keeps an independent review run on a zero-tool model-only profile
     even though its whole job is to critique attacker-influenceable content:
     independent review (2026-08-21) found that a `Bash(gh pr view:*)`-style
     grant let a prompt-injected instruction in the diff pass an unconstrained
     `--repo` argument and read PRs from other, unrelated repositories with no
     shell-escape needed at all -- a risk that scoping the Bash pattern more
     tightly cannot close, but never granting Bash to begin with does.
-    Returns None on any `gh` failure (network, PR not found, etc.)."""
-    view = _gh(["pr", "view", pr_url, "--json", "headRefOid"], repo_path)
-    if view.returncode != 0:
-        return None
-    head_sha = (json.loads(view.stdout or "{}") or {}).get("headRefOid")
-    if not head_sha:
+    Returns None on any `gh` failure or moving-head race."""
+    def current_head() -> str | None:
+        view = _gh(["pr", "view", pr_url, "--json", "headRefOid"], repo_path)
+        if view.returncode != 0:
+            return None
+        try:
+            value = json.loads(view.stdout or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        head = value.get("headRefOid") if isinstance(value, dict) else None
+        return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) else None
+
+    head_before = current_head()
+    if head_before is None:
         return None
     diff = _gh(["pr", "diff", pr_url], repo_path)
     if diff.returncode != 0:
         return None
-    return diff.stdout, head_sha
+    # `gh pr diff` is not itself addressed by commit SHA. Bind its bytes to an
+    # exact head with a second read and fail closed if a force-push raced the
+    # fetch. This is deliberately before any enqueue/idempotency-key creation.
+    head_after = current_head()
+    if head_after != head_before:
+        return None
+    return diff.stdout, head_before
 
 
 def review_once(
@@ -563,7 +590,7 @@ def review_once(
         "ORDER BY t.task_id LIMIT %s",
         params,
     )
-    cascade = cascade_for("review")
+    cascade = _model_only_review_cascade()
     for task_id, pr_url in tasks:
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
@@ -597,9 +624,11 @@ def review_once(
                 break
             payload = {
                 "kind": "agent_run", "v": 1, "project_id": project_id,
-                "repository_path": repository_path, "task_type": "review",
+                "repository_path": repository_path,
+                "task_type": "independent_review",
                 "prompt": prompt,
-                "timeout_seconds": cfg.review_timeout, "untrusted": False,
+                "timeout_seconds": cfg.review_timeout,
+                "untrusted": True,
                 "cascade": cascade,
             }
             if chunk.count == 1:

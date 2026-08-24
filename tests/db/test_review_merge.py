@@ -83,11 +83,13 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     # the task_id -- so a later push to the same PR (remediation, or an
     # ordinary second push while still IN_PROGRESS) gets its own fresh
     # review instead of being permanently deduped against this one.
-    assert key == f"review:VOYN-W0-R1:7:{head}:v3"
+    assert key == f"review:VOYN-W0-R1:7:{head}:v4"
     assert task_id == "VOYN-W0-R1"
     assert [link["executor"] for link in payload["cascade"]] == ["copilot", "claude"]
     assert max_attempts == len(payload["cascade"]) == 2
-    assert payload["task_type"] == "review" and "pull/7" in payload["prompt"]
+    assert payload["task_type"] == "independent_review"
+    assert payload["untrusted"] is True
+    assert "pull/7" in payload["prompt"]
     # The orchestrator embeds the diff in a collision-safe JSON string -- the
     # review agent still needs no Bash/gh access of its own. Independent review
     # (2026-08-21) found that granting a
@@ -955,9 +957,9 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
         (q, k, p, tid, attempts)
     )
 
-    current_head = iter(["a" * 40])
+    current_head = iter(["a" * 40, "a" * 40])
     review_once(app_factory, enqueue, "/tmp")
-    current_head = iter(["b" * 40])
+    current_head = iter(["b" * 40, "b" * 40])
     review_once(app_factory, enqueue, "/tmp")
 
     assert len(calls) == 2
