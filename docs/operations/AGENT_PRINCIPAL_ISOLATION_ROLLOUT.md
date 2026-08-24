@@ -21,11 +21,16 @@ This is a fail-closed deployment gate. Do not set
    Copilot stays out of routing until its auth is proven model-only and carries
    no GitHub repository authority.
 4. Create `/etc/aicc/workspace-authority.env` as root:`aicc-publisher` `0640`
-   with exactly one dedicated stable `AICC_WORKSPACE_AUTHORITY_KEY` of at least
-   32 bytes. Publisher/gh/SSH state remains below `/var/lib/aicc-worker` `0700`.
+   with exactly one dedicated stable `AICC_WORKSPACE_AUTHORITY_KEY`. Use
+   `hex:` or `base64:` explicitly; the decoded key must be at least 32 bytes.
+   Publisher/gh/SSH state remains below `/var/lib/aicc-worker` `0700`.
    Never place the key in the rotator-managed DSN file or lane environments.
 5. Review `/etc/aicc/agent-workspace-roots`, then run
    `deploy/install-agent-principal-isolation.sh` from the exact merged SHA.
+   The installer validates all inputs before mutation, installs the versioned
+   `voyn-aicc-worker@.service` and boundary files atomically, and restores the
+   previous files/service enablement if any later verification fails. Use the
+   same script with `--uninstall` for the recorded reversible uninstall.
    The production allowlist contains only `/srv/aicc-workspaces`; do not add
    the publisher checkout or a home directory. The task-local Git metadata
    dependency must be deployed first.

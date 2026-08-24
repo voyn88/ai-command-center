@@ -8,6 +8,8 @@ fi
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 secret_manifest=/etc/aicc/publisher-secret-paths
+worker_template=/etc/systemd/system/voyn-aicc-worker@.service
+worker_dropin=/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
 
 fail() {
   echo "AICC_AGENT_PRINCIPAL_BOUNDARY_FAIL: $*" >&2
@@ -42,6 +44,26 @@ launcher=/usr/libexec/aicc-agent-launcher
 expected_hash=$(sha256sum "$repo_root/ops/aicc_agent_launcher.py" | cut -d' ' -f1)
 installed_hash=$(sha256sum "$launcher" | cut -d' ' -f1)
 [ "$installed_hash" = "$expected_hash" ] || fail "installed launcher SHA drifted"
+
+expected_template_hash=$(sha256sum "$repo_root/deploy/systemd/voyn-aicc-worker@.service" | cut -d' ' -f1)
+installed_template_hash=$(sha256sum "$worker_template" | cut -d' ' -f1) || \
+  fail "versioned worker template is not installed"
+[ "$installed_template_hash" = "$expected_template_hash" ] || \
+  fail "installed worker template SHA drifted"
+expected_dropin_hash=$(sha256sum "$repo_root/deploy/systemd/voyn-aicc-worker-principal-isolation.conf" | cut -d' ' -f1)
+installed_dropin_hash=$(sha256sum "$worker_dropin" | cut -d' ' -f1) || \
+  fail "principal worker drop-in is not installed"
+[ "$installed_dropin_hash" = "$expected_dropin_hash" ] || \
+  fail "installed worker drop-in SHA drifted"
+[ "$(stat -c %U:%G:%a /etc/aicc/workspace-authority.env)" = \
+  "root:aicc-publisher:640" ] || fail "workspace authority ownership drifted"
+PYTHONPATH="$repo_root" python3 - <<'PY' || fail "workspace authority encoding is invalid"
+from pathlib import Path
+
+from command_center.workspace_authority import load_workspace_authority_environment
+
+load_workspace_authority_environment(Path("/etc/aicc/workspace-authority.env"))
+PY
 
 # Measured from inside the same mount/capability envelope: the exact workspace
 # is visible, while an equally group-readable sibling under the canonical root
@@ -83,6 +105,15 @@ while IFS= read -r secret_path; do
 done < "$secret_manifest"
 
 for unit in voyn-aicc-worker@1.service voyn-aicc-worker@2.service; do
+  systemctl is-enabled --quiet "$unit" || fail "$unit is not enabled"
+  [ "$(systemctl show "$unit" -p LoadState --value)" = loaded ] || \
+    fail "$unit is not loadable from the versioned template"
+  [ "$(systemctl show "$unit" -p FragmentPath --value)" = "$worker_template" ] || \
+    fail "$unit does not use the versioned template"
+  case "$(systemctl show "$unit" -p DropInPaths --value)" in
+    *"$worker_dropin"*) : ;;
+    *) fail "$unit does not inherit the principal boundary" ;;
+  esac
   [ "$(systemctl show "$unit" -p NoNewPrivileges --value)" = yes ] || \
     fail "$unit lacks NoNewPrivileges"
   [ "$(systemctl show "$unit" -p ProtectHome --value)" = read-only ] || \

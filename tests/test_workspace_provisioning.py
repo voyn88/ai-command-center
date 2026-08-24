@@ -20,6 +20,10 @@ import pytest
 
 from command_center import git_info
 from command_center import workspace_provisioning as wp
+from command_center.workspace_authority import (
+    decode_workspace_authority_key,
+    load_workspace_authority_environment,
+)
 
 
 def test_workspace_authority_never_falls_back_to_rotating_lease_dsn(
@@ -45,6 +49,25 @@ def test_workspace_authority_accepts_explicit_32_byte_key(monkeypatch):
     monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", "hex:" + "ab" * 32)
 
     assert wp._workspace_authority_key() == bytes.fromhex("ab" * 32)
+
+
+def test_workspace_authority_runtime_and_installer_decoder_accept_same_base64():
+    encoded = "base64:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU="
+
+    assert decode_workspace_authority_key(encoded) == b"abcdefghijklmnopqrstuvwxyz012345"
+
+
+def test_installer_rejects_long_encoding_with_short_decoded_key(tmp_path):
+    authority = tmp_path / "workspace-authority.env"
+    # 24 decoded bytes; the encoded EnvironmentFile value itself is longer
+    # than 32 characters and was incorrectly accepted by the old installer.
+    authority.write_text(
+        "AICC_WORKSPACE_AUTHORITY_KEY=base64:YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="decode to 32"):
+        load_workspace_authority_environment(authority, require_root_owned=False)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Linux worker dirfd boundary")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -265,6 +267,29 @@ def test_worker_derived_workspace_is_accepted_by_same_canonical_root(
     assert other.parent != derived.parent
 
 
+def test_workspace_permission_normalization_clears_inherited_public_bits(
+    launcher, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    nested = workspace / "nested"
+    nested.mkdir(parents=True)
+    payload = nested / "payload"
+    payload.write_text("test", encoding="utf-8")
+    workspace.chmod(0o777)
+    nested.chmod(0o755)
+    payload.chmod(0o777)
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+
+    launcher._prepare_workspace_permissions(workspace)
+
+    assert stat.S_IMODE(workspace.stat().st_mode) == 0o2770
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o2770
+    assert stat.S_IMODE(payload.stat().st_mode) == 0o660
+
+
 def test_output_limit_is_incremental_and_triggers_seal(launcher, monkeypatch):
     monkeypatch.setattr(launcher, "MAX_OUTPUT_BYTES", 1024)
     proc = subprocess.Popen(
@@ -431,6 +456,9 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     root = Path(__file__).parents[2]
     sysusers = (root / "deploy/sysusers.d/aicc-agent.conf").read_text()
     worker = (root / "deploy/systemd/aicc-worker.service").read_text()
+    worker_template = (
+        root / "deploy/systemd/voyn-aicc-worker@.service"
+    ).read_text()
     socket_unit = (root / "deploy/systemd/aicc-agent-launcher.socket").read_text()
     launcher_unit = (
         root / "deploy/systemd/aicc-agent-launcher@.service"
@@ -446,6 +474,10 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     assert "User=aicc-worker" in worker
     assert "AICC_AGENT_PRINCIPAL_ISOLATION=required" in worker
     assert "NoNewPrivileges=true" in worker
+    assert "ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker" in worker_template
+    assert "EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env" in worker_template
+    assert "TimeoutStopSec=3660s" in worker_template
+    assert "TimeoutStartSec=180s" in worker_template
     assert "SocketUser=root" in socket_unit
     assert "SocketGroup=aicc-publisher" in socket_unit
     assert "SocketMode=0660" in socket_unit
@@ -459,15 +491,20 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     root = Path(__file__).parents[2]
     verifier = (root / "ops/verify-agent-principal-boundary.sh").read_text()
     installer = (root / "deploy/install-agent-principal-isolation.sh").read_text()
+    transaction = (root / "ops/aicc_install_transaction.py").read_text()
     assert "agent_uid" in verifier and "publisher_uid" in verifier
     assert "aicc-agent can read" not in verifier
     assert "runuser -u aicc-agent -- test -r" in verifier
     assert "aicc-agent-launcher.socket" in verifier
     assert "ProtectControlGroups" in verifier
     assert "AICC_AGENT_PRINCIPAL_BOUNDARY_OK" in verifier
-    assert "AICC_WORKSPACE_AUTHORITY_KEY" in installer
+    assert "load_workspace_authority_environment" in installer
     assert "/etc/aicc/workspace-authority.env" in installer
-    assert "voyn-aicc-worker@.service.d/20-principal-isolation.conf" in installer
+    assert "voyn-aicc-worker@.service.d/20-principal-isolation.conf" in transaction
+    assert "_atomic_bytes" in transaction
+    assert "self.restore(manifest)" in transaction
+    assert '"--uninstall"' in installer
+    assert "run_transaction rollback" in installer
     assert "voyn-aicc-worker@1.service" in verifier
     assert "voyn-aicc-worker@2.service" in verifier
     assert "voyn-aicc-worker-2.service" not in verifier

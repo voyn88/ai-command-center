@@ -55,8 +55,6 @@ owns. All other git access is read-only, via `command_center.git_info`.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hmac
 import json
 import os
@@ -73,6 +71,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from command_center import git_info
+from command_center.workspace_authority import decode_workspace_authority_key
 
 # Branch names that denote a repository's main line rather than isolated
 # feature/audit work. A task whose expected branch is one of these (or equals
@@ -530,24 +529,9 @@ def _workspace_authority_key() -> bytes | None:
     # rotating database credential would invalidate every persisted task
     # checkpoint during routine lease-password rotation and couples a DB
     # secret to an unrelated signing purpose.
-    value = os.environ.get("AICC_WORKSPACE_AUTHORITY_KEY")
-    if not value:
-        return None
-    try:
-        if value.startswith("hex:"):
-            key = bytes.fromhex(value.removeprefix("hex:"))
-        elif value.startswith("base64:"):
-            key = base64.b64decode(
-                value.removeprefix("base64:"), validate=True
-            )
-        else:
-            # An explicit encoding is part of the authority contract.  It
-            # prevents a human-readable password from being mistaken for a
-            # random signing key and makes byte length unambiguous.
-            return None
-    except (ValueError, binascii.Error):
-        return None
-    return key if len(key) >= 32 else None
+    return decode_workspace_authority_key(
+        os.environ.get("AICC_WORKSPACE_AUTHORITY_KEY")
+    )
 
 
 def _atomic_write_private(path: Path, payload: bytes) -> None:

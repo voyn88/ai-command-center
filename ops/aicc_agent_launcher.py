@@ -313,11 +313,10 @@ def _prepare_workspace_permissions(workspace: Path) -> None:
             if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
                 raise LaunchRefused(f"hard-linked workspace file refused: {path}")
             os.chown(path, -1, workspace_gid, follow_symlinks=False)
-            mode = stat.S_IMODE(info.st_mode)
             if stat.S_ISDIR(info.st_mode):
-                os.chmod(path, mode | 0o2770, follow_symlinks=False)
+                os.chmod(path, 0o2770, follow_symlinks=False)
             elif stat.S_ISREG(info.st_mode):
-                os.chmod(path, mode | 0o660, follow_symlinks=False)
+                os.chmod(path, 0o660, follow_symlinks=False)
 
 
 def _provider_command(manifest: dict[str, Any]) -> list[str]:

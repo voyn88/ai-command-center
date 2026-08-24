@@ -8,114 +8,137 @@ fi
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 workspace_authority_env=/etc/aicc/workspace-authority.env
+state_dir=/var/lib/aicc-principal-isolation
+service_state="$state_dir/service-state"
+transaction="$repo_root/ops/aicc_install_transaction.py"
 
-if [ ! -f "$workspace_authority_env" ]; then
-  echo "dedicated workspace authority environment is missing" >&2
-  exit 1
+run_transaction() {
+  action=$1
+  python3 "$transaction" "$action" \
+    --repo-root "$repo_root" \
+    --state-dir "$state_dir" \
+    --authority-env "$workspace_authority_env"
+}
+
+read_state_value() {
+  key=$1
+  sed -n "s/^$key=//p" "$service_state" | tail -n 1
+}
+
+if [ "${1:-}" = "--uninstall" ]; then
+  [ -f "$service_state" ] || {
+    echo "principal-isolation service state is missing" >&2
+    exit 1
+  }
+  socket_was_enabled=$(read_state_value socket_enabled)
+  socket_was_active=$(read_state_value socket_active)
+  lane1_was_enabled=$(read_state_value lane1_enabled)
+  lane2_was_enabled=$(read_state_value lane2_enabled)
+  systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  run_transaction uninstall
+  systemctl daemon-reload
+  if [ "$lane1_was_enabled" != enabled ]; then
+    systemctl disable voyn-aicc-worker@1.service >/dev/null 2>&1 || true
+  fi
+  if [ "$lane2_was_enabled" != enabled ]; then
+    systemctl disable voyn-aicc-worker@2.service >/dev/null 2>&1 || true
+  fi
+  if [ "$socket_was_enabled" = enabled ]; then
+    systemctl enable aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  fi
+  if [ "$socket_was_active" = active ]; then
+    systemctl start aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  fi
+  rm -f -- "$service_state"
+  echo "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED"
+  exit 0
 fi
 
-# Parse, but never print, the stable checkpoint authority. EnvironmentFile is
-# not a shell program and must not be sourced by this privileged installer.
-python3 - "$workspace_authority_env" <<'PY'
+# Validate every secret and versioned input before the first mutation. The
+# installer and runtime call the same decoder, so encoded length cannot drift.
+PYTHONPATH="$repo_root" python3 - "$workspace_authority_env" <<'PY'
 import pathlib
-import stat
 import sys
 
-path = pathlib.Path(sys.argv[1])
-info = path.lstat()
-if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-    raise SystemExit(
-        "workspace authority environment must be a root-owned non-writable regular file"
-    )
-values = []
-unexpected = []
-for raw in path.read_text(encoding="utf-8").splitlines():
-    line = raw.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, value = line.split("=", 1)
-    key = key.strip()
-    if key == "AICC_WORKSPACE_AUTHORITY_KEY":
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values.append(value)
-    else:
-        unexpected.append(key)
-if unexpected or len(values) != 1 or len(values[0].encode("utf-8")) < 32:
-    raise SystemExit(
-        "workspace authority environment must contain only one "
-        "AICC_WORKSPACE_AUTHORITY_KEY of at least 32 bytes"
-    )
+from command_center.workspace_authority import load_workspace_authority_environment
+
+load_workspace_authority_environment(pathlib.Path(sys.argv[1]))
 PY
 
 for tool in /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/copilot; do
   resolved=$(readlink -f -- "$tool" 2>/dev/null || true)
   if [ -z "$resolved" ] || [ ! -x "$resolved" ] || \
-     [ "$(stat -c %u -- "$resolved" 2>/dev/null || echo -1)" -ne 0 ]; then
-    echo "root-owned executor missing: $tool; run deploy/install-agent-toolchain.sh" >&2
+     [ "$(stat -c %u -- "$resolved" 2>/dev/null || echo -1)" -ne 0 ] || \
+     find "$resolved" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
+    echo "immutable root-owned executor missing: $tool" >&2
     exit 1
   fi
 done
 
-install -D -o root -g root -m 0644 \
-  "$repo_root/deploy/sysusers.d/aicc-agent.conf" \
-  /usr/lib/sysusers.d/aicc-agent.conf
-systemd-sysusers /usr/lib/sysusers.d/aicc-agent.conf
+run_transaction validate
+sh -n "$repo_root/ops/verify-agent-principal-boundary.sh"
 
-install -D -o root -g root -m 0644 \
-  "$repo_root/deploy/tmpfiles.d/aicc-agent.conf" \
-  /usr/lib/tmpfiles.d/aicc-agent.conf
-systemd-tmpfiles --create /usr/lib/tmpfiles.d/aicc-agent.conf
-"$repo_root/deploy/migrate-agent-model-auth.sh"
+socket_was_enabled=$(systemctl is-enabled aicc-agent-launcher.socket 2>/dev/null || true)
+socket_was_active=$(systemctl is-active aicc-agent-launcher.socket 2>/dev/null || true)
+lane1_was_enabled=$(systemctl is-enabled voyn-aicc-worker@1.service 2>/dev/null || true)
+lane2_was_enabled=$(systemctl is-enabled voyn-aicc-worker@2.service 2>/dev/null || true)
+transaction_active=0
 
-# The stable workspace authority has its own file and lifecycle. It must not
-# share the rotator-managed DSN file or a lane-specific environment.
-chown root:aicc-publisher "$workspace_authority_env"
-chmod 0640 "$workspace_authority_env"
-
-install -D -o root -g root -m 0755 \
-  "$repo_root/ops/aicc_agent_launcher.py" \
-  /usr/libexec/aicc-agent-launcher
-install -D -o root -g root -m 0644 \
-  "$repo_root/deploy/systemd/aicc-agent-launcher.socket" \
-  /etc/systemd/system/aicc-agent-launcher.socket
-install -D -o root -g root -m 0644 \
-  "$repo_root/deploy/systemd/aicc-agent-launcher@.service" \
-  /etc/systemd/system/aicc-agent-launcher@.service
-
-if [ ! -e /etc/aicc/agent-workspace-roots ]; then
-  install -D -o root -g root -m 0644 \
-    "$repo_root/deploy/aicc/agent-workspace-roots" \
-    /etc/aicc/agent-workspace-roots
-fi
-if [ ! -e /etc/aicc/agent.env ]; then
-  install -D -o root -g aicc-agent -m 0640 \
-    "$repo_root/deploy/aicc/agent.env" /etc/aicc/agent.env
-fi
-
-install -D -o root -g root -m 0644 \
-  "$repo_root/deploy/aicc/publisher-secret-paths" \
-  /etc/aicc/publisher-secret-paths
-# Install once on the canonical template so every explicitly enabled lane
-# inherits the same principal boundary without copy-pasted instance drift.
-install -D -o root -g root -m 0644 \
-  "$repo_root/deploy/systemd/voyn-aicc-worker-principal-isolation.conf" \
-  /etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
-
-# Authority separation is invalid if the agent can read even one publisher
-# path. Missing optional paths are ignored; every path that exists is tested
-# as the real execution UID, not inferred only from mode bits.
-while IFS= read -r secret_path; do
-  case "$secret_path" in ''|'#'*) continue ;; esac
-  if [ -e "$secret_path" ] && runuser -u aicc-agent -- test -r "$secret_path"; then
-    echo "aicc-agent can read publisher authority path: $secret_path" >&2
-    exit 1
+restore_service_state() {
+  if [ "$lane1_was_enabled" != enabled ]; then
+    systemctl disable voyn-aicc-worker@1.service >/dev/null 2>&1 || true
   fi
-done < /etc/aicc/publisher-secret-paths
+  if [ "$lane2_was_enabled" != enabled ]; then
+    systemctl disable voyn-aicc-worker@2.service >/dev/null 2>&1 || true
+  fi
+  if [ "$socket_was_enabled" != enabled ]; then
+    systemctl disable aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  fi
+  if [ "$socket_was_active" = active ]; then
+    systemctl start aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  else
+    systemctl stop aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  fi
+}
+
+rollback() {
+  result=$?
+  trap - EXIT HUP INT TERM
+  if [ "$transaction_active" -eq 1 ]; then
+    systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
+    run_transaction rollback || true
+    systemctl daemon-reload || true
+    restore_service_state
+    rm -f -- "$service_state"
+  fi
+  exit "$result"
+}
+trap rollback EXIT HUP INT TERM
+
+# Identity and directory creation are additive/idempotent prerequisites. All
+# replaceable files and migrated model credentials are installed only by the
+# reversible transaction below.
+systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
+systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+run_transaction install
+transaction_active=1
+
+umask 077
+service_state_tmp="$state_dir/.service-state.$$"
+{
+  printf 'socket_enabled=%s\n' "$socket_was_enabled"
+  printf 'socket_active=%s\n' "$socket_was_active"
+  printf 'lane1_enabled=%s\n' "$lane1_was_enabled"
+  printf 'lane2_enabled=%s\n' "$lane2_was_enabled"
+} > "$service_state_tmp"
+chmod 0600 "$service_state_tmp"
+mv -f -- "$service_state_tmp" "$service_state"
 
 systemctl daemon-reload
+systemctl enable voyn-aicc-worker@1.service voyn-aicc-worker@2.service
 systemctl enable --now aicc-agent-launcher.socket
-systemctl is-active --quiet aicc-agent-launcher.socket
+"$repo_root/ops/verify-agent-principal-boundary.sh"
 
+transaction_active=0
+trap - EXIT HUP INT TERM
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"
