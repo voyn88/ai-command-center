@@ -75,9 +75,93 @@ def _ready(store, factory, task_id, pr):
         c.commit()
 
 
+def _current_delivery(
+    app_factory,
+    worker,
+    task_id: str,
+    pr: str,
+    head: str,
+    stage: str,
+    *,
+    review_policy: str = "2026-08-24-v1",
+) -> str:
+    """Create the canonical current delivery-attempt row through the REAL
+    projector: a completed agent_run work item carrying exact publish
+    provenance, bound via control_plane_bind_delivery_attempt (stage
+    PUBLISHED), then advanced to the requested stage by an admin fixture
+    update -- these tests exercise the review/merge loops downstream of the
+    projection, not the stage machine itself (that has its own tests)."""
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    store = WorkQueueStore(app_factory)
+    payload = {
+        "kind": "agent_run",
+        "v": 1,
+        "project_id": "AICC",
+        "repository_path": "/srv/x",
+        "task_type": "implement",
+        "prompt": "work",
+        "timeout_seconds": 900,
+        "untrusted": False,
+    }
+    key = f"delivery:{task_id}:{head}"
+    store.enqueue("execution", idempotency_key=key, payload=payload, task_id=task_id)
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert worker.complete(
+        claimed,
+        {
+            "status": "completed",
+            "head_sha": head,
+            "pr_url": pr,
+            "worktree_path": f"/srv/worktrees/{task_id}",
+        },
+    )
+    # The projector runs under result-ingest's definer rights in production;
+    # the app role deliberately has no direct EXECUTE on it, so the fixture
+    # binds through an admin connection to the same per-test database.
+    import os
+
+    import psycopg
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT current_database()")
+        dbname = cur.fetchone()[0]
+        cur.execute("SELECT result_id FROM work_item WHERE idempotency_key=%s", (key,))
+        result_id = cur.fetchone()[0]
+    with (
+        psycopg.connect(os.environ["AICC_TEST_PG_ADMIN_DSN"], dbname=dbname) as c,
+        c.cursor() as cur,
+    ):
+        cur.execute(
+            "SELECT control_plane_bind_delivery_attempt(%s,%s)",
+            (task_id, result_id),
+        )
+        attempt_id = cur.fetchone()[0]
+        if stage != "PUBLISHED":
+            cur.execute(
+                "UPDATE control_plane_delivery_attempt SET stage=%s,"
+                " review_policy=CASE WHEN %s IN ('REVIEWED','ACCEPTED')"
+                " THEN %s ELSE review_policy END,"
+                " revision=revision+1, updated_at=now()"
+                " WHERE delivery_attempt_id=%s",
+                (stage, stage, review_policy, attempt_id),
+            )
+        c.commit()
+        cur.execute(
+            "SELECT stage, is_current FROM control_plane_delivery_attempt"
+            " WHERE delivery_attempt_id=%s",
+            (attempt_id,),
+        )
+        row = cur.fetchone()
+        assert row is not None and row[1] is True and row[0] == stage, (
+            f"delivery fixture did not land: {row!r}"
+        )
+    return attempt_id
+
+
 def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypatch):
 
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7")
     head = "d" * 40
 
@@ -94,6 +178,14 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-R1",
+        "https://github.com/x/repo-d2/pull/7",
+        head,
+        "CI_GREEN",
+    )
     report = review_once(
         app_factory,
         lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
@@ -131,9 +223,17 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
 
 
 def test_review_skips_a_pr_whose_repo_has_no_route(rig):
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(
         store, app_factory, "VOYN-W0-R2", "https://github.com/x/unrouted-repo/pull/9"
+    )
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-R2",
+        "https://github.com/x/unrouted-repo/pull/9",
+        "a" * 40,
+        "CI_GREEN",
     )
     calls = []
     report = review_once(
@@ -149,7 +249,7 @@ def test_review_skips_a_pr_whose_repo_has_no_route(rig):
 
 
 def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypatch):
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-R3", "https://github.com/x/repo-d2/pull/12")
 
     def fake_gh(argv, repo):
@@ -159,6 +259,14 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-R3",
+        "https://github.com/x/repo-d2/pull/12",
+        "a" * 40,
+        "CI_GREEN",
+    )
     report = review_once(
         app_factory,
         lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
@@ -172,7 +280,7 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
 
 
 def test_review_skips_a_diff_over_the_size_cap(rig, _test_repo_routes, monkeypatch):
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13")
     head = "e" * 40
     huge_diff = "x" * (review_merge._MAX_DIFF_CHARS + 1)
@@ -190,6 +298,14 @@ def test_review_skips_a_diff_over_the_size_cap(rig, _test_repo_routes, monkeypat
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-R4",
+        "https://github.com/x/repo-d2/pull/13",
+        head,
+        "CI_GREEN",
+    )
     report = review_once(
         app_factory,
         lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
@@ -204,7 +320,7 @@ def test_review_skips_a_diff_over_the_size_cap(rig, _test_repo_routes, monkeypat
 
 def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):
 
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
     head = "a" * 40
     merge_sha = "b" * 40
@@ -216,9 +332,23 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):
             body = json.dumps(
                 {
                     "state": "OPEN",
+                    "author": {"login": "dimastov-lab"},
                     "headRefOid": head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "reviews": [
+                        {
+                            "author": {"login": "voyn88-acceptance-gate[bot]"},
+                            "submittedAt": "2026-08-23T06:00:00Z",
+                            "body": f"ACCEPTANCE: ACCEPT {head}",
+                        }
+                    ],
+                    "statusCheckRollup": [
+                        {
+                            "name": "Acceptance gate (independent verdict on exact SHA)",
+                            "conclusion": "SUCCESS",
+                            "startedAt": "2026-08-23T04:00:00Z",
+                        },
+                        {"name": "Final merge gate", "conclusion": "SUCCESS"},
+                    ],
                 }
             )
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -229,6 +359,14 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     monkeypatch.setattr(
         review_merge, "_merged_commit_sha", lambda _repo, _pr: merge_sha
+    )
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M1",
+        "https://github.com/x/y/pull/8",
+        head,
+        "ACCEPTED",
     )
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1", merge_sha) in report.merged
@@ -247,7 +385,7 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):
     login is the SAME as the PR's own author must not authorize merge --
     live-confirmed as a real gap on PRs #354/#355, both merged by the
     account that had posted their own marker."""
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M1B", "https://github.com/x/y/pull/21")
     head = "f" * 40
 
@@ -265,12 +403,27 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):
                         "author": {"login": "dimastov-lab"},
                     }
                 ],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [
+                    {
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {"name": "Final merge gate", "conclusion": "SUCCESS"},
+                ],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M1B",
+        "https://github.com/x/y/pull/21",
+        head,
+        "ACCEPTED",
+    )
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1B", "no_accept_marker_on_head") in report.skipped
     with app_factory() as c, c.cursor() as cur:
@@ -286,7 +439,7 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(
     """The positive case of the same check: a genuinely independent
     reviewer login (the acceptance bot's, in production) does authorize
     merge."""
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M1C", "https://github.com/x/y/pull/22")
     head = "1" * 40
     merge_sha = "3" * 40
@@ -306,7 +459,14 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(
                             "author": {"login": "voyn88-acceptance-gate[bot]"},
                         }
                     ],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [
+                        {
+                            "name": "Acceptance gate (independent verdict on exact SHA)",
+                            "conclusion": "SUCCESS",
+                            "startedAt": "2026-08-23T04:00:00Z",
+                        },
+                        {"name": "Final merge gate", "conclusion": "SUCCESS"},
+                    ],
                 }
             )
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -318,6 +478,14 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(
     monkeypatch.setattr(
         review_merge, "_merged_commit_sha", lambda _repo, _pr: merge_sha
     )
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M1C",
+        "https://github.com/x/y/pull/22",
+        head,
+        "ACCEPTED",
+    )
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1C", merge_sha) in report.merged
 
@@ -327,7 +495,7 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
     gate check blocks merge like any other required check, now that the
     bot behind it is reconnected and the check can genuinely reflect an
     independent verdict rather than being permanently, structurally red."""
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M1D", "https://github.com/x/y/pull/23")
     head = "2" * 40
 
@@ -337,16 +505,16 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
         body = json.dumps(
             {
                 "state": "OPEN",
-                "headRefOid": head,
                 "author": {"login": "dimastov-lab"},
-                "reviews": [
+                "headRefOid": head,
+                                "reviews": [
                     {
                         "body": f"ACCEPTANCE: ACCEPT {head}",
                         "author": {"login": "voyn88-acceptance-gate[bot]"},
                     }
                 ],
                 "statusCheckRollup": [
-                    {"name": "CI", "conclusion": "SUCCESS"},
+                    {"name": "Final merge gate", "conclusion": "SUCCESS"},
                     {
                         "name": "Acceptance gate (independent verdict on exact SHA)",
                         "conclusion": "FAILURE",
@@ -357,6 +525,14 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M1D",
+        "https://github.com/x/y/pull/23",
+        head,
+        "ACCEPTED",
+    )
     report = merge_once(app_factory, "/tmp")
     assert any(
         task_id == "VOYN-W0-M1D" and reason.startswith("checks_not_green")
@@ -366,7 +542,7 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
 
 def test_merge_skips_without_marker(rig, monkeypatch):
 
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M2", "https://github.com/x/y/pull/9")
 
     def fake_gh(argv, repo):
@@ -377,12 +553,27 @@ def test_merge_skips_without_marker(rig, monkeypatch):
                 "state": "OPEN",
                 "headRefOid": "b" * 40,
                 "reviews": [],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [
+                    {
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {"name": "Final merge gate", "conclusion": "SUCCESS"},
+                ],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M2",
+        "https://github.com/x/y/pull/9",
+        "b" * 40,
+        "ACCEPTED",
+    )
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M2", "no_accept_marker_on_head") in report.skipped
     with app_factory() as c, c.cursor() as cur:
@@ -398,7 +589,7 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(
     read identically to one that simply carries no conclusion key at all --
     both passed. A required check still running must block merge, not be
     treated as passing."""
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/20")
     head = "c" * 40
 
@@ -408,6 +599,7 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(
         body = json.dumps(
             {
                 "state": "OPEN",
+                "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
                 "reviews": [
                     {
@@ -416,15 +608,32 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(
                     }
                 ],
                 "statusCheckRollup": [
-                    {"name": "CI", "status": "IN_PROGRESS", "conclusion": None},
+                    {
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {
+                        "name": "Final merge gate",
+                        "status": "IN_PROGRESS",
+                        "conclusion": None,
+                    },
                 ],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M3",
+        "https://github.com/x/y/pull/20",
+        head,
+        "ACCEPTED",
+    )
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M3", "checks_not_green: ['CI']") in report.skipped
+    assert ("VOYN-W0-M3", "checks_not_green: ['Final merge gate']") in report.skipped
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M3",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
@@ -434,7 +643,7 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):
     """The rollup mixes CheckRun and legacy StatusContext shapes; a pending
     StatusContext (`state: PENDING`, no `conclusion`/`status` keys at all)
     must block merge the same as a running CheckRun does."""
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M4", "https://github.com/x/y/pull/21")
     head = "f" * 40
 
@@ -444,6 +653,7 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):
         body = json.dumps(
             {
                 "state": "OPEN",
+                "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
                 "reviews": [
                     {
@@ -451,14 +661,38 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):
                         "submittedAt": "2026-01-01T00:00:00Z",
                     }
                 ],
-                "statusCheckRollup": [{"name": "legacy-ci", "state": "PENDING"}],
+                "statusCheckRollup": [
+                    {
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {
+                        "name": "Final merge gate",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {"name": "legacy-ci", "state": "PENDING"},
+                ],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M4",
+        "https://github.com/x/y/pull/21",
+        head,
+        "ACCEPTED",
+    )
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M4", "checks_not_green: ['legacy-ci']") in report.skipped
+    # The versioned policy names the required checks explicitly; an unlisted
+    # legacy context can neither pass nor block a merge. The refusal must be
+    # the invalid marker, and 'legacy-ci' must never appear in a reason.
+    assert ("VOYN-W0-M4", "no_accept_marker_on_head") in report.skipped
+    assert not any("legacy-ci" in reason for _t, reason in report.skipped)
 
 
 def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):
@@ -466,7 +700,7 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
     OLDER review must not authorize merge once a NEWER review exists on the
     same head -- e.g. a stale ACCEPT from before a dismissed/superseded
     review. Only the latest review by submittedAt counts."""
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M5", "https://github.com/x/y/pull/22")
     head = "9" * 40
 
@@ -487,12 +721,27 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
                         "submittedAt": "2026-01-02T00:00:00Z",
                     },
                 ],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [
+                    {
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {"name": "Final merge gate", "conclusion": "SUCCESS"},
+                ],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M5",
+        "https://github.com/x/y/pull/22",
+        head,
+        "ACCEPTED",
+    )
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
 
@@ -511,6 +760,7 @@ def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(
     head = "d" * 40
     pr_url = "https://github.com/x/y/pull/11"
     _ready(store, app_factory, "VOYN-W0-P1", pr_url)
+    _current_delivery(app_factory, worker, "VOYN-W0-P1", pr_url, head, "CI_GREEN")
     _complete_review(
         app_factory,
         worker,
@@ -557,6 +807,7 @@ def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkey
     head = "e" * 40
     pr_url = "https://github.com/x/y/pull/12"
     _ready(store, app_factory, "VOYN-W0-P1B", pr_url)
+    _current_delivery(app_factory, worker, "VOYN-W0-P1B", pr_url, head, "CI_GREEN")
     _complete_review(
         app_factory,
         worker,
@@ -597,6 +848,7 @@ def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkey
     pr_url = "https://github.com/x/y/pull/12"
     _ready(store, app_factory, "VOYN-W0-P2", pr_url)
     feedback = "Found a real defect: the retry loop never terminates."
+    _current_delivery(app_factory, worker, "VOYN-W0-P2", pr_url, head, "CI_GREEN")
     _complete_review(
         app_factory,
         worker,
@@ -662,6 +914,7 @@ def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):
     head = "e" * 40
     pr_url = "https://github.com/x/y/pull/12"
     _ready(store, app_factory, "VOYN-W0-P2B", pr_url)
+    _current_delivery(app_factory, worker, "VOYN-W0-P2B", pr_url, head, "CI_GREEN")
     _complete_review(
         app_factory,
         worker,
@@ -715,6 +968,7 @@ def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):
     head = "9" * 40
     pr_url = "https://github.com/x/y/pull/16"
     _ready(store, app_factory, "VOYN-W0-P6", pr_url)
+    _current_delivery(app_factory, worker, "VOYN-W0-P6", pr_url, head, "CI_GREEN")
     _complete_review(
         app_factory,
         worker,
@@ -759,6 +1013,7 @@ def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):
     real_head = "b" * 40
     pr_url = "https://github.com/x/y/pull/18"
     _ready(store, app_factory, "VOYN-W0-P8", pr_url)
+    _current_delivery(app_factory, worker, "VOYN-W0-P8", pr_url, real_head, "CI_GREEN")
     _complete_review(
         app_factory,
         worker,
@@ -801,6 +1056,7 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
     real_head = "c" * 40
     pr_url = "https://github.com/x/y/pull/17"
     _ready(store, app_factory, "VOYN-W0-P7", pr_url)
+    _current_delivery(app_factory, worker, "VOYN-W0-P7", pr_url, "c" * 40, "CI_GREEN")
     _complete_review(
         app_factory,
         worker,
@@ -835,18 +1091,19 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
 def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):
     import subprocess as sp
 
-    app_factory, store, _worker = rig
+    app_factory, store, worker = rig
     pr_url = "https://github.com/x/y/pull/13"
     _ready(store, app_factory, "VOYN-W0-P3", pr_url)
 
     def fake_gh(argv, repo):
         if argv[:2] == ["pr", "view"]:
             return sp.CompletedProcess(
-                argv, 0, json.dumps({"headRefOid": "z" * 40, "reviews": []}), ""
+                argv, 0, json.dumps({"headRefOid": "e" * 40, "reviews": []}), ""
             )
         return sp.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _current_delivery(app_factory, worker, "VOYN-W0-P3", pr_url, "e" * 40, "CI_GREEN")
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P3", "no_review_result_yet") in report.skipped
 
@@ -856,6 +1113,7 @@ def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):
     head = "f" * 40
     pr_url = "https://github.com/x/y/pull/14"
     _ready(store, app_factory, "VOYN-W0-P4", pr_url)
+    _current_delivery(app_factory, worker, "VOYN-W0-P4", pr_url, head, "REVIEWED")
     _complete_review(
         app_factory,
         worker,
@@ -874,7 +1132,14 @@ def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):
             body = json.dumps(
                 {
                     "headRefOid": head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "author": {"login": "dimastov-lab"},
+                    "reviews": [
+                        {
+                            "author": {"login": "voyn88-acceptance-gate[bot]"},
+                            "submittedAt": "2026-08-23T06:00:00Z",
+                            "body": f"ACCEPTANCE: ACCEPT {head}",
+                        }
+                    ],
                 }
             )
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -906,6 +1171,7 @@ def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(
     new_head = "2" * 40
     pr_url = "https://github.com/x/y/pull/15"
     _ready(store, app_factory, "VOYN-W0-P5", pr_url)
+    _current_delivery(app_factory, worker, "VOYN-W0-P5", pr_url, new_head, "CI_GREEN")
     _complete_review(
         app_factory,
         worker,
@@ -934,7 +1200,7 @@ def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(
 
 def test_merge_skips_when_a_check_is_red(rig, monkeypatch):
 
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/10")
     head = "c" * 40
 
@@ -944,14 +1210,36 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):
         body = json.dumps(
             {
                 "state": "OPEN",
+                "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
+                "reviews": [
+                    {
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                        "submittedAt": "2026-08-23T06:00:00Z",
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                    }
+                ],
+                "statusCheckRollup": [
+                    {
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {"name": "Final merge gate", "conclusion": "FAILURE"},
+                ],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _current_delivery(
+        app_factory,
+        worker,
+        "VOYN-W0-M3",
+        "https://github.com/x/y/pull/10",
+        head,
+        "ACCEPTED",
+    )
     report = merge_once(app_factory, "/tmp")
     assert any(t == "VOYN-W0-M3" and "checks_not_green" in r for t, r in report.skipped)
 
@@ -967,7 +1255,13 @@ def test_mergeability_uses_latest_check_rerun(monkeypatch):
                 "state": "OPEN",
                 "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"author": {"login": "voyn88-acceptance-gate[bot]"}, "submittedAt": "2026-08-23T06:00:00Z", "body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "reviews": [
+                    {
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                        "submittedAt": "2026-08-23T06:00:00Z",
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                    }
+                ],
                 "statusCheckRollup": [
                     {
                         "name": "Acceptance gate (independent verdict on exact SHA)",
@@ -1007,7 +1301,13 @@ def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
                 "state": "OPEN",
                 "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"author": {"login": "voyn88-acceptance-gate[bot]"}, "submittedAt": "2026-08-23T06:00:00Z", "body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "reviews": [
+                    {
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                        "submittedAt": "2026-08-23T06:00:00Z",
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                    }
+                ],
                 "statusCheckRollup": [
                     {
                         "name": "Final merge gate",
@@ -1034,7 +1334,10 @@ def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
         "/tmp", "https://github.com/x/y/pull/10"
     )
     assert not ready
-    assert reason == "checks_not_green: ['Acceptance gate (independent verdict on exact SHA)']"
+    assert (
+        reason
+        == "checks_not_green: ['Acceptance gate (independent verdict on exact SHA)']"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1057,7 +1360,13 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
                 "state": "OPEN",
                 "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"author": {"login": "voyn88-acceptance-gate[bot]"}, "submittedAt": "2026-08-23T06:00:00Z", "body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "reviews": [
+                    {
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                        "submittedAt": "2026-08-23T06:00:00Z",
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                    }
+                ],
                 "statusCheckRollup": [
                     {
                         "name": "Final merge gate",
@@ -1100,8 +1409,14 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
             },
         ],
         [
-            {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "FAILURE"},
-            {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"},
+            {
+                "name": "Acceptance gate (independent verdict on exact SHA)",
+                "conclusion": "FAILURE",
+            },
+            {
+                "name": "Acceptance gate (independent verdict on exact SHA)",
+                "conclusion": "SUCCESS",
+            },
         ],
     ],
 )
@@ -1116,8 +1431,21 @@ def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, ch
                 "state": "OPEN",
                 "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"author": {"login": "voyn88-acceptance-gate[bot]"}, "submittedAt": "2026-08-23T06:00:00Z", "body": f"ACCEPTANCE: ACCEPT {head}"}],
-                "statusCheckRollup": checks + [{"name": "Final merge gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:00:00Z"}],
+                "reviews": [
+                    {
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                        "submittedAt": "2026-08-23T06:00:00Z",
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                    }
+                ],
+                "statusCheckRollup": checks
+                + [
+                    {
+                        "name": "Final merge gate",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    }
+                ],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -1127,7 +1455,10 @@ def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, ch
         "/tmp", "https://github.com/x/y/pull/10"
     )
     assert not ready
-    assert reason == "checks_not_green: ['Acceptance gate (independent verdict on exact SHA)']"
+    assert (
+        reason
+        == "checks_not_green: ['Acceptance gate (independent verdict on exact SHA)']"
+    )
 
 
 def test_repo_from_pr_url():
@@ -1167,7 +1498,7 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(
     whatever the first push's review concluded."""
     import subprocess as sp
 
-    app_factory, store, _ = rig
+    app_factory, store, worker = rig
     pr_url = "https://github.com/x/repo-d2/pull/20"
     _ready(store, app_factory, "VOYN-W0-R5", pr_url)
 
@@ -1187,8 +1518,10 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(
         calls.append((q, k, p, tid, attempts))
 
     current_head = iter(["a" * 40])
+    _current_delivery(app_factory, worker, "VOYN-W0-R5", pr_url, "a" * 40, "CI_GREEN")
     review_once(app_factory, enqueue, "/tmp")
     current_head = iter(["b" * 40])
+    _current_delivery(app_factory, worker, "VOYN-W0-R5", pr_url, "b" * 40, "CI_GREEN")
     review_once(app_factory, enqueue, "/tmp")
 
     assert len(calls) == 2

@@ -443,7 +443,7 @@ def _latest_review_result(
         "SELECT wr.payload,wr.result_id,a.claimed_by_role,i.idempotency_key "
         "FROM work_item i "
         "JOIN work_result wr ON wr.result_id = i.result_id "
-        "JOIN work_attempt a ON a.attempt_id=wr.attempt_id "
+        "JOIN work_attempt_public a ON a.attempt_id=wr.attempt_id "
         "WHERE i.task_id = %s AND i.idempotency_key = %s AND i.state = 'succeeded' "
         "ORDER BY wr.created_at DESC LIMIT 1",
         (task_id, key),
