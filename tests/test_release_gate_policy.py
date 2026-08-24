@@ -13,7 +13,9 @@ CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 
 EXPECTED_CONTEXTS = {
-    "quality-gates": "Quality gates (whitespace · Ruff · compile · pytest)",
+    "quality-gates": "Linux quality shard ${{ matrix.shard }} of 4",
+    "manifest-gate": "Linux manifest gate (exactly once)",
+    "coverage-gate": "Main coverage aggregation",
     "windows-quality-gates": "Windows quality gates (Ruff · compile · pytest)",
     "security-gates": "Security gates (workflow policy · provenance · supply chain)",
     "build-gates": "Build gates (web production)",
@@ -27,13 +29,18 @@ EXPECTED_CONTEXTS = {
 }
 
 EXPECTED_STEPS = {
-    # The required test gate runs as a parallel body (pytest-xdist) plus a short
-    # serial tail; both together run every test exactly once.
+    # Four fixed shards run the core partition while exactly one matrix member
+    # owns each non-parallel partition. The manifest gate proves the nodeid
+    # union is non-empty and exactly-once before Final can pass.
     "quality-gates": {
-        "Pytest + coverage (parallel)",
+        "Build exactly-once test manifest",
+        "Pytest core shard",
         "Pytest (serial tail)",
         "Real-browser E2E",
+        "Publish exact test manifest",
     },
+    "manifest-gate": {"Verify four identical non-empty manifests"},
+    "coverage-gate": {"PR and merge-group coverage policy"},
     "impact-fast-check": {"Select impacted tests", "Run impacted tests (parallel)"},
     "windows-quality-gates": {"Desktop pytest-qt suite", "Real-browser E2E"},
     "security-gates": {
@@ -234,7 +241,9 @@ def test_every_step_holding_a_repository_secret_first_proves_its_code_is_ours() 
             offenders.append((path.name, job_id, step.get("name"), first))
             continue
         if "GITHUB_TOKEN" not in _secret_names(step.get("env", {})):
-            offenders.append((path.name, job_id, step.get("name"), "guard has no GITHUB_TOKEN"))
+            offenders.append(
+                (path.name, job_id, step.get("name"), "guard has no GITHUB_TOKEN")
+            )
     assert not offenders, (
         "steps receive a repository secret without first proving the checked-out "
         f"code was authored here: {offenders}"
@@ -258,7 +267,9 @@ def test_a_refused_guard_actually_stops_the_step() -> None:
         if shell in ABORTING_SHELLS:
             continue
         inherited = ((job.get("defaults") or {}).get("run") or {}).get("shell")
-        offenders.append((path.name, job_id, step.get("name"), shell or f"inherited:{inherited}"))
+        offenders.append(
+            (path.name, job_id, step.get("name"), shell or f"inherited:{inherited}")
+        )
     assert not offenders, (
         "steps hand over a repository secret under a shell that does not abort on the "
         f"guard's refusal; declare `shell: bash`: {offenders}"
@@ -284,7 +295,10 @@ def test_repository_secrets_are_never_scoped_wider_than_a_single_step() -> None:
             if job.get("uses"):
                 passed = job.get("secrets")
                 assert passed != "inherit", (path.name, job_id, "secrets: inherit")
-                assert not _secret_names(passed or {}) - EPHEMERAL_SECRETS, (path.name, job_id)
+                assert not _secret_names(passed or {}) - EPHEMERAL_SECRETS, (
+                    path.name,
+                    job_id,
+                )
 
 
 def test_the_trust_guard_exists_where_the_workflows_expect_it() -> None:
@@ -297,14 +311,20 @@ def test_the_secret_invariants_see_every_workflow_in_the_directory() -> None:
         CI_WORKFLOW.name,
         BOUNDARY_WORKFLOW.name,
     }
-    assert len(_workflow_paths()) == len(list((ROOT / ".github/workflows").glob("*.y*ml")))
+    assert len(_workflow_paths()) == len(
+        list((ROOT / ".github/workflows").glob("*.y*ml"))
+    )
 
 
 def test_every_required_context_has_a_deliberate_failure_canary() -> None:
     jobs = _all_jobs()
     for job_id in CANARY_LABELS:
         job = jobs[job_id]
-        (canary,) = [step for step in job["steps"] if step.get("name") == "Deliberate failure canary"]
+        (canary,) = [
+            step
+            for step in job["steps"]
+            if step.get("name") == "Deliberate failure canary"
+        ]
         assert CANARY_LABELS[job_id] in canary["if"]
         assert canary["run"].strip() == "exit 1"
 
@@ -320,6 +340,8 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
     final_gate = _workflow(CI_WORKFLOW)["jobs"]["final-gate"]
     required = {
         "quality-gates",
+        "manifest-gate",
+        "coverage-gate",
         "windows-quality-gates",
         "security-gates",
         "build-gates",
@@ -329,7 +351,9 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
     assert set(final_gate["needs"]) == required
 
     (assertion_step,) = [
-        step for step in final_gate["steps"] if step.get("name") == "Assert required checks"
+        step
+        for step in final_gate["steps"]
+        if step.get("name") == "Assert required checks"
     ]
     script = assertion_step["run"]
     for job_id in required:
