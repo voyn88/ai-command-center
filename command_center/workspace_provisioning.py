@@ -81,13 +81,20 @@ from command_center import git_info
 MAIN_BRANCH_NAMES = frozenset({"main", "master"})
 
 # Working-tree cleanliness policies a caller can require before launch.
-STATUS_POLICY_ALLOW_DIRTY = "allow_dirty"      # default — never blocks on dirtiness
-STATUS_POLICY_NO_UNTRACKED = "no_untracked"    # block if there are untracked files
-STATUS_POLICY_CLEAN = "clean"                  # block on any modified/untracked file
+STATUS_POLICY_ALLOW_DIRTY = "allow_dirty"  # default — never blocks on dirtiness
+STATUS_POLICY_NO_UNTRACKED = "no_untracked"  # block if there are untracked files
+STATUS_POLICY_CLEAN = "clean"  # block on any modified/untracked file
 STATUS_POLICIES = frozenset(
     {STATUS_POLICY_ALLOW_DIRTY, STATUS_POLICY_NO_UNTRACKED, STATUS_POLICY_CLEAN}
 )
 PROVISION_OUTCOMES = frozenset({"skipped", "reused", "attached", "created", "cloned"})
+
+# Named tuple so the py314-target formatter (PEP 758) cannot rewrite the
+# except clause into the unparenthesized form that is a SyntaxError on the
+# Python 3.13 runtimes this module must also run on.
+_KEY_DECODE_ERRORS = (ValueError, binascii.Error)
+_MARKER_READ_ERRORS = (OSError, ValueError, TypeError)
+_GIT_RUN_ERRORS = (OSError, subprocess.SubprocessError)
 
 _TASK_LOCAL_MARKER = "aicc-task-workspace.json"
 _TASK_CLONE_PARENT_SUFFIX = "-task-clones"
@@ -240,7 +247,11 @@ def task_workspace_path(repository: str | Path, branch: str) -> Path:
     normalized = branch.strip().strip("/") or "work"
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", normalized).strip("-._") or "work"
     digest = sha256(branch.encode("utf-8")).hexdigest()[:12]
-    return repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}" / f"{slug[:80]}-{digest}"
+    return (
+        repo.parent
+        / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
+        / f"{slug[:80]}-{digest}"
+    )
 
 
 def _git_rev_parse_path(cwd: Path, flag: str) -> Path | None:
@@ -278,7 +289,9 @@ def _is_primary_worktree(cwd: Path) -> bool:
     return git_dir == common
 
 
-def is_pipeline_owned_worktree(workspace: str | Path, repository_path: str | Path | None) -> bool:
+def is_pipeline_owned_worktree(
+    workspace: str | Path, repository_path: str | Path | None
+) -> bool:
     """True when `workspace` is a *linked* worktree of `repository_path` — i.e. a
     directory this application provisions and owns, not a human's primary
     working tree and not an unrelated repository.
@@ -304,10 +317,14 @@ def is_pipeline_owned_worktree(workspace: str | Path, repository_path: str | Pat
         return False
     ws_common = _git_common_dir(ws)
     repo_common = _git_common_dir(repo)
-    return ws_common is not None and repo_common is not None and ws_common == repo_common
+    return (
+        ws_common is not None and repo_common is not None and ws_common == repo_common
+    )
 
 
-def _conflicting_worktree(repo: Path, branch: str, workspace_resolved: Path) -> str | None:
+def _conflicting_worktree(
+    repo: Path, branch: str, workspace_resolved: Path
+) -> str | None:
     """Path of another worktree of `repo` that already has `branch` checked
     out (a different path than `workspace_resolved`), or `None`."""
     for entry in git_info.get_worktrees(repo):
@@ -407,7 +424,8 @@ def _run_provision_git(
             remediation="Resolve the standalone Git workspace failure and retry the launch.",
             expected_workspace=spec.workspace_path,
             expected_branch=spec.expected_branch,
-            detail=(result.stderr or result.stdout).strip() or f"git {' '.join(argv[:2])} failed",
+            detail=(result.stderr or result.stdout).strip()
+            or f"git {' '.join(argv[:2])} failed",
         )
     return result
 
@@ -418,7 +436,10 @@ def _source_remote_url(repo: Path, spec: WorkspaceSpec) -> str:
         value = remote.stdout.strip()
         # Never persist or hand an agent an HTTPS URL containing user-info.
         # Canonical GitHub HTTPS and SSH URLs remain allowed.
-        if value.startswith(("http://", "https://")) and "@" in value.split("//", 1)[1].split("/", 1)[0]:
+        if (
+            value.startswith(("http://", "https://"))
+            and "@" in value.split("//", 1)[1].split("/", 1)[0]
+        ):
             raise WorkspaceVerificationError(
                 failed_step="canonical_remote_has_no_embedded_credentials",
                 remediation="Replace origin with a credential-free canonical repository URL.",
@@ -440,12 +461,12 @@ def _source_remote_url(repo: Path, spec: WorkspaceSpec) -> str:
     return str(repo)
 
 
-def _resolve_remote_base_sha(
-    repo: Path, remote_url: str, spec: WorkspaceSpec
-) -> str:
+def _resolve_remote_base_sha(repo: Path, remote_url: str, spec: WorkspaceSpec) -> str:
     if spec.base_sha:
         candidate = spec.base_sha.strip().lower()
-        if len(candidate) != 40 or any(char not in "0123456789abcdef" for char in candidate):
+        if len(candidate) != 40 or any(
+            char not in "0123456789abcdef" for char in candidate
+        ):
             raise WorkspaceVerificationError(
                 failed_step="base_sha_valid",
                 remediation="Provide a full 40-character hexadecimal base SHA.",
@@ -478,7 +499,9 @@ def _resolve_remote_base_sha(
             detail=f"ambiguous base response for {spec.base_branch!r}",
         )
     candidate = lines[0][0].lower()
-    if len(candidate) != 40 or any(char not in "0123456789abcdef" for char in candidate):
+    if len(candidate) != 40 or any(
+        char not in "0123456789abcdef" for char in candidate
+    ):
         raise WorkspaceVerificationError(
             failed_step="resolve_remote_base_sha",
             remediation="Make the canonical remote return a full commit SHA.",
@@ -510,7 +533,9 @@ def _resolve_remote_ref_sha(
             detail=f"ambiguous remote response for {ref!r}",
         )
     candidate = lines[0][0].lower()
-    if len(candidate) != 40 or any(char not in "0123456789abcdef" for char in candidate):
+    if len(candidate) != 40 or any(
+        char not in "0123456789abcdef" for char in candidate
+    ):
         raise WorkspaceVerificationError(
             failed_step="resolve_remote_ref_sha",
             remediation="Make the canonical remote return a full SHA-1.",
@@ -522,7 +547,11 @@ def _resolve_remote_ref_sha(
 
 
 def _task_local_marker_path(workspace: Path) -> Path:
-    return workspace.parent / ".aicc-task-metadata" / f"{workspace.name}.{_TASK_LOCAL_MARKER}"
+    return (
+        workspace.parent
+        / ".aicc-task-metadata"
+        / f"{workspace.name}.{_TASK_LOCAL_MARKER}"
+    )
 
 
 def _workspace_authority_key() -> bytes | None:
@@ -537,15 +566,13 @@ def _workspace_authority_key() -> bytes | None:
         if value.startswith("hex:"):
             key = bytes.fromhex(value.removeprefix("hex:"))
         elif value.startswith("base64:"):
-            key = base64.b64decode(
-                value.removeprefix("base64:"), validate=True
-            )
+            key = base64.b64decode(value.removeprefix("base64:"), validate=True)
         else:
             # An explicit encoding is part of the authority contract.  It
             # prevents a human-readable password from being mistaken for a
             # random signing key and makes byte length unambiguous.
             return None
-    except (ValueError, binascii.Error):
+    except _KEY_DECODE_ERRORS:
         return None
     return key if len(key) >= 32 else None
 
@@ -595,10 +622,7 @@ def _atomic_write_private(path: Path, payload: bytes) -> None:
     try:
         file_fd = os.open(
             temporary,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
             dir_fd=directory_fd,
         )
@@ -677,20 +701,24 @@ def _read_task_local_marker(workspace: Path) -> dict | None:
     marker = _task_local_marker_path(workspace)
     try:
         value = json.loads(_read_private_file(marker).decode("utf-8"))
-    except (OSError, ValueError, TypeError):
+    except _MARKER_READ_ERRORS:
         return None
     if not isinstance(value, dict):
         return None
     expected = _marker_signature(value)
     actual = value.get("authority_hmac")
-    if expected is None or not isinstance(actual, str) or not hmac.compare_digest(
-        actual, expected
+    if (
+        expected is None
+        or not isinstance(actual, str)
+        or not hmac.compare_digest(actual, expected)
     ):
         return None
     return value
 
 
-def _provision_task_local_clone(spec: WorkspaceSpec, repo: Path, workspace: Path) -> str:
+def _provision_task_local_clone(
+    spec: WorkspaceSpec, repo: Path, workspace: Path
+) -> str:
     """Create an independent clone whose entire Git write surface is local.
 
     The agent receives no remote at all. The guarded publisher later imports
@@ -698,7 +726,10 @@ def _provision_task_local_clone(spec: WorkspaceSpec, repo: Path, workspace: Path
     """
     raw_workspace = Path(spec.workspace_path).expanduser()
     expected_parent = repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
-    if raw_workspace.parent.resolve() != expected_parent.resolve() or raw_workspace.is_symlink():
+    if (
+        raw_workspace.parent.resolve() != expected_parent.resolve()
+        or raw_workspace.is_symlink()
+    ):
         raise WorkspaceVerificationError(
             failed_step="task_clone_path_safe",
             remediation="Use task_workspace_path() below the repository task-clone root.",
@@ -743,7 +774,9 @@ def _provision_task_local_clone(spec: WorkspaceSpec, repo: Path, workspace: Path
             timeout=180,
         )
         created = True
-        present = git_info.run_git_command(target, ["cat-file", "-e", f"{base_sha}^{{commit}}"])
+        present = git_info.run_git_command(
+            target, ["cat-file", "-e", f"{base_sha}^{{commit}}"]
+        )
         if present is None or present.returncode != 0:
             raise WorkspaceVerificationError(
                 failed_step="base_sha_present",
@@ -754,7 +787,8 @@ def _provision_task_local_clone(spec: WorkspaceSpec, repo: Path, workspace: Path
             )
 
         remote_branch = git_info.run_git_command(
-            target, ["rev-parse", "--verify", f"origin/{spec.expected_branch}^{{commit}}"]
+            target,
+            ["rev-parse", "--verify", f"origin/{spec.expected_branch}^{{commit}}"],
         )
         start_ref = (
             f"origin/{spec.expected_branch}"
@@ -844,7 +878,9 @@ def _provision_task_local_clone(spec: WorkspaceSpec, repo: Path, workspace: Path
         raise
 
 
-def _worktree_add(repo: Path, workspace: Path, extra_args: list[str], spec: WorkspaceSpec) -> None:
+def _worktree_add(
+    repo: Path, workspace: Path, extra_args: list[str], spec: WorkspaceSpec
+) -> None:
     workspace.parent.mkdir(parents=True, exist_ok=True)
     try:
         result = subprocess.run(
@@ -869,7 +905,8 @@ def _worktree_add(repo: Path, workspace: Path, extra_args: list[str], spec: Work
             remediation="Resolve the git worktree creation failure and retry the launch.",
             expected_workspace=spec.workspace_path,
             expected_branch=spec.expected_branch,
-            detail=(result.stderr or result.stdout).strip() or "git worktree add failed",
+            detail=(result.stderr or result.stdout).strip()
+            or "git worktree add failed",
         )
 
 
@@ -907,7 +944,9 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
     workspace_target = workspace.resolve()
     branch_exists = spec.expected_branch in git_info.get_branches(repo)
     if branch_exists:
-        conflict = _conflicting_worktree(repo, spec.expected_branch, _resolve(workspace))
+        conflict = _conflicting_worktree(
+            repo, spec.expected_branch, _resolve(workspace)
+        )
         if conflict is not None:
             raise WorkspaceVerificationError(
                 failed_step="no_conflicting_worktree",
@@ -919,7 +958,9 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
                 expected_branch=spec.expected_branch,
                 detail="cannot attach an already-checked-out branch to a second worktree",
             )
-        _worktree_add(repo, workspace, [str(workspace_target), spec.expected_branch], spec)
+        _worktree_add(
+            repo, workspace, [str(workspace_target), spec.expected_branch], spec
+        )
         return "attached"
 
     remote_branch = _remote_branch_ref(repo, spec.expected_branch)
@@ -927,18 +968,31 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
         _worktree_add(
             repo,
             workspace,
-            ["--track", "-b", spec.expected_branch, str(workspace_target), remote_branch],
+            [
+                "--track",
+                "-b",
+                spec.expected_branch,
+                str(workspace_target),
+                remote_branch,
+            ],
             spec,
         )
         return "attached"
 
-    verify = git_info.run_git_command(repo, ["rev-parse", "--verify", f"{spec.base_branch}^{{commit}}"])
+    verify = git_info.run_git_command(
+        repo, ["rev-parse", "--verify", f"{spec.base_branch}^{{commit}}"]
+    )
     if verify is None or verify.returncode != 0:
         # Base branch missing — let `verify_workspace` report it as the
         # structured `base_branch_exists` / `workspace_exists` failure rather
         # than raising a less specific error here.
         return "skipped"
-    _worktree_add(repo, workspace, ["-b", spec.expected_branch, str(workspace_target), spec.base_branch], spec)
+    _worktree_add(
+        repo,
+        workspace,
+        ["-b", spec.expected_branch, str(workspace_target), spec.base_branch],
+        spec,
+    )
     return "created"
 
 
@@ -1225,7 +1279,9 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
         actual_branch=None,
     )
 
-    def fail(step: str, remediation: str, detail: str, actual_branch: str | None = None) -> None:
+    def fail(
+        step: str, remediation: str, detail: str, actual_branch: str | None = None
+    ) -> None:
         raise WorkspaceVerificationError(
             failed_step=step,
             remediation=remediation,
@@ -1239,7 +1295,10 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     evidence.provision_outcome = spec.provision_outcome
 
     # 1. Workspace exists.
-    if not Path(workspace_input).expanduser().exists() or not workspace_resolved.is_dir():
+    if (
+        not Path(workspace_input).expanduser().exists()
+        or not workspace_resolved.is_dir()
+    ):
         fail(
             "workspace_exists",
             "Provision the worktree (git worktree add) or fix the task's workspace_path.",
@@ -1270,7 +1329,11 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     if repo_resolved is not None and git_info.get_status(repo_resolved).get("is_repo"):
         workspace_common = _git_common_dir(workspace_resolved)
         repo_common = _git_common_dir(repo_resolved)
-        if workspace_common is None or repo_common is None or workspace_common != repo_common:
+        if (
+            workspace_common is None
+            or repo_common is None
+            or workspace_common != repo_common
+        ):
             fail(
                 "workspace_belongs_to_repository",
                 "Use a worktree of the configured repository, not a different repository.",
@@ -1279,7 +1342,11 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
             )
         evidence.record("workspace_belongs_to_repository", True, str(workspace_common))
     else:
-        evidence.record("workspace_belongs_to_repository", True, "source repository not provided; skipped")
+        evidence.record(
+            "workspace_belongs_to_repository",
+            True,
+            "source repository not provided; skipped",
+        )
 
     # 4. Current branch equals the expected branch.
     if spec.expected_branch:
@@ -1304,7 +1371,9 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
 
     # 5. Expected branch is not checked out in a conflicting worktree.
     if spec.expected_branch and repo_resolved is not None:
-        conflict = _conflicting_worktree(repo_resolved, spec.expected_branch, workspace_resolved)
+        conflict = _conflicting_worktree(
+            repo_resolved, spec.expected_branch, workspace_resolved
+        )
         if conflict is not None:
             fail(
                 "no_conflicting_worktree",
@@ -1337,7 +1406,9 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     # 7. Base branch exists (when one is configured).
     if spec.base_branch and repo_resolved is not None:
         base_ref = f"{spec.base_branch}^{{commit}}"
-        base_ok = git_info.run_git_command(repo_resolved, ["rev-parse", "--verify", base_ref])
+        base_ok = git_info.run_git_command(
+            repo_resolved, ["rev-parse", "--verify", base_ref]
+        )
         if base_ok is None or base_ok.returncode != 0:
             fail(
                 "base_branch_exists",
@@ -1468,8 +1539,10 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
             expected_branch=expected_branch,
             detail=f"cannot read branch ref safely: {exc}",
         ) from exc
-    if candidate is None or len(candidate) != 40 or any(
-        char not in "0123456789abcdefABCDEF" for char in candidate
+    if (
+        candidate is None
+        or len(candidate) != 40
+        or any(char not in "0123456789abcdefABCDEF" for char in candidate)
     ):
         raise WorkspaceVerificationError(
             failed_step="agent_head_sha",
@@ -1518,7 +1591,9 @@ def _copy_agent_objects(workspace: Path, publisher: Path) -> None:
         for filename in files:
             candidate = root_path / filename
             relative = candidate.relative_to(source).as_posix()
-            if not (_LOOSE_OBJECT.fullmatch(relative) or _PACK_OBJECT.fullmatch(relative)):
+            if not (
+                _LOOSE_OBJECT.fullmatch(relative) or _PACK_OBJECT.fullmatch(relative)
+            ):
                 continue
             try:
                 descriptor = os.open(
@@ -1587,6 +1662,39 @@ def _copy_agent_objects(workspace: Path, publisher: Path) -> None:
                 os.close(descriptor)
 
 
+def resolve_canonical_base_sha(
+    repository_path: str | Path,
+    *,
+    remote_url: str,
+    base_branch: str,
+    spec: WorkspaceSpec,
+) -> str:
+    """Resolve today's canonical remote base tip, failing closed when absent.
+
+    The checkpoint path must prove the same thing full graph verification
+    proves: that the pinned base has not been rewritten out from under the
+    candidate. Callers pass the result as ``current_base_sha`` to
+    ``trusted_publish_clone`` so an infra-failure checkpoint carries the same
+    base-freshness guarantee as a publish.
+    """
+    current_base = _resolve_remote_ref_sha(
+        _resolve(repository_path),
+        remote_url,
+        f"refs/heads/{base_branch}",
+        spec,
+    )
+    if current_base is None:
+        raise WorkspaceVerificationError(
+            failed_step="remote_base_exists",
+            remediation=f"Restore remote base branch {base_branch!r}.",
+            expected_workspace=str(spec.workspace_path),
+            actual_workspace=str(spec.workspace_path),
+            expected_branch=spec.expected_branch,
+            detail="canonical remote base branch is missing",
+        )
+    return current_base
+
+
 @contextmanager
 def trusted_publish_clone(
     workspace_path: str | Path,
@@ -1642,10 +1750,7 @@ def trusted_publish_clone(
             detail=f"workspace inode mismatch: expected={expected_inode}, actual={actual_inode}",
         )
     candidate_sha = _read_agent_head(workspace, expected_branch)
-    if (
-        expected_candidate_sha is not None
-        and candidate_sha != expected_candidate_sha
-    ):
+    if expected_candidate_sha is not None and candidate_sha != expected_candidate_sha:
         raise WorkspaceVerificationError(
             failed_step="agent_candidate_changed_before_validation",
             remediation="Stop the remaining writer and retry from a stable task clone.",
@@ -1663,7 +1768,14 @@ def trusted_publish_clone(
             workspace_path=str(publisher), expected_branch=expected_branch
         )
         _run_provision_git(
-            ["clone", "--no-checkout", "--origin", "origin", remote_url, str(publisher)],
+            [
+                "clone",
+                "--no-checkout",
+                "--origin",
+                "origin",
+                remote_url,
+                str(publisher),
+            ],
             cwd=Path(raw),
             spec=spec,
             failed_step="provision_trusted_publisher_clone",
@@ -1700,16 +1812,28 @@ def trusted_publish_clone(
         _copy_agent_objects(workspace, publisher)
         checks = [
             (["cat-file", "-e", f"{candidate_sha}^{{commit}}"], "agent_commit_valid"),
-            (["merge-base", "--is-ancestor", start_sha, candidate_sha], "agent_commit_ancestry"),
-            (["fsck", "--strict", "--no-reflogs", candidate_sha], "agent_objects_valid"),
+            (
+                ["merge-base", "--is-ancestor", start_sha, candidate_sha],
+                "agent_commit_ancestry",
+            ),
+            (
+                ["fsck", "--strict", "--no-reflogs", candidate_sha],
+                "agent_objects_valid",
+            ),
         ]
         if trusted_base_sha is not None:
             checks.append(
-                (["merge-base", "--is-ancestor", trusted_base_sha, candidate_sha], "candidate_base_ancestry")
+                (
+                    ["merge-base", "--is-ancestor", trusted_base_sha, candidate_sha],
+                    "candidate_base_ancestry",
+                )
             )
         if expected_remote_sha is not None:
             checks.append(
-                (["merge-base", "--is-ancestor", expected_remote_sha, candidate_sha], "candidate_remote_ancestry")
+                (
+                    ["merge-base", "--is-ancestor", expected_remote_sha, candidate_sha],
+                    "candidate_remote_ancestry",
+                )
             )
         for argv, step in checks:
             _run_provision_git(argv, cwd=publisher, spec=spec, failed_step=step)
@@ -1910,7 +2034,10 @@ def _is_pipeline_owned_standalone_clone(
     repo = _resolve(repository_path)
     if verified_inode is None:
         return False
-    if workspace.is_symlink() or workspace.parent != repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}":
+    if (
+        workspace.is_symlink()
+        or workspace.parent != repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
+    ):
         return False
     git_dir = workspace / ".git"
     try:
@@ -1979,7 +2106,9 @@ def remove_workspace(
             return "remove_failed"
         quarantine_root = raw_workspace.parent / ".aicc-quarantine"
         quarantine_root.mkdir(mode=0o700, exist_ok=True)
-        quarantine = quarantine_root / f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
+        quarantine = (
+            quarantine_root / f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
+        )
         try:
             os.replace(raw_workspace, quarantine)
             quarantine_stat = quarantine.lstat()
@@ -2003,7 +2132,7 @@ def remove_workspace(
             timeout=60,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except _GIT_RUN_ERRORS:
         return "remove_failed"
     if result.returncode != 0:
         return "remove_failed"
@@ -2045,6 +2174,6 @@ def prune_repository(repository_path: str | Path) -> str:
             timeout=30,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except _GIT_RUN_ERRORS:
         return "prune_failed"
     return "pruned" if result.returncode == 0 else "prune_failed"

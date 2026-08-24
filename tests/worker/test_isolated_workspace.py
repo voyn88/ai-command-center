@@ -35,10 +35,10 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 def _write_exact_pr_gh(path: Path, url: str) -> None:
     path.write_text(
         "#!/bin/sh\n"
-        "case \"$2\" in\n"
+        'case "$2" in\n'
         "  view) head=$(git rev-parse HEAD); "
-        f"printf '{{\"url\":\"{url}\",\"headRefOid\":\"%s\","
-        "\"baseRefName\":\"main\",\"state\":\"OPEN\"}\\n' \"$head\"; exit 0 ;;\n"
+        f'printf \'{{"url":"{url}","headRefOid":"%s",'
+        '"baseRefName":"main","state":"OPEN"}\\n\' "$head"; exit 0 ;;\n'
         f"  create) echo '{url}'; exit 0 ;;\n"
         "esac\n"
     )
@@ -80,7 +80,9 @@ def _event() -> threading.Event:
     return threading.Event()
 
 
-def _fake_run(*, commit: bool = True, status: str = "completed", exit_code: int | None = 0):
+def _fake_run(
+    *, commit: bool = True, status: str = "completed", exit_code: int | None = 0
+):
     """A `run_claude_code` replacement that -- unlike test_handlers.py's --
     actually writes and commits into the `repository_path` it is given, so a
     test can observe which physical directory received the work."""
@@ -172,7 +174,8 @@ def agent_with_publish(agent, monkeypatch, tmp_path):
     bare = tmp_path / "origin.git"
     subprocess.run(
         ["git", "init", "--bare", "-q", "-b", "main", str(bare)],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     _git(repo, "remote", "add", "origin", str(bare))
     _git(repo, "push", "-q", "origin", "main")
@@ -208,7 +211,10 @@ def test_read_only_task_uses_the_shared_checkout_unchanged(agent, monkeypatch):
     monkeypatch.setattr(
         agent_runner,
         "run_claude_code",
-        lambda **kw: (captured.update(repository_path=kw["repository_path"]) or _fake_run(commit=False)(**kw)),
+        lambda **kw: (
+            captured.update(repository_path=kw["repository_path"])
+            or _fake_run(commit=False)(**kw)
+        ),
     )
     outcome = run_agent(_payload(task_type="review"), _event(), 1)
     assert outcome.ok
@@ -233,9 +239,9 @@ def test_mutating_task_gets_an_isolated_worktree_distinct_from_shared_checkout(
     assert used != repo
     assert used.parent == repo.parent / f"{repo.name}-task-clones"
     assert (used / ".git").is_dir()
-    assert _git(used, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip() == str(
-        used / ".git"
-    )
+    assert _git(
+        used, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    ).stdout.strip() == str(used / ".git")
     assert _git(used, "remote").stdout.strip() == "", "the model process gets no remote"
     # And the primary checkout is untouched by the agent's commit.
     assert not (repo / "change.txt").exists()
@@ -257,7 +263,9 @@ def test_two_different_tasks_get_distinct_workspace_paths(agent, monkeypatch):
     monkeypatch.setattr(
         agent_runner,
         "run_claude_code",
-        lambda **kw: (seen.append(kw["repository_path"]) or _fake_run(commit=False)(**kw)),
+        lambda **kw: (
+            seen.append(kw["repository_path"]) or _fake_run(commit=False)(**kw)
+        ),
     )
 
     assert run_agent(_payload(backlog_task_id="VOYN-TASK-A"), _event(), 1).ok
@@ -276,7 +284,9 @@ def test_retries_of_the_same_task_share_one_worktree(agent, monkeypatch):
     monkeypatch.setattr(
         agent_runner,
         "run_claude_code",
-        lambda **kw: (seen.append(kw["repository_path"]) or _fake_run(commit=False)(**kw)),
+        lambda **kw: (
+            seen.append(kw["repository_path"]) or _fake_run(commit=False)(**kw)
+        ),
     )
 
     assert run_agent(_payload(backlog_task_id="VOYN-TASK-A"), _event(), 1).ok
@@ -294,15 +304,16 @@ def test_project_id_backfills_the_branch_when_no_backlog_task_id(agent, monkeypa
     monkeypatch.setattr(
         agent_runner,
         "run_claude_code",
-        lambda **kw: (captured.update(repository_path=kw["repository_path"]) or _fake_run(commit=False)(**kw)),
+        lambda **kw: (
+            captured.update(repository_path=kw["repository_path"])
+            or _fake_run(commit=False)(**kw)
+        ),
     )
     payload = _payload()
     del payload["backlog_task_id"]
     outcome = run_agent(payload, _event(), 1)
     assert outcome.ok
-    assert Path(captured["repository_path"]) == _workspace(
-        _repo, payload["project_id"]
-    )
+    assert Path(captured["repository_path"]) == _workspace(_repo, payload["project_id"])
 
 
 # --------------------------------------------------------------------------
@@ -380,7 +391,9 @@ def test_cleanup_after_publish_succeeds(agent_with_publish, monkeypatch):
     assert not _workspace(repo).exists()
 
 
-def test_cleanup_after_publish_reports_nothing_to_publish(agent_with_publish, monkeypatch):
+def test_cleanup_after_publish_reports_nothing_to_publish(
+    agent_with_publish, monkeypatch
+):
     """A run that made no commit still counts as a successful publish outcome
     (`nothing_to_publish`) -- there is nothing local to lose, so the
     worktree is disposable exactly as in the pushed case. This is this
@@ -388,7 +401,9 @@ def test_cleanup_after_publish_reports_nothing_to_publish(agent_with_publish, mo
     failed, but nothing was ever written, so cleanup is safe."""
     run_agent, repo = agent_with_publish
     monkeypatch.setattr(
-        agent_runner, "run_claude_code", _fake_run(commit=False, status="failed", exit_code=1)
+        agent_runner,
+        "run_claude_code",
+        _fake_run(commit=False, status="failed", exit_code=1),
     )
 
     outcome = run_agent(_payload(), _event(), 1)
@@ -435,7 +450,11 @@ def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
 
     outcome = run_agent(_payload(), _event(), 1)
 
-    assert outcome.ok  # the handler outcome is still ok=True (BO-S3b: publish failure is data)
+    # Fail closed: an unpublished mutating run is an infrastructure failure
+    # (retryable), never a completed model result -- transport success alone
+    # must not promote work that never left this host.
+    assert not outcome.ok and outcome.retryable
+    assert "guarded publish failed" in outcome.reason
     assert outcome.result["publish"]["ok"] is False
     workspace = _workspace(repo)
     assert workspace.is_dir()
@@ -510,7 +529,9 @@ def test_reused_clone_never_executes_agent_git_config_before_retry_publish(
     (bin_dir / "gh").write_text("#!/bin/sh\nexit 1\n")
     monkeypatch.setattr(agent_runner, "run_claude_code", first_run)
     first = run_agent(_payload(), _event(), 1)
-    assert first.ok and first.result["publish"]["ok"] is False
+    assert not first.ok and first.retryable
+    assert "guarded publish failed" in first.reason
+    assert first.result["publish"]["ok"] is False
     assert not sentinel.exists()
 
     _write_exact_pr_gh(bin_dir / "gh", "https://github.com/o/r/pull/3")
@@ -537,7 +558,9 @@ def test_unpublished_commit_survives_never_started_retry_then_publishes(
     monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run())
     first = run_agent(_payload(), _event(), 1)
     workspace = _workspace(repo)
-    assert first.ok and first.result["publish"]["ok"] is False
+    assert not first.ok and first.retryable
+    assert "guarded publish failed" in first.reason
+    assert first.result["publish"]["ok"] is False
     assert workspace.is_dir() and (workspace / "change.txt").exists()
 
     monkeypatch.setattr(agent_runner, "run_claude_code", _never_started_run)
@@ -625,7 +648,9 @@ def test_uncheckpointed_candidate_is_refused_before_executor(agent, monkeypatch)
     monkeypatch.setattr(
         agent_runner,
         "run_claude_code",
-        lambda **_kwargs: pytest.fail("uncheckpointed candidate must fail before executor"),
+        lambda **_kwargs: pytest.fail(
+            "uncheckpointed candidate must fail before executor"
+        ),
     )
 
     refused = run_agent(_payload(), _event(), 2)
@@ -801,7 +826,9 @@ def test_candidate_change_after_validation_is_never_checkpointed_or_published(
     assert remote.stdout.strip() == ""
 
 
-def test_provision_lock_serializes_concurrent_same_path_provisioning(agent, monkeypatch):
+def test_provision_lock_serializes_concurrent_same_path_provisioning(
+    agent, monkeypatch
+):
     """`provision_workspace` is check-then-act; without the per-path lock two
     threads racing to provision the SAME new path could both pass
     `workspace.exists()` before either creates it. Not a realistic shape for
@@ -814,7 +841,9 @@ def test_provision_lock_serializes_concurrent_same_path_provisioning(agent, monk
 
     def worker(attempt_no: int) -> None:
         try:
-            outcome = run_agent(_payload(backlog_task_id="VOYN-TASK-RACE"), _event(), attempt_no)
+            outcome = run_agent(
+                _payload(backlog_task_id="VOYN-TASK-RACE"), _event(), attempt_no
+            )
             results.append(outcome.ok)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
