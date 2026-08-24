@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile both AICC worker lanes every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=voyn-worker-reconciler.service
+
+[Install]
+WantedBy=timers.target

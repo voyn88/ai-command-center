@@ -66,26 +66,26 @@ from __future__ import annotations
 from types import MappingProxyType
 
 __all__ = [
-    "APP_ROLE",
-    "MIGRATOR_ROLE",
-    "OPERATOR_ROLE",
-    "WORKER_ROLE",
     "ALL_ROLES",
     "ALL_TABLES",
     "ALL_VIEWS",
+    "APP_ROLE",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
-    "merge_privileges",
+    "IDENTITY_SEQUENCES",
+    "MIGRATOR_ROLE",
+    "OPERATOR_ROLE",
+    "PRIVILEGES",
     "VIEW_PRIVILEGES",
+    "WORKER_ROLE",
     "apply_bootstrap",
     "apply_table_grants",
-    "IDENTITY_SEQUENCES",
-    "PRIVILEGES",
+    "merge_privileges",
     "render_bootstrap",
-    "render_worker_host_role",
     "render_grants",
-    "render_table_grants",
     "render_role_creation",
+    "render_table_grants",
+    "render_worker_host_role",
 ]
 
 MIGRATOR_ROLE = "aicc_migrator"
@@ -127,6 +127,10 @@ ALL_TABLES: tuple[str, ...] = (
     "completion",
     "completion_event",
     "completion_validation",
+    "control_plane_component",
+    "control_plane_event",
+    "control_plane_lane",
+    "control_plane_notification",
     "conflict",
     "contact",
     "council_decision",
@@ -187,6 +191,8 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "backlog_evidence": "backlog_evidence_evidence_id_seq",
         "completion_event": "completion_event_id_seq",
         "completion_validation": "completion_validation_id_seq",
+        "control_plane_event": "control_plane_event_event_id_seq",
+        "control_plane_notification": "control_plane_notification_notification_id_seq",
         "council_event": "council_event_id_seq",
         "model_event": "model_event_id_seq",
         "principal_event": "principal_event_id_seq",
@@ -261,6 +267,26 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_event": _READ,
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
+}
+
+# The reconciler is itself the sole writer of its operational memory.  Unlike
+# backlog_task these rows do not encode programme decisions; direct DML lets a
+# whole lane transition and its audit event commit atomically in one ordinary
+# transaction without multiplying SECURITY DEFINER entry points.  Workers see
+# none of it: execution hosts report results through the queue protocol and
+# cannot appoint themselves as control-plane owners.
+_APP_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
+    "control_plane_component": _APP_DML,
+    "control_plane_event": _APP_DML,
+    "control_plane_lane": _APP_DML,
+    "control_plane_notification": _APP_DML,
+}
+
+_WORKER_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
+    "control_plane_component": _NONE,
+    "control_plane_event": _NONE,
+    "control_plane_lane": _NONE,
+    "control_plane_notification": _NONE,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -572,11 +598,15 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _APP_QUEUE_TABLES,
                     _APP_ENROLMENT_TABLES,
                     _APP_BACKLOG_TABLES,
+                    _APP_CONTROL_PLANE_TABLES,
                 )
             ),
             WORKER_ROLE: MappingProxyType(
                 merge_privileges(
-                    _WORKER_TABLES, _WORKER_ENROLMENT_TABLES, _WORKER_BACKLOG_TABLES
+                    _WORKER_TABLES,
+                    _WORKER_ENROLMENT_TABLES,
+                    _WORKER_BACKLOG_TABLES,
+                    _WORKER_CONTROL_PLANE_TABLES,
                 )
             ),
             # No blanket default: this role is not a general-purpose one, and
@@ -857,13 +887,15 @@ def render_worker_host_role(role: str) -> list[str]:
     """
     _require_identifier(role)
     return [
-        "DO $$\n"
-        "BEGIN\n"
-        f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
-        f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
-        "    END IF;\n"
-        "END\n"
-        "$$;"
+        (
+            "DO $$\n"
+            "BEGIN\n"
+            f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
+            f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
+            "    END IF;\n"
+            "END\n"
+            "$$;"
+        )
     ]
 
 
@@ -911,10 +943,9 @@ def apply_table_grants(conn, schema: str = "public") -> int:
 
 
 def _execute(conn, statements: list[str]) -> int:
-    with conn.transaction():
-        with conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
+    with conn.transaction(), conn.cursor() as cur:
+        for statement in statements:
+            cur.execute(statement)
     return len(statements)
 
 

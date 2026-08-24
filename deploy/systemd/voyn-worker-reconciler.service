@@ -1,0 +1,20 @@
+[Unit]
+Description=Recover unhealthy AICC worker lanes with a bounded circuit breaker
+After=voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+Wants=voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/voyn-worker-reconcile
+StateDirectory=voyn-worker-reconciler
+StateDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=false
+LockPersonality=true

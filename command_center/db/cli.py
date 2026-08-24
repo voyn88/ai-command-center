@@ -103,6 +103,19 @@ def build_parser() -> argparse.ArgumentParser:
         "(aicc-backlog-merge.timer). Needs --repo-path.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
 
+    reconcile = sub.add_parser(
+        "control-plane-reconcile",
+        help="Reconcile systemd health and advance durable delivery lanes once.",
+    )
+    reconcile.add_argument("--repo-path", default="/opt/aicc")
+    reconcile.add_argument("--dry-run", action="store_true")
+    reconcile.add_argument("--max-actions", type=int, default=8)
+    health = sub.add_parser(
+        "control-plane-health",
+        help="Fail unless the reconciler heartbeat is fresh and no component circuit is open.",
+    )
+    health.add_argument("--max-age-seconds", type=int, default=180)
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -284,7 +297,10 @@ def main(argv: list[str] | None = None) -> int:
                 report = review_once(
                     lambda: _nc(conn),
                     lambda q, k, pl, tid, attempts: store.enqueue(
-                        q, idempotency_key=k, payload=pl, task_id=tid,
+                        q,
+                        idempotency_key=k,
+                        payload=pl,
+                        task_id=tid,
                         max_attempts=attempts,
                     ),
                     args.repo_path,
@@ -315,6 +331,197 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                return 0
+
+            if args.command == "control-plane-reconcile":
+                from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.control_plane import (
+                    Action,
+                    ActionOutcome,
+                    ControlPlaneConfig,
+                    PostgresControlPlaneStore,
+                    Reconciler,
+                    SystemdUnitManager,
+                )
+                from command_center.orchestrator.review_merge import (
+                    _has_accept_marker,
+                    merge_once,
+                    publish_review_verdicts,
+                    review_once,
+                )
+
+                factory = pool.connection
+
+                queue = WorkQueueStore(factory)
+                store = PostgresControlPlaneStore(factory)
+                config = ControlPlaneConfig(max_actions_per_tick=args.max_actions)
+
+                def record_acceptance(task_id, pr_url):
+                    accepted, head = _has_accept_marker(args.repo_path, pr_url)
+                    if not accepted or not head:
+                        return False
+                    with factory() as evidence_conn, evidence_conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT ok FROM backlog_record_evidence(%s,'acceptance',%s)",
+                            (task_id, f"ACCEPTANCE: ACCEPT {head}"),
+                        )
+                        ok = cur.fetchone()[0]
+                    return bool(ok)
+
+                def review_lane(lane, guard):
+                    enqueued = guard.effect(
+                        lambda: review_once(
+                            factory,
+                            lambda q, k, p, tid, attempts: queue.enqueue(
+                                q,
+                                idempotency_key=k,
+                                payload=p,
+                                task_id=tid,
+                                max_attempts=attempts,
+                            ),
+                            args.repo_path,
+                            task_id=lane.task_id,
+                        )
+                    )
+                    verdict = guard.effect(
+                        lambda: publish_review_verdicts(
+                            factory, args.repo_path, task_id=lane.task_id
+                        )
+                    )
+                    marker_already_exists = any(
+                        reason == "marker_already_posted"
+                        for _task, reason in verdict.skipped
+                    )
+                    if verdict.reviewed or marker_already_exists:
+                        pr_url = (
+                            verdict.reviewed[0][1]
+                            if verdict.reviewed
+                            else lane.payload.get("pr_url")
+                        )
+                        if not pr_url:
+                            with (
+                                factory() as evidence_conn,
+                                evidence_conn.cursor() as cur,
+                            ):
+                                cur.execute(
+                                    "SELECT value FROM backlog_evidence "
+                                    "WHERE task_id=%s AND kind='pr' ORDER BY evidence_id DESC LIMIT 1",
+                                    (lane.task_id,),
+                                )
+                                row = cur.fetchone()
+                            pr_url = row[0] if row else ""
+                        accepted = guard.effect(
+                            lambda: record_acceptance(lane.task_id, pr_url)
+                        )
+                        if not accepted:
+                            return ActionOutcome.retry(
+                                "acceptance_evidence_not_durable"
+                            )
+                        return ActionOutcome.succeeded(
+                            Action.MERGE, owner="merge-controller"
+                        )
+                    if verdict.remediated:
+                        return ActionOutcome.succeeded()
+                    detail = ";".join(reason for _task, reason in verdict.skipped)
+                    if enqueued.reviewed or "no_review_result_yet" in detail:
+                        return ActionOutcome.waiting(
+                            seconds=60, detail=detail or "review_enqueued"
+                        )
+                    return ActionOutcome.retry(detail or "review_not_progressed")
+
+                def merge_lane(lane, guard):
+                    report = guard.effect(
+                        lambda: merge_once(
+                            factory, args.repo_path, task_id=lane.task_id
+                        )
+                    )
+                    if report.merged:
+                        return ActionOutcome.succeeded(Action.DEPLOY, owner="deployer")
+                    detail = ";".join(reason for _task, reason in report.skipped)
+                    if (
+                        detail.startswith("checks_not_green")
+                        or detail == "no_accept_marker_on_head"
+                    ):
+                        return ActionOutcome.waiting(seconds=60, detail=detail)
+                    return ActionOutcome.retry(detail or "merge_not_progressed")
+
+                def ci_wait_lane(_lane, _guard):
+                    # CI/ingest are observed through canonical backlog evidence.
+                    # Waiting is not a failed attempt: discover_ready_lanes will
+                    # replace this action once READY_TO_REVIEW evidence arrives.
+                    return ActionOutcome.waiting(
+                        seconds=60, detail="awaiting_ci_or_backlog_ingest"
+                    )
+
+                def unavailable_deploy_lane(_lane, _guard):
+                    # Deployment runs under a separate capability/principal. An
+                    # unavailable deployer must not pin an already-merged source
+                    # lane or consume its retry budget; split an idempotent
+                    # operational blocker and continue to backlog reconciliation.
+                    return ActionOutcome.deployment_blocked(
+                        "deployment_capability_not_configured"
+                    )
+
+                def backlog_sync_lane(_lane, _guard):
+                    # PostgresControlPlaneStore.finish validates DEPLOYED:<sha>
+                    # and atomically closes backlog + lane in one transaction.
+                    return ActionOutcome.succeeded()
+
+                handlers = {
+                    Action.CI_WAIT: ci_wait_lane,
+                    Action.INDEPENDENT_REVIEW: review_lane,
+                    Action.ACCEPTANCE: review_lane,
+                    Action.MERGE: merge_lane,
+                    Action.DEPLOY: unavailable_deploy_lane,
+                    Action.BACKLOG_SYNC: backlog_sync_lane,
+                }
+                report = Reconciler(
+                    store,
+                    SystemdUnitManager(config.desired_units),
+                    handlers,
+                    config,
+                ).run_once(dry_run=args.dry_run)
+                for probe in report.units:
+                    print(
+                        f"UNIT {probe.unit}: {'OK' if probe.healthy else 'FAIL'} {probe.detail}"
+                    )
+                for task_id, reason in report.recovered:
+                    print(f"RECOVERED {task_id}: {reason}")
+                for task_id, state in report.advanced:
+                    print(f"ADVANCED {task_id}: {state}")
+                for scope, reason in report.refused:
+                    print(f"REFUSED {scope}: {reason}", file=sys.stderr)
+                return 0 if report.healthy else 1
+
+            if args.command == "control-plane-health":
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT extract(epoch FROM (now()-heartbeat_at)), observed_state "
+                        "FROM control_plane_component WHERE component='reconciler'"
+                    )
+                    heartbeat = cur.fetchone()
+                    cur.execute(
+                        "SELECT component FROM control_plane_component "
+                        "WHERE circuit_open_until > now() ORDER BY component"
+                    )
+                    open_circuits = [row[0] for row in cur.fetchall()]
+                if heartbeat is None:
+                    print("unhealthy: no reconciler heartbeat", file=sys.stderr)
+                    return 1
+                age, state = heartbeat
+                if age is None or age > args.max_age_seconds:
+                    print(
+                        f"unhealthy: stale reconciler heartbeat ({age}s)",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if state not in {"HEALTHY", "RUNNING"}:
+                    print(f"unhealthy: reconciler state={state}", file=sys.stderr)
+                    return 1
+                if open_circuits:
+                    print(f"unhealthy: open circuits={open_circuits}", file=sys.stderr)
+                    return 1
+                print(f"healthy: heartbeat_age={float(age):.1f}s")
                 return 0
 
             if args.command == "downgrade":

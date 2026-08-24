@@ -1,0 +1,26 @@
+[Unit]
+Description=24-hour canary for both AICC worker lanes
+After=network-online.target voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+Wants=network-online.target voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/sbin/voyn-aicc-worker-canary run
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=voyn-aicc-canary
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/voyn-aicc-canary
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

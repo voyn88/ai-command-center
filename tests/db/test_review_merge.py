@@ -8,10 +8,15 @@ import json
 
 import pytest
 
-from tests.db.test_backlog_planner import _test_repo_routes, rig  # noqa: F401 — pytest fixtures
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import (
-    merge_once, publish_review_verdicts, review_once,
+    merge_once,
+    publish_review_verdicts,
+    review_once,
+)
+from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
+    _test_repo_routes,
+    rig,
 )
 
 
@@ -78,7 +83,7 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     )
     assert ("VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7") in report.reviewed
     assert len(calls) == 1
-    q, key, payload, task_id, max_attempts = calls[0]
+    _q, key, payload, task_id, max_attempts = calls[0]
     # task + PR number + exact head sha + review policy version -- not just
     # the task_id -- so a later push to the same PR (remediation, or an
     # ordinary second push while still IN_PROGRESS) gets its own fresh
@@ -178,6 +183,7 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
     head = "a" * 40
+    merge_sha = "b" * 40
 
     def fake_gh(argv, repo):
         import subprocess
@@ -193,11 +199,19 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_merged_commit_sha", lambda _repo, _pr: merge_sha
+    )
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M1", head) in report.merged
+    assert ("VOYN-W0-M1", merge_sha) in report.merged
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1",))
-        assert cur.fetchone()[0] == "DONE"
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+        cur.execute(
+            "SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='ci'",
+            ("VOYN-W0-M1",),
+        )
+        assert (f"MERGED:{merge_sha}",) in cur.fetchall()
 
 
 def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):  # noqa: F811
@@ -227,13 +241,14 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch): 
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):  # noqa: F811
     """The positive case of the same check: a genuinely independent
     reviewer login (the acceptance bot's, in production) does authorize
     merge."""
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M1C", "https://github.com/x/y/pull/22")
     head = "1" * 40
+    merge_sha = "3" * 40
 
     def fake_gh(argv, repo):
         import subprocess
@@ -253,8 +268,11 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_merged_commit_sha", lambda _repo, _pr: merge_sha
+    )
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M1C", head) in report.merged
+    assert ("VOYN-W0-M1C", merge_sha) in report.merged
 
 
 def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):  # noqa: F811
@@ -311,7 +329,7 @@ def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
         assert cur.fetchone()[0] == "READY_TO_REVIEW"  # untouched
 
 
-def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, monkeypatch):  # noqa: F811
     """VOYN-W0-AICC-DISABLE-UNSAFE-AUTOMERGE: a CheckRun with `conclusion:
     null` because it hasn't finished (`status` QUEUED/IN_PROGRESS) used to
     read identically to one that simply carries no conclusion key at all --
@@ -362,7 +380,7 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # n
     assert ("VOYN-W0-M4", "checks_not_green: ['legacy-ci']") in report.skipped
 
 
-def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):  # noqa: F811
     """VOYN-W0-AICC-DISABLE-UNSAFE-AUTOMERGE: an ACCEPT marker sitting in an
     OLDER review must not authorize merge once a NEWER review exists on the
     same head -- e.g. a stale ACCEPT from before a dismissed/superseded
@@ -388,7 +406,7 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
     assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
 
 
-def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811, E501
+def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811
     """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: the agent's own ACCEPT
     verdict must reach GitHub as the exact `ACCEPTANCE: ACCEPT <sha>`
     comment-review body, posted under the independent acceptance bot's
@@ -429,7 +447,7 @@ def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig,
     assert posted == [("https://github.com/x/y/pull/11", "ACCEPT", head)]
 
 
-def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: F811, E501
+def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: F811
     """A host with no acceptance-bot credentials must not fall back to the
     old same-identity marker -- that marker can never satisfy
     `_pr_is_mergeable`'s different-author check any more, so posting one
@@ -797,7 +815,9 @@ def test_mergeability_uses_latest_check_rerun(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    assert review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10") == (True, head)
+    assert review_merge._pr_is_mergeable(
+        "/tmp", "https://github.com/x/y/pull/10"
+    ) == (True, f"ready_to_enqueue:{head}")
 
 
 def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
@@ -920,7 +940,7 @@ def test_review_key_scopes_by_pr_number_head_sha_and_policy_version():
     assert review_merge._review_key("VOYN-W0-X", "not a url", sha_a) is None
 
 
-def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(rig, _test_repo_routes, monkeypatch):  # noqa: F811
     """The general case the review-cycle key fixes, not just remediation: an
     ordinary task still IN_PROGRESS/READY_TO_REVIEW that gets a second push
     to its PR must be reviewable again, not permanently deduped against
@@ -940,7 +960,7 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     calls = []
-    enqueue = lambda q, k, p, tid, attempts: calls.append(  # noqa: E731
+    enqueue = lambda q, k, p, tid, attempts: calls.append(
         (q, k, p, tid, attempts)
     )
 

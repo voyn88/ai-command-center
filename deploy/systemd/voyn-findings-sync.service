@@ -1,0 +1,24 @@
+[Unit]
+Description=Deliver worker findings through the pinned control-plane identity
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=voynadmin
+Group=voynadmin
+EnvironmentFile=/etc/voyn/findings-sync.env
+ExecStart=/opt/voyn-worker/bin/voyn-sync-findings
+TimeoutStartSec=60
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/spool/voyn-worker/backlog-outbox /var/spool/voyn-worker/backlog-sent
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+

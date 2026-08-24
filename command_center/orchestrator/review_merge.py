@@ -323,7 +323,7 @@ def review_once(
         params,
     )
     cascade = cascade_for("review")
-    for task_id, pr_url in tasks:
+    for task_id, pr_url in tasks:  # noqa: PLR1704 - selected row shadows filter
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
@@ -359,7 +359,6 @@ def review_once(
         enqueue(cfg.queue, key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
     return report
-
 
 # -- Part 2b: publish the verdict as the marker merge_once reads -------------
 
@@ -582,7 +581,7 @@ def publish_review_verdicts(
         + " ORDER BY t.updated_at LIMIT %s",
         params,
     )
-    for task_id, pr_url in tasks:
+    for task_id, pr_url in tasks:  # noqa: PLR1704 - selected row shadows filter
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
@@ -720,14 +719,15 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     whose reason to exist is gone."""
     view = _gh(
         ["pr", "view", pr_url, "--json",
-         "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author"],
+         "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author,mergeCommit"],
         repo_path,
     )
     if view.returncode != 0:
         return False, f"gh_view_failed: {view.stderr.strip()[:100]}"
     data = json.loads(view.stdout or "{}")
-    if data.get("state") != "OPEN":
-        return False, f"pr_{str(data.get('state')).lower()}"
+    state = data.get("state")
+    if state not in {"OPEN", "MERGED"}:
+        return False, f"pr_{str(state).lower()}"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
@@ -737,66 +737,97 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
         return False, f"checks_not_green: {bad[:3]}"
-    return True, head
+    if state == "MERGED":
+        merge_sha = (data.get("mergeCommit") or {}).get("oid", "")
+        if re.fullmatch(r"[0-9a-f]{40}", merge_sha) is None:
+            return False, "merged_commit_sha_missing"
+        return True, f"already_merged:{merge_sha}"
+    return True, f"ready_to_enqueue:{head}"
 
 
-def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
+def _merged_commit_sha(repo_path: str, pr_url: str) -> str | None:
+    """Return only a durable GitHub merge commit, never the PR head.
+
+    ``gh pr merge`` returning zero may mean only that GitHub accepted the PR
+    into merge queue.  A second immutable observation is therefore the
+    commit boundary: OPEN/QUEUED is still waiting, and only state=MERGED with
+    a valid mergeCommit OID can advance deployment.
+    """
+    view = _gh(
+        ["pr", "view", pr_url, "--json", "state,mergeCommit"], repo_path
+    )
+    if view.returncode != 0:
+        return None
+    try:
+        data = json.loads(view.stdout or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    merge_sha = (data.get("mergeCommit") or {}).get("oid", "")
+    if data.get("state") != "MERGED" or re.fullmatch(r"[0-9a-f]{40}", merge_sha) is None:
+        return None
+    return merge_sha
+
+
+def merge_once(
+    factory: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
+) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE with the merged sha as evidence."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    where_task = " AND t.task_id = %s" if task_id else ""
+    params: tuple[Any, ...] = (task_id, cfg.max_per_tick) if task_id else (cfg.max_per_tick,)
     tasks = _rows(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at LIMIT %s",
-        (cfg.max_per_tick,),
+        "WHERE t.status = 'READY_TO_REVIEW' "
+        "AND NOT EXISTS (SELECT 1 FROM backlog_evidence merged "
+        " WHERE merged.task_id=t.task_id AND merged.kind='ci' "
+        " AND merged.value LIKE 'MERGED:%')"
+        + where_task
+        + " ORDER BY t.updated_at LIMIT %s",
+        params,
     )
-    for task_id, pr_url in tasks:
+    for task_id, pr_url in tasks:  # noqa: PLR1704 - selected row shadows filter
         ready, detail = _pr_is_mergeable(repo_path, pr_url)
         if not ready:
             report.skipped.append((task_id, detail))
             continue
-        merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
-        if merged.returncode != 0:
-            report.skipped.append((task_id, f"merge_failed: {merged.stderr.strip()[:100]}"))
-            continue
-        head = detail  # _pr_is_mergeable returned the head sha
-        # Evidence and the DONE transition are one act: the sha row and the
-        # status move commit together or not at all (an explicit transaction,
-        # since the app factory is autocommit). backlog_transition's third
-        # argument is the optimistic-lock revision (bigint), read here (a plain SELECT — the app role writes only through
-        # functions, so no row lock is taken; the optimistic revision below is
-        # the concurrency guard); the
-        # actor is session_user inside the function, not an argument.
+        already_merged = detail.startswith("already_merged:")
+        merge_sha = detail.removeprefix("already_merged:")
+        if not already_merged:
+            merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
+            if merged.returncode != 0:
+                report.skipped.append((task_id, f"merge_failed: {merged.stderr.strip()[:100]}"))
+                continue
+            merge_sha = _merged_commit_sha(repo_path, pr_url) or ""
+            if not merge_sha:
+                report.skipped.append((task_id, "merge_queued_awaiting_merge"))
+                continue
+        # MERGED is not DONE: deployment and backlog synchronization are
+        # separate durable actions. Record only the exact GitHub merge commit
+        # here. BACKLOG_SYNC may close the task after matching DEPLOYED
+        # evidence exists for this same SHA.
         with factory() as conn:
             conn.autocommit = False
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "SELECT revision FROM backlog_task WHERE task_id = %s",
-                        (task_id,),
-                    )
-                    row = cur.fetchone()
-                    if row is None:
-                        conn.rollback()
-                        report.skipped.append((task_id, "task_vanished"))
-                        continue
-                    revision = row[0]
-                    cur.execute(
-                        "SELECT backlog_record_evidence(%s, 'sha', %s)", (task_id, head)
-                    )
-                    cur.execute(
-                        "SELECT ok, reason FROM backlog_transition(%s, 'DONE', %s)",
-                        (task_id, revision),
+                        "SELECT ok, reason FROM backlog_record_evidence(%s, 'ci', %s)",
+                        (task_id, f"MERGED:{merge_sha}"),
                     )
                     ok, reason = cur.fetchone()
                 if ok:
                     conn.commit()
-                    report.merged.append((task_id, head))
+                    report.merged.append((task_id, merge_sha))
                 else:
                     conn.rollback()
-                    report.skipped.append((task_id, f"transition:{reason}"))
+                    report.skipped.append((task_id, f"merge_evidence:{reason}"))
             finally:
                 conn.autocommit = True
     return report

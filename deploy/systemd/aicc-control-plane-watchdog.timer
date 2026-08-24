@@ -1,0 +1,13 @@
+[Unit]
+Description=Check the AICC control-plane heartbeat independently
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Persistent=true
+Unit=aicc-control-plane-watchdog.service
+
+[Install]
+WantedBy=timers.target
+

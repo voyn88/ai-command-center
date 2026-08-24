@@ -1,0 +1,25 @@
+[Unit]
+Description=AICC durable control-plane reconciler
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/aicc/app.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db control-plane-reconcile --repo-path /opt/aicc
+TimeoutStartSec=180s
+
+# The supervisor needs systemd's control socket, PostgreSQL and GitHub. It does
+# not execute agent-provided commands; action handlers are a compiled allowlist.
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=false
+RestrictSUIDSGID=true
+LockPersonality=true
+

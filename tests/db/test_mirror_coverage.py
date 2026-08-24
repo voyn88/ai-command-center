@@ -33,7 +33,6 @@ from pathlib import Path
 import pytest
 
 from command_center.db import roles
-
 from tests.db.mirror_discovery import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -124,6 +123,35 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
             "SQLite authority ever held them, so there is nothing to mirror."
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
+    "control_plane_lane": Exclusion(
+        reason=(
+            "PostgreSQL-native operational authority: lane ownership, deadlines, "
+            "heartbeats and recovery must be changed in the same transaction; "
+            "an eventually-consistent SQLite copy could dispatch a second owner."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RECONCILER",
+    ),
+    "control_plane_event": Exclusion(
+        reason=(
+            "Append-only audit for the PostgreSQL-native control-plane lane; "
+            "mirroring it would create a second, weaker delivery history."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RECONCILER",
+    ),
+    "control_plane_component": Exclusion(
+        reason=(
+            "PostgreSQL-native desired/observed systemd state and circuit-breaker "
+            "memory. Its transaction is the coordination boundary, not SQLite."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RECONCILER",
+    ),
+    "control_plane_notification": Exclusion(
+        reason=(
+            "PostgreSQL-native durable owner-notification outbox for stalled "
+            "control-plane lanes; delivery adapters consume it idempotently."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RECONCILER",
     ),
     "queue_entry": Exclusion(
         reason=(

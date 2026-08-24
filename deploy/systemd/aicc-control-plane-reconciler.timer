@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the AICC control-plane reconciler every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=aicc-control-plane-reconciler.service
+
+[Install]
+WantedBy=timers.target
+

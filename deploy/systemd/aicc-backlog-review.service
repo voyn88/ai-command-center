@@ -1,9 +1,17 @@
 [Unit]
 Description=AICC backlog review tick (BO-S3b)
-After=postgresql.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=aicc-worker
-EnvironmentFile=-/etc/ai-command-center.env
-ExecStart=/usr/bin/python -m command_center.db backlog-review
+User=aicc-app
+Group=aicc-app
+EnvironmentFile=/etc/aicc/app.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db backlog-review --repo-path /opt/aicc
+TimeoutStartSec=180s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

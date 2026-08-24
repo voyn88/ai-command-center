@@ -1,0 +1,21 @@
+[Unit]
+Description=External dead-man monitor for the AICC control plane
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/aicc/app.env
+WorkingDirectory=/opt/aicc
+ExecStart=/usr/local/libexec/aicc-control-plane-watchdog
+TimeoutStartSec=90s
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=false
+RestrictSUIDSGID=true
+LockPersonality=true

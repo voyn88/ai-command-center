@@ -1,0 +1,19 @@
+[Unit]
+Description=Health probe for both AICC worker lanes
+After=voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+Wants=voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=VOYN_WORKER_WATCHDOG_MAX_AGE_SECONDS=180
+ExecStart=/usr/local/sbin/voyn-worker-health
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true

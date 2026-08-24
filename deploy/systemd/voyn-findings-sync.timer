@@ -1,0 +1,13 @@
+[Unit]
+Description=Run findings delivery every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+Unit=voyn-findings-sync.service
+
+[Install]
+WantedBy=timers.target
+

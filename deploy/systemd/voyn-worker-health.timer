@@ -1,0 +1,13 @@
+[Unit]
+Description=Probe both AICC worker lanes every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=voyn-worker-health.service
+
+[Install]
+WantedBy=timers.target
+
