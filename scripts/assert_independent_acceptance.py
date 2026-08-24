@@ -27,10 +27,11 @@ that made the built-in route unusable.
 
 On a ``merge_group`` event the checked commit is synthetic. GitHub's queue
 creates one linear squash commit per pull request, in queue order, and appends
-``(#<number>)`` to each subject. The gate validates that complete base-to-head
-chain, cross-checks its final number against the GitHub-minted queue ref, then
-re-reads and judges every represented pull request. It never treats the final
-pull request as a proxy for the rest of a batch.
+``(#<number>)`` to each subject. Commit subjects identify the represented pull
+requests but do not prove their exact source heads. The gate therefore binds
+that chain to GitHub's authoritative merge-queue entries, requiring every
+entry's queued head, current pull-request head and accepted SHA to agree. It
+never treats the final pull request as a proxy for the rest of a batch.
 
 Everything it cannot establish is a refusal: no review, no marker, a marker for
 a different commit, an unparseable sha, a missing token, an API error, or an
@@ -63,11 +64,12 @@ _PER_PAGE = 100
 _MAX_PAGES = 50
 _MAX_BYTES = 8 * 1024 * 1024
 _MAX_GROUP_PULL_REQUESTS = 100
+_MAX_QUEUE_ENTRIES = _PER_PAGE * _MAX_PAGES
 
 _SHA = re.compile(r"[0-9a-fA-F]{40}")
 _QUEUE_REF = re.compile(
     r"^refs/heads/gh-readonly-queue/(?P<base>.+)/pr-(?P<number>[1-9][0-9]*)-"
-    r"(?P<head>[0-9a-fA-F]{40})$"
+    r"(?P<stamp>[0-9a-fA-F]{40})$"
 )
 _SQUASH_SUBJECT = re.compile(r"^.+ \(#(?P<number>[1-9][0-9]*)\)$")
 
@@ -209,7 +211,7 @@ def _api(path: str, env: dict[str, str]) -> object:
             "GITHUB_TOKEN is required to read the pull request's reviews"
         )
     base = env.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
-    request = Request(  # noqa: S310 - fixed https API host from the runner environment
+    request = Request(
         f"{base}{path}",
         headers={
             "Accept": "application/vnd.github+json",
@@ -219,7 +221,7 @@ def _api(path: str, env: dict[str, str]) -> object:
         },
     )
     try:
-        with urlopen(request, timeout=30) as response:  # noqa: S310 - see above
+        with urlopen(request, timeout=30) as response:
             body = response.read(_MAX_BYTES + 1)
     except (HTTPError, URLError, TimeoutError, OSError) as error:
         raise AcceptanceError(f"cannot read {path} from the GitHub API") from error
@@ -229,6 +231,43 @@ def _api(path: str, env: dict[str, str]) -> object:
         return json.loads(body.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise AcceptanceError(f"the response for {path} is not JSON") from error
+
+
+def _graphql(query: str, variables: dict[str, object], env: dict[str, str]) -> object:
+    """Run a read-only GraphQL query, with the same fail-closed limits as REST."""
+    token = env.get("GITHUB_TOKEN") or env.get("GH_TOKEN")
+    if not token:
+        raise AcceptanceError("GITHUB_TOKEN is required to read the merge queue")
+    url = env.get("GITHUB_GRAPHQL_URL", "https://api.github.com/graphql")
+    body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+    request = Request(
+        url,
+        method="POST",
+        data=body,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "aicc-acceptance-gate",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            response_body = response.read(_MAX_BYTES + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as error:
+        raise AcceptanceError(
+            "cannot read the merge queue from the GitHub API"
+        ) from error
+    if len(response_body) > _MAX_BYTES:
+        raise AcceptanceError("the merge-queue response is implausibly large")
+    try:
+        decoded = json.loads(response_body.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise AcceptanceError("the merge-queue response is not JSON") from error
+    if not isinstance(decoded, dict) or decoded.get("errors"):
+        raise AcceptanceError("the merge-queue GraphQL query returned errors")
+    return decoded
 
 
 def _event_payload(env: dict[str, str]) -> dict:
@@ -264,14 +303,146 @@ def _commit_sha(value: object, field: str) -> str:
     return value.lower()
 
 
+_MERGE_QUEUE_QUERY = """
+query($owner: String!, $name: String!, $branch: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    mergeQueue(branch: $branch) {
+      entries(first: 100, after: $cursor) {
+        nodes {
+          position
+          state
+          baseCommit { oid }
+          headCommit { oid }
+          pullRequest { number headRefOid baseRefName state }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+"""
+
+
+def _merge_queue_entries(
+    repository: str, branch: str, env: dict[str, str]
+) -> list[dict]:
+    """Return the complete live queue snapshot for ``branch``."""
+    try:
+        owner, name = repository.split("/", 1)
+    except ValueError as error:
+        raise AcceptanceError(f"invalid GITHUB_REPOSITORY: {repository!r}") from error
+    if not owner or not name:
+        raise AcceptanceError(f"invalid GITHUB_REPOSITORY: {repository!r}")
+
+    entries: list[dict] = []
+    cursor: str | None = None
+    for _page in range(_MAX_PAGES):
+        result = _graphql(
+            _MERGE_QUEUE_QUERY,
+            {"owner": owner, "name": name, "branch": branch, "cursor": cursor},
+            env,
+        )
+        data = result.get("data") if isinstance(result, dict) else None
+        repo = data.get("repository") if isinstance(data, dict) else None
+        queue = repo.get("mergeQueue") if isinstance(repo, dict) else None
+        connection = queue.get("entries") if isinstance(queue, dict) else None
+        nodes = connection.get("nodes") if isinstance(connection, dict) else None
+        page_info = connection.get("pageInfo") if isinstance(connection, dict) else None
+        if not isinstance(nodes, list) or not isinstance(page_info, dict):
+            raise AcceptanceError("merge queue or its entries are unavailable")
+        if any(not isinstance(node, dict) for node in nodes):
+            raise AcceptanceError("merge queue contains a malformed entry")
+        entries.extend(nodes)
+        if len(entries) > _MAX_QUEUE_ENTRIES:
+            raise AcceptanceError("merge queue exceeds the supported entry limit")
+        if page_info.get("hasNextPage") is not True:
+            return entries
+        next_cursor = page_info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise AcceptanceError("merge queue pagination has no cursor")
+        cursor = next_cursor
+    raise AcceptanceError("merge queue did not end within the page limit")
+
+
+def _bind_queue_heads(
+    numbers: list[int],
+    base: str,
+    branch: str,
+    repository: str,
+    env: dict[str, str],
+) -> list[tuple[int, str]]:
+    """Bind the synthetic PR sequence to exact heads in the live queue."""
+    queue_entries = _merge_queue_entries(repository, branch, env)
+    by_number: dict[int, dict] = {}
+    for entry in queue_entries:
+        pull_request = entry.get("pullRequest")
+        number = pull_request.get("number") if isinstance(pull_request, dict) else None
+        if not isinstance(number, int):
+            raise AcceptanceError("merge queue entry has no pull request number")
+        if number in by_number:
+            raise AcceptanceError(
+                f"merge queue contains duplicate pull request #{number}"
+            )
+        by_number[number] = entry
+
+    selected: list[tuple[int, int, str]] = []
+    for number in numbers:
+        entry = by_number.get(number)
+        if entry is None:
+            raise AcceptanceError(
+                f"pull request #{number} is no longer in the live merge queue"
+            )
+        pull_request = entry["pullRequest"]
+        if pull_request.get("baseRefName") != branch:
+            raise AcceptanceError(
+                f"merge queue pull request #{number} targets the wrong branch"
+            )
+        if pull_request.get("state") != "OPEN":
+            raise AcceptanceError(f"merge queue pull request #{number} is not open")
+        position = entry.get("position")
+        if not isinstance(position, int):
+            raise AcceptanceError(f"merge queue pull request #{number} has no position")
+        queued_head = entry.get("headCommit")
+        queued_head_oid = (
+            queued_head.get("oid") if isinstance(queued_head, dict) else None
+        )
+        exact_head = _commit_sha(
+            pull_request.get("headRefOid"), f"merge queue pull request #{number} head"
+        )
+        if (
+            _commit_sha(queued_head_oid, f"merge queue entry #{number} head")
+            != exact_head
+        ):
+            raise AcceptanceError(
+                f"merge queue entry #{number} is stale relative to its pull request head"
+            )
+        selected.append((position, number, exact_head))
+
+    selected.sort()
+    positions = [position for position, _number, _head in selected]
+    if positions != list(range(positions[0], positions[0] + len(positions))):
+        raise AcceptanceError(
+            "merge_group entries are not contiguous in the live queue"
+        )
+    ordered_numbers = [number for _position, number, _head in selected]
+    if ordered_numbers != numbers:
+        raise AcceptanceError("merge_group order disagrees with the live merge queue")
+
+    first_base = by_number[numbers[0]].get("baseCommit")
+    first_base_oid = first_base.get("oid") if isinstance(first_base, dict) else None
+    if _commit_sha(first_base_oid, "first merge queue entry base") != base:
+        raise AcceptanceError("merge_group base disagrees with the live merge queue")
+    return [(number, head) for _position, number, head in selected]
+
+
 def _merge_group_numbers(
     payload: dict, repository: str, env: dict[str, str]
-) -> tuple[list[int], str, str]:
+) -> tuple[list[tuple[int, str]], str]:
     """Resolve every PR represented by a validated synthetic queue chain.
 
-    Returns ``(numbers, base_branch, final_pr_head)``. The final head is encoded
-    in the GitHub-minted queue ref and provides an independent cross-check of
-    the last pull request fetched below.
+    Returns ``(number_and_exact_head, base_branch)``. Commit subjects identify
+    group members; GraphQL merge-queue entries authoritatively bind every one
+    of those numbers to its exact queued head.
     """
     merge_group = payload.get("merge_group")
     if not isinstance(merge_group, dict):
@@ -343,7 +514,7 @@ def _merge_group_numbers(
         raise AcceptanceError("merge_group contains a duplicate pull request number")
     if numbers[-1] != int(match.group("number")):
         raise AcceptanceError("merge_group history disagrees with its queue ref")
-    return numbers, base_branch, match.group("head").lower()
+    return _bind_queue_heads(numbers, base, base_branch, repository, env), base_branch
 
 
 def _reviews(repository: str, number: int, env: dict[str, str]) -> list:
@@ -370,18 +541,15 @@ def assert_accepted(env: dict[str, str]) -> str:
     payload = _event_payload(env)
     event = env.get("GITHUB_EVENT_NAME")
     expected_base: str | None = None
-    expected_final_head: str | None = None
     if event == "merge_group":
-        numbers, expected_base, expected_final_head = _merge_group_numbers(
-            payload, repository, env
-        )
+        queued_pulls, expected_base = _merge_group_numbers(payload, repository, env)
     elif event in {"pull_request", "pull_request_review"}:
-        numbers = [_pull_request_number(payload, env)]
+        queued_pulls = [(_pull_request_number(payload, env), None)]
     else:
         raise AcceptanceError(f"unsupported event for acceptance: {event!r}")
 
     evidence = []
-    for index, number in enumerate(numbers):
+    for number, queued_exact_head in queued_pulls:
         # Re-read each pull request rather than trusting the event payload. A
         # pushed head invalidates the old verdict even if this run was queued
         # from an earlier review event.
@@ -404,11 +572,10 @@ def assert_accepted(env: dict[str, str]) -> str:
         head = pull_request.get("head")
         head_sha = head.get("sha") if isinstance(head, dict) else None
         exact_head = _commit_sha(head_sha, f"pull request #{number} head sha")
-        if index == len(numbers) - 1 and expected_final_head is not None:
-            if exact_head != expected_final_head:
-                raise AcceptanceError(
-                    f"merge_group queue ref is stale for pull request #{number}"
-                )
+        if queued_exact_head is not None and exact_head != queued_exact_head:
+            raise AcceptanceError(
+                f"merge_group pull request #{number} moved after the group was built"
+            )
         user = pull_request.get("user")
         author = user.get("login") if isinstance(user, dict) else None
         reviewer = evaluate(_reviews(repository, number, env), exact_head, author)

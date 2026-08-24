@@ -10,8 +10,9 @@ real verdict, and asserts the gate stops it.
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 import re
+from pathlib import Path
 
 import pytest
 import yaml
@@ -23,7 +24,6 @@ from scripts.assert_independent_acceptance import (
     evaluate,
     parse_marker,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/acceptance-gate.yml"
@@ -305,7 +305,8 @@ def test_the_gate_runs_the_verifier_that_exists() -> None:
 BASE = "1111111111111111111111111111111111111111"  # pragma: allowlist secret
 SYNTHETIC_ONE = "2222222222222222222222222222222222222222"  # pragma: allowlist secret
 SYNTHETIC_TWO = "3333333333333333333333333333333333333333"  # pragma: allowlist secret
-FINAL_HEAD = "4444444444444444444444444444444444444444"  # pragma: allowlist secret
+HEAD_ELEVEN = "4444444444444444444444444444444444444444"  # pragma: allowlist secret
+HEAD_TWELVE = "5555555555555555555555555555555555555555"  # pragma: allowlist secret
 
 
 def merge_group_payload(number: int = 12) -> dict:
@@ -314,7 +315,7 @@ def merge_group_payload(number: int = 12) -> dict:
             "base_sha": BASE,
             "head_sha": SYNTHETIC_TWO,
             "base_ref": "refs/heads/main",
-            "head_ref": (f"refs/heads/gh-readonly-queue/main/pr-{number}-{FINAL_HEAD}"),
+            "head_ref": (f"refs/heads/gh-readonly-queue/main/pr-{number}-{BASE}"),
         }
     }
 
@@ -336,7 +337,37 @@ def synthetic(sha: str, parent: str, number: int) -> dict:
     }
 
 
-def test_a_batch_merge_group_resolves_every_pull_request(monkeypatch) -> None:
+def queue_entry(position: int, number: int, head: str, base: str = BASE) -> dict:
+    return {
+        "position": position,
+        "state": "AWAITING_CHECKS",
+        "baseCommit": {"oid": base},
+        "headCommit": {"oid": head},
+        "pullRequest": {
+            "number": number,
+            "headRefOid": head,
+            "baseRefName": "main",
+            "state": "OPEN",
+        },
+    }
+
+
+def queue_response(entries: list[dict]) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "mergeQueue": {
+                    "entries": {
+                        "nodes": entries,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        }
+    }
+
+
+def mock_merge_group_apis(monkeypatch, entries: list[dict]) -> None:
     response = comparison(
         [
             synthetic(SYNTHETIC_ONE, BASE, 11),
@@ -346,14 +377,27 @@ def test_a_batch_merge_group_resolves_every_pull_request(monkeypatch) -> None:
     monkeypatch.setattr(
         "scripts.assert_independent_acceptance._api", lambda _path, _env: response
     )
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_response(entries),
+    )
 
-    numbers, base, final_head = _merge_group_numbers(
+
+def test_a_batch_merge_group_resolves_every_pull_request(monkeypatch) -> None:
+    mock_merge_group_apis(
+        monkeypatch,
+        [
+            queue_entry(1, 11, HEAD_ELEVEN),
+            queue_entry(2, 12, HEAD_TWELVE),
+        ],
+    )
+
+    queued_pulls, base = _merge_group_numbers(
         merge_group_payload(), "dimastov-lab/ai-command-center", {"GITHUB_TOKEN": "x"}
     )
 
-    assert numbers == [11, 12]
+    assert queued_pulls == [(11, HEAD_ELEVEN), (12, HEAD_TWELVE)]
     assert base == "main"
-    assert final_head == FINAL_HEAD
 
 
 @pytest.mark.parametrize(
@@ -381,6 +425,12 @@ def test_an_ambiguous_merge_group_is_refused(monkeypatch, mutate, message) -> No
     monkeypatch.setattr(
         "scripts.assert_independent_acceptance._api", lambda _path, _env: response
     )
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_response(
+            [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(2, 12, HEAD_TWELVE)]
+        ),
+    )
 
     with pytest.raises(AcceptanceError, match=message):
         _merge_group_numbers(
@@ -390,17 +440,56 @@ def test_an_ambiguous_merge_group_is_refused(monkeypatch, mutate, message) -> No
         )
 
 
-def test_a_merge_group_that_disagrees_with_the_queue_ref_is_refused(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ([queue_entry(1, 12, HEAD_TWELVE)], "#11 is no longer"),
+        (
+            [queue_entry(2, 11, HEAD_ELEVEN), queue_entry(1, 12, HEAD_TWELVE)],
+            "order disagrees",
+        ),
+        (
+            [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(3, 12, HEAD_TWELVE)],
+            "not contiguous",
+        ),
+    ],
+)
+def test_a_group_that_disagrees_with_live_queue_is_refused(
+    monkeypatch, entries, message
 ) -> None:
-    response = comparison(
+    mock_merge_group_apis(monkeypatch, entries)
+
+    with pytest.raises(AcceptanceError, match=message):
+        _merge_group_numbers(
+            merge_group_payload(),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_every_group_member_is_bound_to_its_exact_queued_head(monkeypatch) -> None:
+    stale = queue_entry(1, 11, HEAD_ELEVEN)
+    stale["headCommit"]["oid"] = HEAD_TWELVE
+    mock_merge_group_apis(
+        monkeypatch,
         [
-            synthetic(SYNTHETIC_ONE, BASE, 11),
-            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
-        ]
+            stale,
+            queue_entry(2, 12, HEAD_TWELVE),
+        ],
     )
-    monkeypatch.setattr(
-        "scripts.assert_independent_acceptance._api", lambda _path, _env: response
+
+    with pytest.raises(AcceptanceError, match="stale relative"):
+        _merge_group_numbers(
+            merge_group_payload(),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_a_group_with_the_wrong_final_queue_ref_number_is_refused(monkeypatch) -> None:
+    mock_merge_group_apis(
+        monkeypatch,
+        [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(2, 12, HEAD_TWELVE)],
     )
 
     with pytest.raises(AcceptanceError, match="disagrees with its queue ref"):
@@ -408,4 +497,105 @@ def test_a_merge_group_that_disagrees_with_the_queue_ref_is_refused(
             merge_group_payload(number=13),
             "dimastov-lab/ai-command-center",
             {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_batch_acceptance_checks_each_queue_bound_exact_head(
+    monkeypatch, tmp_path: Path
+) -> None:
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(merge_group_payload()), encoding="utf-8")
+    compare_response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+
+    def api(path: str, _env: dict[str, str]) -> object:
+        if "/compare/" in path:
+            return compare_response
+        if path.endswith("/pulls/11"):
+            return {
+                "number": 11,
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {"sha": HEAD_ELEVEN},
+                "user": {"login": AUTHOR},
+            }
+        if path.endswith("/pulls/12"):
+            return {
+                "number": 12,
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {"sha": HEAD_TWELVE},
+                "user": {"login": AUTHOR},
+            }
+        if "/pulls/11/reviews" in path:
+            return [review(f"ACCEPTANCE: ACCEPT {HEAD_ELEVEN}")]
+        if "/pulls/12/reviews" in path:
+            return [review(f"ACCEPTANCE: ACCEPT {HEAD_TWELVE}")]
+        raise AssertionError(path)
+
+    monkeypatch.setattr("scripts.assert_independent_acceptance._api", api)
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_response(
+            [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(2, 12, HEAD_TWELVE)]
+        ),
+    )
+
+    evidence = assert_accepted(
+        {
+            "GITHUB_REPOSITORY": "dimastov-lab/ai-command-center",
+            "GITHUB_EVENT_PATH": str(event),
+            "GITHUB_EVENT_NAME": "merge_group",
+            "GITHUB_TOKEN": "x",
+        }
+    )
+
+    assert evidence == f"#11:{REVIEWER}, #12:{REVIEWER}"
+
+
+def test_a_pr_moving_after_the_group_was_built_is_refused(
+    monkeypatch, tmp_path: Path
+) -> None:
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(merge_group_payload()), encoding="utf-8")
+    compare_response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+
+    def api(path: str, _env: dict[str, str]) -> object:
+        if "/compare/" in path:
+            return compare_response
+        if path.endswith("/pulls/11"):
+            return {
+                "number": 11,
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {"sha": OTHER},
+                "user": {"login": AUTHOR},
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr("scripts.assert_independent_acceptance._api", api)
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_response(
+            [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(2, 12, HEAD_TWELVE)]
+        ),
+    )
+
+    with pytest.raises(AcceptanceError, match="moved after the group was built"):
+        assert_accepted(
+            {
+                "GITHUB_REPOSITORY": "dimastov-lab/ai-command-center",
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_EVENT_NAME": "merge_group",
+                "GITHUB_TOKEN": "x",
+            }
         )
