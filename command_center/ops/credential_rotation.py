@@ -766,7 +766,6 @@ class RotationController:
             paths.append(recovery)
 
         candidates: list[tuple[Path, PostgresConfig]] = []
-        seen_passwords: set[bytes] = set()
         for path in paths:
             try:
                 metadata = path.lstat()
@@ -781,10 +780,15 @@ class RotationController:
                 config = _postgres_config(read_environment_file(path))
             except FileNotFoundError:
                 continue
-            fingerprint = hashlib.sha256(config.password.encode()).digest()
-            if fingerprint in seen_passwords:
+            # Dedupe by constant-time comparison against the (at most one)
+            # already-collected candidate. No password-derived digest is ever
+            # computed or stored: hashing a live credential with a fast hash
+            # only creates a second, weaker secret representation.
+            if any(
+                hmac.compare_digest(config.password, existing.password)
+                for _path, existing in candidates
+            ):
                 continue
-            seen_passwords.add(fingerprint)
             candidates.append((path, config))
         return candidates
 
