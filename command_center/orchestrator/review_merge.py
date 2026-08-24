@@ -206,15 +206,8 @@ _COMPLETE_REVIEW_PROMPT = (
 
 _REVIEW_INPUT_MARKER = "\nINPUT_ENVELOPE_JSON:\n"
 
-# This is the budget for the actual UTF-8 prompt sent to the reviewer, not a
-# character limit on the raw diff. JSON escaping, task/PR metadata, hashes,
-# chunk counters and the review instructions all consume this same budget.
 _MAX_REVIEW_PROMPT_BYTES = 60_000
-
-# A stable utility default for direct callers/tests. review_once does not rely
-# on this approximation: _review_chunks measures the fully rendered prompt.
-_DEFAULT_DIFF_CHUNK_BYTES = 40_000
-
+_MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
 _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 
@@ -225,13 +218,12 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # incrementing this constant, forcing every task to be re-reviewed under the
 # new contract rather than silently reusing a verdict given for an older,
 # looser policy.
-_REVIEW_POLICY_VERSION = "v4"
+_REVIEW_POLICY_VERSION = "v5"
 
 _MODEL_ONLY_REVIEW_EXECUTORS = frozenset({"copilot", "claude"})
 
 
 def _model_only_review_cascade() -> list[dict[str, Any]]:
-    """Only providers with an argv-enforced zero-tool profile may see PR data."""
     route = cascade_for("review")
     return [
         {**link, "task_type": "independent_review", "capability": "model_only"}
@@ -256,7 +248,19 @@ def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
     return match.group(1), match.group(2), match.group(3)
 
 
-def _review_key(task_id: str, pr_url: str, head_sha: str) -> str | None:
+@dataclass(frozen=True, slots=True)
+class _PRSnapshot:
+    text: str
+    base: str
+    head: str
+    digest: str
+
+    @classmethod
+    def create(cls, text: str, base: str, head: str) -> _PRSnapshot:
+        return cls(text, base, head, hashlib.sha256(text.encode()).hexdigest())
+
+
+def _review_key(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
     """The review-cycle identity: (task, PR, exact head sha, policy
     version) -- not just task_id. A permanent `review:<task_id>` key meant
     that once a task's FIRST review concluded (either verdict), no later
@@ -275,10 +279,13 @@ def _review_key(task_id: str, pr_url: str, head_sha: str) -> str | None:
     validates this via `_repo_from_pr_url` before reaching here in
     practice, but a malformed URL must never produce a malformed key)."""
     match = _PR_URL.match(pr_url)
-    if match is None:
+    if (match is None or not re.fullmatch(r"[0-9a-f]{40}", snapshot.base)
+            or not re.fullmatch(r"[0-9a-f]{40}", snapshot.head)
+            or not re.fullmatch(r"[0-9a-f]{64}", snapshot.digest)):
         return None
     pr_number = match.group(3)
-    return f"review:{task_id}:{pr_number}:{head_sha}:{_REVIEW_POLICY_VERSION}"
+    return (f"review:{task_id}:{pr_number}:{snapshot.head}:{_REVIEW_POLICY_VERSION}:"
+            f"base:{snapshot.base}:diff:{snapshot.digest}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,25 +306,6 @@ def _make_diff_chunks(raw_chunks: list[str]) -> tuple[_DiffChunk, ...]:
     )
 
 
-def _split_oversized_unit(unit: str, cap: int) -> list[str]:
-    """Split by UTF-8 bytes at a line boundary, never inside a code point."""
-    pieces: list[str] = []
-    remaining = unit.encode("utf-8")
-    while len(remaining) > cap:
-        cut = cap
-        while cut > 0 and remaining[cut] & 0xC0 == 0x80:
-            cut -= 1
-        if cut == 0:
-            raise ValueError("chunk cap is smaller than one UTF-8 code point")
-        newline = remaining.rfind(b"\n", 0, cut)
-        cut = newline + 1 if newline >= 0 else cut
-        pieces.append(remaining[:cut].decode("utf-8"))
-        remaining = remaining[cut:]
-    if remaining:
-        pieces.append(remaining.decode("utf-8"))
-    return pieces
-
-
 def _diff_units(diff: str) -> list[str]:
     if not diff:
         return [""]
@@ -329,42 +317,8 @@ def _diff_units(diff: str) -> list[str]:
     return [diff[start:end] for start, end in zip(starts, starts[1:] + [len(diff)])]
 
 
-def _diff_chunks(
-    diff: str, cap: int = _DEFAULT_DIFF_CHUNK_BYTES
-) -> tuple[_DiffChunk, ...]:
-    """Build deterministic file/hunk-aligned chunks bounded by UTF-8 bytes.
-
-    Boundaries before ``diff --git`` and ``@@`` keep whole files/hunks together
-    whenever they fit. An individually oversized hunk is split at a newline (or
-    the last complete UTF-8 code point before the cap for a pathological long
-    line). The concatenated chunk text is byte-for-byte the original string:
-    there is no head/tail truncation.
-    """
-    if cap < 1:
-        raise ValueError("chunk cap must be positive")
-    bounded_units = [
-        piece
-        for unit in _diff_units(diff)
-        for piece in _split_oversized_unit(unit, cap)
-    ]
-    raw_chunks: list[str] = []
-    current = ""
-    for unit in bounded_units:
-        if current and len((current + unit).encode("utf-8")) > cap:
-            raw_chunks.append(current)
-            current = ""
-        current += unit
-    if current or not raw_chunks:
-        raw_chunks.append(current)
-    if "".join(raw_chunks) != diff or any(
-        len(chunk.encode("utf-8")) > cap for chunk in raw_chunks
-    ):
-        raise RuntimeError("diff chunking invariant violated")
-    return _make_diff_chunks(raw_chunks)
-
-
 def _review_input_envelope(
-    task_id: str, pr_url: str, head_sha: str, chunk: _DiffChunk
+    task_id: str, pr_url: str, snapshot: _PRSnapshot, chunk: _DiffChunk
 ) -> str:
     content_bytes = chunk.text.encode("utf-8")
     if hashlib.sha256(content_bytes).hexdigest() != chunk.content_hash:
@@ -374,7 +328,9 @@ def _review_input_envelope(
         "policy_version": _REVIEW_POLICY_VERSION,
         "task_id": task_id,
         "pr_url": pr_url,
-        "head_sha": head_sha,
+        "base_sha": snapshot.base,
+        "head_sha": snapshot.head,
+        "diff_sha256": snapshot.digest,
         "scope": "complete_diff" if chunk.count == 1 else "partial_chunk",
         "chunk": {
             "index": chunk.index,
@@ -388,14 +344,11 @@ def _review_input_envelope(
             "text": chunk.text,
         },
     }
-    # Compact one-line JSON is the data boundary. In particular, newline and
-    # carriage-return bytes inside a malicious diff are escaped by json.dumps,
-    # so a diff line containing ``` can never become a prompt-level fence.
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _render_review_prompt(
-    task_id: str, pr_url: str, head_sha: str, chunk: _DiffChunk
+    task_id: str, pr_url: str, snapshot: _PRSnapshot, chunk: _DiffChunk
 ) -> str:
     scope_prompt = (
         _COMPLETE_REVIEW_PROMPT if chunk.count == 1 else _CHUNK_REVIEW_PROMPT
@@ -404,7 +357,7 @@ def _render_review_prompt(
         scope_prompt
         + _REVIEW_PROMPT
         + _REVIEW_INPUT_MARKER
-        + _review_input_envelope(task_id, pr_url, head_sha, chunk)
+        + _review_input_envelope(task_id, pr_url, snapshot, chunk)
     )
 
 
@@ -413,7 +366,6 @@ def _prompt_size_bytes(prompt: str) -> int:
 
 
 def _split_unit_to_fit(unit: str, fits: Any) -> list[str]:
-    """Deterministically split a unit using the actual rendered-prompt size."""
     pieces: list[str] = []
     remaining = unit
     while remaining and not fits(remaining):
@@ -438,18 +390,15 @@ def _split_unit_to_fit(unit: str, fits: Any) -> list[str]:
 
 
 def _review_chunks(
-    diff: str, task_id: str, pr_url: str, head_sha: str
+    snapshot: _PRSnapshot, task_id: str, pr_url: str
 ) -> tuple[_DiffChunk, ...]:
-    """Chunk by the UTF-8 size of the complete, encoded reviewer prompt."""
+    diff = snapshot.text
     whole = _make_diff_chunks([diff])
-    if _prompt_size_bytes(_render_review_prompt(task_id, pr_url, head_sha, whole[0])) <= (
+    if _prompt_size_bytes(_render_review_prompt(task_id, pr_url, snapshot, whole[0])) <= (
         _MAX_REVIEW_PROMPT_BYTES
     ):
         return whole
 
-    # Ten decimal digits are a conservative bound for both counters. Their
-    # width, all fixed instructions, actual task/PR/head metadata, JSON escaping
-    # and the content itself are measured together for every candidate.
     def fits(text: str) -> bool:
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         candidate = _DiffChunk(
@@ -460,7 +409,7 @@ def _review_chunks(
             manifest_hash="f" * 64,
         )
         return _prompt_size_bytes(
-            _render_review_prompt(task_id, pr_url, head_sha, candidate)
+            _render_review_prompt(task_id, pr_url, snapshot, candidate)
         ) <= _MAX_REVIEW_PROMPT_BYTES
 
     if not fits(""):
@@ -483,7 +432,7 @@ def _review_chunks(
         raise RuntimeError("review prompt chunking lost diff content")
     chunks = _make_diff_chunks(raw_chunks)
     if len(chunks) < 2 or any(
-        _prompt_size_bytes(_render_review_prompt(task_id, pr_url, head_sha, chunk))
+        _prompt_size_bytes(_render_review_prompt(task_id, pr_url, snapshot, chunk))
         > _MAX_REVIEW_PROMPT_BYTES
         for chunk in chunks
     ):
@@ -492,20 +441,20 @@ def _review_chunks(
 
 
 def _chunk_review_key(
-    task_id: str, pr_url: str, head_sha: str, chunk: _DiffChunk
+    task_id: str, pr_url: str, snapshot: _PRSnapshot, chunk: _DiffChunk
 ) -> str | None:
-    base = _review_key(task_id, pr_url, head_sha)
+    base = _review_key(task_id, pr_url, snapshot)
     if base is None:
         return None
     return f"{base}:chunk:{chunk.index:04d}:{chunk.content_hash}"
 
 
-def _chunk_key_prefix(task_id: str, pr_url: str, head_sha: str) -> str | None:
-    base = _review_key(task_id, pr_url, head_sha)
+def _chunk_key_prefix(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
+    base = _review_key(task_id, pr_url, snapshot)
     return f"{base}:chunk:" if base else None
 
 
-def _pr_diff_and_head(repo_path: str, pr_url: str) -> tuple[str, str] | None:
+def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
     prompt (rather than granting the agent its own `gh`/Bash access to fetch
@@ -516,31 +465,36 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> tuple[str, str] | None:
     `--repo` argument and read PRs from other, unrelated repositories with no
     shell-escape needed at all -- a risk that scoping the Bash pattern more
     tightly cannot close, but never granting Bash to begin with does.
-    Returns None on any `gh` failure or moving-head race."""
-    def current_head() -> str | None:
-        view = _gh(["pr", "view", pr_url, "--json", "headRefOid"], repo_path)
-        if view.returncode != 0:
-            return None
-        try:
-            value = json.loads(view.stdout or "{}")
-        except (TypeError, json.JSONDecodeError):
-            return None
-        head = value.get("headRefOid") if isinstance(value, dict) else None
-        return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) else None
-
-    head_before = current_head()
-    if head_before is None:
+    Returns None on any malformed or cross-repository response."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
         return None
-    diff = _gh(["pr", "diff", pr_url], repo_path)
-    if diff.returncode != 0:
+    owner, repo, number = parsed
+    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    try:
+        data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
+        base, head = data["base"], data["head"]
+        base_sha, head_sha = base["sha"], head["sha"]
+        same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
+        stats = tuple(data[name] for name in ("changed_files", "additions", "deletions"))
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
         return None
-    # `gh pr diff` is not itself addressed by commit SHA. Bind its bytes to an
-    # exact head with a second read and fail closed if a force-push raced the
-    # fetch. This is deliberately before any enqueue/idempotency-key creation.
-    head_after = current_head()
-    if head_after != head_before:
+    if (not same_repo or not re.fullmatch(r"[0-9a-f]{40}", base_sha)
+            or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
+            or not all(type(value) is int and value >= 0 for value in stats)):
         return None
-    return diff.stdout, head_before
+    diff = _gh(["api", f"repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
+                "-H", "Accept: application/vnd.github.v3.diff"], repo_path)
+    text = diff.stdout
+    if diff.returncode != 0 or len(text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
+        return None
+    lines = text.splitlines()
+    observed = (
+        sum(line.startswith("diff --git ") for line in lines),
+        sum(line.startswith("+") and not line.startswith("+++ ") for line in lines),
+        sum(line.startswith("-") and not line.startswith("--- ") for line in lines),
+    )
+    return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
 
 
 def review_once(
@@ -591,7 +545,7 @@ def review_once(
         params,
     )
     cascade = _model_only_review_cascade()
-    for task_id, pr_url in tasks:
+    for task_id, pr_url in tasks:  # noqa: PLR1704
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
@@ -604,21 +558,21 @@ def review_once(
         if fetched is None:
             report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
             continue
-        diff, head_sha = fetched
-        key = _review_key(task_id, pr_url, head_sha)
+        snapshot = fetched
+        key = _review_key(task_id, pr_url, snapshot)
         if key is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
         project_id, repository_path = route
         try:
-            chunks = _review_chunks(diff, task_id, pr_url, head_sha)
+            chunks = _review_chunks(snapshot, task_id, pr_url)
         except (RuntimeError, ValueError) as exc:
             report.skipped.append((task_id, f"review_prompt_budget_invalid: {exc}"))
             continue
 
         prepared: list[tuple[str, dict[str, Any]]] = []
         for chunk in chunks:
-            prompt = _render_review_prompt(task_id, pr_url, head_sha, chunk)
+            prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
                 prepared = []
                 break
@@ -634,17 +588,19 @@ def review_once(
             if chunk.count == 1:
                 prepared.append((key, payload))
             else:
-                chunk_key = _chunk_review_key(task_id, pr_url, head_sha, chunk)
+                chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
                 if chunk_key is None:
                     raise RuntimeError("validated PR URL produced no chunk key")
                 payload["review_chunk"] = {
-                    "version": 2,
+                    "version": 3,
                     "index": chunk.index,
                     "count": chunk.count,
                     "content_bytes": len(chunk.text.encode("utf-8")),
                     "content_hash": chunk.content_hash,
                     "manifest_hash": chunk.manifest_hash,
-                    "head_sha": head_sha,
+                    "base_sha": snapshot.base,
+                    "head_sha": snapshot.head,
+                    "diff_hash": snapshot.digest,
                 }
                 prepared.append((chunk_key, payload))
         if not prepared:
@@ -725,9 +681,9 @@ def _json_object(value: Any) -> dict[str, Any] | None:
 
 
 def _chunk_review_rows(
-    factory: Any, task_id: str, pr_url: str, head_sha: str
+    factory: Any, task_id: str, pr_url: str, snapshot: _PRSnapshot
 ) -> tuple[str | None, list[tuple[Any, ...]]]:
-    prefix = _chunk_key_prefix(task_id, pr_url, head_sha)
+    prefix = _chunk_key_prefix(task_id, pr_url, snapshot)
     if prefix is None:
         return None, []
     rows = _rows(
@@ -742,16 +698,15 @@ def _chunk_review_rows(
 
 
 def _aggregate_chunk_verdict(
-    rows: list[tuple[Any, ...]], current_head: str, prefix: str
+    rows: list[tuple[Any, ...]], snapshot: _PRSnapshot, prefix: str
 ) -> tuple[str, str]:
-    """Return ACCEPT, REJECT or WAIT after validating one whole manifest."""
-    indexed: dict[int, tuple[str, str, dict[str, Any] | None]] = {}
+    indexed: dict[int, tuple[str, str, dict[str, Any] | None, str]] = {}
     expected_count: int | None = None
     expected_manifest: str | None = None
     for key, state, payload_value, result_value in rows:
         payload = _json_object(payload_value)
         metadata = payload.get("review_chunk") if payload else None
-        if not isinstance(metadata, dict) or metadata.get("version") != 2:
+        if not isinstance(metadata, dict) or metadata.get("version") != 3:
             return "WAIT", "review_chunk_manifest_invalid"
         index = metadata.get("index")
         count = metadata.get("count")
@@ -771,10 +726,12 @@ def _aggregate_chunk_verdict(
             or not re.fullmatch(r"[0-9a-f]{64}", content_hash)
             or not isinstance(manifest_hash, str)
             or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash)
-            or metadata.get("head_sha") != current_head
+            or metadata.get("base_sha") != snapshot.base
+            or metadata.get("head_sha") != snapshot.head
+            or metadata.get("diff_hash") != snapshot.digest
             or key != f"{prefix}{index:04d}:{content_hash}"
             or index in indexed
-            or not _chunk_payload_matches_envelope(payload, metadata, current_head)
+            or not _chunk_payload_matches_envelope(payload, metadata, snapshot)
         ):
             return "WAIT", "review_chunk_manifest_invalid"
         if expected_count is None:
@@ -782,7 +739,11 @@ def _aggregate_chunk_verdict(
             expected_manifest = manifest_hash
         elif count != expected_count or manifest_hash != expected_manifest:
             return "WAIT", "review_chunk_manifest_inconsistent"
-        indexed[index] = (str(state), content_hash, _json_object(result_value))
+        envelope = _review_envelope_from_prompt(payload.get("prompt"))
+        content = envelope.get("content") if envelope else None
+        if not isinstance(content, dict) or not isinstance(content.get("text"), str):
+            return "WAIT", "review_chunk_manifest_invalid"
+        indexed[index] = (str(state), content_hash, _json_object(result_value), content["text"])
 
     if expected_count is None:
         return "WAIT", "review_chunks_missing"
@@ -792,11 +753,13 @@ def _aggregate_chunk_verdict(
         actual_manifest = hashlib.sha256("\n".join(ordered_hashes).encode()).hexdigest()
         if actual_manifest != expected_manifest:
             return "WAIT", "review_chunk_manifest_hash_mismatch"
+        if hashlib.sha256("".join(indexed[i][3] for i in range(expected_count)).encode()).hexdigest() != snapshot.digest:
+            return "WAIT", "review_chunk_diff_hash_mismatch"
 
     rejections: list[str] = []
     waiting_reason = ""
     for index in sorted(indexed):
-        state, _content_hash, result = indexed[index]
+        state, _content_hash, result, _text = indexed[index]
         if state != "succeeded" or result is None:
             waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
             continue
@@ -806,7 +769,7 @@ def _aggregate_chunk_verdict(
             waiting_reason = waiting_reason or f"review_chunk_verdict_missing:{index}"
             continue
         verdict, sha = parsed
-        if sha != current_head:
+        if sha != snapshot.head:
             waiting_reason = waiting_reason or f"review_chunk_head_sha_mismatch:{index}"
             continue
         if verdict == "REJECT":
@@ -818,7 +781,7 @@ def _aggregate_chunk_verdict(
         return "WAIT", f"review_chunks_missing:{missing}"
     if waiting_reason:
         return "WAIT", waiting_reason
-    return "ACCEPT", current_head
+    return "ACCEPT", snapshot.head
 
 
 def _review_envelope_from_prompt(prompt: Any) -> dict[str, Any] | None:
@@ -833,9 +796,8 @@ def _review_envelope_from_prompt(prompt: Any) -> dict[str, Any] | None:
 
 
 def _chunk_payload_matches_envelope(
-    payload: dict[str, Any], metadata: dict[str, Any], current_head: str
+    payload: dict[str, Any], metadata: dict[str, Any], snapshot: _PRSnapshot
 ) -> bool:
-    """Bind publisher metadata to the exact collision-safe prompt content."""
     envelope = _review_envelope_from_prompt(payload.get("prompt"))
     if envelope is None:
         return False
@@ -852,7 +814,9 @@ def _chunk_payload_matches_envelope(
         envelope.get("schema") == "voyn.review-input/v1"
         and envelope.get("policy_version") == _REVIEW_POLICY_VERSION
         and envelope.get("scope") == "partial_chunk"
-        and envelope.get("head_sha") == current_head
+        and envelope.get("base_sha") == snapshot.base
+        and envelope.get("head_sha") == snapshot.head
+        and envelope.get("diff_sha256") == snapshot.digest
         and content.get("encoding") == "json-string-utf8"
         and content.get("byte_length") == len(encoded)
         and content.get("sha256") == actual_hash
@@ -1029,7 +993,7 @@ def publish_review_verdicts(
         + " ORDER BY t.updated_at LIMIT %s",
         params,
     )
-    for task_id, pr_url in tasks:
+    for task_id, pr_url in tasks:  # noqa: PLR1704
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
@@ -1037,16 +1001,20 @@ def publish_review_verdicts(
         if not current_head:
             report.skipped.append((task_id, "pr_view_failed"))
             continue
-        key = _review_key(task_id, pr_url, current_head)
+        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        if snapshot is None or snapshot.head != current_head:
+            report.skipped.append((task_id, "pr_diff_snapshot_failed"))
+            continue
+        key = _review_key(task_id, pr_url, snapshot)
         if key is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
         prefix, chunk_rows = _chunk_review_rows(
-            factory, task_id, pr_url, current_head
+            factory, task_id, pr_url, snapshot
         )
         if chunk_rows:
             verdict, text = _aggregate_chunk_verdict(
-                chunk_rows, current_head, prefix or ""
+                chunk_rows, snapshot, prefix or ""
             )
             if verdict == "WAIT":
                 report.skipped.append((task_id, text))

@@ -198,8 +198,7 @@ def _probe_uncached(executable: str, args: list[str], *, provider_id: str) -> tu
         result = subprocess.run(
             [executable, *args],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=5,
             shell=False,
@@ -974,7 +973,7 @@ class OllamaProvider:
         # `ollama list` is the cheapest proof that the local daemon is actually
         # reachable. Without it the binary exists but every run would fail on
         # first token with a connection error.
-        daemon_ok, listing = _probe(executable, ["list"], provider_id=self.id)
+        daemon_ok, _listing = _probe(executable, ["list"], provider_id=self.id)
         if not daemon_ok:
             return ProviderAvailability(
                 self.id,

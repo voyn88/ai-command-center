@@ -96,7 +96,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from command_center import models, project_config, storage
@@ -787,7 +787,7 @@ class RunResult:
             return True
         if executor != "copilot" or self.status != "failed" or not self.exit_code:
             return False
-        diagnostic = "\n".join((self.stdout, self.stderr)).lower()
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
         return any(
             signature in diagnostic
             for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
@@ -796,7 +796,7 @@ class RunResult:
     @property
     def is_executor_sandbox_error(self) -> bool:
         """Whether the sandbox launcher reported its known loopback failure."""
-        diagnostic = "\n".join((self.stdout, self.stderr)).lower()
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
         return all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
 
 
@@ -1038,7 +1038,7 @@ def run_claude_code(
             started_at=started_at,
             completed_at=models.iso_now(),
         )
-    diagnostic = "\n".join((stdout, stderr)).lower()
+    diagnostic = f"{stdout}\n{stderr}".lower()
     status = (
         "failed"
         if all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
@@ -1144,7 +1144,7 @@ def report_path_for(run: dict) -> Path:
     try:
         started_dt = datetime.fromisoformat(started)
     except ValueError:
-        started_dt = datetime.now()
+        started_dt = datetime.now(UTC)
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
     task_part = _safe_path_component(run.get("task_id") or "adhoc", "adhoc")[:12]
     agent = _safe_path_component(run.get("agent") or "agent", "agent")

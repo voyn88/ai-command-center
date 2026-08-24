@@ -15,7 +15,10 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        review_merge, "_pr_diff_and_head", lambda *args: ("diff", "a" * 40)
+        review_merge, "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create(
+            "diff", "b" * 40, "a" * 40
+        )
     )
     monkeypatch.setattr(
         "command_center.orchestrator.planner.repo_route",
@@ -31,7 +34,7 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     ]
     _queue, key, payload, task_id, max_attempts = calls[0]
     assert task_id == "VOYN-W0-X"
-    assert key.endswith(":v4")
+    assert ":v5:base:" in key and ":diff:" in key
     assert [link["executor"] for link in payload["cascade"]] == [
         "copilot",
         "claude",

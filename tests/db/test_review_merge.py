@@ -1,6 +1,7 @@
 """review_once / merge_once (BO-S3b 2/3, 3/3) on live PostgreSQL: the store
 side is real (READY_TO_REVIEW tasks with pr evidence), gh is faked in-process
 by patching the module's _gh, and enqueue is a recording stub."""
+# ruff: noqa: RUF100
 
 from __future__ import annotations
 
@@ -8,14 +9,35 @@ import json
 
 import pytest
 
-from tests.db.test_backlog_planner import _test_repo_routes, rig  # noqa: F401 — pytest fixtures
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import (
-    merge_once, publish_review_verdicts, review_once,
+    merge_once,
+    publish_review_verdicts,
+    review_once,
 )
+from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
+    _test_repo_routes,
+    rig,
+)
+
+BASE = "c" * 40
+DIFF = "diff --git a/x b/x\n+hi\n"
+SNAPSHOTS = {}
+ORIGINAL_PR_SNAPSHOT = review_merge._pr_diff_and_head
+
+
+def _snapshot(head, diff=DIFF):
+    return review_merge._PRSnapshot.create(diff, BASE, head)
+
+
+@pytest.fixture(autouse=True)
+def _snapshots(monkeypatch):
+    SNAPSHOTS.clear()
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda _repo, pr: SNAPSHOTS.get(pr))
 
 
 def _complete_review(app_factory, worker, task_id, pr_url, head_sha, result_text):
+    SNAPSHOTS[pr_url] = _snapshot(head_sha)
     """Enqueue + claim + complete a review-class work item exactly the way
     review_once/the real daemon would, so publish_review_verdicts reads a
     result shaped like production, not a hand-built row. Keyed via the real
@@ -32,7 +54,7 @@ def _complete_review(app_factory, worker, task_id, pr_url, head_sha, result_text
         "repository_path": "", "task_type": "review",
         "prompt": "review it", "timeout_seconds": 900, "untrusted": False,
     }
-    key = review_merge._review_key(task_id, pr_url, head_sha)
+    key = review_merge._review_key(task_id, pr_url, _snapshot(head_sha))
     store.enqueue("execution", idempotency_key=key, payload=payload, task_id=task_id)
     claimed = worker.claim("execution", visibility_seconds=60)
     assert worker.complete(claimed, {"status": "completed", "result_text": result_text})
@@ -63,13 +85,17 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
 
     def fake_gh(argv, repo):
         import subprocess
-        if argv[:2] == ["pr", "view"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"headRefOid": head}), "")
-        if argv[:2] == ["pr", "diff"]:
-            return subprocess.CompletedProcess(argv, 0, "diff --git a/x b/x\n+hi\n", "")
+        if argv[0] == "api" and "/pulls/7" in argv[1]:
+            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": head}, "changed_files": 1,
+                    "additions": 1, "deletions": 0}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api":
+            return subprocess.CompletedProcess(argv, 0, DIFF, "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
     calls = []
     report = review_once(
         app_factory,
@@ -78,7 +104,7 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     )
     assert ("VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7") in report.reviewed
     assert len(calls) == 1
-    q, key, payload, task_id, max_attempts = calls[0]
+    _q, key, payload, task_id, max_attempts = calls[0]
     # task + PR number + exact head sha + review policy version -- not just
     # the task_id -- so a later push to the same PR (remediation, or an
     # ordinary second push while still IN_PROGRESS) gets its own fresh
@@ -153,17 +179,21 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13")
     head = "e" * 40
-    huge_diff = "я" * 60_000
+    huge_diff = "diff --git a/x b/x\n+" + "я" * 60_000
 
     def fake_gh(argv, repo):
         import subprocess
-        if argv[:2] == ["pr", "view"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"headRefOid": head}), "")
-        if argv[:2] == ["pr", "diff"]:
+        if argv[0] == "api" and "/pulls/13" in argv[1]:
+            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": head}, "changed_files": 1,
+                    "additions": 1, "deletions": 0}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api":
             return subprocess.CompletedProcess(argv, 0, huge_diff, "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
     calls = []
     report = review_once(
         app_factory,
@@ -171,10 +201,8 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
         "/tmp",
     )
     chunks = review_merge._review_chunks(
-        huge_diff,
-        "VOYN-W0-R4",
-        "https://github.com/x/repo-d2/pull/13",
-        head,
+        _snapshot(head, huge_diff), "VOYN-W0-R4",
+        "https://github.com/x/repo-d2/pull/13"
     )
     assert len(calls) == len(chunks) > 1
     assert all(len(call[2]["review_chunk"]["content_hash"]) == 64 for call in calls)
@@ -694,10 +722,12 @@ def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):
     app_factory, store, _worker = rig
     pr_url = "https://github.com/x/y/pull/13"
     _ready(store, app_factory, "VOYN-W0-P3", pr_url)
+    live_head = "7" * 40
+    SNAPSHOTS[pr_url] = _snapshot(live_head)
 
     def fake_gh(argv, repo):
         if argv[:2] == ["pr", "view"]:
-            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": "z" * 40, "reviews": []}), "")
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": live_head, "reviews": []}), "")
         return sp.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
@@ -755,6 +785,7 @@ def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig,
         app_factory, worker, "VOYN-W0-P5", pr_url, reviewed_sha,
         f"Looks fine.\nVERDICT: ACCEPT\nHEAD_SHA: {reviewed_sha}\n",
     )
+    SNAPSHOTS[pr_url] = _snapshot(new_head)
 
     posted = []
 
@@ -926,11 +957,11 @@ def test_review_key_scopes_by_pr_number_head_sha_and_policy_version():
     base = "https://github.com/voyn88/aios/pull/273"
     sha_a = "a" * 40
     sha_b = "b" * 40
-    key_a = review_merge._review_key("VOYN-W0-X", base, sha_a)
-    key_b = review_merge._review_key("VOYN-W0-X", base, sha_b)
+    key_a = review_merge._review_key("VOYN-W0-X", base, _snapshot(sha_a))
+    key_b = review_merge._review_key("VOYN-W0-X", base, _snapshot(sha_b))
     assert key_a != key_b  # a new commit is a new review, automatically
-    assert key_a == f"review:VOYN-W0-X:273:{sha_a}:{review_merge._REVIEW_POLICY_VERSION}"
-    assert review_merge._review_key("VOYN-W0-X", "not a url", sha_a) is None
+    assert f":{sha_a}:{review_merge._REVIEW_POLICY_VERSION}:base:{BASE}:diff:" in key_a
+    assert review_merge._review_key("VOYN-W0-X", "not a url", _snapshot(sha_a)) is None
 
 
 def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
@@ -945,21 +976,24 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
     _ready(store, app_factory, "VOYN-W0-R5", pr_url)
 
     def fake_gh(argv, repo):
-        if argv[:2] == ["pr", "view"]:
-            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": next(current_head)}), "")
-        if argv[:2] == ["pr", "diff"]:
-            return sp.CompletedProcess(argv, 0, "diff --git a/x b/x\n+hi\n", "")
+        if argv[0] == "api" and "/pulls/20" in argv[1]:
+            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": next(current_head)}, "changed_files": 1,
+                    "additions": 1, "deletions": 0}
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api":
+            return sp.CompletedProcess(argv, 0, DIFF, "")
         return sp.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
     calls = []
-    enqueue = lambda q, k, p, tid, attempts: calls.append(  # noqa: E731
-        (q, k, p, tid, attempts)
-    )
+    def enqueue(q, k, p, tid, attempts):
+        calls.append((q, k, p, tid, attempts))
 
-    current_head = iter(["a" * 40, "a" * 40])
+    current_head = iter(["a" * 40])
     review_once(app_factory, enqueue, "/tmp")
-    current_head = iter(["b" * 40, "b" * 40])
+    current_head = iter(["b" * 40])
     review_once(app_factory, enqueue, "/tmp")
 
     assert len(calls) == 2
