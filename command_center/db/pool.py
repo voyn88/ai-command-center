@@ -31,8 +31,8 @@ import logging
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from typing import Any
 
-from command_center.db import adapter
 from command_center.db.config import PostgresConfig, load_config
 
 __all__ = [
@@ -42,13 +42,16 @@ __all__ = [
     "get_pool",
     "open_pool",
     "pool_stats",
+    "replace_pool",
 ]
 
 _LOG = logging.getLogger(__name__)
 
 _lock = threading.Lock()
-_pool = None
+_pool: Any = None
 _config: PostgresConfig | None = None
+_active: dict[int, int] = {}
+_retired: dict[int, Any] = {}
 
 
 class PoolNotOpenError(RuntimeError):
@@ -63,22 +66,58 @@ def open_pool(config: PostgresConfig | None = None):
         if _pool is not None:
             return _pool
         resolved = config or load_config()
-        # `aios_db.open_pool` waits for the first connections and closes the
-        # half-built pool if they fail, so a bad DSN, an unreachable host or a
-        # rejected certificate surfaces here rather than on the first request.
-        pool = adapter.open_pool(
-            resolved.conninfo(),
-            min_size=resolved.pool_min_size,
-            max_size=resolved.pool_max_size,
-            timeout=resolved.pool_timeout_seconds,
-            checkout_timeout=resolved.pool_timeout_seconds,
-            autocommit=True,
-            name="aicc",
-        )
+        pool = _build_pool(resolved)
         _pool = pool
         _config = resolved
         _LOG.info("postgres pool open: %s", resolved.redacted())
         return pool
+
+
+def _build_pool(config: PostgresConfig):
+    from command_center.db import adapter
+
+    # `aios_db.open_pool` waits for the first connections and closes the
+    # half-built pool if they fail, so a bad DSN, an unreachable host or a
+    # rejected certificate surfaces before it can replace the working pool.
+    return adapter.open_pool(
+        config.conninfo(),
+        min_size=config.pool_min_size,
+        max_size=config.pool_max_size,
+        timeout=config.pool_timeout_seconds,
+        checkout_timeout=config.pool_timeout_seconds,
+        autocommit=True,
+        name="aicc",
+    )
+
+
+def replace_pool(config: PostgresConfig):
+    """Atomically replace the process pool after credential rotation.
+
+    The replacement is opened and connectivity-checked *before* the old pool
+    is detached. Existing checkouts stay valid against PostgreSQL's established
+    sessions; the old pool is retired only after its last checkout returns.
+    New heartbeats/queue calls immediately use the replacement. This is what
+    makes a credential reload safe in the middle of a 3600-second agent job.
+    """
+
+    global _pool, _config
+
+    replacement = _build_pool(config)
+    close_now: Any | None = None
+    with _lock:
+        previous = _pool
+        _pool = replacement
+        _config = config
+        if previous is not None:
+            previous_id = id(previous)
+            if _active.get(previous_id, 0) == 0:
+                close_now = previous
+            else:
+                _retired[previous_id] = previous
+    if close_now is not None:
+        close_now.close()
+    _LOG.info("postgres pool replaced: %s", config.redacted())
+    return replacement
 
 
 def get_pool():
@@ -94,20 +133,46 @@ def close_pool() -> None:
     """Close the pool and drop the cached config. Safe to call when not open."""
     global _pool, _config
 
+    closing: list[Any]
     with _lock:
-        if _pool is not None:
-            _pool.close()
+        closing = ([] if _pool is None else [_pool]) + list(_retired.values())
         _pool = None
         _config = None
+        _retired.clear()
+        _active.clear()
+    for item in closing:
+        item.close()
 
 
 @contextmanager
 def connection() -> Iterator:
     """Check a connection out of the pool for the duration of the block."""
-    with get_pool().connection() as conn:
-        yield conn
+    with _lock:
+        selected = _pool
+        if selected is None:
+            raise PoolNotOpenError(
+                "PostgreSQL pool is not open. Call open_pool() during startup."
+            )
+        selected_id = id(selected)
+        _active[selected_id] = _active.get(selected_id, 0) + 1
+    try:
+        with selected.connection() as conn:
+            yield conn
+    finally:
+        close_retired: Any | None = None
+        with _lock:
+            remaining = _active[selected_id] - 1
+            if remaining:
+                _active[selected_id] = remaining
+            else:
+                _active.pop(selected_id, None)
+                close_retired = _retired.pop(selected_id, None)
+        if close_retired is not None:
+            close_retired.close()
 
 
 def pool_stats() -> dict[str, int]:
     """Pool counters for the readiness probe and metrics."""
+    from command_center.db import adapter
+
     return adapter.pool_stats(get_pool())

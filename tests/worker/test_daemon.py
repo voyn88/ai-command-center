@@ -10,7 +10,6 @@ for exactly one reason.
 
 from __future__ import annotations
 
-
 from command_center.db.work_queue_store import ClaimedWork, QueueRefusal
 from command_center.worker.daemon import (
     HandlerOutcome,
@@ -161,6 +160,60 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
     daemon.run_forever()
 
     assert len(seen) == 1, "the second item must not be claimed after stop"
+    assert ("complete", "wat-1", {}) in store.calls
+
+
+def test_credential_hot_reload_does_not_wait_for_or_signal_the_running_job() -> None:
+    """Pool generations change beside a 3600-second handler. The handler is
+    neither stopped nor duplicated, while its heartbeat can move to the new
+    pool on its next checkout."""
+
+    import threading
+
+    store = ScriptedStore([_work({"kind": "slow"})])
+    events: list[str] = []
+    pings: list[str] = []
+    daemon: WorkerDaemon
+    handler_started = threading.Event()
+    handler_release = threading.Event()
+    reload_done = threading.Event()
+
+    def handler(payload, lease_lost, attempt_no=1):
+        events.append("handler")
+        handler_started.set()
+        assert handler_release.wait(timeout=5)
+        events.append("handler-finished")
+        return HandlerOutcome(ok=True, result={})
+
+    def reload_credentials() -> None:
+        assert not handler_release.is_set(), "test must reload while job is active"
+        events.append("reload")
+        reload_done.set()
+
+    def sleep(_seconds: float) -> None:
+        daemon.request_stop()
+
+    daemon = WorkerDaemon(
+        store,
+        {"slow": handler},
+        WorkerConfig(visibility_seconds=3),
+        sleep=sleep,
+        notify=pings.append,
+        reload_credentials=reload_credentials,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    assert handler_started.wait(timeout=5)
+    daemon.request_drain()
+    daemon.request_reload()
+    assert reload_done.wait(timeout=5)
+    handler_release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert events == ["handler", "reload", "handler-finished"]
+    assert pings.count("READY=1") == 2
+    assert "STATUS=aicc-draining" in pings
     assert ("complete", "wat-1", {}) in store.calls
 
 

@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+
+from command_center.db import pool
+from command_center.db.config import PostgresConfig
+
+
+class FakePool:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.closed = False
+
+    @contextmanager
+    def connection(self):
+        yield self.name
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _config(password: str) -> PostgresConfig:
+    return PostgresConfig(
+        host="127.0.0.1",
+        port=5432,
+        dbname="aicc",
+        user="aicc_worker",
+        password=password,
+        sslmode="disable",
+        sslrootcert=None,
+        connect_timeout=5,
+        application_name="test",
+        pool_min_size=1,
+        pool_max_size=2,
+        pool_timeout_seconds=5,
+        statement_timeout_ms=30_000,
+    )
+
+
+def test_replace_pool_keeps_checked_out_old_generation_until_return(
+    monkeypatch,
+) -> None:
+    old = FakePool("old")
+    new = FakePool("new")
+    generations = iter((old, new))
+    monkeypatch.setattr(pool, "_build_pool", lambda config: next(generations))
+    pool.close_pool()
+    try:
+        pool.open_pool(_config("a" * 64))
+        checkout = pool.connection()
+        assert checkout.__enter__() == "old"
+
+        pool.replace_pool(_config("b" * 64))
+        assert not old.closed, "an active heartbeat checkout must not be cut"
+        with pool.connection() as value:
+            assert value == "new"
+
+        checkout.__exit__(None, None, None)
+        assert old.closed, "the retired generation closes after its last return"
+        assert not new.closed
+    finally:
+        pool.close_pool()
+
+
+def test_failed_replacement_leaves_current_pool_usable(monkeypatch) -> None:
+    old = FakePool("old")
+    monkeypatch.setattr(pool, "_build_pool", lambda config: old)
+    pool.close_pool()
+    try:
+        pool.open_pool(_config("a" * 64))
+
+        def fail(config):
+            raise ConnectionError("new credential refused")
+
+        monkeypatch.setattr(pool, "_build_pool", fail)
+        try:
+            pool.replace_pool(_config("b" * 64))
+        except ConnectionError:
+            pass
+        else:
+            raise AssertionError("replacement failure was swallowed")
+
+        with pool.connection() as value:
+            assert value == "old"
+        assert not old.closed
+    finally:
+        pool.close_pool()
