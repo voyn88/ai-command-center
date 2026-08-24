@@ -20,6 +20,7 @@ import yaml
 from scripts.assert_independent_acceptance import (
     AcceptanceError,
     _merge_group_numbers,
+    _merge_queue_entries,
     assert_accepted,
     evaluate,
     parse_marker,
@@ -290,7 +291,7 @@ def test_the_check_name_is_the_one_branch_protection_can_require() -> None:
 
 
 def test_the_gate_asks_for_no_more_access_than_it_reads() -> None:
-    """It reads a pull request and its reviews. It writes nothing, ever."""
+    """It reads commits, pull requests, reviews and the queue; never writes."""
     assert _workflow()["permissions"] == {"contents": "read", "pull-requests": "read"}
 
 
@@ -401,6 +402,64 @@ def queue_response(entries: list[dict]) -> dict:
             }
         }
     }
+
+
+def queue_page(
+    entries: list[dict], *, has_next: bool, cursor: str | None
+) -> dict:
+    response = queue_response(entries)
+    page_info = response["data"]["repository"]["mergeQueue"]["entries"][
+        "pageInfo"
+    ]
+    page_info["hasNextPage"] = has_next
+    page_info["endCursor"] = cursor
+    return response
+
+
+def test_merge_queue_pagination_binds_every_page_and_advances_cursor(
+    monkeypatch,
+) -> None:
+    cursors: list[str | None] = []
+
+    def graphql(_query, variables, _env):
+        cursors.append(variables["cursor"])
+        if variables["cursor"] is None:
+            return queue_page(
+                [queue_entry(1, 11, HEAD_ELEVEN)],
+                has_next=True,
+                cursor="page-two",
+            )
+        assert variables["cursor"] == "page-two"
+        return queue_page(
+            [queue_entry(2, 12, HEAD_TWELVE)],
+            has_next=False,
+            cursor=None,
+        )
+
+    monkeypatch.setattr("scripts.assert_independent_acceptance._graphql", graphql)
+
+    entries = _merge_queue_entries(
+        "dimastov-lab/ai-command-center", "main", {"GITHUB_TOKEN": "x"}
+    )
+
+    assert [entry["pullRequest"]["number"] for entry in entries] == [11, 12]
+    assert cursors == [None, "page-two"]
+
+
+def test_merge_queue_pagination_repeated_cursor_is_refused(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_page(
+            [queue_entry(1, 11, HEAD_ELEVEN)],
+            has_next=True,
+            cursor="same",
+        ),
+    )
+
+    with pytest.raises(AcceptanceError, match="repeated a cursor"):
+        _merge_queue_entries(
+            "dimastov-lab/ai-command-center", "main", {"GITHUB_TOKEN": "x"}
+        )
 
 
 def mock_merge_group_apis(monkeypatch, entries: list[dict]) -> None:

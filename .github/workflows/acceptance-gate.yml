@@ -44,8 +44,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
   cancel-in-progress: true
 
-# Read-only, and only what the one API caller needs: the pull request's head
-# sha, its author, and its reviews. This gate has nothing to write.
+# Read-only, and only what the API callers need: `contents: read` for the
+# synthetic commit comparison, and `pull-requests: read` for PR/reviews plus
+# the repository merge-queue GraphQL fields. This gate has nothing to write.
 permissions:
   contents: read
   pull-requests: read

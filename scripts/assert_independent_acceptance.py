@@ -33,6 +33,10 @@ that chain to GitHub's authoritative merge-queue entries, requiring every
 entry's queued head, current pull-request head and accepted SHA to agree. It
 never treats the final pull request as a proxy for the rest of a batch.
 
+The subject suffix is an explicit repository contract: changing GitHub's
+squash-message template so queue commits no longer end in ``(#<number>)``
+will stop the gate closed until the resolver and its tests are updated.
+
 Everything it cannot establish is a refusal: no review, no marker, a marker for
 a different commit, an unparseable sha, a missing token, an API error, or an
 ambiguous synthetic history. A gate that guesses accepts nothing in particular.
@@ -336,6 +340,7 @@ def _merge_queue_entries(
 
     entries: list[dict] = []
     cursor: str | None = None
+    seen_cursors: set[str] = set()
     for _page in range(_MAX_PAGES):
         result = _graphql(
             _MERGE_QUEUE_QUERY,
@@ -360,6 +365,9 @@ def _merge_queue_entries(
         next_cursor = page_info.get("endCursor")
         if not isinstance(next_cursor, str) or not next_cursor:
             raise AcceptanceError("merge queue pagination has no cursor")
+        if next_cursor in seen_cursors:
+            raise AcceptanceError("merge queue pagination repeated a cursor")
+        seen_cursors.add(next_cursor)
         cursor = next_cursor
     raise AcceptanceError("merge queue did not end within the page limit")
 
