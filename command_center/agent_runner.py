@@ -125,6 +125,11 @@ PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     "claude": "/usr/local/bin/claude",
     "codex": "/usr/local/bin/codex",
+    # Every supported executor must map, or principal_isolation turns each
+    # dispatch of the missing one into an unbreakable retry loop -- the
+    # generic gate applies to all three, so its allowlist must too
+    # (review finding on 6218a21).
+    "copilot": "/usr/local/bin/copilot",
 }
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 
@@ -709,7 +714,7 @@ def _run_git(
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError, subprocess.SubprocessError:
         return None
 
 
@@ -966,7 +971,7 @@ def extract_result_text(stdout: str) -> str:
     """
     try:
         data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError, ValueError:
         return stdout
     if isinstance(data, list):
         for item in reversed(data):
@@ -994,7 +999,7 @@ def _parse_cli_result_payload(stdout: str) -> dict | None:
         return None
     try:
         data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
+    except json.JSONDecodeError, ValueError:
         return None
     return data if isinstance(data, dict) else None
 
@@ -1150,7 +1155,7 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
     if sys.platform == "win32":
         try:
             proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-        except (OSError, ValueError):
+        except OSError, ValueError:
             pass
     else:
         try:
@@ -1319,7 +1324,7 @@ def run_claude_code(
     def _collect() -> None:
         try:
             out, err = proc.communicate(input=launcher_input)
-        except (OSError, ValueError):
+        except OSError, ValueError:
             out, err = "", ""
         collected["stdout"] = out or ""
         collected["stderr"] = err or ""

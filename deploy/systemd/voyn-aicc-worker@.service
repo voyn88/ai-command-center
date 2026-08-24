@@ -25,6 +25,9 @@ EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=-/etc/aicc/executors.env
 EnvironmentFile=-/etc/aicc/worker-%i.env
 UnsetEnvironment=ANTHROPIC_API_KEY
+# ADR-0010 invariant: the worker neither receives sudo nor selects a
+# privileged command (review finding on 6218a21).
+NoNewPrivileges=yes
 ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker-%i/pgpass
 ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
 ExecReload=/bin/kill -HUP $MAINPID

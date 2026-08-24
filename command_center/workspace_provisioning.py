@@ -1944,7 +1944,20 @@ def remove_workspace(
         if not verified_clean:
             return "remove_failed"
         quarantine_root = raw_workspace.parent / ".aicc-quarantine"
-        quarantine_root.mkdir(mode=0o700, exist_ok=True)
+        # An agent-writable parent means .aicc-quarantine could be a symlink
+        # to an attacker directory; mkdir(exist_ok=True) would follow it and
+        # os.replace would move the (credential-bearing) clone there with
+        # this privileged process's rights. Reject any non-directory /
+        # symlink and pin the mode explicitly (review finding on 6218a21).
+        try:
+            quarantine_root.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            return "remove_failed"
+        root_stat = quarantine_root.lstat()
+        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+            return "remove_failed"
+        if stat.S_IMODE(root_stat.st_mode) != 0o700:
+            os.chmod(quarantine_root, 0o700)
         quarantine = (
             quarantine_root / f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
         )
@@ -1953,8 +1966,8 @@ def remove_workspace(
             quarantine_stat = quarantine.lstat()
             if (quarantine_stat.st_dev, quarantine_stat.st_ino) != inode:
                 return "remove_failed"
-            shutil.rmtree(quarantine)
             _task_local_marker_path(raw_workspace).unlink(missing_ok=True)
+            shutil.rmtree(quarantine)
         except OSError:
             return "remove_failed"
         return "removed"
