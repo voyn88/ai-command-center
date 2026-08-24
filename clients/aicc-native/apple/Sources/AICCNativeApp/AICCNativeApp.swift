@@ -115,20 +115,86 @@ private struct ProjectRow: View {
 }
 
 private struct WorkView: View {
-    var body: some View { NavigationStack { List { Section("Сегодня") { Label("AICC Native — финальная проверка макета", systemImage: "circle.fill").foregroundStyle(.indigo); Label("AIOS — работа идёт по плану", systemImage: "circle.fill").foregroundStyle(.green) }; Section("План") { Label("Три приоритета на эту неделю", systemImage: "calendar") } }.navigationTitle("Работа") } }
+    var body: some View {
+        CompanionPage(title: "Работа", subtitle: "То, что движется сегодня. Без технических деталей.") {
+            CompanionCard(title: "AICC Native", detail: "Следующий шаг — посмотреть обновлённый дизайн.", tint: AICCTheme.plum)
+            CompanionCard(title: "AIOS", detail: "План выполняется, критичных препятствий нет.", tint: AICCTheme.forest)
+            CompanionCard(title: "План недели", detail: "Три важных направления в понятном порядке.", tint: .gray)
+        }
+    }
 }
 
 private struct DialoguesView: View {
-    var body: some View { NavigationStack { List { Section("Нужен ответ") { Label("Обсуждение дизайна AICC Native", systemImage: "bubble.left.and.bubble.right.fill").foregroundStyle(.indigo) }; Section("Недавние") { Label("Еженедельный бриф", systemImage: "text.bubble"); Label("Выбор сценария для аудита", systemImage: "text.bubble") } }.navigationTitle("Диалоги").toolbar { Button("Спросить AICC", systemImage: "waveform") {} } } }
+    var body: some View {
+        CompanionPage(title: "Диалоги", subtitle: "Разговоры всегда связаны с конкретным делом.") {
+            CompanionCard(title: "Обсуждение дизайна AICC", detail: "Есть короткое резюме и следующий вопрос для вас.", tint: .orange, badge: "Новый")
+            CompanionCard(title: "Ваш недельный бриф", detail: "Три главные темы, которые стоит знать.", tint: AICCTheme.plum)
+        }
+    }
 }
 
 private struct DecisionsView: View {
-    var body: some View { NavigationStack { List { Section("На будущее") { Label("Как провести первую проверку дизайна", systemImage: "lightbulb.fill").foregroundStyle(.orange) }; Section("Спокойно") { Label("Все предыдущие решения идут по плану", systemImage: "checkmark.circle") } }.navigationTitle("Решения") } }
+    var body: some View {
+        CompanionPage(title: "Решения", subtitle: "Только важные выборы — с контекстом и ясными последствиями.") {
+            VStack(alignment: .leading, spacing: 9) {
+                Text("НА БУДУЩЕЕ").font(.caption2.weight(.bold)).tracking(1).foregroundStyle(.secondary)
+                Text("Как провести первую проверку дизайна?").font(.system(.title2, design: .serif, weight: .medium))
+                Text("Рекомендация готова. Решение можно спокойно отложить.").foregroundStyle(.secondary)
+                Button("Посмотреть варианты") {}
+                    .buttonStyle(.borderedProminent).tint(AICCTheme.plum).padding(.top, 4)
+            }.padding(22).frame(maxWidth: .infinity, alignment: .leading).background(AICCTheme.peach, in: RoundedRectangle(cornerRadius: 24))
+            CompanionCard(title: "Предыдущие решения", detail: "Все идут по плану.", tint: AICCTheme.forest)
+        }
+    }
 }
 
 private struct MoreView: View {
     let events: [TimelineEvent]
-    var body: some View { NavigationStack { List { Section("Контроль") { Label("Проверки и происшествия", systemImage: "checkmark.shield"); Label("События", systemImage: "clock.arrow.circlepath") }; Section("Интеллект") { Label("Помощники и память", systemImage: "brain"); Label("Сводки и совет", systemImage: "doc.text") }; Section("Личное") { Label("Настройки", systemImage: "gearshape") }; if !events.isEmpty { Section("Недавнее") { ForEach(events) { Label($0.summary, systemImage: "circle.fill").foregroundStyle(.secondary) } } } }.navigationTitle("Ещё") } }
+    var body: some View {
+        CompanionPage(title: "Ещё", subtitle: "Всё остальное уже предусмотрено, но не мешает вам каждый день.") {
+            CompanionCard(title: "Помощники и память", detail: "Команда AI, объяснения и успешные решения.", tint: AICCTheme.plum)
+            CompanionCard(title: "Проверки и происшествия", detail: "Картина качества, рисков и восстановления.", tint: AICCTheme.forest)
+            CompanionCard(title: "Сводки, совет и настройки", detail: "Всё для спокойной картины и управления.", tint: .gray)
+        }
+    }
+}
+
+private struct CompanionPage<Content: View>: View {
+    let title: String
+    let subtitle: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text(title).font(.system(size: 44, weight: .medium, design: .serif)).tracking(-1)
+                    Text(subtitle).font(.title3).foregroundStyle(.secondary).padding(.bottom, 12)
+                    content
+                }.padding()
+            }.navigationTitle("AICC")
+        }
+    }
+}
+
+private struct CompanionCard: View {
+    let title: String
+    let detail: String
+    let tint: Color
+    var badge: String? = nil
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Circle().fill(tint).frame(width: 10, height: 10)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.headline)
+                Text(detail).font(.subheadline).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if let badge { Text(badge).font(.caption2.weight(.bold)).foregroundStyle(tint) }
+            Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+        }.padding(18).background(.background, in: RoundedRectangle(cornerRadius: 19)).overlay { RoundedRectangle(cornerRadius: 19).stroke(.quaternary) }
+    }
 }
 
 #Preview("Спокойный обзор") { AICCNativeShell(snapshot: .preview) }
