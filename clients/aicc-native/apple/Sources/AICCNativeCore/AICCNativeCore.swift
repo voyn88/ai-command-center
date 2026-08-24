@@ -91,6 +91,46 @@ public enum SnapshotDecoder {
 
 public enum AICCNativeError: Error, Equatable { case unsafeDTO }
 
+public struct GatewayConfiguration: Equatable, Sendable {
+    public let baseURL: URL
+    public let expectedSchemaVersion: String
+
+    public init(baseURL: URL, expectedSchemaVersion: String = "1.0") throws {
+        guard baseURL.scheme?.lowercased() == "https", baseURL.host != nil else { throw GatewayError.insecureEndpoint }
+        self.baseURL = baseURL
+        self.expectedSchemaVersion = expectedSchemaVersion
+    }
+}
+
+public enum GatewayError: Error, Equatable {
+    case insecureEndpoint, invalidResponse, unexpectedStatus(Int), schemaMismatch, notModified
+}
+
+public struct SnapshotRemoteStore: Sendable {
+    private let configuration: GatewayConfiguration
+    private let session: URLSession
+
+    public init(configuration: GatewayConfiguration, session: URLSession = .shared) {
+        self.configuration = configuration
+        self.session = session
+    }
+
+    public func fetchSnapshot(revision: String? = nil) async throws -> Snapshot {
+        let endpoint = configuration.baseURL.appending(path: "v1/snapshot")
+        var request = URLRequest(url: endpoint)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("1.0", forHTTPHeaderField: "X-AICC-Client-Version")
+        if let revision, !revision.isEmpty { request.setValue(revision, forHTTPHeaderField: "If-None-Match") }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw GatewayError.invalidResponse }
+        if http.statusCode == 304 { throw GatewayError.notModified }
+        guard (200...299).contains(http.statusCode) else { throw GatewayError.unexpectedStatus(http.statusCode) }
+        let snapshot = try SnapshotDecoder.decode(data)
+        guard snapshot.schemaVersion == configuration.expectedSchemaVersion else { throw GatewayError.schemaMismatch }
+        return snapshot
+    }
+}
+
 public enum Fixture {
     public static func healthySnapshot() throws -> Snapshot {
         let url = try Bundle.module.url(forResource: "healthy-snapshot", withExtension: "json").unwrap()

@@ -23,3 +23,10 @@ import Testing
 @Test func unsafeDTOIsRejectedBeforeDecoding() {
     #expect(throws: AICCNativeError.unsafeDTO) { try SnapshotDecoder.decode(Data("{\"authorization\":\"Bearer secret\"}".utf8)) }
 }
+
+@Test func gatewayAcceptsOnlyHTTPSAndPinsSchemaVersion() throws {
+    #expect(throws: GatewayError.insecureEndpoint) { try GatewayConfiguration(baseURL: URL(string: "http://control.example")!) }
+    let configuration = try GatewayConfiguration(baseURL: URL(string: "https://control.example/aicc")!)
+    #expect(configuration.baseURL.absoluteString == "https://control.example/aicc")
+    #expect(configuration.expectedSchemaVersion == "1.0")
+}
