@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import shlex
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from command_center.ops.credential_rotation import (
+    CREDENTIAL_SAFETY_MARGIN_SECONDS,
+    SELF_CREDENTIAL_TTL_SECONDS,
+    SYSTEMD_EXIT_MARGIN_SECONDS,
     Audit,
     RotationConfig,
     RotationController,
@@ -21,6 +26,7 @@ from command_center.worker.credential_file import (
 )
 
 OLD_PASSWORD = "a" * 64
+NOW = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
 LANE_1 = "voyn-aicc-worker@1.service"
 LANE_2 = "voyn-aicc-worker@2.service"
 TUNNEL = "voyn-aicc-pgtunnel.service"
@@ -111,7 +117,7 @@ class FakeAuthority:
         assert config.password == self.current_password
         assert verifier.startswith("SCRAM-SHA-256$")
         self.current_password = new_secret
-        return "2026-08-24T13:00:00+00:00"
+        return NOW + timedelta(hours=1)
 
 
 def _controller(tmp_path: Path, events: list[tuple]):
@@ -122,6 +128,7 @@ def _controller(tmp_path: Path, events: list[tuple]):
         systemd,
         authority,
         Audit(),
+        wall_clock=lambda: NOW,
         port_probe=lambda host, port, timeout: events.append(
             ("port", host, port, timeout)
         ),
@@ -160,13 +167,14 @@ def test_reload_and_restart_failure_is_non_success_and_recovers_other_lane(
 ) -> None:
     events: list[tuple] = []
     controller, systemd, _ = _controller(tmp_path, events)
+    controller.config = replace(controller.config, restart_timeout=20)
     systemd.reload_fail.add(LANE_1)
     systemd.restart_fail.add(LANE_1)
 
     with pytest.raises(RotationError, match="restart failed"):
         controller.rotate()
 
-    assert ("restart", LANE_1, 3720) in events
+    assert ("restart", LANE_1, 20) in events
     assert ("reload", LANE_2, 10) in events, "the second lane restores availability"
 
 
@@ -268,6 +276,7 @@ def test_post_rotation_activation_failure_rolls_every_lane_to_verified_new_auth(
 ) -> None:
     events: list[tuple] = []
     controller, systemd, authority = _controller(tmp_path, events)
+    controller.config = replace(controller.config, restart_timeout=20)
     failures_left = [1]
     original_restart = systemd.restart
 
@@ -288,6 +297,121 @@ def test_post_rotation_activation_failure_rolls_every_lane_to_verified_new_auth(
     # One activation failure plus one rollback attempt; the latter proves the
     # durable current credential before advertising ready.
     assert events.count(("reload", LANE_2, 10)) >= 2
+
+
+def test_one_hour_expiry_bounds_both_lanes_and_rollback_before_long_restart(
+    tmp_path: Path,
+) -> None:
+    """A 3600-second job cannot fit after a one-hour credential is issued.
+
+    Exercise lane 1 failure, lane 2 recovery and both rollback attempts against
+    one deterministic monotonic/wall clock. The controller must never begin the
+    3720-second fallback and every new-credential probe stays inside the expiry
+    safety boundary.
+    """
+
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    elapsed = [0.0]
+    controller.config = replace(
+        controller.config,
+        reload_timeout=180,
+        poll_initial=1,
+        poll_max=1,
+    )
+    controller.monotonic = lambda: elapsed[0]
+    controller.wall_clock = lambda: NOW + timedelta(seconds=elapsed[0])
+    original_reload = systemd.reload
+
+    def reload(unit: str, timeout: float) -> None:
+        elapsed[0] += timeout
+        original_reload(unit, timeout)
+
+    original_probe = authority.probe
+
+    def probe(config) -> None:
+        events.append(("timed-probe", config.password, elapsed[0]))
+        original_probe(config)
+
+    systemd.reload = reload  # type: ignore[method-assign]
+    systemd.reload_fail.add(LANE_1)
+    authority.probe = probe  # type: ignore[method-assign]
+
+    with pytest.raises(RotationError, match="restart fallback exceeds"):
+        controller.rotate()
+
+    assert not any(event[0] == "restart" for event in events)
+    assert systemd.status == {LANE_1: "aicc-drained", LANE_2: "aicc-ready"}
+    assert events.count(("reload", LANE_2, 180)) == 2
+    usable_until = SELF_CREDENTIAL_TTL_SECONDS - CREDENTIAL_SAFETY_MARGIN_SECONDS
+    new_probes = [
+        event[2]
+        for event in events
+        if event[0] == "timed-probe" and event[1] == authority.current_password
+    ]
+    assert new_probes
+    assert max(new_probes) < usable_until
+    assert elapsed[0] < usable_until
+
+
+def test_controller_refuses_mutation_when_preflight_consumed_recovery_budget(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, _, authority = _controller(tmp_path, events)
+    clock = [0.0]
+    controller.config = replace(
+        controller.config,
+        controller_timeout=1000,
+        drain_timeout=10,
+        reload_timeout=10,
+    )
+    controller.monotonic = lambda: clock[0]
+
+    tunnel_calls = [0]
+
+    def port_probe(host: str, port: int, timeout: float) -> None:
+        tunnel_calls[0] += 1
+        if tunnel_calls[0] == 2:
+            clock[0] = 500.0
+
+    controller.port_probe = port_probe
+
+    with pytest.raises(RotationError, match="before credential mutation"):
+        controller.rotate()
+
+    assert authority.current_password == OLD_PASSWORD
+    assert not any(event[0] == "rotate" for event in events)
+
+
+def test_unexpected_short_expiry_retains_recovery_secret_and_keeps_lanes_drained(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    original_rotate = authority.rotate
+
+    def rotate(config, new_secret: str, verifier: str):
+        original_rotate(config, new_secret, verifier)
+        return NOW + timedelta(minutes=5)
+
+    authority.rotate = rotate  # type: ignore[method-assign]
+
+    with pytest.raises(RotationError, match="recovery file retained"):
+        controller.rotate()
+
+    assert authority.current_password != OLD_PASSWORD
+    assert systemd.status == {LANE_1: "aicc-drained", LANE_2: "aicc-drained"}
+    assert (
+        read_environment_file(controller.config.env_file)["AICC_PG_PASSWORD"]
+        == OLD_PASSWORD
+    )
+    recovery = list(tmp_path.glob(".worker.env.*"))
+    assert len(recovery) == 1
+    assert (
+        read_environment_file(recovery[0])["AICC_PG_PASSWORD"]
+        == authority.current_password
+    )
 
 
 def test_cli_returns_nonzero_and_audits_controller_failure(
@@ -376,6 +500,44 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     assert rotation.index("--worker-unit voyn-aicc-worker@1.service") < rotation.index(
         "--worker-unit voyn-aicc-worker@2.service"
     )
+    lines = dict(line.split("=", 1) for line in rotation.splitlines() if "=" in line)
+    argv = shlex.split(lines["ExecStart"])
+
+    def option(name: str) -> float:
+        return float(argv[argv.index(name) + 1])
+
+    controller_timeout = option("--controller-timeout")
+    prerequisite_timeout = option("--prerequisite-timeout")
+    drain_timeout = option("--drain-timeout")
+    reload_timeout = option("--reload-timeout")
+    restart_timeout = option("--restart-timeout")
+    systemd_timeout = float(lines["TimeoutStartSec"].removesuffix("s"))
+    lane_count = argv.count("--worker-unit")
+    authority_timeout = 10 + 30
+    safe_post_rotation = (
+        lane_count * 4 * reload_timeout
+        + (2 * lane_count + 1) * authority_timeout
+        + CREDENTIAL_SAFETY_MARGIN_SECONDS
+    )
+    complete_rotation = (
+        (lane_count + 2) * prerequisite_timeout
+        + drain_timeout
+        + 3 * authority_timeout
+        + safe_post_rotation
+    )
+    assert systemd_timeout >= controller_timeout + SYSTEMD_EXIT_MARGIN_SECONDS
+    assert controller_timeout >= complete_rotation
+    assert SELF_CREDENTIAL_TTL_SECONDS >= authority_timeout + safe_post_rotation
+    assert (
+        SELF_CREDENTIAL_TTL_SECONDS
+        < authority_timeout + safe_post_rotation + 2 * lane_count * restart_timeout
+    ), "a one-hour credential must disable the long restart fallback globally"
+    enrollment = (
+        root / "command_center/db/sql/0003_worker_enrollment.up.sql"
+    ).read_text()
+    rotate_function = enrollment.split("CREATE FUNCTION enroll_rotate_self", 1)[1]
+    rotate_function = rotate_function.split("$$;", 1)[0]
+    assert "p_new_scram_verifier, interval '1 hour'" in rotate_function
     assert "OnUnitInactiveSec=30min" in timer
     assert "OnUnitActiveSec" not in timer
     assert "10.20." not in worker

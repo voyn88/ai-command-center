@@ -9,7 +9,7 @@ rotation path. It replaces the untracked `~/aicc-preprod/rotate.py`.
    exponential backoff) for the tunnel socket and proves the current database
    credential.
 2. It requires both worker lanes to be `aicc-ready`, sends each lane `SIGUSR1`,
-   and waits for both claim gates to report `aicc-draining`/`aicc-drained`.
+   and acknowledges drain only after both claim gates report `aicc-drained`.
    Existing jobs continue; no new jobs intentionally enter during the short
    credential hand-off.
 3. Only after both claim gates are closed does it prepare and fsync the replacement
@@ -19,8 +19,11 @@ rotation path. It replaces the untracked `~/aicc-preprod/rotate.py`.
    verifies a new PostgreSQL pool while any 3600-second agent job continues.
    The pool pointer changes atomically; old checked-out sessions retire only
    when returned. `Type=notify-reload` does not return before READY. A failed
-   reload falls back to a graceful restart with a 3660-second stop budget. The
-   second lane is never restarted before the first is ready.
+   reload falls back to a graceful restart only if the remaining controller
+   and credential lifetime cover the complete stop plus readiness budget. The
+   fixed one-hour credential cannot safely cover a 3600-second job at this
+   stage, so the deployed policy refuses that fallback, leaves the failed lane
+   drained, and restores the other lane with the current credential.
 5. Every transition is JSON in journald and in
    `/var/lib/voyn-aicc-credential-rotation/audit.jsonl`. Any prerequisite,
    systemd, rotation, auth or readiness failure exits non-zero.
@@ -29,6 +32,13 @@ rotation path. It replaces the untracked `~/aicc-preprod/rotate.py`.
 slack. `KillMode=mixed` sends SIGTERM only to the daemon; the child agent is
 left alone until the final bounded SIGKILL. Lease expiry and queue reaping stay
 the last-resort redelivery path.
+
+The controller has a 7200-second monotonic deadline. The systemd unit allows
+7800 seconds, leaving 600 seconds for audited recovery and clean exit. Before
+changing the database verifier, the controller proves that activation plus a
+complete two-lane rollback still fits. After issuance, every reload/readiness
+operation is bounded by both that controller deadline and the credential's
+expiry minus a five-minute safety margin.
 
 ## Deployment from a merged SHA
 

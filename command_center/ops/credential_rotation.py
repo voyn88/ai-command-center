@@ -11,9 +11,10 @@ workers immediately.  This controller instead uses an explicit protocol:
    retire only when returned, so a running job and its heartbeat are not cut.
 
 There is never a concurrent restart. A failed in-process reload may fall back
-to a graceful restart whose 3660-second stop budget lets the current job
-finish; the other lane is untouched until the first is ready. Every transition
-is emitted as structured JSON and failures return non-zero.
+to a graceful restart only when the controller and credential deadlines can
+cover the complete stop/readiness budget. Otherwise that lane remains drained
+while the other lane is recovered. Every transition is emitted as structured
+JSON and failures return non-zero.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -44,6 +45,13 @@ from command_center.worker.credential_file import (
 
 _DRAINED = "aicc-drained"
 _READY = "aicc-ready"
+
+# enroll_rotate_self() grants a fixed one-hour credential. Keep this contract
+# beside the protocol budget so a unit/test change cannot silently make a
+# graceful 3600-second job incompatible with post-rotation recovery.
+SELF_CREDENTIAL_TTL_SECONDS = 3600.0
+CREDENTIAL_SAFETY_MARGIN_SECONDS = 300.0
+SYSTEMD_EXIT_MARGIN_SECONDS = 600.0
 
 
 class RotationError(RuntimeError):
@@ -71,6 +79,7 @@ class RotationConfig:
     drain_timeout: float = 3660.0
     reload_timeout: float = 120.0
     restart_timeout: float = 3720.0
+    controller_timeout: float = 7200.0
     poll_initial: float = 0.25
     poll_max: float = 5.0
 
@@ -235,6 +244,7 @@ class RotationController:
         *,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        wall_clock: Callable[[], datetime] | None = None,
         port_probe: Callable[[str, int, float], None] | None = None,
     ) -> None:
         self.config = config
@@ -243,7 +253,60 @@ class RotationController:
         self.audit = audit
         self.monotonic = monotonic
         self.sleep = sleep
+        self.wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self.port_probe = port_probe or self._port_probe
+        self._controller_deadline: float | None = None
+        self._credential_deadline: datetime | None = None
+        self._restart_fallback_allowed = False
+
+    @staticmethod
+    def _authority_timeout(config: PostgresConfig) -> float:
+        """Upper bound for one connect plus one statement."""
+        return config.connect_timeout + config.statement_timeout_ms / 1000.0
+
+    def _post_rotation_budget(self, config: PostgresConfig) -> tuple[float, bool]:
+        """Return the complete activation+rollback budget and restart policy.
+
+        Each lane may be attempted once during activation and once during
+        rollback. A hot attempt is conservatively bounded as reload +
+        readiness + auth probe. The extra auth probe verifies the durable file
+        before lane activation starts. A restart fallback is enabled only when
+        *every* attempt could take that path and the entire sequence would
+        still fit the database's fixed credential lifetime.
+        """
+        lanes = len(self.config.worker_units)
+        authority_timeout = self._authority_timeout(config)
+        hot_budget = (
+            4 * lanes * self.config.reload_timeout
+            + (2 * lanes + 1) * authority_timeout
+            + CREDENTIAL_SAFETY_MARGIN_SECONDS
+        )
+        restart_budget = hot_budget + 2 * lanes * self.config.restart_timeout
+        # Rotation can issue the credential at any point during its bounded DB
+        # operation, so reserve one more authority operation before the
+        # returned expiry becomes visible to the controller.
+        if SELF_CREDENTIAL_TTL_SECONDS >= authority_timeout + restart_budget:
+            return restart_budget, True
+        if SELF_CREDENTIAL_TTL_SECONDS >= authority_timeout + hot_budget:
+            return hot_budget, False
+        raise RotationError(
+            "database credential TTL is below hot activation/rollback budget"
+        )
+
+    def _bounded_timeout(
+        self, requested: float, description: str, *, credential: bool = False
+    ) -> float:
+        budgets = [requested]
+        if self._controller_deadline is not None:
+            budgets.append(self._controller_deadline - self.monotonic())
+        if credential and self._credential_deadline is not None:
+            budgets.append(
+                (self._credential_deadline - self.wall_clock()).total_seconds()
+            )
+        timeout = min(budgets)
+        if timeout <= 0:
+            raise RotationError(f"no safe time budget remains for {description}")
+        return timeout
 
     @staticmethod
     def _port_probe(host: str, port: int, timeout: float) -> None:
@@ -290,7 +353,11 @@ class RotationController:
             return True
 
         self._wait(
-            "PostgreSQL tunnel readiness", self.config.prerequisite_timeout, ready
+            "PostgreSQL tunnel readiness",
+            self._bounded_timeout(
+                self.config.prerequisite_timeout, "PostgreSQL tunnel readiness"
+            ),
+            ready,
         )
         self.audit.emit("tunnel_ready", unit=self.config.tunnel_unit)
 
@@ -302,12 +369,17 @@ class RotationController:
 
             self._wait(
                 f"{unit} readiness",
-                self.config.prerequisite_timeout,
+                self._bounded_timeout(
+                    self.config.prerequisite_timeout, f"{unit} readiness"
+                ),
                 healthy,
             )
 
     def _drain_all(self) -> None:
         signalled: list[str] = []
+        drain_deadline = self.monotonic() + self._bounded_timeout(
+            self.config.drain_timeout, "worker claim-gate drain"
+        )
         try:
             for unit in self.config.worker_units:
                 self.systemd.drain(unit)
@@ -320,7 +392,9 @@ class RotationController:
 
                 self._wait(
                     f"{unit} drain",
-                    self.config.drain_timeout,
+                    self._bounded_timeout(
+                        drain_deadline - self.monotonic(), f"{unit} drain"
+                    ),
                     claim_gate_closed,
                 )
                 self.audit.emit("worker_claim_gate_closed", unit=unit)
@@ -330,7 +404,10 @@ class RotationController:
             # healthy lane in drain forever.
             for unit in signalled:
                 try:
-                    self.systemd.reload(unit, self.config.reload_timeout)
+                    timeout = self._bounded_timeout(
+                        self.config.reload_timeout, f"{unit} drain rollback"
+                    )
+                    self.systemd.reload(unit, timeout)
                     self.audit.emit("worker_drain_rolled_back", unit=unit)
                 except Exception as error:  # noqa: BLE001 - audit all recovery failures
                     self.audit.emit(
@@ -340,11 +417,57 @@ class RotationController:
 
     def _activate_lane(self, unit: str, new_config: PostgresConfig) -> None:
         try:
-            self.systemd.reload(unit, self.config.reload_timeout)
+            reload_timeout = self._bounded_timeout(
+                self.config.reload_timeout,
+                f"{unit} credential reload",
+                credential=True,
+            )
+            self.systemd.reload(unit, reload_timeout)
             method = "reload"
-        except Exception as reload_error:  # noqa: BLE001 - safe drained fallback
+        except Exception as reload_error:
             self.audit.emit("worker_reload_failed", unit=unit, error=str(reload_error))
-            self.systemd.restart(unit, self.config.restart_timeout)
+            # A restart may wait for a 3600-second job. Start it only when both
+            # the controller and the newly issued credential can cover the
+            # entire restart plus readiness proof. Otherwise keep this lane
+            # drained and recover the other lane while the secret is valid.
+            if not self._restart_fallback_allowed:
+                self.audit.emit(
+                    "worker_restart_refused_budget",
+                    unit=unit,
+                    required="complete two-lane activation/rollback",
+                    available="credential TTL",
+                )
+                raise RotationError(
+                    f"{unit}: restart fallback exceeds credential/controller budget"
+                ) from reload_error
+            required = (
+                self.config.restart_timeout
+                + self.config.reload_timeout
+                + self._authority_timeout(new_config)
+            )
+            available = self._bounded_timeout(
+                required, f"{unit} restart fallback", credential=True
+            )
+            if available < required:
+                self.audit.emit(
+                    "worker_restart_refused_budget",
+                    unit=unit,
+                    required=required,
+                    available=available,
+                )
+                raise RotationError(
+                    f"{unit}: restart fallback exceeds credential/controller budget"
+                ) from reload_error
+            restart_timeout = self._bounded_timeout(
+                self.config.restart_timeout,
+                f"{unit} restart",
+                credential=True,
+            )
+            if restart_timeout < self.config.restart_timeout:
+                raise RotationError(
+                    f"{unit}: restart fallback exceeds credential/controller budget"
+                ) from reload_error
+            self.systemd.restart(unit, restart_timeout)
             method = "restart"
 
         def ready() -> bool:
@@ -352,7 +475,11 @@ class RotationController:
 
         self._wait(
             f"{unit} post-rotation readiness",
-            self.config.reload_timeout,
+            self._bounded_timeout(
+                self.config.reload_timeout,
+                f"{unit} post-rotation readiness",
+                credential=True,
+            ),
             ready,
         )
         self.authority.probe(new_config)
@@ -377,10 +504,33 @@ class RotationController:
             raise RotationError("at least two worker lanes are required")
         if len(set(self.config.worker_units)) != len(self.config.worker_units):
             raise RotationError("worker units must be distinct")
+        if self.config.controller_timeout <= CREDENTIAL_SAFETY_MARGIN_SECONDS:
+            raise RotationError("controller timeout must exceed its safety margin")
+        self._controller_deadline = self.monotonic() + self.config.controller_timeout
+        self._credential_deadline = None
+        self._restart_fallback_allowed = False
 
         self._wait_tunnel()
         values = read_environment_file(self.config.env_file)
         current = _postgres_config(values)
+        safe_post_rotation, restart_fallback_allowed = self._post_rotation_budget(
+            current
+        )
+        authority_timeout = self._authority_timeout(current)
+        # From this point the controller still owes one current-auth probe,
+        # per-lane health checks, one shared drain, a second tunnel/auth proof,
+        # the rotation query and the complete post-rotation recovery budget.
+        remaining_protocol = (
+            len(self.config.worker_units) * self.config.prerequisite_timeout
+            + self.config.drain_timeout
+            + self.config.prerequisite_timeout
+            + 3 * authority_timeout
+            + safe_post_rotation
+        )
+        if self._bounded_timeout(remaining_protocol, "complete rotation") < (
+            remaining_protocol
+        ):
+            raise RotationError("controller budget is below complete rotation budget")
         self.authority.probe(current)
         self._wait_workers_healthy()
         self.audit.emit("rotation_preflight_ok", lanes=len(self.config.worker_units))
@@ -399,6 +549,18 @@ class RotationController:
             # job is deliberately still running and does not delay this step.
             self._wait_tunnel()
             self.authority.probe(current)
+            # The credential mutation is the point of no return. Refuse it if
+            # preflight/drain consumed so much of the controller deadline that
+            # a full activation plus rollback no longer fits. This guarantees
+            # systemd's outer deadline cannot kill us mid-recovery.
+            mutation_budget = authority_timeout + safe_post_rotation
+            controller_budget = self._bounded_timeout(
+                mutation_budget, "credential mutation and recovery"
+            )
+            if controller_budget < mutation_budget:
+                raise RotationError(
+                    "controller budget exhausted before credential mutation"
+                )
             new_secret = secrets.token_hex(32)
             prepared = prepare_password_update(self.config.env_file, new_secret)
             new_values = dict(values)
@@ -410,6 +572,31 @@ class RotationController:
             database_rotated = True
             resume_config = None
             try:
+                expiry = (
+                    expires
+                    if isinstance(expires, datetime)
+                    else datetime.fromisoformat(str(expires))
+                )
+                if expiry.tzinfo is None:
+                    raise ValueError("naive credential expiry")
+            except (TypeError, ValueError) as error:
+                raise RotationError(
+                    "credential authority returned invalid expiry after database "
+                    f"rotation; recovery file retained at {prepared.temporary}"
+                ) from error
+            remaining = (expiry - self.wall_clock()).total_seconds()
+            # Activation plus a complete rollback is four bounded reload /
+            # readiness phases per two-lane deployment. Validate the authority's
+            # actual returned expiry, not merely the configured expectation.
+            if remaining < safe_post_rotation:
+                raise RotationError(
+                    "issued credential expires before safe activation/rollback "
+                    f"budget; recovery file retained at {prepared.temporary}"
+                )
+            self._credential_deadline = expiry - timedelta(
+                seconds=CREDENTIAL_SAFETY_MARGIN_SECONDS
+            )
+            try:
                 prepared.commit()
             except OSError as error:
                 # This file is now the only durable copy of the accepted new
@@ -420,6 +607,7 @@ class RotationController:
                 ) from error
             committed = True
             resume_config = new_config
+            self._restart_fallback_allowed = restart_fallback_allowed
             persisted = _postgres_config(read_environment_file(self.config.env_file))
             if not hmac.compare_digest(persisted.password, new_config.password):
                 raise RotationError(
@@ -471,6 +659,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--drain-timeout", type=float, default=3660.0)
     parser.add_argument("--reload-timeout", type=float, default=120.0)
     parser.add_argument("--restart-timeout", type=float, default=3720.0)
+    parser.add_argument("--controller-timeout", type=float, default=7200.0)
     return parser
 
 
@@ -488,6 +677,7 @@ def main(argv: list[str] | None = None) -> int:
         drain_timeout=args.drain_timeout,
         reload_timeout=args.reload_timeout,
         restart_timeout=args.restart_timeout,
+        controller_timeout=args.controller_timeout,
     )
     audit = Audit(config.audit_file)
     config.lock_file.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
