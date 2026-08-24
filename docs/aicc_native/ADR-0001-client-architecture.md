@@ -18,6 +18,10 @@ Adopt a contract-first multi-platform client:
 3. Windows and Android use Compose Multiplatform presentation targets over the same core. Windows uses native installer/update integration; Android uses system navigation, TalkBack and Keystore APIs.
 4. The first live capability is strictly read-only. Future mutations are a separate Command Gateway contract and require authorization, idempotency, policy, risk confirmation, audit and observable outcome.
 
+### Current delivery slice
+
+The first product release is deliberately Apple-only: **macOS and iPhone**. It uses SwiftUI screens and a small native Swift domain module that reads the approved v1 fixtures. iPad, Windows and Android remain future options; their implementation is not part of this slice and must not delay the first manager-ready Apple experience.
+
 The Phase-0 prototype must prove SwiftUI-to-core cancellation, event decoding, list virtualization and theme/accessibility semantics before client implementation starts. Failure of that proof reopens this ADR; no compatibility layer is silently retained.
 
 ## Alternatives considered
@@ -39,6 +43,6 @@ The Phase-0 prototype must prove SwiftUI-to-core cancellation, event decoding, l
 ## Acceptance gates
 
 1. Core fixture decoding and compatibility tests pass on all targets.
-2. Apple and Compose spikes demonstrate cancellation, offline read, reduced motion and a virtualized 10,000-row list without main-thread I/O.
+2. The Apple spike demonstrates cancellation, offline read, reduced motion and a virtualized 10,000-row list without main-thread I/O. Compose platform spikes are deferred until the Apple release is accepted.
 3. No public DTO contains secret, raw path, raw prompt or privileged credential material.
 4. Platform release, signing and store credentials remain a human gate; unsigned development builds are allowed only for local/simulator testing.
