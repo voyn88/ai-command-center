@@ -16,8 +16,10 @@ local development tool; `/proc` does not exist on macOS.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
+from enum import Enum
 
 
 @dataclass(frozen=True)
@@ -30,9 +32,40 @@ class ProcessIdentity:
         return f"{self.start_time}|{self.command}"
 
 
-def capture_identity(pid: int, *, timeout: float = 5.0) -> ProcessIdentity | None:
-    """Return the current identity of `pid`, or None if no such process exists
-    (or it could not be queried). Never raises for an absent/invalid pid."""
+class ProcessQueryStatus(str, Enum):
+    LIVE = "LIVE"
+    ABSENT = "ABSENT"
+    ZOMBIE = "ZOMBIE"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ProcessQuery:
+    status: ProcessQueryStatus
+    identity: ProcessIdentity | None = None
+
+
+def _status_after_failed_ps(pid: int) -> ProcessQueryStatus:
+    """Distinguish a confirmed absent pid from an unreadable live/unknown one."""
+    if pid <= 0:
+        return ProcessQueryStatus.ABSENT
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return ProcessQueryStatus.ABSENT
+    except (PermissionError, OSError):
+        return ProcessQueryStatus.UNKNOWN
+    # The pid exists, but the identity query failed. It must not be treated as
+    # gone: doing so could free a lease or terminalize work still in progress.
+    return ProcessQueryStatus.UNKNOWN
+
+
+def query_identity(pid: int, *, timeout: float = 5.0) -> ProcessQuery:
+    """Return a tri-state-safe process query.
+
+    ``UNKNOWN`` is intentionally distinct from ``ABSENT``/``ZOMBIE`` so a
+    failing or incompatible ``ps`` cannot make live work appear gone.
+    """
     try:
         result = subprocess.run(
             ["ps", "-o", "state=,lstart=,command=", "-p", str(pid)],
@@ -42,12 +75,12 @@ def capture_identity(pid: int, *, timeout: float = 5.0) -> ProcessIdentity | Non
             check=False,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
-        return None
+        return ProcessQuery(_status_after_failed_ps(pid))
     if result.returncode != 0:
-        return None
+        return ProcessQuery(_status_after_failed_ps(pid))
     line = result.stdout.strip("\n")
     if not line.strip():
-        return None
+        return ProcessQuery(_status_after_failed_ps(pid))
     # `state` is the first token; its first character is the portable primary
     # process state on both Linux procps and BSD/macOS ps. A zombie has exited
     # and cannot execute, even though it keeps a PID until its parent reaps it.
@@ -57,18 +90,30 @@ def capture_identity(pid: int, *, timeout: float = 5.0) -> ProcessIdentity | Non
     # locale-specific date parsing is required here.
     parts = line.split(None, 6)
     if parts and parts[0].startswith("Z"):
-        return None
+        return ProcessQuery(ProcessQueryStatus.ZOMBIE)
     if len(parts) < 7:
-        # Unexpected `ps` output shape — still return *something* stable
-        # rather than silently treating this as "no such process".
-        return ProcessIdentity(pid=pid, start_time=line, command="")
+        return ProcessQuery(ProcessQueryStatus.UNKNOWN)
     start_time = " ".join(parts[1:6])
     command = parts[6]
-    return ProcessIdentity(pid=pid, start_time=start_time, command=command)
+    process_identity = ProcessIdentity(
+        pid=pid, start_time=start_time, command=command
+    )
+    return ProcessQuery(ProcessQueryStatus.LIVE, process_identity)
+
+
+def capture_identity(pid: int, *, timeout: float = 5.0) -> ProcessIdentity | None:
+    """Return a confirmed live identity, else ``None``.
+
+    Callers making a liveness decision must use :func:`query_identity` or
+    :func:`process_exists`; ``None`` alone intentionally does not distinguish
+    absent/zombie from an unqueryable process.
+    """
+    return query_identity(pid, timeout=timeout).identity
 
 
 def process_exists(pid: int) -> bool:
-    return capture_identity(pid) is not None
+    status = query_identity(pid).status
+    return status not in {ProcessQueryStatus.ABSENT, ProcessQueryStatus.ZOMBIE}
 
 
 def identity_matches(pid: int, recorded_identity: str | None) -> bool:
@@ -78,7 +123,7 @@ def identity_matches(pid: int, recorded_identity: str | None) -> bool:
     recorded identity (nothing to compare against)."""
     if not recorded_identity:
         return False
-    current = capture_identity(pid)
-    if current is None:
+    query = query_identity(pid)
+    if query.status is not ProcessQueryStatus.LIVE or query.identity is None:
         return False
-    return current.as_string() == recorded_identity
+    return query.identity.as_string() == recorded_identity

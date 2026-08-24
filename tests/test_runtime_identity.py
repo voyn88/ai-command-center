@@ -110,3 +110,54 @@ def test_identity_matches_false_when_recorded_identity_missing():
 
 def test_capture_identity_handles_invalid_pid_gracefully():
     assert identity.capture_identity(-1) is None
+
+
+def test_failed_ps_for_existing_pid_is_unknown_and_conservatively_exists(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        identity.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="", stderr="unsupported state keyword"
+        ),
+    )
+    monkeypatch.setattr(identity.os, "kill", lambda _pid, _signal: None)
+
+    query = identity.query_identity(4242)
+    assert query.status is identity.ProcessQueryStatus.UNKNOWN
+    assert query.identity is None
+    assert identity.capture_identity(4242) is None
+    assert identity.process_exists(4242) is True
+    assert identity.identity_matches(4242, "recorded|identity") is False
+
+
+def test_failed_ps_for_absent_pid_is_confirmed_absent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        identity.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr=""
+        ),
+    )
+
+    def absent(_pid: int, _signal: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(identity.os, "kill", absent)
+
+    assert identity.query_identity(4242).status is identity.ProcessQueryStatus.ABSENT
+    assert identity.process_exists(4242) is False
+
+
+def test_malformed_successful_ps_output_is_unknown_not_absent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        identity.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="S malformed", stderr=""
+        ),
+    )
+
+    assert identity.query_identity(4242).status is identity.ProcessQueryStatus.UNKNOWN
+    assert identity.process_exists(4242) is True

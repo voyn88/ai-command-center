@@ -188,6 +188,38 @@ def test_a_missing_token_refuses_instead_of_passing_unverified(tmp_path: Path) -
         assert_accepted(env)
 
 
+def test_single_pull_request_preserves_bare_reviewer_evidence(
+    monkeypatch, tmp_path: Path
+) -> None:
+    event = tmp_path / "event.json"
+    event.write_text('{"pull_request": {"number": 7}}', encoding="utf-8")
+
+    def api(path: str, _env: dict[str, str]) -> object:
+        if path.endswith("/pulls/7"):
+            return {
+                "number": 7,
+                "head": {"sha": HEAD},
+                "user": {"login": AUTHOR},
+            }
+        if "/pulls/7/reviews" in path:
+            return [accept()]
+        raise AssertionError(path)
+
+    monkeypatch.setattr("scripts.assert_independent_acceptance._api", api)
+
+    assert (
+        assert_accepted(
+            {
+                "GITHUB_REPOSITORY": "dimastov-lab/ai-command-center",
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_EVENT_NAME": "pull_request",
+                "GITHUB_TOKEN": "x",
+            }
+        )
+        == REVIEWER
+    )
+
+
 def test_an_event_without_a_pull_request_is_refused(tmp_path: Path) -> None:
     event = tmp_path / "event.json"
     event.write_text('{"ref": "refs/heads/main"}', encoding="utf-8")
@@ -337,7 +369,11 @@ def synthetic(sha: str, parent: str, number: int) -> dict:
     }
 
 
-def queue_entry(position: int, number: int, head: str, base: str = BASE) -> dict:
+def queue_entry(
+    position: int, number: int, head: str, base: str | None = None
+) -> dict:
+    if base is None:
+        base = BASE if position == 1 else SYNTHETIC_ONE
     return {
         "position": position,
         "state": "AWAITING_CHECKS",
@@ -445,7 +481,10 @@ def test_an_ambiguous_merge_group_is_refused(monkeypatch, mutate, message) -> No
     [
         ([queue_entry(1, 12, HEAD_TWELVE)], "#11 is no longer"),
         (
-            [queue_entry(2, 11, HEAD_ELEVEN), queue_entry(1, 12, HEAD_TWELVE)],
+            [
+                queue_entry(2, 11, HEAD_ELEVEN, base=BASE),
+                queue_entry(1, 12, HEAD_TWELVE, base=SYNTHETIC_ONE),
+            ],
             "order disagrees",
         ),
         (
@@ -479,6 +518,21 @@ def test_every_group_member_is_bound_to_its_exact_queued_head(monkeypatch) -> No
     )
 
     with pytest.raises(AcceptanceError, match="stale relative"):
+        _merge_group_numbers(
+            merge_group_payload(),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_every_group_member_base_is_bound_to_the_synthetic_chain(monkeypatch) -> None:
+    wrong_base = queue_entry(2, 12, HEAD_TWELVE, base=BASE)
+    mock_merge_group_apis(
+        monkeypatch,
+        [queue_entry(1, 11, HEAD_ELEVEN), wrong_base],
+    )
+
+    with pytest.raises(AcceptanceError, match="base disagrees"):
         _merge_group_numbers(
             merge_group_payload(),
             "dimastov-lab/ai-command-center",

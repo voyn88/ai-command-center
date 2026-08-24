@@ -211,7 +211,7 @@ def _api(path: str, env: dict[str, str]) -> object:
             "GITHUB_TOKEN is required to read the pull request's reviews"
         )
     base = env.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
-    request = Request(
+    request = Request(  # noqa: S310 - fixed GitHub API host from runner env
         f"{base}{path}",
         headers={
             "Accept": "application/vnd.github+json",
@@ -221,7 +221,7 @@ def _api(path: str, env: dict[str, str]) -> object:
         },
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=30) as response:  # noqa: S310 - see above
             body = response.read(_MAX_BYTES + 1)
     except (HTTPError, URLError, TimeoutError, OSError) as error:
         raise AcceptanceError(f"cannot read {path} from the GitHub API") from error
@@ -240,7 +240,7 @@ def _graphql(query: str, variables: dict[str, object], env: dict[str, str]) -> o
         raise AcceptanceError("GITHUB_TOKEN is required to read the merge queue")
     url = env.get("GITHUB_GRAPHQL_URL", "https://api.github.com/graphql")
     body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
-    request = Request(
+    request = Request(  # noqa: S310 - fixed GitHub GraphQL host from runner env
         url,
         method="POST",
         data=body,
@@ -253,7 +253,7 @@ def _graphql(query: str, variables: dict[str, object], env: dict[str, str]) -> o
         },
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=30) as response:  # noqa: S310 - see above
             response_body = response.read(_MAX_BYTES + 1)
     except (HTTPError, URLError, TimeoutError, OSError) as error:
         raise AcceptanceError(
@@ -366,12 +366,14 @@ def _merge_queue_entries(
 
 def _bind_queue_heads(
     numbers: list[int],
-    base: str,
+    expected_bases: list[str],
     branch: str,
     repository: str,
     env: dict[str, str],
 ) -> list[tuple[int, str]]:
     """Bind the synthetic PR sequence to exact heads in the live queue."""
+    if len(numbers) != len(expected_bases):
+        raise AcceptanceError("merge_group queue-binding inputs are inconsistent")
     queue_entries = _merge_queue_entries(repository, branch, env)
     by_number: dict[int, dict] = {}
     for entry in queue_entries:
@@ -386,7 +388,7 @@ def _bind_queue_heads(
         by_number[number] = entry
 
     selected: list[tuple[int, int, str]] = []
-    for number in numbers:
+    for number, expected_base in zip(numbers, expected_bases, strict=True):
         entry = by_number.get(number)
         if entry is None:
             raise AcceptanceError(
@@ -416,6 +418,17 @@ def _bind_queue_heads(
             raise AcceptanceError(
                 f"merge queue entry #{number} is stale relative to its pull request head"
             )
+        queued_base = entry.get("baseCommit")
+        queued_base_oid = (
+            queued_base.get("oid") if isinstance(queued_base, dict) else None
+        )
+        if (
+            _commit_sha(queued_base_oid, f"merge queue entry #{number} base")
+            != expected_base
+        ):
+            raise AcceptanceError(
+                f"merge queue entry #{number} base disagrees with the synthetic chain"
+            )
         selected.append((position, number, exact_head))
 
     selected.sort()
@@ -428,10 +441,6 @@ def _bind_queue_heads(
     if ordered_numbers != numbers:
         raise AcceptanceError("merge_group order disagrees with the live merge queue")
 
-    first_base = by_number[numbers[0]].get("baseCommit")
-    first_base_oid = first_base.get("oid") if isinstance(first_base, dict) else None
-    if _commit_sha(first_base_oid, "first merge queue entry base") != base:
-        raise AcceptanceError("merge_group base disagrees with the live merge queue")
     return [(number, head) for _position, number, head in selected]
 
 
@@ -483,6 +492,7 @@ def _merge_group_numbers(
         raise AcceptanceError("merge_group base is not the comparison merge base")
 
     numbers: list[int] = []
+    expected_queue_bases: list[str] = []
     previous = base
     for commit in commits:
         if not isinstance(commit, dict):
@@ -506,6 +516,7 @@ def _merge_group_numbers(
                 f"merge_group commit {commit_sha} has no unambiguous pull request number"
             )
         numbers.append(int(subject_match.group("number")))
+        expected_queue_bases.append(previous)
         previous = commit_sha
 
     if previous != head:
@@ -514,7 +525,12 @@ def _merge_group_numbers(
         raise AcceptanceError("merge_group contains a duplicate pull request number")
     if numbers[-1] != int(match.group("number")):
         raise AcceptanceError("merge_group history disagrees with its queue ref")
-    return _bind_queue_heads(numbers, base, base_branch, repository, env), base_branch
+    return (
+        _bind_queue_heads(
+            numbers, expected_queue_bases, base_branch, repository, env
+        ),
+        base_branch,
+    )
 
 
 def _reviews(repository: str, number: int, env: dict[str, str]) -> list:
@@ -581,6 +597,9 @@ def assert_accepted(env: dict[str, str]) -> str:
         reviewer = evaluate(_reviews(repository, number, env), exact_head, author)
         evidence.append(f"#{number}:{reviewer}")
 
+    if event != "merge_group":
+        # Preserve the original public return contract for existing callers.
+        return evidence[0].split(":", 1)[1]
     return ", ".join(evidence)
 
 
