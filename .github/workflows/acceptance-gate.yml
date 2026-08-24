@@ -21,6 +21,12 @@ name: Acceptance gate
 #
 # A separate file rather than a job in `ci.yml`: this gate reaches the API on
 # every review event, and the open pull requests rebase against `ci.yml`.
+#
+# Merge queue checks run on a synthetic commit, not on a pull request head.
+# `merge_group` is therefore mandatory: the verifier resolves every pull
+# request represented by the synthetic commit range and requires a live,
+# independent exact-head verdict for each one. Ambiguous group history refuses
+# rather than silently accepting only the last pull request in a batch.
 
 on:
   pull_request:
@@ -28,15 +34,19 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   pull_request_review:
     types: [submitted, edited, dismissed]
+  merge_group:
+    types: [checks_requested]
 
 concurrency:
-  # Per pull request, so a burst of review events collapses to the newest
-  # evaluation. A cancelled run reports as a failure, which is the safe side.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  # Per pull request or exact synthetic merge-group head, so a burst of review
+  # events collapses while independent queue groups never cancel one another.
+  # A cancelled run reports as a failure, which is the safe side.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
   cancel-in-progress: true
 
-# Read-only, and only what the one API caller needs: the pull request's head
-# sha, its author, and its reviews. This gate has nothing to write.
+# Read-only, and only what the API callers need: `contents: read` for the
+# synthetic commit comparison, and `pull-requests: read` for PR/reviews plus
+# the repository merge-queue GraphQL fields. This gate has nothing to write.
 permissions:
   contents: read
   pull-requests: read

@@ -10,19 +10,21 @@ real verdict, and asserts the gate stops it.
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 import re
+from pathlib import Path
 
 import pytest
 import yaml
 
 from scripts.assert_independent_acceptance import (
     AcceptanceError,
+    _merge_group_numbers,
+    _merge_queue_entries,
     assert_accepted,
     evaluate,
     parse_marker,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/acceptance-gate.yml"
@@ -54,7 +56,9 @@ def test_a_verdict_from_a_different_identity_on_the_current_head_passes() -> Non
 
 
 def test_a_verdict_may_carry_its_reasoning_below_the_marker() -> None:
-    body = f"ACCEPTANCE: ACCEPT {HEAD}\n\nChecked the migration and the rollback path.\n"
+    body = (
+        f"ACCEPTANCE: ACCEPT {HEAD}\n\nChecked the migration and the rollback path.\n"
+    )
     assert evaluate([review(body)], HEAD, AUTHOR) == REVIEWER
 
 
@@ -150,7 +154,9 @@ def test_an_unsubmitted_draft_verdict_does_not_accept() -> None:
 
 def test_an_unattributable_verdict_cannot_establish_independence() -> None:
     with pytest.raises(AcceptanceError, match="no acceptance verdict"):
-        evaluate([{"body": f"ACCEPTANCE: ACCEPT {HEAD}", "state": "COMMENTED"}], HEAD, AUTHOR)
+        evaluate(
+            [{"body": f"ACCEPTANCE: ACCEPT {HEAD}", "state": "COMMENTED"}], HEAD, AUTHOR
+        )
 
 
 @pytest.mark.parametrize("head", [None, "", "not-a-sha", HEAD[:39], 12345])
@@ -183,10 +189,42 @@ def test_a_missing_token_refuses_instead_of_passing_unverified(tmp_path: Path) -
         assert_accepted(env)
 
 
+def test_single_pull_request_preserves_bare_reviewer_evidence(
+    monkeypatch, tmp_path: Path
+) -> None:
+    event = tmp_path / "event.json"
+    event.write_text('{"pull_request": {"number": 7}}', encoding="utf-8")
+
+    def api(path: str, _env: dict[str, str]) -> object:
+        if path.endswith("/pulls/7"):
+            return {
+                "number": 7,
+                "head": {"sha": HEAD},
+                "user": {"login": AUTHOR},
+            }
+        if "/pulls/7/reviews" in path:
+            return [accept()]
+        raise AssertionError(path)
+
+    monkeypatch.setattr("scripts.assert_independent_acceptance._api", api)
+
+    assert (
+        assert_accepted(
+            {
+                "GITHUB_REPOSITORY": "dimastov-lab/ai-command-center",
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_EVENT_NAME": "pull_request",
+                "GITHUB_TOKEN": "x",
+            }
+        )
+        == REVIEWER
+    )
+
+
 def test_an_event_without_a_pull_request_is_refused(tmp_path: Path) -> None:
     event = tmp_path / "event.json"
     event.write_text('{"ref": "refs/heads/main"}', encoding="utf-8")
-    with pytest.raises(AcceptanceError, match="carries no pull request"):
+    with pytest.raises(AcceptanceError, match="unsupported event"):
         assert_accepted(
             {
                 "GITHUB_REPOSITORY": "dimastov-lab/ai-command-center",
@@ -232,12 +270,17 @@ def test_the_gate_re_runs_when_the_verdict_arrives_after_ci() -> None:
     just given.
     """
     workflow = _workflow()
-    assert set(workflow["on"]) == {"pull_request", "pull_request_review"}
+    assert set(workflow["on"]) == {
+        "pull_request",
+        "pull_request_review",
+        "merge_group",
+    }
     assert set(workflow["on"]["pull_request_review"]["types"]) == {
         "submitted",
         "edited",
         "dismissed",
     }
+    assert workflow["on"]["merge_group"]["types"] == ["checks_requested"]
     # `edited` and `dismissed` matter as much as `submitted`: a verdict body
     # edited into a rejection, or an acceptance dismissed, must re-judge.
 
@@ -248,7 +291,7 @@ def test_the_check_name_is_the_one_branch_protection_can_require() -> None:
 
 
 def test_the_gate_asks_for_no_more_access_than_it_reads() -> None:
-    """It reads a pull request and its reviews. It writes nothing, ever."""
+    """It reads commits, pull requests, reviews and the queue; never writes."""
     assert _workflow()["permissions"] == {"contents": "read", "pull-requests": "read"}
 
 
@@ -266,7 +309,9 @@ def test_the_gate_runs_under_a_shell_that_aborts_and_says_so_explicitly() -> Non
 
 def test_the_gate_has_a_deliberate_failure_canary() -> None:
     steps = _workflow()["jobs"]["acceptance-gate"]["steps"]
-    (canary,) = [step for step in steps if step.get("name") == "Deliberate failure canary"]
+    (canary,) = [
+        step for step in steps if step.get("name") == "Deliberate failure canary"
+    ]
     assert "release-gate-canary-acceptance" in canary["if"]
     assert canary["run"].strip() == "exit 1"
 
@@ -283,3 +328,387 @@ def test_the_gate_runs_the_verifier_that_exists() -> None:
         step.get("run", "") for step in _workflow()["jobs"]["acceptance-gate"]["steps"]
     )
     assert "scripts/assert_independent_acceptance.py" in commands
+
+
+# --------------------------------------------------------------------------
+# Merge-group resolution
+# --------------------------------------------------------------------------
+
+
+BASE = "1111111111111111111111111111111111111111"  # pragma: allowlist secret
+SYNTHETIC_ONE = "2222222222222222222222222222222222222222"  # pragma: allowlist secret
+SYNTHETIC_TWO = "3333333333333333333333333333333333333333"  # pragma: allowlist secret
+HEAD_ELEVEN = "4444444444444444444444444444444444444444"  # pragma: allowlist secret
+HEAD_TWELVE = "5555555555555555555555555555555555555555"  # pragma: allowlist secret
+
+
+def merge_group_payload(number: int = 12) -> dict:
+    return {
+        "merge_group": {
+            "base_sha": BASE,
+            "head_sha": SYNTHETIC_TWO,
+            "base_ref": "refs/heads/main",
+            "head_ref": (f"refs/heads/gh-readonly-queue/main/pr-{number}-{BASE}"),
+        }
+    }
+
+
+def comparison(commits: list[dict]) -> dict:
+    return {
+        "ahead_by": len(commits),
+        "total_commits": len(commits),
+        "merge_base_commit": {"sha": BASE},
+        "commits": commits,
+    }
+
+
+def synthetic(sha: str, parent: str, number: int) -> dict:
+    return {
+        "sha": sha,
+        "parents": [{"sha": parent}],
+        "commit": {"message": f"Queued change (#{number})\n\nDetails"},
+    }
+
+
+def queue_entry(
+    position: int, number: int, head: str, base: str | None = None
+) -> dict:
+    if base is None:
+        base = BASE if position == 1 else SYNTHETIC_ONE
+    return {
+        "position": position,
+        "state": "AWAITING_CHECKS",
+        "baseCommit": {"oid": base},
+        "headCommit": {"oid": head},
+        "pullRequest": {
+            "number": number,
+            "headRefOid": head,
+            "baseRefName": "main",
+            "state": "OPEN",
+        },
+    }
+
+
+def queue_response(entries: list[dict]) -> dict:
+    return {
+        "data": {
+            "repository": {
+                "mergeQueue": {
+                    "entries": {
+                        "nodes": entries,
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        }
+    }
+
+
+def queue_page(
+    entries: list[dict], *, has_next: bool, cursor: str | None
+) -> dict:
+    response = queue_response(entries)
+    page_info = response["data"]["repository"]["mergeQueue"]["entries"][
+        "pageInfo"
+    ]
+    page_info["hasNextPage"] = has_next
+    page_info["endCursor"] = cursor
+    return response
+
+
+def test_merge_queue_pagination_binds_every_page_and_advances_cursor(
+    monkeypatch,
+) -> None:
+    cursors: list[str | None] = []
+
+    def graphql(_query, variables, _env):
+        cursors.append(variables["cursor"])
+        if variables["cursor"] is None:
+            return queue_page(
+                [queue_entry(1, 11, HEAD_ELEVEN)],
+                has_next=True,
+                cursor="page-two",
+            )
+        assert variables["cursor"] == "page-two"
+        return queue_page(
+            [queue_entry(2, 12, HEAD_TWELVE)],
+            has_next=False,
+            cursor=None,
+        )
+
+    monkeypatch.setattr("scripts.assert_independent_acceptance._graphql", graphql)
+
+    entries = _merge_queue_entries(
+        "dimastov-lab/ai-command-center", "main", {"GITHUB_TOKEN": "x"}
+    )
+
+    assert [entry["pullRequest"]["number"] for entry in entries] == [11, 12]
+    assert cursors == [None, "page-two"]
+
+
+def test_merge_queue_pagination_repeated_cursor_is_refused(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_page(
+            [queue_entry(1, 11, HEAD_ELEVEN)],
+            has_next=True,
+            cursor="same",
+        ),
+    )
+
+    with pytest.raises(AcceptanceError, match="repeated a cursor"):
+        _merge_queue_entries(
+            "dimastov-lab/ai-command-center", "main", {"GITHUB_TOKEN": "x"}
+        )
+
+
+def mock_merge_group_apis(monkeypatch, entries: list[dict]) -> None:
+    response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._api", lambda _path, _env: response
+    )
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_response(entries),
+    )
+
+
+def test_a_batch_merge_group_resolves_every_pull_request(monkeypatch) -> None:
+    mock_merge_group_apis(
+        monkeypatch,
+        [
+            queue_entry(1, 11, HEAD_ELEVEN),
+            queue_entry(2, 12, HEAD_TWELVE),
+        ],
+    )
+
+    queued_pulls, base = _merge_group_numbers(
+        merge_group_payload(), "dimastov-lab/ai-command-center", {"GITHUB_TOKEN": "x"}
+    )
+
+    assert queued_pulls == [(11, HEAD_ELEVEN), (12, HEAD_TWELVE)]
+    assert base == "main"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda value: value.update(total_commits=3), "incomplete"),
+        (
+            lambda value: value["commits"][1].update(parents=[{"sha": BASE}]),
+            "discontinuous",
+        ),
+        (
+            lambda value: value["commits"][1]["commit"].update(message="No PR suffix"),
+            "no unambiguous pull request number",
+        ),
+    ],
+)
+def test_an_ambiguous_merge_group_is_refused(monkeypatch, mutate, message) -> None:
+    response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+    mutate(response)
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._api", lambda _path, _env: response
+    )
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_response(
+            [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(2, 12, HEAD_TWELVE)]
+        ),
+    )
+
+    with pytest.raises(AcceptanceError, match=message):
+        _merge_group_numbers(
+            merge_group_payload(),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ([queue_entry(1, 12, HEAD_TWELVE)], "#11 is no longer"),
+        (
+            [
+                queue_entry(2, 11, HEAD_ELEVEN, base=BASE),
+                queue_entry(1, 12, HEAD_TWELVE, base=SYNTHETIC_ONE),
+            ],
+            "order disagrees",
+        ),
+        (
+            [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(3, 12, HEAD_TWELVE)],
+            "not contiguous",
+        ),
+    ],
+)
+def test_a_group_that_disagrees_with_live_queue_is_refused(
+    monkeypatch, entries, message
+) -> None:
+    mock_merge_group_apis(monkeypatch, entries)
+
+    with pytest.raises(AcceptanceError, match=message):
+        _merge_group_numbers(
+            merge_group_payload(),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_every_group_member_is_bound_to_its_exact_queued_head(monkeypatch) -> None:
+    stale = queue_entry(1, 11, HEAD_ELEVEN)
+    stale["headCommit"]["oid"] = HEAD_TWELVE
+    mock_merge_group_apis(
+        monkeypatch,
+        [
+            stale,
+            queue_entry(2, 12, HEAD_TWELVE),
+        ],
+    )
+
+    with pytest.raises(AcceptanceError, match="stale relative"):
+        _merge_group_numbers(
+            merge_group_payload(),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_every_group_member_base_is_bound_to_the_synthetic_chain(monkeypatch) -> None:
+    wrong_base = queue_entry(2, 12, HEAD_TWELVE, base=BASE)
+    mock_merge_group_apis(
+        monkeypatch,
+        [queue_entry(1, 11, HEAD_ELEVEN), wrong_base],
+    )
+
+    with pytest.raises(AcceptanceError, match="base disagrees"):
+        _merge_group_numbers(
+            merge_group_payload(),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_a_group_with_the_wrong_final_queue_ref_number_is_refused(monkeypatch) -> None:
+    mock_merge_group_apis(
+        monkeypatch,
+        [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(2, 12, HEAD_TWELVE)],
+    )
+
+    with pytest.raises(AcceptanceError, match="disagrees with its queue ref"):
+        _merge_group_numbers(
+            merge_group_payload(number=13),
+            "dimastov-lab/ai-command-center",
+            {"GITHUB_TOKEN": "x"},
+        )
+
+
+def test_batch_acceptance_checks_each_queue_bound_exact_head(
+    monkeypatch, tmp_path: Path
+) -> None:
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(merge_group_payload()), encoding="utf-8")
+    compare_response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+
+    def api(path: str, _env: dict[str, str]) -> object:
+        if "/compare/" in path:
+            return compare_response
+        if path.endswith("/pulls/11"):
+            return {
+                "number": 11,
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {"sha": HEAD_ELEVEN},
+                "user": {"login": AUTHOR},
+            }
+        if path.endswith("/pulls/12"):
+            return {
+                "number": 12,
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {"sha": HEAD_TWELVE},
+                "user": {"login": AUTHOR},
+            }
+        if "/pulls/11/reviews" in path:
+            return [review(f"ACCEPTANCE: ACCEPT {HEAD_ELEVEN}")]
+        if "/pulls/12/reviews" in path:
+            return [review(f"ACCEPTANCE: ACCEPT {HEAD_TWELVE}")]
+        raise AssertionError(path)
+
+    monkeypatch.setattr("scripts.assert_independent_acceptance._api", api)
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_response(
+            [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(2, 12, HEAD_TWELVE)]
+        ),
+    )
+
+    evidence = assert_accepted(
+        {
+            "GITHUB_REPOSITORY": "dimastov-lab/ai-command-center",
+            "GITHUB_EVENT_PATH": str(event),
+            "GITHUB_EVENT_NAME": "merge_group",
+            "GITHUB_TOKEN": "x",
+        }
+    )
+
+    assert evidence == f"#11:{REVIEWER}, #12:{REVIEWER}"
+
+
+def test_a_pr_moving_after_the_group_was_built_is_refused(
+    monkeypatch, tmp_path: Path
+) -> None:
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps(merge_group_payload()), encoding="utf-8")
+    compare_response = comparison(
+        [
+            synthetic(SYNTHETIC_ONE, BASE, 11),
+            synthetic(SYNTHETIC_TWO, SYNTHETIC_ONE, 12),
+        ]
+    )
+
+    def api(path: str, _env: dict[str, str]) -> object:
+        if "/compare/" in path:
+            return compare_response
+        if path.endswith("/pulls/11"):
+            return {
+                "number": 11,
+                "state": "open",
+                "base": {"ref": "main"},
+                "head": {"sha": OTHER},
+                "user": {"login": AUTHOR},
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr("scripts.assert_independent_acceptance._api", api)
+    monkeypatch.setattr(
+        "scripts.assert_independent_acceptance._graphql",
+        lambda _query, _variables, _env: queue_response(
+            [queue_entry(1, 11, HEAD_ELEVEN), queue_entry(2, 12, HEAD_TWELVE)]
+        ),
+    )
+
+    with pytest.raises(AcceptanceError, match="moved after the group was built"):
+        assert_accepted(
+            {
+                "GITHUB_REPOSITORY": "dimastov-lab/ai-command-center",
+                "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_EVENT_NAME": "merge_group",
+                "GITHUB_TOKEN": "x",
+            }
+        )
