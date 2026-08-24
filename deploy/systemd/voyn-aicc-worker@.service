@@ -1,4 +1,4 @@
-# Versioned two-lane worker template for VOYN pre-production.
+# Versioned registry-driven worker template for VOYN pre-production.
 [Unit]
 Description=AICC preprod worker lane %i
 After=network-online.target voyn-aicc-pgtunnel.service

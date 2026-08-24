@@ -91,7 +91,10 @@ def resolve(verb: str, unit: str, lanes: tuple[str, ...]) -> list[str]:
 
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
-        print("usage: voyn-aicc-rotation-helper {show|drain|reload|restart} <unit>", file=sys.stderr)
+        print(
+            "usage: voyn-aicc-rotation-helper {show|drain|reload|restart} <unit>",
+            file=sys.stderr,
+        )
         return 64
     try:
         lanes = read_registry()
