@@ -139,11 +139,25 @@ _COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
     "econnreset",
 )
 _CODEX_PREFLIGHT_PROMPT = (
-    "This is a sandbox capability probe. Do not edit files, run tools, or inspect "
-    "the repository. Reply with exactly: AICC_CODEX_WORKSPACE_WRITE_OK"
+    "This is a disposable sandbox capability probe. In the current repository, "
+    "create a file named aicc-codex-commit-probe.txt containing exactly "
+    "AICC_CODEX_COMMIT_OK followed by a newline. Run git add for that file and "
+    "git commit -m 'aicc codex commit probe'. Do not inspect any other path or "
+    "use a remote. After the commit succeeds, reply exactly: "
+    "AICC_CODEX_WORKSPACE_WRITE_OK"
 )
 _codex_workspace_write_preflight_lock = threading.Lock()
 _codex_workspace_write_preflight_result: tuple[bool, str] | None = None
+
+
+def disable_codex_workspace_write(detail: str = "") -> None:
+    """Open the worker-local Codex circuit after a runtime bwrap failure."""
+    global _codex_workspace_write_preflight_result
+    reason = "Codex workspace-write sandbox unavailable"
+    if detail:
+        reason = f"{reason}: {detail[-400:]}"
+    with _codex_workspace_write_preflight_lock:
+        _codex_workspace_write_preflight_result = (False, reason)
 
 # --------------------------------------------------------------------------
 # Execution profiles — named, testable single source of truth for "what can
@@ -300,7 +314,18 @@ _VCS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "GITHUB_API_TOKEN",
         "GITHUB_ACCESS_TOKEN",
         "GIT_ASKPASS",
+        "GIT_SSH_COMMAND",
+        "SSH_AUTH_SOCK",
         "SSH_ASKPASS",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "AICC_WORKSPACE_AUTHORITY_KEY",
+        "AICC_PUBLISH_DEPLOY_KEY",
+        "AICC_PUBLISH_OWNER",
+        "VOYN_LEASE_DSN",
+        "VOYN_LEASE_TOOL",
+        "VOYN_LEASE_SESSION",
+        "VOYN_LEASE_REPOSITORY",
     }
 )
 
@@ -309,7 +334,26 @@ def scrub_vcs_credentials(environment: dict[str, str]) -> dict[str, str]:
     """Return a copy of `environment` with Git/GitHub credential variables
     (`_VCS_CREDENTIAL_ENV_VARS`) removed, so a spawned agent cannot inherit
     ambient push/merge credentials. Never removes the agent's own model auth."""
-    return {key: value for key, value in environment.items() if key not in _VCS_CREDENTIAL_ENV_VARS}
+    scrubbed = {
+        key: value
+        for key, value in environment.items()
+        if key not in _VCS_CREDENTIAL_ENV_VARS
+        and not key.startswith(("GIT_CONFIG_", "AICC_PUBLISH_", "VOYN_LEASE_"))
+    }
+    # Ignore machine/user Git config and the host gh credential store for the
+    # model process.  The task clone carries only the local identity needed to
+    # commit; it has no remote until the guarded publisher restores one after
+    # the process exits.
+    scrubbed.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GH_CONFIG_DIR": "/nonexistent/aicc-agent-gh",
+            "SSH_ASKPASS_REQUIRE": "never",
+        }
+    )
+    return scrubbed
 
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -386,6 +430,53 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
                     f"cannot create disposable Codex probe workspace: {initialized.stderr.strip()}",
                 )
                 return _codex_workspace_write_preflight_result
+            for key, value in (
+                ("user.name", "AICC Codex Preflight"),
+                ("user.email", "aicc-codex-preflight@localhost"),
+            ):
+                configured = subprocess.run(
+                    ["git", "config", "--local", key, value],
+                    cwd=probe,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if configured.returncode != 0:
+                    _codex_workspace_write_preflight_result = (
+                        False,
+                        f"cannot configure disposable Codex probe: {configured.stderr.strip()}",
+                    )
+                    return _codex_workspace_write_preflight_result
+            seed = probe / ".aicc-codex-preflight-seed"
+            seed.write_text("seed\n", encoding="utf-8")
+            seeded = subprocess.run(
+                ["git", "add", seed.name],
+                cwd=probe,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if seeded.returncode == 0:
+                seeded = subprocess.run(
+                    ["git", "commit", "--quiet", "-m", "aicc codex preflight seed"],
+                    cwd=probe,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            if seeded.returncode != 0:
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"cannot seed disposable Codex probe: {seeded.stderr.strip()}",
+                )
+                return _codex_workspace_write_preflight_result
+            before = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=probe,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
             run = run_claude_code(
                 repository_path=probe,
                 prompt=_CODEX_PREFLIGHT_PROMPT,
@@ -393,21 +484,54 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
                 timeout_seconds=MIN_TIMEOUT_SECONDS,
                 executor="codex",
             )
-        diagnostic = "\n".join(part for part in (run.stdout, run.stderr) if part)
-        if run.is_executor_sandbox_error:
-            detail = diagnostic[-400:] or "bwrap loopback namespace setup was denied"
-            _codex_workspace_write_preflight_result = (
-                False,
-                f"Codex workspace-write sandbox unavailable: {detail}",
-            )
-        elif run.status != "completed":
-            detail = diagnostic[-400:] or f"exit_code={run.exit_code!r}"
-            _codex_workspace_write_preflight_result = (
-                False,
-                f"Codex workspace-write preflight failed: {detail}",
-            )
-        else:
-            _codex_workspace_write_preflight_result = (True, "")
+            diagnostic = "\n".join(part for part in (run.stdout, run.stderr) if part)
+            if run.is_executor_sandbox_error:
+                detail = diagnostic[-400:] or "bwrap loopback namespace setup was denied"
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"Codex workspace-write sandbox unavailable: {detail}",
+                )
+            elif run.status != "completed":
+                detail = diagnostic[-400:] or f"exit_code={run.exit_code!r}"
+                # Provider/auth/network failures are transient. Do not pin a
+                # worker-wide negative forever; only the proven bwrap/capability
+                # failures above/below open the persistent local circuit.
+                return (
+                    False,
+                    f"Codex workspace-write preflight failed: {detail}",
+                )
+            else:
+                after = _run_git(["rev-parse", "HEAD"], probe)
+                status = _run_git(["status", "--porcelain"], probe)
+                common = _run_git(["rev-parse", "--path-format=absolute", "--git-common-dir"], probe)
+                probe_file = probe / "aicc-codex-commit-probe.txt"
+                try:
+                    probe_content = probe_file.read_text(encoding="utf-8")
+                except OSError:
+                    probe_content = None
+                commit_ok = bool(
+                    after
+                    and after.returncode == 0
+                    and after.stdout.strip()
+                    and after.stdout.strip() != before
+                    and status
+                    and status.returncode == 0
+                    and not status.stdout.strip()
+                    and common
+                    and common.returncode == 0
+                    and Path(common.stdout.strip()).resolve() == (probe / ".git").resolve()
+                    and probe_content == "AICC_CODEX_COMMIT_OK\n"
+                )
+                if not commit_ok:
+                    _codex_workspace_write_preflight_result = (
+                        False,
+                        (
+                            "Codex workspace-write preflight could not create a clean local commit "
+                            "with task-local Git metadata"
+                        ),
+                    )
+                else:
+                    _codex_workspace_write_preflight_result = (True, "")
         return _codex_workspace_write_preflight_result
 
 
