@@ -919,6 +919,17 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
     Never rewrites `workspace_path` to the source repository: an unprovisioned
     workspace becomes a hard verification failure, never a silent fallback."""
     workspace = Path(spec.workspace_path).expanduser()
+    if not spec.task_local_git_metadata:
+        # The legacy contract, unchanged: an already-existing workspace is
+        # "reused" REGARDLESS of whether the authority fields are complete
+        # (verify_workspace judges it), and disabled provisioning
+        # short-circuits before any repository access. Splicing the
+        # task-local branch in must not reorder this pre-existing path
+        # (independent-review finding on d661d8f).
+        if workspace.exists():
+            return "reused"
+        if not spec.allow_provision:
+            return "skipped"
     if not (spec.repository_path and spec.expected_branch and spec.base_branch):
         return "skipped"
 
@@ -930,11 +941,6 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
         if not spec.allow_provision and not workspace.exists():
             return "skipped"
         return _provision_task_local_clone(spec, repo, workspace)
-
-    if workspace.exists():
-        return "reused"
-    if not spec.allow_provision:
-        return "skipped"
 
     workspace_target = workspace.resolve()
     branch_exists = spec.expected_branch in git_info.get_branches(repo)
@@ -1376,6 +1382,17 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
             detail=".git must be a directory and HEAD a regular file",
         )
     expected_ref = f"refs/heads/{expected_branch}"
+    if any(
+        part in {"", ".", ".."} for part in expected_branch.split("/")
+    ):
+        raise WorkspaceVerificationError(
+            failed_step="agent_head_branch",
+            remediation="Use a branch name without empty or dot path components.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="branch name would escape .git/refs/heads",
+        )
     if head_text != f"ref: {expected_ref}":
         raise WorkspaceVerificationError(
             failed_step="agent_head_branch",

@@ -79,6 +79,11 @@ if [ -e "$state_dir" ]; then
 else
   install -d -m 0700 -o root -g root "$state_dir"
 fi
+# NOTE: snapshot's own discover_units() additionally folds in every loaded/
+# enabled voyn-aicc-worker@* template instance, so runtime-only lanes are
+# snapshotted even when absent from the repo lane file. The two legacy units
+# below mirror LEGACY_WORKER_UNITS in ops/aicc_staged_worker_rollout.py --
+# keep the two lists in lockstep.
 run_rollout snapshot --lanes "$repo_lanes" --state "$attempt_units" \
   --include-unit aicc-agent-launcher.socket \
   --include-unit aicc-principal-recovery.service \
@@ -101,6 +106,10 @@ rollback() {
   rollback_complete=1
   if [ "$transaction_active" -eq 1 ] && [ -f "$state_dir/pending.json" ]; then
     systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
+    # The uninstall path disables this too; a rolled-back FIRST install must
+    # not leave the enable symlink dangling after the transaction removes the
+    # unit file (independent-review finding on d661d8f).
+    systemctl disable aicc-principal-recovery.service >/dev/null 2>&1 || true
     if ! run_transaction recover; then
       # Keep pending.json, its generation, and attempt-units.json intact.
       # The boot recovery unit retries the same compare-and-restore plus

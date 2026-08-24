@@ -439,3 +439,14 @@ def test_prepare_refuses_to_clobber_a_pending_transaction(tmp_path):
     assert transaction.pending.exists()
     with pytest.raises(RuntimeError, match="pending install transaction"):
         transaction.prepare((_spec(module, source, "/etc/target.bin"),))
+
+
+def test_target_rejects_or_contains_double_leading_slash(tmp_path):
+    """"//etc/x" minus one slash is still absolute and would discard root in
+    the join, escaping the sandbox root entirely (review finding on d661d8f)."""
+    module = _module()
+    transaction = module.FileTransaction(tmp_path / "root", tmp_path / "state")
+    contained = transaction._target("//etc/x")
+    assert str(contained).startswith(str(tmp_path / "root"))
+    with pytest.raises(ValueError):
+        transaction._target("///")

@@ -267,7 +267,14 @@ class FileTransaction:
     def _target(self, absolute: str) -> Path:
         if not absolute.startswith("/") or ".." in Path(absolute).parts:
             raise ValueError(f"unsafe installation target: {absolute}")
-        return self.root / absolute.removeprefix("/")
+        # lstrip, not removeprefix: "//etc/passwd" minus ONE slash is still
+        # absolute, and joining an absolute path onto self.root discards the
+        # root entirely (PurePath.__truediv__) -- a silent sandbox escape
+        # (independent-review finding on d661d8f).
+        relative = absolute.lstrip("/")
+        if not relative:
+            raise ValueError(f"unsafe installation target: {absolute}")
+        return self.root / relative
 
     def _validate_parent_chain(self, target: Path) -> None:
         current = target.parent
