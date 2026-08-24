@@ -1389,10 +1389,33 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
     """Resolve HEAD without invoking Git against agent-controlled config."""
     git_dir = workspace / ".git"
     head_path = git_dir / "HEAD"
+    # Check-then-read is not enough against a hostile workspace: a FIFO at
+    # `.git/HEAD` would make a bare `read_text()` block forever (DoS), and a
+    # symlink would read outside the workspace. Open the path itself with
+    # O_NOFOLLOW|O_NONBLOCK, then let fstat on the descriptor -- not a racy
+    # earlier lstat -- prove it is a regular file before any byte is read.
     try:
         git_info_stat = git_dir.lstat()
-        head_stat = head_path.lstat()
-        head_text = head_path.read_text(encoding="ascii").strip()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        head_descriptor = os.open(head_path, flags)
+        try:
+            head_stat = os.fstat(head_descriptor)
+            if not stat.S_ISREG(head_stat.st_mode):
+                raise WorkspaceVerificationError(
+                    failed_step="agent_head_regular",
+                    remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    detail=".git/HEAD must be a regular file",
+                )
+            with os.fdopen(head_descriptor, "r", encoding="ascii") as head_handle:
+                head_descriptor = -1
+                head_text = head_handle.read(4096).strip()
+        finally:
+            if head_descriptor != -1:
+                os.close(head_descriptor)
     except OSError as exc:
         raise WorkspaceVerificationError(
             failed_step="agent_head_readable",
@@ -1401,13 +1424,13 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
             actual_workspace=str(workspace),
             detail=f"cannot read task-local HEAD safely: {exc}",
         ) from exc
-    if not stat.S_ISDIR(git_info_stat.st_mode) or not stat.S_ISREG(head_stat.st_mode):
+    if not stat.S_ISDIR(git_info_stat.st_mode):
         raise WorkspaceVerificationError(
             failed_step="agent_head_regular",
             remediation="Preserve the workspace for inspection and retry on a clean clone.",
             expected_workspace=str(workspace),
             actual_workspace=str(workspace),
-            detail=".git must be a directory and HEAD a regular file",
+            detail=".git must be a directory",
         )
     expected_ref = f"refs/heads/{expected_branch}"
     if head_text != f"ref: {expected_ref}":

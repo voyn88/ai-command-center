@@ -817,13 +817,17 @@ def _run_agent(
                     verified_clean=True,
                     verified_inode=(evidence.workspace_device, evidence.workspace_inode),
                 )
-            if pub.reason in {
-                "uncommitted_changes",
-                "pinned_base_sha_missing",
-                "head_not_descendant_of_pinned_base",
-            }:
+            if not pub.ok and pub.reason != "nothing_to_publish":
+                # Fail closed on EVERY unpublished outcome, not a shortlist.
+                # A push refusal, PR-creation error, lease conflict or any
+                # future PublishResult reason means the run's commits are NOT
+                # durable anywhere but the preserved worktree; promoting such
+                # a run to a completed model result would mark work done that
+                # never left this host (the exact fail-open the typed
+                # payloads.py contract forbids). `nothing_to_publish` is the
+                # one legitimate ok=False: the run made no commit at all.
                 return HandlerOutcome.executor_infra_failure(
-                    f"publish precondition failed: {pub.reason}",
+                    f"guarded publish failed: {pub.reason}",
                     result=result,
                 )
         elif isolated_workspace is not None:
