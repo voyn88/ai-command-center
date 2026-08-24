@@ -31,8 +31,8 @@ rotation path. It replaces the untracked `~/aicc-preprod/rotate.py`.
 5. `ExecStopPost` reads that journal after a crash, timeout or SIGTERM. It
    proves whether `worker.env` or the prepared recovery file is the unique
    credential PostgreSQL accepts, commits that candidate if necessary, then
-   reloads and proves both canonical `voyn-aicc-worker@1.service` and
-   `voyn-aicc-worker@2.service` ready before clearing the journal. A later timer
+   reloads and proves every lane named by the root-owned registry
+   `/etc/voyn/aicc-worker-lanes.conf` ready before clearing the journal. A later timer
    invocation performs the same recovery before attempting any new rotation.
 6. Every transition is JSON in journald and in
    `/var/lib/voyn-aicc-credential-rotation/audit.jsonl`. Any prerequisite,
@@ -62,8 +62,18 @@ gate is closed, while an existing 3600-second child continues on its old pool.
 
 1. Drain the existing services and disable the old rotation timer. Do not
    delete the old unit files yet.
-2. Install the five versioned units and the sudoers policy from the checked-out
-   merged SHA; validate sudoers with `visudo -c` and run `systemd-analyze verify`.
+2. Install the five versioned units, the rotation helper
+   (`deploy/voyn-aicc-rotation-helper` -> `/usr/local/sbin/voyn-aicc-rotation-helper`,
+   root:root 0755), the lane registry (`deploy/voyn-aicc-worker-lanes.conf` ->
+   `/etc/voyn/aicc-worker-lanes.conf`, root:root 0644) and the sudoers policy from
+   the checked-out merged SHA; validate sudoers with `visudo -c` and run
+   `systemd-analyze verify`. Sudo grants the rotator only the helper; the helper
+   authorizes units against the registry, so scaling the fleet is a registry edit
+   plus enabling the new `voyn-aicc-worker@N.service` — never a sudoers change.
+   The `--recover-only` stop path runs under `--stop-budget` (TimeoutStopSec
+   minus the exit margin): a fleet too large to recover in that window refuses
+   fail-closed with the phase journal intact, and the next timer start recovers
+   it under the full controller budget.
    The immutable release is `/opt/aicc`; the units never execute code from a
    worker-writable checkout.
 3. Create dedicated `aicc-worker` and `aicc-rotator` principals. Copy the
@@ -74,7 +84,7 @@ gate is closed, while an existing 3600-second child continues on its old pool.
    addresses or secrets belong in Git. Create non-secret per-lane files
    `worker-1.env` and `worker-2.env` containing
    distinct `AICC_PUBLISH_OWNER` and `VOYN_LEASE_SESSION` values.
-4. Enable `voyn-aicc-worker@1.service` and `@2.service`. Require both to show
+4. Enable every `voyn-aicc-worker@N.service` named by the lane registry. Require each to show
    `STATUS=aicc-ready` and complete a database claim/auth smoke before disabling
    the legacy worker services.
 5. Run the database migration that installs

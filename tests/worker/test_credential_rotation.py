@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
+import os
 import shlex
 import signal
 import subprocess
@@ -20,6 +23,7 @@ from command_center.ops.credential_rotation import (
     RotationController,
     RotationError,
     UnitState,
+    load_lane_registry,
     main,
 )
 from command_center.worker.credential_file import (
@@ -583,6 +587,26 @@ def test_sigterm_crash_phase_is_reopened_by_execstop_recovery(tmp_path: Path) ->
     assert not controller.config.phase_file.exists()
 
 
+def _lane_registry(tmp_path: Path, monkeypatch) -> Path:
+    """A registry file plus a loader patched to this process's own uid/gid.
+
+    The production loader demands root:root; tests keep the full parsing and
+    mode contract while substituting ownership expectations they can satisfy.
+    """
+    registry = tmp_path / "aicc-worker-lanes.conf"
+    registry.write_text(f"# lanes\n{LANE_1}\n{LANE_2}\n", encoding="utf-8")
+    registry.chmod(0o644)
+    import command_center.ops.credential_rotation as rotation_module
+
+    original = rotation_module.load_lane_registry
+    monkeypatch.setattr(
+        rotation_module,
+        "load_lane_registry",
+        lambda path: original(path, expected_uid=os.getuid(), expected_gid=os.getgid()),
+    )
+    return registry
+
+
 def test_cli_returns_nonzero_and_audits_controller_failure(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -600,10 +624,8 @@ def test_cli_returns_nonzero_and_audits_controller_failure(
             str(tmp_path / "phase.json"),
             "--tunnel-unit",
             TUNNEL,
-            "--worker-unit",
-            LANE_1,
-            "--worker-unit",
-            LANE_2,
+            "--lane-registry",
+            str(_lane_registry(tmp_path, monkeypatch)),
         ]
     )
 
@@ -626,10 +648,8 @@ def test_missing_environment_is_audited_nonzero_not_silently_skipped(
             str(tmp_path / "phase.json"),
             "--tunnel-unit",
             TUNNEL,
-            "--worker-unit",
-            LANE_1,
-            "--worker-unit",
-            LANE_2,
+            "--lane-registry",
+            str(_lane_registry(tmp_path, monkeypatch)),
         ]
     )
 
@@ -699,9 +719,11 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     assert "TimeoutStopSec=3660s" in worker
     assert "TimeoutStartSec=180s" in worker
     assert "ExecReload=/bin/kill -HUP $MAINPID" in worker
-    assert rotation.index("--worker-unit voyn-aicc-worker@1.service") < rotation.index(
-        "--worker-unit voyn-aicc-worker@2.service"
+    assert "--worker-unit" not in rotation, (
+        "lane enumeration in the unit file binds the fleet to a fixed size; "
+        "lanes come from the root-owned registry"
     )
+    assert "--lane-registry /etc/voyn/aicc-worker-lanes.conf" in rotation
     assert "ConditionPathExists" not in rotation
     assert "OnFailure=voyn-aicc-credential-rotation-alert@%n.service" in rotation
     assert "ExecStopPost=" in rotation
@@ -711,11 +733,6 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     lines = dict(line.split("=", 1) for line in rotation.splitlines() if "=" in line)
     argv = shlex.split(lines["ExecStart"])
     recovery_argv = shlex.split(lines["ExecStopPost"])
-    assert [
-        recovery_argv[index + 1]
-        for index, value in enumerate(recovery_argv)
-        if value == "--worker-unit"
-    ] == [LANE_1, LANE_2]
     assert [argument for argument in recovery_argv if argument != "--recover-only"] == (
         argv
     )
@@ -729,7 +746,17 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     reload_timeout = option("--reload-timeout")
     restart_timeout = option("--restart-timeout")
     systemd_timeout = float(lines["TimeoutStartSec"].removesuffix("s"))
-    lane_count = argv.count("--worker-unit")
+    registry_text = (root / "deploy/voyn-aicc-worker-lanes.conf").read_text()
+    deployed_lanes = [
+        line.strip()
+        for line in registry_text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert deployed_lanes == [LANE_1, LANE_2]
+    lane_count = len(deployed_lanes)
+    stop_budget = float(argv[argv.index("--stop-budget") + 1])
+    systemd_stop = float(lines["TimeoutStopSec"].removesuffix("s"))
+    assert systemd_stop >= stop_budget + SYSTEMD_EXIT_MARGIN_SECONDS
     authority_timeout = 10 + 30
     safe_post_rotation = (
         lane_count * 4 * reload_timeout
@@ -793,3 +820,188 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
         "100.114."
         not in (root / "deploy/systemd/voyn-aicc-pgtunnel.service").read_text()
     )
+
+
+def _helper_module():
+    root = Path(__file__).parents[2]
+    loader = importlib.machinery.SourceFileLoader(
+        "voyn_aicc_rotation_helper",
+        str(root / "deploy/voyn-aicc-rotation-helper"),
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_lane_registry_parses_only_strict_lane_units(tmp_path: Path) -> None:
+    registry = tmp_path / "lanes.conf"
+    registry.write_text(f"# fleet\n{LANE_1}\n{LANE_2}\n", encoding="utf-8")
+    registry.chmod(0o644)
+    lanes = load_lane_registry(
+        registry, expected_uid=os.getuid(), expected_gid=os.getgid()
+    )
+    assert lanes == (LANE_1, LANE_2)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        "# only comments\n",
+        "voyn-aicc-worker@1.service\nvoyn-aicc-worker@1.service\n",
+        "voyn-aicc-worker@evil.service\n",
+        "voyn-aicc-worker@1.service --now\n",
+        "sshd.service\n",
+        "voyn-aicc-worker@12345.service\n",
+    ],
+)
+def test_lane_registry_refuses_malformed_content(tmp_path: Path, body: str) -> None:
+    registry = tmp_path / "lanes.conf"
+    registry.write_text(body, encoding="utf-8")
+    registry.chmod(0o644)
+    with pytest.raises(RotationError):
+        load_lane_registry(registry, expected_uid=os.getuid(), expected_gid=os.getgid())
+
+
+def test_lane_registry_refuses_unsafe_ownership_and_mode(tmp_path: Path) -> None:
+    registry = tmp_path / "lanes.conf"
+    registry.write_text(f"{LANE_1}\n{LANE_2}\n", encoding="utf-8")
+    registry.chmod(0o666)
+    with pytest.raises(RotationError, match="writable"):
+        load_lane_registry(registry, expected_uid=os.getuid(), expected_gid=os.getgid())
+    registry.chmod(0o644)
+    with pytest.raises(RotationError, match="root:root"):
+        load_lane_registry(
+            registry, expected_uid=os.getuid() + 1, expected_gid=os.getgid()
+        )
+    missing = tmp_path / "absent.conf"
+    with pytest.raises(RotationError, match="cannot open"):
+        load_lane_registry(missing, expected_uid=os.getuid(), expected_gid=os.getgid())
+
+
+def test_rotation_helper_resolves_exact_systemctl_argv() -> None:
+    helper = _helper_module()
+    lanes = (LANE_1, LANE_2)
+    assert helper.resolve("drain", LANE_1, lanes) == [
+        "kill",
+        "--kill-whom=main",
+        "--signal=SIGUSR1",
+        LANE_1,
+    ]
+    assert helper.resolve("show", TUNNEL, lanes)[0] == "show"
+    assert helper.resolve("reload", LANE_2, lanes) == ["reload", LANE_2]
+    assert helper.resolve("restart", LANE_2, lanes) == ["restart", LANE_2]
+
+
+@pytest.mark.parametrize(
+    ("verb", "unit"),
+    [
+        ("drain", TUNNEL),
+        ("restart", TUNNEL),
+        ("reload", TUNNEL),
+        ("drain", "voyn-aicc-worker@3.service"),
+        ("stop", LANE_1),
+        ("show", "sshd.service"),
+        ("show", "voyn-aicc-worker@1.service --now"),
+    ],
+)
+def test_rotation_helper_refuses_out_of_registry_requests(verb: str, unit: str) -> None:
+    helper = _helper_module()
+    with pytest.raises(ValueError):
+        helper.resolve(verb, unit, (LANE_1, LANE_2))
+
+
+def test_rotation_helper_and_module_share_the_registry_grammar(
+    tmp_path: Path,
+) -> None:
+    helper = _helper_module()
+    text = f"# fleet\n{LANE_1}\n{LANE_2}\n"
+    assert helper.load_registry_lines(text) == (LANE_1, LANE_2)
+    for bad in ("", "voyn-aicc-worker@x.service\n", f"{LANE_1}\n{LANE_1}\n"):
+        with pytest.raises(ValueError):
+            helper.load_registry_lines(bad)
+
+
+def test_sudoers_grants_only_the_helper_without_lane_enumeration() -> None:
+    root = Path(__file__).parents[2]
+    sudoers = (root / "deploy/sudoers.d/voyn-aicc-credential-rotation").read_text()
+    assert "/usr/local/sbin/voyn-aicc-rotation-helper" in sudoers
+    assert "systemctl" not in sudoers
+    assert "voyn-aicc-worker@1" not in sudoers
+    assert "voyn-aicc-worker@2" not in sudoers
+    assert "NOPASSWD: VOYN_AICC_ROTATION" in sudoers
+
+
+def test_recover_only_runs_under_the_stop_budget(tmp_path: Path, monkeypatch) -> None:
+    captured: dict[str, RotationConfig] = {}
+
+    class _Recorder:
+        def __init__(self, config, systemd, authority, audit) -> None:
+            captured["config"] = config
+
+        def recover_interrupted(self) -> bool:
+            return False
+
+        def rotate(self) -> None:  # pragma: no cover - not taken here
+            raise AssertionError("recover-only must not rotate")
+
+    import command_center.ops.credential_rotation as rotation_module
+
+    monkeypatch.setattr(rotation_module, "RotationController", _Recorder)
+    registry = _lane_registry(tmp_path, monkeypatch)
+    result = main(
+        [
+            "--recover-only",
+            "--env-file",
+            str(_environment(tmp_path / "worker.env")),
+            "--lock-file",
+            str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
+            "--tunnel-unit",
+            TUNNEL,
+            "--lane-registry",
+            str(registry),
+            "--controller-timeout",
+            "7200",
+            "--stop-budget",
+            "1140",
+        ]
+    )
+    assert result == 0
+    assert captured["config"].controller_timeout == 1140.0
+    assert captured["config"].stop_budget == 1140.0
+    assert captured["config"].worker_units == (LANE_1, LANE_2)
+
+
+def test_malformed_registry_refuses_rotation_fail_closed(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    registry = tmp_path / "lanes.conf"
+    registry.write_text("sshd.service\n", encoding="utf-8")
+    registry.chmod(0o644)
+    import command_center.ops.credential_rotation as rotation_module
+
+    original = rotation_module.load_lane_registry
+    monkeypatch.setattr(
+        rotation_module,
+        "load_lane_registry",
+        lambda path: original(path, expected_uid=os.getuid(), expected_gid=os.getgid()),
+    )
+    result = main(
+        [
+            "--env-file",
+            str(_environment(tmp_path / "worker.env")),
+            "--lock-file",
+            str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
+            "--tunnel-unit",
+            TUNNEL,
+            "--lane-registry",
+            str(registry),
+        ]
+    )
+    assert result == 78
+    assert '"event":"rotation_refused"' in capsys.readouterr().out

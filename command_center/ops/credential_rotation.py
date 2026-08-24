@@ -27,6 +27,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import socket
 import stat as stat_module
@@ -80,10 +81,17 @@ class RotationConfig:
     tunnel_port: int
     worker_units: tuple[str, ...]
     prerequisite_timeout: float = 120.0
+    # ExecStopPost recovery budget (systemd TimeoutStopSec minus a margin).
+    # Recovery invoked from the stop path is bounded to this window; when the
+    # fleet is too large to recover inside it, recovery refuses fail-closed,
+    # the phase journal survives, and the next timer start recovers under the
+    # full controller budget. This is what keeps a static unit file correct
+    # for an arbitrary lane count.
     drain_timeout: float = 180.0
     reload_timeout: float = 120.0
     restart_timeout: float = 3720.0
     controller_timeout: float = 7200.0
+    stop_budget: float = 1140.0
     poll_initial: float = 0.25
     poll_max: float = 5.0
 
@@ -254,8 +262,22 @@ class PhaseJournal:
 
 
 class SubprocessSystemd:
+    """Talks to systemd only through the root-owned rotation helper.
+
+    The helper (deploy/voyn-aicc-rotation-helper, installed at
+    /usr/local/sbin) validates the verb and the unit against the root-owned
+    lane registry and then execs the exact systemctl argv itself; sudo grants
+    the rotator nothing but that helper. This process therefore sends
+    `<verb> <unit>` pairs, never raw systemctl arguments.
+    """
+
     def __init__(
-        self, command: tuple[str, ...] = ("sudo", "-n", "/usr/bin/systemctl")
+        self,
+        command: tuple[str, ...] = (
+            "sudo",
+            "-n",
+            "/usr/local/sbin/voyn-aicc-rotation-helper",
+        ),
     ) -> None:
         self._command = command
 
@@ -280,12 +302,7 @@ class SubprocessSystemd:
         return result.stdout
 
     def state(self, unit: str) -> UnitState:
-        output = self._run(
-            "show",
-            unit,
-            "--property=ActiveState,SubState,StatusText,MainPID",
-            "--no-pager",
-        )
+        output = self._run("show", unit)
         fields = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
         try:
             pid = int(fields.get("MainPID", "0"))
@@ -299,7 +316,7 @@ class SubprocessSystemd:
         )
 
     def drain(self, unit: str) -> None:
-        self._run("kill", "--kill-whom=main", "--signal=SIGUSR1", unit)
+        self._run("drain", unit)
 
     def reload(self, unit: str, timeout: float) -> None:
         self._run("reload", unit, timeout=timeout)
@@ -360,6 +377,55 @@ class PsycopgCredentialAuthority:
         if refusal is not None:
             raise RotationError(f"credential rotation refused: {refusal}")
         return expires
+
+
+LANE_UNIT_PATTERN = re.compile(r"^voyn-aicc-worker@[0-9]{1,4}\.service$")
+
+
+def load_lane_registry(
+    path: Path, *, expected_uid: int = 0, expected_gid: int = 0
+) -> tuple[str, ...]:
+    """Read the root-owned worker lane registry, failing closed.
+
+    The same file authorizes the root rotation helper, so both sides of the
+    sudo boundary derive the fleet from one root-owned authority. Unsafe
+    ownership/mode, symlinks, duplicates, malformed entries or an empty
+    registry refuse the rotation rather than shrinking it.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise RotationError(f"cannot open lane registry {path}: {error}") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat_module.S_ISREG(info.st_mode):
+            raise RotationError("lane registry is not a regular file")
+        if info.st_uid != expected_uid or info.st_gid != expected_gid:
+            raise RotationError("lane registry must be owned by root:root")
+        if stat_module.S_IMODE(info.st_mode) & 0o022:
+            raise RotationError("lane registry must not be group/other writable")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            text = handle.read()
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+    lanes: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not LANE_UNIT_PATTERN.fullmatch(line):
+            raise RotationError(f"malformed lane registry entry: {line!r}")
+        if line in lanes:
+            raise RotationError(f"duplicate lane registry entry: {line!r}")
+        lanes.append(line)
+    if not lanes:
+        raise RotationError("lane registry names no lanes")
+    return tuple(lanes)
 
 
 def scram_verifier(password: str, iterations: int = 4096) -> str:
@@ -956,17 +1022,33 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tunnel-unit", required=True)
     parser.add_argument("--tunnel-host", default="127.0.0.1")
     parser.add_argument("--tunnel-port", type=int, default=5433)
-    parser.add_argument("--worker-unit", action="append", required=True)
+    parser.add_argument("--lane-registry", type=Path, required=True)
     parser.add_argument("--prerequisite-timeout", type=float, default=120.0)
     parser.add_argument("--drain-timeout", type=float, default=180.0)
     parser.add_argument("--reload-timeout", type=float, default=120.0)
     parser.add_argument("--restart-timeout", type=float, default=3720.0)
     parser.add_argument("--controller-timeout", type=float, default=7200.0)
+    parser.add_argument("--stop-budget", type=float, default=1140.0)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    try:
+        worker_units = load_lane_registry(args.lane_registry)
+    except RotationError as error:
+        Audit(args.audit_file).emit("rotation_refused", error=str(error))
+        return 78
+    # ExecStopPost recovery must finish inside systemd's stop window. Running
+    # it under min(controller, stop) budget makes every existing bounded-
+    # timeout check enforce that window; an over-large fleet fails closed with
+    # the journal intact and the next timer start recovers under the full
+    # controller budget.
+    controller_timeout = (
+        min(args.controller_timeout, args.stop_budget)
+        if args.recover_only
+        else args.controller_timeout
+    )
     config = RotationConfig(
         env_file=args.env_file,
         lock_file=args.lock_file,
@@ -975,12 +1057,13 @@ def main(argv: list[str] | None = None) -> int:
         tunnel_unit=args.tunnel_unit,
         tunnel_host=args.tunnel_host,
         tunnel_port=args.tunnel_port,
-        worker_units=tuple(args.worker_unit),
+        worker_units=worker_units,
         prerequisite_timeout=args.prerequisite_timeout,
         drain_timeout=args.drain_timeout,
         reload_timeout=args.reload_timeout,
         restart_timeout=args.restart_timeout,
-        controller_timeout=args.controller_timeout,
+        controller_timeout=controller_timeout,
+        stop_budget=args.stop_budget,
     )
     audit = Audit(config.audit_file)
     config.lock_file.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
