@@ -719,16 +719,38 @@ jobs:
           python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
           pip install "$AICC_AIOS_DB_WHEEL"
 
-      - name: Run impacted tests (parallel)
+      - name: Run impacted tests (parallel body + serial tail)
         if: steps.select.outputs.mode == 'subset'
         run: |
           echo "Running $(wc -l < selected-tests.txt) impacted test file(s):"
           cat selected-tests.txt
-          # NUL-delimit the paths and let xargs build the argv; `-r` guarantees
-          # pytest is never invoked with an empty argv (which would run the
-          # whole suite). `mode == subset` already implies a non-empty file.
-          tr '\n' '\0' < selected-tests.txt \
-            | xargs -0 -r pytest -q -m "not serial" -n auto --dist loadscope
+          # Mirror the mandatory quality gate's two phases. The selected set
+          # can contain only serial or only non-serial tests, so pytest's
+          # no-tests-collected exit code (5) is neutral for either phase; every
+          # other non-zero result remains a real failure. A bash array preserves
+          # paths and exit codes, unlike xargs (which maps child failures to 123).
+          selected=()
+          while IFS= read -r path || [ -n "$path" ]; do
+            [ -n "$path" ] && selected+=("$path")
+          done < selected-tests.txt
+          if [ "${#selected[@]}" -eq 0 ]; then
+            echo "selected-tests.txt is empty despite mode=subset; refusing the whole suite" >&2
+            exit 1
+          fi
+          run_phase() {
+            local rc
+            set +e
+            pytest "$@" "${selected[@]}"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 5 ]; then
+              echo "No tests collected for this phase; nothing to run."
+              return 0
+            fi
+            return "$rc"
+          }
+          run_phase -q -m "not serial" -n auto --dist loadscope
+          run_phase -q -m serial -p no:xdist
 
   # Stable protected context. `always()` guarantees that the aggregator runs
   # even when an upstream job fails, is cancelled, or is skipped; only every

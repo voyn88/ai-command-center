@@ -29,9 +29,11 @@ On a ``merge_group`` event the checked commit is synthetic. GitHub's queue
 creates one linear squash commit per pull request, in queue order, and appends
 ``(#<number>)`` to each subject. Commit subjects identify the represented pull
 requests but do not prove their exact source heads. The gate therefore binds
-that chain to GitHub's authoritative merge-queue entries, requiring every
-entry's queued head, current pull-request head and accepted SHA to agree. It
-never treats the final pull request as a proxy for the rest of a batch.
+that chain to GitHub's authoritative merge-queue entries. Every entry's
+``baseCommit`` and synthetic ``headCommit`` must match its segment of that
+chain, while the entry's current pull-request head must match both a second
+API read and the accepted SHA. It never treats the final pull request as a
+proxy for the rest of a batch.
 
 The subject suffix is an explicit repository contract: changing GitHub's
 squash-message template so queue commits no longer end in ``(#<number>)``
@@ -375,12 +377,13 @@ def _merge_queue_entries(
 def _bind_queue_heads(
     numbers: list[int],
     expected_bases: list[str],
+    expected_heads: list[str],
     branch: str,
     repository: str,
     env: dict[str, str],
 ) -> list[tuple[int, str]]:
     """Bind the synthetic PR sequence to exact heads in the live queue."""
-    if len(numbers) != len(expected_bases):
+    if not (len(numbers) == len(expected_bases) == len(expected_heads)):
         raise AcceptanceError("merge_group queue-binding inputs are inconsistent")
     queue_entries = _merge_queue_entries(repository, branch, env)
     by_number: dict[int, dict] = {}
@@ -396,7 +399,9 @@ def _bind_queue_heads(
         by_number[number] = entry
 
     selected: list[tuple[int, int, str]] = []
-    for number, expected_base in zip(numbers, expected_bases, strict=True):
+    for number, expected_base, expected_head in zip(
+        numbers, expected_bases, expected_heads, strict=True
+    ):
         entry = by_number.get(number)
         if entry is None:
             raise AcceptanceError(
@@ -416,15 +421,14 @@ def _bind_queue_heads(
         queued_head_oid = (
             queued_head.get("oid") if isinstance(queued_head, dict) else None
         )
-        exact_head = _commit_sha(
+        exact_pull_head = _commit_sha(
             pull_request.get("headRefOid"), f"merge queue pull request #{number} head"
         )
-        if (
-            _commit_sha(queued_head_oid, f"merge queue entry #{number} head")
-            != exact_head
-        ):
+        if _commit_sha(
+            queued_head_oid, f"merge queue entry #{number} synthetic head"
+        ) != expected_head:
             raise AcceptanceError(
-                f"merge queue entry #{number} is stale relative to its pull request head"
+                f"merge queue entry #{number} head disagrees with the synthetic chain"
             )
         queued_base = entry.get("baseCommit")
         queued_base_oid = (
@@ -437,7 +441,7 @@ def _bind_queue_heads(
             raise AcceptanceError(
                 f"merge queue entry #{number} base disagrees with the synthetic chain"
             )
-        selected.append((position, number, exact_head))
+        selected.append((position, number, exact_pull_head))
 
     selected.sort()
     positions = [position for position, _number, _head in selected]
@@ -501,6 +505,7 @@ def _merge_group_numbers(
 
     numbers: list[int] = []
     expected_queue_bases: list[str] = []
+    expected_queue_heads: list[str] = []
     previous = base
     for commit in commits:
         if not isinstance(commit, dict):
@@ -525,6 +530,7 @@ def _merge_group_numbers(
             )
         numbers.append(int(subject_match.group("number")))
         expected_queue_bases.append(previous)
+        expected_queue_heads.append(commit_sha)
         previous = commit_sha
 
     if previous != head:
@@ -535,7 +541,12 @@ def _merge_group_numbers(
         raise AcceptanceError("merge_group history disagrees with its queue ref")
     return (
         _bind_queue_heads(
-            numbers, expected_queue_bases, base_branch, repository, env
+            numbers,
+            expected_queue_bases,
+            expected_queue_heads,
+            base_branch,
+            repository,
+            env,
         ),
         base_branch,
     )
