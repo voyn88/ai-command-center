@@ -127,6 +127,26 @@ def test_snapshot_and_restore_tolerate_unit_absent_on_clean_host():
     assert ("disable", unit) in systemd.calls
 
 
+def test_absent_baseline_unit_restore_fails_if_unit_remains_active():
+    module = _module()
+    unit = "aicc-principal-recovery.service"
+
+    class StubbornSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args == ("stop", unit):
+                self.calls.append(args)
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = StubbornSystemd((unit,))
+    state = {
+        "version": 2,
+        "units": {unit: {"exists": False, "enabled": False, "active": False}},
+    }
+    with pytest.raises(module.RolloutError, match="did not restore exactly"):
+        module.restore(systemd, state)
+
+
 def test_staged_rollout_drains_and_proves_each_lane_before_next():
     module = _module()
     units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")

@@ -96,16 +96,23 @@ fi
 rollback() {
   result=$?
   trap - EXIT HUP INT TERM
+  rollback_complete=1
   if [ "$transaction_active" -eq 1 ] && [ -f "$state_dir/pending.json" ]; then
     systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
-    run_transaction recover || true
-    systemctl daemon-reload || true
-    run_rollout restore --state "$attempt_units" >/dev/null 2>&1 || true
+    if ! run_transaction recover; then
+      # Keep pending.json, its generation, and attempt-units.json intact.
+      # The boot recovery unit retries the same compare-and-restore plus
+      # service snapshot instead of silently discarding failed stop/disable.
+      rollback_complete=0
+      echo "principal-isolation rollback incomplete; durable WAL retained" >&2
+    fi
   fi
-  if [ "$baseline_created" -eq 1 ]; then
+  if [ "$rollback_complete" -eq 1 ] && [ "$baseline_created" -eq 1 ]; then
     rm -f -- "$baseline_units"
   fi
-  rm -f -- "$attempt_units"
+  if [ "$rollback_complete" -eq 1 ]; then
+    rm -f -- "$attempt_units"
+  fi
   exit "$result"
 }
 trap rollback EXIT HUP INT TERM

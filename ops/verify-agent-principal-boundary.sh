@@ -72,6 +72,14 @@ for provider_env in /etc/aicc/agent.env /etc/aicc/agent-claude.env /etc/aicc/age
     fail "provider environment ownership or mode drifted: $provider_env"
 done
 
+for model_auth in \
+  /var/lib/aicc-agent/claude/.claude/.credentials.json \
+  /var/lib/aicc-agent/codex/.codex/auth.json; do
+  [ ! -L "$model_auth" ] || fail "model auth target is a symlink: $model_auth"
+  [ "$(stat -c %U:%G:%a "$model_auth")" = root:root:600 ] || \
+    fail "model auth target ownership or mode drifted: $model_auth"
+done
+
 # Measured from inside the same mount/capability envelope: the exact workspace
 # is visible, while an equally group-readable sibling under the canonical root
 # is EACCES because the original root is hidden before the exact bind.

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import grp
+import hashlib
 import json
 import os
 import re
@@ -40,10 +41,21 @@ class BackupRecord:
     original_mode: int | None
     original_uid: int | None
     original_gid: int | None
+    original_sha256: str | None
     staged: str
+    install_sha256: str
     install_mode: int
     install_uid: int
     install_gid: int
+
+
+@dataclass(frozen=True)
+class FileState:
+    payload: bytes
+    sha256: str
+    mode: int
+    uid: int
+    gid: int
 
 
 def _fsync_dir(path: Path) -> None:
@@ -57,7 +69,7 @@ def _fsync_dir(path: Path) -> None:
 def _atomic_bytes(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.name}.aicc-{secrets.token_hex(8)}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(temporary, flags, mode)
@@ -76,6 +88,60 @@ def _atomic_bytes(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> 
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _read_regular(path: Path, *, max_bytes: int = 128 * 1024 * 1024) -> FileState:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size > max_bytes
+        ):
+            raise RuntimeError(f"protected file shape is unsafe: {path}")
+        chunks: list[bytes] = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise RuntimeError(f"protected file was truncated: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        final = os.fstat(descriptor)
+        if (
+            final.st_dev != info.st_dev
+            or final.st_ino != info.st_ino
+            or final.st_size != info.st_size
+            or final.st_mtime_ns != info.st_mtime_ns
+            or final.st_ctime_ns != info.st_ctime_ns
+            or final.st_uid != info.st_uid
+            or final.st_gid != info.st_gid
+            or stat.S_IMODE(final.st_mode) != stat.S_IMODE(info.st_mode)
+        ):
+            raise RuntimeError(f"protected file changed while being read: {path}")
+        return FileState(
+            payload=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            mode=stat.S_IMODE(info.st_mode),
+            uid=info.st_uid,
+            gid=info.st_gid,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bool:
+    return (
+        state.sha256 == sha256
+        and state.mode == mode
+        and state.uid == uid
+        and state.gid == gid
+    )
 
 
 def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
@@ -113,24 +179,60 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
                 or f"systemctl {' '.join(arguments)} failed during recovery"
             )
 
+    def probe(*arguments: str) -> tuple[int, str]:
+        result = run(
+            ["/usr/bin/systemctl", *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        return result.returncode, result.stdout.strip()
+
+    def assert_restored(unit: str, state: dict[str, bool]) -> None:
+        load_rc, load_state = probe("show", unit, "--property=LoadState", "--value")
+        pid_rc, main_pid = probe("show", unit, "--property=MainPID", "--value")
+        _active_rc, active = probe("is-active", unit)
+        _enabled_rc, enabled = probe("is-enabled", unit)
+        if load_rc or pid_rc or not load_state or not main_pid:
+            raise RuntimeError(f"cannot prove restored service state: {unit}")
+        expected_active = state["active"]
+        expected_enabled = state["enabled"]
+        active_matches = (active == "active") is expected_active
+        enabled_matches = (enabled == "enabled") is expected_enabled
+        if state["exists"]:
+            exists_matches = load_state not in {"", "not-found"}
+        else:
+            # The early-boot recovery process cannot synchronously stop
+            # itself. It may remain loaded/active only when systemd proves
+            # that this exact process is the service MainPID; its enablement
+            # and every file target have already been rolled back durably.
+            self_recovery = (
+                unit == "aicc-principal-recovery.service"
+                and active == "active"
+                and main_pid == str(os.getpid())
+            )
+            exists_matches = load_state in {"", "not-found"} or self_recovery
+            active_matches = active != "active" or self_recovery
+            enabled_matches = enabled != "enabled"
+        if not (exists_matches and active_matches and enabled_matches):
+            raise RuntimeError(f"service snapshot did not restore exactly: {unit}")
+        if active != "active" and main_pid not in {"", "0"}:
+            raise RuntimeError(f"inactive restored service retains MainPID: {unit}")
+
     systemctl("daemon-reload")
     for unit, state in validated:
         if state["exists"] is False:
-            run(
-                ["/usr/bin/systemctl", "stop", unit],
-                capture_output=True,
-                check=False,
-                text=True,
-            )
-            run(
-                ["/usr/bin/systemctl", "disable", unit],
-                capture_output=True,
-                check=False,
-                text=True,
-            )
+            # Best-effort mutations are followed by authoritative state
+            # probes. A failed command is harmless only when the desired
+            # state is nevertheless proven; otherwise recover() keeps WAL
+            # and the service snapshot for the next retry.
+            probe("stop", unit)
+            probe("disable", unit)
+            assert_restored(unit, state)
             continue
         systemctl("enable" if state["enabled"] else "disable", unit)
         systemctl("start" if state["active"] else "stop", unit)
+        assert_restored(unit, state)
 
 
 class FileTransaction:
@@ -199,9 +301,12 @@ class FileTransaction:
         validated = tuple(specs)
         targets: set[str] = set()
         for spec in validated:
-            info = spec.source.lstat()
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                raise ValueError(f"source is not a regular file: {spec.source}")
+            try:
+                _read_regular(spec.source)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(
+                    f"source is not a safe regular file: {spec.source}"
+                ) from exc
             if spec.target in targets:
                 raise ValueError(f"duplicate installation target: {spec.target}")
             targets.add(spec.target)
@@ -210,7 +315,7 @@ class FileTransaction:
     def prepare(self, specs: Iterable[FileSpec]) -> Path:
         """Durably journal backups and staged payloads without touching targets."""
         validated = self.validate_sources(specs)
-        source_payloads = {spec.target: spec.source.read_bytes() for spec in validated}
+        source_states = {spec.target: _read_regular(spec.source) for spec in validated}
         previous_current = (
             self.current.read_text(encoding="utf-8") if self.current.exists() else None
         )
@@ -251,7 +356,7 @@ class FileTransaction:
                 staged_path = staged / f"{index:03d}.bin"
                 _atomic_bytes(
                     staged_path,
-                    source_payloads[spec.target],
+                    source_states[spec.target].payload,
                     0o600,
                     os.geteuid(),
                     os.getegid(),
@@ -267,7 +372,9 @@ class FileTransaction:
                             None,
                             None,
                             None,
+                            None,
                             str(staged_path),
+                            source_states[spec.target].sha256,
                             spec.mode,
                             spec.uid,
                             spec.gid,
@@ -276,10 +383,11 @@ class FileTransaction:
                     continue
                 if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                     raise ValueError(f"existing target is not a regular file: {target}")
+                original = _read_regular(target)
                 backup = backups / f"{index:03d}.bin"
                 _atomic_bytes(
                     backup,
-                    target.read_bytes(),
+                    original.payload,
                     0o600,
                     os.geteuid(),
                     os.getegid(),
@@ -289,10 +397,12 @@ class FileTransaction:
                         spec.target,
                         True,
                         str(backup),
-                        stat.S_IMODE(info.st_mode),
-                        info.st_uid,
-                        info.st_gid,
+                        original.mode,
+                        original.uid,
+                        original.gid,
+                        original.sha256,
                         str(staged_path),
+                        source_states[spec.target].sha256,
                         spec.mode,
                         spec.uid,
                         spec.gid,
@@ -348,9 +458,18 @@ class FileTransaction:
             for index, record in enumerate(records):
                 # Write-ahead index makes every destination mutation recoverable.
                 self._write_journal(manifest, "APPLYING", index)
+                staged = _read_regular(Path(record.staged))
+                if not _matches(
+                    staged,
+                    record.install_sha256,
+                    0o600,
+                    os.geteuid(),
+                    os.getegid(),
+                ):
+                    raise RuntimeError("staged generation payload SHA drifted")
                 _atomic_bytes(
                     self._target(record.target),
-                    Path(record.staged).read_bytes(),
+                    staged.payload,
                     record.install_mode,
                     record.install_uid,
                     record.install_gid,
@@ -438,25 +557,69 @@ class FileTransaction:
         records = [BackupRecord(**value) for value in payload["records"]]
         for record in reversed(records):
             target = self._target(record.target)
+            try:
+                current = _read_regular(target)
+            except FileNotFoundError:
+                current = None
+            except OSError as exc:
+                raise RuntimeError(
+                    f"generation target shape changed before restore: {target}"
+                ) from exc
             if record.existed:
                 assert record.backup is not None
                 assert record.original_mode is not None
                 assert record.original_uid is not None
                 assert record.original_gid is not None
+                assert record.original_sha256 is not None
+                if current is None:
+                    raise RuntimeError(f"generation target disappeared: {target}")
+                if _matches(
+                    current,
+                    record.original_sha256,
+                    record.original_mode,
+                    record.original_uid,
+                    record.original_gid,
+                ):
+                    continue
+                if not _matches(
+                    current,
+                    record.install_sha256,
+                    record.install_mode,
+                    record.install_uid,
+                    record.install_gid,
+                ):
+                    raise RuntimeError(
+                        f"generation target changed before compare-and-restore: {target}"
+                    )
+                backup = _read_regular(Path(record.backup))
+                if not _matches(
+                    backup,
+                    record.original_sha256,
+                    0o600,
+                    os.geteuid(),
+                    os.getegid(),
+                ):
+                    raise RuntimeError(f"generation backup SHA drifted: {target}")
                 _atomic_bytes(
                     target,
-                    Path(record.backup).read_bytes(),
+                    backup.payload,
                     record.original_mode,
                     record.original_uid,
                     record.original_gid,
                 )
             else:
-                try:
-                    info = target.lstat()
-                except FileNotFoundError:
+                if current is None:
                     continue
-                if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                    raise RuntimeError(f"refusing to remove replaced target: {target}")
+                if not _matches(
+                    current,
+                    record.install_sha256,
+                    record.install_mode,
+                    record.install_uid,
+                    record.install_gid,
+                ):
+                    raise RuntimeError(
+                        f"new generation target changed before removal: {target}"
+                    )
                 target.unlink()
                 _fsync_dir(target.parent)
         previous_current = payload.get("previous_current")

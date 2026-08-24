@@ -138,9 +138,44 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
         if raw["exists"] is False:
             systemd.run("stop", unit, check=False)
             systemd.run("disable", unit, check=False)
+            active = systemd.run("is-active", unit, check=False)
+            enabled = systemd.run("is-enabled", unit, check=False)
+            load_state = systemd.run(
+                "show", unit, "--property=LoadState", "--value", check=False
+            )
+            main_pid = systemd.run(
+                "show", unit, "--property=MainPID", "--value", check=False
+            )
+            self_recovery = (
+                unit == "aicc-principal-recovery.service"
+                and active == "active"
+                and main_pid == str(os.getpid())
+            )
+            if (
+                enabled == "enabled"
+                or (active == "active" and not self_recovery)
+                or (load_state not in {"", "not-found"} and not self_recovery)
+                or (active != "active" and main_pid not in {"", "0"})
+            ):
+                raise RolloutError(f"service snapshot did not restore exactly: {unit}")
             continue
         systemd.run("enable" if raw.get("enabled") is True else "disable", unit)
         systemd.run("start" if raw.get("active") is True else "stop", unit)
+        active = systemd.run("is-active", unit, check=False)
+        enabled = systemd.run("is-enabled", unit, check=False)
+        load_state = systemd.run(
+            "show", unit, "--property=LoadState", "--value", check=False
+        )
+        main_pid = systemd.run(
+            "show", unit, "--property=MainPID", "--value", check=False
+        )
+        if (
+            load_state in {"", "not-found"}
+            or ((active == "active") is not (raw.get("active") is True))
+            or ((enabled == "enabled") is not (raw.get("enabled") is True))
+            or (active != "active" and main_pid not in {"", "0"})
+        ):
+            raise RolloutError(f"service snapshot did not restore exactly: {unit}")
 
 
 def _uid_for_user(user: str) -> int:

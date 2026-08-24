@@ -216,6 +216,20 @@ def test_recovery_generator_is_the_first_destination_of_clean_install(tmp_path):
     assert (
         specs[0].target == "/usr/lib/systemd/system-generators/aicc-principal-recovery"
     )
+    by_target = {spec.target: spec for spec in specs}
+    for target in (
+        "/var/lib/aicc-agent/claude/.claude/.credentials.json",
+        "/var/lib/aicc-agent/codex/.codex/auth.json",
+    ):
+        assert (
+            by_target[target].uid,
+            by_target[target].gid,
+            by_target[target].mode,
+        ) == (
+            0,
+            0,
+            0o600,
+        )
 
 
 def test_boot_recovery_restores_dynamic_worker_and_auxiliary_unit_state(tmp_path):
@@ -245,11 +259,31 @@ def test_boot_recovery_restores_dynamic_worker_and_auxiliary_unit_state(tmp_path
 
     def run(command, **kwargs):
         calls.append(command)
-        return SimpleNamespace(returncode=0, stderr="")
+        action = command[1]
+        unit = command[2] if len(command) > 2 else ""
+        stdout = ""
+        if action == "is-active":
+            stdout = "active\n" if unit.startswith("voyn-aicc-worker") else "inactive\n"
+        elif action == "is-enabled":
+            stdout = (
+                "enabled\n" if unit.startswith("voyn-aicc-worker") else "disabled\n"
+            )
+        elif action == "show":
+            stdout = (
+                "loaded\n"
+                if "LoadState" in command
+                else ("1234\n" if unit.startswith("voyn-aicc-worker") else "0\n")
+            )
+        return SimpleNamespace(returncode=0, stderr="", stdout=stdout)
 
     module.restore_service_snapshot(snapshot, run=run)
 
-    assert calls == [
+    mutations = [
+        command
+        for command in calls
+        if command[1] in {"daemon-reload", "enable", "disable", "start", "stop"}
+    ]
+    assert mutations == [
         ["/usr/bin/systemctl", "daemon-reload"],
         ["/usr/bin/systemctl", "enable", "voyn-aicc-worker@blue.service"],
         ["/usr/bin/systemctl", "start", "voyn-aicc-worker@blue.service"],
@@ -284,6 +318,89 @@ def test_failed_boot_service_restore_keeps_journal_for_retry(monkeypatch, tmp_pa
     transaction.recover()
     assert not (root / "etc/new").exists()
     assert not transaction.pending.exists()
+
+
+def test_compare_and_restore_refuses_changed_generation_target(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    target = root / "etc/target"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"before")
+    target.chmod(0o600)
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/target", 0o640),))
+    transaction.apply()
+    target.write_bytes(b"unexpected third-party mutation")
+
+    with pytest.raises(RuntimeError, match="compare-and-restore"):
+        transaction.recover()
+
+    assert transaction.pending.exists()
+    assert target.read_bytes() == b"unexpected third-party mutation"
+    target.write_bytes(b"installed")
+    target.chmod(0o640)
+    transaction.recover()
+    assert target.read_bytes() == b"before"
+    assert not transaction.pending.exists()
+
+
+def test_compare_and_restore_refuses_generation_mode_drift(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    target = root / "etc/target"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"before")
+    target.chmod(0o600)
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/target", 0o640),))
+    transaction.apply()
+    target.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="compare-and-restore"):
+        transaction.recover()
+
+    assert transaction.pending.exists()
+    target.chmod(0o640)
+    transaction.recover()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_absent_unit_restore_verifies_final_stop_disable_state(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-principal-recovery.service": {
+                        "exists": False,
+                        "enabled": False,
+                        "active": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(command, **kwargs):
+        action = command[1]
+        stdout = {
+            "is-active": "active\n",
+            "is-enabled": "enabled\n",
+            "show": "loaded\n",
+        }.get(action, "")
+        return SimpleNamespace(returncode=0, stderr="", stdout=stdout)
+
+    with pytest.raises(RuntimeError, match="did not restore exactly"):
+        module.restore_service_snapshot(snapshot, run=run)
 
 
 def test_invalid_source_is_rejected_before_any_target_mutation(tmp_path):

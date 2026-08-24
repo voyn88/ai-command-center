@@ -16,6 +16,7 @@ home tree and every publisher authority path remain inaccessible.
 from __future__ import annotations
 
 import base64
+import fcntl
 import grp
 import hashlib
 import json
@@ -34,6 +35,11 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+
+# Kept as a named tuple so the formatter (target py314, PEP 758) cannot
+# rewrite an `except (A, B):` clause into the unparenthesized form that is a
+# SyntaxError on the Python 3.13 runtimes this launcher must also run on.
+_SYSTEMCTL_ERRORS = (OSError, subprocess.SubprocessError)
 
 FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 SOCKET_PATH = "/run/aicc-agent-launcher/control.sock"
@@ -59,6 +65,7 @@ EXECUTOR_BINARIES = {
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
 QUARANTINE_ROOT = Path("/srv/aicc-quarantine")
+ACTIVE_UNIT_ROOT = Path("/run/aicc-agent-launcher/active")
 CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_PROMPT_BYTES = 128 * 1024
@@ -67,10 +74,14 @@ MAX_PROMPT_BYTES = 128 * 1024
 # bounded line-reader limit; oversized output becomes retryable infrastructure
 # while its potentially modified task workspace is preserved.
 MAX_OUTPUT_BYTES = 512 * 1024
+MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
+MAX_GIT_INDEX_ENTRIES = 1_000_000
+MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
 PROFILES = frozenset({"read_only", "trusted_development"})
 MODEL_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 RUN_ID_RE = re.compile(r"[a-f0-9]{32}")
 BROKER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/]{1,200}\.service")
+AGENT_UNIT_RE = re.compile(r"aicc-agent-[a-f0-9]{32}-[0-9]{1,20}\.service")
 MANIFEST_KEYS = frozenset(
     {
         "version",
@@ -235,6 +246,53 @@ def _private_agent_environment(path: Path, *, optional: bool = False) -> bool:
     )
 
 
+def _read_exact_protected_file(
+    path: Path, *, expected_uid: int, expected_gid: int, exact_mode: int
+) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise LaunchRefused(f"cannot open protected file safely: {path}") from exc
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != expected_uid
+            or info.st_gid != expected_gid
+            or stat.S_IMODE(info.st_mode) != exact_mode
+            or info.st_size > MAX_MODEL_AUTH_BYTES
+        ):
+            raise LaunchRefused(f"protected file ownership or mode drifted: {path}")
+        chunks: list[bytes] = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise LaunchRefused(f"protected file was truncated: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        final = os.fstat(descriptor)
+        if (
+            final.st_dev != info.st_dev
+            or final.st_ino != info.st_ino
+            or final.st_size != info.st_size
+            or final.st_mtime_ns != info.st_mtime_ns
+            or final.st_ctime_ns != info.st_ctime_ns
+            or final.st_uid != expected_uid
+            or final.st_gid != expected_gid
+            or stat.S_IMODE(final.st_mode) != exact_mode
+        ):
+            raise LaunchRefused(f"protected file changed while being read: {path}")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
 def _workspace_roots(path: Path = ROOTS_FILE) -> tuple[Path, ...]:
     _root_owned_regular(path)
     roots: list[Path] = []
@@ -319,68 +377,231 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
     except KeyError as exc:
         raise LaunchRefused("aicc-agent user does not exist") from exc
     source = MODEL_AUTH_SOURCES[executor]
-    _root_owned_regular(source)
-    source_info = source.stat()
-    if source_info.st_mode & 0o077:
-        raise LaunchRefused(f"model auth source is not root-private: {source}")
+    source_payload = _read_exact_protected_file(
+        source, expected_uid=0, expected_gid=0, exact_mode=0o600
+    )
 
     home = EPHEMERAL_HOME_ROOT / run_id
     try:
         home.mkdir(mode=0o700)
         target = home / MODEL_AUTH_TARGETS[executor]
         target.parent.mkdir(mode=0o700, parents=True)
-        shutil.copyfile(source, target)
-        for path in (home, target.parent, target):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.fchown(descriptor, account.pw_uid, account.pw_gid)
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(source_payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            target_info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(target_info.st_mode)
+                or target_info.st_nlink != 1
+                or target_info.st_uid != account.pw_uid
+                or target_info.st_gid != account.pw_gid
+                or stat.S_IMODE(target_info.st_mode) != 0o600
+                or target_info.st_size != len(source_payload)
+            ):
+                raise LaunchRefused("ephemeral model auth target failed validation")
+        finally:
+            os.close(descriptor)
+        for path in (home, target.parent):
             os.chown(path, account.pw_uid, account.pw_gid)
-        target.chmod(0o600)
     except (FileExistsError, OSError) as exc:
         shutil.rmtree(home, ignore_errors=True)
         raise LaunchRefused("cannot prepare ephemeral model home") from exc
     return home
 
 
-def _tracked_executables(workspace: Path) -> frozenset[Path]:
-    """Return executable paths from the trusted index without changing Git state."""
-    command = [
-        "/usr/bin/git",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        f"safe.directory={workspace}",
-        "-C",
-        str(workspace),
-        "ls-files",
-        "--stage",
-        "-z",
-    ]
-    environment = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": "/nonexistent",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_OPTIONAL_LOCKS": "0",
-    }
-    result = subprocess.run(command, env=environment, capture_output=True, check=False)
-    if result.returncode != 0:
-        raise LaunchRefused("cannot read the task-local Git executable metadata")
+def _parse_git_index_payload(data: bytes, workspace: Path) -> frozenset[Path]:
+    signature, version, entry_count = struct.unpack_from("!4sLL", data)
+    if (
+        signature != b"DIRC"
+        or version not in {2, 3, 4}
+        or entry_count > MAX_GIT_INDEX_ENTRIES
+    ):
+        raise LaunchRefused("unsupported task-local Git index format")
     executable: set[Path] = set()
-    for raw in result.stdout.split(b"\0"):
-        if not raw:
+    offset = 12
+    previous_path = b""
+    for _ in range(entry_count):
+        entry_start = offset
+        if offset + 62 > len(data):
+            raise LaunchRefused("truncated task-local Git index entry")
+        mode = struct.unpack_from("!L", data, offset + 24)[0]
+        index_flags = struct.unpack_from("!H", data, offset + 60)[0]
+        offset += 62
+        if index_flags & 0x4000:
+            if version < 3 or offset + 2 > len(data):
+                raise LaunchRefused("malformed extended Git index entry")
+            offset += 2
+        if version == 4:
+            if offset >= len(data):
+                raise LaunchRefused("truncated Git v4 path prefix")
+            byte = data[offset]
+            offset += 1
+            strip_count = byte & 0x7F
+            while byte & 0x80:
+                if offset >= len(data):
+                    raise LaunchRefused("truncated Git v4 path prefix")
+                byte = data[offset]
+                offset += 1
+                strip_count = ((strip_count + 1) << 7) + (byte & 0x7F)
+            if strip_count > len(previous_path):
+                raise LaunchRefused("Git v4 path prefix escaped prior entry")
+            end = data.find(b"\0", offset)
+            if end < 0:
+                raise LaunchRefused("unterminated Git v4 index path")
+            path_bytes = (
+                previous_path[: len(previous_path) - strip_count] + data[offset:end]
+            )
+            offset = end + 1
+        else:
+            declared_length = index_flags & 0x0FFF
+            if declared_length < 0x0FFF:
+                end = offset + declared_length
+                if end >= len(data) or data[end] != 0:
+                    raise LaunchRefused("malformed Git index path length")
+            else:
+                end = data.find(b"\0", offset)
+                if end < 0:
+                    raise LaunchRefused("unterminated Git index path")
+            path_bytes = data[offset:end]
+            entry_size = end + 1 - entry_start
+            offset = entry_start + ((entry_size + 7) & ~7)
+        if offset > len(data) or not path_bytes:
+            raise LaunchRefused("malformed task-local Git index padding")
+        if (
+            path_bytes.startswith(b"/")
+            or b"//" in path_bytes
+            or any(
+                component in {b"", b".", b".."} for component in path_bytes.split(b"/")
+            )
+        ):
+            raise LaunchRefused("Git index path escaped the workspace")
+        previous_path = path_bytes
+        stage = (index_flags >> 12) & 0x3
+        if stage:
             continue
         try:
-            metadata, path_bytes = raw.split(b"\t", 1)
-            mode, _object_id, stage = metadata.split(b" ", 2)
+            relative = Path(os.fsdecode(path_bytes))
         except ValueError as exc:
-            raise LaunchRefused("malformed task-local Git index metadata") from exc
-        if stage != b"0":
-            continue
-        relative = Path(os.fsdecode(path_bytes))
+            raise LaunchRefused("invalid task-local Git index path") from exc
         if relative.is_absolute() or ".." in relative.parts:
             raise LaunchRefused("Git index path escaped the workspace")
         candidate = workspace / relative
-        if mode == b"100755":
+        if mode == 0o100755:
             executable.add(candidate)
+        elif mode not in {0o100644, 0o120000, 0o160000}:
+            raise LaunchRefused("unsupported task-local Git index mode")
+    while offset < len(data):
+        if offset + 8 > len(data):
+            raise LaunchRefused("truncated task-local Git index extension")
+        extension = data[offset : offset + 4]
+        extension_size = struct.unpack_from("!L", data, offset + 4)[0]
+        offset += 8
+        if offset + extension_size > len(data):
+            raise LaunchRefused("truncated task-local Git index extension payload")
+        # Split-index and sparse-index entries depend on state outside the
+        # bounded entry table. Refuse them instead of silently clearing an
+        # executable bit. Other optional extensions only cache derived data.
+        if extension in {b"link", b"sdir"}:
+            raise LaunchRefused("unsupported task-local Git index extension")
+        if extension[:1].islower():
+            raise LaunchRefused("unknown mandatory task-local Git index extension")
+        offset += extension_size
     return frozenset(executable)
+
+
+def _tracked_executables(workspace: Path) -> frozenset[Path]:
+    """Safely parse executable bits without invoking Git as root.
+
+    The index is agent-controlled input. Running even a read-only Git command
+    would load its config and may execute helpers such as ``core.fsmonitor``.
+    This bounded parser accepts only the documented v2/v3/v4 on-disk formats,
+    opens ``.git/index`` with O_NOFOLLOW, and treats every malformed field as
+    infrastructure failure. No config, hook, object filter or helper runs.
+    The parsed mode is convenience evidence only; it is never repository/SHA
+    authority. Both Git object hash formats and documented all-zero skipHash
+    trailers are accepted, then disambiguated by a complete structural parse.
+    """
+    git_dir = workspace / ".git"
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    try:
+        git_descriptor = os.open(git_dir, directory_flags)
+    except OSError as exc:
+        raise LaunchRefused("task-local Git metadata is not a real directory") from exc
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open("index", flags, dir_fd=git_descriptor)
+    except OSError as exc:
+        raise LaunchRefused("cannot open task-local Git index safely") from exc
+    finally:
+        os.close(git_descriptor)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size < 32
+            or info.st_size > MAX_GIT_INDEX_BYTES
+        ):
+            raise LaunchRefused("task-local Git index shape is unsafe")
+        chunks: list[bytes] = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise LaunchRefused("task-local Git index was truncated")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        final = os.fstat(descriptor)
+        if (
+            final.st_dev != info.st_dev
+            or final.st_ino != info.st_ino
+            or final.st_size != info.st_size
+            or final.st_mtime_ns != info.st_mtime_ns
+            or final.st_ctime_ns != info.st_ctime_ns
+        ):
+            raise LaunchRefused("task-local Git index changed while being read")
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    candidates: list[bytes] = []
+    for checksum_size, digest in (
+        (20, lambda value: hashlib.sha1(value, usedforsecurity=False).digest()),
+        (32, lambda value: hashlib.sha256(value).digest()),
+    ):
+        if len(raw) < 12 + checksum_size:
+            continue
+        content = raw[:-checksum_size]
+        checksum = raw[-checksum_size:]
+        if checksum == bytes(checksum_size) or digest(content) == checksum:
+            candidates.append(content)
+    parsed: list[frozenset[Path]] = []
+    errors: list[LaunchRefused] = []
+    for candidate in candidates:
+        try:
+            parsed.append(_parse_git_index_payload(candidate, workspace))
+        except (LaunchRefused, struct.error) as exc:
+            errors.append(
+                exc
+                if isinstance(exc, LaunchRefused)
+                else LaunchRefused("truncated task-local Git index header")
+            )
+    if len(parsed) == 1:
+        return parsed[0]
+    if not parsed and errors:
+        raise errors[0]
+    raise LaunchRefused("task-local Git index checksum or format is ambiguous")
 
 
 def _prepare_workspace_permissions(workspace: Path) -> None:
@@ -632,7 +853,7 @@ def _systemctl(
             stderr=subprocess.DEVNULL,
             timeout=timeout,
         )
-    except (OSError, subprocess.SubprocessError):
+    except _SYSTEMCTL_ERRORS:
         return None
 
 
@@ -718,10 +939,189 @@ def _seal_or_quarantine(unit: str, workspace: Path, run_id: str) -> Path | None:
     return _quarantine_workspace(workspace, run_id)
 
 
+def _active_workspace_name(workspace: Path) -> str:
+    return hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()
+
+
+def _open_workspace_lock(workspace: Path) -> int:
+    """Hold one root-owned lock for the complete broker/workspace lifecycle."""
+    ACTIVE_UNIT_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root_info = ACTIVE_UNIT_ROOT.lstat()
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+    ):
+        raise LaunchRefused("active-agent registry ownership or mode drifted")
+    path = ACTIVE_UNIT_ROOT / f"{_active_workspace_name(workspace)}.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise LaunchRefused("active-agent workspace lock drifted")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise LaunchRefused("workspace already has an active agent broker") from exc
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _active_workspace_record(workspace: Path) -> Path:
+    return ACTIVE_UNIT_ROOT / f"{_active_workspace_name(workspace)}.json"
+
+
+def _write_active_workspace_unit(workspace: Path, unit: str) -> None:
+    if not AGENT_UNIT_RE.fullmatch(unit):
+        raise LaunchRefused("active-agent unit name is invalid")
+    payload = json.dumps(
+        {"version": 1, "workspace": str(workspace), "unit": unit},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    _atomic_root_state(_active_workspace_record(workspace), payload)
+
+
+def _atomic_root_state(path: Path, payload: bytes) -> None:
+    directory = path.parent
+    directory_fd = os.open(
+        directory,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    temporary = f".{path.name}.{os.getpid()}.{threading.get_ident()}"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("active-agent registry write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+
+
+def _read_active_workspace_unit(workspace: Path) -> str | None:
+    record = _active_workspace_record(workspace)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(record, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > 4096
+        ):
+            raise LaunchRefused("active-agent registry record drifted")
+        raw = os.read(descriptor, info.st_size + 1)
+        if len(raw) != info.st_size:
+            raise LaunchRefused("active-agent registry record changed while read")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LaunchRefused("active-agent registry record is malformed") from exc
+    unit = value.get("unit") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"version", "workspace", "unit"}
+        or value.get("version") != 1
+        or value.get("workspace") != str(workspace)
+        or not isinstance(unit, str)
+        or not AGENT_UNIT_RE.fullmatch(unit)
+    ):
+        raise LaunchRefused("active-agent registry record is invalid")
+    return unit
+
+
+def _clear_active_workspace_unit(workspace: Path, unit: str) -> None:
+    if _read_active_workspace_unit(workspace) != unit:
+        return
+    _active_workspace_record(workspace).unlink()
+    directory = os.open(ACTIVE_UNIT_ROOT, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _seal_previous_workspace_agent(workspace: Path) -> None:
+    """Prove a crash-left cgroup dead before touching shared file modes."""
+    previous = _read_active_workspace_unit(workspace)
+    if previous is None:
+        return
+    if not _seal_unit(previous):
+        quarantine_id = hashlib.sha256(previous.encode("ascii")).hexdigest()[:32]
+        quarantined = _quarantine_workspace(workspace, quarantine_id)
+        raise LaunchRefused(
+            f"previous agent cgroup is unsealed; workspace quarantined at {quarantined}"
+        )
+    _clear_active_workspace_unit(workspace, previous)
+
+
+def _prepare_reusable_workspace(workspace: Path) -> None:
+    # Never recurse over/chmod a workspace while a prior agent could still be
+    # mutating it. The durable active-unit record survives a broker SIGKILL;
+    # BindsTo normally kills that cgroup, and this check proves the result.
+    _seal_previous_workspace_agent(workspace)
+    _prepare_workspace_permissions(workspace)
+
+
 def _serve_connected_socket(sock: socket.socket) -> int:
     agent_home: Path | None = None
     unit: str | None = None
     workspace: Path | None = None
+    workspace_lock: int | None = None
+    unit_recorded = False
     try:
         peer = _peer_uid(sock)
         if not _authorised_peer(peer):
@@ -731,10 +1131,13 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         workspace = _validated_workspace(manifest["workspace"], workspace_roots)
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
-        _prepare_workspace_permissions(workspace)
+        workspace_lock = _open_workspace_lock(workspace)
+        _prepare_reusable_workspace(workspace)
         _validate_binary(EXECUTOR_BINARIES[manifest["executor"]])
         agent_home = _prepare_agent_home(manifest["executor"], manifest["run_id"])
         unit = f"aicc-agent-{manifest['run_id']}-{os.getpid()}.service"
+        _write_active_workspace_unit(workspace, unit)
+        unit_recorded = True
         command = _systemd_command(
             manifest,
             workspace,
@@ -812,7 +1215,9 @@ def _serve_connected_socket(sock: socket.socket) -> int:
                             ).encode()
                         ).decode("ascii"),
                     }
-            except (AssertionError, OSError) as exc:
+                elif unit_recorded:
+                    _clear_active_workspace_unit(workspace, unit)
+            except (AssertionError, LaunchRefused, OSError) as exc:
                 response = {
                     "version": 1,
                     "exit_code": 125,
@@ -823,6 +1228,8 @@ def _serve_connected_socket(sock: socket.socket) -> int:
                 }
         if agent_home is not None:
             shutil.rmtree(agent_home, ignore_errors=True)
+        if workspace_lock is not None:
+            os.close(workspace_lock)
     try:
         sock.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
     except OSError:

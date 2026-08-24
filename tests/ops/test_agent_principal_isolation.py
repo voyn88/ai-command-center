@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import stat
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -338,6 +340,119 @@ def test_workspace_permission_normalization_preserves_tracked_executable_bit(
     assert after == before
 
 
+def test_workspace_index_parser_never_executes_malicious_git_fsmonitor(
+    launcher, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    script = workspace / "run.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    subprocess.run(["git", "-C", str(workspace), "add", "run.sh"], check=True)
+    marker = tmp_path / "root-code-executed"
+    malicious = tmp_path / "malicious-fsmonitor"
+    malicious.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n", encoding="utf-8")
+    malicious.chmod(0o755)
+    subprocess.run(
+        ["git", "-C", str(workspace), "config", "core.fsmonitor", str(malicious)],
+        check=True,
+    )
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("root launcher must never invoke Git")
+        ),
+    )
+
+    launcher._prepare_workspace_permissions(workspace)
+
+    assert stat.S_IMODE(script.stat().st_mode) == 0o770
+    assert not marker.exists()
+
+
+def _write_index(path: Path, *, version: int, mode: int, name: bytes) -> None:
+    entry = bytearray(62)
+    struct.pack_into("!L", entry, 24, mode)
+    struct.pack_into("!H", entry, 60, min(len(name), 0xFFF))
+    content = bytearray(struct.pack("!4sLL", b"DIRC", version, 1))
+    entry_payload = entry + name + b"\0"
+    if version in {2, 3}:
+        entry_payload.extend(b"\0" * (-len(entry_payload) % 8))
+    content.extend(entry_payload)
+    digest = hashlib.sha1(content, usedforsecurity=False).digest()
+    path.write_bytes(content + digest)
+
+
+def test_workspace_index_parser_rejects_malformed_untrusted_inputs(
+    launcher, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    index = git_dir / "index"
+
+    index.write_bytes(b"DIRC\0\0")
+    with pytest.raises(launcher.LaunchRefused):
+        launcher._tracked_executables(workspace)
+
+    _write_index(index, version=5, mode=0o100755, name=b"run.sh")
+    with pytest.raises(launcher.LaunchRefused, match="unsupported"):
+        launcher._tracked_executables(workspace)
+
+    _write_index(index, version=2, mode=0o100755, name=b"../escape")
+    with pytest.raises(launcher.LaunchRefused, match="escaped"):
+        launcher._tracked_executables(workspace)
+
+    _write_index(index, version=2, mode=0o100600, name=b"unsupported")
+    with pytest.raises(launcher.LaunchRefused, match="mode"):
+        launcher._tracked_executables(workspace)
+
+    _write_index(index, version=2, mode=0o100755, name=b"run.sh")
+    payload = index.read_bytes()
+    content = payload[:-20] + b"link" + struct.pack("!L", 0)
+    index.write_bytes(content + hashlib.sha1(content, usedforsecurity=False).digest())
+    with pytest.raises(launcher.LaunchRefused, match="extension"):
+        launcher._tracked_executables(workspace)
+
+    monkeypatch.setattr(launcher, "MAX_GIT_INDEX_BYTES", 16)
+    with pytest.raises(launcher.LaunchRefused, match="shape"):
+        launcher._tracked_executables(workspace)
+
+
+def test_prior_agent_cgroup_is_sealed_before_permission_normalization(
+    launcher, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    active = tmp_path / "active"
+    monkeypatch.setattr(launcher, "ACTIVE_UNIT_ROOT", active)
+    active.mkdir(mode=0o700)
+    unit = f"aicc-agent-{'a' * 32}-123.service"
+    launcher._write_active_workspace_unit(workspace, unit)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        launcher,
+        "_seal_unit",
+        lambda name: calls.append(f"seal:{name}") or True,
+    )
+    monkeypatch.setattr(
+        launcher,
+        "_prepare_workspace_permissions",
+        lambda path: calls.append(f"prepare:{path}"),
+    )
+
+    launcher._prepare_reusable_workspace(workspace)
+
+    assert calls == [f"seal:{unit}", f"prepare:{workspace}"]
+    assert not launcher._active_workspace_record(workspace).exists()
+
+
 def test_provider_environment_policy_rejects_public_mode_and_symlink(
     launcher, tmp_path
 ):
@@ -366,6 +481,35 @@ def test_provider_environment_policy_rejects_public_mode_and_symlink(
             expected_uid=os.getuid(),
             expected_gid=os.getgid(),
             exact_mode=0o640,
+        )
+
+
+def test_model_auth_reader_is_nofollow_and_exact_mode(launcher, tmp_path):
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"token":"model-only"}\n', encoding="utf-8")
+    auth.chmod(0o644)
+    with pytest.raises(launcher.LaunchRefused, match="drifted"):
+        launcher._read_exact_protected_file(
+            auth,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            exact_mode=0o600,
+        )
+    auth.chmod(0o600)
+    assert launcher._read_exact_protected_file(
+        auth,
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        exact_mode=0o600,
+    ).startswith(b'{"token"')
+    alias = tmp_path / "auth-link.json"
+    alias.symlink_to(auth)
+    with pytest.raises(launcher.LaunchRefused, match="safely"):
+        launcher._read_exact_protected_file(
+            alias,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            exact_mode=0o600,
         )
 
 
@@ -587,6 +731,8 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert '"--uninstall"' in installer
     assert "run_transaction recover" in installer
     assert "aicc_staged_worker_rollout.py" in verifier
+    assert "/var/lib/aicc-agent/claude/.claude/.credentials.json" in verifier
+    assert "/var/lib/aicc-agent/codex/.codex/auth.json" in verifier
     assert "discover_units" in rollout
     assert "for unit in units" in rollout
     assert "voyn-aicc-worker-2.service" not in verifier

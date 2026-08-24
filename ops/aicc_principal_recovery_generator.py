@@ -12,6 +12,16 @@ from pathlib import Path
 
 STATE_DIR = Path("/var/lib/aicc-principal-isolation")
 
+# Named tuple so the py314-target formatter cannot rewrite the except clause
+# into the PEP 758 unparenthesized form, which is a SyntaxError on Python 3.13.
+_JOURNAL_READ_ERRORS = (
+    FileNotFoundError,
+    KeyError,
+    OSError,
+    ValueError,
+    json.JSONDecodeError,
+)
+
 
 def generate(
     destination: Path, state_dir: Path = STATE_DIR, *, expected_uid: int = 0
@@ -23,7 +33,7 @@ def generate(
         recovery_path = Path(payload["recovery"])
         info = recovery_path.lstat()
         recovery = str(recovery_path.resolve(strict=True))
-    except (FileNotFoundError, KeyError, OSError, ValueError, json.JSONDecodeError):
+    except _JOURNAL_READ_ERRORS:
         return False
     expected_prefix = re.escape(str(state_dir.resolve()))
     pattern = re.compile(rf"{expected_prefix}/generation-[a-f0-9]{{16}}/recovery\.py")
