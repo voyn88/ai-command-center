@@ -9,8 +9,9 @@ import os
 import socket
 import sys
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ import pytest
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
-from command_center.worker.payloads import parse_agent_run, PayloadError
+from command_center.worker.payloads import PayloadError, parse_agent_run
 
 
 def _payload(**overrides):
@@ -45,12 +46,22 @@ def isolated_path(repository: Path, backlog_task: str = "proj") -> Path:
     `handlers._isolated_workspace_path` (`<repo>-worktrees/backlog-<task>`)
     so a test can predict where the lease gate and provisioning will look
     without importing the private helper itself."""
-    return repository.parent / f"{repository.name}-worktrees" / f"backlog-{backlog_task}"
+    return workspace_provisioning.task_workspace_path(
+        repository, f"backlog/{backlog_task}"
+    )
 
 
 @dataclass(frozen=True)
 class _FakeEvidence:
     workspace_path: str
+    expected_branch: str
+    remote_url: str
+    start_sha: str
+    base_sha: str
+    remote_task_sha: str | None
+    workspace_device: int
+    workspace_inode: int
+    provision_outcome: str
 
 
 @pytest.fixture
@@ -90,7 +101,35 @@ def handler(monkeypatch, tmp_path):
     monkeypatch.setattr(
         workspace_provisioning,
         "provision_and_verify",
-        lambda spec: _FakeEvidence(workspace_path=spec.workspace_path),
+        lambda spec: _FakeEvidence(
+            workspace_path=spec.workspace_path,
+            expected_branch=spec.expected_branch or "",
+            remote_url=str(tmp_path),
+            start_sha="0" * 40,
+            base_sha="0" * 40,
+            remote_task_sha=None,
+            workspace_device=1,
+            workspace_inode=1,
+            provision_outcome="cloned",
+        ),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "trusted_publish_clone",
+        lambda workspace, **kwargs: nullcontext(Path(workspace)),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        lambda workspace, **kwargs: "0" * 40,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda workspace, **kwargs: kwargs["previous_start_sha"],
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "task_workspace_is_unchanged", lambda *a, **kw: True
     )
     monkeypatch.setattr(
         workspace_provisioning, "remove_workspace", lambda *a, **kw: "removed"
@@ -135,7 +174,7 @@ def _lease_row(worktree, **overrides) -> str:
         "worktree": str(worktree),
         "process_pid": 4242,
         "expires_at": (
-            datetime.now(timezone.utc) + timedelta(minutes=5)
+            datetime.now(UTC) + timedelta(minutes=5)
         ).isoformat(),
     }
     row.update(overrides)
@@ -278,36 +317,58 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch
 
 
 def test_bwrap_loopback_result_is_retryable_infrastructure_failure(handler, monkeypatch):
-    run_agent, _ = handler
+    run_agent, _runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "codex"
+    payload["cascade"][0]["task_type"] = "implementation"
+    monkeypatch.setattr(
+        agent_runner, "_codex_workspace_write_preflight_result", (True, "")
+    )
 
-    def bwrap_failure(**kwargs):
+    seen = []
+
+    def bwrap_then_fallback(**kwargs):
+        seen.append(kwargs["executor"])
+        if kwargs["executor"] == "codex":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=0,
+                stdout="",
+                stderr="bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+                duration_seconds=0.01,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
         return agent_runner.RunResult(
-            status="failed",
+            status="completed",
             exit_code=0,
-            stdout="",
-            stderr="bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+            stdout='{"result": "fallback done"}',
+            stderr="",
             duration_seconds=0.01,
-            started_at="2026-08-23T12:00:00+00:00",
-            completed_at="2026-08-23T12:00:01+00:00",
+            started_at="2026-08-23T12:00:02+00:00",
+            completed_at="2026-08-23T12:00:03+00:00",
         )
 
-    monkeypatch.setattr(agent_runner, "run_claude_code", bwrap_failure)
-    outcome = run_agent(_payload(), _event(), 1)
-    assert not outcome.ok
-    assert outcome.retryable
-    assert "Codex workspace-write sandbox" in outcome.reason
+    monkeypatch.setattr(agent_runner, "run_claude_code", bwrap_then_fallback)
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert seen == ["codex", payload["cascade"][1]["executor"]]
+    assert agent_runner.codex_workspace_write_preflight()[0] is False
 
 
-def test_codex_workspace_preflight_refuses_before_task_run(handler, monkeypatch):
+def test_codex_workspace_preflight_skips_to_fallback_without_spending_attempt(
+    handler, monkeypatch
+):
     run_agent, runs = handler
     payload = _cascade_payload()
     payload["cascade"][0]["executor"] = "codex"
     payload["cascade"][0]["task_type"] = "implementation"
     monkeypatch.setattr(agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap"))
     outcome = run_agent(payload, _event(), 1)
-    assert not outcome.ok and outcome.retryable
-    assert "codex workspace-write sandbox unavailable" in outcome.reason
-    assert runs == []
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert runs[0]["executor"] == payload["cascade"][1]["executor"]
 
 
 def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
@@ -861,7 +922,7 @@ def test_expired_other_host_and_other_path_leases_do_not_block(
 ) -> None:
     """Three ways a row can name this path without holding it."""
     run_agent, runs = handler
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    stale = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
     worktree = isolated_path(tmp_path)
     for row in (
         _lease_row(worktree, expires_at=stale),
@@ -967,7 +1028,7 @@ def test_a_lease_with_no_identity_token_still_blocks(
 ) -> None:
     """An unverifiable match is not a match: the row names our pid, but with
     no ``process_start`` on either side to confirm it, the gate fails closed."""
-    run_agent, runs = handler
+    run_agent, _runs = handler
     row = json.loads(_lease_row(isolated_path(tmp_path), process_pid=os.getpid()))
     row[0].pop("process_start", None)
     lease_tool(json.dumps(row))

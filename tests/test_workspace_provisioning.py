@@ -16,7 +16,17 @@ from pathlib import Path
 
 import pytest
 
-from command_center import git_info, workspace_provisioning as wp
+from command_center import git_info
+from command_center import workspace_provisioning as wp
+
+
+def test_workspace_authority_never_falls_back_to_rotating_lease_dsn(
+    monkeypatch,
+):
+    monkeypatch.delenv("AICC_WORKSPACE_AUTHORITY_KEY", raising=False)
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://rotating-secret")
+
+    assert wp._workspace_authority_key() is None
 
 
 def _git(cwd: Path, *args: str) -> None:

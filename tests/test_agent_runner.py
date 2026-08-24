@@ -176,6 +176,29 @@ def test_implementation_and_remediation_do_not_block_edit_or_write(task_type):
     assert "Write" not in disallowed
 
 
+def test_agent_environment_keeps_model_auth_but_strips_publisher_authority():
+    scrubbed = agent_runner.scrub_vcs_credentials(
+        {
+            "ANTHROPIC_API_KEY": "model-only",
+            "AICC_PUBLISH_DEPLOY_KEY": "/secret/publisher-key",
+            "AICC_WORKSPACE_AUTHORITY_KEY": "marker-secret",
+            "VOYN_LEASE_DSN": "postgresql://lease-secret",
+            "VOYN_LEASE_TOOL": "/trusted/voyn-lease",
+            "GH_TOKEN": "github-secret",
+        }
+    )
+
+    assert scrubbed["ANTHROPIC_API_KEY"] == "model-only"
+    for secret in (
+        "AICC_PUBLISH_DEPLOY_KEY",
+        "AICC_WORKSPACE_AUTHORITY_KEY",
+        "VOYN_LEASE_DSN",
+        "VOYN_LEASE_TOOL",
+        "GH_TOKEN",
+    ):
+        assert secret not in scrubbed
+
+
 # --------------------------------------------------------------------------
 # Execution profiles (Required fix 1): named, testable read_only vs.
 # trusted_development, and the permission-mode fix (Required fix 3).
@@ -531,6 +554,67 @@ def test_claude_cli_preflight_reports_available_for_an_existing_binary():
     available, message = agent_runner.claude_cli_preflight(sys.executable)
     assert available is True
     assert message == ""
+
+
+def test_codex_workspace_preflight_requires_a_real_clean_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _binary: "/usr/bin/codex")
+    monkeypatch.setattr(agent_runner, "_codex_workspace_write_preflight_result", None)
+
+    def committed(**kwargs):
+        repo = kwargs["repository_path"]
+        (repo / "aicc-codex-commit-probe.txt").write_text("AICC_CODEX_COMMIT_OK\n")
+        subprocess.run(["git", "add", "aicc-codex-commit-probe.txt"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", "aicc codex commit probe"],
+            cwd=repo,
+            check=True,
+        )
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout="AICC_CODEX_WORKSPACE_WRITE_OK",
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", committed)
+    assert agent_runner.codex_workspace_write_preflight() == (True, "")
+
+
+def test_codex_workspace_preflight_rejects_completed_without_commit(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _binary: "/usr/bin/codex")
+    monkeypatch.setattr(agent_runner, "_codex_workspace_write_preflight_result", None)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **_kwargs: agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout="AICC_CODEX_WORKSPACE_WRITE_OK",
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:01+00:00",
+        ),
+    )
+
+    ok, reason = agent_runner.codex_workspace_write_preflight()
+    assert ok is False
+    assert "clean local commit" in reason
+
+
+def test_runtime_bwrap_failure_opens_codex_workspace_write_circuit(monkeypatch):
+    monkeypatch.setattr(
+        agent_runner, "_codex_workspace_write_preflight_result", (True, "")
+    )
+    agent_runner.disable_codex_workspace_write("bwrap: loopback denied")
+
+    ok, reason = agent_runner.codex_workspace_write_preflight()
+    assert ok is False
+    assert "sandbox unavailable" in reason
+    assert "loopback" in reason
 
 
 def test_claude_cli_preflight_names_the_missing_binary_and_how_to_fix_it():

@@ -12,7 +12,9 @@ from command_center.orchestrator.publish import PublishConfig, publish_run
 
 
 def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    )
 
 
 @pytest.fixture
@@ -68,13 +70,26 @@ def test_a_run_with_no_commit_is_nothing_to_publish(repo, monkeypatch):
     assert not r.ok and r.reason == "nothing_to_publish"
 
 
+def test_dirty_tree_at_base_is_operational_failure_not_nothing_to_publish(
+    repo, monkeypatch
+):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "uncommitted.txt").write_text("only surviving agent diff\n")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok and r.reason == "uncommitted_changes"
+    assert (work / "uncommitted.txt").exists()
+    assert not calls.exists(), "publisher must not acquire a push lease for dirty state"
+
+
 def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     work, bin_, calls = repo
     _with_path(bin_, monkeypatch)
     (work / "change.txt").write_text("x\n")
     _git(work, "add", ".")
     _git(work, "commit", "-m", "work")
-
     r = publish_run(work, _cfg(bin_))
     assert r.ok, r.reason
     assert r.branch == "backlog/VOYN-W0-TEST"
@@ -82,7 +97,7 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     assert r.head_sha
     # branch landed on the remote
     out = subprocess.run(["git", "ls-remote", "--heads", str(work.parent / "origin.git")],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, text=True, check=False).stdout
     assert "backlog/VOYN-W0-TEST" in out
     log = calls.read_text()
     assert " acquire " in log and " release " in log  # lease taken and freed
@@ -92,6 +107,38 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     # the CLI at all, so acquire silently got the tool's own default
     # instead of PublishConfig.ttl's declared 600.
     assert "--ttl 600" in log
+
+
+def test_already_durable_branch_is_rechecked_before_pr(repo, monkeypatch):
+    """A stale pre-agent remote SHA must never authorize a PR for another tip."""
+    from dataclasses import replace
+
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / "candidate.txt").write_text("candidate\n")
+    _git(work, "add", "candidate.txt")
+    _git(work, "commit", "-m", "candidate")
+    candidate = _git(work, "rev-parse", "HEAD").stdout.strip()
+    _git(work, "push", "origin", "HEAD:refs/heads/backlog/VOYN-W0-TEST")
+    (work / "concurrent.txt").write_text("concurrent\n")
+    _git(work, "add", "concurrent.txt")
+    _git(work, "commit", "-m", "concurrent update")
+    _git(work, "push", "origin", "HEAD:refs/heads/backlog/VOYN-W0-TEST")
+    _git(work, "checkout", "--detach", candidate)
+
+    result = publish_run(
+        work,
+        replace(
+            _cfg(bin_),
+            base_sha=base,
+            remote_sha=candidate,
+            remote_sha_known=True,
+        ),
+    )
+
+    assert not result.ok and result.reason == "remote_branch_changed_before_pr"
+    assert not calls.exists() or "gh " not in calls.read_text()
 
 
 def test_release_lease_false_never_calls_release(repo, monkeypatch):
@@ -163,6 +210,7 @@ def test_a_github_ssh_origin_is_pushed_over_https(repo, monkeypatch):
     (work / "change.txt").write_text("x\n")
     _git(work, "add", ".")
     _git(work, "commit", "-m", "work")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
 
     import shutil
 
@@ -172,7 +220,8 @@ def test_a_github_ssh_origin_is_pushed_over_https(repo, monkeypatch):
         f"#!/bin/sh\n"
         f"echo \"git $*\" >> {calls}\n"
         "case \"$1\" in\n"
-        "  ls-remote) exit 0 ;;\n"
+        f"  ls-remote) n=$(grep -c '^git ls-remote' {calls}); "
+        f"[ \"$n\" -gt 1 ] && echo \"{head} refs/heads/backlog/VOYN-W0-TEST\"; exit 0 ;;\n"
         "  push) exit 0 ;;\n"
         f"  *) exec {real_git} \"$@\" ;;\n"
         "esac\n"
@@ -198,6 +247,7 @@ def test_a_github_https_update_uses_the_observed_remote_sha(repo, monkeypatch):
     (work / "change.txt").write_text("x\n")
     _git(work, "add", ".")
     _git(work, "commit", "-m", "work")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
 
     import shutil
 
@@ -208,7 +258,9 @@ def test_a_github_https_update_uses_the_observed_remote_sha(repo, monkeypatch):
         f"#!/bin/sh\n"
         f"echo \"git $*\" >> {calls}\n"
         "case \"$1\" in\n"
-        f"  ls-remote) echo \"{expected} refs/heads/backlog/VOYN-W0-TEST\"; exit 0 ;;\n"
+        f"  ls-remote) n=$(grep -c '^git ls-remote' {calls}); "
+        f"if [ \"$n\" -eq 1 ]; then echo \"{expected} refs/heads/backlog/VOYN-W0-TEST\"; "
+        f"else echo \"{head} refs/heads/backlog/VOYN-W0-TEST\"; fi; exit 0 ;;\n"
         "  push) exit 0 ;;\n"
         f"  *) exec {real_git} \"$@\" ;;\n"
         "esac\n"
@@ -286,7 +338,7 @@ def test_lease_refusal_does_not_push(repo, monkeypatch):
     r = publish_run(work, _cfg(bin_))
     assert not r.ok and r.reason.startswith("lease_unavailable")
     out = subprocess.run(["git", "ls-remote", "--heads", str(work.parent / "origin.git")],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, text=True, check=False).stdout
     assert "backlog" not in out  # never pushed
 
 
@@ -319,5 +371,5 @@ def test_stale_hook_identity_fails_closed_without_pushing(repo, monkeypatch):
     log = calls.read_text()
     assert " acquire " in log and " install-hooks " in log and " release " in log
     out = subprocess.run(["git", "ls-remote", "--heads", str(work.parent / "origin.git")],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, text=True, check=False).stdout
     assert "backlog" not in out  # never pushed
