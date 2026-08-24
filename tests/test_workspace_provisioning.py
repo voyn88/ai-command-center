@@ -24,7 +24,7 @@ def test_workspace_authority_never_falls_back_to_rotating_lease_dsn(
     monkeypatch,
 ):
     monkeypatch.delenv("AICC_WORKSPACE_AUTHORITY_KEY", raising=False)
-    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://rotating-secret")
+    monkeypatch.setenv("VOYN_LEASE_DSN", "test-only-rotating-dsn")
 
     assert wp._workspace_authority_key() is None
 

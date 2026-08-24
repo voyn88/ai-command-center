@@ -179,7 +179,7 @@ def test_implementation_and_remediation_do_not_block_edit_or_write(task_type):
 def test_agent_environment_keeps_model_auth_but_strips_publisher_authority():
     scrubbed = agent_runner.scrub_vcs_credentials(
         {
-            "ANTHROPIC_API_KEY": "model-only",
+            "ANTHROPIC_API_KEY": "model-only",  # pragma: allowlist secret
             "AICC_PUBLISH_DEPLOY_KEY": "/secret/publisher-key",
             "AICC_WORKSPACE_AUTHORITY_KEY": "marker-secret",
             "VOYN_LEASE_DSN": "postgresql://lease-secret",
@@ -188,7 +188,7 @@ def test_agent_environment_keeps_model_auth_but_strips_publisher_authority():
         }
     )
 
-    assert scrubbed["ANTHROPIC_API_KEY"] == "model-only"
+    assert scrubbed["ANTHROPIC_API_KEY"] == "model-only"  # pragma: allowlist secret
     for secret in (
         "AICC_PUBLISH_DEPLOY_KEY",
         "AICC_WORKSPACE_AUTHORITY_KEY",
