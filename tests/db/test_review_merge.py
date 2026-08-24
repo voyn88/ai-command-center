@@ -109,7 +109,9 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     # the task_id -- so a later push to the same PR (remediation, or an
     # ordinary second push while still IN_PROGRESS) gets its own fresh
     # review instead of being permanently deduped against this one.
-    assert key == f"review:VOYN-W0-R1:7:{head}:v4"
+    assert key.startswith(
+        f"review:VOYN-W0-R1:7:{head}:{review_merge._REVIEW_POLICY_VERSION}:base:{BASE}:diff:"
+    )
     assert task_id == "VOYN-W0-R1"
     assert [link["executor"] for link in payload["cascade"]] == ["copilot", "claude"]
     assert max_attempts == len(payload["cascade"]) == 2
