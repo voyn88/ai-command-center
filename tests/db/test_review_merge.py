@@ -145,7 +145,7 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
     )
 
 
-def test_review_skips_a_diff_over_the_size_cap(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13")
     head = "e" * 40
@@ -166,11 +166,10 @@ def test_review_skips_a_diff_over_the_size_cap(rig, _test_repo_routes, monkeypat
         lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
         "/tmp",
     )
-    assert not calls
-    assert any(
-        task_id == "VOYN-W0-R4" and reason.startswith("diff_too_large")
-        for task_id, reason in report.skipped
-    )
+    chunks = review_merge._diff_chunks(huge_diff)
+    assert len(calls) == len(chunks) == 2
+    assert all(len(call[2]["review_chunk"]["content_hash"]) == 64 for call in calls)
+    assert ("VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13") in report.reviewed
 
 
 def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noqa: F811

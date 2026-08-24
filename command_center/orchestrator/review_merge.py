@@ -59,6 +59,7 @@ already-merged PR closes the task once.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -198,6 +199,15 @@ _REVIEW_PROMPT = (
 # larger change.
 _MAX_DIFF_CHARS = 60_000
 
+_CHUNK_REVIEW_PROMPT = (
+    "This is deterministic diff chunk {chunk_number}/{chunk_count} for one "
+    "independent exact-SHA review. Chunk SHA-256: {chunk_hash}. Ordered manifest "
+    "SHA-256: {manifest_hash}. Review every byte in this chunk; do not infer an "
+    "overall pull-request ACCEPT from this partial view. The control plane will "
+    "post one marker only after every chunk in the same manifest independently "
+    "ACCEPTS the same head.\n\n" + _REVIEW_PROMPT
+)
+
 
 _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 
@@ -249,6 +259,86 @@ def _review_key(task_id: str, pr_url: str, head_sha: str) -> str | None:
         return None
     pr_number = match.group(3)
     return f"review:{task_id}:{pr_number}:{head_sha}:{_REVIEW_POLICY_VERSION}"
+
+
+@dataclass(frozen=True, slots=True)
+class _DiffChunk:
+    index: int
+    count: int
+    text: str
+    content_hash: str
+    manifest_hash: str
+
+
+def _split_oversized_unit(unit: str, cap: int) -> list[str]:
+    """Split at a line boundary when possible, and never drop a character."""
+    pieces: list[str] = []
+    remaining = unit
+    while len(remaining) > cap:
+        cut = remaining.rfind("\n", 0, cap)
+        cut = cap if cut < 0 else cut + 1
+        pieces.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        pieces.append(remaining)
+    return pieces
+
+
+def _diff_chunks(diff: str, cap: int = _MAX_DIFF_CHARS) -> tuple[_DiffChunk, ...]:
+    """Build deterministic file/hunk-aligned chunks bounded by ``cap``.
+
+    Boundaries before ``diff --git`` and ``@@`` keep whole files/hunks together
+    whenever they fit. An individually oversized hunk is split at a newline (or
+    exactly at the cap for a pathological long line). The concatenated chunk
+    text is byte-for-byte the original string: there is no head/tail truncation.
+    """
+    if cap < 1:
+        raise ValueError("chunk cap must be positive")
+    if not diff:
+        raw_chunks = [""]
+    else:
+        boundaries = [
+            match.start()
+            for match in re.finditer(r"(?m)^(?:diff --git |@@ )", diff)
+        ]
+        starts = sorted({0, *boundaries})
+        units = [diff[start:end] for start, end in zip(starts, starts[1:] + [len(diff)])]
+        bounded_units = [
+            piece
+            for unit in units
+            for piece in _split_oversized_unit(unit, cap)
+        ]
+        raw_chunks: list[str] = []
+        current = ""
+        for unit in bounded_units:
+            if current and len(current) + len(unit) > cap:
+                raw_chunks.append(current)
+                current = ""
+            current += unit
+        if current or not raw_chunks:
+            raw_chunks.append(current)
+    if "".join(raw_chunks) != diff or any(len(chunk) > cap for chunk in raw_chunks):
+        raise RuntimeError("diff chunking invariant violated")
+    hashes = [hashlib.sha256(chunk.encode()).hexdigest() for chunk in raw_chunks]
+    manifest_hash = hashlib.sha256("\n".join(hashes).encode()).hexdigest()
+    return tuple(
+        _DiffChunk(index, len(raw_chunks), text, hashes[index], manifest_hash)
+        for index, text in enumerate(raw_chunks)
+    )
+
+
+def _chunk_review_key(
+    task_id: str, pr_url: str, head_sha: str, chunk: _DiffChunk
+) -> str | None:
+    base = _review_key(task_id, pr_url, head_sha)
+    if base is None:
+        return None
+    return f"{base}:chunk:{chunk.index:04d}:{chunk.content_hash}"
+
+
+def _chunk_key_prefix(task_id: str, pr_url: str, head_sha: str) -> str | None:
+    base = _review_key(task_id, pr_url, head_sha)
+    return f"{base}:chunk:" if base else None
 
 
 def _pr_diff_and_head(repo_path: str, pr_url: str) -> tuple[str, str] | None:
@@ -337,26 +427,53 @@ def review_once(
             report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
             continue
         diff, head_sha = fetched
-        if len(diff) > _MAX_DIFF_CHARS:
-            report.skipped.append(
-                (task_id, f"diff_too_large: {len(diff)} chars > {_MAX_DIFF_CHARS}")
-            )
-            continue
         key = _review_key(task_id, pr_url, head_sha)
         if key is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
         project_id, repository_path = route
-        payload = {
-            "kind": "agent_run", "v": 1, "project_id": project_id,
-            "repository_path": repository_path, "task_type": "review",
-            "prompt": _REVIEW_PROMPT.format(
-                pr=pr_url, task=task_id, head_sha=head_sha, diff=diff
-            ),
-            "timeout_seconds": cfg.review_timeout, "untrusted": False,
-            "cascade": cascade,
-        }
-        enqueue(cfg.queue, key, payload, task_id, len(cascade))
+        if len(diff) <= _MAX_DIFF_CHARS:
+            payload = {
+                "kind": "agent_run", "v": 1, "project_id": project_id,
+                "repository_path": repository_path, "task_type": "review",
+                "prompt": _REVIEW_PROMPT.format(
+                    pr=pr_url, task=task_id, head_sha=head_sha, diff=diff
+                ),
+                "timeout_seconds": cfg.review_timeout, "untrusted": False,
+                "cascade": cascade,
+            }
+            enqueue(cfg.queue, key, payload, task_id, len(cascade))
+        else:
+            chunks = _diff_chunks(diff)
+            for chunk in chunks:
+                chunk_key = _chunk_review_key(task_id, pr_url, head_sha, chunk)
+                if chunk_key is None:
+                    raise RuntimeError("validated PR URL produced no chunk key")
+                payload = {
+                    "kind": "agent_run", "v": 1, "project_id": project_id,
+                    "repository_path": repository_path, "task_type": "review",
+                    "prompt": _CHUNK_REVIEW_PROMPT.format(
+                        pr=pr_url,
+                        task=task_id,
+                        head_sha=head_sha,
+                        diff=chunk.text,
+                        chunk_number=chunk.index + 1,
+                        chunk_count=chunk.count,
+                        chunk_hash=chunk.content_hash,
+                        manifest_hash=chunk.manifest_hash,
+                    ),
+                    "timeout_seconds": cfg.review_timeout, "untrusted": False,
+                    "cascade": cascade,
+                    "review_chunk": {
+                        "version": 1,
+                        "index": chunk.index,
+                        "count": chunk.count,
+                        "content_hash": chunk.content_hash,
+                        "manifest_hash": chunk.manifest_hash,
+                        "head_sha": head_sha,
+                    },
+                }
+                enqueue(cfg.queue, chunk_key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
     return report
 
@@ -415,6 +532,110 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
         return None
     payload = rows[0][0]
     return json.loads(payload) if isinstance(payload, str) else payload
+
+
+def _json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _chunk_review_rows(
+    factory: Any, task_id: str, pr_url: str, head_sha: str
+) -> tuple[str | None, list[tuple[Any, ...]]]:
+    prefix = _chunk_key_prefix(task_id, pr_url, head_sha)
+    if prefix is None:
+        return None, []
+    rows = _rows(
+        factory,
+        "SELECT i.idempotency_key,i.state,i.payload,wr.payload "
+        "FROM work_item i LEFT JOIN work_result wr ON wr.result_id=i.result_id "
+        "WHERE i.task_id=%s AND left(i.idempotency_key,char_length(%s))=%s "
+        "ORDER BY i.idempotency_key",
+        (task_id, prefix, prefix),
+    )
+    return prefix, rows
+
+
+def _aggregate_chunk_verdict(
+    rows: list[tuple[Any, ...]], current_head: str, prefix: str
+) -> tuple[str, str]:
+    """Return ACCEPT, REJECT or WAIT after validating one whole manifest."""
+    indexed: dict[int, tuple[str, str, dict[str, Any] | None]] = {}
+    expected_count: int | None = None
+    expected_manifest: str | None = None
+    for key, state, payload_value, result_value in rows:
+        payload = _json_object(payload_value)
+        metadata = payload.get("review_chunk") if payload else None
+        if not isinstance(metadata, dict) or metadata.get("version") != 1:
+            return "WAIT", "review_chunk_manifest_invalid"
+        index = metadata.get("index")
+        count = metadata.get("count")
+        content_hash = metadata.get("content_hash")
+        manifest_hash = metadata.get("manifest_hash")
+        if (
+            not isinstance(index, int)
+            or not isinstance(count, int)
+            or count < 2
+            or index < 0
+            or index >= count
+            or not isinstance(content_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", content_hash)
+            or not isinstance(manifest_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash)
+            or metadata.get("head_sha") != current_head
+            or key != f"{prefix}{index:04d}:{content_hash}"
+            or index in indexed
+        ):
+            return "WAIT", "review_chunk_manifest_invalid"
+        if expected_count is None:
+            expected_count = count
+            expected_manifest = manifest_hash
+        elif count != expected_count or manifest_hash != expected_manifest:
+            return "WAIT", "review_chunk_manifest_inconsistent"
+        indexed[index] = (str(state), content_hash, _json_object(result_value))
+
+    if expected_count is None:
+        return "WAIT", "review_chunks_missing"
+    complete = set(indexed) == set(range(expected_count))
+    if complete:
+        ordered_hashes = [indexed[index][1] for index in range(expected_count)]
+        actual_manifest = hashlib.sha256("\n".join(ordered_hashes).encode()).hexdigest()
+        if actual_manifest != expected_manifest:
+            return "WAIT", "review_chunk_manifest_hash_mismatch"
+
+    rejections: list[str] = []
+    waiting_reason = ""
+    for index in sorted(indexed):
+        state, _content_hash, result = indexed[index]
+        if state != "succeeded" or result is None:
+            waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
+            continue
+        text = result.get("result_text") or ""
+        parsed = _parse_verdict(text)
+        if parsed is None:
+            waiting_reason = waiting_reason or f"review_chunk_verdict_missing:{index}"
+            continue
+        verdict, sha = parsed
+        if sha != current_head:
+            waiting_reason = waiting_reason or f"review_chunk_head_sha_mismatch:{index}"
+            continue
+        if verdict == "REJECT":
+            rejections.append(f"Chunk {index + 1}/{expected_count}:\n{text}")
+    if rejections:
+        return "REJECT", "\n\n".join(rejections)
+    if not complete:
+        missing = sorted(set(range(expected_count)) - set(indexed))
+        return "WAIT", f"review_chunks_missing:{missing}"
+    if waiting_reason:
+        return "WAIT", waiting_reason
+    return "ACCEPT", current_head
 
 
 def _accept_marker_on_latest_review(
@@ -594,26 +815,38 @@ def publish_review_verdicts(
         if key is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
-        result = _latest_review_result(factory, task_id, key)
-        if result is None:
-            report.skipped.append((task_id, "no_review_result_yet"))
-            continue
-        text = result.get("result_text") or ""
-        parsed = _parse_verdict(text)
-        if parsed is None:
-            report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
-            continue
-        verdict, sha = parsed
-        if sha != current_head:
-            # The review-cycle key already scopes the lookup to a review run
-            # AT current_head, so this is the agent misreporting its own
-            # HEAD_SHA line rather than a stale-evidence race -- fail closed
-            # either way, never post a marker whose sha doesn't match what
-            # the agent said it reviewed.
-            report.skipped.append(
-                (task_id, f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}")
+        prefix, chunk_rows = _chunk_review_rows(
+            factory, task_id, pr_url, current_head
+        )
+        if chunk_rows:
+            verdict, text = _aggregate_chunk_verdict(
+                chunk_rows, current_head, prefix or ""
             )
-            continue
+            if verdict == "WAIT":
+                report.skipped.append((task_id, text))
+                continue
+            sha = current_head
+        else:
+            result = _latest_review_result(factory, task_id, key)
+            if result is None:
+                report.skipped.append((task_id, "no_review_result_yet"))
+                continue
+            text = result.get("result_text") or ""
+            parsed = _parse_verdict(text)
+            if parsed is None:
+                report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
+                continue
+            verdict, sha = parsed
+            if sha != current_head:
+                # The review-cycle key already scopes the lookup to a review run
+                # AT current_head, so this is the agent misreporting its own
+                # HEAD_SHA line rather than a stale-evidence race -- fail closed
+                # either way, never post a marker whose sha doesn't match what
+                # the agent said it reviewed.
+                report.skipped.append(
+                    (task_id, f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}")
+                )
+                continue
         if verdict != "ACCEPT":
             new_task_id = _remediate_rejection(factory, task_id, pr_url, current_head, text)
             if new_task_id:
