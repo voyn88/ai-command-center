@@ -1,6 +1,14 @@
 import SwiftUI
 import AICCNativeCore
 
+private enum AICCTheme {
+    static let plum = Color(red: 0.34, green: 0.25, blue: 0.43)
+    static let lilac = Color(red: 0.91, green: 0.89, blue: 0.98)
+    static let peach = Color(red: 1.00, green: 0.88, blue: 0.80)
+    static let mint = Color(red: 0.88, green: 0.95, blue: 0.91)
+    static let forest = Color(red: 0.16, green: 0.42, blue: 0.32)
+}
+
 @main
 struct AICCNativeApp: App {
     var body: some Scene {
@@ -39,7 +47,7 @@ struct AICCNativeShell: View {
             MoreView(events: snapshot.events)
                 .tabItem { Label(AppTab.more.title, systemImage: AppTab.more.icon) }.tag(AppTab.more)
         }
-        .tint(.indigo)
+        .tint(AICCTheme.plum)
     }
 }
 
@@ -49,21 +57,21 @@ private struct OverviewView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    Text("Спокойная картина дня").font(.caption.weight(.bold)).foregroundStyle(.secondary)
-                    Text("Всё под контролем.").font(.system(size: 38, weight: .bold, design: .rounded))
-                    Text("Работа движется по плану. Автоматика сама разбирается с обычными вопросами.")
-                        .font(.title3).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("ДОБРОЕ УТРО").font(.caption2.weight(.bold)).tracking(1.3).foregroundStyle(AICCTheme.plum)
+                    Text("Всё идёт\nсвоим ходом.").font(.system(size: 46, weight: .medium, design: .serif)).tracking(-1.5)
+                    Text("Я собрала главное и оставила вам только то, что действительно заслуживает внимания.")
+                        .font(.title3).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     CalmStatus(freshness: snapshot.freshness, needsAttention: snapshot.overview.needsAttention)
                     ProgressCard()
-                    Text("Проекты").font(.title2.bold())
-                    ProjectRow(name: "AIOS", detail: "Работа идёт по плану", color: .mint)
-                    ProjectRow(name: "AICC", detail: "Новая версия проходит проверку", color: .indigo)
-                    ProjectRow(name: "Другие проекты", detail: "Ничего важного не происходит", color: .gray)
+                    Text("Ваши проекты").font(.title2.weight(.semibold))
+                    ProjectRow(name: "AIOS", detail: "Главная работа идёт по плану", color: AICCTheme.forest)
+                    ProjectRow(name: "AICC Native", detail: "Собираем новый опыт для Mac и iPhone", color: AICCTheme.plum)
+                    ProjectRow(name: "Ваш портфель", detail: "Ничего не требует срочного участия", color: .gray)
                 }.padding()
             }
             .navigationTitle("AICC")
-            .toolbar { ToolbarItem(placement: .primaryAction) { Button("Обновить", systemImage: "arrow.clockwise") {}.accessibilityLabel("Обновить данные") } }
+            .toolbar { ToolbarItem(placement: .primaryAction) { Button("Спросить AICC", systemImage: "sparkles") {}.accessibilityLabel("Спросить AICC") } }
         }
     }
 }
@@ -74,14 +82,14 @@ private struct CalmStatus: View {
     var body: some View {
         HStack(spacing: 14) {
             Image(systemName: needsAttention == 0 ? "checkmark.circle.fill" : "eye.circle.fill")
-                .font(.system(size: 35)).foregroundStyle(needsAttention == 0 ? .green : .orange)
+                .font(.system(size: 31)).foregroundStyle(needsAttention == 0 ? AICCTheme.forest : .orange)
             VStack(alignment: .leading) {
-                Text(needsAttention == 0 ? "Всё идёт ровно" : "Есть один вопрос на будущее").font(.headline)
+                Text(needsAttention == 0 ? "Сейчас всё спокойно" : "Есть один вопрос на будущее").font(.headline)
                 Text(freshness == .offline ? "Показаны последние доступные данные" : "Ничего срочного не требует вашего решения").foregroundStyle(.secondary)
             }
         }
         .padding().frame(maxWidth: .infinity, alignment: .leading)
-        .background(needsAttention == 0 ? Color.green.opacity(0.11) : Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 20))
+        .background(needsAttention == 0 ? AICCTheme.mint : AICCTheme.peach, in: RoundedRectangle(cornerRadius: 20))
         .accessibilityElement(children: .combine)
     }
 }
@@ -89,11 +97,11 @@ private struct CalmStatus: View {
 private struct ProgressCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
-            Text("Ближайшая цель").font(.headline)
-            Text("Работа почти готова").font(.title3.bold())
+            Text("БЛИЖАЙШАЯ ЦЕЛЬ").font(.caption2.weight(.bold)).tracking(1.1).foregroundStyle(.secondary)
+            Text("Новая версия AICC\nпочти готова").font(.system(.title2, design: .serif, weight: .medium))
             Text("Осталась финальная проверка. Мы сообщим, только если понадобится ваше участие.").foregroundStyle(.secondary)
-            ProgressView(value: 0.72).tint(.indigo).accessibilityLabel("Ближайшая цель почти готова")
-        }.padding().background(.indigo.opacity(0.09), in: RoundedRectangle(cornerRadius: 20))
+            ProgressView(value: 0.72).tint(AICCTheme.plum).accessibilityLabel("Ближайшая цель почти готова")
+        }.padding(22).background(AICCTheme.lilac, in: RoundedRectangle(cornerRadius: 24))
     }
 }
 
@@ -101,7 +109,7 @@ private struct ProjectRow: View {
     let name: String; let detail: String; let color: Color
     var body: some View {
         HStack { Circle().fill(color).frame(width: 10, height: 10); VStack(alignment: .leading) { Text(name).font(.headline); Text(detail).foregroundStyle(.secondary) }; Spacer(); Image(systemName: "chevron.right").foregroundStyle(.tertiary) }
-            .padding().background(.background, in: RoundedRectangle(cornerRadius: 16)).overlay { RoundedRectangle(cornerRadius: 16).stroke(.quaternary) }
+            .padding().background(.background, in: RoundedRectangle(cornerRadius: 18)).overlay { RoundedRectangle(cornerRadius: 18).stroke(.quaternary) }
             .accessibilityElement(children: .combine)
     }
 }
