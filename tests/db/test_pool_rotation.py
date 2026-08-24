@@ -85,3 +85,20 @@ def test_failed_replacement_leaves_current_pool_usable(monkeypatch) -> None:
         assert not old.closed
     finally:
         pool.close_pool()
+
+
+def test_close_pool_during_inflight_checkout_does_not_raise(monkeypatch) -> None:
+    """close_pool() clearing the bookkeeping while a connection() checkout is
+    still inside its context must not turn the checkout's finally-block into
+    a KeyError: shutdown concurrent with in-flight work is the scenario
+    rotation makes routine (independent-review finding on 2d5687c)."""
+    fake = FakePool("only")
+    monkeypatch.setattr(pool, "_build_pool", lambda config: fake)
+    pool.close_pool()
+    pool.open_pool(_config("a" * 64))
+    checkout = pool.connection()
+    assert checkout.__enter__() == "only"
+    pool.close_pool()
+    assert fake.closed, "close_pool() owns shutdown of every pool"
+    # The regression: this __exit__ raised KeyError before the fix.
+    checkout.__exit__(None, None, None)

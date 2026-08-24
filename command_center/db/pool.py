@@ -161,9 +161,17 @@ def connection() -> Iterator:
     finally:
         close_retired: Any | None = None
         with _lock:
-            remaining = _active[selected_id] - 1
-            if remaining:
-                _active[selected_id] = remaining
+            count = _active.get(selected_id)
+            if count is None:
+                # close_pool() ran while this checkout was in flight and
+                # already cleared the bookkeeping and closed every pool --
+                # including this one. There is nothing left to decrement or
+                # close here; raising KeyError would crash the caller's
+                # thread during shutdown and mask its real exception
+                # (independent-review finding on 2d5687c).
+                pass
+            elif count > 1:
+                _active[selected_id] = count - 1
             else:
                 _active.pop(selected_id, None)
                 close_retired = _retired.pop(selected_id, None)
