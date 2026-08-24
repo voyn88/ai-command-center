@@ -11,12 +11,14 @@ private enum AICCTheme {
 
 @main
 struct AICCNativeApp: App {
+    @StateObject private var model = AICCAppModel()
+
     var body: some Scene {
-        WindowGroup { AICCNativeShell(snapshot: (try? Fixture.healthySnapshot()) ?? .preview) }
+        WindowGroup { AICCNativeShell(model: model) }
     }
 }
 
-private extension Snapshot {
+extension Snapshot {
     static let preview = Snapshot(
         schemaVersion: "1.0", revision: "preview", generatedAt: .now, freshness: .fresh,
         tasks: [], lanes: [], events: []
@@ -31,12 +33,12 @@ private enum AppTab: String, CaseIterable, Identifiable {
 }
 
 struct AICCNativeShell: View {
-    let snapshot: Snapshot
+    @ObservedObject var model: AICCAppModel
     @State private var tab: AppTab = .overview
 
     var body: some View {
         TabView(selection: $tab) {
-            OverviewView(snapshot: snapshot)
+            OverviewView(snapshot: model.snapshot, connection: model.connection)
                 .tabItem { Label(AppTab.overview.title, systemImage: AppTab.overview.icon) }.tag(AppTab.overview)
             WorkView()
                 .tabItem { Label(AppTab.work.title, systemImage: AppTab.work.icon) }.tag(AppTab.work)
@@ -44,15 +46,17 @@ struct AICCNativeShell: View {
                 .tabItem { Label(AppTab.dialogues.title, systemImage: AppTab.dialogues.icon) }.tag(AppTab.dialogues)
             DecisionsView()
                 .tabItem { Label(AppTab.decisions.title, systemImage: AppTab.decisions.icon) }.tag(AppTab.decisions)
-            MoreView(events: snapshot.events)
+            MoreView(events: model.snapshot.events, connection: model.connection)
                 .tabItem { Label(AppTab.more.title, systemImage: AppTab.more.icon) }.tag(AppTab.more)
         }
         .tint(AICCTheme.plum)
+        .task { await model.refresh() }
     }
 }
 
 private struct OverviewView: View {
     let snapshot: Snapshot
+    let connection: AICCAppModel.ConnectionState
 
     var body: some View {
         NavigationStack {
@@ -62,7 +66,7 @@ private struct OverviewView: View {
                     Text("Всё идёт\nсвоим ходом.").font(.system(size: 46, weight: .medium, design: .serif)).tracking(-1.5)
                     Text("Я собрала главное и оставила вам только то, что действительно заслуживает внимания.")
                         .font(.title3).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    CalmStatus(freshness: snapshot.freshness, needsAttention: snapshot.overview.needsAttention)
+                    CalmStatus(freshness: snapshot.freshness, needsAttention: snapshot.overview.needsAttention, connection: connection)
                     ProgressCard()
                     Text("Ваши проекты").font(.title2.weight(.semibold))
                     ProjectRow(name: "AIOS", detail: "Главная работа идёт по плану", color: AICCTheme.forest)
@@ -79,13 +83,14 @@ private struct OverviewView: View {
 private struct CalmStatus: View {
     let freshness: Freshness
     let needsAttention: Int
+    let connection: AICCAppModel.ConnectionState
     var body: some View {
         HStack(spacing: 14) {
             Image(systemName: needsAttention == 0 ? "checkmark.circle.fill" : "eye.circle.fill")
                 .font(.system(size: 31)).foregroundStyle(needsAttention == 0 ? AICCTheme.forest : .orange)
             VStack(alignment: .leading) {
                 Text(needsAttention == 0 ? "Сейчас всё спокойно" : "Есть один вопрос на будущее").font(.headline)
-                Text(freshness == .offline ? "Показаны последние доступные данные" : "Ничего срочного не требует вашего решения").foregroundStyle(.secondary)
+                Text(freshness == .offline ? "Показаны последние доступные данные" : connection.title).foregroundStyle(.secondary)
             }
         }
         .padding().frame(maxWidth: .infinity, alignment: .leading)
@@ -150,8 +155,10 @@ private struct DecisionsView: View {
 
 private struct MoreView: View {
     let events: [TimelineEvent]
+    let connection: AICCAppModel.ConnectionState
     var body: some View {
         CompanionPage(title: "Ещё", subtitle: "Всё остальное уже предусмотрено, но не мешает вам каждый день.") {
+            CompanionCard(title: "Подключение", detail: connection.title, tint: connection == .offline ? .orange : AICCTheme.forest)
             CompanionCard(title: "Помощники и память", detail: "Команда AI, объяснения и успешные решения.", tint: AICCTheme.plum)
             CompanionCard(title: "Проверки и происшествия", detail: "Картина качества, рисков и восстановления.", tint: AICCTheme.forest)
             CompanionCard(title: "Сводки, совет и настройки", detail: "Всё для спокойной картины и управления.", tint: .gray)
@@ -197,4 +204,4 @@ private struct CompanionCard: View {
     }
 }
 
-#Preview("Спокойный обзор") { AICCNativeShell(snapshot: .preview) }
+#Preview("Спокойный обзор") { AICCNativeShell(model: AICCAppModel()) }

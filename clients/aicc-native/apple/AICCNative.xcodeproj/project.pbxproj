@@ -6,16 +6,18 @@
 	objects = {
 
 		AA0000010000000000000001 /* AICCNativeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000002 /* AICCNativeApp.swift */; };
+		AA0000010000000000000020 /* AICCAppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000019 /* AICCAppModel.swift */; };
 		AA0000010000000000000003 /* AICCNativeCore in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000010000000000000004 /* AICCNativeCore */; };
 
 		AA0000010000000000000005 /* AICC.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AICC.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000010000000000000002 /* AICCNativeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/AICCNativeApp.swift; sourceTree = SOURCE_ROOT; };
+		AA0000010000000000000019 /* AICCAppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/AICCAppModel.swift; sourceTree = SOURCE_ROOT; };
 
 		AA0000010000000000000006 /* Products */ = {isa = PBXGroup; children = (AA0000010000000000000005 /* AICC.app */,); name = Products; sourceTree = "<group>"; };
-		AA0000010000000000000007 = {isa = PBXGroup; children = (AA0000010000000000000002 /* AICCNativeApp.swift */, AA0000010000000000000006 /* Products */,); sourceTree = "<group>"; };
+		AA0000010000000000000007 = {isa = PBXGroup; children = (AA0000010000000000000002 /* AICCNativeApp.swift */, AA0000010000000000000019 /* AICCAppModel.swift */, AA0000010000000000000006 /* Products */,); sourceTree = "<group>"; };
 
 		AA0000010000000000000008 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (AA0000010000000000000003 /* AICCNativeCore in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
-		AA0000010000000000000009 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (AA0000010000000000000001 /* AICCNativeApp.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+		AA0000010000000000000009 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (AA0000010000000000000001 /* AICCNativeApp.swift in Sources */, AA0000010000000000000020 /* AICCAppModel.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
 
 		AA0000010000000000000010 /* AICC */ = {
 			isa = PBXNativeTarget;
