@@ -168,3 +168,13 @@ def test_pr_snapshot_rejects_oversize(monkeypatch):
     monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
         argv, 0, json.dumps(body) if "/pulls/" in argv[1] else "diff --git a/x b/x\n", ""))
     assert review_merge._pr_diff_and_head("/repo", PR) is None
+
+
+def test_pr_snapshot_rejects_binary_diff_even_when_stats_match(monkeypatch):
+    body = {"base": {"sha": BASE, "repo": {
+        "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
+        "changed_files": 1, "additions": 0, "deletions": 0}
+    binary = "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
+    monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
+        argv, 0, json.dumps(body) if "/pulls/" in argv[1] else binary, ""))
+    assert review_merge._pr_diff_and_head("/repo", PR) is None

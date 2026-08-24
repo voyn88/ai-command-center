@@ -489,6 +489,12 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     if diff.returncode != 0 or len(text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
         return None
     lines = text.splitlines()
+    if any(
+        line == "GIT binary patch"
+        or (line.startswith("Binary files ") and line.endswith(" differ"))
+        for line in lines
+    ):
+        return None
     observed = (
         sum(line.startswith("diff --git ") for line in lines),
         sum(line.startswith("+") and not line.startswith("+++ ") for line in lines),
