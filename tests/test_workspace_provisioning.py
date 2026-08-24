@@ -10,7 +10,9 @@ fell back to `repository_path`.
 
 from __future__ import annotations
 
+import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -27,6 +29,71 @@ def test_workspace_authority_never_falls_back_to_rotating_lease_dsn(
     monkeypatch.setenv("VOYN_LEASE_DSN", "test-only-rotating-dsn")
 
     assert wp._workspace_authority_key() is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["plain-text-secret", "hex:01", "hex:not-hex", "base64:YWJj"],
+)
+def test_workspace_authority_rejects_weak_or_ambiguous_keys(monkeypatch, value):
+    monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", value)
+
+    assert wp._workspace_authority_key() is None
+
+
+def test_workspace_authority_accepts_explicit_32_byte_key(monkeypatch):
+    monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", "hex:" + "ab" * 32)
+
+    assert wp._workspace_authority_key() == bytes.fromhex("ab" * 32)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux worker dirfd boundary")
+def test_private_authority_write_replaces_final_symlink_without_following(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"preserve")
+    marker = tmp_path / "authority.json"
+    marker.symlink_to(victim)
+
+    wp._atomic_write_private(marker, b"signed\n")
+
+    assert victim.read_bytes() == b"preserve"
+    assert stat.S_ISREG(marker.lstat().st_mode)
+    assert marker.read_bytes() == b"signed\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux worker dirfd boundary")
+def test_private_authority_write_refuses_precreated_temp_symlink(
+    tmp_path, monkeypatch
+):
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"preserve")
+    marker = tmp_path / "authority.json"
+    monkeypatch.setattr(wp.secrets, "token_hex", lambda _length: "fixed")
+    (tmp_path / ".authority.json.fixed.tmp").symlink_to(victim)
+
+    with pytest.raises(FileExistsError):
+        wp._atomic_write_private(marker, b"signed\n")
+
+    assert victim.read_bytes() == b"preserve"
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux worker dirfd boundary")
+def test_private_authority_write_fsyncs_file_and_parent(tmp_path, monkeypatch):
+    marker = tmp_path / "authority.json"
+    observed: list[str] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        observed.append("dir" if stat.S_ISDIR(mode) else "file")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(wp.os, "fsync", recording_fsync)
+
+    wp._atomic_write_private(marker, b"signed\n")
+
+    assert observed == ["file", "dir"]
 
 
 def _git(cwd: Path, *args: str) -> None:

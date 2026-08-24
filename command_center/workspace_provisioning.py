@@ -55,10 +55,13 @@ owns. All other git access is read-only, via `command_center.git_info`.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hmac
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -528,7 +531,137 @@ def _workspace_authority_key() -> bytes | None:
     # checkpoint during routine lease-password rotation and couples a DB
     # secret to an unrelated signing purpose.
     value = os.environ.get("AICC_WORKSPACE_AUTHORITY_KEY")
-    return value.encode("utf-8") if value else None
+    if not value:
+        return None
+    try:
+        if value.startswith("hex:"):
+            key = bytes.fromhex(value.removeprefix("hex:"))
+        elif value.startswith("base64:"):
+            key = base64.b64decode(
+                value.removeprefix("base64:"), validate=True
+            )
+        else:
+            # An explicit encoding is part of the authority contract.  It
+            # prevents a human-readable password from being mistaken for a
+            # random signing key and makes byte length unambiguous.
+            return None
+    except (ValueError, binascii.Error):
+        return None
+    return key if len(key) >= 32 else None
+
+
+def _atomic_write_private(path: Path, payload: bytes) -> None:
+    """Replace one private authority file without following any symlink.
+
+    The model process currently shares the worker UID, so both the final name
+    and any predictable temporary name are attacker-controlled.  Operate
+    relative to a verified directory fd, create a random O_EXCL/O_NOFOLLOW
+    file, fsync it, rename it atomically, then fsync the parent so a reported
+    checkpoint survives a crash.
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "nt":
+        # AICC workers are Linux; retain functional Windows CI/developer
+        # support with the strongest primitives Python exposes there.
+        file_fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(file_fd, view)
+                if written <= 0:
+                    raise OSError("private authority write made no progress")
+                view = view[written:]
+            os.fsync(file_fd)
+            os.close(file_fd)
+            file_fd = -1
+            os.replace(temporary_path, path)
+        except BaseException:
+            if file_fd >= 0:
+                os.close(file_fd)
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
+        return
+    directory_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary = f".{path.name}.{secrets.token_hex(16)}.tmp"
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(file_fd, view)
+            if written <= 0:
+                raise OSError("private authority write made no progress")
+            view = view[written:]
+        os.fchmod(file_fd, 0o600)
+        os.fsync(file_fd)
+        os.close(file_fd)
+        file_fd = None
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        final = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(final.st_mode):
+            raise OSError("private authority destination is not a regular file")
+        os.fsync(directory_fd)
+    except BaseException:
+        if file_fd is not None:
+            os.close(file_fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def _read_private_file(path: Path) -> bytes:
+    if os.name == "nt":
+        return path.read_bytes()
+    directory_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("private authority source is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory_fd)
 
 
 def _marker_signature(value: dict) -> str | None:
@@ -543,7 +676,7 @@ def _marker_signature(value: dict) -> str | None:
 def _read_task_local_marker(workspace: Path) -> dict | None:
     marker = _task_local_marker_path(workspace)
     try:
-        value = json.loads(marker.read_text(encoding="utf-8"))
+        value = json.loads(_read_private_file(marker).decode("utf-8"))
     except (OSError, ValueError, TypeError):
         return None
     if not isinstance(value, dict):
@@ -697,11 +830,10 @@ def _provision_task_local_clone(spec: WorkspaceSpec, repo: Path, workspace: Path
             )
         marker["authority_hmac"] = signature
         marker_path = _task_local_marker_path(target)
-        marker_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        marker_path.write_text(
-            json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8"
+        _atomic_write_private(
+            marker_path,
+            (json.dumps(marker, sort_keys=True) + "\n").encode("utf-8"),
         )
-        marker_path.chmod(0o600)
         return "cloned"
     except BaseException:
         # The path did not exist before this function and cannot contain user
@@ -1727,10 +1859,10 @@ def checkpoint_task_workspace(
         )
     updated["authority_hmac"] = signature
     marker_path = _task_local_marker_path(workspace)
-    temporary = marker_path.with_suffix(f"{marker_path.suffix}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(updated, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.chmod(0o600)
-    os.replace(temporary, marker_path)
+    _atomic_write_private(
+        marker_path,
+        (json.dumps(updated, sort_keys=True) + "\n").encode("utf-8"),
+    )
     return candidate
 
 

@@ -34,6 +34,7 @@ not an error — a review/analysis task legitimately changes no files.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -162,6 +163,115 @@ def _remote_branch_sha(
     return True, sha.lower()
 
 
+def _pr_snapshot(repo_path: Path, reference: str) -> tuple[int, dict[str, str] | None]:
+    result = _run(
+        [
+            "gh",
+            "pr",
+            "view",
+            reference,
+            "--json",
+            "url,headRefOid,baseRefName,state",
+        ],
+        repo_path,
+    )
+    if result.returncode != 0:
+        return result.returncode, None
+    try:
+        value = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return 0, None
+    return 0, value if isinstance(value, dict) else None
+
+
+def _verified_pr_result(
+    repo_path: Path,
+    cfg: PublishConfig,
+    branch: str,
+    head_sha: str,
+    durable_target: str,
+    durable_env: dict[str, str] | None,
+) -> PublishResult:
+    """Resolve/create the PR while the repository writer lease is held.
+
+    A URL is not evidence that the PR still points at the commit we pushed.
+    Validate head, base and open state, then make one final remote read before
+    returning success so the lease fences the entire push -> PR handoff.
+    """
+    view_status, snapshot = _pr_snapshot(repo_path, branch)
+    if view_status != 0:
+        body = f"Autonomous delivery of {cfg.task}.\n\nHEAD_SHA: {head_sha}\n"
+        created = _run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--base",
+                cfg.base,
+                "--head",
+                branch,
+                "--title",
+                f"{cfg.task}: autonomous delivery",
+                "--body",
+                body,
+            ],
+            repo_path,
+        )
+        if created.returncode != 0:
+            return PublishResult(
+                ok=False,
+                branch=branch,
+                head_sha=head_sha,
+                reason=f"pr_create_failed: {created.stderr.strip()[:160]}",
+            )
+        pr_reference = created.stdout.strip()
+        if not pr_reference:
+            return PublishResult(
+                ok=False, branch=branch, head_sha=head_sha, reason="pr_create_missing_url"
+            )
+        view_status, snapshot = _pr_snapshot(repo_path, pr_reference)
+        if view_status != 0:
+            return PublishResult(
+                ok=False,
+                branch=branch,
+                head_sha=head_sha,
+                reason="pr_unreadable_after_create",
+            )
+
+    if snapshot is None:
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_snapshot_malformed"
+        )
+    pr_url = snapshot.get("url", "")
+    if snapshot.get("headRefOid", "").lower() != head_sha.lower():
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_head_sha_mismatch"
+        )
+    if snapshot.get("baseRefName") != cfg.base:
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_base_mismatch"
+        )
+    if snapshot.get("state") != "OPEN":
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_not_open"
+        )
+    if not pr_url:
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_snapshot_missing_url"
+        )
+    durable, durable_sha = _remote_branch_sha(
+        repo_path, durable_target, branch, durable_env
+    )
+    if not durable or durable_sha != head_sha.lower():
+        return PublishResult(
+            ok=False,
+            branch=branch,
+            head_sha=head_sha,
+            reason="remote_branch_changed_during_pr_handoff",
+        )
+    return PublishResult(ok=True, branch=branch, head_sha=head_sha, pr_url=pr_url)
+
+
 def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     """Acquire the lease, push a branch, open a PR. Idempotent on the branch
     name (``backlog/<task>``): a re-run force-updates the same branch and
@@ -220,11 +330,8 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
             return PublishResult(
                 ok=False, reason="remote_branch_changed_before_pr", head_sha=head_sha
             )
-    if not already_durable:
-        lease = _run(_lease_argv(cfg, "acquire", repo_path), repo_path)
-    else:
-        lease = None
-    if lease is not None and lease.returncode != 0:
+    lease = _run(_lease_argv(cfg, "acquire", repo_path), repo_path)
+    if lease.returncode != 0:
         # The lease is held by another writer: a data refusal, the attempt
         # returns to the pool and a later tick retries — never a forced push.
         return PublishResult(ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}")
@@ -244,12 +351,8 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     # one ever run on a host. Failing this fails closed (release, refuse to
     # push) rather than attempting a push `verify` is already known to
     # reject with this stale a file.
-    hooks = (
-        _run(_lease_argv(cfg, "install-hooks", repo_path), repo_path)
-        if not already_durable
-        else None
-    )
-    if hooks is not None and hooks.returncode != 0:
+    hooks = _run(_lease_argv(cfg, "install-hooks", repo_path), repo_path)
+    if hooks.returncode != 0:
         if cfg.release_lease:
             _run(_lease_argv(cfg, "release", repo_path), repo_path)
         return PublishResult(
@@ -327,27 +430,14 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
                     reason="remote_branch_head_not_durable_after_push",
                     head_sha=head_sha,
                 )
-    finally:
-        if not already_durable and cfg.release_lease:
-            _run(_lease_argv(cfg, "release", repo_path), repo_path)
-
-    body = (
-        f"Autonomous delivery of {cfg.task}.\n\n"
-        f"HEAD_SHA: {head_sha}\n"
-    )
-    existing = _run(
-        ["gh", "pr", "view", branch, "--json", "url", "-q", ".url"], repo_path
-    )
-    if existing.returncode == 0 and existing.stdout.strip():
-        return PublishResult(ok=True, branch=branch, head_sha=head_sha, pr_url=existing.stdout.strip())
-    created = _run(
-        ["gh", "pr", "create", "--base", cfg.base, "--head", branch,
-         "--title", f"{cfg.task}: autonomous delivery", "--body", body],
-        repo_path,
-    )
-    if created.returncode != 0:
-        return PublishResult(
-            ok=False, branch=branch, head_sha=head_sha,
-            reason=f"pr_create_failed: {created.stderr.strip()[:160]}",
+        return _verified_pr_result(
+            repo_path,
+            cfg,
+            branch,
+            head_sha,
+            durable_target,
+            durable_env,
         )
-    return PublishResult(ok=True, branch=branch, head_sha=head_sha, pr_url=created.stdout.strip())
+    finally:
+        if cfg.release_lease:
+            _run(_lease_argv(cfg, "release", repo_path), repo_path)

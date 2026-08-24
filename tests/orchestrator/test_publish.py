@@ -39,11 +39,17 @@ def repo(tmp_path):
     lease.write_text(f"#!/bin/sh\necho \"lease $*\" >> {calls}\nexit 0\n")
     lease.chmod(0o755)
     gh = bin_ / "gh"
+    pr_exists = tmp_path / "pr.exists"
     gh.write_text(
         f"#!/bin/sh\necho \"gh $*\" >> {calls}\n"
         "case \"$2\" in\n"
-        "  view) exit 1 ;;\n"  # no existing PR
-        "  create) echo 'https://github.com/x/y/pull/1'; exit 0 ;;\n"
+        f"  view) [ -f {pr_exists} ] || exit 1; "
+        "head=$(git rev-parse HEAD); "
+        "printf '{\"url\":\"https://github.com/x/y/pull/1\","
+        "\"headRefOid\":\"%s\",\"baseRefName\":\"main\","
+        "\"state\":\"OPEN\"}\\n' \"$head\"; exit 0 ;;\n"
+        f"  create) touch {pr_exists}; "
+        "echo 'https://github.com/x/y/pull/1'; exit 0 ;;\n"
         "esac\n"
     )
     gh.chmod(0o755)
@@ -107,6 +113,62 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     # the CLI at all, so acquire silently got the tool's own default
     # instead of PublishConfig.ttl's declared 600.
     assert "--ttl 600" in log
+
+
+def test_existing_pr_head_race_fails_before_lease_release(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+    gh = bin_ / "gh"
+    gh.write_text(
+        f"#!/bin/sh\necho \"gh $*\" >> {calls}\n"
+        "case \"$2\" in\n"
+        "  view) printf '{\"url\":\"https://github.com/x/y/pull/1\","
+        "\"headRefOid\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+        "\"baseRefName\":\"main\",\"state\":\"OPEN\"}\\n'; exit 0 ;;\n"
+        "esac\n"
+    )
+    gh.chmod(0o755)
+
+    result = publish_run(work, _cfg(bin_))
+
+    assert not result.ok and result.reason == "pr_head_sha_mismatch"
+    log = calls.read_text()
+    assert log.index("gh pr view") < log.index(" release ")
+
+
+def test_created_pr_remote_race_fails_before_lease_release(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+    gh = bin_ / "gh"
+    created = work.parent / "created.flag"
+    bare = work.parent / "origin.git"
+    gh.write_text(
+        f"#!/bin/sh\necho \"gh $*\" >> {calls}\n"
+        "case \"$2\" in\n"
+        f"  view) [ -f {created} ] || exit 1; "
+        f"git --git-dir={bare} update-ref refs/heads/backlog/VOYN-W0-TEST {base}; "
+        f"printf '{{\"url\":\"https://github.com/x/y/pull/1\","
+        f"\"headRefOid\":\"{head}\",\"baseRefName\":\"main\","
+        "\"state\":\"OPEN\"}\\n'; exit 0 ;;\n"
+        f"  create) touch {created}; echo 'https://github.com/x/y/pull/1'; exit 0 ;;\n"
+        "esac\n"
+    )
+    gh.chmod(0o755)
+
+    result = publish_run(work, _cfg(bin_))
+
+    assert not result.ok
+    assert result.reason == "remote_branch_changed_during_pr_handoff"
+    log = calls.read_text()
+    assert log.index("gh pr create") < log.index(" release ")
 
 
 def test_already_durable_branch_is_rechecked_before_pr(repo, monkeypatch):

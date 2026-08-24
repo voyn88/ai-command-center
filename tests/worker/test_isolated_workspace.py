@@ -31,6 +31,19 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
+def _write_exact_pr_gh(path: Path, url: str) -> None:
+    path.write_text(
+        "#!/bin/sh\n"
+        "case \"$2\" in\n"
+        "  view) head=$(git rev-parse HEAD); "
+        f"printf '{{\"url\":\"{url}\",\"headRefOid\":\"%s\","
+        "\"baseRefName\":\"main\",\"state\":\"OPEN\"}\\n' \"$head\"; exit 0 ;;\n"
+        f"  create) echo '{url}'; exit 0 ;;\n"
+        "esac\n"
+    )
+    path.chmod(0o755)
+
+
 def _make_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     _git(path, "init", "-q")
@@ -140,7 +153,7 @@ def agent(monkeypatch, tmp_path):
         agent_runner, "validate_repository", lambda project_id, path: repo
     )
     monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda: (True, "ok"))
-    monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", "test-workspace-authority")
+    monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", "hex:" + "42" * 32)
     monkeypatch.delenv("VOYN_LEASE_DSN", raising=False)
     monkeypatch.delenv("AICC_PUBLISH_DEPLOY_KEY", raising=False)
     return build_handlers()["agent_run"], repo
@@ -169,14 +182,7 @@ def agent_with_publish(agent, monkeypatch, tmp_path):
     lease.write_text("#!/bin/sh\nexit 0\n")
     lease.chmod(0o755)
     gh = bin_dir / "gh"
-    gh.write_text(
-        "#!/bin/sh\n"
-        "case \"$2\" in\n"
-        "  view) exit 1 ;;\n"  # no existing PR
-        "  create) echo 'https://github.com/o/r/pull/1'; exit 0 ;;\n"
-        "esac\n"
-    )
-    gh.chmod(0o755)
+    _write_exact_pr_gh(gh, "https://github.com/o/r/pull/1")
 
     import os
 
@@ -438,13 +444,7 @@ def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
 
     # The push is already durable, then main advances before redelivery. The
     # retry must reuse the saved commit and finish only the missing PR step.
-    (bin_dir / "gh").write_text(
-        "#!/bin/sh\n"
-        "case \"$2\" in\n"
-        "  view) exit 1 ;;\n"
-        "  create) echo 'https://github.com/o/r/pull/2'; exit 0 ;;\n"
-        "esac\n"
-    )
+    _write_exact_pr_gh(bin_dir / "gh", "https://github.com/o/r/pull/2")
     (repo / "main-advanced.txt").write_text("new main\n")
     _git(repo, "add", "main-advanced.txt")
     _git(repo, "commit", "-q", "-m", "advance main")
@@ -512,13 +512,7 @@ def test_reused_clone_never_executes_agent_git_config_before_retry_publish(
     assert first.ok and first.result["publish"]["ok"] is False
     assert not sentinel.exists()
 
-    (bin_dir / "gh").write_text(
-        "#!/bin/sh\n"
-        "case \"$2\" in\n"
-        "  view) exit 1 ;;\n"
-        "  create) echo 'https://github.com/o/r/pull/3'; exit 0 ;;\n"
-        "esac\n"
-    )
+    _write_exact_pr_gh(bin_dir / "gh", "https://github.com/o/r/pull/3")
     monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run(commit=False))
     second = run_agent(_payload(), _event(), 2)
 
