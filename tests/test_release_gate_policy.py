@@ -41,7 +41,10 @@ EXPECTED_STEPS = {
     },
     "manifest-gate": {"Verify four identical non-empty manifests"},
     "coverage-gate": {"PR and merge-group coverage policy"},
-    "impact-fast-check": {"Select impacted tests", "Run impacted tests (parallel)"},
+    "impact-fast-check": {
+        "Select impacted tests",
+        "Run impacted tests (parallel body + serial tail)",
+    },
     "windows-quality-gates": {"Desktop pytest-qt suite", "Real-browser E2E"},
     "security-gates": {
         "Release gate policy",
@@ -144,6 +147,24 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
     for job_id, required_steps in EXPECTED_STEPS.items():
         step_names = {step.get("name") for step in jobs[job_id]["steps"]}
         assert required_steps <= step_names
+
+
+def test_impact_fast_check_uses_the_mandatory_two_phase_serial_split() -> None:
+    impact = _workflow(CI_WORKFLOW)["jobs"]["impact-fast-check"]
+    (step,) = [
+        step
+        for step in impact["steps"]
+        if step.get("name") == "Run impacted tests (parallel body + serial tail)"
+    ]
+    command = step["run"]
+
+    assert 'run_phase -q -m "not serial" -n auto --dist loadscope' in command
+    assert "run_phase -q -m serial -p no:xdist" in command
+    assert 'if [ "$rc" -eq 5 ]' in command
+    assert 'if [ "${#selected[@]}" -eq 0 ]' in command
+    assert "xargs" not in "\n".join(
+        line for line in command.splitlines() if not line.lstrip().startswith("#")
+    )
 
 
 SECRET_REFERENCE = re.compile(r"\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)[^}]*\}\}")
