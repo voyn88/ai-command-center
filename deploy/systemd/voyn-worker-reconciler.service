@@ -1,13 +1,14 @@
 [Unit]
-Description=Recover unhealthy AICC worker lanes with a bounded circuit breaker
-After=voyn-aicc-worker@1.service voyn-aicc-worker@2.service
-Wants=voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+Description=Recover declared AICC worker lanes with a bounded circuit breaker
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 User=root
 Group=root
 ExecStart=/usr/local/sbin/voyn-worker-reconcile
+TimeoutStartSec=3900s
 StateDirectory=voyn-worker-reconciler
 StateDirectoryMode=0700
 NoNewPrivileges=true

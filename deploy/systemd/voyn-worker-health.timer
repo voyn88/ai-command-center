@@ -1,5 +1,5 @@
 [Unit]
-Description=Probe both AICC worker lanes every minute
+Description=Probe the declared AICC worker fleet every minute
 
 [Timer]
 OnBootSec=2min

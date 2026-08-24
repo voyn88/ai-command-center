@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from contextlib import nullcontext
 
@@ -115,6 +116,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail unless the reconciler heartbeat is fresh and no component circuit is open.",
     )
     health.add_argument("--max-age-seconds", type=int, default=180)
+    notify = sub.add_parser(
+        "control-plane-notify",
+        help="Deliver durable owner alerts through the configured HTTPS adapter.",
+    )
+    notify.add_argument("--limit", type=int, default=20)
+    notify_health = sub.add_parser(
+        "control-plane-notification-health",
+        help="Dead-man check for dead or overdue owner alerts.",
+    )
+    notify_health.add_argument("--max-age-seconds", type=int, default=900)
+    deploy = sub.add_parser(
+        "control-plane-record-deployment",
+        help="Record an exact deployment (requires the aicc_deployer DB principal).",
+    )
+    deploy.add_argument("task_id")
+    deploy.add_argument("merged_sha")
+    deploy.add_argument("--environment", default="preprod")
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -161,6 +179,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "upgrade":
+                # A newly introduced narrow principal must exist before the
+                # migration defining its function is granted. The migrator has
+                # bounded CREATEROLE for this purpose; the statement is
+                # advisory-lock protected and idempotent.
+                with conn.cursor() as cur:
+                    cur.execute(roles.render_role_creation(roles.DEPLOYER_ROLE))
                 applied = migrations.upgrade(conn)
                 print(f"applied: {list(applied)}" if applied else "already up to date")
                 # Unconditionally, not only when something was applied: a table
@@ -333,6 +357,53 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"SKIP      {task_id}: {reason}")
                 return 0
 
+            if args.command == "control-plane-record-deployment":
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT control_plane_record_deployment(%s,%s,%s)",
+                        (args.task_id, args.merged_sha, args.environment),
+                    )
+                    recorded = bool(cur.fetchone()[0])
+                print("recorded" if recorded else "refused")
+                return 0 if recorded else 1
+
+            if args.command in {
+                "control-plane-notify",
+                "control-plane-notification-health",
+            }:
+                from datetime import UTC, datetime
+
+                from command_center.orchestrator.control_plane import (
+                    HttpsNotificationAdapter,
+                    PostgresControlPlaneStore,
+                )
+
+                notification_store = PostgresControlPlaneStore(
+                    lambda: nullcontext(conn)
+                )
+                if args.command == "control-plane-notification-health":
+                    healthy, detail = notification_store.notification_health(
+                        now=datetime.now(UTC), max_age_seconds=args.max_age_seconds
+                    )
+                    print(detail)
+                    return 0 if healthy else 1
+                endpoint = os.environ.get("AICC_OWNER_ALERT_URL", "").strip()
+                if not endpoint:
+                    print("AICC_OWNER_ALERT_URL is required", file=sys.stderr)
+                    return 2
+                adapter = HttpsNotificationAdapter(
+                    endpoint, os.environ.get("AICC_OWNER_ALERT_TOKEN", "")
+                )
+                outcomes = notification_store.deliver_notifications(
+                    adapter,
+                    claimant="aicc-control-plane-notifier",
+                    now=datetime.now(UTC),
+                    limit=args.limit,
+                )
+                for notification_id, outcome in outcomes:
+                    print(f"{notification_id}: {outcome}")
+                return 1 if any(state == "dead" for _, state in outcomes) else 0
+
             if args.command == "control-plane-reconcile":
                 from command_center.db.work_queue_store import WorkQueueStore
                 from command_center.orchestrator.control_plane import (
@@ -343,6 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                     Reconciler,
                     SystemdUnitManager,
                 )
+                from command_center.orchestrator.desired_state import load
                 from command_center.orchestrator.review_merge import (
                     _has_accept_marker,
                     merge_once,
@@ -354,7 +426,17 @@ def main(argv: list[str] | None = None) -> int:
 
                 queue = WorkQueueStore(factory)
                 store = PostgresControlPlaneStore(factory)
-                config = ControlPlaneConfig(max_actions_per_tick=args.max_actions)
+                registry = load(
+                    os.environ.get(
+                        "AICC_DESIRED_STATE_FILE", "/etc/aicc/desired-state.json"
+                    )
+                )
+                config = ControlPlaneConfig(
+                    max_actions_per_tick=args.max_actions,
+                    desired_units=registry.control.units,
+                    max_unit_restarts=registry.control.max_restarts,
+                    unit_circuit_seconds=registry.control.circuit_open_seconds,
+                )
 
                 def record_acceptance(task_id, pr_url):
                     accepted, head = _has_accept_marker(args.repo_path, pr_url)
@@ -383,10 +465,16 @@ def main(argv: list[str] | None = None) -> int:
                             task_id=lane.task_id,
                         )
                     )
+                    guard.progress(
+                        f"review-enqueue:{lane.payload.get('head_sha', 'unknown')}"
+                    )
                     verdict = guard.effect(
                         lambda: publish_review_verdicts(
                             factory, args.repo_path, task_id=lane.task_id
                         )
+                    )
+                    guard.progress(
+                        f"review-verdict:{lane.payload.get('head_sha', 'unknown')}"
                     )
                     marker_already_exists = any(
                         reason == "marker_already_posted"
@@ -435,12 +523,21 @@ def main(argv: list[str] | None = None) -> int:
                             factory, args.repo_path, task_id=lane.task_id
                         )
                     )
+                    guard.progress(
+                        "merge-observed:"
+                        + str(
+                            lane.payload.get("merged_sha")
+                            or lane.payload.get("head_sha")
+                            or "unknown"
+                        )
+                    )
                     if report.merged:
                         return ActionOutcome.succeeded(Action.DEPLOY, owner="deployer")
                     detail = ";".join(reason for _task, reason in report.skipped)
                     if (
                         detail.startswith("checks_not_green")
                         or detail == "no_accept_marker_on_head"
+                        or detail == "merge_queued_awaiting_merge"
                     ):
                         return ActionOutcome.waiting(seconds=60, detail=detail)
                     return ActionOutcome.retry(detail or "merge_not_progressed")
@@ -457,7 +554,8 @@ def main(argv: list[str] | None = None) -> int:
                     # Deployment runs under a separate capability/principal. An
                     # unavailable deployer must not pin an already-merged source
                     # lane or consume its retry budget; split an idempotent
-                    # operational blocker and continue to backlog reconciliation.
+                    # operational blocker while the source lane keeps waiting
+                    # on the dedicated deployment capability.
                     return ActionOutcome.deployment_blocked(
                         "deployment_capability_not_configured"
                     )
@@ -477,7 +575,10 @@ def main(argv: list[str] | None = None) -> int:
                 }
                 report = Reconciler(
                     store,
-                    SystemdUnitManager(config.desired_units),
+                    SystemdUnitManager(
+                        config.desired_units,
+                        max_restarts=config.max_unit_restarts,
+                    ),
                     handlers,
                     config,
                 ).run_once(dry_run=args.dry_run)

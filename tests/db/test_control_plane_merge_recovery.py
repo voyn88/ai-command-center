@@ -37,9 +37,7 @@ def test_merge_reconciles_github_success_after_crash_before_database_commit(
                         "author": {"login": "independent-reviewer"},
                     }
                 ],
-                "statusCheckRollup": [
-                    {"name": "CI", "conclusion": "SUCCESS"}
-                ],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -101,7 +99,7 @@ def test_merge_queue_enqueue_is_not_reported_or_recorded_as_merged(
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
         cur.execute(
             "SELECT count(*) FROM backlog_evidence WHERE task_id=%s "
-            "AND kind='ci' AND value LIKE 'MERGED:%'",
+            "AND kind='ci' AND value LIKE 'MERGED:%%'",
             (task_id,),
         )
         assert cur.fetchone()[0] == 0

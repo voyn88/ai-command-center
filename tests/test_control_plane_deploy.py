@@ -12,6 +12,8 @@ def test_control_plane_units_and_installer_are_versioned_and_fail_closed():
         "aicc-control-plane-reconciler.timer",
         "aicc-control-plane-watchdog.service",
         "aicc-control-plane-watchdog.timer",
+        "aicc-control-plane-notify.service",
+        "aicc-control-plane-notify.timer",
     }
     assert expected <= {path.name for path in systemd.iterdir()}
 
@@ -32,14 +34,16 @@ def test_control_plane_units_and_installer_are_versioned_and_fail_closed():
     assert "deployed-sha" in installer
     assert "--dry-run" in installer
     assert "control-plane-health" in installer
-    assert "enable --now aicc-control-plane-reconciler.timer" in installer
-    for timer in (
-        "aicc-backlog-planner.timer",
-        "aicc-backlog-review.timer",
-        "aicc-backlog-merge.timer",
-        "aicc-queue-reaper.timer",
-    ):
-        assert timer in installer
+    assert "control-plane-notification-health" in installer
+    assert "control-plane-record-deployment" in installer
+    assert "systemd-analyze verify" in installer
+    assert "/etc/aicc/desired-state.json" in installer
+    assert "/etc/aicc/deployer.env" in installer
+    assert installer.index("migrator.env upgrade") < installer.index("daemon-reload")
+    assert installer.index("daemon-reload") < installer.index("--dry-run")
+    assert installer.index("--dry-run") < installer.index("enable --now")
+    assert "control-units" in installer
+    assert 'enable --now "${timer_units[@]}"' in installer
     for service_name in ("aicc-backlog-review.service", "aicc-backlog-merge.service"):
         service_text = (systemd / service_name).read_text()
         assert "User=aicc-app" in service_text
@@ -48,8 +52,10 @@ def test_control_plane_units_and_installer_are_versioned_and_fail_closed():
     assert "git clone --local --no-hardlinks --no-checkout" in bootstrap
     assert "uv sync" in bootstrap and "--frozen" in bootstrap
     assert "root:(400|600)" in bootstrap
+    assert "/etc/aicc/migrator.env" in bootstrap
+    assert "/etc/aicc/deployer.env" in bootstrap
     assert "status --porcelain)" in bootstrap
-    assert "exec \"$TARGET/ops/install_control_plane.sh\"" in bootstrap
+    assert 'exec "$TARGET/ops/install_control_plane.sh"' in bootstrap
 
 
 def test_watchdog_repairs_once_and_requires_a_fresh_post_repair_probe():
@@ -60,6 +66,10 @@ def test_watchdog_repairs_once_and_requires_a_fresh_post_repair_probe():
     second = script.rindex("control-plane-health")
 
     assert first < repair_timer < repair_tick < second
+    notification_first = script.index("control-plane-notification-health")
+    notification_repair = script.index("systemctl start aicc-control-plane-notify")
+    notification_second = script.rindex("control-plane-notification-health")
+    assert notification_first < notification_repair < notification_second
     assert "set -euo pipefail" in script
 
 

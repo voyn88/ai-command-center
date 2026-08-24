@@ -1,7 +1,7 @@
 [Unit]
-Description=Health probe for both AICC worker lanes
-After=voyn-aicc-worker@1.service voyn-aicc-worker@2.service
-Wants=voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+Description=Health probe for the declared AICC worker fleet
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot

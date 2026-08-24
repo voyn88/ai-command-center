@@ -8,11 +8,23 @@ readonly EVIDENCE_FILE="$STATE_DIR/evidence.json"
 readonly HEALTH_PROBE=${HEALTH_PROBE:-/usr/local/sbin/voyn-worker-health}
 readonly DEPLOYED_SHA_FILE=${VOYN_MONITOR_DEPLOYED_SHA_FILE:-/var/lib/voyn-worker-monitor/deployed-sha}
 readonly SYSTEMCTL_BIN=${SYSTEMCTL_BIN:-/bin/systemctl}
+readonly PYTHON_BIN=${PYTHON_BIN:-/usr/bin/python3}
+readonly DESIRED_STATE_READER=${DESIRED_STATE_READER:-/usr/local/libexec/aicc-desired-state}
+readonly DESIRED_STATE_FILE=${AICC_DESIRED_STATE_FILE:-/etc/voyn/aicc-desired-state.json}
 readonly SHA256SUM_BIN=${SHA256SUM_BIN:-/usr/bin/sha256sum}
 readonly SAMPLE_SECONDS=${VOYN_CANARY_SAMPLE_SECONDS:-60}
 readonly DURATION_SECONDS=${VOYN_CANARY_DURATION_SECONDS:-86400}
 readonly MIN_SAMPLES=${VOYN_CANARY_MIN_SAMPLES:-1300}
-readonly WORKER_UNITS=(voyn-aicc-worker@1.service voyn-aicc-worker@2.service)
+WORKER_UNITS=()
+while IFS= read -r unit; do
+  WORKER_UNITS+=("$unit")
+done < <("$PYTHON_BIN" "$DESIRED_STATE_READER" "$DESIRED_STATE_FILE" worker-units)
+readonly WORKER_UNITS
+DESIRED_STATE_SHA=$(
+  "$PYTHON_BIN" "$DESIRED_STATE_READER" "$DESIRED_STATE_FILE" sha256
+)
+readonly DESIRED_STATE_SHA
+(( ${#WORKER_UNITS[@]} > 0 )) || { echo "worker registry is empty" >&2; exit 2; }
 
 state_value() {
   local key=$1
@@ -40,6 +52,7 @@ start() {
     printf 'boot_id=%s\n' "$(< /proc/sys/kernel/random/boot_id)"
     printf 'health_probe_sha256=%s\n' "$("$SHA256SUM_BIN" "$HEALTH_PROBE" | cut -d' ' -f1)"
     printf 'deployed_sha=%s\n' "$deployed_sha"
+    printf 'desired_state_sha256=%s\n' "$DESIRED_STATE_SHA"
     printf 'failures=0\n'
     local unit restarts
     for unit in "${WORKER_UNITS[@]}"; do
@@ -135,6 +148,7 @@ evidence = {
     "boot_id": state["boot_id"],
     "health_probe_sha256": state["health_probe_sha256"],
     "deployed_sha": state["deployed_sha"],
+    "desired_state_sha256": state["desired_state_sha256"],
     "sample_count": len(samples),
     "failures": int(state["failures"]),
     "restart_baselines": baselines,

@@ -6,6 +6,9 @@ The reconciler is a control-only rollout. It does not restart workers and does
 not relax the writer lease, exact-SHA acceptance or merge gates. Its PostgreSQL
 lane is the durable authority for `next_action`, owner, deadline, heartbeat and
 retry budget; systemd timers are replaceable wake-up mechanisms.
+`deploy/config/aicc-desired-state.json` is the versioned desired-state registry
+for the exact control units and worker lanes. Consumers reject unknown keys,
+duplicate/malformed units and drain policies that cannot preserve readiness.
 
 ## Preconditions
 
@@ -20,21 +23,25 @@ retry budget; systemd timers are replaceable wake-up mechanisms.
 4. Confirm `/etc/aicc/app.env` is root-readable and contains the application
    PostgreSQL and independent GitHub App settings. It must not contain an
    agent/model credential.
+5. Provision separate root-owned `migrator.env` and `deployer.env` files. The
+   deployer authenticates as `aicc_deployer`; `aicc_app` cannot create a
+   deployment attestation.
 
 ## Ordered rollout
 
 ```text
 drain control ticks (workers continue) -> deploy exact merged SHA ->
-database backup/restore point -> migrator upgrade -> control-plane dry-run ->
-install root-owned units from exact SHA -> readiness -> recovery drills -> canary
+database backup/restore point -> migrator upgrade -> install/verify root-owned
+unit definitions from exact SHA -> read-only activation plan -> enable ->
+readiness -> recovery drills -> canary
 ```
 
 Commands are intentionally split by privilege:
 
 ```bash
-# first install only; the third argument is a root-owned 0400/0600 env file
+# first install only; the three env files are separate 0400/0600 capabilities
 sudo ./ops/bootstrap_control_plane.sh <trusted-clean-source> <merged-sha> \
-  /root/aicc-app.env
+  /root/aicc-app.env /root/aicc-migrator.env /root/aicc-deployer.env <task-id>
 
 # migrator identity
 /opt/aicc/.venv/bin/python -m command_center.db upgrade
@@ -42,13 +49,13 @@ sudo ./ops/bootstrap_control_plane.sh <trusted-clean-source> <merged-sha> \
 # read-only application-identity probe
 /opt/aicc/.venv/bin/python -m command_center.db control-plane-reconcile --dry-run
 
-# root; argument two is the exact merged SHA
-/opt/aicc/ops/install_control_plane.sh /opt/aicc <merged-sha>
+# root; the deploy principal attests the exact task + merged SHA after readiness
+/opt/aicc/ops/install_control_plane.sh /opt/aicc <merged-sha> <task-id>
 ```
 
 The installer refuses a non-root caller, a dirty/different checkout, a missing
-runtime/env file, a red database status or a red dry-run. It then installs the
-four versioned unit files as root, enables the reconciler and independent
+runtime/env file, invalid unit definitions, a red database status or a red
+activation dry-run. It installs the versioned unit files as root, enables the reconciler and independent
 watchdog timers, runs one tick and requires a fresh healthy heartbeat. Only
 after all of those gates pass it atomically records the exact merged SHA in
 root-owned `/var/lib/aicc-control-plane/deployed-sha`.
@@ -62,10 +69,9 @@ root-owned `/var/lib/aicc-control-plane/deployed-sha`.
    return it to READY once; at exhausted retry budget it must become BLOCKED,
    never duplicate execution.
 3. Make an allowlisted unit fail three times. Its persisted circuit opens for
-   the configured cooldown and the resulting event becomes the only input an
-   owner-notification adapter may consume. This slice records the escalation
-   durably; installing a delivery channel is a separate deployment-specific
-   adapter, not a hard-coded chat/webhook in the supervisor.
+   the configured cooldown. The durable outbox must deliver the owner alert
+   through the configured HTTPS adapter, retry with backoff, and make the
+   independent watchdog red if an alert becomes DEAD or remains overdue.
 4. Complete tests and independent review evidence for a canary commit. Exactly
    one GUARDED_PUBLISH action must be dispatched by the publisher capability,
    followed by CI, exact-SHA acceptance, merge and backlog evidence.
@@ -74,20 +80,24 @@ root-owned `/var/lib/aicc-control-plane/deployed-sha`.
    it must neither enter backlog sync nor convert a technical failure into
    `DEFER_TO_USER` before matching deployment evidence exists.
 
-Worker crash/restart and 3600-second drain drills remain gated on
-`VOYN-W0-AICC-ROTATE-PY-UNTRACKED`; this control-only rollout must not guess at
-worker shutdown semantics.
+Worker recovery is activated only after `VOYN-W0-AICC-ROTATE-PY-UNTRACKED`
+installs the versioned drain protocol and a stop timeout at least as long as
+the registry's maximum-job plus drain-grace budget.
 
 ## Worker monitor correction
 
-The worker-side monitor rollout is versioned separately and never restarts an
-AICC worker. `voyn-worker-health` now proves systemd `Type=notify` readiness and
-a fresh watchdog timestamp for both canonical worker instances; it has no dependency on the retired
-`voyn-claude.service` or `/run/voyn-claude/heartbeat`. The canonical lanes are
-`voyn-aicc-worker@1.service` and `voyn-aicc-worker@2.service`; every health,
-recovery and canary consumer targets those same two template instances. The 24-hour canary uses
-the same two-lane probe and a new state directory, so old Claude-canary state
-cannot be mistaken for current evidence.
+The worker-side monitor rollout reads an arbitrary lane set and minimum-ready
+quorum from the desired-state registry. Each tick drains at most one unhealthy
+lane, keeps the declared ready quorum live, allows the configured maximum job
+to finish, and waits for that lane's readiness. A recovery that would violate
+quorum fails closed and contributes to the generic circuit breaker.
+`voyn-worker-health` proves systemd `Type=notify-reload` readiness, bounded
+restart count and a fresh watchdog timestamp for every declared worker; it has
+no dependency on the retired `voyn-claude.service` or
+`/run/voyn-claude/heartbeat`. Every health, recovery, installer and canary
+consumer reads the same registry. The 24-hour canary binds its evidence to the
+registry digest and a new state directory, so old Claude-canary state cannot be
+mistaken for current evidence.
 
 Findings delivery reads its control endpoint from the root-owned
 `/etc/voyn/findings-sync.env`. The shipped default is the stable Tailscale DNS
@@ -104,7 +114,7 @@ sudo /home/voynadmin/aicc-preprod/repo/ops/install_worker_monitors.sh \
 ```
 
 The installer validates the exact SHA, scripts, root-owned configuration,
-pinned endpoint and current readiness of both workers before replacing monitor
+pinned endpoint and current readiness of the declared fleet before replacing monitor
 units. It only restarts the monitor canary and enables monitor timers; worker
 restart/drain remains the rotation rollout's responsibility.
 It also atomically records that exact merged SHA in the root-owned

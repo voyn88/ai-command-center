@@ -153,6 +153,14 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-CONTROL-PLANE-RECONCILER",
     ),
+    "control_plane_deployment": Exclusion(
+        reason=(
+            "PostgreSQL-native deployment attestation written only by the "
+            "dedicated deploy principal; mirroring it into an app-writable "
+            "store would erase the trust boundary it proves."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RECONCILER",
+    ),
     "queue_entry": Exclusion(
         reason=(
             "Mirrored under a contract of its own rather than the shared one: the "

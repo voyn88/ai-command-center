@@ -19,6 +19,9 @@ CREATE TABLE control_plane_lane (
     claimant         text,
     deadline_at      timestamptz NOT NULL,
     heartbeat_at     timestamptz,
+    progress_at      timestamptz NOT NULL DEFAULT now(),
+    progress_token   text,
+    interrupt_requested_at timestamptz,
     lease_expires_at timestamptz,
     attempts         integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     max_attempts     integer NOT NULL DEFAULT 5 CHECK (max_attempts BETWEEN 1 AND 100),
@@ -55,11 +58,60 @@ CREATE TABLE control_plane_notification (
     owner            text NOT NULL,
     payload          jsonb NOT NULL DEFAULT '{}'::jsonb,
     state            text NOT NULL DEFAULT 'PENDING'
-                     CHECK (state IN ('PENDING', 'SENT')),
+                     CHECK (state IN ('PENDING', 'DELIVERING', 'SENT', 'DEAD')),
+    attempts         integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    max_attempts     integer NOT NULL DEFAULT 8 CHECK (max_attempts BETWEEN 1 AND 100),
+    available_at     timestamptz NOT NULL DEFAULT now(),
+    claimed_by       text,
+    lease_expires_at timestamptz,
+    last_error       text,
     dedupe_key       text NOT NULL UNIQUE,
     created_at       timestamptz NOT NULL DEFAULT now(),
     sent_at          timestamptz
 );
+
+CREATE INDEX idx_control_plane_notification_due
+    ON control_plane_notification(state, available_at, lease_expires_at);
+
+-- Deployment is a separate authority. aicc_app may read this attestation but
+-- cannot write it; the only writer is the dedicated deploy login through the
+-- function below, which additionally proves the exact merge commit.
+CREATE TABLE control_plane_deployment (
+    task_id       text NOT NULL REFERENCES backlog_task(task_id),
+    merged_sha    text NOT NULL CHECK (merged_sha ~ '^[0-9a-f]{40}$'),
+    environment   text NOT NULL CHECK (length(environment) > 0),
+    deployed_by   text NOT NULL,
+    deployed_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, merged_sha, environment)
+);
+
+CREATE FUNCTION control_plane_record_deployment(
+    p_task_id text, p_merged_sha text, p_environment text
+) RETURNS boolean
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+    SET search_path = pg_catalog, public AS $$
+DECLARE verdict backlog_verdict;
+BEGIN
+    IF session_user <> 'aicc_deployer' THEN
+        RAISE EXCEPTION 'deployment attestation requires aicc_deployer'
+            USING ERRCODE = '42501';
+    END IF;
+    IF p_merged_sha !~ '^[0-9a-f]{40}$' OR coalesce(p_environment, '') = '' THEN
+        RETURN false;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM backlog_evidence
+         WHERE task_id=p_task_id AND kind='ci' AND value='MERGED:' || p_merged_sha
+    ) THEN
+        RETURN false;
+    END IF;
+    INSERT INTO control_plane_deployment(task_id, merged_sha, environment, deployed_by)
+    VALUES (p_task_id, p_merged_sha, p_environment, session_user)
+    ON CONFLICT DO NOTHING;
+    verdict := backlog_record_evidence(p_task_id, 'ci', 'DEPLOYED:' || p_merged_sha);
+    RETURN verdict.ok;
+END
+$$;
 
 CREATE TABLE control_plane_component (
     component         text PRIMARY KEY,
@@ -76,4 +128,5 @@ CREATE TABLE control_plane_component (
 );
 
 REVOKE ALL ON control_plane_lane, control_plane_event, control_plane_notification,
-    control_plane_component FROM PUBLIC;
+    control_plane_deployment, control_plane_component FROM PUBLIC;
+REVOKE ALL ON FUNCTION control_plane_record_deployment(text, text, text) FROM PUBLIC;

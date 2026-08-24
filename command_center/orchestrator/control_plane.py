@@ -19,17 +19,22 @@ import re
 import subprocess
 import threading
 import time
+import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
+from urllib.parse import urlparse
+
+_JSON_ERRORS = (TypeError, json.JSONDecodeError)
 
 __all__ = [
     "Action",
     "ActionOutcome",
     "ControlPlaneConfig",
     "ControlPlaneReport",
+    "HttpsNotificationAdapter",
     "LaneLeaseGuard",
     "LaneLeaseLost",
     "PostgresControlPlaneStore",
@@ -106,6 +111,9 @@ class ControlPlaneStore(Protocol):
     def lane_heartbeat(
         self, lane: Lane, claimant: str, *, now: datetime, lease_seconds: int
     ) -> bool: ...
+    def lane_progress(
+        self, lane: Lane, claimant: str, token: str, *, now: datetime
+    ) -> bool: ...
     def fenced_effect(
         self,
         lane: Lane,
@@ -151,10 +159,12 @@ class SystemdUnitManager:
         *,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         attempts: int = 2,
+        max_restarts: int = 3,
     ) -> None:
         self._allowed = frozenset(allowed_units)
         self._runner = runner
         self._attempts = max(1, attempts)
+        self._max_restarts = max(0, max_restarts)
 
     def _run(self, *argv: str) -> subprocess.CompletedProcess[str]:
         return self._runner(
@@ -169,23 +179,66 @@ class SystemdUnitManager:
             "--property=LoadState",
             "--property=ActiveState",
             "--property=SubState",
+            "--property=Result",
+            "--property=NRestarts",
         )
         if shown.returncode != 0:
             return UnitProbe(unit, False, f"probe_failed:{shown.stderr.strip()[:160]}")
         values = dict(
             line.split("=", 1) for line in shown.stdout.splitlines() if "=" in line
         )
-        healthy = (
-            values.get("LoadState") == "loaded"
-            and values.get("ActiveState") == "active"
+        result = values.get("Result", "")
+        active = values.get("ActiveState")
+        restart_text = values.get("NRestarts", "")
+        restart_count = int(restart_text) if restart_text.isdigit() else None
+        # Timers/long-running services must be active. A completed oneshot is
+        # healthy while inactive only when systemd recorded a clean result.
+        healthy = values.get("LoadState") == "loaded" and result not in {
+            "exit-code",
+            "signal",
+            "timeout",
+            "watchdog",
+            "core-dump",
+            "resources",
+        }
+        healthy = healthy and (
+            active in {"active", "activating"}
+            or (
+                unit.endswith(".service")
+                and active == "inactive"
+                and result == "success"
+            )
         )
+        if unit.endswith(".service"):
+            healthy = healthy and restart_count is not None
+        if restart_count is not None and restart_count > self._max_restarts:
+            healthy = False
         return UnitProbe(unit, healthy, json.dumps(values, sort_keys=True))
 
     def ensure_active(self, unit: str, *, dry_run: bool) -> UnitProbe:
         if unit not in self._allowed:
             return UnitProbe(unit, False, "unit_not_allowlisted")
         probe = self._probe(unit)
-        if probe.healthy or dry_run:
+        if probe.healthy:
+            return probe
+        if dry_run:
+            try:
+                values = json.loads(probe.detail)
+            except _JSON_ERRORS:
+                return probe
+            restart_text = values.get("NRestarts", "")
+            restart_count = int(restart_text) if restart_text.isdigit() else None
+            restart_safe = (
+                not unit.endswith(".service") or restart_count is not None
+            ) and (restart_count is None or restart_count <= self._max_restarts)
+            activatable = (
+                values.get("LoadState") == "loaded"
+                and values.get("ActiveState") == "inactive"
+                and values.get("Result", "") in {"", "success"}
+                and restart_safe
+            )
+            if activatable:
+                return UnitProbe(unit, True, f"would_start:{probe.detail}")
             return probe
         last = probe
         for attempt in range(self._attempts):
@@ -203,18 +256,46 @@ class SystemdUnitManager:
         return last
 
 
+class HttpsNotificationAdapter:
+    """Send a structured owner alert to one operator-configured HTTPS endpoint."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        token: str = "",
+        *,
+        opener: Callable[..., Any] = urllib.request.urlopen,
+    ) -> None:
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username:
+            raise ValueError("notification endpoint must be an absolute HTTPS URL")
+        self._endpoint = endpoint
+        self._token = token
+        self._opener = opener
+
+    def __call__(self, payload: dict[str, Any]) -> None:
+        headers = {"Content-Type": "application/json"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        request = urllib.request.Request(
+            self._endpoint,
+            data=json.dumps(payload, sort_keys=True).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with self._opener(request, timeout=15) as response:
+            if not 200 <= int(response.status) < 300:
+                raise RuntimeError(f"notification_http_status:{response.status}")
+
+
 @dataclass(frozen=True, slots=True)
 class ControlPlaneConfig:
     owner: str = "aicc-control-plane"
     max_actions_per_tick: int = 8
     lane_lease_seconds: int = 180
     unit_circuit_seconds: int = 600
-    desired_units: tuple[str, ...] = (
-        "aicc-backlog-planner.timer",
-        "aicc-backlog-review.timer",
-        "aicc-backlog-merge.timer",
-        "aicc-queue-reaper.timer",
-    )
+    desired_units: tuple[str, ...] = ()
+    max_unit_restarts: int = 0
 
 
 @dataclass(slots=True)
@@ -255,6 +336,17 @@ class LaneLeaseGuard:
             self.lost.set()
             raise LaneLeaseLost("lane_lease_lost")
 
+    def progress(self, token: str) -> None:
+        if (
+            not token
+            or self.lost.is_set()
+            or not self.store.lane_progress(
+                self.lane, self.claimant, token, now=self.clock()
+            )
+        ):
+            self.lost.set()
+            raise LaneLeaseLost("lane_lease_lost")
+
     def effect(self, callback: Callable[[], Any]) -> Any:
         if self.lost.is_set():
             raise LaneLeaseLost("lane_lease_lost")
@@ -288,6 +380,10 @@ class Reconciler:
         self._units = units
         self._handlers = dict(handlers)
         self._config = config or ControlPlaneConfig()
+        if not self._config.desired_units or len(
+            set(self._config.desired_units)
+        ) != len(self._config.desired_units):
+            raise ValueError("desired unit registry must be non-empty and unique")
         self._clock = clock
 
     def _run_handler(self, lane: Lane, handler: ActionHandler) -> ActionOutcome:
@@ -433,11 +529,11 @@ class PostgresControlPlaneStore:
                 " (SELECT e.value FROM backlog_evidence e WHERE e.task_id=t.task_id "
                 "  AND e.kind='sha' ORDER BY e.evidence_id DESC LIMIT 1) AS head_sha, "
                 " (SELECT substring(e.value from 8) FROM backlog_evidence e "
-                "  WHERE e.task_id=t.task_id AND e.kind='ci' AND e.value LIKE 'MERGED:%' "
+                "  WHERE e.task_id=t.task_id AND e.kind='ci' AND e.value LIKE 'MERGED:%%' "
                 "  ORDER BY e.evidence_id DESC LIMIT 1) AS merged_sha, "
-                " (SELECT substring(e.value from 10) FROM backlog_evidence e "
-                "  WHERE e.task_id=t.task_id AND e.kind='ci' AND e.value LIKE 'DEPLOYED:%' "
-                "  ORDER BY e.evidence_id DESC LIMIT 1) AS deployed_sha, "
+                " (SELECT d.merged_sha FROM control_plane_deployment d "
+                "  WHERE d.task_id=t.task_id AND d.deployed_by='aicc_deployer' "
+                "  ORDER BY d.deployed_at DESC LIMIT 1) AS deployed_sha, "
                 " EXISTS (SELECT 1 FROM backlog_evidence e WHERE e.task_id=t.task_id "
                 "         AND e.kind='pr') AS has_pr "
                 " FROM backlog_task t), exact_facts AS ("
@@ -490,21 +586,30 @@ class PostgresControlPlaneStore:
         with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
             cur.execute(
                 "SELECT task_id, state, attempts, max_attempts, owner FROM control_plane_lane "
-                "WHERE (state='RUNNING' AND lease_expires_at <= %s) "
+                "WHERE (state='RUNNING' AND (lease_expires_at <= %s "
+                "       OR progress_at <= %s - interval '65 minutes')) "
                 "   OR (state='WAITING' AND deadline_at <= %s) FOR UPDATE SKIP LOCKED",
-                (now, now),
+                (now, now, now),
             )
             recovered: list[tuple[str, str]] = []
-            for task_id, previous_state, attempts, max_attempts, owner in cur.fetchall():
+            for (
+                task_id,
+                previous_state,
+                attempts,
+                max_attempts,
+                owner,
+            ) in cur.fetchall():
                 attempts += int(previous_state == "RUNNING")
                 exhausted = attempts >= max_attempts
                 state = "BLOCKED" if exhausted else "READY"
                 reason = "attempt_budget_exhausted" if exhausted else "watchdog_requeue"
                 cur.execute(
                     "UPDATE control_plane_lane SET state=%s, claimant=NULL, lease_expires_at=NULL, "
-                    "deadline_at=%s, attempts=%s, last_error=%s, revision=revision+1, updated_at=now() "
+                    "deadline_at=%s, attempts=%s, last_error=%s, interrupt_requested_at="
+                    "CASE WHEN %s='RUNNING' THEN %s ELSE interrupt_requested_at END, "
+                    "revision=revision+1, updated_at=now() "
                     "WHERE task_id=%s",
-                    (state, now, attempts, reason, task_id),
+                    (state, now, attempts, reason, previous_state, now, task_id),
                 )
                 cur.execute(
                     "INSERT INTO control_plane_event(task_id,component,event,outcome,detail) "
@@ -537,8 +642,9 @@ class PostgresControlPlaneStore:
             task_id, action, lane_owner, payload, revision = row
             cur.execute(
                 "UPDATE control_plane_lane SET state='RUNNING', claimant=%s, heartbeat_at=%s, "
+                "progress_at=%s,progress_token='claimed:' || next_action,interrupt_requested_at=NULL,"
                 "lease_expires_at=%s, revision=revision+1, updated_at=now() WHERE task_id=%s",
-                (owner, now, now + timedelta(seconds=lease_seconds), task_id),
+                (owner, now, now, now + timedelta(seconds=lease_seconds), task_id),
             )
             cur.execute(
                 "INSERT INTO control_plane_event(task_id,component,event,outcome,detail) "
@@ -578,6 +684,26 @@ class PostgresControlPlaneStore:
                     (lane.task_id,),
                 )
             return ok
+
+    def lane_progress(
+        self, lane: Lane, claimant: str, token: str, *, now: datetime
+    ) -> bool:
+        with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "UPDATE control_plane_lane SET progress_at=%s,progress_token=%s,updated_at=now() "
+                "WHERE task_id=%s AND state='RUNNING' AND claimant=%s AND revision=%s "
+                "AND lease_expires_at>%s",
+                (now, token[:240], lane.task_id, claimant, lane.revision, now),
+            )
+            if cur.rowcount != 1:
+                return False
+            cur.execute(
+                "INSERT INTO control_plane_event(task_id,component,event,outcome,detail) "
+                "VALUES (%s,'reconciler','progress','granted',"
+                "jsonb_build_object('token',%s::text))",
+                (lane.task_id, token[:240]),
+            )
+            return True
 
     def fenced_effect(
         self,
@@ -661,10 +787,10 @@ class PostgresControlPlaneStore:
                 if not re.fullmatch(r"[0-9a-f]{40}", merged_sha):
                     raise RuntimeError("merged_sha_missing_or_invalid")
                 cur.execute(
-                    "SELECT revision, EXISTS (SELECT 1 FROM backlog_evidence "
-                    "WHERE task_id=%s AND kind='ci' AND value=%s) "
-                    "FROM backlog_task WHERE task_id=%s FOR UPDATE",
-                    (lane.task_id, f"DEPLOYED:{merged_sha}", lane.task_id),
+                    "SELECT revision, EXISTS (SELECT 1 FROM control_plane_deployment "
+                    "WHERE task_id=%s AND merged_sha=%s AND deployed_by='aicc_deployer') "
+                    "FROM backlog_task WHERE task_id=%s",
+                    (lane.task_id, merged_sha, lane.task_id),
                 )
                 task = cur.fetchone()
                 if task is None or not task[1]:
@@ -685,7 +811,8 @@ class PostgresControlPlaneStore:
                     raise RuntimeError(f"backlog_done_refused:{reason}")
             cur.execute(
                 "UPDATE control_plane_lane SET state=%s,next_action=%s,owner=%s,claimant=NULL,"
-                "deadline_at=%s,heartbeat_at=%s,lease_expires_at=NULL,attempts=%s,last_error=%s,"
+                "deadline_at=%s,heartbeat_at=%s,progress_at=%s,progress_token=%s,"
+                "lease_expires_at=NULL,attempts=%s,last_error=%s,"
                 "revision=revision+1,updated_at=now() WHERE task_id=%s",
                 (
                     state,
@@ -693,6 +820,8 @@ class PostgresControlPlaneStore:
                     outcome.next_owner,
                     now + timedelta(seconds=outcome.retry_after_seconds),
                     now,
+                    now,
+                    f"finish:{state}:{next_action}",
                     attempts,
                     outcome.detail or None,
                     lane.task_id,
@@ -758,6 +887,101 @@ class PostgresControlPlaneStore:
                 (lane.task_id, blocker_id),
             )
         return blocker_id
+
+    def deliver_notifications(
+        self,
+        deliver: Callable[[dict[str, Any]], None],
+        *,
+        claimant: str,
+        now: datetime,
+        limit: int = 20,
+    ) -> list[tuple[int, str]]:
+        """Lease, deliver and durably ack owner alerts with bounded retries."""
+        outcomes: list[tuple[int, str]] = []
+        for _ in range(max(0, limit)):
+            with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
+                cur.execute(
+                    "SELECT notification_id,task_id,kind,owner,payload,attempts,max_attempts "
+                    "FROM control_plane_notification WHERE "
+                    "(state='PENDING' AND available_at<=%s) OR "
+                    "(state='DELIVERING' AND lease_expires_at<=%s) "
+                    "ORDER BY available_at,notification_id LIMIT 1 FOR UPDATE SKIP LOCKED",
+                    (now, now),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    break
+                notification_id, task_id, kind, owner, payload, attempts, _maximum = row
+                attempts += 1
+                cur.execute(
+                    "UPDATE control_plane_notification SET state='DELIVERING',claimed_by=%s,"
+                    "lease_expires_at=%s,attempts=%s,last_error=NULL WHERE notification_id=%s",
+                    (claimant, now + timedelta(seconds=90), attempts, notification_id),
+                )
+            body = {
+                "notification_id": notification_id,
+                "task_id": task_id,
+                "kind": kind,
+                "owner": owner,
+                "payload": payload,
+                "attempt": attempts,
+            }
+            error = ""
+            try:
+                deliver(body)
+            except Exception as exc:  # noqa: BLE001 - persisted for retry/deadman
+                error = f"{type(exc).__name__}:{str(exc)[:240]}"
+            with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
+                cur.execute(
+                    "SELECT state,claimed_by,attempts,max_attempts FROM "
+                    "control_plane_notification WHERE notification_id=%s FOR UPDATE",
+                    (notification_id,),
+                )
+                current = cur.fetchone()
+                if current is None or current[:2] != ("DELIVERING", claimant):
+                    outcomes.append((notification_id, "lease_lost"))
+                    continue
+                if not error:
+                    cur.execute(
+                        "UPDATE control_plane_notification SET state='SENT',sent_at=%s,"
+                        "claimed_by=NULL,lease_expires_at=NULL WHERE notification_id=%s",
+                        (now, notification_id),
+                    )
+                    outcomes.append((notification_id, "sent"))
+                    continue
+                dead = current[2] >= current[3]
+                retry_seconds = min(3600, 30 * (2 ** min(current[2] - 1, 7)))
+                cur.execute(
+                    "UPDATE control_plane_notification SET state=%s,available_at=%s,"
+                    "claimed_by=NULL,lease_expires_at=NULL,last_error=%s "
+                    "WHERE notification_id=%s",
+                    (
+                        "DEAD" if dead else "PENDING",
+                        now + timedelta(seconds=retry_seconds),
+                        error,
+                        notification_id,
+                    ),
+                )
+                outcomes.append((notification_id, "dead" if dead else "retry"))
+        return outcomes
+
+    def notification_health(
+        self, *, now: datetime, max_age_seconds: int
+    ) -> tuple[bool, str]:
+        with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FILTER (WHERE state='DEAD'), "
+                "extract(epoch FROM (%s-min(created_at) FILTER "
+                "(WHERE state IN ('PENDING','DELIVERING')))) "
+                "FROM control_plane_notification WHERE state<>'SENT'",
+                (now,),
+            )
+            dead, oldest_age = cur.fetchone()
+        if dead:
+            return False, f"dead_notifications:{dead}"
+        if oldest_age is not None and float(oldest_age) > max_age_seconds:
+            return False, f"notification_delivery_stalled:{float(oldest_age):.0f}s"
+        return True, "healthy"
 
     def component_allows_attempt(self, component: str, *, now: datetime) -> bool:
         with self._factory() as conn, conn.transaction(), conn.cursor() as cur:

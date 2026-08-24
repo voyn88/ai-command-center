@@ -1,7 +1,7 @@
 [Unit]
-Description=24-hour canary for both AICC worker lanes
-After=network-online.target voyn-aicc-worker@1.service voyn-aicc-worker@2.service
-Wants=network-online.target voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+Description=24-hour canary for the declared AICC worker fleet
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple

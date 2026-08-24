@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
 
 from command_center.orchestrator.control_plane import (
     Action,
     ActionOutcome,
     ControlPlaneConfig,
+    HttpsNotificationAdapter,
     Lane,
     LaneLeaseLost,
     Reconciler,
     SystemdUnitManager,
     UnitProbe,
 )
+from command_center.orchestrator.desired_state import load
 
 NOW = datetime(2026, 8, 24, 12, tzinfo=UTC)
 
@@ -40,6 +45,9 @@ class FakeStore:
         return self.lanes.pop(0) if self.lanes else None
 
     def lane_heartbeat(self, lane, claimant, *, now, lease_seconds):
+        return True
+
+    def lane_progress(self, lane, claimant, token, *, now):
         return True
 
     def fenced_effect(self, lane, claimant, effect, *, now, lease_seconds):
@@ -74,7 +82,41 @@ class FakeUnits:
 
 
 def config(*units):
-    return ControlPlaneConfig(desired_units=tuple(units), max_actions_per_tick=8)
+    return ControlPlaneConfig(
+        desired_units=tuple(units) or ("aicc-test.timer",), max_actions_per_tick=8
+    )
+
+
+def test_default_supervision_covers_each_control_service_timer_and_deadman():
+    registry = load(
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "config"
+        / "aicc-desired-state.json"
+    )
+    units = set(registry.control.units)
+    for component in (
+        "aicc-backlog-planner",
+        "aicc-backlog-review",
+        "aicc-backlog-merge",
+        "aicc-queue-reaper",
+        "aicc-control-plane-reconciler",
+        "aicc-control-plane-notify",
+        "aicc-control-plane-watchdog",
+    ):
+        assert {f"{component}.service", f"{component}.timer"} <= units
+
+
+def test_reconciler_refuses_an_empty_or_duplicate_desired_registry():
+    with pytest.raises(ValueError, match="desired unit registry"):
+        Reconciler(FakeStore(), FakeUnits(), {}, ControlPlaneConfig())
+    with pytest.raises(ValueError, match="desired unit registry"):
+        Reconciler(
+            FakeStore(),
+            FakeUnits(),
+            {},
+            ControlPlaneConfig(desired_units=("same.timer", "same.timer")),
+        )
 
 
 def test_ready_lane_advances_without_waiting_for_an_operator_question():
@@ -229,3 +271,78 @@ def test_unit_manager_repairs_an_inactive_allowlisted_timer_and_rechecks():
 
     assert result.healthy
     assert [call[1] for call in calls] == ["show", "start", "show"]
+
+
+def test_unit_manager_dry_run_accepts_loaded_inactive_unit_as_plan_only():
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\n",
+            "",
+        )
+
+    result = SystemdUnitManager(("aicc-safe.timer",), runner=run).ensure_active(
+        "aicc-safe.timer", dry_run=True
+    )
+
+    assert result.healthy
+    assert result.detail.startswith("would_start:")
+    assert [call[1] for call in calls] == ["show"]
+
+
+def test_unit_probe_checks_result_and_restart_counter_not_only_active_state():
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "LoadState=loaded\nActiveState=active\nSubState=running\n"
+            "Result=success\nNRestarts=4\n",
+            "",
+        )
+
+    manager = SystemdUnitManager(("aicc-worker.service",), runner=run, attempts=1)
+    result = manager.ensure_active("aicc-worker.service", dry_run=True)
+
+    assert not result.healthy
+    assert '"NRestarts": "4"' in result.detail
+    assert '"Result": "success"' in result.detail
+    assert "--property=Result" in calls[0]
+    assert "--property=NRestarts" in calls[0]
+
+
+def test_notification_adapter_is_https_only_and_sends_no_tooling():
+    with pytest.raises(ValueError, match="HTTPS"):
+        HttpsNotificationAdapter("http://owner.example/alert")
+
+    requests = []
+
+    class Response:
+        status = 202
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def open_request(request, *, timeout):
+        requests.append((request, timeout))
+        return Response()
+
+    adapter = HttpsNotificationAdapter(
+        "https://owner.example/alert", "secret", opener=open_request
+    )
+    adapter({"task_id": "VOYN-X", "kind": "LANE_STALLED"})
+
+    request, timeout = requests[0]
+    assert timeout == 15
+    assert request.method == "POST"
+    assert request.get_header("Authorization") == "Bearer secret"
+    assert b'"task_id": "VOYN-X"' in request.data

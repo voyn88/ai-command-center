@@ -1,5 +1,5 @@
 [Unit]
-Description=Reconcile both AICC worker lanes every minute
+Description=Reconcile the declared AICC worker fleet every minute
 
 [Timer]
 OnBootSec=3min

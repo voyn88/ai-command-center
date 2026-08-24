@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -9,6 +11,17 @@ HEALTH = ROOT / "ops" / "voyn_worker_health.sh"
 SYNC = ROOT / "ops" / "voyn_sync_findings.sh"
 CANARY = ROOT / "ops" / "voyn_aicc_worker_canary.sh"
 RECONCILE = ROOT / "ops" / "voyn_worker_reconcile.sh"
+DESIRED_READER = ROOT / "command_center" / "orchestrator" / "desired_state.py"
+DESIRED_STATE = ROOT / "deploy" / "config" / "aicc-desired-state.json"
+
+
+def _desired_env(path: Path = DESIRED_STATE) -> dict[str, str]:
+    return {
+        "PYTHON_BIN": sys.executable,
+        "DESIRED_STATE_READER": str(DESIRED_READER),
+        "AICC_DESIRED_STATE_FILE": str(path),
+        "SYNC_BIN": "/usr/bin/true",
+    }
 
 
 def _fake_systemctl(tmp_path: Path) -> Path:
@@ -44,6 +57,7 @@ def test_health_requires_both_current_aicc_worker_watchdogs(tmp_path):
         [str(HEALTH)],
         env={
             **os.environ,
+            **_desired_env(),
             "SYSTEMCTL_BIN": str(systemctl),
             "UPTIME_FILE": str(uptime),
         },
@@ -68,6 +82,7 @@ def test_health_fails_closed_when_either_worker_watchdog_is_stale(tmp_path):
         [str(HEALTH)],
         env={
             **os.environ,
+            **_desired_env(),
             "SYSTEMCTL_BIN": str(systemctl),
             "UPTIME_FILE": str(uptime),
             "STALE_UNIT": "voyn-aicc-worker@2.service",
@@ -80,6 +95,29 @@ def test_health_fails_closed_when_either_worker_watchdog_is_stale(tmp_path):
     assert result.returncode == 1
     assert "voyn-aicc-worker@2.service" in result.stdout
     assert "stale" in result.stdout
+
+
+def test_health_fails_closed_after_restart_storm(tmp_path):
+    systemctl = _fake_systemctl(tmp_path)
+    systemctl.write_text(systemctl.read_text().replace("NRestarts=0", "NRestarts=4"))
+    uptime = tmp_path / "uptime"
+    uptime.write_text("1000.00 1.00\n")
+
+    result = subprocess.run(
+        [str(HEALTH)],
+        env={
+            **os.environ,
+            **_desired_env(),
+            "SYSTEMCTL_BIN": str(systemctl),
+            "UPTIME_FILE": str(uptime),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "restarts=4 exceeds=3" in result.stdout
 
 
 def test_findings_sync_uses_configured_dns_pinned_host_and_moves_only_on_success(
@@ -150,25 +188,30 @@ def test_worker_monitor_units_and_installer_are_versioned_and_non_disruptive():
     installer = (ROOT / "ops" / "install_worker_monitors.sh").read_text()
     config = (ROOT / "deploy" / "config" / "voyn-findings-sync.env").read_text()
 
-    canonical = "voyn-aicc-worker@1.service voyn-aicc-worker@2.service"
-    assert canonical in canary
-    assert canonical in HEALTH.read_text()
-    assert canonical in RECONCILE.read_text()
+    registry = DESIRED_STATE.read_text()
+    assert "voyn-aicc-worker@1.service" in registry
+    assert "voyn-aicc-worker@2.service" in registry
+    assert "aicc-desired-state.json" in CANARY.read_text()
+    assert "aicc-desired-state.json" in HEALTH.read_text()
+    assert "aicc-desired-state.json" in RECONCILE.read_text()
     assert "voyn-claude.service" not in canary
     assert "voyn-control-01.tail39d0b6.ts.net" in config
     assert "exact 40-character merged SHA" in installer
     assert "/var/lib/voyn-worker-monitor" in installer
     assert "deployed-sha" in installer
-    assert "runuser -u voynadmin -- /opt/voyn-worker/bin/voyn-sync-findings check" in installer
+    assert (
+        "runuser -u voynadmin -- /opt/voyn-worker/bin/voyn-sync-findings check"
+        in installer
+    )
     assert "status --porcelain)" in installer
     assert "--untracked-files=no" not in installer
     assert "restart voyn-aicc-worker" not in installer
     assert "voyn-worker-reconcile" in installer
     assert installer.index("systemctl daemon-reload") < installer.index(
-        'printf \'%s\\n\' "$EXPECTED_SHA"'
+        "printf '%s\\n' \"$EXPECTED_SHA\""
     )
     assert installer.index("voyn-worker-health") < installer.index(
-        'printf \'%s\\n\' "$EXPECTED_SHA"'
+        "printf '%s\\n' \"$EXPECTED_SHA\""
     )
 
 
@@ -185,11 +228,194 @@ def test_canary_binds_evidence_to_the_exact_deployed_monitor_sha():
 def test_worker_recovery_is_allowlisted_bounded_and_circuit_broken():
     source = RECONCILE.read_text()
 
-    assert "voyn-aicc-worker@1.service voyn-aicc-worker@2.service" in source
-    assert "restart \"$unit\"" in source
+    assert "worker-units" in source
+    assert "--kill-who=main --signal=TERM" in source
+    assert 'restart "$unit"' not in source
+    assert "ready lane quorum" in source
+    assert "worker-minimum-stop-seconds" in source
     assert "MAX_FAILURES" in source
     assert "open_until" in source
     assert "eval" not in source
+
+
+def test_worker_recovery_drains_only_failed_lane_and_keeps_sibling_ready(tmp_path):
+    recovered = tmp_path / "recovered"
+    calls = tmp_path / "calls"
+    health = tmp_path / "health"
+    health.write_text(
+        "#!/usr/bin/env bash\n"
+        f"if [[ $1 == voyn-aicc-worker@1.service && ! -f {recovered!s} ]]; then exit 1; fi\n"
+        "exit 0\n"
+    )
+    health.chmod(0o755)
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >>{calls!s}\n"
+        "if [[ $* == *TimeoutStopUSec* ]]; then echo 3660000000; exit 0; fi\n"
+        "if [[ $* == *ActiveState* ]]; then echo active; exit 0; fi\n"
+        f"if [[ $1 == kill ]]; then touch {recovered!s}; fi\n"
+    )
+    systemctl.chmod(0o755)
+
+    result = subprocess.run(
+        [str(RECONCILE)],
+        env={
+            **os.environ,
+            **_desired_env(),
+            "SYSTEMCTL_BIN": str(systemctl),
+            "HEALTH_PROBE": str(health),
+            "STATE_DIRECTORY": str(tmp_path / "state"),
+            "CHOWN_BIN": "/usr/bin/true",
+            "VOYN_WORKER_RECOVERY_POLL_SECONDS": "1",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    invoked = calls.read_text()
+    assert "kill --kill-who=main --signal=TERM voyn-aicc-worker@1.service" in invoked
+    assert "voyn-aicc-worker@2.service" not in "\n".join(
+        line for line in invoked.splitlines() if line.startswith("kill ")
+    )
+    assert "restart" not in invoked
+
+
+def test_worker_recovery_refuses_timeout_shorter_than_declared_job_budget(tmp_path):
+    calls = tmp_path / "calls"
+    health = tmp_path / "health"
+    health.write_text("#!/usr/bin/env bash\n[[ $1 != voyn-aicc-worker@1.service ]]\n")
+    health.chmod(0o755)
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >>{calls!s}\n"
+        "if [[ $* == *TimeoutStopUSec* ]]; then echo 330000000; exit 0; fi\n"
+    )
+    systemctl.chmod(0o755)
+
+    result = subprocess.run(
+        [str(RECONCILE)],
+        env={
+            **os.environ,
+            **_desired_env(),
+            "SYSTEMCTL_BIN": str(systemctl),
+            "HEALTH_PROBE": str(health),
+            "STATE_DIRECTORY": str(tmp_path / "state"),
+            "CHOWN_BIN": "/usr/bin/true",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "unsafe stop timeout 330s" in result.stderr
+    assert "kill " not in calls.read_text()
+
+
+def test_worker_recovery_refuses_to_cycle_both_unhealthy_lanes(tmp_path):
+    desired = json.loads(DESIRED_STATE.read_text())
+    desired["worker_fleet"]["circuit_failure_threshold"] = 1
+    registry = tmp_path / "desired.json"
+    registry.write_text(json.dumps(desired))
+    calls = tmp_path / "calls"
+    health = tmp_path / "health"
+    health.write_text("#!/usr/bin/env bash\nexit 1\n")
+    health.chmod(0o755)
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >>{calls!s}\n")
+    systemctl.chmod(0o755)
+
+    result = subprocess.run(
+        [str(RECONCILE)],
+        env={
+            **os.environ,
+            **_desired_env(registry),
+            "SYSTEMCTL_BIN": str(systemctl),
+            "HEALTH_PROBE": str(health),
+            "STATE_DIRECTORY": str(tmp_path / "state"),
+            "CHOWN_BIN": "/usr/bin/true",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "ready lane quorum would be violated" in result.stderr
+    assert not calls.exists() or "kill" not in calls.read_text()
+    assert "failures=1" in (tmp_path / "state" / "circuit").read_text()
+
+    second = subprocess.run(
+        [str(RECONCILE)],
+        env={
+            **os.environ,
+            **_desired_env(registry),
+            "SYSTEMCTL_BIN": str(systemctl),
+            "HEALTH_PROBE": str(health),
+            "STATE_DIRECTORY": str(tmp_path / "state"),
+            "CHOWN_BIN": "/usr/bin/true",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert second.returncode == 1
+    assert "worker recovery circuit open" in second.stderr
+
+
+def test_worker_recovery_scales_beyond_two_lanes_and_preserves_ready_quorum(tmp_path):
+    desired = json.loads(DESIRED_STATE.read_text())
+    desired["worker_fleet"]["units"] = [
+        f"voyn-aicc-worker@{index}.service" for index in range(1, 5)
+    ]
+    desired["worker_fleet"]["minimum_ready_lanes"] = 2
+    registry = tmp_path / "desired.json"
+    registry.write_text(json.dumps(desired))
+    recovered = tmp_path / "recovered"
+    calls = tmp_path / "calls"
+    health = tmp_path / "health"
+    health.write_text(
+        "#!/usr/bin/env bash\n"
+        f"if [[ $1 == voyn-aicc-worker@1.service && ! -f {recovered!s} ]]; then exit 1; fi\n"
+        "if [[ $1 == voyn-aicc-worker@2.service ]]; then exit 1; fi\n"
+        "exit 0\n"
+    )
+    health.chmod(0o755)
+    systemctl = tmp_path / "systemctl"
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >>{calls!s}\n"
+        "if [[ $* == *TimeoutStopUSec* ]]; then echo 3660000000; exit 0; fi\n"
+        "if [[ $* == *ActiveState* ]]; then echo active; exit 0; fi\n"
+        f"if [[ $1 == kill ]]; then touch {recovered!s}; fi\n"
+    )
+    systemctl.chmod(0o755)
+
+    result = subprocess.run(
+        [str(RECONCILE)],
+        env={
+            **os.environ,
+            **_desired_env(registry),
+            "SYSTEMCTL_BIN": str(systemctl),
+            "HEALTH_PROBE": str(health),
+            "STATE_DIRECTORY": str(tmp_path / "state"),
+            "CHOWN_BIN": "/usr/bin/true",
+            "VOYN_WORKER_RECOVERY_POLL_SECONDS": "1",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    drains = [
+        line for line in calls.read_text().splitlines() if line.startswith("kill ")
+    ]
+    assert drains == ["kill --kill-who=main --signal=TERM voyn-aicc-worker@1.service"]
 
 
 def test_findings_check_opens_a_real_pinned_ssh_connection():
@@ -214,8 +440,7 @@ def test_canary_start_records_exact_deployed_sha(tmp_path):
     sha256sum.chmod(0o755)
     systemctl = tmp_path / "systemctl"
     systemctl.write_text(
-        "#!/usr/bin/env bash\n"
-        "if [[ $* == *--property=NRestarts* ]]; then echo 0; fi\n"
+        "#!/usr/bin/env bash\nif [[ $* == *--property=NRestarts* ]]; then echo 0; fi\n"
     )
     systemctl.chmod(0o755)
 
@@ -223,6 +448,7 @@ def test_canary_start_records_exact_deployed_sha(tmp_path):
         [str(CANARY), "start"],
         env={
             **os.environ,
+            **_desired_env(),
             "STATE_DIRECTORY": str(state_dir),
             "HEALTH_PROBE": str(health),
             "SHA256SUM_BIN": str(sha256sum),

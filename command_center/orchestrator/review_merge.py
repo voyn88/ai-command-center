@@ -49,8 +49,9 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   why a cycle back into the rejected task's own state machine was rejected
   in favour of a new linked task.
 - ``merge_once``: for each PR that carries an ACCEPT marker AND whose required
-  checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
-  with the merged sha as evidence (via the existing backlog_transition gate).
+  checks are green, request merge, then record only a separately observed
+  ``MERGED:<mergeCommit.oid>``. Deployment and backlog synchronization remain
+  later durable lanes; queue acceptance alone never means DONE.
 
 All three are refusal-as-data, driven by oneshot timers, and idempotent: a
 task already reviewed is skipped, a marker already posted is skipped, an
@@ -72,6 +73,8 @@ from typing import Any
 
 from command_center.orchestrator import github_app_auth
 from command_center.orchestrator.routing import cascade_for
+
+_JSON_ERRORS = (TypeError, json.JSONDecodeError)
 
 __all__ = [
     "LoopReport",
@@ -104,8 +107,12 @@ class LoopReport:
 
 def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["gh", *argv], cwd=repo_path, capture_output=True, text=True,
-        check=False, timeout=120,
+        ["gh", *argv],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
     )
 
 
@@ -164,7 +171,12 @@ def _post_marker_as_bot(
     try:
         with urllib.request.urlopen(req, timeout=15):
             pass
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        OSError,
+    ) as exc:
         return False, f"marker_post_failed: {exc}"
     return True, ""
 
@@ -348,19 +360,25 @@ def review_once(
             continue
         project_id, repository_path = route
         payload = {
-            "kind": "agent_run", "v": 1, "project_id": project_id,
-            "repository_path": repository_path, "task_type": "review",
+            "kind": "agent_run",
+            "v": 1,
+            "project_id": project_id,
+            "repository_path": repository_path,
+            "task_type": "review",
             "prompt": _REVIEW_PROMPT.format(
                 pr=pr_url, task=task_id, head_sha=head_sha, diff=diff
             ),
-            "timeout_seconds": cfg.review_timeout, "untrusted": False,
+            "timeout_seconds": cfg.review_timeout,
+            "untrusted": False,
             "cascade": cascade,
         }
         enqueue(cfg.queue, key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
     return report
 
+
 # -- Part 2b: publish the verdict as the marker merge_once reads -------------
+
 
 # Three rounds of independent review (2026-08-21) each broke a version of
 # this that scanned the whole transcript for VERDICT:/HEAD_SHA: tokens and
@@ -392,7 +410,9 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict_match.group(1), sha_match.group(1)
 
 
-def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any] | None:
+def _latest_review_result(
+    factory: Any, task_id: str, key: str
+) -> dict[str, Any] | None:
     """The succeeded review-class work result for this exact review-cycle
     key (task, PR, head sha, policy version), or None if no review has
     completed for exactly this state yet -- covers both "still running" and
@@ -452,15 +472,15 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
     job). Returns (has_marker, head_sha)."""
-    view = _gh(
-        ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
-    )
+    view = _gh(["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path)
     if view.returncode != 0:
         return False, ""
     data = json.loads(view.stdout or "{}")
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
+    accept = _accept_marker_on_latest_review(
+        data.get("reviews", []), head, author_login
+    )
     return accept, head
 
 
@@ -530,15 +550,23 @@ def _remediate_rejection(
             store = BacklogStore(lambda: nullcontext(conn))
             ok, _reason, _changed = store.upsert_task(
                 ParsedTask(
-                    task_id=new_task_id, wave=wave, priority=priority,
-                    status="OPEN", kind="task", title=new_title, body=new_body,
-                    repo=repo, line_no=0,
+                    task_id=new_task_id,
+                    wave=wave,
+                    priority=priority,
+                    status="OPEN",
+                    kind="task",
+                    title=new_title,
+                    body=new_body,
+                    repo=repo,
+                    line_no=0,
                 )
             )
             if not ok:
                 conn.rollback()
                 return None
-            ok, _reason = store.record_remediation(new_task_id, task_id, pr_url, head_sha)
+            ok, _reason = store.record_remediation(
+                new_task_id, task_id, pr_url, head_sha
+            )
             if not ok:
                 conn.rollback()
                 return None
@@ -577,7 +605,8 @@ def publish_review_verdicts(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task
+        "WHERE t.status = 'READY_TO_REVIEW'"
+        + where_task
         + " ORDER BY t.updated_at LIMIT %s",
         params,
     )
@@ -600,7 +629,9 @@ def publish_review_verdicts(
         text = result.get("result_text") or ""
         parsed = _parse_verdict(text)
         if parsed is None:
-            report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
+            report.skipped.append(
+                (task_id, "verdict_or_head_sha_missing_in_review_result")
+            )
             continue
         verdict, sha = parsed
         if sha != current_head:
@@ -610,15 +641,22 @@ def publish_review_verdicts(
             # either way, never post a marker whose sha doesn't match what
             # the agent said it reviewed.
             report.skipped.append(
-                (task_id, f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}")
+                (
+                    task_id,
+                    f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}",
+                )
             )
             continue
         if verdict != "ACCEPT":
-            new_task_id = _remediate_rejection(factory, task_id, pr_url, current_head, text)
+            new_task_id = _remediate_rejection(
+                factory, task_id, pr_url, current_head, text
+            )
             if new_task_id:
                 report.remediated.append((task_id, new_task_id))
             else:
-                report.skipped.append((task_id, "review_verdict_reject_remediation_already_dispatched"))
+                report.skipped.append(
+                    (task_id, "review_verdict_reject_remediation_already_dispatched")
+                )
             continue
         creds = _acceptance_app_credentials()
         if creds is None:
@@ -718,8 +756,13 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     removing the exclusion is not a relaxation, it is retiring a workaround
     whose reason to exist is gone."""
     view = _gh(
-        ["pr", "view", pr_url, "--json",
-         "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author,mergeCommit"],
+        [
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author,mergeCommit",
+        ],
         repo_path,
     )
     if view.returncode != 0:
@@ -730,7 +773,9 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
         return False, f"pr_{str(state).lower()}"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
+    accept = _accept_marker_on_latest_review(
+        data.get("reviews", []), head, author_login
+    )
     if not accept:
         return False, "no_accept_marker_on_head"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
@@ -753,17 +798,18 @@ def _merged_commit_sha(repo_path: str, pr_url: str) -> str | None:
     commit boundary: OPEN/QUEUED is still waiting, and only state=MERGED with
     a valid mergeCommit OID can advance deployment.
     """
-    view = _gh(
-        ["pr", "view", pr_url, "--json", "state,mergeCommit"], repo_path
-    )
+    view = _gh(["pr", "view", pr_url, "--json", "state,mergeCommit"], repo_path)
     if view.returncode != 0:
         return None
     try:
         data = json.loads(view.stdout or "{}")
-    except (TypeError, json.JSONDecodeError):
+    except _JSON_ERRORS:
         return None
     merge_sha = (data.get("mergeCommit") or {}).get("oid", "")
-    if data.get("state") != "MERGED" or re.fullmatch(r"[0-9a-f]{40}", merge_sha) is None:
+    if (
+        data.get("state") != "MERGED"
+        or re.fullmatch(r"[0-9a-f]{40}", merge_sha) is None
+    ):
         return None
     return merge_sha
 
@@ -775,12 +821,13 @@ def merge_once(
     *,
     task_id: str | None = None,
 ) -> LoopReport:
-    """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
-    green checks, then close it DONE with the merged sha as evidence."""
+    """Request merge for accepted PRs and record only observed merge commits."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     where_task = " AND t.task_id = %s" if task_id else ""
-    params: tuple[Any, ...] = (task_id, cfg.max_per_tick) if task_id else (cfg.max_per_tick,)
+    params: tuple[Any, ...] = (
+        (task_id, cfg.max_per_tick) if task_id else (cfg.max_per_tick,)
+    )
     tasks = _rows(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
@@ -788,7 +835,7 @@ def merge_once(
         "WHERE t.status = 'READY_TO_REVIEW' "
         "AND NOT EXISTS (SELECT 1 FROM backlog_evidence merged "
         " WHERE merged.task_id=t.task_id AND merged.kind='ci' "
-        " AND merged.value LIKE 'MERGED:%')"
+        " AND merged.value LIKE 'MERGED:%%')"
         + where_task
         + " ORDER BY t.updated_at LIMIT %s",
         params,
@@ -803,7 +850,9 @@ def merge_once(
         if not already_merged:
             merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
             if merged.returncode != 0:
-                report.skipped.append((task_id, f"merge_failed: {merged.stderr.strip()[:100]}"))
+                report.skipped.append(
+                    (task_id, f"merge_failed: {merged.stderr.strip()[:100]}")
+                )
                 continue
             merge_sha = _merged_commit_sha(repo_path, pr_url) or ""
             if not merge_sha:

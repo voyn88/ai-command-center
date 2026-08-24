@@ -8,7 +8,7 @@ not. That coupling is deliberate: the defect behind `VOYN-W0-SEC-AUDIT-PG-CRED`
 was a grant that no test exercised, so a grant added here without a matching
 row in the matrix cannot silently widen access.
 
-Four roles, by what fails if each one is compromised:
+Five roles, by what fails if each one is compromised:
 
 * `aicc_migrator` owns the schema and is the only role with DDL. It is used by
   the migration runner and by nothing else at runtime.
@@ -32,6 +32,9 @@ Four roles, by what fails if each one is compromised:
   the control plane" can only be expressed as a second, more trusted
   `session_user`. A compromised operator credential can admit and evict hosts; it
   still cannot read any host's secret, because no role can.
+* `aicc_deployer` has no table DML. Its only capability is attesting an exact
+  already-observed merge commit through `control_plane_record_deployment`;
+  `aicc_app` can read that attestation but cannot create it.
 
 `DELETE` is granted to no role on any table: this schema is an append/update
 ledger, and row removal is a migration-time operation performed by the owner.
@@ -71,6 +74,7 @@ __all__ = [
     "ALL_VIEWS",
     "APP_ROLE",
     "COLUMN_PRIVILEGES",
+    "DEPLOYER_ROLE",
     "FUNCTION_PRIVILEGES",
     "IDENTITY_SEQUENCES",
     "MIGRATOR_ROLE",
@@ -98,14 +102,15 @@ WORKER_ROLE = "aicc_worker"
 #: carries no DML on any domain table — its whole reach is EXECUTE on the
 #: admission and revocation levers.
 OPERATOR_ROLE = "aicc_operator"
+DEPLOYER_ROLE = "aicc_deployer"
 
-ALL_ROLES = (MIGRATOR_ROLE, APP_ROLE, WORKER_ROLE, OPERATOR_ROLE)
+ALL_ROLES = (MIGRATOR_ROLE, APP_ROLE, WORKER_ROLE, OPERATOR_ROLE, DEPLOYER_ROLE)
 
 #: The roles the matrix grants to. The migrator is excluded because its rights
 #: come from ownership; naming it here rather than repeating a literal tuple at
 #: each of the four loops in `render_table_grants()` is what stops a fifth role
 #: from being added to three of them.
-_GRANTED_ROLES = (APP_ROLE, WORKER_ROLE, OPERATOR_ROLE)
+_GRANTED_ROLES = (APP_ROLE, WORKER_ROLE, OPERATOR_ROLE, DEPLOYER_ROLE)
 
 # Every domain table created by the migration set, plus the runner's own
 # bookkeeping table. `test_upgrade_creates_the_declared_schema` fails if the
@@ -128,6 +133,7 @@ ALL_TABLES: tuple[str, ...] = (
     "completion_event",
     "completion_validation",
     "control_plane_component",
+    "control_plane_deployment",
     "control_plane_event",
     "control_plane_lane",
     "control_plane_notification",
@@ -280,6 +286,7 @@ _APP_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
     "control_plane_event": _APP_DML,
     "control_plane_lane": _APP_DML,
     "control_plane_notification": _APP_DML,
+    "control_plane_deployment": _READ,
 }
 
 _WORKER_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
@@ -287,6 +294,7 @@ _WORKER_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
     "control_plane_event": _NONE,
     "control_plane_lane": _NONE,
     "control_plane_notification": _NONE,
+    "control_plane_deployment": _NONE,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -470,6 +478,7 @@ VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = 
                     "principal_credential_public": _READ,
                 }
             ),
+            DEPLOYER_ROLE: MappingProxyType({}),
         }
     )
 )
@@ -551,6 +560,8 @@ _OPERATOR_FUNCTIONS = (
     "identity_sweep_expired()",
 )
 
+_DEPLOYER_FUNCTIONS = ("control_plane_record_deployment(text, text, text)",)
+
 FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
     {
         # Concatenated rather than replaced, for the reason `merge_privileges`
@@ -560,6 +571,7 @@ FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
         APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS + _APP_BACKLOG_FUNCTIONS,
         WORKER_ROLE: _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS,
         OPERATOR_ROLE: _OPERATOR_FUNCTIONS,
+        DEPLOYER_ROLE: _DEPLOYER_FUNCTIONS,
     }
 )
 
@@ -615,6 +627,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
             OPERATOR_ROLE: MappingProxyType(
                 merge_privileges(_OPERATOR_ENROLMENT_TABLES)
             ),
+            DEPLOYER_ROLE: MappingProxyType({}),
         }
     )
 )

@@ -55,7 +55,7 @@ reachable off the machine at all.
 
 ## Roles
 
-Three roles, provisioned by `render_bootstrap()` / `render_table_grants()` and
+Five roles, provisioned by `render_bootstrap()` / `render_table_grants()` and
 enforced by the database:
 
 | Role | May do | May not do |
@@ -63,6 +63,8 @@ enforced by the database:
 | `aicc_migrator` | Own the schema, run DDL | Nothing else runs as it |
 | `aicc_app` | `SELECT`/`INSERT`/`UPDATE` on every domain table | DDL, `DELETE`, `TRUNCATE`, and any write to `schema_migration` |
 | `aicc_worker` | Queue and execution tables only | Read or write proposals, council motions/votes, audit findings, provenance, marketplace, model registry; write `completion.review_*` |
+| `aicc_operator` | Execute worker admission and revocation functions | Domain-table DML or deployment evidence |
+| `aicc_deployer` | Execute exact deployment attestation only | Table DML, arbitrary merge evidence, or backlog transitions |
 
 `aicc_worker` is deliberately the narrowest: execution hosts run agent
 processes against untrusted repository content, so a compromised worker
@@ -128,6 +130,7 @@ stores them:
 
 ```sql
 ALTER ROLE aicc_app LOGIN PASSWORD '...';
+ALTER ROLE aicc_deployer LOGIN PASSWORD '...';
 ```
 
 ## Migrations

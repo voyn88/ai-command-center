@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "control": {
+    "circuit_open_seconds": 600,
+    "max_restarts": 3,
+    "units": [
+      "aicc-backlog-planner.service",
+      "aicc-backlog-planner.timer",
+      "aicc-backlog-review.service",
+      "aicc-backlog-review.timer",
+      "aicc-backlog-merge.service",
+      "aicc-backlog-merge.timer",
+      "aicc-queue-reaper.service",
+      "aicc-queue-reaper.timer",
+      "aicc-control-plane-reconciler.service",
+      "aicc-control-plane-reconciler.timer",
+      "aicc-control-plane-notify.service",
+      "aicc-control-plane-notify.timer",
+      "aicc-control-plane-watchdog.service",
+      "aicc-control-plane-watchdog.timer"
+    ]
+  },
+  "worker_fleet": {
+    "circuit_failure_threshold": 3,
+    "circuit_open_seconds": 600,
+    "drain_grace_seconds": 60,
+    "max_job_seconds": 3600,
+    "max_restarts": 3,
+    "minimum_ready_lanes": 1,
+    "recovery_poll_seconds": 5,
+    "recovery_timeout_seconds": 3720,
+    "units": [
+      "voyn-aicc-worker@1.service",
+      "voyn-aicc-worker@2.service"
+    ]
+  }
+}
