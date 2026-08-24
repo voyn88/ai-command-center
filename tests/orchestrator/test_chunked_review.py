@@ -9,32 +9,24 @@ from command_center.orchestrator import planner, review_merge
 TASK = "VOYN-W0-CHUNKED"
 PR = "https://github.com/voyn88/ai-command-center/pull/380"
 HEAD = "e" * 40
-BASE = "c" * 40
 
 
 def _rows_for(chunks, verdicts=None, *, result_head=HEAD):
     verdicts = verdicts or ["ACCEPT"] * len(chunks)
-    diff_hash = hashlib.sha256(
-        "".join(chunk.text for chunk in chunks).encode("utf-8")
-    ).hexdigest()
     rows = []
     for chunk, verdict in zip(chunks, verdicts, strict=True):
-        key = review_merge._chunk_review_key(TASK, PR, HEAD, BASE, diff_hash, chunk)
+        key = review_merge._chunk_review_key(TASK, PR, HEAD, chunk)
         payload = {
-            "prompt": review_merge._render_review_prompt(
-                TASK, PR, BASE, HEAD, diff_hash, chunk
-            ),
+            "prompt": review_merge._render_review_prompt(TASK, PR, HEAD, chunk),
             "review_chunk": {
-                "version": 3,
+                "version": 2,
                 "index": chunk.index,
                 "count": chunk.count,
                 "content_bytes": len(chunk.text.encode("utf-8")),
                 "content_hash": chunk.content_hash,
                 "manifest_hash": chunk.manifest_hash,
-                "base_sha": BASE,
                 "head_sha": HEAD,
-                "diff_hash": diff_hash,
-            },
+            }
         }
         result = {"result_text": f"VERDICT: {verdict}\nHEAD_SHA: {result_head}"}
         rows.append((key, "succeeded", payload, result))
@@ -61,20 +53,11 @@ def _publish(monkeypatch, rows):
     monkeypatch.setattr(
         review_merge, "_has_accept_marker", lambda _repo, _pr: (False, HEAD)
     )
-    diff_hash = rows[0][2]["review_chunk"]["diff_hash"]
-    monkeypatch.setattr(
-        review_merge,
-        "_pr_diff_and_head",
-        lambda _repo, _pr: review_merge._PullRequestDiff("", BASE, HEAD, diff_hash),
-    )
     monkeypatch.setattr(review_merge, "_acceptance_app_credentials", object)
     monkeypatch.setattr(
         review_merge,
         "_post_marker_as_bot",
-        lambda _creds, pr, verdict, sha: (
-            posted.append((pr, verdict, sha)) or True,
-            "",
-        ),
+        lambda _creds, pr, verdict, sha: (posted.append((pr, verdict, sha)) or True, ""),
     )
     monkeypatch.setattr(
         review_merge,
@@ -123,7 +106,9 @@ def test_one_rejected_chunk_dispatches_remediation_and_never_posts_marker(monkey
     rows = _rows_for(chunks, verdicts)
     key, _state, payload, _result = rows[0]
     rows[0] = (key, "running", payload, None)
-    report, posted, remediated = _publish(monkeypatch, rows)
+    report, posted, remediated = _publish(
+        monkeypatch, rows
+    )
 
     assert posted == []
     assert report.remediated == [(TASK, f"{TASK}-REM")]
@@ -141,46 +126,26 @@ def test_chunk_order_and_hashes_are_deterministic_and_cover_the_whole_diff():
     assert "".join(chunk.text for chunk in first) == file_a + file_b
     assert all(len(chunk.text) <= 45 for chunk in first)
     assert first[0].manifest_hash != reordered[0].manifest_hash
-    first_hash = hashlib.sha256((file_a + file_b).encode()).hexdigest()
-    reordered_hash = hashlib.sha256((file_b + file_a).encode()).hexdigest()
-    assert [
-        review_merge._chunk_review_key(TASK, PR, HEAD, BASE, first_hash, chunk)
-        for chunk in first
-    ] != [
-        review_merge._chunk_review_key(TASK, PR, HEAD, BASE, reordered_hash, chunk)
+    assert [review_merge._chunk_review_key(TASK, PR, HEAD, chunk) for chunk in first] != [
+        review_merge._chunk_review_key(TASK, PR, HEAD, chunk)
         for chunk in reordered
     ]
     outcome, _detail = review_merge._aggregate_chunk_verdict(
         list(reversed(_rows_for(first))),
         HEAD,
-        BASE,
-        hashlib.sha256((file_a + file_b).encode()).hexdigest(),
-        review_merge._chunk_key_prefix(
-            TASK,
-            PR,
-            HEAD,
-            BASE,
-            hashlib.sha256((file_a + file_b).encode()).hexdigest(),
-        )
-        or "",
+        review_merge._chunk_key_prefix(TASK, PR, HEAD) or "",
     )
     assert outcome == "ACCEPT"
 
     tampered = _rows_for(first)
     key, state, payload, result = tampered[0]
     payload["review_chunk"]["content_hash"] = "0" * 64
-    diff_hash = hashlib.sha256((file_a + file_b).encode()).hexdigest()
-    key = (
-        f"{review_merge._chunk_key_prefix(TASK, PR, HEAD, BASE, diff_hash)}"
-        f"0000:{'0' * 64}"
-    )
+    key = f"{review_merge._chunk_key_prefix(TASK, PR, HEAD)}0000:{'0' * 64}"
     tampered[0] = (key, state, payload, result)
     outcome, detail = review_merge._aggregate_chunk_verdict(
         tampered,
         HEAD,
-        BASE,
-        diff_hash,
-        review_merge._chunk_key_prefix(TASK, PR, HEAD, BASE, diff_hash) or "",
+        review_merge._chunk_key_prefix(TASK, PR, HEAD) or "",
     )
     assert (outcome, detail) == ("WAIT", "review_chunk_manifest_invalid")
 
@@ -199,9 +164,7 @@ def test_large_diff_enqueues_one_exact_manifest_item_per_bounded_chunk(monkeypat
     )
     monkeypatch.setattr(planner, "repo_route", lambda _repo: ("AICC", "/repo"))
     monkeypatch.setattr(
-        review_merge,
-        "_pr_diff_and_head",
-        lambda _repo, _pr: review_merge._PullRequestDiff.create(diff, BASE, HEAD),
+        review_merge, "_pr_diff_and_head", lambda _repo, _pr: (diff, HEAD)
     )
     calls = []
 
@@ -213,25 +176,21 @@ def test_large_diff_enqueues_one_exact_manifest_item_per_bounded_chunk(monkeypat
         "/repo",
     )
 
-    diff_hash = hashlib.sha256(diff.encode()).hexdigest()
-    chunks = review_merge._review_chunks(diff, TASK, PR, BASE, HEAD, diff_hash)
+    chunks = review_merge._review_chunks(diff, TASK, PR, HEAD)
     assert report.reviewed == [(TASK, PR)]
     assert len(calls) == len(chunks) > 1
     assert [call[1] for call in calls] == [
-        review_merge._chunk_review_key(TASK, PR, HEAD, BASE, diff_hash, chunk)
-        for chunk in chunks
+        review_merge._chunk_review_key(TASK, PR, HEAD, chunk) for chunk in chunks
     ]
     assert {call[2]["review_chunk"]["manifest_hash"] for call in calls} == {
         chunks[0].manifest_hash
     }
     assert all(
-        len(call[2]["prompt"].encode("utf-8")) <= review_merge._MAX_REVIEW_PROMPT_BYTES
+        len(call[2]["prompt"].encode("utf-8"))
+        <= review_merge._MAX_REVIEW_PROMPT_BYTES
         for call in calls
     )
-    assert (
-        "".join(_envelope(call[2]["prompt"])["content"]["text"] for call in calls)
-        == diff
-    )
+    assert "".join(_envelope(call[2]["prompt"])["content"]["text"] for call in calls) == diff
 
 
 def test_context_fence_and_injected_verdict_stay_inside_json_data(monkeypatch):
@@ -249,9 +208,7 @@ def test_context_fence_and_injected_verdict_stay_inside_json_data(monkeypatch):
     )
     monkeypatch.setattr(planner, "repo_route", lambda _repo: ("AICC", "/repo"))
     monkeypatch.setattr(
-        review_merge,
-        "_pr_diff_and_head",
-        lambda _repo, _pr: review_merge._PullRequestDiff.create(injected, BASE, HEAD),
+        review_merge, "_pr_diff_and_head", lambda _repo, _pr: (injected, HEAD)
     )
     calls = []
 
@@ -286,9 +243,7 @@ def test_sixty_thousand_cyrillic_characters_fit_actual_prompt_byte_budget(monkey
     )
     monkeypatch.setattr(planner, "repo_route", lambda _repo: ("AICC", "/repo"))
     monkeypatch.setattr(
-        review_merge,
-        "_pr_diff_and_head",
-        lambda _repo, _pr: review_merge._PullRequestDiff.create(diff, BASE, HEAD),
+        review_merge, "_pr_diff_and_head", lambda _repo, _pr: (diff, HEAD)
     )
     calls = []
 
@@ -313,67 +268,21 @@ def test_sixty_thousand_cyrillic_characters_fit_actual_prompt_byte_budget(monkey
     assert "".join(decoded) == diff
 
 
-def test_pr_diff_uses_immutable_commit_compare_so_aba_cannot_supply_moving_diff(
-    monkeypatch,
-):
-    pinned = "diff --git a/pinned b/pinned\n"
-    moving = "diff --git a/attacker-b b/attacker-b\n"
+def test_pr_diff_fetch_fails_closed_when_head_moves_during_fetch(monkeypatch):
+    heads = iter(("a" * 40, "b" * 40))
     calls = []
 
     def fake_gh(argv, _repo):
         calls.append(argv[:2])
-        if argv[0] == "api" and "/pulls/380" in argv[1]:
+        if argv[:2] == ["pr", "view"]:
             return subprocess.CompletedProcess(
-                argv,
-                0,
-                json.dumps(
-                    {
-                        "base": {
-                            "sha": BASE,
-                            "repo": {"full_name": "voyn88/ai-command-center"},
-                        },
-                        "head": {"sha": HEAD},
-                    }
-                ),
-                "",
+                argv, 0, json.dumps({"headRefOid": next(heads)}), ""
             )
         if argv[:2] == ["pr", "diff"]:
-            return subprocess.CompletedProcess(argv, 0, moving, "")
-        if argv[0] == "api" and "/compare/" in argv[1]:
-            assert f"compare/{BASE}...{HEAD}" in argv[1]
-            return subprocess.CompletedProcess(argv, 0, pinned, "")
+            return subprocess.CompletedProcess(argv, 0, "diff --git a/a b/a\n", "")
         raise AssertionError(argv)
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
 
-    snapshot = review_merge._pr_diff_and_head("/repo", PR)
-    assert snapshot == review_merge._PullRequestDiff.create(pinned, BASE, HEAD)
-    assert ["pr", "diff"] not in calls
-
-
-def test_pr_diff_rejects_malformed_or_cross_repository_snapshot(monkeypatch):
-    responses = [
-        {"base": {"sha": BASE}, "head": {"sha": HEAD}},
-        {
-            "base": {
-                "sha": BASE,
-                "repo": {"full_name": "attacker/unrelated"},
-            },
-            "head": {"sha": HEAD},
-        },
-    ]
-    compare_calls = []
-
-    def fake_gh(argv, _repo):
-        if argv[0] == "api" and "/pulls/380" in argv[1]:
-            return subprocess.CompletedProcess(
-                argv, 0, json.dumps(responses.pop(0)), ""
-            )
-        compare_calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "unexpected", "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
-
     assert review_merge._pr_diff_and_head("/repo", PR) is None
-    assert review_merge._pr_diff_and_head("/repo", PR) is None
-    assert compare_calls == []
+    assert calls == [["pr", "view"], ["pr", "diff"], ["pr", "view"]]
