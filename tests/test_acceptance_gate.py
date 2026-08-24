@@ -371,18 +371,24 @@ def synthetic(sha: str, parent: str, number: int) -> dict:
 
 
 def queue_entry(
-    position: int, number: int, head: str, base: str | None = None
+    position: int,
+    number: int,
+    pull_head: str,
+    base: str | None = None,
+    synthetic_head: str | None = None,
 ) -> dict:
     if base is None:
         base = BASE if position == 1 else SYNTHETIC_ONE
+    if synthetic_head is None:
+        synthetic_head = SYNTHETIC_ONE if position == 1 else SYNTHETIC_TWO
     return {
         "position": position,
         "state": "AWAITING_CHECKS",
         "baseCommit": {"oid": base},
-        "headCommit": {"oid": head},
+        "headCommit": {"oid": synthetic_head},
         "pullRequest": {
             "number": number,
-            "headRefOid": head,
+            "headRefOid": pull_head,
             "baseRefName": "main",
             "state": "OPEN",
         },
@@ -541,8 +547,20 @@ def test_an_ambiguous_merge_group_is_refused(monkeypatch, mutate, message) -> No
         ([queue_entry(1, 12, HEAD_TWELVE)], "#11 is no longer"),
         (
             [
-                queue_entry(2, 11, HEAD_ELEVEN, base=BASE),
-                queue_entry(1, 12, HEAD_TWELVE, base=SYNTHETIC_ONE),
+                queue_entry(
+                    2,
+                    11,
+                    HEAD_ELEVEN,
+                    base=BASE,
+                    synthetic_head=SYNTHETIC_ONE,
+                ),
+                queue_entry(
+                    1,
+                    12,
+                    HEAD_TWELVE,
+                    base=SYNTHETIC_ONE,
+                    synthetic_head=SYNTHETIC_TWO,
+                ),
             ],
             "order disagrees",
         ),
@@ -565,9 +583,9 @@ def test_a_group_that_disagrees_with_live_queue_is_refused(
         )
 
 
-def test_every_group_member_is_bound_to_its_exact_queued_head(monkeypatch) -> None:
+def test_every_group_member_is_bound_to_its_exact_synthetic_head(monkeypatch) -> None:
     stale = queue_entry(1, 11, HEAD_ELEVEN)
-    stale["headCommit"]["oid"] = HEAD_TWELVE
+    stale["headCommit"]["oid"] = SYNTHETIC_TWO
     mock_merge_group_apis(
         monkeypatch,
         [
@@ -576,7 +594,7 @@ def test_every_group_member_is_bound_to_its_exact_queued_head(monkeypatch) -> No
         ],
     )
 
-    with pytest.raises(AcceptanceError, match="stale relative"):
+    with pytest.raises(AcceptanceError, match="head disagrees"):
         _merge_group_numbers(
             merge_group_payload(),
             "dimastov-lab/ai-command-center",
