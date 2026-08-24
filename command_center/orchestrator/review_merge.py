@@ -73,6 +73,7 @@ from typing import Any
 
 from command_center.orchestrator import github_app_auth
 from command_center.orchestrator.routing import cascade_for
+from command_center.worker.outcomes import completed_model_result
 
 __all__ = [
     "LoopReport",
@@ -551,34 +552,38 @@ def review_once(
         params,
     )
     cascade = _model_only_review_cascade()
-    for task_id, pr_url in tasks:  # noqa: PLR1704
+    for current_task_id, pr_url in tasks:
         if not cascade:
-            report.skipped.append((task_id, "no_review_executor_route"))
+            report.skipped.append((current_task_id, "no_review_executor_route"))
             continue
         repo = _repo_from_pr_url(pr_url)
         route = repo_route(repo) if repo else None
         if route is None:
-            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            report.skipped.append((current_task_id, f"no_repo_route: {pr_url!r}"))
             continue
         fetched = _pr_diff_and_head(repo_path, pr_url)
         if fetched is None:
-            report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
+            report.skipped.append(
+                (current_task_id, f"pr_diff_fetch_failed: {pr_url!r}")
+            )
             continue
         snapshot = fetched
-        key = _review_key(task_id, pr_url, snapshot)
+        key = _review_key(current_task_id, pr_url, snapshot)
         if key is None:
-            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            report.skipped.append((current_task_id, f"no_repo_route: {pr_url!r}"))
             continue
         project_id, repository_path = route
         try:
-            chunks = _review_chunks(snapshot, task_id, pr_url)
+            chunks = _review_chunks(snapshot, current_task_id, pr_url)
         except (RuntimeError, ValueError) as exc:
-            report.skipped.append((task_id, f"review_prompt_budget_invalid: {exc}"))
+            report.skipped.append(
+                (current_task_id, f"review_prompt_budget_invalid: {exc}")
+            )
             continue
 
         prepared: list[tuple[str, dict[str, Any]]] = []
         for chunk in chunks:
-            prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
+            prompt = _render_review_prompt(current_task_id, pr_url, snapshot, chunk)
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
                 prepared = []
                 break
@@ -594,7 +599,9 @@ def review_once(
             if chunk.count == 1:
                 prepared.append((key, payload))
             else:
-                chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
+                chunk_key = _chunk_review_key(
+                    current_task_id, pr_url, snapshot, chunk
+                )
                 if chunk_key is None:
                     raise RuntimeError("validated PR URL produced no chunk key")
                 payload["review_chunk"] = {
@@ -610,11 +617,13 @@ def review_once(
                 }
                 prepared.append((chunk_key, payload))
         if not prepared:
-            report.skipped.append((task_id, "review_prompt_budget_invariant_failed"))
+            report.skipped.append(
+                (current_task_id, "review_prompt_budget_invariant_failed")
+            )
             continue
         for review_key, payload in prepared:
-            enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
-        report.reviewed.append((task_id, pr_url))
+            enqueue(cfg.queue, review_key, payload, current_task_id, len(cascade))
+        report.reviewed.append((current_task_id, pr_url))
     return report
 
 
@@ -671,7 +680,13 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
     if not rows:
         return None
     payload = rows[0][0]
-    return json.loads(payload) if isinstance(payload, str) else payload
+    decoded = json.loads(payload) if isinstance(payload, str) else payload
+    # Work-item ``succeeded`` proves only that the queue durably accepted a
+    # transport result.  It is not evidence that an executor completed or
+    # that a model emitted a verdict.  Accept only the typed worker envelope;
+    # legacy, failed and signal-terminated payloads all fail closed and are
+    # retried/reviewed rather than promoted into an acceptance marker.
+    return decoded if completed_model_result(decoded) else None
 
 
 def _json_object(value: Any) -> dict[str, Any] | None:
@@ -766,7 +781,7 @@ def _aggregate_chunk_verdict(
     waiting_reason = ""
     for index in sorted(indexed):
         state, _content_hash, result, _text = indexed[index]
-        if state != "succeeded" or result is None:
+        if state != "succeeded" or not completed_model_result(result):
             waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
             continue
         text = result.get("result_text") or ""
@@ -999,42 +1014,44 @@ def publish_review_verdicts(
         + " ORDER BY t.updated_at LIMIT %s",
         params,
     )
-    for task_id, pr_url in tasks:  # noqa: PLR1704
+    for current_task_id, pr_url in tasks:
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
-            report.skipped.append((task_id, "marker_already_posted"))
+            report.skipped.append((current_task_id, "marker_already_posted"))
             continue
         if not current_head:
-            report.skipped.append((task_id, "pr_view_failed"))
+            report.skipped.append((current_task_id, "pr_view_failed"))
             continue
         snapshot = _pr_diff_and_head(repo_path, pr_url)
         if snapshot is None or snapshot.head != current_head:
-            report.skipped.append((task_id, "pr_diff_snapshot_failed"))
+            report.skipped.append((current_task_id, "pr_diff_snapshot_failed"))
             continue
-        key = _review_key(task_id, pr_url, snapshot)
+        key = _review_key(current_task_id, pr_url, snapshot)
         if key is None:
-            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            report.skipped.append((current_task_id, f"no_repo_route: {pr_url!r}"))
             continue
         prefix, chunk_rows = _chunk_review_rows(
-            factory, task_id, pr_url, snapshot
+            factory, current_task_id, pr_url, snapshot
         )
         if chunk_rows:
             verdict, text = _aggregate_chunk_verdict(
                 chunk_rows, snapshot, prefix or ""
             )
             if verdict == "WAIT":
-                report.skipped.append((task_id, text))
+                report.skipped.append((current_task_id, text))
                 continue
             sha = current_head
         else:
-            result = _latest_review_result(factory, task_id, key)
+            result = _latest_review_result(factory, current_task_id, key)
             if result is None:
-                report.skipped.append((task_id, "no_review_result_yet"))
+                report.skipped.append((current_task_id, "no_review_result_yet"))
                 continue
             text = result.get("result_text") or ""
             parsed = _parse_verdict(text)
             if parsed is None:
-                report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
+                report.skipped.append(
+                    (current_task_id, "verdict_or_head_sha_missing_in_review_result")
+                )
                 continue
             verdict, sha = parsed
             if sha != current_head:
@@ -1044,15 +1061,25 @@ def publish_review_verdicts(
                 # either way, never post a marker whose sha doesn't match what
                 # the agent said it reviewed.
                 report.skipped.append(
-                    (task_id, f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}")
+                    (
+                        current_task_id,
+                        f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}",
+                    )
                 )
                 continue
         if verdict != "ACCEPT":
-            new_task_id = _remediate_rejection(factory, task_id, pr_url, current_head, text)
+            new_task_id = _remediate_rejection(
+                factory, current_task_id, pr_url, current_head, text
+            )
             if new_task_id:
-                report.remediated.append((task_id, new_task_id))
+                report.remediated.append((current_task_id, new_task_id))
             else:
-                report.skipped.append((task_id, "review_verdict_reject_remediation_already_dispatched"))
+                report.skipped.append(
+                    (
+                        current_task_id,
+                        "review_verdict_reject_remediation_already_dispatched",
+                    )
+                )
             continue
         creds = _acceptance_app_credentials()
         if creds is None:
@@ -1066,7 +1093,7 @@ def publish_review_verdicts(
             # comment that goes nowhere. Skip loudly instead, so an
             # operator sees exactly why nothing merges on this host rather
             # than a silently-ineffective marker.
-            report.skipped.append((task_id, "acceptance_bot_not_configured"))
+            report.skipped.append((current_task_id, "acceptance_bot_not_configured"))
             continue
         # The independent identity: posts as `voyn88-acceptance-gate[bot]`,
         # never the operational identity that authored and will merge this
@@ -1074,9 +1101,9 @@ def publish_review_verdicts(
         # #354/#355 (same account posted the marker AND merged).
         ok, reason = _post_marker_as_bot(creds, pr_url, "ACCEPT", sha)
         if not ok:
-            report.skipped.append((task_id, reason))
+            report.skipped.append((current_task_id, reason))
             continue
-        report.reviewed.append((task_id, pr_url))
+        report.reviewed.append((current_task_id, pr_url))
     return report
 
 

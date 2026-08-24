@@ -10,13 +10,13 @@ for exactly one reason.
 
 from __future__ import annotations
 
-
 from command_center.db.work_queue_store import ClaimedWork, QueueRefusal
 from command_center.worker.daemon import (
     HandlerOutcome,
     WorkerConfig,
     WorkerDaemon,
 )
+from command_center.worker.outcomes import QueueOutcomeKind
 
 
 def _work(payload: dict, attempt_id: str = "wat-1") -> ClaimedWork:
@@ -57,6 +57,30 @@ class ScriptedStore:
         return True
 
 
+def test_handler_outcome_factories_keep_transport_and_execution_distinct() -> None:
+    completed = HandlerOutcome.model_result({"status": "completed"})
+    infra = HandlerOutcome.executor_infra_failure("signal 15")
+    rejected = HandlerOutcome.request_rejected("policy")
+
+    assert completed.kind == QueueOutcomeKind.TRANSPORT_SUCCEEDED
+    assert completed.result["executor_result_kind"] == "model_result"
+    assert infra.kind == QueueOutcomeKind.EXECUTOR_INFRA_FAILURE
+    assert infra.retryable and not infra.ok
+    assert rejected.kind == QueueOutcomeKind.REQUEST_REJECTED
+    assert not rejected.retryable and not rejected.ok
+
+
+def test_handler_outcome_rejects_contradictory_typed_state() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="disagrees with ok"):
+        HandlerOutcome(
+            ok=True,
+            retryable=False,
+            kind=QueueOutcomeKind.REQUEST_REJECTED,
+        )
+
+
 def _run_until_idle(daemon: WorkerDaemon, store: ScriptedStore) -> None:
     """Run the loop until the script is exhausted, then stop it via the
     injected sleep — the daemon idles only when there is no work, so the
@@ -72,7 +96,7 @@ def test_a_claimed_item_is_dispatched_and_completed() -> None:
 
     def echo(payload, lease_lost, attempt_no=1):
         outcomes.append(payload)
-        return HandlerOutcome(ok=True, result={"echoed": payload["x"]})
+        return HandlerOutcome.transport_succeeded({"echoed": payload["x"]})
 
     daemon = WorkerDaemon(store, {"echo": echo}, WorkerConfig(visibility_seconds=3))
     _run_until_idle(daemon, store)
@@ -85,7 +109,7 @@ def test_a_failing_handler_reports_fail_not_complete() -> None:
     store = ScriptedStore([_work({"kind": "boom"})])
 
     def boom(payload, lease_lost, attempt_no=1):
-        return HandlerOutcome(ok=False, reason="did not work", retryable=True)
+        return HandlerOutcome.executor_infra_failure("did not work")
 
     daemon = WorkerDaemon(store, {"boom": boom}, WorkerConfig(visibility_seconds=3))
     _run_until_idle(daemon, store)
@@ -130,7 +154,7 @@ def test_a_lost_lease_discards_the_outcome() -> None:
     def slow(payload, lease_lost, attempt_no=1):
         # Wait until the heartbeat thread notices; then finish "successfully".
         assert lease_lost.wait(timeout=10), "heartbeat never signalled loss"
-        return HandlerOutcome(ok=True, result={"too": "late"})
+        return HandlerOutcome.transport_succeeded({"too": "late"})
 
     daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
     _run_until_idle(daemon, store)
@@ -147,7 +171,7 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
 
     def echo(payload, lease_lost, attempt_no=1):
         seen.append(payload)
-        return HandlerOutcome(ok=True, result={})
+        return HandlerOutcome.transport_succeeded()
 
     daemon = WorkerDaemon(store, {"echo": echo}, WorkerConfig(visibility_seconds=3))
 
@@ -171,7 +195,7 @@ def test_idle_backoff_grows_and_resets_on_work(monkeypatch) -> None:
     sleeps: list[float] = []
     daemon = WorkerDaemon(
         store,
-        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True)},
+        {"echo": lambda p, e, a=1: HandlerOutcome.transport_succeeded()},
         WorkerConfig(visibility_seconds=3, idle_min_seconds=1.0, idle_max_seconds=8.0),
     )
     monkeypatch.setattr(
@@ -208,7 +232,7 @@ def test_a_refused_report_is_logged_not_swallowed(caplog) -> None:
     store.complete = refuse_complete  # type: ignore[method-assign]
     daemon = WorkerDaemon(
         store,
-        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
+        {"echo": lambda p, e, a=1: HandlerOutcome.transport_succeeded()},
         WorkerConfig(visibility_seconds=3),
     )
     with caplog.at_level(logging.WARNING):
@@ -242,7 +266,7 @@ def test_persistent_heartbeat_errors_stop_the_work() -> None:
 
     def slow(payload, lease_lost, attempt_no=1):
         assert lease_lost.wait(timeout=30), "errors alone never signalled loss"
-        return HandlerOutcome(ok=True, result={"too": "late"})
+        return HandlerOutcome.transport_succeeded({"too": "late"})
 
     daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
     _run_until_idle(daemon, store)
@@ -260,7 +284,7 @@ def test_the_claim_loop_feeds_the_watchdog_between_claims() -> None:
     pings: list[str] = []
     daemon = WorkerDaemon(
         store,
-        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
+        {"echo": lambda p, e, a=1: HandlerOutcome.transport_succeeded()},
         WorkerConfig(visibility_seconds=3),
         notify=pings.append,
     )
@@ -298,7 +322,7 @@ def test_the_heartbeat_thread_feeds_the_watchdog_during_a_long_run() -> None:
     def slow(payload, lease_lost, attempt_no=1):
         handler_running.set()
         assert lease_lost.wait(timeout=10), "heartbeat never signalled loss"
-        return HandlerOutcome(ok=True, result={"too": "late"})
+        return HandlerOutcome.transport_succeeded({"too": "late"})
 
     daemon = WorkerDaemon(
         store, {"slow": slow}, WorkerConfig(visibility_seconds=3), notify=notify
@@ -396,7 +420,7 @@ def test_the_watchdog_cap_keeps_the_beat_alive_under_a_long_visibility(
             "no heartbeat within the watchdog budget: the uncapped interval "
             "would have parked the beat thread for visibility/3 seconds"
         )
-        return HandlerOutcome(ok=True, result={})
+        return HandlerOutcome.transport_succeeded()
 
     daemon = WorkerDaemon(
         store,
@@ -426,7 +450,7 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
         store = ScriptedStore([_work({"kind": "echo"})])
         daemon = WorkerDaemon(
             store,
-            {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
+            {"echo": lambda p, e, a=1: HandlerOutcome.transport_succeeded()},
             WorkerConfig(visibility_seconds=3),
         )
         _run_until_idle(daemon, store)

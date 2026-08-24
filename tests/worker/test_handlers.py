@@ -19,6 +19,7 @@ import pytest
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
+from command_center.worker.outcomes import ExecutorResultKind, QueueOutcomeKind
 from command_center.worker.payloads import PayloadError, parse_agent_run
 
 
@@ -218,6 +219,9 @@ def test_a_completed_run_reports_ok_with_bounded_result(handler) -> None:
     assert outcome.ok
     assert outcome.result["status"] == "completed"
     assert outcome.result["result_text"] == "done"
+    assert outcome.kind == QueueOutcomeKind.TRANSPORT_SUCCEEDED
+    assert outcome.result["transport_status"] == "transport_succeeded"
+    assert outcome.result["executor_result_kind"] == ExecutorResultKind.MODEL_RESULT
     assert runs[0]["task_type"] == "review"
 
 
@@ -240,6 +244,32 @@ def test_agent_failure_is_still_ok_not_redelivered(handler, monkeypatch) -> None
     monkeypatch.setattr(agent_runner, "run_claude_code", failed_run)
     outcome = run_agent(_payload(), _event(), 1)
     assert outcome.ok and outcome.result["status"] == "failed"
+    assert outcome.kind == QueueOutcomeKind.TRANSPORT_SUCCEEDED
+
+
+def test_signal_terminated_executor_is_retryable_infrastructure_failure(
+    handler, monkeypatch
+) -> None:
+    run_agent, _ = handler
+
+    def terminated(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=-15,
+            stdout="partial model output is not a verdict",
+            stderr="terminated",
+            duration_seconds=2.0,
+            started_at="2026-08-24T12:00:00+00:00",
+            completed_at="2026-08-24T12:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", terminated)
+    outcome = run_agent(_payload(), _event(), 1)
+
+    assert not outcome.ok and outcome.retryable
+    assert outcome.kind == QueueOutcomeKind.EXECUTOR_INFRA_FAILURE
+    assert "signal 15" in outcome.reason
+    assert outcome.result["status"] == "failed"
 
 
 def test_runner_never_started_is_retryable(handler, monkeypatch) -> None:

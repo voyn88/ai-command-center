@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from command_center.orchestrator import planner, review_merge
+from command_center.worker.outcomes import model_result_payload
 
 TASK = "VOYN-W0-CHUNKED"
 PR = "https://github.com/voyn88/ai-command-center/pull/380"
@@ -34,7 +35,13 @@ def rows(snapshot, verdicts=None):
             "review_chunk": metadata,
         }
         key = review_merge._chunk_review_key(TASK, PR, snapshot, chunk)
-        output = {"result_text": f"VERDICT: {verdict}\nHEAD_SHA: {HEAD}"}
+        output = model_result_payload(
+            {
+                "status": "completed",
+                "exit_code": 0,
+                "result_text": f"VERDICT: {verdict}\nHEAD_SHA: {HEAD}",
+            }
+        )
         result.append((key, "succeeded", payload, output))
     return result
 
@@ -77,6 +84,33 @@ def test_chunk_completeness_failure_and_reject_are_fail_closed(monkeypatch):
     verdicts[-1] = "REJECT"
     report, posted, remediated = publish(monkeypatch, snapshot, rows(snapshot, verdicts))
     assert not posted and remediated and report.remediated
+
+
+@pytest.mark.parametrize(
+    "invalid_result",
+    [
+        {"status": "completed", "result_text": f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"},
+        model_result_payload(
+            {
+                "status": "failed",
+                "exit_code": -15,
+                "result_text": f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}",
+            }
+        ),
+    ],
+)
+def test_chunk_manifest_rejects_legacy_or_signal_terminated_results(
+    monkeypatch, invalid_result
+):
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    review_rows = rows(snapshot)
+    key, state, payload, _result = review_rows[0]
+    review_rows[0] = key, state, payload, invalid_result
+
+    report, posted, _ = publish(monkeypatch, snapshot, review_rows)
+
+    assert not posted
+    assert "review_chunk_not_succeeded" in report.skipped[0][1]
 
 
 def test_manifest_reorder_hash_and_snapshot_identity_are_bound():

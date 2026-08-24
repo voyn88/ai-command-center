@@ -23,6 +23,7 @@ import pytest
 
 from command_center import agent_runner, workspace_provisioning
 from command_center.worker.handlers import build_handlers
+from command_center.worker.outcomes import QueueOutcomeKind
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -613,6 +614,49 @@ def test_tampered_retry_marker_is_refused_before_executor(agent, monkeypatch):
     assert workspace.exists()
 
 
+def test_uncheckpointed_candidate_is_refused_before_executor(agent, monkeypatch):
+    run_agent, repo = agent
+    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run(commit=False))
+    assert run_agent(_payload(), _event(), 1).ok
+    workspace = _workspace(repo)
+    (workspace / "outside-checkpoint.txt").write_text("untrusted commit\n")
+    _git(workspace, "add", "outside-checkpoint.txt")
+    _git(workspace, "commit", "-qm", "outside signed checkpoint")
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **_kwargs: pytest.fail("uncheckpointed candidate must fail before executor"),
+    )
+
+    refused = run_agent(_payload(), _event(), 2)
+
+    assert not refused.ok and refused.retryable
+    assert "task_workspace_checkpoint" in refused.reason
+    assert workspace.exists()
+
+
+def test_changed_canonical_remote_is_refused_before_executor(
+    agent, monkeypatch, tmp_path
+):
+    run_agent, repo = agent
+    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run(commit=False))
+    assert run_agent(_payload(), _event(), 1).ok
+    workspace = _workspace(repo)
+    replacement = _make_repo(tmp_path / "replacement")
+    _git(repo, "remote", "add", "origin", str(replacement))
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **_kwargs: pytest.fail("remote mismatch must fail before executor"),
+    )
+
+    refused = run_agent(_payload(), _event(), 2)
+
+    assert not refused.ok and refused.retryable
+    assert "workspace_belongs_to_repository" in refused.reason
+    assert workspace.exists()
+
+
 def test_late_bwrap_signature_preserves_any_local_commit(agent, monkeypatch):
     run_agent, repo = agent
     monkeypatch.setattr(
@@ -689,6 +733,42 @@ def test_provider_error_after_commit_is_checkpointed_for_retry(agent, monkeypatc
     recovered = run_agent(_payload(), _event(), 2)
     assert recovered.ok
     assert workspace.is_dir()
+
+
+def test_sigterm_after_commit_is_checkpointed_and_retry_is_idempotent(
+    agent, monkeypatch
+):
+    run_agent, repo = agent
+
+    def committed_then_sigterm(**kwargs):
+        _fake_run()(**kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=-15,
+            stdout="partial output",
+            stderr="terminated",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", committed_then_sigterm)
+    first = run_agent(_payload(), _event(), 1)
+
+    assert not first.ok and first.retryable
+    assert first.kind == QueueOutcomeKind.EXECUTOR_INFRA_FAILURE
+    assert "signal 15" in first.reason
+    workspace = _workspace(repo)
+    checkpointed_sha = _git(workspace, "rev-parse", "HEAD").stdout.strip()
+    assert (workspace / "change.txt").exists()
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run(commit=False))
+    recovered = run_agent(_payload(), _event(), 2)
+
+    assert recovered.ok
+    assert recovered.kind == QueueOutcomeKind.TRANSPORT_SUCCEEDED
+    assert _git(workspace, "rev-parse", "HEAD").stdout.strip() == checkpointed_sha
+    assert len(_git(workspace, "log", "--format=%s").stdout.splitlines()) == 2
 
 
 def test_candidate_change_after_validation_is_never_checkpointed_or_published(

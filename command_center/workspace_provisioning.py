@@ -950,8 +950,40 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
 _FULL_SHA1 = re.compile(r"^[0-9a-f]{40}$")
 
 
-def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
-    """Verify a reused agent clone without executing its Git configuration."""
+@dataclass(frozen=True, slots=True)
+class _TaskLocalLocation:
+    """Filesystem identity established before reading task-controlled metadata."""
+
+    spec: WorkspaceSpec
+    repository: Path
+    workspace: Path
+    expected_workspace: Path
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskLocalCheckpoint:
+    """Authenticated marker plus the exact agent HEAD it authorizes."""
+
+    location: _TaskLocalLocation
+    remote_url: str
+    marker_base: str
+    marker_start: str
+    candidate: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskLocalRemoteState:
+    """Current canonical remote state used by the trusted graph verifier."""
+
+    checkpoint: _TaskLocalCheckpoint
+    current_base: str
+    remote_task: str | None
+
+
+def _locate_task_local_workspace(spec: WorkspaceSpec) -> _TaskLocalLocation:
+    """Prove the deterministic, non-symlinked task-clone filesystem identity."""
     if not (spec.repository_path and spec.expected_branch and spec.base_branch):
         raise WorkspaceVerificationError(
             failed_step="task_local_authority_complete",
@@ -993,6 +1025,24 @@ def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
             expected_branch=spec.expected_branch,
             detail="task clone root is not a real directory",
         )
+    return _TaskLocalLocation(
+        spec=spec,
+        repository=repo,
+        workspace=absolute,
+        expected_workspace=expected_path,
+        device=workspace_stat.st_dev,
+        inode=workspace_stat.st_ino,
+    )
+
+
+def _authenticate_task_local_checkpoint(
+    location: _TaskLocalLocation,
+) -> _TaskLocalCheckpoint:
+    """Authenticate marker authority and bind it to the exact saved HEAD."""
+    spec = location.spec
+    absolute = location.workspace
+    expected_path = location.expected_workspace
+    repo = location.repository
     marker = _read_task_local_marker(absolute)
     if marker is None:
         raise WorkspaceVerificationError(
@@ -1040,64 +1090,115 @@ def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
             expected_branch=spec.expected_branch,
             detail=f"saved HEAD {candidate} differs from signed checkpoint {marker_start}",
         )
+    return _TaskLocalCheckpoint(
+        location=location,
+        remote_url=remote_url,
+        marker_base=marker_base,
+        marker_start=marker_start,
+        candidate=candidate,
+    )
+
+
+def _resolve_task_local_remote(
+    checkpoint: _TaskLocalCheckpoint,
+) -> _TaskLocalRemoteState:
+    """Resolve current canonical refs without trusting the agent clone config."""
+    location = checkpoint.location
+    spec = location.spec
     current_base = _resolve_remote_ref_sha(
-        repo, remote_url, f"refs/heads/{spec.base_branch}", spec
+        location.repository,
+        checkpoint.remote_url,
+        f"refs/heads/{spec.base_branch}",
+        spec,
     )
     if current_base is None:
         raise WorkspaceVerificationError(
             failed_step="remote_base_exists",
             remediation=f"Restore remote base branch {spec.base_branch!r}.",
-            expected_workspace=str(expected_path),
-            actual_workspace=str(absolute),
+            expected_workspace=str(location.expected_workspace),
+            actual_workspace=str(location.workspace),
             expected_branch=spec.expected_branch,
             detail="canonical remote base branch is missing",
         )
     remote_task = _resolve_remote_ref_sha(
-        repo, remote_url, f"refs/heads/{spec.expected_branch}", spec
+        location.repository,
+        checkpoint.remote_url,
+        f"refs/heads/{spec.expected_branch}",
+        spec,
     )
+    return _TaskLocalRemoteState(
+        checkpoint=checkpoint,
+        current_base=current_base,
+        remote_task=remote_task,
+    )
+
+
+def _verify_task_local_graph(remote: _TaskLocalRemoteState) -> VerificationEvidence:
+    """Verify commit/object/remote ancestry in a fresh trusted publisher clone."""
+    checkpoint = remote.checkpoint
+    location = checkpoint.location
+    spec = location.spec
     # This disposable clone proves the marker's original base is a real
     # ancestor of today's canonical base and that the saved candidate is a
     # clean descendant. It never reads agent-controlled Git config.
     with trusted_publish_clone(
-        absolute,
+        location.workspace,
         expected_branch=spec.expected_branch,
-        remote_url=remote_url,
-        start_sha=marker_base,
-        trusted_base_sha=marker_base,
-        current_base_sha=current_base,
-        expected_remote_sha=remote_task,
-        expected_inode=(workspace_stat.st_dev, workspace_stat.st_ino),
+        remote_url=checkpoint.remote_url,
+        start_sha=checkpoint.marker_base,
+        trusted_base_sha=checkpoint.marker_base,
+        current_base_sha=remote.current_base,
+        expected_remote_sha=remote.remote_task,
+        expected_inode=(location.device, location.inode),
         require_clean=spec.status_policy != STATUS_POLICY_ALLOW_DIRTY,
     ):
         pass
     evidence = VerificationEvidence(
-        workspace_path=str(absolute),
-        repository_path=str(repo),
+        workspace_path=str(location.workspace),
+        repository_path=str(location.repository),
         expected_branch=spec.expected_branch,
         actual_branch=spec.expected_branch,
         is_worktree=True,
         is_isolated_worktree=True,
         provision_outcome=spec.provision_outcome,
-        git_dir=str(absolute / ".git"),
-        git_common_dir=str(absolute / ".git"),
-        base_sha=marker_base,
-        start_sha=candidate,
-        remote_task_sha=remote_task,
-        remote_url=remote_url,
-        workspace_device=workspace_stat.st_dev,
-        workspace_inode=workspace_stat.st_ino,
+        git_dir=str(location.workspace / ".git"),
+        git_common_dir=str(location.workspace / ".git"),
+        base_sha=checkpoint.marker_base,
+        start_sha=checkpoint.candidate,
+        remote_task_sha=remote.remote_task,
+        remote_url=checkpoint.remote_url,
+        workspace_device=location.device,
+        workspace_inode=location.inode,
     )
     for step, detail in (
-        ("workspace_exists", str(absolute)),
-        ("task_local_git_metadata", str(absolute / ".git")),
-        ("workspace_belongs_to_repository", str(repo)),
+        ("workspace_exists", str(location.workspace)),
+        ("task_local_git_metadata", str(location.workspace / ".git")),
+        ("workspace_belongs_to_repository", str(location.repository)),
         ("branch_matches", spec.expected_branch),
         ("isolated_worktree_required", "is_isolated=True"),
-        ("base_branch_exists", current_base),
+        ("base_branch_exists", remote.current_base),
         ("status_policy_satisfied", f"policy={spec.status_policy}"),
     ):
         evidence.record(step, True, detail)
     return evidence
+
+
+_TASK_LOCAL_VERIFICATION_PIPELINE = (
+    _locate_task_local_workspace,
+    _authenticate_task_local_checkpoint,
+    _resolve_task_local_remote,
+    _verify_task_local_graph,
+)
+
+
+def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
+    """Run the one authoritative, composable task-local verification pipeline."""
+    state = spec
+    for invariant in _TASK_LOCAL_VERIFICATION_PIPELINE:
+        state = invariant(state)
+    if not isinstance(state, VerificationEvidence):
+        raise TypeError("task-local verification pipeline returned no evidence")
+    return state
 
 
 def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
@@ -1165,91 +1266,8 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     evidence.git_dir = str(git_dir) if git_dir else None
     evidence.git_common_dir = str(git_common_dir) if git_common_dir else None
 
-    marker: dict | None = None
-    if spec.task_local_git_metadata:
-        marker = _read_task_local_marker(workspace_resolved)
-        if marker is None:
-            fail(
-                "task_local_workspace_marker",
-                "Re-provision this task as a standalone pipeline-owned clone.",
-                "standalone workspace ownership marker is missing or invalid",
-                actual_branch=actual_branch,
-            )
-        if (
-            git_dir is None
-            or git_common_dir is None
-            or git_dir != git_common_dir
-            or git_dir != workspace_resolved / ".git"
-            or git_dir.parent != workspace_resolved
-        ):
-            fail(
-                "task_local_git_metadata",
-                "Use a standalone clone whose .git directory is inside the task root.",
-                f"git_dir={git_dir}, git_common_dir={git_common_dir}",
-                actual_branch=actual_branch,
-            )
-        evidence.record(
-            "task_local_git_metadata", True, f"git_dir={git_dir}; common_dir={git_common_dir}"
-        )
-
     # 3. Workspace belongs to the expected repository.
-    if (
-        spec.task_local_git_metadata
-        and repo_resolved is not None
-        and git_info.get_status(repo_resolved).get("is_repo")
-    ):
-        assert marker is not None
-        current_remote = _source_remote_url(repo_resolved, spec)
-        if not spec.base_branch or not spec.expected_branch:
-            fail(
-                "task_local_authority_complete",
-                "Provide both base_branch and expected_branch for a task-local clone.",
-                "trusted branch authority is incomplete",
-                actual_branch=actual_branch,
-            )
-        current_base = _resolve_remote_ref_sha(
-            repo_resolved, current_remote, f"refs/heads/{spec.base_branch}", spec
-        )
-        if current_base is None:
-            fail(
-                "remote_base_exists",
-                f"Create the canonical remote base branch {spec.base_branch!r}.",
-                "canonical remote base branch is missing",
-                actual_branch=actual_branch,
-            )
-        remote_task = _resolve_remote_ref_sha(
-            repo_resolved, current_remote, f"refs/heads/{spec.expected_branch}", spec
-        )
-        current_start = remote_task or current_base
-        mismatches = {
-            "source_repository": (marker.get("source_repository"), str(repo_resolved)),
-            "remote_url": (marker.get("remote_url"), current_remote),
-            "expected_branch": (marker.get("expected_branch"), spec.expected_branch),
-            "base_branch": (marker.get("base_branch"), spec.base_branch),
-            "base_sha": (marker.get("base_sha"), current_base),
-            "start_sha": (marker.get("start_sha"), current_start),
-        }
-        if spec.base_sha:
-            mismatches["base_sha"] = (marker.get("base_sha"), spec.base_sha.lower())
-        failed = {
-            key: values for key, values in mismatches.items() if values[0] != values[1]
-        }
-        if failed:
-            fail(
-                "workspace_belongs_to_repository",
-                "Discard the mismatched clone only after preserving any diff, then re-provision it.",
-                f"task-local ownership mismatch: {failed}",
-                actual_branch=actual_branch,
-            )
-        evidence.base_sha = current_base
-        evidence.start_sha = current_start
-        evidence.remote_url = current_remote
-        evidence.record(
-            "workspace_belongs_to_repository",
-            True,
-            f"standalone clone of {repo_resolved} at {current_start}",
-        )
-    elif repo_resolved is not None and git_info.get_status(repo_resolved).get("is_repo"):
+    if repo_resolved is not None and git_info.get_status(repo_resolved).get("is_repo"):
         workspace_common = _git_common_dir(workspace_resolved)
         repo_common = _git_common_dir(repo_resolved)
         if workspace_common is None or repo_common is None or workspace_common != repo_common:
@@ -1285,7 +1303,7 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     evidence.record("branch_matches", True, f"branch={actual_branch}")
 
     # 5. Expected branch is not checked out in a conflicting worktree.
-    if spec.expected_branch and repo_resolved is not None and not spec.task_local_git_metadata:
+    if spec.expected_branch and repo_resolved is not None:
         conflict = _conflicting_worktree(repo_resolved, spec.expected_branch, workspace_resolved)
         if conflict is not None:
             fail(
@@ -1299,7 +1317,7 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     # 6. The main repository is not used for a feature/audit task.
     feature = is_feature_task(spec.expected_branch, spec.base_branch, spec.task_type)
     is_primary = _is_primary_worktree(workspace_resolved)
-    isolated = spec.task_local_git_metadata or not is_primary
+    isolated = not is_primary
     evidence.is_isolated_worktree = isolated
     if feature and not isolated:
         fail(
@@ -1318,13 +1336,8 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
 
     # 7. Base branch exists (when one is configured).
     if spec.base_branch and repo_resolved is not None:
-        base_ref = (
-            f"{evidence.start_sha}^{{commit}}"
-            if spec.task_local_git_metadata and marker is not None
-            else f"{spec.base_branch}^{{commit}}"
-        )
-        base_repo = workspace_resolved if spec.task_local_git_metadata else repo_resolved
-        base_ok = git_info.run_git_command(base_repo, ["rev-parse", "--verify", base_ref])
+        base_ref = f"{spec.base_branch}^{{commit}}"
+        base_ok = git_info.run_git_command(repo_resolved, ["rev-parse", "--verify", base_ref])
         if base_ok is None or base_ok.returncode != 0:
             fail(
                 "base_branch_exists",

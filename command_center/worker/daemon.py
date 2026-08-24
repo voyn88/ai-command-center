@@ -29,6 +29,11 @@ Design decisions, each traceable to the shipped substrate:
   that hangs *and* takes the beat thread with it, a claim loop stuck in a
   driver call — misses two pings and systemd restarts the unit. Restart is
   safe by the same construction as SIGKILL: lease expiry plus the reaper.
+* **Transport success is not a model verdict.** A successful queue completion
+  carries an explicit typed model-result payload. Executor infrastructure
+  failures instead fail the attempt as retryable; request-policy refusals are
+  non-retryable. Consumers must validate the typed payload before aggregating
+  a verdict.
 """
 
 from __future__ import annotations
@@ -37,8 +42,9 @@ import logging
 import random
 import signal
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from command_center.db.work_queue_store import (
     ClaimedWork,
@@ -46,6 +52,7 @@ from command_center.db.work_queue_store import (
     WorkQueueStore,
 )
 from command_center.worker import sdnotify
+from command_center.worker.outcomes import QueueOutcomeKind, model_result_payload
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +61,53 @@ __all__ = ["Handler", "HandlerOutcome", "WorkerConfig", "WorkerDaemon"]
 
 @dataclass(frozen=True, slots=True)
 class HandlerOutcome:
+    kind: QueueOutcomeKind
     ok: bool
     result: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
-    retryable: bool = True
+    retryable: bool = False
+
+    def __post_init__(self) -> None:
+        if self.ok != (self.kind == QueueOutcomeKind.TRANSPORT_SUCCEEDED):
+            raise ValueError("HandlerOutcome kind disagrees with ok")
+        if self.retryable != (self.kind == QueueOutcomeKind.EXECUTOR_INFRA_FAILURE):
+            raise ValueError("HandlerOutcome kind disagrees with retryable")
+
+    @classmethod
+    def transport_succeeded(
+        cls, result: dict[str, Any] | None = None
+    ) -> HandlerOutcome:
+        return cls(
+            ok=True,
+            retryable=False,
+            result=dict(result or {}),
+            kind=QueueOutcomeKind.TRANSPORT_SUCCEEDED,
+        )
+
+    @classmethod
+    def model_result(cls, result: dict[str, Any]) -> HandlerOutcome:
+        return cls.transport_succeeded(model_result_payload(result))
+
+    @classmethod
+    def executor_infra_failure(
+        cls, reason: str, *, result: dict[str, Any] | None = None
+    ) -> HandlerOutcome:
+        return cls(
+            ok=False,
+            retryable=True,
+            reason=reason,
+            result=dict(result or {}),
+            kind=QueueOutcomeKind.EXECUTOR_INFRA_FAILURE,
+        )
+
+    @classmethod
+    def request_rejected(cls, reason: str) -> HandlerOutcome:
+        return cls(
+            ok=False,
+            retryable=False,
+            reason=reason,
+            kind=QueueOutcomeKind.REQUEST_REJECTED,
+        )
 
 
 class Handler(Protocol):
@@ -93,14 +143,14 @@ class WorkerDaemon:
         self,
         store: WorkQueueStore,
         handlers: dict[str, Handler],
-        config: WorkerConfig = WorkerConfig(),
+        config: WorkerConfig | None = None,
         *,
         sleep: Callable[[float], None] | None = None,
         notify: Callable[[str], object] | None = None,
     ) -> None:
         self._store = store
         self._handlers = dict(handlers)
-        self._config = config
+        self._config = config or WorkerConfig()
         self._stop = threading.Event()
         # Injectable so tests drive time instead of waiting through it.
         self._sleep = sleep if sleep is not None else self._stop.wait
@@ -206,10 +256,8 @@ class WorkerDaemon:
             # queue_enqueue accepts any jsonb — a list or bare string is
             # producible by the app role, and `.get` on it would raise out of
             # run_forever and kill the daemon over one malformed item.
-            return HandlerOutcome(
-                ok=False,
-                reason=f"payload is {type(work.payload).__name__}, not an object",
-                retryable=False,
+            return HandlerOutcome.request_rejected(
+                f"payload is {type(work.payload).__name__}, not an object"
             )
         kind = str(work.payload.get("kind", ""))
         handler = self._handlers.get(kind)
@@ -217,16 +265,14 @@ class WorkerDaemon:
             # Non-retryable by design: a payload nobody can execute will not
             # become executable on the next attempt, and retrying it burns the
             # attempt budget on the way to the same dead letter.
-            return HandlerOutcome(
-                ok=False,
-                reason=f"no handler for payload kind {kind!r}",
-                retryable=False,
+            return HandlerOutcome.request_rejected(
+                f"no handler for payload kind {kind!r}"
             )
         try:
             return handler(work.payload, lease_lost, work.attempt_no)
-        except Exception as error:  # noqa: BLE001 -- the boundary of the daemon
+        except Exception as error:  # the daemon is the exception boundary
             logger.exception("handler for %r raised", kind)
-            return HandlerOutcome(ok=False, reason=repr(error), retryable=True)
+            return HandlerOutcome.executor_infra_failure(repr(error))
 
     def _heartbeat_loop(
         self,
@@ -251,7 +297,7 @@ class WorkerDaemon:
             self._notify("WATCHDOG=1")
             try:
                 alive = self._store.heartbeat(work)
-            except Exception:  # noqa: BLE001 -- transient DB errors must not kill the beat
+            except Exception:  # transient DB errors must not kill the beat
                 consecutive_errors += 1
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
                 # Errors are not refusals, but they are not free either: after

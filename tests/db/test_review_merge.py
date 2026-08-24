@@ -15,10 +15,9 @@ from command_center.orchestrator.review_merge import (
     publish_review_verdicts,
     review_once,
 )
-from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
-    _test_repo_routes,
-    rig,
-)
+from command_center.worker.outcomes import model_result_payload
+
+pytest_plugins = ("tests.db.test_backlog_planner",)
 
 BASE = "c" * 40
 DIFF = "diff --git a/x b/x\n+hi\n"
@@ -36,8 +35,18 @@ def _snapshots(monkeypatch):
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda _repo, pr: SNAPSHOTS.get(pr))
 
 
-def _complete_review(app_factory, worker, task_id, pr_url, head_sha, result_text):
-    SNAPSHOTS[pr_url] = _snapshot(head_sha)
+def _complete_review(
+    app_factory,
+    worker,
+    task_id,
+    pr_url,
+    head_sha,
+    result_text,
+    *,
+    status="completed",
+    exit_code=0,
+    typed=True,
+):
     """Enqueue + claim + complete a review-class work item exactly the way
     review_once/the real daemon would, so publish_review_verdicts reads a
     result shaped like production, not a hand-built row. Keyed via the real
@@ -46,6 +55,7 @@ def _complete_review(app_factory, worker, task_id, pr_url, head_sha, result_text
     reports as `headRefOid`, the same way review_once/publish_review_
     verdicts always compute the key from the PR's live head, never a value
     handed in separately."""
+    SNAPSHOTS[pr_url] = _snapshot(head_sha)
     from command_center.db.work_queue_store import WorkQueueStore
 
     store = WorkQueueStore(app_factory)
@@ -57,7 +67,14 @@ def _complete_review(app_factory, worker, task_id, pr_url, head_sha, result_text
     key = review_merge._review_key(task_id, pr_url, _snapshot(head_sha))
     store.enqueue("execution", idempotency_key=key, payload=payload, task_id=task_id)
     claimed = worker.claim("execution", visibility_seconds=60)
-    assert worker.complete(claimed, {"status": "completed", "result_text": result_text})
+    result = {
+        "status": status,
+        "exit_code": exit_code,
+        "result_text": result_text,
+    }
+    if typed:
+        result = model_result_payload(result)
+    assert worker.complete(claimed, result)
 
 
 def _ready(store, factory, task_id, pr):
@@ -77,7 +94,35 @@ def _ready(store, factory, task_id, pr):
         c.commit()
 
 
-def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize(
+    ("payload", "accepted"),
+    [
+        ({"status": "completed", "result_text": "legacy"}, False),
+        (
+            model_result_payload(
+                {"status": "failed", "exit_code": -15, "result_text": "partial"}
+            ),
+            False,
+        ),
+        (
+            model_result_payload(
+                {"status": "completed", "exit_code": 0, "result_text": "verdict"}
+            ),
+            True,
+        ),
+    ],
+)
+def test_latest_review_result_requires_a_completed_typed_model_payload(
+    monkeypatch, payload, accepted
+):
+    monkeypatch.setattr(review_merge, "_rows", lambda *args, **kwargs: [(payload,)])
+
+    result = review_merge._latest_review_result(object(), "task", "review-key")
+
+    assert (result is not None) is accepted
+
+
+def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypatch):
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7")
@@ -139,7 +184,7 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     assert payload["repository_path"] == "/srv/repo-d2"
 
 
-def test_review_skips_a_pr_whose_repo_has_no_route(rig):  # noqa: F811
+def test_review_skips_a_pr_whose_repo_has_no_route(rig):
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R2", "https://github.com/x/unrouted-repo/pull/9")
     calls = []
@@ -155,7 +200,7 @@ def test_review_skips_a_pr_whose_repo_has_no_route(rig):  # noqa: F811
     )
 
 
-def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypatch):
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R3", "https://github.com/x/repo-d2/pull/12")
 
@@ -216,7 +261,7 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
     assert ("VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13") in report.reviewed
 
 
-def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noqa: F811
+def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
@@ -243,7 +288,7 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
         assert cur.fetchone()[0] == "DONE"
 
 
-def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):  # noqa: F811
+def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):
     """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: a marker whose reviewer
     login is the SAME as the PR's own author must not authorize merge --
     live-confirmed as a real gap on PRs #354/#355, both merged by the
@@ -270,7 +315,7 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch): 
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):
     """The positive case of the same check: a genuinely independent
     reviewer login (the acceptance bot's, in production) does authorize
     merge."""
@@ -300,7 +345,7 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
     assert ("VOYN-W0-M1C", head) in report.merged
 
 
-def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):  # noqa: F811
+def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
     """The `"cceptance" not in name` exclusion is gone: a red Acceptance
     gate check blocks merge like any other required check, now that the
     bot behind it is reconnected and the check can genuinely reflect an
@@ -333,7 +378,7 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
     )
 
 
-def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
+def test_merge_skips_without_marker(rig, monkeypatch):
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M2", "https://github.com/x/y/pull/9")
@@ -354,7 +399,7 @@ def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
         assert cur.fetchone()[0] == "READY_TO_REVIEW"  # untouched
 
 
-def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, monkeypatch):
     """VOYN-W0-AICC-DISABLE-UNSAFE-AUTOMERGE: a CheckRun with `conclusion:
     null` because it hasn't finished (`status` QUEUED/IN_PROGRESS) used to
     read identically to one that simply carries no conclusion key at all --
@@ -383,7 +428,7 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, mon
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # noqa: F811
+def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):
     """The rollup mixes CheckRun and legacy StatusContext shapes; a pending
     StatusContext (`state: PENDING`, no `conclusion`/`status` keys at all)
     must block merge the same as a running CheckRun does."""
@@ -405,7 +450,7 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # n
     assert ("VOYN-W0-M4", "checks_not_green: ['legacy-ci']") in report.skipped
 
 
-def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):
     """VOYN-W0-AICC-DISABLE-UNSAFE-AUTOMERGE: an ACCEPT marker sitting in an
     OLDER review must not authorize merge once a NEWER review exists on the
     same head -- e.g. a stale ACCEPT from before a dismissed/superseded
@@ -431,7 +476,7 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
     assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
 
 
-def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811, E501
+def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):
     """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: the agent's own ACCEPT
     verdict must reach GitHub as the exact `ACCEPTANCE: ACCEPT <sha>`
     comment-review body, posted under the independent acceptance bot's
@@ -472,7 +517,7 @@ def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig,
     assert posted == [("https://github.com/x/y/pull/11", "ACCEPT", head)]
 
 
-def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: F811, E501
+def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):
     """A host with no acceptance-bot credentials must not fall back to the
     old same-identity marker -- that marker can never satisfy
     `_pr_is_mergeable`'s different-author check any more, so posting one
@@ -500,7 +545,7 @@ def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkey
     assert ("VOYN-W0-P1B", "acceptance_bot_not_configured") in report.skipped
 
 
-def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkeypatch):
     """VOYN-W0-AICC-REVIEW-REJECT-REMEDIATION-LOOP: a REJECT must not just be
     skipped forever -- it dispatches a new, linked follow-up task (0010's
     design: a new task, not a cycle back into the rejected task's own state
@@ -560,7 +605,7 @@ def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkey
         assert linked_sha == head
 
 
-def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):
     """The parent task leaves READY_TO_REVIEW the instant it is REJECTED, so
     a second publish_review_verdicts tick never even selects it again -- the
     state machine itself is the idempotency boundary, not a special skip
@@ -609,7 +654,7 @@ def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):  # 
         assert cur.fetchone()[0] == 1
 
 
-def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):
     """Independent review, 2026-08-21: a reviewing agent reasoning aloud can
     draft a tentative ACCEPT, keep reading, find a real defect, and correct
     itself to REJECT further down the same transcript. .search() would have
@@ -643,7 +688,7 @@ def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
-def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):
     """Independent review, round 3 (2026-08-21): even a single co-located
     VERDICT+HEAD_SHA regex still matches wherever it occurs in the text --
     including a purely illustrative block ("a passing review would read
@@ -682,7 +727,7 @@ def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):  
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
-def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypatch):
     """Independent review, round 2 (2026-08-21): taking the last VERDICT and
     the last HEAD_SHA *independently* can still combine two unrelated lines
     -- e.g. the reviewer's real, final REJECT followed by incidental prose
@@ -718,7 +763,7 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
-def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):
     import subprocess as sp
 
     app_factory, store, _worker = rig
@@ -737,7 +782,47 @@ def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):
     assert ("VOYN-W0-P3", "no_review_result_yet") in report.skipped
 
 
-def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize(
+    ("status", "exit_code", "typed"),
+    [
+        ("completed", 0, False),
+        ("failed", -15, True),
+    ],
+)
+def test_review_result_aggregation_fails_closed_without_completed_typed_model_result(
+    rig, monkeypatch, status, exit_code, typed
+):
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    task_id = f"VOYN-W0-P-TYPED-{status}-{typed}"
+    pr_url = "https://github.com/x/y/pull/113"
+    head = "3" * 40
+    _ready(store, app_factory, task_id, pr_url)
+    _complete_review(
+        app_factory,
+        worker,
+        task_id,
+        pr_url,
+        head,
+        f"VERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        status=status,
+        exit_code=exit_code,
+        typed=typed,
+    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({"headRefOid": head, "reviews": []})
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "unexpected")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert (task_id, "no_review_result_yet") in report.skipped
+
+
+def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):
     app_factory, store, worker = rig
     head = "f" * 40
     pr_url = "https://github.com/x/y/pull/14"
@@ -766,7 +851,7 @@ def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F
     assert not posted
 
 
-def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig, monkeypatch):
     """VOYN-OPS-EVIDENCE-MEASURED-ON-A-STATE-THAT-NO-LONGER-EXISTS, same
     class at a new site: the review ran against a sha that is no longer the
     PR's head (a push landed after the review was dispatched). Posting the
@@ -805,7 +890,7 @@ def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig,
     assert not posted
 
 
-def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
+def test_merge_skips_when_a_check_is_red(rig, monkeypatch):
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/10")
@@ -966,7 +1051,7 @@ def test_review_key_scopes_by_pr_number_head_sha_and_policy_version():
     assert review_merge._review_key("VOYN-W0-X", "not a url", _snapshot(sha_a)) is None
 
 
-def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(rig, _test_repo_routes, monkeypatch):
     """The general case the review-cycle key fixes, not just remediation: an
     ordinary task still IN_PROGRESS/READY_TO_REVIEW that gets a second push
     to its PR must be reviewable again, not permanently deduped against

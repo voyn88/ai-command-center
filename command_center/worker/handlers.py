@@ -190,9 +190,9 @@ def _run_agent(
 ) -> HandlerOutcome:
     request = parse_agent_run(payload)
     if isinstance(request, PayloadError):
-        return HandlerOutcome(
-            ok=False, reason=request.reason, retryable=request.retryable
-        )
+        if request.retryable:
+            return HandlerOutcome.executor_infra_failure(request.reason)
+        return HandlerOutcome.request_rejected(request.reason)
 
     link = _cascade_link(request, attempt_no)
     cascade_step = attempt_no if link is not None else None
@@ -209,10 +209,8 @@ def _run_agent(
             # attempt to the pool and the next delivery selects the next
             # link. An unknown name on the LAST link exhausts the budget
             # into the dead letter, where the reason names the route.
-            return HandlerOutcome(
-                ok=False,
-                reason=f"executor_unavailable: {executor!r} (cascade step {attempt_no})",
-                retryable=True,
+            return HandlerOutcome.executor_infra_failure(
+                f"executor_unavailable: {executor!r} (cascade step {attempt_no})"
             )
         task_type = str(link.get("task_type", task_type))
         model_override = link.get("model")
@@ -227,7 +225,7 @@ def _run_agent(
         # A repository this host cannot see may exist on another: the row is
         # host-local state, so let redelivery try elsewhere -- bounded by the
         # item's own max_attempts.
-        return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
+        return HandlerOutcome.executor_infra_failure(str(exc))
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
     if not available and executor == "codex" and link is not None:
@@ -262,15 +260,15 @@ def _run_agent(
             )
             break
     if not available:
-        return HandlerOutcome(
-            ok=False, reason=f"{unavailable_reason}: {detail}", retryable=True
+        return HandlerOutcome.executor_infra_failure(
+            f"{unavailable_reason}: {detail}"
         )
 
     if lease_lost.is_set():
         # The lease died while we validated; starting a mutating run now
         # would produce effects no attempt row accounts for.
-        return HandlerOutcome(
-            ok=False, reason="lease lost before execution started", retryable=True
+        return HandlerOutcome.executor_infra_failure(
+            "lease lost before execution started"
         )
 
     # Provenance gate (audit D7, applied at the queue boundary): an untrusted
@@ -282,13 +280,9 @@ def _run_agent(
     # redelivery cannot add the operator elevation; the control plane
     # re-enqueues with untrusted=false after review.
     if request.untrusted and task_type in agent_runner.MUTATING_TASK_TYPES:
-        return HandlerOutcome(
-            ok=False,
-            reason=(
-                f"untrusted payload requests mutating task_type "
-                f"{task_type!r}; operator elevation required"
-            ),
-            retryable=False,
+        return HandlerOutcome.request_rejected(
+            f"untrusted payload requests mutating task_type "
+            f"{task_type!r}; operator elevation required"
         )
 
     # The publish branch is `backlog/<task>` (publish.py) -- per-task, or
@@ -338,7 +332,7 @@ def _run_agent(
             # once it is released, bounded by the item's own max_attempts.
             held = blocking_lease(isolated_workspace)
             if held is not None:
-                return HandlerOutcome(ok=False, reason=held, retryable=True)
+                return HandlerOutcome.executor_infra_failure(held)
 
             # Full-lifecycle writer lease. `blocking_lease` above is a
             # deliberately read-only preflight (its own docstring: "it never
@@ -414,10 +408,8 @@ def _run_agent(
                     # refusal, not a defect -- the attempt returns to the
                     # pool and a later delivery retries once the lease
                     # clears, bounded by max_attempts.
-                    return HandlerOutcome(
-                        ok=False,
-                        reason=f"writer lease unavailable: {exc}",
-                        retryable=True,
+                    return HandlerOutcome.executor_infra_failure(
+                        f"writer lease unavailable: {exc}"
                     )
 
             base_branch = (
@@ -447,10 +439,8 @@ def _run_agent(
                 # state that a later moment can genuinely cure -- redelivery
                 # retries once whatever blocked it clears, bounded by
                 # max_attempts.
-                return HandlerOutcome(
-                    ok=False,
-                    reason=f"workspace isolation failed at {exc.failed_step}: {exc.detail}",
-                    retryable=True,
+                return HandlerOutcome.executor_infra_failure(
+                    f"workspace isolation failed at {exc.failed_step}: {exc.detail}"
                 )
             run_repository = Path(evidence.workspace_path)
 
@@ -551,10 +541,8 @@ def _run_agent(
             # this function's own legibility and to keep `publish_run` from
             # ever running against a killed-mid-flight worktree, not to
             # change what the daemon does with the result.
-            return HandlerOutcome(
-                ok=False,
-                reason="lease lost mid-execution; agent process group was forcibly terminated",
-                retryable=True,
+            return HandlerOutcome.executor_infra_failure(
+                "lease lost mid-execution; agent process group was forcibly terminated"
             )
 
         result_text = agent_runner.extract_result_text(run.stdout)
@@ -617,13 +605,11 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
-                return HandlerOutcome(
-                    ok=False,
-                    reason=(
+                return HandlerOutcome.executor_infra_failure(
+                    (
                         "infrastructure retry checkpoint failed at "
                         f"{exc.failed_step}: {exc.detail}"
                     ),
-                    retryable=True,
                     result=result,
                 )
             return None
@@ -644,10 +630,24 @@ def _run_agent(
                     verified_clean=True,
                     verified_inode=(evidence.workspace_device, evidence.workspace_inode),
                 )
-            return HandlerOutcome(
-                ok=False,
-                reason=_tail(run.stderr) or "runner failed to start",
-                retryable=True,
+            return HandlerOutcome.executor_infra_failure(
+                _tail(run.stderr) or "runner failed to start"
+            )
+        if (
+            run.status in {"failed", "cancelled"}
+            and isinstance(run.exit_code, int)
+            and run.exit_code < 0
+        ):
+            # A negative process exit is a Unix signal, not a model verdict.
+            # Preserve and authenticate any commit the interrupted process
+            # managed to create, then return the attempt to the queue.  The
+            # next worker can resume from that exact signed candidate without
+            # replaying the already-durable commit.
+            checkpoint_failure = checkpoint_preserved_candidate()
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+            return HandlerOutcome.executor_infra_failure(
+                f"executor terminated by signal {-run.exit_code}", result=result
             )
         read_only_copilot_failure = (
             executor == "copilot"
@@ -667,13 +667,11 @@ def _run_agent(
             checkpoint_failure = checkpoint_preserved_candidate()
             if checkpoint_failure is not None:
                 return checkpoint_failure
-            return HandlerOutcome(
-                ok=False,
-                reason=(
+            return HandlerOutcome.executor_infra_failure(
+                (
                     "executor infrastructure failure "
                     f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
                 ),
-                retryable=True,
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.
@@ -684,13 +682,11 @@ def _run_agent(
             checkpoint_failure = checkpoint_preserved_candidate()
             if checkpoint_failure is not None:
                 return checkpoint_failure
-            return HandlerOutcome(
-                ok=False,
-                reason=(
+            return HandlerOutcome.executor_infra_failure(
+                (
                     "executor infrastructure failure (Codex workspace-write "
                     f"sandbox): {_tail(run.stderr or result_text)}"
                 ),
-                retryable=True,
             )
         # BO-S3b: a successful mutating run publishes its commits as a PR so
         # the autonomous loop closes without a human. Opt-in by env
@@ -730,10 +726,8 @@ def _run_agent(
             if not (
                 evidence.expected_branch and evidence.remote_url and evidence.start_sha
             ):
-                return HandlerOutcome(
-                    ok=False,
-                    reason="guarded publish authority is incomplete",
-                    retryable=True,
+                return HandlerOutcome.executor_infra_failure(
+                    "guarded publish authority is incomplete"
                 )
             try:
                 candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
@@ -789,10 +783,8 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
-                return HandlerOutcome(
-                    ok=False,
-                    reason=f"guarded publish preparation failed at {exc.failed_step}: {exc.detail}",
-                    retryable=True,
+                return HandlerOutcome.executor_infra_failure(
+                    f"guarded publish preparation failed at {exc.failed_step}: {exc.detail}"
                 )
             result["publish"] = {
                 "ok": pub.ok,
@@ -830,10 +822,8 @@ def _run_agent(
                 "pinned_base_sha_missing",
                 "head_not_descendant_of_pinned_base",
             }:
-                return HandlerOutcome(
-                    ok=False,
-                    reason=f"publish precondition failed: {pub.reason}",
-                    retryable=True,
+                return HandlerOutcome.executor_infra_failure(
+                    f"publish precondition failed: {pub.reason}",
                     result=result,
                 )
         elif isolated_workspace is not None:
@@ -882,16 +872,14 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
-                return HandlerOutcome(
-                    ok=False,
-                    reason=(
+                return HandlerOutcome.executor_infra_failure(
+                    (
                         "local task checkpoint failed at "
                         f"{exc.failed_step}: {exc.detail}"
                     ),
-                    retryable=True,
                     result=result,
                 )
-        return HandlerOutcome(ok=True, result=result)
+        return HandlerOutcome.model_result(result)
     finally:
         stack.close()
 

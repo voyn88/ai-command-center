@@ -10,6 +10,7 @@ fell back to `repository_path`.
 
 from __future__ import annotations
 
+import inspect
 import os
 import shutil
 import stat
@@ -20,6 +21,19 @@ import pytest
 
 from command_center import git_info
 from command_center import workspace_provisioning as wp
+
+
+def test_task_local_verification_has_one_authoritative_pipeline() -> None:
+    """Task-local policy cannot drift into a second generic-verifier branch."""
+    source = inspect.getsource(wp.verify_workspace)
+    assert source.count("spec.task_local_git_metadata") == 1
+    assert "return _verify_task_local_workspace(spec)" in source
+    assert tuple(step.__name__ for step in wp._TASK_LOCAL_VERIFICATION_PIPELINE) == (
+        "_locate_task_local_workspace",
+        "_authenticate_task_local_checkpoint",
+        "_resolve_task_local_remote",
+        "_verify_task_local_graph",
+    )
 
 
 def test_workspace_authority_never_falls_back_to_rotating_lease_dsn(
