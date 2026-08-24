@@ -1,3 +1,0 @@
-# One real (non-symlink) directory per line.  The launcher accepts only exact
-# descendants and bind-mounts only that task directory into an agent unit.
-/srv/aicc-workspaces

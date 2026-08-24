@@ -1,4 +1,0 @@
-# Canonical minimum lanes. Additional enabled/loaded template instances are
-# discovered automatically; deployments can scale by adding instance names.
-1
-2

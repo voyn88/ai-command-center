@@ -8,7 +8,9 @@ The queue worker and guarded publisher remain the existing publisher principal
 (`voynadmin` on the current preprod host; `aicc-worker` in the canonical unit).
 Both are members of the non-secret `aicc-publisher` socket-access group. Every
 model CLI, its shell tools and all descendants run in a separate transient
-systemd service as the non-login `aicc-agent` user. A root-owned,
+systemd service with a per-run `DynamicUser` kernel UID. The non-login
+`aicc-agent` account is only a deployment-time group/credential staging
+identity and never executes model code. A root-owned,
 socket-activated fixed launcher is the only identity bridge. The worker keeps
 `NoNewPrivileges=yes`; it neither receives sudo nor selects a privileged command.
 
@@ -27,7 +29,9 @@ Copilot is not in the isolated executor allowlist because its current login is
 a GitHub credential. It remains disabled for all agent tasks until a separate
 model-only credential with no repository authority is independently proven.
 
-Each run gets a separate cgroup and mount namespace. Only its exact workspace
+Each run gets a distinct host UID, cgroup and mount namespace. Concurrent
+canaries must prove different `/proc` owners rather than trusting unit text.
+Only its exact workspace
 is bind-mounted read-write at `/workspace`; homes are hidden, `/proc` is
 restricted, privilege gain and capabilities are disabled, and process teardown
 uses `KillMode=control-group`. The canonical workspace root is inaccessible in
@@ -53,7 +57,7 @@ agent unit. Codex keeps its inner `workspace-write` sandbox; no
 ## Operational cost and revisit condition
 
 Deployment must install provider CLIs at root-owned, non-writable paths and
-migrate model-only auth into `aicc-agent` state. This is intentional cost for a
+migrate model-only auth into root-owned provider state. This is intentional cost for a
 kernel-enforced boundary. Revisit only if a maintained container/microVM runtime
 provides equal exact-workspace, credential and cancellation guarantees with
 measured lower lifecycle cost.

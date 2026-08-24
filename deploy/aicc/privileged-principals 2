@@ -1,3 +1,0 @@
-# Every host-level principal that the untrusted agent must never alias.
-root
-voynadmin

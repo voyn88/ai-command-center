@@ -795,7 +795,7 @@ def _systemd_command(
         "--property=DynamicUser=yes",
         "--working-directory=/workspace",
         "--setenv=HOME=/agent-home",
-        "--setenv=XDG_CONFIG_HOME=/agent-home/config",
+        "--setenv=XDG_CONFIG_HOME=/agent-home/config",  # pragma: allowlist secret
         "--setenv=XDG_CACHE_HOME=/agent-home/cache",
         "--setenv=PATH=/usr/local/bin:/usr/bin:/bin",
         "--setenv=GIT_CONFIG_NOSYSTEM=1",

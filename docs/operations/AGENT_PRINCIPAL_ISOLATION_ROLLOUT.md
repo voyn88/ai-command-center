@@ -34,12 +34,17 @@ This is a fail-closed deployment gate. Do not set
    The production allowlist contains only `/srv/aicc-workspaces`; do not add
    the publisher checkout or a home directory. The task-local Git metadata
    dependency must be deployed first.
+   Before any templated lane starts, the installer snapshots, drains and
+   disables both legacy `voyn-aicc-worker.service` units and proves they are
+   inactive, disabled and have `MainPID=0`; rollback restores the snapshot.
 6. Run the OS-boundary test and a real Codex `workspace-write` commit preflight.
-   Both must run as `aicc-agent`; a direct same-UID fallback is forbidden.
-7. Start `voyn-aicc-worker@1.service` as the canary and require readiness plus one controlled
+   Both must run under per-run systemd `DynamicUser` identities; a shared
+   `aicc-agent` execution UID or direct worker-UID fallback is forbidden. Run
+   two units concurrently and prove their kernel UIDs differ.
+7. Start the first configured `voyn-aicc-worker@<lane>.service` as the canary and require readiness plus one controlled
    task -> local commit -> guarded publish/PR cycle. Verify the agent could not
    read sentinel publisher secrets and no process remains in its transient
    cgroup.
-8. Drain and roll `voyn-aicc-worker@2.service` only after the first lane stays ready. Record
+8. Drain and roll every remaining discovered lane, one at a time, only after the previous lane stays ready. Record
    exact deployed SHA and unit hashes. Roll back the unit/code to the previous
    merged SHA if any boundary or readiness check fails; do not disable isolation.

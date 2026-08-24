@@ -73,6 +73,9 @@ from pathlib import Path
 from command_center import git_info
 from command_center.workspace_authority import decode_workspace_authority_key
 
+_GIT_OPERATION_ERRORS = (OSError, subprocess.SubprocessError)
+_MARKER_READ_ERRORS = (OSError, ValueError, TypeError)
+
 # Branch names that denote a repository's main line rather than isolated
 # feature/audit work. A task whose expected branch is one of these (or equals
 # its own base branch) is treated as main-line work that may legitimately run
@@ -413,7 +416,7 @@ def _run_provision_git(
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except _GIT_OPERATION_ERRORS as exc:
         raise WorkspaceVerificationError(
             failed_step=failed_step,
             remediation="Resolve the standalone Git workspace failure and retry the launch.",
@@ -691,7 +694,7 @@ def _read_task_local_marker(workspace: Path) -> dict | None:
     marker = _task_local_marker_path(workspace)
     try:
         value = json.loads(_read_private_file(marker).decode("utf-8"))
-    except (OSError, ValueError, TypeError):
+    except _MARKER_READ_ERRORS:
         return None
     if not isinstance(value, dict):
         return None
@@ -883,7 +886,7 @@ def _worktree_add(
             timeout=60,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except _GIT_OPERATION_ERRORS as exc:
         raise WorkspaceVerificationError(
             failed_step="provision_worktree",
             remediation="Resolve the git worktree creation failure and retry the launch.",
@@ -2067,7 +2070,7 @@ def remove_workspace(
             timeout=60,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except _GIT_OPERATION_ERRORS:
         return "remove_failed"
     if result.returncode != 0:
         return "remove_failed"
@@ -2109,6 +2112,6 @@ def prune_repository(repository_path: str | Path) -> str:
             timeout=30,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except _GIT_OPERATION_ERRORS:
         return "prune_failed"
     return "pruned" if result.returncode == 0 else "prune_failed"
