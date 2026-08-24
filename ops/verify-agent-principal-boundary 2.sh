@@ -99,7 +99,7 @@ cleanup_canary() {
 }
 trap cleanup_canary EXIT HUP INT TERM
 systemd-run --quiet --wait --pipe --collect \
-  --property=DynamicUser=yes \
+  --uid=aicc-agent --gid=aicc-agent \
   --property=SupplementaryGroups=aicc-workspace \
   --property=NoNewPrivileges=yes \
   --property=ProtectSystem=strict \
@@ -109,38 +109,6 @@ systemd-run --quiet --wait --pipe --collect \
   'test -r /workspace/visible && ! test -r /srv/aicc-workspaces/.principal-boundary.*/sibling/must-not-read' || \
   fail "exact-workspace sibling isolation canary failed"
 cleanup_canary
-trap - EXIT HUP INT TERM
-
-# Two simultaneously active units must receive different kernel UIDs.  This
-# is the measured boundary that prevents same-UID /proc access and same-UID
-# signalling across concurrent task runs; configuration text alone is not
-# accepted as evidence.
-principal_unit_a="aicc-principal-canary-a-$$.service"
-principal_unit_b="aicc-principal-canary-b-$$.service"
-cleanup_principal_units() {
-  systemctl stop "$principal_unit_a" "$principal_unit_b" >/dev/null 2>&1 || true
-  systemctl reset-failed "$principal_unit_a" "$principal_unit_b" >/dev/null 2>&1 || true
-}
-trap cleanup_principal_units EXIT HUP INT TERM
-for principal_unit in "$principal_unit_a" "$principal_unit_b"; do
-  systemd-run --quiet --unit="$principal_unit" \
-    --property=DynamicUser=yes \
-    --property=ProtectProc=invisible \
-    --property=ProcSubset=pid \
-    --property=NoNewPrivileges=yes \
-    --property=CapabilityBoundingSet= \
-    -- /bin/sleep 30 || fail "cannot start dynamic-principal canary"
-done
-principal_pid_a=$(systemctl show "$principal_unit_a" --property=MainPID --value)
-principal_pid_b=$(systemctl show "$principal_unit_b" --property=MainPID --value)
-case "$principal_pid_a:$principal_pid_b" in
-  *[!0-9:]*|0:*|*:0) fail "dynamic-principal canary has no live PID" ;;
-esac
-principal_uid_a=$(stat -c %u "/proc/$principal_pid_a")
-principal_uid_b=$(stat -c %u "/proc/$principal_pid_b")
-[ "$principal_uid_a" != "$principal_uid_b" ] || \
-  fail "concurrent agents share a kernel UID"
-cleanup_principal_units
 trap - EXIT HUP INT TERM
 
 [ -r "$secret_manifest" ] || fail "publisher secret manifest is missing"

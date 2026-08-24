@@ -19,7 +19,6 @@ from pathlib import Path
 
 RESTORABLE_UNIT_RE = re.compile(
     r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
-    r"voyn-aicc-worker(?:-2)?\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
 )
 

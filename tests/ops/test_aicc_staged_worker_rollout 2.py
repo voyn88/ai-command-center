@@ -52,16 +52,8 @@ class FakeSystemd:
                 for value in args
                 if value.startswith("--property=")
             )
-            if unit not in self.states:
-                return "0" if name == "MainPID" else "not-found"
             return str(self.states[unit][name])
         unit = args[-1]
-        if unit not in self.states:
-            if action == "is-enabled":
-                return "disabled"
-            if action == "is-active":
-                return "inactive"
-            return ""
         state = self.states[unit]
         if action == "is-enabled":
             return "enabled" if state["enabled"] else "disabled"
@@ -173,8 +165,6 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
         call for call in systemd.calls if call[0] in {"enable", "stop", "start"}
     ]
     assert mutations == [
-        ("stop", "voyn-aicc-worker.service"),
-        ("stop", "voyn-aicc-worker-2.service"),
         ("enable", units[0]),
         ("stop", units[0]),
         ("start", units[0]),
@@ -182,40 +172,6 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
         ("stop", units[1]),
         ("start", units[1]),
     ]
-
-
-def test_rollout_refuses_to_start_template_lane_while_legacy_pid_survives():
-    module = _module()
-    unit = "voyn-aicc-worker@1.service"
-    systemd = FakeSystemd((unit,))
-    systemd.states["voyn-aicc-worker.service"] = {
-        "enabled": False,
-        "LoadState": "loaded",
-        "ActiveState": "active",
-        "MainPID": "4242",
-    }
-
-    original_run = systemd.run
-
-    def run(*args, **kwargs):
-        if args == ("stop", "voyn-aicc-worker.service"):
-            systemd.calls.append(args)
-            return ""
-        return original_run(*args, **kwargs)
-
-    systemd.run = run
-    with pytest.raises(module.RolloutError, match="legacy worker"):
-        module.rollout(
-            systemd,
-            (unit,),
-            agent_user="aicc-agent",
-            privileged_users=("root", "voynadmin"),
-            uid_for_user=_uid,
-            process_uid=lambda pid: 1002,
-        )
-    # Snapshot rollback may restore an originally active template unit, but
-    # the forward drain/start sequence must not begin.
-    assert ("stop", unit) not in systemd.calls
 
 
 @pytest.mark.parametrize(

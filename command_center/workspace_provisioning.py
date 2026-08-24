@@ -127,6 +127,12 @@ class WorkspaceSpec:
     # base branch directly against the source repository's canonical remote and
     # persists that exact SHA in its ownership marker.
     base_sha: str | None = None
+    # Optional deployment-owned root for standalone task clones.  When set,
+    # the exact clone path is still derived from the canonical source
+    # repository and branch; callers cannot choose an arbitrary descendant.
+    # This lets hardened workers place the complete task-local Git surface
+    # below /srv/aicc-workspaces without falling back to linked worktrees.
+    task_clone_root: str | None = None
 
 
 class WorkspaceVerificationError(Exception):
@@ -233,17 +239,22 @@ def _resolve(path: str | Path) -> Path:
     return Path(path).expanduser().resolve()
 
 
-def task_workspace_path(repository: str | Path, branch: str) -> Path:
+def task_workspace_path(
+    repository: str | Path, branch: str, *, clone_root: str | Path | None = None
+) -> Path:
     """Collision-resistant standalone workspace path for one task branch."""
     repo = Path(repository).expanduser().resolve()
     normalized = branch.strip().strip("/") or "work"
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", normalized).strip("-._") or "work"
     digest = sha256(branch.encode("utf-8")).hexdigest()[:12]
-    return (
-        repo.parent
-        / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
-        / f"{slug[:80]}-{digest}"
-    )
+    if clone_root is None:
+        parent = repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
+    else:
+        root = Path(clone_root).expanduser().resolve(strict=True)
+        repository_id = sha256(str(repo).encode("utf-8")).hexdigest()[:16]
+        repository_slug = re.sub(r"[^A-Za-z0-9._-]", "-", repo.name)
+        parent = root / f"{repository_slug}-{repository_id}"
+    return parent / f"{slug[:80]}-{digest}"
 
 
 def _git_rev_parse_path(cwd: Path, flag: str) -> Path | None:
@@ -704,9 +715,11 @@ def _provision_task_local_clone(
     only content-addressed objects into a fresh trusted clone.
     """
     raw_workspace = Path(spec.workspace_path).expanduser()
-    expected_parent = repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
+    expected_path = task_workspace_path(
+        repo, spec.expected_branch or "", clone_root=spec.task_clone_root
+    )
     if (
-        raw_workspace.parent.resolve() != expected_parent.resolve()
+        Path(os.path.abspath(raw_workspace)) != expected_path
         or raw_workspace.is_symlink()
     ):
         raise WorkspaceVerificationError(
@@ -996,7 +1009,9 @@ def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     repo = _resolve(spec.repository_path)
     raw = Path(spec.workspace_path).expanduser()
     absolute = Path(os.path.abspath(raw))
-    expected_path = task_workspace_path(repo, spec.expected_branch)
+    expected_path = task_workspace_path(
+        repo, spec.expected_branch, clone_root=spec.task_clone_root
+    )
     if absolute != expected_path or raw.is_symlink():
         raise WorkspaceVerificationError(
             failed_step="task_clone_path_safe",

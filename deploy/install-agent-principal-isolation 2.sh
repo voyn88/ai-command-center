@@ -81,9 +81,7 @@ else
 fi
 run_rollout snapshot --lanes "$repo_lanes" --state "$attempt_units" \
   --include-unit aicc-agent-launcher.socket \
-  --include-unit aicc-principal-recovery.service \
-  --include-unit voyn-aicc-worker.service \
-  --include-unit voyn-aicc-worker-2.service
+  --include-unit aicc-principal-recovery.service
 transaction_active=0
 baseline_created=0
 

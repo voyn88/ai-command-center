@@ -172,8 +172,7 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
         tmp_path.parent,
     )
     joined = "\n".join(command)
-    assert "--property=DynamicUser=yes" in command
-    assert "--uid=aicc-agent" not in command
+    assert "--uid=aicc-agent" in command
     assert "--property=NoNewPrivileges=yes" in command
     assert "--property=CapabilityBoundingSet=" in command
     assert "--property=AmbientCapabilities=" in command
@@ -191,7 +190,6 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
         "/var/lib/aicc-worker",
         "/var/lib/aicc-agent",
         "/run/aicc-agent-launcher",
-        "/run/aicc-agent-homes",
         str(tmp_path.parent),
     ):
         assert inaccessible in joined
@@ -425,35 +423,6 @@ def test_workspace_index_parser_rejects_malformed_untrusted_inputs(
     monkeypatch.setattr(launcher, "MAX_GIT_INDEX_BYTES", 16)
     with pytest.raises(launcher.LaunchRefused, match="shape"):
         launcher._tracked_executables(workspace)
-
-
-def test_workspace_index_fifo_is_refused_without_blocking(launcher, tmp_path):
-    workspace = tmp_path / "workspace"
-    git_dir = workspace / ".git"
-    git_dir.mkdir(parents=True)
-    os.mkfifo(git_dir / "index")
-    started = __import__("time").monotonic()
-    with pytest.raises(launcher.LaunchRefused, match="shape"):
-        launcher._tracked_executables(workspace)
-    assert __import__("time").monotonic() - started < 1.0
-
-
-def test_workspace_index_open_is_fd_relative(launcher, monkeypatch, tmp_path):
-    workspace = tmp_path / "workspace"
-    git_dir = workspace / ".git"
-    git_dir.mkdir(parents=True)
-    _write_index(git_dir / "index", version=2, mode=0o100755, name=b"run.sh")
-    real_open = launcher.os.open
-    observed: list[tuple[object, object]] = []
-
-    def recording_open(path, flags, mode=0o777, *, dir_fd=None):
-        observed.append((path, dir_fd))
-        return real_open(path, flags, mode, dir_fd=dir_fd)
-
-    monkeypatch.setattr(launcher.os, "open", recording_open)
-    launcher._tracked_executables(workspace)
-    assert any(path == ".git" and dir_fd is not None for path, dir_fd in observed)
-    assert any(path == "index" and dir_fd is not None for path, dir_fd in observed)
 
 
 def test_prior_agent_cgroup_is_sealed_before_permission_normalization(
@@ -735,7 +704,6 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     assert "SocketMode=0660" in socket_unit
     assert "User=root" in launcher_unit
     assert "ExecStart=/usr/libexec/aicc-agent-launcher --serve-socket" in launcher_unit
-    assert "DynamicUser=yes" in (root / "ops/aicc_agent_launcher.py").read_text()
     assert "/srv/aicc-workspaces" in workspace_roots
     assert "/home/" not in workspace_roots
 

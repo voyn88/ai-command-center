@@ -52,7 +52,7 @@ def test_workspace_authority_accepts_explicit_32_byte_key(monkeypatch):
 
 
 def test_workspace_authority_runtime_and_installer_decoder_accept_same_base64():
-    encoded = "base64:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU="
+    encoded = "base64:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU="  # pragma: allowlist secret
 
     assert (
         decode_workspace_authority_key(encoded) == b"abcdefghijklmnopqrstuvwxyz012345"
@@ -64,7 +64,7 @@ def test_installer_rejects_long_encoding_with_short_decoded_key(tmp_path):
     # 24 decoded bytes; the encoded EnvironmentFile value itself is longer
     # than 32 characters and was incorrectly accepted by the old installer.
     authority.write_text(
-        "AICC_WORKSPACE_AUTHORITY_KEY=base64:YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh\n",
+        "AICC_WORKSPACE_AUTHORITY_KEY=base64:YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh\n",  # pragma: allowlist secret
         encoding="utf-8",
     )
 
@@ -161,6 +161,37 @@ def test_missing_workspace_is_created_automatically(tmp_path):
     assert evidence.provision_outcome == "created"
     assert _current_branch(workspace) == "audit/execution-queue"
     assert evidence.is_isolated_worktree is True
+
+
+def test_standalone_clone_under_canonical_worker_root_is_exact_and_reusable(
+    tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path / "publisher" / "repo")
+    canonical_root = tmp_path / "srv" / "aicc-workspaces"
+    canonical_root.mkdir(parents=True)
+    branch = "backlog/VOYN-W0-CANONICAL"
+    workspace = wp.task_workspace_path(repo, branch, clone_root=canonical_root)
+    monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", "hex:" + "42" * 32)
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch=branch,
+        base_branch="main",
+        repository_path=str(repo),
+        task_local_git_metadata=True,
+        task_clone_root=str(canonical_root),
+    )
+
+    evidence = wp.provision_and_verify(spec)
+    assert evidence.provision_outcome == "cloned"
+    assert workspace.is_relative_to(canonical_root)
+    assert (workspace / ".git").is_dir()
+    assert wp.provision_and_verify(spec).provision_outcome == "reused"
+
+    wrong = wp.WorkspaceSpec(
+        **{**spec.__dict__, "workspace_path": str(canonical_root / "attacker")}
+    )
+    with pytest.raises(wp.WorkspaceVerificationError, match="trusted path"):
+        wp.verify_workspace(wrong)
 
 
 def test_branch_is_created_from_base_branch(tmp_path):

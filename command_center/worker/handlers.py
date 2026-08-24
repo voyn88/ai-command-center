@@ -35,7 +35,6 @@ stays on the worker host's journal.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import threading
@@ -87,18 +86,13 @@ _provision_locks_guard = threading.Lock()
 
 
 def _isolated_workspace_path(repository: Path, branch: str) -> Path:
-    task_path = workspace_provisioning.task_workspace_path(repository, branch)
     if agent_runner.principal_isolation_required():
-        repository_slug = re.sub(r"[^A-Za-z0-9._-]", "-", repository.name)
-        repository_id = hashlib.sha256(
-            str(repository.resolve(strict=True)).encode("utf-8")
-        ).hexdigest()[:16]
-        return (
-            agent_runner.principal_workspace_root()
-            / f"{repository_slug}-{repository_id}"
-            / task_path.name
+        return workspace_provisioning.task_workspace_path(
+            repository,
+            branch,
+            clone_root=agent_runner.principal_workspace_root(),
         )
-    return task_path
+    return workspace_provisioning.task_workspace_path(repository, branch)
 
 
 def _task_lease_scope(request: Any) -> str:
@@ -458,6 +452,11 @@ def _run_agent(
                 repository_path=str(repository),
                 task_type=task_type,
                 task_local_git_metadata=True,
+                task_clone_root=(
+                    str(agent_runner.principal_workspace_root())
+                    if agent_runner.principal_isolation_required()
+                    else None
+                ),
             )
             try:
                 # Locked per-path: `provision_workspace` is check-then-act

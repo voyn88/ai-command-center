@@ -16,12 +16,7 @@ UNIT_RE = re.compile(r"voyn-aicc-worker@[^/@\s]+\.service")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 RESTORABLE_UNIT_RE = re.compile(
     r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
-    r"voyn-aicc-worker(?:-2)?\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
-)
-LEGACY_WORKER_UNITS = (
-    "voyn-aicc-worker.service",
-    "voyn-aicc-worker-2.service",
 )
 DEFAULT_LANES = Path("/etc/aicc/worker-lanes")
 DEFAULT_PRIVILEGED_USERS = Path("/etc/aicc/privileged-principals")
@@ -109,26 +104,6 @@ def discover_units(
     if not units:
         raise RolloutError("no worker lanes discovered")
     return tuple(sorted(units))
-
-
-def retire_legacy_units(systemd: Systemd) -> None:
-    """Drain and disable every pre-template worker before lane startup."""
-    for unit in LEGACY_WORKER_UNITS:
-        systemd.run("stop", unit, check=False)
-        systemd.run("disable", unit, check=False)
-    verify_legacy_units_retired(systemd)
-
-
-def verify_legacy_units_retired(systemd: Systemd) -> None:
-    """Prove old claimers cannot coexist with templated worker lanes."""
-    for unit in LEGACY_WORKER_UNITS:
-        active = systemd.run("is-active", unit, check=False)
-        enabled = systemd.run("is-enabled", unit, check=False)
-        main_pid = systemd.run(
-            "show", unit, "--property=MainPID", "--value", check=False
-        )
-        if active == "active" or enabled == "enabled" or main_pid not in {"", "0"}:
-            raise RolloutError(f"legacy worker was not drained and disabled: {unit}")
 
 
 def snapshot(systemd: Systemd, units: tuple[str, ...]) -> dict[str, object]:
@@ -274,7 +249,6 @@ def verify_all(
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
-    verify_legacy_units_retired(systemd)
     agent_uid = uid_for_user(agent_user)
     privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
     if agent_uid in privileged_uids:
@@ -301,9 +275,8 @@ def rollout(
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
-    original = snapshot(systemd, (*units, *LEGACY_WORKER_UNITS))
+    original = snapshot(systemd, units)
     try:
-        retire_legacy_units(systemd)
         agent_uid = uid_for_user(agent_user)
         privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
         for unit in units:

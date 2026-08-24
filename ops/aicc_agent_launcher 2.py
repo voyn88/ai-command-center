@@ -373,9 +373,9 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
     file into a per-run tmpfs-backed path and removes it after cgroup exit.
     """
     try:
-        workspace_gid = grp.getgrnam("aicc-workspace").gr_gid
+        account = pwd.getpwnam("aicc-agent")
     except KeyError as exc:
-        raise LaunchRefused("aicc-workspace group does not exist") from exc
+        raise LaunchRefused("aicc-agent user does not exist") from exc
     source = MODEL_AUTH_SOURCES[executor]
     source_payload = _read_exact_protected_file(
         source, expected_uid=0, expected_gid=0, exact_mode=0o600
@@ -389,10 +389,10 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(target, flags, 0o640)
+        descriptor = os.open(target, flags, 0o600)
         try:
-            os.fchmod(descriptor, 0o640)
-            os.fchown(descriptor, 0, workspace_gid)
+            os.fchmod(descriptor, 0o600)
+            os.fchown(descriptor, account.pw_uid, account.pw_gid)
             with os.fdopen(descriptor, "wb", closefd=False) as stream:
                 stream.write(source_payload)
                 stream.flush()
@@ -401,17 +401,16 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
             if (
                 not stat.S_ISREG(target_info.st_mode)
                 or target_info.st_nlink != 1
-                or target_info.st_uid != 0
-                or target_info.st_gid != workspace_gid
-                or stat.S_IMODE(target_info.st_mode) != 0o640
+                or target_info.st_uid != account.pw_uid
+                or target_info.st_gid != account.pw_gid
+                or stat.S_IMODE(target_info.st_mode) != 0o600
                 or target_info.st_size != len(source_payload)
             ):
                 raise LaunchRefused("ephemeral model auth target failed validation")
         finally:
             os.close(descriptor)
         for path in (home, target.parent):
-            os.chown(path, 0, workspace_gid)
-            os.chmod(path, 0o770)
+            os.chown(path, account.pw_uid, account.pw_gid)
     except (FileExistsError, OSError) as exc:
         shutil.rmtree(home, ignore_errors=True)
         raise LaunchRefused("cannot prepare ephemeral model home") from exc
@@ -530,22 +529,15 @@ def _tracked_executables(workspace: Path) -> frozenset[Path]:
     authority. Both Git object hash formats and documented all-zero skipHash
     trailers are accepted, then disambiguated by a complete structural parse.
     """
+    git_dir = workspace / ".git"
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
     try:
-        workspace_descriptor = os.open(workspace, directory_flags)
-    except OSError as exc:
-        raise LaunchRefused("task workspace is not a stable real directory") from exc
-    try:
-        git_descriptor = os.open(".git", directory_flags, dir_fd=workspace_descriptor)
+        git_descriptor = os.open(git_dir, directory_flags)
     except OSError as exc:
         raise LaunchRefused("task-local Git metadata is not a real directory") from exc
-    finally:
-        os.close(workspace_descriptor)
-    # O_NONBLOCK must be present on open, before fstat.  Otherwise an
-    # attacker-controlled FIFO named `.git/index` can pin the root broker.
-    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -624,65 +616,22 @@ def _prepare_workspace_permissions(workspace: Path) -> None:
         workspace_gid = grp.getgrnam("aicc-workspace").gr_gid
     except KeyError as exc:
         raise LaunchRefused("aicc-workspace group does not exist") from exc
+    owner_uid = workspace.lstat().st_uid
     executable = _tracked_executables(workspace)
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
-    file_flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        directory_flags |= os.O_NOFOLLOW
-        file_flags |= os.O_NOFOLLOW
-    try:
-        workspace_fd = os.open(workspace, directory_flags)
-    except OSError as exc:
-        raise LaunchRefused("cannot open task workspace safely") from exc
-    owner_uid = os.fstat(workspace_fd).st_uid
-
-    def normalize_directory(directory_fd: int, relative: Path) -> None:
-        os.fchown(directory_fd, owner_uid, workspace_gid)
-        os.fchmod(directory_fd, 0o2770)
-        # scandir owns only the duplicate. All mutations below are relative to
-        # the still-open parent descriptor, so renames and symlink swaps do
-        # not redirect root outside the workspace.
-        with os.scandir(os.dup(directory_fd)) as entries:
-            snapshot = list(entries)
-        for entry in snapshot:
-            before = entry.stat(follow_symlinks=False)
-            if stat.S_ISLNK(before.st_mode):
+    for root, dirs, files in os.walk(workspace, followlinks=False):
+        paths = [Path(root), *(Path(root) / name for name in dirs + files)]
+        for path in paths:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
                 continue
-            child_relative = relative / entry.name
-            flags = directory_flags if stat.S_ISDIR(before.st_mode) else file_flags
-            try:
-                child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
-            except OSError as exc:
-                raise LaunchRefused(
-                    f"workspace entry changed while opening: {child_relative}"
-                ) from exc
-            try:
-                current = os.fstat(child_fd)
-                if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
-                    raise LaunchRefused(
-                        f"workspace entry changed while opening: {child_relative}"
-                    )
-                if stat.S_ISDIR(current.st_mode):
-                    normalize_directory(child_fd, child_relative)
-                elif stat.S_ISREG(current.st_mode):
-                    if current.st_nlink != 1:
-                        raise LaunchRefused(
-                            f"hard-linked workspace file refused: {child_relative}"
-                        )
-                    os.fchown(child_fd, owner_uid, workspace_gid)
-                    path = workspace / child_relative
-                    os.fchmod(child_fd, 0o770 if path in executable else 0o660)
-                else:
-                    raise LaunchRefused(
-                        f"unsupported workspace node refused: {child_relative}"
-                    )
-            finally:
-                os.close(child_fd)
-
-    try:
-        normalize_directory(workspace_fd, Path())
-    finally:
-        os.close(workspace_fd)
+            if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                raise LaunchRefused(f"hard-linked workspace file refused: {path}")
+            os.chown(path, owner_uid, workspace_gid, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                os.chmod(path, 0o2770, follow_symlinks=False)
+            elif stat.S_ISREG(info.st_mode):
+                mode = 0o770 if path in executable else 0o660
+                os.chmod(path, mode, follow_symlinks=False)
 
 
 def _provider_command(manifest: dict[str, Any]) -> list[str]:
@@ -789,10 +738,8 @@ def _systemd_command(
         f"--unit={unit}",
         f"--property=BindsTo={broker_unit}",
         f"--property=After={broker_unit}",
-        # Each concurrently active transient unit receives a distinct host
-        # UID.  ProtectProc therefore enforces a per-run process boundary;
-        # task isolation no longer relies on one shared aicc-agent UID.
-        "--property=DynamicUser=yes",
+        "--uid=aicc-agent",
+        "--gid=aicc-agent",
         "--working-directory=/workspace",
         "--setenv=HOME=/agent-home",
         "--setenv=XDG_CONFIG_HOME=/agent-home/config",
@@ -833,7 +780,7 @@ def _systemd_command(
         "--property=TasksMax=512",
         f"--property=RuntimeMaxSec={timeout + 30}",
         "--property=TimeoutStopSec=20",
-        f"--property=InaccessiblePaths=/etc/aicc /var/lib/aicc-worker /var/lib/aicc-agent /run/aicc-agent-launcher {EPHEMERAL_HOME_ROOT} {workspace_root}",
+        f"--property=InaccessiblePaths=/etc/aicc /var/lib/aicc-worker /var/lib/aicc-agent /run/aicc-agent-launcher {workspace_root}",
         f"--property=BindPaths={workspace}:/workspace",
         f"--property=BindPaths={agent_home}:/agent-home",
         "--property=ReadWritePaths=/workspace /agent-home",
