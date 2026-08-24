@@ -46,10 +46,20 @@ def read_environment_file(path: str | os.PathLike[str]) -> dict[str, str]:
 
     source = Path(path)
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        text = source.read_text(encoding="utf-8")
     except OSError as error:
         raise CredentialFileError(f"cannot read credential file: {error}") from error
+    return parse_environment_text(text)
 
+
+def parse_environment_text(text: str) -> dict[str, str]:
+    """Parse the EnvironmentFile subset from already-read text.
+
+    Callers that must read through a validated file descriptor (O_NOFOLLOW +
+    fstat-on-the-fd, e.g. rotation crash recovery) parse via this function so
+    the open they validated is the open they consume.
+    """
+    lines = text.splitlines()
     values: dict[str, str] = {}
     for number, raw in enumerate(lines, 1):
         stripped = raw.strip()

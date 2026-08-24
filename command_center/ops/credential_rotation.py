@@ -45,6 +45,7 @@ from typing import Protocol
 from command_center.db.config import PostgresConfig, load_config
 from command_center.worker.credential_file import (
     PreparedCredentialFile,
+    parse_environment_text,
     prepare_password_update,
     read_environment_file,
 )
@@ -1071,8 +1072,18 @@ class RotationController:
 
         candidates: list[tuple[Path, PostgresConfig]] = []
         for path in paths:
+            # The open that is validated must be the open that is read:
+            # lstat-then-read reintroduced the TOCTOU race every other
+            # journal reader here avoids (review finding on 00e5fda).
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
             try:
-                metadata = path.lstat()
+                descriptor = os.open(path, flags)
+            except FileNotFoundError:
+                continue
+            try:
+                metadata = os.fstat(descriptor)
                 if (
                     not stat_module.S_ISREG(metadata.st_mode)
                     or metadata.st_uid != os.geteuid()
@@ -1081,9 +1092,13 @@ class RotationController:
                     raise RotationError(
                         "rotation recovery credential ownership/mode is unsafe"
                     )
-                config = _postgres_config(read_environment_file(path))
-            except FileNotFoundError:
-                continue
+                with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                    descriptor = -1
+                    text = handle.read()
+                config = _postgres_config(parse_environment_text(text))
+            finally:
+                if descriptor != -1:
+                    os.close(descriptor)
             # Dedupe by constant-time comparison against the (at most one)
             # already-collected candidate. No password-derived digest is ever
             # computed or stored: hashing a live credential with a fast hash
@@ -1136,6 +1151,15 @@ class RotationController:
                 target=self.config.env_file, temporary=source
             ).commit()
             self.audit.emit("rotation_recovery_credential_committed")
+        elif phase.recovery_file is not None:
+            # The old credential won: the temp file holds a generated but
+            # never-enrolled plaintext secret, and clearing the phase journal
+            # below would orphan it forever (review finding on 00e5fda).
+            try:
+                phase.recovery_file.unlink()
+            except FileNotFoundError:
+                pass
+            self.audit.emit("rotation_recovery_stale_credential_removed")
         self._set_credential_deadline(
             expiry, remaining, "interrupted rotation credential"
         )
