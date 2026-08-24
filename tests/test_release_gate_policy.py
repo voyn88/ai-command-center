@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -162,9 +164,96 @@ def test_impact_fast_check_uses_the_mandatory_two_phase_serial_split() -> None:
     assert "run_phase -q -m serial -p no:xdist" in command
     assert 'if [ "$rc" -eq 5 ]' in command
     assert 'if [ "${#selected[@]}" -eq 0 ]' in command
+    assert 'read -r path || [ -n "$path" ]' in command
+    assert '[ -n "$path" ] && selected+=("$path")' in command
     assert "xargs" not in "\n".join(
         line for line in command.splitlines() if not line.lstrip().startswith("#")
     )
+
+
+def _impact_script() -> str:
+    impact = _workflow(CI_WORKFLOW)["jobs"]["impact-fast-check"]
+    (step,) = [
+        step
+        for step in impact["steps"]
+        if step.get("name") == "Run impacted tests (parallel body + serial tail)"
+    ]
+    return step["run"]
+
+
+def _run_impact_script(
+    tmp_path: Path, selection: str, *, parallel_rc: int = 0, serial_rc: int = 0
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "pytest-calls.txt"
+    fake_pytest = bin_dir / "pytest"
+    fake_pytest.write_text(
+        """#!/usr/bin/env bash
+printf 'CALL\\n' >> "$PYTEST_CALLS"
+printf '<%s>\\n' "$@" >> "$PYTEST_CALLS"
+if [[ " $* " == *' -m not serial '* ]]; then
+  exit "$PARALLEL_RC"
+fi
+exit "$SERIAL_RC"
+""",
+        encoding="utf-8",
+    )
+    fake_pytest.chmod(0o755)
+    (tmp_path / "selected-tests.txt").write_text(selection, encoding="utf-8")
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "PYTEST_CALLS": str(calls),
+        "PARALLEL_RC": str(parallel_rc),
+        "SERIAL_RC": str(serial_rc),
+    }
+    result = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", _impact_script()],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+def test_impact_script_keeps_unterminated_last_path_and_skips_blank_lines(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_impact_script(
+        tmp_path, "tests/first.py\n\ntests/last.py"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.count("CALL\n") == 2
+    assert calls.count("<tests/first.py>\n") == 2
+    assert calls.count("<tests/last.py>\n") == 2
+    assert "<>" not in calls
+
+
+def test_impact_script_neutralizes_only_no_tests_collected(tmp_path: Path) -> None:
+    no_tests, calls = _run_impact_script(
+        tmp_path, "tests/only.py\n", parallel_rc=5, serial_rc=5
+    )
+    assert no_tests.returncode == 0
+    assert calls.count("CALL\n") == 2
+
+    failed_dir = tmp_path / "failed"
+    failed_dir.mkdir()
+    failed, failed_calls = _run_impact_script(
+        failed_dir, "tests/only.py\n", parallel_rc=1
+    )
+    assert failed.returncode == 1
+    assert failed_calls.count("CALL\n") == 1
+
+
+def test_impact_script_refuses_an_empty_selection(tmp_path: Path) -> None:
+    result, calls = _run_impact_script(tmp_path, "\n\n")
+
+    assert result.returncode == 1
+    assert calls == ""
 
 
 SECRET_REFERENCE = re.compile(r"\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)[^}]*\}\}")

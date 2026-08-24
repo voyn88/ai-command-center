@@ -730,7 +730,9 @@ jobs:
           # other non-zero result remains a real failure. A bash array preserves
           # paths and exit codes, unlike xargs (which maps child failures to 123).
           selected=()
-          while IFS= read -r path; do selected+=("$path"); done < selected-tests.txt
+          while IFS= read -r path || [ -n "$path" ]; do
+            [ -n "$path" ] && selected+=("$path")
+          done < selected-tests.txt
           if [ "${#selected[@]}" -eq 0 ]; then
             echo "selected-tests.txt is empty despite mode=subset; refusing the whole suite" >&2
             exit 1
