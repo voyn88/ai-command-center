@@ -82,7 +82,7 @@ while IFS= read -r secret_path; do
   fi
 done < "$secret_manifest"
 
-for unit in voyn-aicc-worker.service voyn-aicc-worker-2.service; do
+for unit in voyn-aicc-worker@1.service voyn-aicc-worker@2.service; do
   [ "$(systemctl show "$unit" -p NoNewPrivileges --value)" = yes ] || \
     fail "$unit lacks NoNewPrivileges"
   [ "$(systemctl show "$unit" -p ProtectHome --value)" = read-only ] || \

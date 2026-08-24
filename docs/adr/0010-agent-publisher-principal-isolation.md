@@ -19,9 +19,10 @@ commands are reconstructed from a fixed allowlist. Model authentication is
 loaded from root-owned per-provider environment files or a root-private model
 auth store. The broker copies only that credential into a fresh per-run home
 and deletes it after cgroup exit, so one task cannot persist model config or
-instructions into another. Publisher/GitHub/SSH credentials, writer-lease authority and
-`AICC_WORKSPACE_AUTHORITY_KEY` remain under the publisher's private home/state,
-which the agent UID cannot read and its mount namespace marks inaccessible.
+instructions into another. Publisher/GitHub/SSH credentials and writer-lease authority
+remain private. `AICC_WORKSPACE_AUTHORITY_KEY` remains in the dedicated root-owned
+`/etc/aicc/workspace-authority.env`, readable by the publisher group only;
+the agent UID cannot read it and its mount namespace marks it inaccessible.
 Copilot is not in the isolated executor allowlist because its current login is
 a GitHub credential. It remains disabled for all agent tasks until a separate
 model-only credential with no repository authority is independently proven.

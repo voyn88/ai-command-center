@@ -466,4 +466,9 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "ProtectControlGroups" in verifier
     assert "AICC_AGENT_PRINCIPAL_BOUNDARY_OK" in verifier
     assert "AICC_WORKSPACE_AUTHORITY_KEY" in installer
+    assert "/etc/aicc/workspace-authority.env" in installer
+    assert "voyn-aicc-worker@.service.d/20-principal-isolation.conf" in installer
+    assert "voyn-aicc-worker@1.service" in verifier
+    assert "voyn-aicc-worker@2.service" in verifier
+    assert "voyn-aicc-worker-2.service" not in verifier
     assert "source " not in installer

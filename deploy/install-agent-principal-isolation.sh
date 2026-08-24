@@ -7,37 +7,45 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
-worker_env=/home/voynadmin/aicc-preprod/worker.env
-if [ ! -f "$worker_env" ]; then
-  worker_env=/etc/aicc/worker.env
-fi
+workspace_authority_env=/etc/aicc/workspace-authority.env
 
-if [ ! -f "$worker_env" ]; then
-  echo "worker environment is missing; cannot prove workspace authority separation" >&2
+if [ ! -f "$workspace_authority_env" ]; then
+  echo "dedicated workspace authority environment is missing" >&2
   exit 1
 fi
 
 # Parse, but never print, the stable checkpoint authority. EnvironmentFile is
 # not a shell program and must not be sourced by this privileged installer.
-python3 - "$worker_env" <<'PY'
+python3 - "$workspace_authority_env" <<'PY'
 import pathlib
+import stat
 import sys
 
 path = pathlib.Path(sys.argv[1])
+info = path.lstat()
+if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+    raise SystemExit(
+        "workspace authority environment must be a root-owned non-writable regular file"
+    )
 values = []
+unexpected = []
 for raw in path.read_text(encoding="utf-8").splitlines():
     line = raw.strip()
     if not line or line.startswith("#") or "=" not in line:
         continue
     key, value = line.split("=", 1)
-    if key.strip() == "AICC_WORKSPACE_AUTHORITY_KEY":
+    key = key.strip()
+    if key == "AICC_WORKSPACE_AUTHORITY_KEY":
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         values.append(value)
-if len(values) != 1 or len(values[0].encode("utf-8")) < 32:
+    else:
+        unexpected.append(key)
+if unexpected or len(values) != 1 or len(values[0].encode("utf-8")) < 32:
     raise SystemExit(
-        "exactly one dedicated AICC_WORKSPACE_AUTHORITY_KEY of at least 32 bytes is required"
+        "workspace authority environment must contain only one "
+        "AICC_WORKSPACE_AUTHORITY_KEY of at least 32 bytes"
     )
 PY
 
@@ -61,11 +69,10 @@ install -D -o root -g root -m 0644 \
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/aicc-agent.conf
 "$repo_root/deploy/migrate-agent-model-auth.sh"
 
-# The publisher can read this through its aicc-publisher supplementary group;
-# aicc-agent is deliberately not a member. This removes same-UID ownership of
-# the lease/HMAC environment before isolated execution is enabled.
-chown root:aicc-publisher "$worker_env"
-chmod 0640 "$worker_env"
+# The stable workspace authority has its own file and lifecycle. It must not
+# share the rotator-managed DSN file or a lane-specific environment.
+chown root:aicc-publisher "$workspace_authority_env"
+chmod 0640 "$workspace_authority_env"
 
 install -D -o root -g root -m 0755 \
   "$repo_root/ops/aicc_agent_launcher.py" \
@@ -90,11 +97,11 @@ fi
 install -D -o root -g root -m 0644 \
   "$repo_root/deploy/aicc/publisher-secret-paths" \
   /etc/aicc/publisher-secret-paths
-for unit in voyn-aicc-worker.service voyn-aicc-worker-2.service; do
-  install -D -o root -g root -m 0644 \
-    "$repo_root/deploy/systemd/voyn-aicc-worker-principal-isolation.conf" \
-    "/etc/systemd/system/$unit.d/20-principal-isolation.conf"
-done
+# Install once on the canonical template so every explicitly enabled lane
+# inherits the same principal boundary without copy-pasted instance drift.
+install -D -o root -g root -m 0644 \
+  "$repo_root/deploy/systemd/voyn-aicc-worker-principal-isolation.conf" \
+  /etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
 
 # Authority separation is invalid if the agent can read even one publisher
 # path. Missing optional paths are ignored; every path that exists is tested
