@@ -110,6 +110,30 @@ def test_private_authority_write_fsyncs_file_and_parent(tmp_path, monkeypatch):
     assert observed == ["file", "dir"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux worker dirfd boundary")
+def test_bounded_dirfd_read_rejects_same_inode_content_race(tmp_path, monkeypatch):
+    source = tmp_path / "metadata"
+    source.write_bytes(b"a" * (128 * 1024))
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    real_read = wp.os.read
+    mutated = False
+
+    def mutate_after_first_read(descriptor, length):
+        nonlocal mutated
+        chunk = real_read(descriptor, length)
+        if chunk and not mutated:
+            mutated = True
+            source.write_bytes(b"b" * (128 * 1024))
+        return chunk
+
+    monkeypatch.setattr(wp.os, "read", mutate_after_first_read)
+    try:
+        with pytest.raises(OSError, match="changed"):
+            wp._read_regular_at(parent_fd, "metadata", max_bytes=256 * 1024)
+    finally:
+        os.close(parent_fd)
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
 

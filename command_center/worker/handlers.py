@@ -482,12 +482,25 @@ def _run_agent(
             ):
                 break
             agent_runner.disable_codex_workspace_write(_tail(run.stderr or run.stdout))
+            try:
+                current_base_sha = workspace_provisioning.resolve_canonical_base_sha(
+                    repository,
+                    remote_url=evidence.remote_url,
+                    base_branch=base_branch,
+                    spec=spec,
+                )
+            except workspace_provisioning.WorkspaceVerificationError:
+                # A missing or rewritten canonical base makes even a
+                # no-change cascade unsafe: fail closed and let the ordinary
+                # infrastructure outcome preserve the workspace.
+                break
             unchanged = workspace_provisioning.task_workspace_is_unchanged(
                 run_repository,
                 expected_branch=evidence.expected_branch,
                 remote_url=evidence.remote_url,
                 start_sha=evidence.start_sha,
                 trusted_base_sha=evidence.base_sha,
+                current_base_sha=current_base_sha,
                 expected_remote_sha=evidence.remote_task_sha,
                 expected_inode=(evidence.workspace_device, evidence.workspace_inode),
             )
@@ -761,6 +774,12 @@ def _run_agent(
                         evidence.workspace_inode,
                     ),
                 )
+                current_base_sha = workspace_provisioning.resolve_canonical_base_sha(
+                    repository,
+                    remote_url=evidence.remote_url,
+                    base_branch=base_branch,
+                    spec=spec,
+                )
                 with workspace_provisioning.trusted_publish_clone(
                     run_repository,
                     expected_branch=evidence.expected_branch,
@@ -773,6 +792,7 @@ def _run_agent(
                         evidence.workspace_inode,
                     ),
                     expected_candidate_sha=candidate_sha,
+                    current_base_sha=current_base_sha,
                 ) as publish_clone:
                     # The fresh publisher clone above has now proved that the
                     # candidate is a clean descendant of the signed base
@@ -883,6 +903,12 @@ def _run_agent(
                         evidence.workspace_inode,
                     ),
                 )
+                current_base_sha = workspace_provisioning.resolve_canonical_base_sha(
+                    repository,
+                    remote_url=evidence.remote_url,
+                    base_branch=base_branch,
+                    spec=spec,
+                )
                 with workspace_provisioning.trusted_publish_clone(
                     run_repository,
                     expected_branch=evidence.expected_branch,
@@ -895,6 +921,7 @@ def _run_agent(
                         evidence.workspace_inode,
                     ),
                     expected_candidate_sha=candidate_sha,
+                    current_base_sha=current_base_sha,
                 ):
                     workspace_provisioning.checkpoint_task_workspace(
                         run_repository,

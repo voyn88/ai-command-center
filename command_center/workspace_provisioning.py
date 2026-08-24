@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import hmac
 import json
 import os
@@ -67,12 +68,184 @@ import stat
 import subprocess
 import tempfile
 import time
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 
 from command_center import git_info
+
+_SAFE_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+_SAFE_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+def _safe_relative_parts(relative: str) -> tuple[str, ...]:
+    """Return a path suitable for an openat walk, never a pathname escape."""
+    parts = tuple(part for part in relative.split("/") if part)
+    if not parts or any(part in {".", ".."} or "/" in part for part in parts):
+        raise OSError(f"unsafe relative path: {relative!r}")
+    return parts
+
+
+@contextmanager
+def _open_directory_at(parent_fd: int, relative: str) -> Iterator[int]:
+    """Open a directory tree one component at a time without following links."""
+    current = os.dup(parent_fd)
+    try:
+        for component in _safe_relative_parts(relative):
+            child = os.open(component, _SAFE_DIRECTORY_FLAGS, dir_fd=current)
+            os.close(current)
+            current = child
+            if not stat.S_ISDIR(os.fstat(current).st_mode):
+                raise OSError(f"non-directory component in {relative!r}")
+        yield current
+    finally:
+        os.close(current)
+
+
+@contextmanager
+def _open_regular_at(
+    parent_fd: int,
+    relative: str,
+    *,
+    max_bytes: int,
+) -> Iterator[tuple[int, os.stat_result]]:
+    """Open one bounded regular file beneath an already verified dirfd.
+
+    Intermediate components and the final component are all opened relative to
+    descriptors with ``O_NOFOLLOW``. ``O_NONBLOCK`` ensures a hostile FIFO or
+    device can never stall the privileged publisher before ``fstat`` rejects
+    it.  Consumers read from the returned descriptor, never from a pathname.
+    """
+    parts = _safe_relative_parts(relative)
+    directory = os.dup(parent_fd)
+    try:
+        for component in parts[:-1]:
+            child = os.open(component, _SAFE_DIRECTORY_FLAGS, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        descriptor = os.open(parts[-1], _SAFE_READ_FLAGS, dir_fd=directory)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError(f"non-regular file: {relative}")
+            if info.st_size < 0 or info.st_size > max_bytes:
+                raise OSError(
+                    f"file exceeds {max_bytes} byte limit: {relative} ({info.st_size})"
+                )
+            yield descriptor, info
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
+def _read_regular_at(parent_fd: int, relative: str, *, max_bytes: int) -> bytes:
+    """Read a stable, bounded regular file through the shared dirfd boundary."""
+    with _open_regular_at(parent_fd, relative, max_bytes=max_bytes) as (
+        descriptor,
+        before,
+    ):
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if len(payload) > max_bytes or len(payload) != before.st_size:
+            raise OSError(f"file changed or exceeded bound while reading: {relative}")
+        if identity_before != identity_after:
+            raise OSError(f"file changed while reading: {relative}")
+        return payload
+
+
+def _read_regular_path(path: Path, *, max_bytes: int) -> bytes:
+    """Descriptor-verified fallback for platforms without openat support."""
+    before_path = path.lstat()
+    if not stat.S_ISREG(before_path.st_mode) or before_path.st_size > max_bytes:
+        raise OSError(f"unsafe or oversized regular file: {path}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        before = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (
+            before_path.st_dev,
+            before_path.st_ino,
+        ) or not stat.S_ISREG(before.st_mode):
+            raise OSError(f"file changed before read: {path}")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) > max_bytes
+            or len(payload) != before.st_size
+            or (
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+        ):
+            raise OSError(f"file changed while reading: {path}")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _open_agent_git_dir(
+    workspace: Path, *, expected_inode: tuple[int, int] | None = None
+) -> Iterator[int]:
+    """Anchor all reads to the verified workspace and its real ``.git`` dir."""
+    workspace_fd = os.open(workspace, _SAFE_DIRECTORY_FLAGS)
+    try:
+        workspace_stat = os.fstat(workspace_fd)
+        actual_inode = (workspace_stat.st_dev, workspace_stat.st_ino)
+        if expected_inode is not None and actual_inode != expected_inode:
+            raise OSError(
+                f"workspace changed before Git read: expected={expected_inode}, "
+                f"actual={actual_inode}"
+            )
+        with _open_directory_at(workspace_fd, ".git") as git_fd:
+            yield git_fd
+    finally:
+        os.close(workspace_fd)
+
 
 # Branch names that denote a repository's main line rather than isolated
 # feature/audit work. A task whose expected branch is one of these (or equals
@@ -663,28 +836,11 @@ def _read_private_file(path: Path) -> bytes:
         return path.read_bytes()
     directory_fd = os.open(
         path.parent,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        _SAFE_DIRECTORY_FLAGS,
     )
-    file_fd: int | None = None
     try:
-        file_fd = os.open(
-            path.name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory_fd,
-        )
-        info = os.fstat(file_fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise OSError("private authority source is not a regular file")
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(file_fd, 64 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks)
+        return _read_regular_at(directory_fd, path.name, max_bytes=64 * 1024)
     finally:
-        if file_fd is not None:
-            os.close(file_fd)
         os.close(directory_fd)
 
 
@@ -1134,7 +1290,11 @@ def _authenticate_task_local_checkpoint(
             expected_branch=spec.expected_branch,
             detail=f"task-local ownership mismatch: {static_failed or 'invalid base SHA'}",
         )
-    candidate = _read_agent_head(absolute, spec.expected_branch)
+    candidate = _read_agent_head(
+        absolute,
+        spec.expected_branch,
+        expected_inode=(location.device, location.inode),
+    )
     if candidate != marker_start:
         raise WorkspaceVerificationError(
             failed_step="task_workspace_checkpoint",
@@ -1456,88 +1616,67 @@ def provision_and_verify(spec: WorkspaceSpec) -> VerificationEvidence:
     return evidence
 
 
-def _read_agent_head(workspace: Path, expected_branch: str) -> str:
+def _read_agent_head(
+    workspace: Path,
+    expected_branch: str,
+    *,
+    expected_inode: tuple[int, int] | None = None,
+) -> str:
     """Resolve HEAD without invoking Git against agent-controlled config."""
-    git_dir = workspace / ".git"
-    head_path = git_dir / "HEAD"
-    # Check-then-read is not enough against a hostile workspace: a FIFO at
-    # `.git/HEAD` would make a bare `read_text()` block forever (DoS), and a
-    # symlink would read outside the workspace. Open the path itself with
-    # O_NOFOLLOW|O_NONBLOCK, then let fstat on the descriptor -- not a racy
-    # earlier lstat -- prove it is a regular file before any byte is read.
+    expected_ref = f"refs/heads/{expected_branch}"
     try:
-        git_info_stat = git_dir.lstat()
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NONBLOCK
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        head_descriptor = os.open(head_path, flags)
-        try:
-            head_stat = os.fstat(head_descriptor)
-            if not stat.S_ISREG(head_stat.st_mode):
+        if os.name == "nt":
+            git_dir = workspace / ".git"
+            workspace_info = workspace.lstat()
+            actual_inode = (workspace_info.st_dev, workspace_info.st_ino)
+            if expected_inode is not None and actual_inode != expected_inode:
+                raise OSError("workspace changed before Git read")
+
+            def read(relative: str, max_bytes: int) -> bytes:
+                return _read_regular_path(git_dir / relative, max_bytes=max_bytes)
+
+            git_context = nullcontext(None)
+        else:
+            git_context = _open_agent_git_dir(workspace, expected_inode=expected_inode)
+        with git_context as git_fd:
+            if os.name != "nt":
+
+                def read(relative: str, max_bytes: int) -> bytes:
+                    return _read_regular_at(git_fd, relative, max_bytes=max_bytes)
+
+            head_text = read("HEAD", 4096).decode("ascii").strip()
+            if head_text != f"ref: {expected_ref}":
                 raise WorkspaceVerificationError(
-                    failed_step="agent_head_regular",
-                    remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                    failed_step="agent_head_branch",
+                    remediation="Keep the task on its exact expected branch.",
                     expected_workspace=str(workspace),
                     actual_workspace=str(workspace),
-                    detail=".git/HEAD must be a regular file",
+                    expected_branch=expected_branch,
+                    detail=f"unexpected HEAD contents: {head_text!r}",
                 )
-            with os.fdopen(head_descriptor, "r", encoding="ascii") as head_handle:
-                head_descriptor = -1
-                head_text = head_handle.read(4096).strip()
-        finally:
-            if head_descriptor != -1:
-                os.close(head_descriptor)
-    except OSError as exc:
+            candidate: str | None
+            try:
+                candidate = read(expected_ref, 256).decode("ascii").strip()
+            except FileNotFoundError:
+                candidate = None
+                try:
+                    packed = read("packed-refs", 16 * 1024 * 1024).decode("ascii")
+                except FileNotFoundError:
+                    packed = ""
+                for line in packed.splitlines():
+                    if not line or line.startswith(("#", "^")):
+                        continue
+                    sha, separator, ref = line.partition(" ")
+                    if separator and ref == expected_ref:
+                        candidate = sha
+                        break
+    except (OSError, UnicodeError) as exc:
         raise WorkspaceVerificationError(
             failed_step="agent_head_readable",
             remediation="Preserve the workspace for inspection and retry on a clean clone.",
             expected_workspace=str(workspace),
             actual_workspace=str(workspace),
             detail=f"cannot read task-local HEAD safely: {exc}",
-        ) from exc
-    if not stat.S_ISDIR(git_info_stat.st_mode):
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_regular",
-            remediation="Preserve the workspace for inspection and retry on a clean clone.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            detail=".git must be a directory",
-        )
-    expected_ref = f"refs/heads/{expected_branch}"
-    if head_text != f"ref: {expected_ref}":
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_branch",
-            remediation="Keep the task on its exact expected branch.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail=f"unexpected HEAD contents: {head_text!r}",
-        )
-    ref_path = git_dir.joinpath(*expected_ref.split("/"))
-    candidate: str | None = None
-    try:
-        if ref_path.exists():
-            if not stat.S_ISREG(ref_path.lstat().st_mode):
-                raise OSError("branch ref is not a regular file")
-            candidate = ref_path.read_text(encoding="ascii").strip()
-        else:
-            packed_path = git_dir / "packed-refs"
-            if packed_path.exists() and stat.S_ISREG(packed_path.lstat().st_mode):
-                for line in packed_path.read_text(encoding="ascii").splitlines():
-                    if not line or line.startswith(("#", "^")):
-                        continue
-                    sha, _, ref = line.partition(" ")
-                    if ref == expected_ref:
-                        candidate = sha
-                        break
-    except OSError as exc:
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_ref",
-            remediation="Preserve the workspace for inspection and retry on a clean clone.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail=f"cannot read branch ref safely: {exc}",
         ) from exc
     if (
         candidate is None
@@ -1555,111 +1694,152 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
     return candidate.lower()
 
 
-_LOOSE_OBJECT = re.compile(r"^[0-9a-f]{2}/[0-9a-f]{38}$")
 _PACK_OBJECT = re.compile(r"^pack/pack-[0-9a-f]{40}\.(?:pack|idx|rev|bitmap)$")
 _MAX_OBJECT_TRANSFER_BYTES = 1_073_741_824
+_MAX_OBJECT_TRANSFER_FILES = 1_000_000
 
 
-def _copy_agent_objects(workspace: Path, publisher: Path) -> None:
+def _copy_regular_at(
+    parent_fd: int, relative: str, target: Path, *, max_bytes: int
+) -> int:
+    """Stream one anchored regular file to a trusted target within a bound."""
+    with _open_regular_at(parent_fd, relative, max_bytes=max_bytes) as (
+        descriptor,
+        before,
+    ):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        writing = not target.exists()
+        target_file = target.open("xb" if writing else "rb")
+        copied = 0
+        with target_file:
+            while True:
+                chunk = os.read(descriptor, min(1024 * 1024, max_bytes - copied + 1))
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > max_bytes:
+                    raise OSError(f"file exceeds transfer bound: {relative}")
+                if writing:
+                    target_file.write(chunk)
+                elif target_file.read(len(chunk)) != chunk:
+                    raise OSError(f"object collision for {relative}")
+            if not writing and target_file.read(1):
+                raise OSError(f"object collision for {relative}")
+        after = os.fstat(descriptor)
+        if copied != before.st_size or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise OSError(f"object changed during transfer: {relative}")
+        return copied
+
+
+def _copy_agent_objects(
+    workspace: Path,
+    publisher: Path,
+    *,
+    expected_inode: tuple[int, int] | None = None,
+) -> None:
     """Copy only content-addressed object files, never config/hooks/remotes."""
-    source = workspace / ".git" / "objects"
     destination = publisher / ".git" / "objects"
+    if os.name == "nt":
+        source = workspace / ".git" / "objects"
+        total = 0
+        count = 0
+        try:
+            for root, directories, files in os.walk(source, followlinks=False):
+                root_path = Path(root)
+                if any((root_path / name).is_symlink() for name in directories):
+                    raise OSError("symlinked object directory")
+                for filename in files:
+                    relative = (root_path / filename).relative_to(source).as_posix()
+                    if not (
+                        re.fullmatch(r"[0-9a-f]{2}/[0-9a-f]{38}", relative)
+                        or _PACK_OBJECT.fullmatch(relative)
+                    ):
+                        continue
+                    count += 1
+                    remaining = _MAX_OBJECT_TRANSFER_BYTES - total
+                    if count > _MAX_OBJECT_TRANSFER_FILES or remaining <= 0:
+                        raise OSError("agent object transfer exceeds bound")
+                    payload = _read_regular_path(source / relative, max_bytes=remaining)
+                    total += len(payload)
+                    target = destination / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.exists() and target.read_bytes() != payload:
+                        raise OSError(f"object collision for {relative}")
+                    if not target.exists():
+                        target.write_bytes(payload)
+            return
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="agent_objects_safe",
+                remediation="Preserve the task clone and retry after operator inspection.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                detail=f"cannot transfer agent objects safely: {exc}",
+            ) from exc
+    total = 0
+    count = 0
     try:
-        if not stat.S_ISDIR(source.lstat().st_mode):
-            raise OSError("objects is not a directory")
+        with (
+            _open_agent_git_dir(workspace, expected_inode=expected_inode) as git_fd,
+            _open_directory_at(git_fd, "objects") as objects_fd,
+        ):
+
+            def transfer(relative: str) -> None:
+                nonlocal count, total
+                count += 1
+                if count > _MAX_OBJECT_TRANSFER_FILES:
+                    raise OSError("agent object transfer exceeds file-count limit")
+                remaining = _MAX_OBJECT_TRANSFER_BYTES - total
+                if remaining <= 0:
+                    raise OSError("agent object transfer exceeds 1 GiB")
+                total += _copy_regular_at(
+                    objects_fd,
+                    relative,
+                    destination / relative,
+                    max_bytes=remaining,
+                )
+
+            with os.scandir(objects_fd) as entries:
+                for entry in entries:
+                    if re.fullmatch(r"[0-9a-f]{2}", entry.name):
+                        with (
+                            _open_directory_at(objects_fd, entry.name) as loose_fd,
+                            os.scandir(loose_fd) as loose_entries,
+                        ):
+                            for child in loose_entries:
+                                if re.fullmatch(r"[0-9a-f]{38}", child.name):
+                                    transfer(f"{entry.name}/{child.name}")
+                    elif entry.name == "pack":
+                        with (
+                            _open_directory_at(objects_fd, "pack") as pack_fd,
+                            os.scandir(pack_fd) as pack_entries,
+                        ):
+                            for child in pack_entries:
+                                relative = f"pack/{child.name}"
+                                if _PACK_OBJECT.fullmatch(relative):
+                                    transfer(relative)
+    except WorkspaceVerificationError:
+        raise
     except OSError as exc:
         raise WorkspaceVerificationError(
             failed_step="agent_objects_safe",
             remediation="Preserve the task clone and retry after operator inspection.",
             expected_workspace=str(workspace),
             actual_workspace=str(workspace),
-            detail=f"cannot inspect agent object database: {exc}",
+            detail=f"cannot transfer agent objects safely: {exc}",
         ) from exc
-    total = 0
-    for root, directories, files in os.walk(source, followlinks=False):
-        root_path = Path(root)
-        for directory in list(directories):
-            child = root_path / directory
-            if child.is_symlink():
-                raise WorkspaceVerificationError(
-                    failed_step="agent_objects_safe",
-                    remediation="Remove symlinks from the task object database.",
-                    expected_workspace=str(workspace),
-                    actual_workspace=str(workspace),
-                    detail=f"symlinked object directory: {child.relative_to(source)}",
-                )
-        for filename in files:
-            candidate = root_path / filename
-            relative = candidate.relative_to(source).as_posix()
-            if not (
-                _LOOSE_OBJECT.fullmatch(relative) or _PACK_OBJECT.fullmatch(relative)
-            ):
-                continue
-            try:
-                descriptor = os.open(
-                    candidate,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                )
-                info = os.fstat(descriptor)
-            except OSError as exc:
-                raise WorkspaceVerificationError(
-                    failed_step="agent_objects_safe",
-                    remediation="Preserve the task clone and retry after operator inspection.",
-                    expected_workspace=str(workspace),
-                    actual_workspace=str(workspace),
-                    detail=f"cannot stat object {relative}: {exc}",
-                ) from exc
-            if not stat.S_ISREG(info.st_mode):
-                os.close(descriptor)
-                raise WorkspaceVerificationError(
-                    failed_step="agent_objects_safe",
-                    remediation="Only regular content-addressed Git objects may cross the boundary.",
-                    expected_workspace=str(workspace),
-                    actual_workspace=str(workspace),
-                    detail=f"non-regular object: {relative}",
-                )
-            try:
-                target = destination / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with os.fdopen(descriptor, "rb", closefd=False) as source_file:
-                    if target.exists():
-                        target_file = target.open("rb")
-                        writing = False
-                    else:
-                        target_file = target.open("xb")
-                        writing = True
-                    with target_file:
-                        copied = 0
-                        while True:
-                            chunk = source_file.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            copied += len(chunk)
-                            total += len(chunk)
-                            if total > _MAX_OBJECT_TRANSFER_BYTES:
-                                raise WorkspaceVerificationError(
-                                    failed_step="agent_objects_bounded",
-                                    remediation="Split the task or inspect the oversized object transfer.",
-                                    expected_workspace=str(workspace),
-                                    actual_workspace=str(workspace),
-                                    detail="agent object transfer exceeds 1 GiB",
-                                )
-                            if writing:
-                                target_file.write(chunk)
-                            elif target_file.read(len(chunk)) != chunk:
-                                raise WorkspaceVerificationError(
-                                    failed_step="agent_object_collision",
-                                    remediation="Preserve both repositories for object-integrity inspection.",
-                                    expected_workspace=str(workspace),
-                                    actual_workspace=str(workspace),
-                                    detail=f"object collision for {relative}",
-                                )
-                        if copied != info.st_size or (
-                            not writing and target_file.read(1)
-                        ):
-                            raise OSError("object size changed during transfer")
-            finally:
-                os.close(descriptor)
 
 
 def resolve_canonical_base_sha(
@@ -1749,7 +1929,9 @@ def trusted_publish_clone(
             expected_branch=expected_branch,
             detail=f"workspace inode mismatch: expected={expected_inode}, actual={actual_inode}",
         )
-    candidate_sha = _read_agent_head(workspace, expected_branch)
+    candidate_sha = _read_agent_head(
+        workspace, expected_branch, expected_inode=actual_inode
+    )
     if expected_candidate_sha is not None and candidate_sha != expected_candidate_sha:
         raise WorkspaceVerificationError(
             failed_step="agent_candidate_changed_before_validation",
@@ -1809,7 +1991,7 @@ def trusted_publish_clone(
                 spec=spec,
                 failed_step="expected_remote_present",
             )
-        _copy_agent_objects(workspace, publisher)
+        _copy_agent_objects(workspace, publisher, expected_inode=actual_inode)
         checks = [
             (["cat-file", "-e", f"{candidate_sha}^{{commit}}"], "agent_commit_valid"),
             (
@@ -1929,7 +2111,9 @@ def task_workspace_candidate_sha(
                 f"actual={actual_inode}"
             ),
         )
-    return _read_agent_head(raw_workspace.resolve(), expected_branch)
+    return _read_agent_head(
+        raw_workspace.resolve(), expected_branch, expected_inode=expected_inode
+    )
 
 
 def task_workspace_is_unchanged(
@@ -1939,12 +2123,20 @@ def task_workspace_is_unchanged(
     remote_url: str,
     start_sha: str,
     trusted_base_sha: str,
+    current_base_sha: str,
     expected_remote_sha: str | None,
     expected_inode: tuple[int, int],
 ) -> bool:
     """Prove a failed executor made no filesystem or commit change."""
     try:
-        if _read_agent_head(Path(workspace_path), expected_branch) != start_sha:
+        if (
+            _read_agent_head(
+                Path(workspace_path),
+                expected_branch,
+                expected_inode=expected_inode,
+            )
+            != start_sha
+        ):
             return False
         with trusted_publish_clone(
             workspace_path,
@@ -1952,6 +2144,7 @@ def task_workspace_is_unchanged(
             remote_url=remote_url,
             start_sha=start_sha,
             trusted_base_sha=trusted_base_sha,
+            current_base_sha=current_base_sha,
             expected_remote_sha=expected_remote_sha,
             expected_inode=expected_inode,
         ):
@@ -1992,7 +2185,9 @@ def checkpoint_task_workspace(
             expected_branch=expected_branch,
             detail="signed marker is missing or no longer matches the pre-agent checkpoint",
         )
-    candidate = _read_agent_head(workspace, expected_branch)
+    candidate = _read_agent_head(
+        workspace, expected_branch, expected_inode=expected_inode
+    )
     if candidate != expected_candidate_sha:
         raise WorkspaceVerificationError(
             failed_step="task_workspace_checkpoint_candidate",
@@ -2052,6 +2247,54 @@ def _is_pipeline_owned_standalone_clone(
         return False
 
 
+def _remove_directory_tree_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_inode: tuple[int, int] | None = None,
+) -> None:
+    """Remove one directory by descriptor, never by a re-resolved pathname."""
+    directory_fd = os.open(name, _SAFE_DIRECTORY_FLAGS, dir_fd=parent_fd)
+    try:
+        info = os.fstat(directory_fd)
+        actual_inode = (info.st_dev, info.st_ino)
+        if expected_inode is not None and actual_inode != expected_inode:
+            raise OSError(f"quarantined directory identity changed: {actual_inode}")
+        with os.scandir(directory_fd) as entries:
+            children = [entry.name for entry in entries]
+        for child in children:
+            try:
+                _remove_directory_tree_at(directory_fd, child)
+            except NotADirectoryError:
+                os.unlink(child, dir_fd=directory_fd)
+            except OSError as exc:
+                # ELOOP is the expected O_NOFOLLOW result for a symlink.  A
+                # concurrent file-for-directory swap likewise becomes an
+                # unlink of the exact name under this anchored descriptor.
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    os.unlink(child, dir_fd=directory_fd)
+                else:
+                    raise
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _unlink_private_marker_for(workspace: Path) -> None:
+    marker = _task_local_marker_path(workspace)
+    try:
+        parent_fd = os.open(marker.parent, _SAFE_DIRECTORY_FLAGS)
+    except FileNotFoundError:
+        return
+    try:
+        try:
+            os.unlink(marker.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(parent_fd)
+
+
 # --------------------------------------------------------------------------
 # Teardown (the other mutating git subcommands: `worktree remove` / `prune`)
 # --------------------------------------------------------------------------
@@ -2104,20 +2347,57 @@ def remove_workspace(
         # candidate clean and durable, or when the executor never started.
         if not verified_clean:
             return "remove_failed"
-        quarantine_root = raw_workspace.parent / ".aicc-quarantine"
-        quarantine_root.mkdir(mode=0o700, exist_ok=True)
-        quarantine = (
-            quarantine_root / f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
-        )
-        try:
-            os.replace(raw_workspace, quarantine)
-            quarantine_stat = quarantine.lstat()
-            if (quarantine_stat.st_dev, quarantine_stat.st_ino) != inode:
+        if os.name == "nt":
+            quarantine_root = raw_workspace.parent / ".aicc-quarantine"
+            quarantine_root.mkdir(mode=0o700, exist_ok=True)
+            quarantine = quarantine_root / (
+                f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
+            )
+            try:
+                os.replace(raw_workspace, quarantine)
+                quarantined = quarantine.lstat()
+                if (quarantined.st_dev, quarantined.st_ino) != inode:
+                    return "remove_failed"
+                shutil.rmtree(quarantine)
+                _task_local_marker_path(raw_workspace).unlink(missing_ok=True)
+            except OSError:
                 return "remove_failed"
-            shutil.rmtree(quarantine)
-            _task_local_marker_path(raw_workspace).unlink(missing_ok=True)
+            return "removed"
+        quarantine_name = ".aicc-quarantine"
+        quarantined_name = f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
+        parent_fd: int | None = None
+        quarantine_fd: int | None = None
+        try:
+            parent_fd = os.open(raw_workspace.parent, _SAFE_DIRECTORY_FLAGS)
+            source_stat = os.stat(
+                raw_workspace.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (source_stat.st_dev, source_stat.st_ino) != inode:
+                return "remove_failed"
+            try:
+                os.mkdir(quarantine_name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            quarantine_fd = os.open(
+                quarantine_name, _SAFE_DIRECTORY_FLAGS, dir_fd=parent_fd
+            )
+            os.rename(
+                raw_workspace.name,
+                quarantined_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=quarantine_fd,
+            )
+            _remove_directory_tree_at(
+                quarantine_fd, quarantined_name, expected_inode=inode
+            )
+            _unlink_private_marker_for(raw_workspace)
         except OSError:
             return "remove_failed"
+        finally:
+            if quarantine_fd is not None:
+                os.close(quarantine_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
         return "removed"
     workspace = raw_workspace.resolve()
     if not is_pipeline_owned_worktree(workspace, repository_path):

@@ -15,8 +15,10 @@ recorded.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -364,6 +366,125 @@ def test_agent_git_config_cannot_redirect_guarded_publish(
     assert not _workspace(repo).exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux worker dirfd boundary")
+@pytest.mark.parametrize("target", ["HEAD", "branch", "packed-refs", "object"])
+def test_hostile_git_fifo_or_symlink_fails_closed_without_blocking(
+    agent, monkeypatch, tmp_path, target
+):
+    """Every agent-controlled Git read shares the nonblocking dirfd boundary."""
+    run_agent, repo = agent
+    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run(commit=False))
+    assert run_agent(_payload(), _event(), 1).ok
+    workspace = _workspace(repo)
+    branch_ref = workspace / ".git/refs/heads/backlog/VOYN-TASK-A"
+
+    if target == "HEAD":
+        (workspace / ".git/HEAD").unlink()
+        os.mkfifo(workspace / ".git/HEAD")
+    elif target == "branch":
+        victim = tmp_path / "outside-ref"
+        victim.write_text("0" * 40 + "\n")
+        branch_ref.unlink()
+        branch_ref.symlink_to(victim)
+    elif target == "packed-refs":
+        branch_ref.unlink()
+        (workspace / ".git/packed-refs").unlink(missing_ok=True)
+        os.mkfifo(workspace / ".git/packed-refs")
+    else:
+        object_path = workspace / ".git/objects/aa" / ("b" * 38)
+        object_path.parent.mkdir(exist_ok=True)
+        os.mkfifo(object_path)
+
+    started = time.monotonic()
+    with pytest.raises(workspace_provisioning.WorkspaceVerificationError):
+        candidate = workspace_provisioning.task_workspace_candidate_sha(
+            workspace,
+            expected_branch="backlog/VOYN-TASK-A",
+            expected_inode=(workspace.stat().st_dev, workspace.stat().st_ino),
+        )
+        with workspace_provisioning.trusted_publish_clone(
+            workspace,
+            expected_branch="backlog/VOYN-TASK-A",
+            remote_url=str(repo),
+            start_sha=candidate,
+            expected_candidate_sha=candidate,
+        ):
+            pass
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux worker dirfd boundary")
+def test_private_marker_fifo_is_rejected_before_executor_without_blocking(
+    agent, monkeypatch
+):
+    run_agent, repo = agent
+    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run(commit=False))
+    assert run_agent(_payload(), _event(), 1).ok
+    workspace = _workspace(repo)
+    marker = next((workspace.parent / ".aicc-task-metadata").glob("*.json"))
+    marker.unlink()
+    os.mkfifo(marker)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **_kwargs: pytest.fail("invalid marker must fail before executor"),
+    )
+
+    started = time.monotonic()
+    refused = run_agent(_payload(), _event(), 2)
+
+    assert not refused.ok and refused.retryable
+    assert "task_local_workspace_marker" in refused.reason
+    assert time.monotonic() - started < 2
+
+
+def _unrelated_commit(repo: Path) -> str:
+    tree = _git(repo, "write-tree").stdout.strip()
+    return subprocess.run(
+        ["git", "commit-tree", tree],
+        cwd=repo,
+        input="rewrite canonical base\n",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def test_local_checkpoint_reresolves_and_rejects_rewritten_base(agent, monkeypatch):
+    run_agent, repo = agent
+
+    def commit_then_rewrite_base(**kwargs):
+        result = _fake_run()(**kwargs)
+        _git(repo, "update-ref", "refs/heads/main", _unrelated_commit(repo))
+        return result
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", commit_then_rewrite_base)
+    outcome = run_agent(_payload(), _event(), 1)
+
+    assert not outcome.ok and outcome.retryable
+    assert "local task checkpoint failed" in outcome.reason
+    assert _workspace(repo).exists()
+
+
+def test_guarded_publish_reresolves_and_rejects_rewritten_base(
+    agent_with_publish, monkeypatch
+):
+    run_agent, repo = agent_with_publish
+
+    def commit_then_rewrite_base(**kwargs):
+        result = _fake_run()(**kwargs)
+        rewritten = _unrelated_commit(repo)
+        _git(repo, "push", "--force", "origin", f"{rewritten}:refs/heads/main")
+        return result
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", commit_then_rewrite_base)
+    outcome = run_agent(_payload(), _event(), 1)
+
+    assert not outcome.ok and outcome.retryable
+    assert "guarded publish preparation failed" in outcome.reason
+    assert _workspace(repo).exists()
+
+
 # --------------------------------------------------------------------------
 # Cleanup
 # --------------------------------------------------------------------------
@@ -389,6 +510,35 @@ def test_cleanup_after_publish_succeeds(agent_with_publish, monkeypatch):
 
     assert outcome.ok and outcome.result["publish"]["ok"] is True
     assert not _workspace(repo).exists()
+
+
+def test_cleanup_is_inode_bound_and_preserves_path_replacement(agent, monkeypatch):
+    run_agent, repo = agent
+    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run(commit=False))
+    assert run_agent(_payload(), _event(), 1).ok
+    workspace = _workspace(repo)
+    inode = (workspace.stat().st_dev, workspace.stat().st_ino)
+    real_remove = workspace_provisioning._remove_directory_tree_at
+
+    def replace_original_path(parent_fd, name, *, expected_inode=None):
+        if expected_inode is not None:
+            workspace.mkdir()
+            (workspace / "replacement.txt").write_text("preserve\n")
+        return real_remove(parent_fd, name, expected_inode=expected_inode)
+
+    monkeypatch.setattr(
+        workspace_provisioning, "_remove_directory_tree_at", replace_original_path
+    )
+    assert (
+        workspace_provisioning.remove_workspace(
+            workspace,
+            repo,
+            verified_clean=True,
+            verified_inode=inode,
+        )
+        == "removed"
+    )
+    assert (workspace / "replacement.txt").read_text() == "preserve\n"
 
 
 def test_cleanup_after_publish_reports_nothing_to_publish(

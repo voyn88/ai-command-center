@@ -130,6 +130,11 @@ def handler(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         workspace_provisioning,
+        "resolve_canonical_base_sha",
+        lambda repository, **kwargs: "0" * 40,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
         "checkpoint_task_workspace",
         lambda workspace, **kwargs: kwargs["previous_start_sha"],
     )
