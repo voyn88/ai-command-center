@@ -83,20 +83,22 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     # the task_id -- so a later push to the same PR (remediation, or an
     # ordinary second push while still IN_PROGRESS) gets its own fresh
     # review instead of being permanently deduped against this one.
-    assert key == f"review:VOYN-W0-R1:7:{head}:v2"
+    assert key == f"review:VOYN-W0-R1:7:{head}:v3"
     assert task_id == "VOYN-W0-R1"
     assert [link["executor"] for link in payload["cascade"]] == ["copilot", "claude"]
     assert max_attempts == len(payload["cascade"]) == 2
     assert payload["task_type"] == "review" and "pull/7" in payload["prompt"]
-    # The diff is embedded in the prompt directly -- the orchestrator fetches
-    # it, not the review agent -- so the agent needs no Bash/gh access of its
-    # own at all. Independent review (2026-08-21) found that granting a
+    # The orchestrator embeds the diff in a collision-safe JSON string -- the
+    # review agent still needs no Bash/gh access of its own. Independent review
+    # (2026-08-21) found that granting a
     # review agent even a narrowly-scoped `gh pr view/diff` Bash pattern let
     # a prompt-injected instruction inside the diff pass an unconstrained
     # `--repo` argument and read unrelated private repos, no shell escape
     # needed; embedding is the fix that removes the capability instead of
     # trying to scope it.
-    assert "diff --git a/x b/x" in payload["prompt"]
+    envelope = review_merge._review_envelope_from_prompt(payload["prompt"])
+    assert envelope is not None
+    assert envelope["content"]["text"] == "diff --git a/x b/x\n+hi\n"
     assert head in payload["prompt"]
     # Resolved through the same repo_route() table implementation dispatch
     # uses, not the raw backlog task_id and an empty path -- the worker's
@@ -149,7 +151,7 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13")
     head = "e" * 40
-    huge_diff = "x" * (review_merge._MAX_DIFF_CHARS + 1)
+    huge_diff = "я" * 60_000
 
     def fake_gh(argv, repo):
         import subprocess
@@ -166,9 +168,19 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
         lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
         "/tmp",
     )
-    chunks = review_merge._diff_chunks(huge_diff)
-    assert len(calls) == len(chunks) == 2
+    chunks = review_merge._review_chunks(
+        huge_diff,
+        "VOYN-W0-R4",
+        "https://github.com/x/repo-d2/pull/13",
+        head,
+    )
+    assert len(calls) == len(chunks) > 1
     assert all(len(call[2]["review_chunk"]["content_hash"]) == 64 for call in calls)
+    assert all(
+        len(call[2]["prompt"].encode("utf-8"))
+        <= review_merge._MAX_REVIEW_PROMPT_BYTES
+        for call in calls
+    )
     assert ("VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13") in report.reviewed
 
 

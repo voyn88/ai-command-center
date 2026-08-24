@@ -30,7 +30,7 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     ]
     _queue, key, payload, task_id, max_attempts = calls[0]
     assert task_id == "VOYN-W0-X"
-    assert key.endswith(":v2")
+    assert key.endswith(":v3")
     assert [link["executor"] for link in payload["cascade"]] == [
         "copilot",
         "claude",
