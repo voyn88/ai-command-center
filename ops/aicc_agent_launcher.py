@@ -373,9 +373,15 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
     file into a per-run tmpfs-backed path and removes it after cgroup exit.
     """
     try:
-        workspace_gid = grp.getgrnam("aicc-workspace").gr_gid
+        # A DEDICATED group for ephemeral model-credential homes. The shared
+        # aicc-workspace output group also contains the guarded publisher and
+        # operators; keying the live provider token to it let every one of
+        # them read every agent's credential (review finding on 363e91d).
+        # aicc-agent-auth has no human or publisher members -- only the
+        # transient agent units join it.
+        auth_gid = grp.getgrnam("aicc-agent-auth").gr_gid
     except KeyError as exc:
-        raise LaunchRefused("aicc-workspace group does not exist") from exc
+        raise LaunchRefused("aicc-agent-auth group does not exist") from exc
     source = MODEL_AUTH_SOURCES[executor]
     source_payload = _read_exact_protected_file(
         source, expected_uid=0, expected_gid=0, exact_mode=0o600
@@ -392,7 +398,7 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
         descriptor = os.open(target, flags, 0o640)
         try:
             os.fchmod(descriptor, 0o640)
-            os.fchown(descriptor, 0, workspace_gid)
+            os.fchown(descriptor, 0, auth_gid)
             with os.fdopen(descriptor, "wb", closefd=False) as stream:
                 stream.write(source_payload)
                 stream.flush()
@@ -402,7 +408,7 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
                 not stat.S_ISREG(target_info.st_mode)
                 or target_info.st_nlink != 1
                 or target_info.st_uid != 0
-                or target_info.st_gid != workspace_gid
+                or target_info.st_gid != auth_gid
                 or stat.S_IMODE(target_info.st_mode) != 0o640
                 or target_info.st_size != len(source_payload)
             ):
@@ -410,7 +416,7 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
         finally:
             os.close(descriptor)
         for path in (home, target.parent):
-            os.chown(path, 0, workspace_gid)
+            os.chown(path, 0, auth_gid)
             os.chmod(path, 0o770)
     except (FileExistsError, OSError) as exc:
         shutil.rmtree(home, ignore_errors=True)
@@ -802,7 +808,7 @@ def _systemd_command(
         "--setenv=GIT_CONFIG_GLOBAL=/dev/null",
         "--setenv=GIT_TERMINAL_PROMPT=0",
         "--setenv=GCM_INTERACTIVE=never",
-        "--property=SupplementaryGroups=aicc-workspace",
+        "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
         "--property=UMask=0007",
         "--property=NoNewPrivileges=yes",
         "--property=CapabilityBoundingSet=",

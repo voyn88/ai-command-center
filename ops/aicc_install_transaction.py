@@ -334,6 +334,16 @@ class FileTransaction:
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 raise ValueError(f"existing target is not a regular file: {target}")
         self._prepare_state_dir()
+        if self.pending.exists():
+            # A prior install was interrupted after prepare/apply but before
+            # commit. Overwriting pending.json here would orphan that
+            # generation's backups and permanently destroy the restore path
+            # (review finding on 363e91d). The operator must run recover
+            # first; this transaction refuses rather than clobbers.
+            raise RuntimeError(
+                "a pending install transaction already exists; run recover "
+                "before installing again"
+            )
         transaction = self.state_dir / f"generation-{secrets.token_hex(8)}"
         backups = transaction / "backups"
         staged = transaction / "staged"

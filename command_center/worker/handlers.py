@@ -657,11 +657,18 @@ def _run_agent(
             # nothing executed, so redelivery is safe and may land on a
             # healthier host. The worktree (if any) holds no run output
             # either -- safe to remove immediately rather than leave an
-            # empty one behind for every failed launch attempt.
-            if (
-                isolated_workspace is not None
-                and evidence.provision_outcome == "cloned"
-            ):
+            # empty one behind for every failed launch attempt. "Safe" is
+            # keyed to freshness, not to the provisioning mode: a workspace
+            # this attempt just created ("cloned"/"created"/"attached")
+            # holds nothing, while a "reused" one may carry a preserved
+            # unpublished commit from an earlier attempt and must survive
+            # for the retry to publish (review finding on 363e91d: the old
+            # `== "cloned"` gate leaked every legacy fresh worktree).
+            if isolated_workspace is not None and evidence.provision_outcome in {
+                "cloned",
+                "created",
+                "attached",
+            }:
                 workspace_provisioning.remove_workspace(
                     isolated_workspace,
                     repository,

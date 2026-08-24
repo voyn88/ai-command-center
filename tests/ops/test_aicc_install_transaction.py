@@ -422,3 +422,20 @@ def test_invalid_source_is_rejected_before_any_target_mutation(tmp_path):
 
     assert target.read_bytes() == b"before"
     assert not state.exists()
+
+
+def test_prepare_refuses_to_clobber_a_pending_transaction(tmp_path):
+    """An interrupted install (pending.json still present) must make the next
+    prepare() refuse instead of silently overwriting the journal and orphaning
+    the prior generation's backups (independent-review finding on 363e91d)."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    root.mkdir()
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"one")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/target.bin"),))
+    assert transaction.pending.exists()
+    with pytest.raises(RuntimeError, match="pending install transaction"):
+        transaction.prepare((_spec(module, source, "/etc/target.bin"),))
