@@ -95,6 +95,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -112,6 +113,20 @@ CLAUDE_BINARY = "claude"
 # the service already runs as that user), which systemd does not add for it.
 CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
 COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
+
+# The worker never elevates and keeps NoNewPrivileges=yes.  A root-owned,
+# socket-activated launcher is the sole bridge to the separate aicc-agent UID.
+# This path is deliberately not environment-overridable: worker.env contains
+# publisher authority and must not be able to replace the executable that
+# enforces the boundary around it.
+PRINCIPAL_ISOLATION_LAUNCHER = "/usr/libexec/aicc-agent-launcher"
+PRINCIPAL_ISOLATION_REQUIRED_ENV = "AICC_AGENT_PRINCIPAL_ISOLATION"
+PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
+PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
+    "claude": "/usr/local/bin/claude",
+    "codex": "/usr/local/bin/codex",
+}
+_PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 
 # Codex 0.149.0 on worker-01 can exit zero after its vendor bwrap fails to
 # create loopback inside the network namespace. This exact, two-part signature
@@ -356,6 +371,86 @@ def scrub_vcs_credentials(environment: dict[str, str]) -> dict[str, str]:
     return scrubbed
 
 
+def build_principal_isolation_manifest(
+    *,
+    repository_path: Path,
+    prompt: str,
+    task_type: str,
+    timeout_seconds: int,
+    executor: str,
+    model: str | None,
+) -> dict[str, object]:
+    """Build the only payload accepted by the privileged launcher.
+
+    No environment value crosses this interface.  In particular, publisher,
+    lease, workspace-HMAC and GitHub credentials remain in the aicc-worker
+    process.  The launcher loads only provider-specific model authentication
+    from root-owned allowlisted files after it has selected ``aicc-agent``.
+    """
+    if executor not in COMMAND_BUILDERS:
+        raise RunnerError(f"unknown executor {executor!r}")
+    return {
+        "version": 1,
+        "run_id": uuid.uuid4().hex,
+        "workspace": str(repository_path.resolve(strict=True)),
+        "executor": executor,
+        "profile": profile_for_task_type(task_type),
+        "prompt": prompt,
+        "model": model,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def principal_isolation_required() -> bool:
+    return os.environ.get(PRINCIPAL_ISOLATION_REQUIRED_ENV) == "required"
+
+
+def principal_workspace_root(
+    config_path: Path | None = None, *, require_root_owned: bool = True
+) -> Path:
+    """Read the one canonical task root shared with the privileged broker."""
+    path = config_path or PRINCIPAL_WORKSPACE_ROOTS_FILE
+    info = path.stat()
+    if require_root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
+        raise RunnerError("principal workspace-root config is not immutable root-owned")
+    roots = [
+        Path(line.strip())
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if len(roots) != 1 or not roots[0].is_absolute():
+        raise RunnerError("principal workspace-root config must contain one absolute root")
+    return roots[0].resolve(strict=True)
+
+
+def principal_executor_preflight(executor: str) -> tuple[bool, str]:
+    """Cheap worker-side check for the fixed root-owned provider path.
+
+    The privileged broker repeats ownership/mode validation.  This check only
+    avoids spending a queue attempt when deployment is visibly incomplete.
+    """
+    binary = PRINCIPAL_EXECUTOR_BINARIES.get(executor)
+    if binary is None:
+        return False, f"executor {executor!r} is not allowlisted"
+    if Path(binary).is_file() and os.access(binary, os.X_OK):
+        return True, ""
+    return False, f"isolated executor binary is unavailable: {binary}"
+
+
+def _principal_launcher_environment() -> dict[str, str]:
+    """Minimal environment for the unprivileged socket client.
+
+    The client needs no model or repository credential.  Keeping HOME, XDG,
+    SSH and Git variables out also prevents a future client regression from
+    turning the bridge into an ambient-secret transport.
+    """
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+    }
+
+
 DEFAULT_TIMEOUT_SECONDS = 900
 MIN_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 3600
@@ -407,16 +502,43 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
     with _codex_workspace_write_preflight_lock:
         if _codex_workspace_write_preflight_result is not None:
             return _codex_workspace_write_preflight_result
-        if shutil.which(CODEX_BINARY) is None:
+        if principal_isolation_required():
+            binary_available, binary_detail = principal_executor_preflight("codex")
+        else:
+            binary_available = shutil.which(CODEX_BINARY) is not None
+            binary_detail = f"Codex CLI {CODEX_BINARY!r} is not available on PATH"
+        if not binary_available:
             _codex_workspace_write_preflight_result = (
                 False,
-                f"Codex CLI {CODEX_BINARY!r} is not available on PATH",
+                binary_detail,
             )
             return _codex_workspace_write_preflight_result
 
         import tempfile
 
-        with tempfile.TemporaryDirectory(prefix="aicc-codex-preflight-") as raw_probe:
+        try:
+            probe_parent = (
+                str(principal_workspace_root())
+                if principal_isolation_required()
+                else None
+            )
+        except (OSError, RunnerError) as exc:
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"isolated workspace root is unavailable: {exc}",
+            )
+            return _codex_workspace_write_preflight_result
+        try:
+            temporary = tempfile.TemporaryDirectory(
+                prefix="aicc-codex-preflight-", dir=probe_parent
+            )
+        except OSError as exc:
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"cannot create isolated Codex probe workspace: {exc}",
+            )
+            return _codex_workspace_write_preflight_result
+        with temporary as raw_probe:
             probe = Path(raw_probe)
             initialized = subprocess.run(
                 ["git", "init", "--quiet", str(probe)],
@@ -696,8 +818,9 @@ def build_codex_command(
     ]
     if model:
         command += ["--model", model]
-    # The prompt goes last and positionally: `codex exec [OPTIONS] [PROMPT]`.
-    command.append(prompt)
+    # Terminate option parsing before the untrusted task prompt. Without `--`,
+    # a prompt beginning with a Codex flag could replace the selected sandbox.
+    command += ["--", prompt]
     return command
 
 
@@ -923,6 +1046,16 @@ class RunResult:
         diagnostic = f"{self.stdout}\n{self.stderr}".lower()
         return all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
 
+    @property
+    def is_principal_isolation_error(self) -> bool:
+        """The OS launcher refused or lost the isolated execution service.
+
+        The fixed signature is emitted only by the root-owned launcher/client,
+        before a provider verdict can be trusted.  It is therefore executor
+        infrastructure and safe to retry, never a completed task result.
+        """
+        return _PRINCIPAL_ISOLATION_FAILURE in f"{self.stdout}\n{self.stderr}"
+
 
 # How often the mid-run poll loop wakes to re-check `cancel_event` and the
 # deadline. Short enough that a lease-loss signal turns into a SIGTERM within
@@ -1066,20 +1199,52 @@ def run_claude_code(
             completed_at=models.iso_now(),
         )
     command = builder(prompt, task_type=task_type, model=model)
+    launcher_input: str | None = None
+    launch_environment = scrub_vcs_credentials(dict(os.environ))
+    launch_cwd = repository_path
+    if principal_isolation_required():
+        try:
+            manifest = build_principal_isolation_manifest(
+                repository_path=repository_path,
+                prompt=prompt,
+                task_type=task_type,
+                timeout_seconds=timeout_seconds,
+                executor=executor,
+                model=model,
+            )
+        except (OSError, RunnerError) as exc:
+            now = models.iso_now()
+            return RunResult(
+                status="failed",
+                exit_code=None,
+                stdout="",
+                stderr=f"{_PRINCIPAL_ISOLATION_FAILURE}: invalid manifest: {exc}",
+                duration_seconds=0.0,
+                started_at=now,
+                completed_at=now,
+            )
+        command = [PRINCIPAL_ISOLATION_LAUNCHER, "--client"]
+        launcher_input = json.dumps(manifest, separators=(",", ":")) + "\n"
+        launch_environment = _principal_launcher_environment()
+        # The client only opens the protected Unix socket.  It must not need
+        # access to the task tree; the root launcher bind-mounts the verified
+        # workspace into the aicc-agent unit as /workspace.
+        launch_cwd = Path("/")
     started_at = models.iso_now()
     started_monotonic = time.monotonic()
 
     try:
         proc = subprocess.Popen(
             command,
-            cwd=repository_path,
+            cwd=launch_cwd,
+            stdin=subprocess.PIPE if launcher_input is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             # Strip ambient Git/GitHub credentials: this agent has no reason to
             # authenticate to a remote, and the completion pipeline (not the
             # agent) owns push/merge. See scrub_vcs_credentials.
-            env=scrub_vcs_credentials(dict(os.environ)),
+            env=launch_environment,
             **_popen_new_process_group_kwargs(),
         )
     except OSError as exc:
@@ -1106,7 +1271,7 @@ def run_claude_code(
 
     def _collect() -> None:
         try:
-            out, err = proc.communicate()
+            out, err = proc.communicate(input=launcher_input)
         except (OSError, ValueError):
             out, err = "", ""
         collected["stdout"] = out or ""

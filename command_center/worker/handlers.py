@@ -35,6 +35,7 @@ stays on the worker host's journal.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
@@ -86,7 +87,18 @@ _provision_locks_guard = threading.Lock()
 
 
 def _isolated_workspace_path(repository: Path, branch: str) -> Path:
-    return workspace_provisioning.task_workspace_path(repository, branch)
+    task_path = workspace_provisioning.task_workspace_path(repository, branch)
+    if agent_runner.principal_isolation_required():
+        repository_slug = re.sub(r"[^A-Za-z0-9._-]", "-", repository.name)
+        repository_id = hashlib.sha256(
+            str(repository.resolve(strict=True)).encode("utf-8")
+        ).hexdigest()[:16]
+        return (
+            agent_runner.principal_workspace_root()
+            / f"{repository_slug}-{repository_id}"
+            / task_path.name
+        )
+    return task_path
 
 
 def _task_lease_scope(request: Any) -> str:
@@ -173,6 +185,9 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
+    if agent_runner.principal_isolation_required():
+        available, detail = agent_runner.principal_executor_preflight(executor)
+        return available, detail, f"isolated {executor} cli unavailable"
     if executor == "codex":
         available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
         return available, detail, "codex cli unavailable"
@@ -325,7 +340,16 @@ def _run_agent(
     try:
         if task_type in agent_runner.MUTATING_TASK_TYPES:
             expected_branch = f"backlog/{backlog_task}"
-            isolated_workspace = _isolated_workspace_path(repository, expected_branch)
+            try:
+                isolated_workspace = _isolated_workspace_path(
+                    repository, expected_branch
+                )
+            except (OSError, agent_runner.RunnerError) as exc:
+                return HandlerOutcome(
+                    ok=False,
+                    reason=f"isolated workspace root unavailable: {exc}",
+                    retryable=True,
+                )
 
             # Single-writer gate at the dispatch boundary (part B of
             # VOYN-OPS-WORKER-DISPATCH-INTO-LEASED-WORKTREE), now checked
@@ -647,6 +671,24 @@ def _run_agent(
             return HandlerOutcome(
                 ok=False,
                 reason=_tail(run.stderr) or "runner failed to start",
+                retryable=True,
+            )
+        if run.is_principal_isolation_error:
+            # The separate-UID launcher failed before it could return a
+            # trustworthy provider outcome. It may have failed either before
+            # starting the agent or after the agent changed the tree but
+            # before the broker returned the outcome. Preserve the task-local
+            # workspace for reconciliation: deleting it in the latter case
+            # would destroy the only copy of a local commit. Never consume the
+            # task as completed and never fall back to direct same-UID
+            # execution. A later delivery may land after socket/systemd
+            # recovery and safely inspect/reuse the workspace.
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    "executor infrastructure failure (agent principal "
+                    f"isolation): {_tail(run.stderr or result_text)}"
+                ),
                 retryable=True,
             )
         read_only_copilot_failure = (

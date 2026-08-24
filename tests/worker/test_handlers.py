@@ -261,6 +261,43 @@ def test_runner_never_started_is_retryable(handler, monkeypatch) -> None:
     assert not outcome.ok and outcome.retryable
 
 
+def test_principal_isolation_failure_is_retryable_not_a_task_result(
+    handler, monkeypatch, tmp_path
+) -> None:
+    run_agent, _ = handler
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "remove_workspace",
+        lambda *args, **kwargs: removed.append(args),
+    )
+
+    def launcher_refused(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr="AICC_AGENT_LAUNCH_INFRA_FAILURE: launcher socket unavailable",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", launcher_refused)
+    outcome = run_agent(
+        _payload(
+            task_type="implementation",
+            repository_path=str(tmp_path / "repo"),
+        ),
+        _event(),
+        1,
+    )
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "agent principal isolation" in outcome.reason
+    assert not removed, "ambiguous launcher failure must preserve task-local work"
+
+
 def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch) -> None:
     """Incident 2026-08-21 16:09 UTC (control-01/worker-01): a shared
     Claude-CLI account hit its session/rate limit mid-fleet. The process

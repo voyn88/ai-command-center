@@ -26,7 +26,11 @@ Type=notify
 WatchdogSec=240s
 User=aicc-worker
 Group=aicc-worker
+SupplementaryGroups=aicc-workspace
 EnvironmentFile=/etc/aicc/worker.env
+Environment=AICC_AGENT_PRINCIPAL_ISOLATION=required
+Environment=HOME=/var/lib/aicc-worker
+Environment=XDG_CONFIG_HOME=/var/lib/aicc-worker/config
 WorkingDirectory=/opt/aicc
 ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
 
@@ -48,9 +52,27 @@ TimeoutStopSec=330s
 # nothing here needs privileges, a home, or a writable system.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
 StateDirectory=aicc-worker
+StateDirectoryMode=0700
+ReadWritePaths=/srv/aicc-workspaces
 # Resource envelope (SRV-05): declared limits, enforced by cgroups — which,
 # unlike the mount/network sandbox directives, apply for user units too.
 # Acceptance of the *sandbox* directives is measurement-from-inside per
