@@ -11,11 +11,13 @@ AIOS owns execution and proof. AICC Native is a calm, glanceable visual control 
 | Overview | Is owner action needed? | health, bottleneck, delivery stages, attention queue | project/task drill-down |
 | Projects | Which portfolio area needs focus? | health, throughput, cost, risk, deploy | project delivery history |
 | Tasks | What is true about this task? | status derived from evidence, blocker in plain language | attempts, remediation and full proof chain |
+| Dialogues | What needs my answer or discussion? | conversations, decision requests and message summaries | context, participants, sources and a safe reply action |
+| Decisions | What choice is needed and why now? | options, impact and deadline | decision package, alternatives and later outcome |
 | Agents & infrastructure | Can the system deliver? | lanes, hosts, heartbeat, circuit-breaker | safe redacted timeline |
 | Delivery pipeline | Where is work waiting? | task-to-deploy flow | gate/reviewer/remediation evidence |
 | Activity | What changed and why? | filterable ordered events | correlated object detail |
 
-Desktop uses a command palette, shortcuts and multi-select. Mobile uses an Overview, Attention, Tasks and Activity tab model; it does not compress desktop tables.
+Desktop uses a command palette, shortcuts and multi-select. Mobile uses an Overview, Attention, Dialogues, Tasks and Activity tab model; it does not compress desktop tables. A full backlog-derived feature inventory and release order lives in `BACKLOG_PRODUCT_COVERAGE.md`; the whole-product navigation and interaction model lives in `NAVIGATION_AND_UX_ARCHITECTURE.md`.
 
 ## Critical journeys
 
@@ -23,6 +25,7 @@ Desktop uses a command palette, shortcuts and multi-select. Mobile uses an Overv
 2. Owner opens an attention item and sees the evidence-backed blocker, automatic recovery status and safe next action.
 3. Engineer opens a task and traverses every proof link without reading raw logs.
 4. A network loss opens the last validated snapshot immediately, labels freshness, and reconnects with a resumable cursor.
+5. Owner opens a dialogue or escalation, understands the question in plain language, sees the options and answers through the governed gateway; the app never sends a hidden instruction or irreversible action.
 
 ## Design foundation
 
@@ -38,4 +41,4 @@ Desktop uses a command palette, shortcuts and multi-select. Mobile uses an Overv
 
 ## Non-goals of Phase 0
 
-No AIOS-core changes, no direct infrastructure access, no mutation commands, no release-signing credentials, and no claim of a production-ready application. The next executable scope is a polished fixture-first vertical slice in this worktree after independent ADR review.
+No AIOS-core changes, no direct infrastructure access, no mutation commands, no release-signing credentials, and no claim of a production-ready application. Messages and replies are represented in fixture-first UI only until the separately accepted, auditable command and conversation contracts exist. The next executable scope is a polished fixture-first vertical slice in this worktree after independent ADR review.

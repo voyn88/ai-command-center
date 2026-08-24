@@ -16,10 +16,10 @@ private extension Snapshot {
 }
 
 private enum AppTab: String, CaseIterable, Identifiable {
-    case overview, attention, projects, activity
+    case overview, work, dialogues, decisions, more
     var id: Self { self }
-    var title: String { switch self { case .overview: "Обзор"; case .attention: "Внимание"; case .projects: "Проекты"; case .activity: "События" } }
-    var icon: String { switch self { case .overview: "sparkles"; case .attention: "bell"; case .projects: "square.grid.2x2"; case .activity: "clock.arrow.circlepath" } }
+    var title: String { switch self { case .overview: "Сегодня"; case .work: "Работа"; case .dialogues: "Диалоги"; case .decisions: "Решения"; case .more: "Ещё" } }
+    var icon: String { switch self { case .overview: "sparkles"; case .work: "checklist"; case .dialogues: "bubble.left.and.bubble.right"; case .decisions: "lightbulb"; case .more: "square.grid.2x2" } }
 }
 
 struct AICCNativeShell: View {
@@ -30,12 +30,14 @@ struct AICCNativeShell: View {
         TabView(selection: $tab) {
             OverviewView(snapshot: snapshot)
                 .tabItem { Label(AppTab.overview.title, systemImage: AppTab.overview.icon) }.tag(AppTab.overview)
-            AttentionView(snapshot: snapshot)
-                .tabItem { Label(AppTab.attention.title, systemImage: AppTab.attention.icon) }.tag(AppTab.attention)
-            ProjectsView()
-                .tabItem { Label(AppTab.projects.title, systemImage: AppTab.projects.icon) }.tag(AppTab.projects)
-            ActivityView(events: snapshot.events)
-                .tabItem { Label(AppTab.activity.title, systemImage: AppTab.activity.icon) }.tag(AppTab.activity)
+            WorkView()
+                .tabItem { Label(AppTab.work.title, systemImage: AppTab.work.icon) }.tag(AppTab.work)
+            DialoguesView()
+                .tabItem { Label(AppTab.dialogues.title, systemImage: AppTab.dialogues.icon) }.tag(AppTab.dialogues)
+            DecisionsView()
+                .tabItem { Label(AppTab.decisions.title, systemImage: AppTab.decisions.icon) }.tag(AppTab.decisions)
+            MoreView(events: snapshot.events)
+                .tabItem { Label(AppTab.more.title, systemImage: AppTab.more.icon) }.tag(AppTab.more)
         }
         .tint(.indigo)
     }
@@ -104,18 +106,21 @@ private struct ProjectRow: View {
     }
 }
 
-private struct AttentionView: View {
-    let snapshot: Snapshot
-    var body: some View { NavigationStack { List { Section("Требует взгляда") { if snapshot.overview.needsAttention == 0 { ContentUnavailableView("Всё спокойно", systemImage: "checkmark.circle", description: Text("Сейчас нет вопросов, требующих вашего решения.")) } else { Label("Система собирает контекст для следующего решения", systemImage: "lightbulb") } } }.navigationTitle("Внимание") } }
+private struct WorkView: View {
+    var body: some View { NavigationStack { List { Section("Сегодня") { Label("AICC Native — финальная проверка макета", systemImage: "circle.fill").foregroundStyle(.indigo); Label("AIOS — работа идёт по плану", systemImage: "circle.fill").foregroundStyle(.green) }; Section("План") { Label("Три приоритета на эту неделю", systemImage: "calendar") } }.navigationTitle("Работа") } }
 }
 
-private struct ProjectsView: View {
-    var body: some View { NavigationStack { ContentUnavailableView("Картина по проектам", systemImage: "square.grid.2x2", description: Text("Здесь появится понятная сводка по каждому направлению.")) .navigationTitle("Проекты") } }
+private struct DialoguesView: View {
+    var body: some View { NavigationStack { List { Section("Нужен ответ") { Label("Обсуждение дизайна AICC Native", systemImage: "bubble.left.and.bubble.right.fill").foregroundStyle(.indigo) }; Section("Недавние") { Label("Еженедельный бриф", systemImage: "text.bubble"); Label("Выбор сценария для аудита", systemImage: "text.bubble") } }.navigationTitle("Диалоги").toolbar { Button("Спросить AICC", systemImage: "waveform") {} } } }
 }
 
-private struct ActivityView: View {
+private struct DecisionsView: View {
+    var body: some View { NavigationStack { List { Section("На будущее") { Label("Как провести первую проверку дизайна", systemImage: "lightbulb.fill").foregroundStyle(.orange) }; Section("Спокойно") { Label("Все предыдущие решения идут по плану", systemImage: "checkmark.circle") } }.navigationTitle("Решения") } }
+}
+
+private struct MoreView: View {
     let events: [TimelineEvent]
-    var body: some View { NavigationStack { List(events) { event in Label(event.summary, systemImage: "circle.fill").foregroundStyle(.secondary) }.navigationTitle("События") } }
+    var body: some View { NavigationStack { List { Section("Контроль") { Label("Проверки и происшествия", systemImage: "checkmark.shield"); Label("События", systemImage: "clock.arrow.circlepath") }; Section("Интеллект") { Label("Помощники и память", systemImage: "brain"); Label("Сводки и совет", systemImage: "doc.text") }; Section("Личное") { Label("Настройки", systemImage: "gearshape") }; if !events.isEmpty { Section("Недавнее") { ForEach(events) { Label($0.summary, systemImage: "circle.fill").foregroundStyle(.secondary) } } } }.navigationTitle("Ещё") } }
 }
 
 #Preview("Спокойный обзор") { AICCNativeShell(snapshot: .preview) }
