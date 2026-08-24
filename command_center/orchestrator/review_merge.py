@@ -105,8 +105,12 @@ class LoopReport:
 
 def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["gh", *argv], cwd=repo_path, capture_output=True, text=True,
-        check=False, timeout=120,
+        ["gh", *argv],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
     )
 
 
@@ -165,7 +169,12 @@ def _post_marker_as_bot(
     try:
         with urllib.request.urlopen(req, timeout=15):
             pass
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        OSError,
+    ) as exc:
         return False, f"marker_post_failed: {exc}"
     return True, ""
 
@@ -225,7 +234,7 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # incrementing this constant, forcing every task to be re-reviewed under the
 # new contract rather than silently reusing a verdict given for an older,
 # looser policy.
-_REVIEW_POLICY_VERSION = "v4"
+_REVIEW_POLICY_VERSION = "v5"
 
 _MODEL_ONLY_REVIEW_EXECUTORS = frozenset({"copilot", "claude"})
 
@@ -256,7 +265,13 @@ def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
     return match.group(1), match.group(2), match.group(3)
 
 
-def _review_key(task_id: str, pr_url: str, head_sha: str) -> str | None:
+def _review_key(
+    task_id: str,
+    pr_url: str,
+    head_sha: str,
+    base_sha: str,
+    diff_hash: str,
+) -> str | None:
     """The review-cycle identity: (task, PR, exact head sha, policy
     version) -- not just task_id. A permanent `review:<task_id>` key meant
     that once a task's FIRST review concluded (either verdict), no later
@@ -275,10 +290,35 @@ def _review_key(task_id: str, pr_url: str, head_sha: str) -> str | None:
     validates this via `_repo_from_pr_url` before reaching here in
     practice, but a malformed URL must never produce a malformed key)."""
     match = _PR_URL.match(pr_url)
-    if match is None:
+    if (
+        match is None
+        or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
+        or re.fullmatch(r"[0-9a-f]{64}", diff_hash) is None
+    ):
         return None
     pr_number = match.group(3)
-    return f"review:{task_id}:{pr_number}:{head_sha}:{_REVIEW_POLICY_VERSION}"
+    return (
+        f"review:{task_id}:{pr_number}:{head_sha}:{_REVIEW_POLICY_VERSION}:"
+        f"base:{base_sha}:diff:{diff_hash}"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PullRequestDiff:
+    text: str
+    base_sha: str
+    head_sha: str
+    diff_hash: str
+
+    @classmethod
+    def create(cls, text: str, base_sha: str, head_sha: str) -> _PullRequestDiff:
+        return cls(
+            text,
+            base_sha,
+            head_sha,
+            hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,8 +362,7 @@ def _diff_units(diff: str) -> list[str]:
     if not diff:
         return [""]
     boundaries = [
-        match.start()
-        for match in re.finditer(r"(?m)^(?:diff --git |@@ )", diff)
+        match.start() for match in re.finditer(r"(?m)^(?:diff --git |@@ )", diff)
     ]
     starts = sorted({0, *boundaries})
     return [diff[start:end] for start, end in zip(starts, starts[1:] + [len(diff)])]
@@ -364,17 +403,26 @@ def _diff_chunks(
 
 
 def _review_input_envelope(
-    task_id: str, pr_url: str, head_sha: str, chunk: _DiffChunk
+    task_id: str,
+    pr_url: str,
+    base_sha: str,
+    head_sha: str,
+    diff_hash: str,
+    chunk: _DiffChunk,
 ) -> str:
     content_bytes = chunk.text.encode("utf-8")
     if hashlib.sha256(content_bytes).hexdigest() != chunk.content_hash:
         raise RuntimeError("review chunk content hash mismatch")
+    if chunk.count == 1 and diff_hash != chunk.content_hash:
+        raise RuntimeError("complete review content does not match diff hash")
     value = {
         "schema": "voyn.review-input/v1",
         "policy_version": _REVIEW_POLICY_VERSION,
         "task_id": task_id,
         "pr_url": pr_url,
+        "base_sha": base_sha,
         "head_sha": head_sha,
+        "diff_sha256": diff_hash,
         "scope": "complete_diff" if chunk.count == 1 else "partial_chunk",
         "chunk": {
             "index": chunk.index,
@@ -395,16 +443,19 @@ def _review_input_envelope(
 
 
 def _render_review_prompt(
-    task_id: str, pr_url: str, head_sha: str, chunk: _DiffChunk
+    task_id: str,
+    pr_url: str,
+    base_sha: str,
+    head_sha: str,
+    diff_hash: str,
+    chunk: _DiffChunk,
 ) -> str:
-    scope_prompt = (
-        _COMPLETE_REVIEW_PROMPT if chunk.count == 1 else _CHUNK_REVIEW_PROMPT
-    )
+    scope_prompt = _COMPLETE_REVIEW_PROMPT if chunk.count == 1 else _CHUNK_REVIEW_PROMPT
     return (
         scope_prompt
         + _REVIEW_PROMPT
         + _REVIEW_INPUT_MARKER
-        + _review_input_envelope(task_id, pr_url, head_sha, chunk)
+        + _review_input_envelope(task_id, pr_url, base_sha, head_sha, diff_hash, chunk)
     )
 
 
@@ -438,12 +489,22 @@ def _split_unit_to_fit(unit: str, fits: Any) -> list[str]:
 
 
 def _review_chunks(
-    diff: str, task_id: str, pr_url: str, head_sha: str
+    diff: str,
+    task_id: str,
+    pr_url: str,
+    base_sha: str,
+    head_sha: str,
+    diff_hash: str,
 ) -> tuple[_DiffChunk, ...]:
     """Chunk by the UTF-8 size of the complete, encoded reviewer prompt."""
     whole = _make_diff_chunks([diff])
-    if _prompt_size_bytes(_render_review_prompt(task_id, pr_url, head_sha, whole[0])) <= (
-        _MAX_REVIEW_PROMPT_BYTES
+    if (
+        _prompt_size_bytes(
+            _render_review_prompt(
+                task_id, pr_url, base_sha, head_sha, diff_hash, whole[0]
+            )
+        )
+        <= _MAX_REVIEW_PROMPT_BYTES
     ):
         return whole
 
@@ -459,16 +520,19 @@ def _review_chunks(
             content_hash=content_hash,
             manifest_hash="f" * 64,
         )
-        return _prompt_size_bytes(
-            _render_review_prompt(task_id, pr_url, head_sha, candidate)
-        ) <= _MAX_REVIEW_PROMPT_BYTES
+        return (
+            _prompt_size_bytes(
+                _render_review_prompt(
+                    task_id, pr_url, base_sha, head_sha, diff_hash, candidate
+                )
+            )
+            <= _MAX_REVIEW_PROMPT_BYTES
+        )
 
     if not fits(""):
         raise ValueError("review prompt wrapper exceeds byte budget")
     bounded_units = [
-        piece
-        for unit in _diff_units(diff)
-        for piece in _split_unit_to_fit(unit, fits)
+        piece for unit in _diff_units(diff) for piece in _split_unit_to_fit(unit, fits)
     ]
     raw_chunks: list[str] = []
     current = ""
@@ -483,7 +547,9 @@ def _review_chunks(
         raise RuntimeError("review prompt chunking lost diff content")
     chunks = _make_diff_chunks(raw_chunks)
     if len(chunks) < 2 or any(
-        _prompt_size_bytes(_render_review_prompt(task_id, pr_url, head_sha, chunk))
+        _prompt_size_bytes(
+            _render_review_prompt(task_id, pr_url, base_sha, head_sha, diff_hash, chunk)
+        )
         > _MAX_REVIEW_PROMPT_BYTES
         for chunk in chunks
     ):
@@ -492,20 +558,27 @@ def _review_chunks(
 
 
 def _chunk_review_key(
-    task_id: str, pr_url: str, head_sha: str, chunk: _DiffChunk
+    task_id: str,
+    pr_url: str,
+    head_sha: str,
+    base_sha: str,
+    diff_hash: str,
+    chunk: _DiffChunk,
 ) -> str | None:
-    base = _review_key(task_id, pr_url, head_sha)
+    base = _review_key(task_id, pr_url, head_sha, base_sha, diff_hash)
     if base is None:
         return None
     return f"{base}:chunk:{chunk.index:04d}:{chunk.content_hash}"
 
 
-def _chunk_key_prefix(task_id: str, pr_url: str, head_sha: str) -> str | None:
-    base = _review_key(task_id, pr_url, head_sha)
+def _chunk_key_prefix(
+    task_id: str, pr_url: str, head_sha: str, base_sha: str, diff_hash: str
+) -> str | None:
+    base = _review_key(task_id, pr_url, head_sha, base_sha, diff_hash)
     return f"{base}:chunk:" if base else None
 
 
-def _pr_diff_and_head(repo_path: str, pr_url: str) -> tuple[str, str] | None:
+def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PullRequestDiff | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
     prompt (rather than granting the agent its own `gh`/Bash access to fetch
@@ -516,31 +589,62 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> tuple[str, str] | None:
     `--repo` argument and read PRs from other, unrelated repositories with no
     shell-escape needed at all -- a risk that scoping the Bash pattern more
     tightly cannot close, but never granting Bash to begin with does.
-    Returns None on any `gh` failure or moving-head race."""
-    def current_head() -> str | None:
-        view = _gh(["pr", "view", pr_url, "--json", "headRefOid"], repo_path)
-        if view.returncode != 0:
-            return None
-        try:
-            value = json.loads(view.stdout or "{}")
-        except (TypeError, json.JSONDecodeError):
-            return None
-        head = value.get("headRefOid") if isinstance(value, dict) else None
-        return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head) else None
-
-    head_before = current_head()
-    if head_before is None:
+    Returns None on any `gh` failure or invalid immutable object identity."""
+    parsed_url = _owner_repo_number_from_pr_url(pr_url)
+    if parsed_url is None:
         return None
-    diff = _gh(["pr", "diff", pr_url], repo_path)
+    owner, repo, number = parsed_url
+    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    if view.returncode != 0:
+        return None
+    try:
+        value = json.loads(view.stdout or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    base = value.get("base")
+    head = value.get("head")
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        return None
+    base_repo = base.get("repo")
+    if not isinstance(base_repo, dict):
+        return None
+    # The REST resource path is derived exclusively from the trusted PR URL.
+    # Still bind the returned base repository to that same owner/name so a
+    # malformed or mocked cross-repository response cannot smuggle unrelated
+    # commit objects into the compare request. A forked *head* remains valid;
+    # GitHub exposes its object through the base repository for the PR.
+    full_name = base_repo.get("full_name")
+    if (
+        not isinstance(full_name, str)
+        or full_name.casefold() != f"{owner}/{repo}".casefold()
+    ):
+        return None
+    base_sha = base.get("sha")
+    head_sha = head.get("sha")
+    if (
+        not isinstance(base_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None
+        or not isinstance(head_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+    ):
+        return None
+    # Unlike `gh pr diff`, the compare resource is addressed exclusively by
+    # immutable commit object IDs. A PR can move A->B->A during this call and
+    # cannot change the bytes returned for the exact base/head pair below.
+    diff = _gh(
+        [
+            "api",
+            f"repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
+            "-H",
+            "Accept: application/vnd.github.v3.diff",
+        ],
+        repo_path,
+    )
     if diff.returncode != 0:
         return None
-    # `gh pr diff` is not itself addressed by commit SHA. Bind its bytes to an
-    # exact head with a second read and fail closed if a force-push raced the
-    # fetch. This is deliberately before any enqueue/idempotency-key creation.
-    head_after = current_head()
-    if head_after != head_before:
-        return None
-    return diff.stdout, head_before
+    return _PullRequestDiff.create(diff.stdout, base_sha, head_sha)
 
 
 def review_once(
@@ -591,7 +695,7 @@ def review_once(
         params,
     )
     cascade = _model_only_review_cascade()
-    for task_id, pr_url in tasks:
+    for task_id, pr_url in tasks:  # noqa: PLR1704 - selected row shadows filter
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
@@ -604,26 +708,48 @@ def review_once(
         if fetched is None:
             report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
             continue
-        diff, head_sha = fetched
-        key = _review_key(task_id, pr_url, head_sha)
+        snapshot = fetched
+        key = _review_key(
+            task_id,
+            pr_url,
+            snapshot.head_sha,
+            snapshot.base_sha,
+            snapshot.diff_hash,
+        )
         if key is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
         project_id, repository_path = route
         try:
-            chunks = _review_chunks(diff, task_id, pr_url, head_sha)
+            chunks = _review_chunks(
+                snapshot.text,
+                task_id,
+                pr_url,
+                snapshot.base_sha,
+                snapshot.head_sha,
+                snapshot.diff_hash,
+            )
         except (RuntimeError, ValueError) as exc:
             report.skipped.append((task_id, f"review_prompt_budget_invalid: {exc}"))
             continue
 
         prepared: list[tuple[str, dict[str, Any]]] = []
         for chunk in chunks:
-            prompt = _render_review_prompt(task_id, pr_url, head_sha, chunk)
+            prompt = _render_review_prompt(
+                task_id,
+                pr_url,
+                snapshot.base_sha,
+                snapshot.head_sha,
+                snapshot.diff_hash,
+                chunk,
+            )
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
                 prepared = []
                 break
             payload = {
-                "kind": "agent_run", "v": 1, "project_id": project_id,
+                "kind": "agent_run",
+                "v": 1,
+                "project_id": project_id,
                 "repository_path": repository_path,
                 "task_type": "independent_review",
                 "prompt": prompt,
@@ -634,17 +760,26 @@ def review_once(
             if chunk.count == 1:
                 prepared.append((key, payload))
             else:
-                chunk_key = _chunk_review_key(task_id, pr_url, head_sha, chunk)
+                chunk_key = _chunk_review_key(
+                    task_id,
+                    pr_url,
+                    snapshot.head_sha,
+                    snapshot.base_sha,
+                    snapshot.diff_hash,
+                    chunk,
+                )
                 if chunk_key is None:
                     raise RuntimeError("validated PR URL produced no chunk key")
                 payload["review_chunk"] = {
-                    "version": 2,
+                    "version": 3,
                     "index": chunk.index,
                     "count": chunk.count,
                     "content_bytes": len(chunk.text.encode("utf-8")),
                     "content_hash": chunk.content_hash,
                     "manifest_hash": chunk.manifest_hash,
-                    "head_sha": head_sha,
+                    "base_sha": snapshot.base_sha,
+                    "head_sha": snapshot.head_sha,
+                    "diff_hash": snapshot.diff_hash,
                 }
                 prepared.append((chunk_key, payload))
         if not prepared:
@@ -657,6 +792,7 @@ def review_once(
 
 
 # -- Part 2b: publish the verdict as the marker merge_once reads -------------
+
 
 # Three rounds of independent review (2026-08-21) each broke a version of
 # this that scanned the whole transcript for VERDICT:/HEAD_SHA: tokens and
@@ -688,7 +824,9 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict_match.group(1), sha_match.group(1)
 
 
-def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any] | None:
+def _latest_review_result(
+    factory: Any, task_id: str, key: str
+) -> dict[str, Any] | None:
     """The succeeded review-class work result for this exact review-cycle
     key (task, PR, head sha, policy version), or None if no review has
     completed for exactly this state yet -- covers both "still running" and
@@ -725,9 +863,14 @@ def _json_object(value: Any) -> dict[str, Any] | None:
 
 
 def _chunk_review_rows(
-    factory: Any, task_id: str, pr_url: str, head_sha: str
+    factory: Any,
+    task_id: str,
+    pr_url: str,
+    head_sha: str,
+    base_sha: str,
+    diff_hash: str,
 ) -> tuple[str | None, list[tuple[Any, ...]]]:
-    prefix = _chunk_key_prefix(task_id, pr_url, head_sha)
+    prefix = _chunk_key_prefix(task_id, pr_url, head_sha, base_sha, diff_hash)
     if prefix is None:
         return None, []
     rows = _rows(
@@ -742,16 +885,20 @@ def _chunk_review_rows(
 
 
 def _aggregate_chunk_verdict(
-    rows: list[tuple[Any, ...]], current_head: str, prefix: str
+    rows: list[tuple[Any, ...]],
+    current_head: str,
+    current_base: str,
+    current_diff_hash: str,
+    prefix: str,
 ) -> tuple[str, str]:
     """Return ACCEPT, REJECT or WAIT after validating one whole manifest."""
-    indexed: dict[int, tuple[str, str, dict[str, Any] | None]] = {}
+    indexed: dict[int, tuple[str, str, dict[str, Any] | None, str]] = {}
     expected_count: int | None = None
     expected_manifest: str | None = None
     for key, state, payload_value, result_value in rows:
         payload = _json_object(payload_value)
         metadata = payload.get("review_chunk") if payload else None
-        if not isinstance(metadata, dict) or metadata.get("version") != 2:
+        if not isinstance(metadata, dict) or metadata.get("version") != 3:
             return "WAIT", "review_chunk_manifest_invalid"
         index = metadata.get("index")
         count = metadata.get("count")
@@ -771,10 +918,14 @@ def _aggregate_chunk_verdict(
             or not re.fullmatch(r"[0-9a-f]{64}", content_hash)
             or not isinstance(manifest_hash, str)
             or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash)
+            or metadata.get("base_sha") != current_base
             or metadata.get("head_sha") != current_head
+            or metadata.get("diff_hash") != current_diff_hash
             or key != f"{prefix}{index:04d}:{content_hash}"
             or index in indexed
-            or not _chunk_payload_matches_envelope(payload, metadata, current_head)
+            or not _chunk_payload_matches_envelope(
+                payload, metadata, current_head, current_base, current_diff_hash
+            )
         ):
             return "WAIT", "review_chunk_manifest_invalid"
         if expected_count is None:
@@ -782,7 +933,16 @@ def _aggregate_chunk_verdict(
             expected_manifest = manifest_hash
         elif count != expected_count or manifest_hash != expected_manifest:
             return "WAIT", "review_chunk_manifest_inconsistent"
-        indexed[index] = (str(state), content_hash, _json_object(result_value))
+        envelope = _review_envelope_from_prompt(payload.get("prompt"))
+        content = envelope.get("content") if envelope else None
+        if not isinstance(content, dict) or not isinstance(content.get("text"), str):
+            return "WAIT", "review_chunk_manifest_invalid"
+        indexed[index] = (
+            str(state),
+            content_hash,
+            _json_object(result_value),
+            content["text"],
+        )
 
     if expected_count is None:
         return "WAIT", "review_chunks_missing"
@@ -792,13 +952,21 @@ def _aggregate_chunk_verdict(
         actual_manifest = hashlib.sha256("\n".join(ordered_hashes).encode()).hexdigest()
         if actual_manifest != expected_manifest:
             return "WAIT", "review_chunk_manifest_hash_mismatch"
+        ordered_text = [indexed[index][3] for index in range(expected_count)]
+        actual_diff_hash = hashlib.sha256(
+            "".join(ordered_text).encode("utf-8")
+        ).hexdigest()
+        if actual_diff_hash != current_diff_hash:
+            return "WAIT", "review_chunk_diff_hash_mismatch"
 
     rejections: list[str] = []
     waiting_reason = ""
     for index in sorted(indexed):
-        state, _content_hash, result = indexed[index]
+        state, _content_hash, result, _text = indexed[index]
         if state != "succeeded" or result is None:
-            waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
+            waiting_reason = (
+                waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
+            )
             continue
         text = result.get("result_text") or ""
         parsed = _parse_verdict(text)
@@ -833,7 +1001,11 @@ def _review_envelope_from_prompt(prompt: Any) -> dict[str, Any] | None:
 
 
 def _chunk_payload_matches_envelope(
-    payload: dict[str, Any], metadata: dict[str, Any], current_head: str
+    payload: dict[str, Any],
+    metadata: dict[str, Any],
+    current_head: str,
+    current_base: str,
+    current_diff_hash: str,
 ) -> bool:
     """Bind publisher metadata to the exact collision-safe prompt content."""
     envelope = _review_envelope_from_prompt(payload.get("prompt"))
@@ -852,7 +1024,9 @@ def _chunk_payload_matches_envelope(
         envelope.get("schema") == "voyn.review-input/v1"
         and envelope.get("policy_version") == _REVIEW_POLICY_VERSION
         and envelope.get("scope") == "partial_chunk"
+        and envelope.get("base_sha") == current_base
         and envelope.get("head_sha") == current_head
+        and envelope.get("diff_sha256") == current_diff_hash
         and content.get("encoding") == "json-string-utf8"
         and content.get("byte_length") == len(encoded)
         and content.get("sha256") == actual_hash
@@ -900,15 +1074,15 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
     job). Returns (has_marker, head_sha)."""
-    view = _gh(
-        ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
-    )
+    view = _gh(["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path)
     if view.returncode != 0:
         return False, ""
     data = json.loads(view.stdout or "{}")
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
+    accept = _accept_marker_on_latest_review(
+        data.get("reviews", []), head, author_login
+    )
     return accept, head
 
 
@@ -978,15 +1152,23 @@ def _remediate_rejection(
             store = BacklogStore(lambda: nullcontext(conn))
             ok, _reason, _changed = store.upsert_task(
                 ParsedTask(
-                    task_id=new_task_id, wave=wave, priority=priority,
-                    status="OPEN", kind="task", title=new_title, body=new_body,
-                    repo=repo, line_no=0,
+                    task_id=new_task_id,
+                    wave=wave,
+                    priority=priority,
+                    status="OPEN",
+                    kind="task",
+                    title=new_title,
+                    body=new_body,
+                    repo=repo,
+                    line_no=0,
                 )
             )
             if not ok:
                 conn.rollback()
                 return None
-            ok, _reason = store.record_remediation(new_task_id, task_id, pr_url, head_sha)
+            ok, _reason = store.record_remediation(
+                new_task_id, task_id, pr_url, head_sha
+            )
             if not ok:
                 conn.rollback()
                 return None
@@ -1025,11 +1207,12 @@ def publish_review_verdicts(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task
+        "WHERE t.status = 'READY_TO_REVIEW'"
+        + where_task
         + " ORDER BY t.updated_at LIMIT %s",
         params,
     )
-    for task_id, pr_url in tasks:
+    for task_id, pr_url in tasks:  # noqa: PLR1704 - selected row shadows filter
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
@@ -1037,16 +1220,38 @@ def publish_review_verdicts(
         if not current_head:
             report.skipped.append((task_id, "pr_view_failed"))
             continue
-        key = _review_key(task_id, pr_url, current_head)
+        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        if snapshot is None:
+            report.skipped.append((task_id, "pr_diff_snapshot_failed"))
+            continue
+        if snapshot.head_sha != current_head:
+            report.skipped.append((task_id, "pr_head_changed_during_verdict_publish"))
+            continue
+        key = _review_key(
+            task_id,
+            pr_url,
+            snapshot.head_sha,
+            snapshot.base_sha,
+            snapshot.diff_hash,
+        )
         if key is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
         prefix, chunk_rows = _chunk_review_rows(
-            factory, task_id, pr_url, current_head
+            factory,
+            task_id,
+            pr_url,
+            snapshot.head_sha,
+            snapshot.base_sha,
+            snapshot.diff_hash,
         )
         if chunk_rows:
             verdict, text = _aggregate_chunk_verdict(
-                chunk_rows, current_head, prefix or ""
+                chunk_rows,
+                snapshot.head_sha,
+                snapshot.base_sha,
+                snapshot.diff_hash,
+                prefix or "",
             )
             if verdict == "WAIT":
                 report.skipped.append((task_id, text))
@@ -1060,7 +1265,9 @@ def publish_review_verdicts(
             text = result.get("result_text") or ""
             parsed = _parse_verdict(text)
             if parsed is None:
-                report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
+                report.skipped.append(
+                    (task_id, "verdict_or_head_sha_missing_in_review_result")
+                )
                 continue
             verdict, sha = parsed
             if sha != current_head:
@@ -1070,15 +1277,22 @@ def publish_review_verdicts(
                 # either way, never post a marker whose sha doesn't match what
                 # the agent said it reviewed.
                 report.skipped.append(
-                    (task_id, f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}")
+                    (
+                        task_id,
+                        f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}",
+                    )
                 )
                 continue
         if verdict != "ACCEPT":
-            new_task_id = _remediate_rejection(factory, task_id, pr_url, current_head, text)
+            new_task_id = _remediate_rejection(
+                factory, task_id, pr_url, current_head, text
+            )
             if new_task_id:
                 report.remediated.append((task_id, new_task_id))
             else:
-                report.skipped.append((task_id, "review_verdict_reject_remediation_already_dispatched"))
+                report.skipped.append(
+                    (task_id, "review_verdict_reject_remediation_already_dispatched")
+                )
             continue
         creds = _acceptance_app_credentials()
         if creds is None:
@@ -1178,8 +1392,13 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     removing the exclusion is not a relaxation, it is retiring a workaround
     whose reason to exist is gone."""
     view = _gh(
-        ["pr", "view", pr_url, "--json",
-         "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author"],
+        [
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author",
+        ],
         repo_path,
     )
     if view.returncode != 0:
@@ -1189,7 +1408,9 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
+    accept = _accept_marker_on_latest_review(
+        data.get("reviews", []), head, author_login
+    )
     if not accept:
         return False, "no_accept_marker_on_head"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
@@ -1199,7 +1420,9 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return True, head
 
 
-def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
+def merge_once(
+    factory: Any, repo_path: str, cfg: ReviewConfig | None = None
+) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE with the merged sha as evidence."""
     cfg = cfg or ReviewConfig()
@@ -1218,7 +1441,9 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             continue
         merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
         if merged.returncode != 0:
-            report.skipped.append((task_id, f"merge_failed: {merged.stderr.strip()[:100]}"))
+            report.skipped.append(
+                (task_id, f"merge_failed: {merged.stderr.strip()[:100]}")
+            )
             continue
         head = detail  # _pr_is_mergeable returned the head sha
         # Evidence and the DONE transition are one act: the sha row and the
