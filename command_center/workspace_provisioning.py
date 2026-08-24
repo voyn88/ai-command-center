@@ -1221,95 +1221,8 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     evidence.git_dir = str(git_dir) if git_dir else None
     evidence.git_common_dir = str(git_common_dir) if git_common_dir else None
 
-    marker: dict | None = None
-    if spec.task_local_git_metadata:
-        marker = _read_task_local_marker(workspace_resolved)
-        if marker is None:
-            fail(
-                "task_local_workspace_marker",
-                "Re-provision this task as a standalone pipeline-owned clone.",
-                "standalone workspace ownership marker is missing or invalid",
-                actual_branch=actual_branch,
-            )
-        if (
-            git_dir is None
-            or git_common_dir is None
-            or git_dir != git_common_dir
-            or git_dir != workspace_resolved / ".git"
-            or git_dir.parent != workspace_resolved
-        ):
-            fail(
-                "task_local_git_metadata",
-                "Use a standalone clone whose .git directory is inside the task root.",
-                f"git_dir={git_dir}, git_common_dir={git_common_dir}",
-                actual_branch=actual_branch,
-            )
-        evidence.record(
-            "task_local_git_metadata",
-            True,
-            f"git_dir={git_dir}; common_dir={git_common_dir}",
-        )
-
     # 3. Workspace belongs to the expected repository.
-    if (
-        spec.task_local_git_metadata
-        and repo_resolved is not None
-        and git_info.get_status(repo_resolved).get("is_repo")
-    ):
-        assert marker is not None
-        current_remote = _source_remote_url(repo_resolved, spec)
-        if not spec.base_branch or not spec.expected_branch:
-            fail(
-                "task_local_authority_complete",
-                "Provide both base_branch and expected_branch for a task-local clone.",
-                "trusted branch authority is incomplete",
-                actual_branch=actual_branch,
-            )
-        current_base = _resolve_remote_ref_sha(
-            repo_resolved, current_remote, f"refs/heads/{spec.base_branch}", spec
-        )
-        if current_base is None:
-            fail(
-                "remote_base_exists",
-                f"Create the canonical remote base branch {spec.base_branch!r}.",
-                "canonical remote base branch is missing",
-                actual_branch=actual_branch,
-            )
-        remote_task = _resolve_remote_ref_sha(
-            repo_resolved, current_remote, f"refs/heads/{spec.expected_branch}", spec
-        )
-        current_start = remote_task or current_base
-        mismatches = {
-            "source_repository": (marker.get("source_repository"), str(repo_resolved)),
-            "remote_url": (marker.get("remote_url"), current_remote),
-            "expected_branch": (marker.get("expected_branch"), spec.expected_branch),
-            "base_branch": (marker.get("base_branch"), spec.base_branch),
-            "base_sha": (marker.get("base_sha"), current_base),
-            "start_sha": (marker.get("start_sha"), current_start),
-        }
-        if spec.base_sha:
-            mismatches["base_sha"] = (marker.get("base_sha"), spec.base_sha.lower())
-        failed = {
-            key: values for key, values in mismatches.items() if values[0] != values[1]
-        }
-        if failed:
-            fail(
-                "workspace_belongs_to_repository",
-                "Discard the mismatched clone only after preserving any diff, then re-provision it.",
-                f"task-local ownership mismatch: {failed}",
-                actual_branch=actual_branch,
-            )
-        evidence.base_sha = current_base
-        evidence.start_sha = current_start
-        evidence.remote_url = current_remote
-        evidence.record(
-            "workspace_belongs_to_repository",
-            True,
-            f"standalone clone of {repo_resolved} at {current_start}",
-        )
-    elif repo_resolved is not None and git_info.get_status(repo_resolved).get(
-        "is_repo"
-    ):
+    if repo_resolved is not None and git_info.get_status(repo_resolved).get("is_repo"):
         workspace_common = _git_common_dir(workspace_resolved)
         repo_common = _git_common_dir(repo_resolved)
         if (
@@ -1353,11 +1266,7 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     evidence.record("branch_matches", True, f"branch={actual_branch}")
 
     # 5. Expected branch is not checked out in a conflicting worktree.
-    if (
-        spec.expected_branch
-        and repo_resolved is not None
-        and not spec.task_local_git_metadata
-    ):
+    if spec.expected_branch and repo_resolved is not None:
         conflict = _conflicting_worktree(
             repo_resolved, spec.expected_branch, workspace_resolved
         )
@@ -1373,7 +1282,7 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     # 6. The main repository is not used for a feature/audit task.
     feature = is_feature_task(spec.expected_branch, spec.base_branch, spec.task_type)
     is_primary = _is_primary_worktree(workspace_resolved)
-    isolated = spec.task_local_git_metadata or not is_primary
+    isolated = not is_primary
     evidence.is_isolated_worktree = isolated
     if feature and not isolated:
         fail(
@@ -1392,16 +1301,8 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
 
     # 7. Base branch exists (when one is configured).
     if spec.base_branch and repo_resolved is not None:
-        base_ref = (
-            f"{evidence.start_sha}^{{commit}}"
-            if spec.task_local_git_metadata and marker is not None
-            else f"{spec.base_branch}^{{commit}}"
-        )
-        base_repo = (
-            workspace_resolved if spec.task_local_git_metadata else repo_resolved
-        )
         base_ok = git_info.run_git_command(
-            base_repo, ["rev-parse", "--verify", base_ref]
+            repo_resolved, ["rev-parse", "--verify", f"{spec.base_branch}^{{commit}}"]
         )
         if base_ok is None or base_ok.returncode != 0:
             fail(

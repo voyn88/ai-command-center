@@ -9,6 +9,7 @@ fi
 # Exact deployed versions observed and canaried on worker-01. Updating these is
 # a reviewed dependency change, not an ambient `latest` upgrade.
 npm install --global --omit=dev --no-audit --no-fund \
+  @anthropic-ai/claude-code@2.1.231 \
   @openai/codex@0.149.0 \
   @github/copilot@1.0.80
 

@@ -28,7 +28,6 @@ User=aicc-worker
 Group=aicc-worker
 SupplementaryGroups=aicc-workspace
 EnvironmentFile=/etc/aicc/worker.env
-Environment=AICC_AGENT_PRINCIPAL_ISOLATION=required
 Environment=HOME=/var/lib/aicc-worker
 Environment=XDG_CONFIG_HOME=/var/lib/aicc-worker/config
 WorkingDirectory=/opt/aicc
