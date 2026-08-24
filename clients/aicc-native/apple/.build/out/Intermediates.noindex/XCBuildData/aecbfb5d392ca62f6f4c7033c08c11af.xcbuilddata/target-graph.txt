@@ -1,0 +1,6 @@
+Target dependency graph (3 targets)
+Target 'AICCNativeApp-product' in project 'AICCNative'
+➜ Explicit dependency on target 'AICCNativeCore' in project 'AICCNative'
+Target 'AICCNativeCore' in project 'AICCNative'
+➜ Explicit dependency on target 'AICCNative_AICCNativeCore' in project 'AICCNative'
+Target 'AICCNative_AICCNativeCore' in project 'AICCNative' (no dependencies)

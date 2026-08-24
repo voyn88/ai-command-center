@@ -1,0 +1,19 @@
+{
+  "" : {
+    "diagnostics" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp-primary.dia",
+    "emit-module-dependencies" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp-primary-emit-module.dia",
+    "pch" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp-primary.swiftdeps"
+  },
+  "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/Sources/AICCNativeApp/AICCNativeApp.swift" : {
+    "const-values" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp.swiftconstvalues",
+    "dependencies" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp.d",
+    "diagnostics" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp.dia",
+    "index-unit-output-path" : "/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp.o",
+    "llvm-bc" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp.bc",
+    "object" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp.o",
+    "swift-dependencies" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp.swiftdeps",
+    "swiftmodule" : "/Users/dmitrijcernikov/Projects/aicc-native-phase0/clients/aicc-native/apple/.build/out/Intermediates.noindex/AICCNative.build/Debug/AICCNativeApp-p.build/Objects-normal/arm64/AICCNativeApp~partial.swiftmodule"
+  }
+}

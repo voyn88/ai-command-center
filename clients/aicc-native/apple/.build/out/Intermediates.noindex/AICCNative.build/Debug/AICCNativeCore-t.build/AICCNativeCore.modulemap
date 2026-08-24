@@ -1,0 +1,4 @@
+module AICCNativeCore {
+header "AICCNativeCore-Swift.h"
+export *
+}
