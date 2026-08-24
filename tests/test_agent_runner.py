@@ -812,3 +812,15 @@ def test_copilot_never_grants_blanket_permissions():
         assert "--allow-all" not in joined, task_type
         assert "--allow-all-paths" not in joined, task_type
         assert "--allow-all-tools" not in joined, task_type
+
+
+def test_independent_review_is_model_only_for_both_review_providers():
+    claude = agent_runner.build_command("embedded diff", task_type="independent_review")
+    copilot = agent_runner.build_copilot_command(
+        "embedded diff", task_type="independent_review"
+    )
+
+    assert claude[claude.index("--tools") + 1] == ""
+    assert "--available-tools=" in copilot
+    assert "--allow-tool" not in copilot
+    assert "--allow-all-tools" not in copilot

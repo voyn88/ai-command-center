@@ -96,7 +96,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from command_center import models, project_config, storage
@@ -168,6 +168,7 @@ PROFILE_READ_ONLY = "read_only"
 PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
 
 READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
+MODEL_ONLY_TASK_TYPES = {"independent_review"}
 MUTATING_TASK_TYPES = {"implementation", "remediation"}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
@@ -498,7 +499,12 @@ def build_command(
         PERMISSION_MODE_BY_PROFILE[profile],
     ]
 
-    if profile == PROFILE_READ_ONLY:
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        # The exact PR diff is already embedded in the prompt by the trusted
+        # control plane. Giving this reviewer Read/Grep/Glob would add ambient
+        # repository authority it neither needs nor can bind to that exact SHA.
+        command += ["--tools", ""]
+    elif profile == PROFILE_READ_ONLY:
         # Tool-set replacement, not a permission-layer denial: Bash (and every
         # shell-reachable mutation) is not in this list, so it cannot be invoked by
         # this run at all. See the module docstring and READ_ONLY_ALLOWED_TOOLS.
@@ -614,7 +620,11 @@ def build_copilot_command(
         "--no-custom-instructions",
         "--no-ask-user",
     ]
-    if profile == PROFILE_READ_ONLY:
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        # Empty availability is stronger than a permission prompt: no Copilot
+        # tool is exposed to the model at all, including read and shell.
+        command += ["--available-tools="]
+    elif profile == PROFILE_READ_ONLY:
         # Grant reads only. Absent `write`/`shell`, mutation is unreachable.
         command += ["--allow-tool", "read"]
     else:
@@ -777,7 +787,7 @@ class RunResult:
             return True
         if executor != "copilot" or self.status != "failed" or not self.exit_code:
             return False
-        diagnostic = "\n".join((self.stdout, self.stderr)).lower()
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
         return any(
             signature in diagnostic
             for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
@@ -786,7 +796,7 @@ class RunResult:
     @property
     def is_executor_sandbox_error(self) -> bool:
         """Whether the sandbox launcher reported its known loopback failure."""
-        diagnostic = "\n".join((self.stdout, self.stderr)).lower()
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
         return all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
 
 
@@ -1028,7 +1038,7 @@ def run_claude_code(
             started_at=started_at,
             completed_at=models.iso_now(),
         )
-    diagnostic = "\n".join((stdout, stderr)).lower()
+    diagnostic = f"{stdout}\n{stderr}".lower()
     status = (
         "failed"
         if all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
@@ -1134,7 +1144,7 @@ def report_path_for(run: dict) -> Path:
     try:
         started_dt = datetime.fromisoformat(started)
     except ValueError:
-        started_dt = datetime.now()
+        started_dt = datetime.now(UTC)
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
     task_part = _safe_path_component(run.get("task_id") or "adhoc", "adhoc")[:12]
     agent = _safe_path_component(run.get("agent") or "agent", "agent")
