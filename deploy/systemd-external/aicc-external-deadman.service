@@ -1,0 +1,17 @@
+[Unit]
+Description=Independent AICC control-plane dead-man
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aicc-deadman
+Group=aicc-deadman
+EnvironmentFile=/etc/aicc-deadman/deadman.env
+ExecStart=/usr/local/libexec/aicc-external-deadman
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+

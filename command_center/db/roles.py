@@ -133,6 +133,7 @@ ALL_TABLES: tuple[str, ...] = (
     "completion_event",
     "completion_validation",
     "control_plane_component",
+    "control_plane_delivery_attempt",
     "control_plane_deployment",
     "control_plane_event",
     "control_plane_lane",
@@ -283,6 +284,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
 # cannot appoint themselves as control-plane owners.
 _APP_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
     "control_plane_component": _APP_DML,
+    "control_plane_delivery_attempt": _READ,
     "control_plane_event": _APP_DML,
     "control_plane_lane": _APP_DML,
     "control_plane_notification": _APP_DML,
@@ -291,6 +293,7 @@ _APP_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
 
 _WORKER_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
     "control_plane_component": _NONE,
+    "control_plane_delivery_attempt": _NONE,
     "control_plane_event": _NONE,
     "control_plane_lane": _NONE,
     "control_plane_notification": _NONE,
@@ -520,6 +523,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_return_to_pool(text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    "control_plane_advance_delivery(text, text, bigint, text, text, jsonb)",
 )
 
 # The enrolment surface (0003), split by who may do what.

@@ -106,7 +106,12 @@ class ControlPlaneStore(Protocol):
     def discover_ready_lanes(self, *, now: datetime) -> int: ...
     def recover_stalled(self, *, now: datetime) -> list[tuple[str, str]]: ...
     def claim(
-        self, owner: str, *, now: datetime, lease_seconds: int
+        self,
+        owner: str,
+        capabilities: frozenset[Action],
+        *,
+        now: datetime,
+        lease_seconds: int,
     ) -> Lane | None: ...
     def lane_heartbeat(
         self, lane: Lane, claimant: str, *, now: datetime, lease_seconds: int
@@ -127,6 +132,9 @@ class ControlPlaneStore(Protocol):
     def split_deployment_blocker(
         self, lane: Lane, detail: str, *, now: datetime
     ) -> str: ...
+    def advance_delivery(
+        self, lane: Lane, stage: str, detail: dict[str, Any]
+    ) -> bool: ...
     def component_allows_attempt(self, component: str, *, now: datetime) -> bool: ...
     def component_result(
         self,
@@ -296,6 +304,7 @@ class ControlPlaneConfig:
     unit_circuit_seconds: int = 600
     desired_units: tuple[str, ...] = ()
     max_unit_restarts: int = 0
+    capabilities: frozenset[Action] = frozenset()
 
 
 @dataclass(slots=True)
@@ -384,6 +393,10 @@ class Reconciler:
             set(self._config.desired_units)
         ) != len(self._config.desired_units):
             raise ValueError("desired unit registry must be non-empty and unique")
+        configured = self._config.capabilities or frozenset(self._handlers)
+        if not configured <= self._handlers.keys():
+            raise ValueError("every capability requires an explicit handler")
+        self._capabilities = frozenset(configured)
         self._clock = clock
 
     def _run_handler(self, lane: Lane, handler: ActionHandler) -> ActionOutcome:
@@ -458,6 +471,7 @@ class Reconciler:
                 now = self._clock()
                 lane = self._store.claim(
                     self._config.owner,
+                    self._capabilities,
                     now=now,
                     lease_seconds=self._config.lane_lease_seconds,
                 )
@@ -524,44 +538,43 @@ class PostgresControlPlaneStore:
         """
         with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
             cur.execute(
-                "WITH facts AS ("
-                " SELECT t.task_id, t.status, "
-                " (SELECT e.value FROM backlog_evidence e WHERE e.task_id=t.task_id "
-                "  AND e.kind='sha' ORDER BY e.evidence_id DESC LIMIT 1) AS head_sha, "
-                " (SELECT substring(e.value from 8) FROM backlog_evidence e "
-                "  WHERE e.task_id=t.task_id AND e.kind='ci' AND e.value LIKE 'MERGED:%%' "
-                "  ORDER BY e.evidence_id DESC LIMIT 1) AS merged_sha, "
-                " (SELECT d.merged_sha FROM control_plane_deployment d "
-                "  WHERE d.task_id=t.task_id AND d.deployed_by='aicc_deployer' "
-                "  ORDER BY d.deployed_at DESC LIMIT 1) AS deployed_sha, "
-                " EXISTS (SELECT 1 FROM backlog_evidence e WHERE e.task_id=t.task_id "
-                "         AND e.kind='pr') AS has_pr "
-                " FROM backlog_task t), exact_facts AS ("
-                " SELECT f.*, EXISTS (SELECT 1 FROM backlog_evidence e "
-                "   WHERE e.task_id=f.task_id AND e.kind='acceptance' "
-                "   AND e.value='ACCEPTANCE: ACCEPT ' || f.head_sha) AS accepted "
-                " FROM facts f), candidates AS ("
-                " SELECT f.task_id, f.head_sha, f.merged_sha, CASE "
-                "  WHEN f.status='IN_PROGRESS' AND f.head_sha IS NOT NULL AND NOT f.has_pr "
-                "   AND EXISTS (SELECT 1 FROM backlog_evidence e WHERE e.task_id=f.task_id "
-                "               AND e.kind='ci' AND e.value='LOCAL_TESTS:PASS:' || f.head_sha) "
-                "   AND EXISTS (SELECT 1 FROM backlog_evidence e WHERE e.task_id=f.task_id "
-                "               AND e.kind='acceptance' "
-                "               AND e.value='INDEPENDENT_REVIEW:PASS:' || f.head_sha) "
-                "    THEN 'GUARDED_PUBLISH' "
-                "  WHEN f.status='READY_TO_REVIEW' AND f.merged_sha IS NOT NULL "
-                "   AND f.deployed_sha=f.merged_sha THEN 'BACKLOG_SYNC' "
-                "  WHEN f.status='READY_TO_REVIEW' AND f.merged_sha IS NOT NULL THEN 'DEPLOY' "
-                "  WHEN f.status='READY_TO_REVIEW' AND f.has_pr AND NOT f.accepted THEN 'INDEPENDENT_REVIEW' "
-                "  WHEN f.status='READY_TO_REVIEW' AND f.has_pr AND f.accepted THEN 'MERGE' END action "
-                " FROM exact_facts f) "
+                "WITH local_candidates AS ("
+                " SELECT t.task_id,min(e.value) AS head_sha,NULL::text AS pr_url,"
+                " NULL::text AS delivery_attempt_id,NULL::bigint AS delivery_revision,"
+                " NULL::text AS merged_sha,'GUARDED_PUBLISH'::text AS action "
+                " FROM backlog_task t JOIN backlog_evidence e ON e.task_id=t.task_id "
+                " WHERE t.status='IN_PROGRESS' AND e.kind='sha' "
+                " AND NOT EXISTS (SELECT 1 FROM control_plane_delivery_attempt d "
+                "                 WHERE d.task_id=t.task_id AND d.is_current) "
+                " AND NOT EXISTS (SELECT 1 FROM backlog_evidence p "
+                "                 WHERE p.task_id=t.task_id AND p.kind='pr') "
+                " GROUP BY t.task_id HAVING count(DISTINCT e.value)=1 "
+                " AND bool_or(EXISTS (SELECT 1 FROM backlog_evidence c "
+                "   WHERE c.task_id=t.task_id AND c.kind='ci' "
+                "   AND c.value='LOCAL_TESTS:PASS:' || e.value)) "
+                " AND bool_or(EXISTS (SELECT 1 FROM backlog_evidence a "
+                "   WHERE a.task_id=t.task_id AND a.kind='acceptance' "
+                "   AND a.value='INDEPENDENT_REVIEW:PASS:' || e.value))), "
+                "delivery_candidates AS ("
+                " SELECT d.task_id,d.head_sha,d.pr_url,d.delivery_attempt_id,"
+                " d.revision AS delivery_revision,d.merge_sha,CASE d.stage "
+                " WHEN 'PUBLISHED' THEN 'CI_WAIT' WHEN 'CI_GREEN' THEN 'INDEPENDENT_REVIEW' "
+                " WHEN 'REVIEWED' THEN 'ACCEPTANCE' WHEN 'ACCEPTED' THEN 'MERGE' "
+                " WHEN 'MERGED' THEN 'DEPLOY' WHEN 'DEPLOYED' THEN 'BACKLOG_SYNC' END action "
+                " FROM control_plane_delivery_attempt d JOIN backlog_task t ON t.task_id=d.task_id "
+                " WHERE d.is_current AND t.status='READY_TO_REVIEW'), candidates AS ("
+                " SELECT * FROM local_candidates UNION ALL SELECT * FROM delivery_candidates) "
                 "INSERT INTO control_plane_lane(task_id,next_action,owner,deadline_at,payload) "
                 "SELECT task_id, action, CASE WHEN action='GUARDED_PUBLISH' THEN 'guarded-publisher' "
+                " WHEN action='CI_WAIT' THEN 'ci-observer' "
                 " WHEN action='INDEPENDENT_REVIEW' THEN 'independent-reviewer' "
+                " WHEN action='ACCEPTANCE' THEN 'acceptance-publisher' "
                 " WHEN action='DEPLOY' THEN 'deployer' "
                 " WHEN action='BACKLOG_SYNC' THEN 'control-plane' "
                 " ELSE 'merge-controller' END, %s, "
-                " jsonb_strip_nulls(jsonb_build_object('head_sha', head_sha, 'merged_sha', merged_sha)) "
+                " jsonb_strip_nulls(jsonb_build_object('head_sha',head_sha,'pr_url',pr_url,"
+                " 'delivery_attempt_id',delivery_attempt_id,'delivery_revision',delivery_revision,"
+                " 'merged_sha',merged_sha)) "
                 "FROM candidates WHERE action IS NOT NULL "
                 "ON CONFLICT (task_id) DO UPDATE SET "
                 " next_action=EXCLUDED.next_action,owner=EXCLUDED.owner,deadline_at=EXCLUDED.deadline_at,"
@@ -628,13 +641,23 @@ class PostgresControlPlaneStore:
                 recovered.append((task_id, reason))
             return recovered
 
-    def claim(self, owner: str, *, now: datetime, lease_seconds: int) -> Lane | None:
+    def claim(
+        self,
+        owner: str,
+        capabilities: frozenset[Action],
+        *,
+        now: datetime,
+        lease_seconds: int,
+    ) -> Lane | None:
+        if not capabilities:
+            return None
         with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
             cur.execute(
                 "SELECT task_id,next_action,owner,payload,revision FROM control_plane_lane "
-                "WHERE state='READY' AND deadline_at <= %s ORDER BY deadline_at,task_id "
+                "WHERE state='READY' AND deadline_at <= %s AND next_action=ANY(%s) "
+                "ORDER BY deadline_at,task_id "
                 "LIMIT 1 FOR UPDATE SKIP LOCKED",
-                (now,),
+                (now, [action.value for action in sorted(capabilities)]),
             )
             row = cur.fetchone()
             if row is None:
@@ -787,9 +810,14 @@ class PostgresControlPlaneStore:
                 if not re.fullmatch(r"[0-9a-f]{40}", merged_sha):
                     raise RuntimeError("merged_sha_missing_or_invalid")
                 cur.execute(
-                    "SELECT revision, EXISTS (SELECT 1 FROM control_plane_deployment "
-                    "WHERE task_id=%s AND merged_sha=%s AND deployed_by='aicc_deployer') "
-                    "FROM backlog_task WHERE task_id=%s",
+                    "SELECT t.revision, EXISTS (SELECT 1 "
+                    "FROM control_plane_delivery_attempt d "
+                    "JOIN control_plane_deployment x ON x.task_id=d.task_id "
+                    " AND x.merged_sha=d.merge_sha "
+                    "WHERE d.task_id=%s AND d.is_current AND d.stage='DEPLOYED' "
+                    "AND d.merge_sha=%s AND d.deployed_sha=d.merge_sha "
+                    "AND x.deployed_by='aicc_deployer') "
+                    "FROM backlog_task t WHERE t.task_id=%s",
                     (lane.task_id, merged_sha, lane.task_id),
                 )
                 task = cur.fetchone()
@@ -809,6 +837,14 @@ class PostgresControlPlaneStore:
                 done, reason = cur.fetchone()
                 if not done:
                     raise RuntimeError(f"backlog_done_refused:{reason}")
+                cur.execute(
+                    "UPDATE control_plane_delivery_attempt SET stage='DONE',"
+                    "revision=revision+1,updated_at=now() WHERE task_id=%s "
+                    "AND is_current AND stage='DEPLOYED' AND merge_sha=%s",
+                    (lane.task_id, merged_sha),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("delivery_done_projection_refused")
             cur.execute(
                 "UPDATE control_plane_lane SET state=%s,next_action=%s,owner=%s,claimant=NULL,"
                 "deadline_at=%s,heartbeat_at=%s,progress_at=%s,progress_token=%s,"
@@ -833,6 +869,21 @@ class PostgresControlPlaneStore:
                 "jsonb_build_object('action',%s::text,'detail',%s::text))",
                 (lane.task_id, state.lower(), lane.action.value, outcome.detail),
             )
+            if exhausted:
+                cur.execute(
+                    "INSERT INTO control_plane_notification"
+                    "(task_id,kind,owner,payload,dedupe_key) VALUES "
+                    "(%s,'LANE_RETRY_EXHAUSTED',%s,"
+                    "jsonb_build_object('action',%s::text,'detail',%s::text),%s) "
+                    "ON CONFLICT(dedupe_key) DO NOTHING",
+                    (
+                        lane.task_id,
+                        lane.owner,
+                        lane.action.value,
+                        outcome.detail,
+                        f"lane-retry-exhausted:{lane.task_id}:{attempts}",
+                    ),
+                )
 
     def split_deployment_blocker(
         self, lane: Lane, detail: str, *, now: datetime
@@ -888,6 +939,26 @@ class PostgresControlPlaneStore:
             )
         return blocker_id
 
+    def advance_delivery(self, lane: Lane, stage: str, detail: dict[str, Any]) -> bool:
+        attempt_id = str(lane.payload.get("delivery_attempt_id") or "")
+        head_sha = str(lane.payload.get("head_sha") or "")
+        revision = lane.payload.get("delivery_revision")
+        if not attempt_id or not isinstance(revision, int):
+            return False
+        with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                "SELECT control_plane_advance_delivery(%s,%s,%s,%s,%s,%s)",
+                (
+                    lane.task_id,
+                    attempt_id,
+                    revision,
+                    stage,
+                    head_sha,
+                    json.dumps(detail, sort_keys=True),
+                ),
+            )
+            return cur.fetchone()[0] != 0
+
     def deliver_notifications(
         self,
         deliver: Callable[[dict[str, Any]], None],
@@ -901,7 +972,7 @@ class PostgresControlPlaneStore:
         for _ in range(max(0, limit)):
             with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
                 cur.execute(
-                    "SELECT notification_id,task_id,kind,owner,payload,attempts,max_attempts "
+                    "SELECT notification_id,task_id,component,kind,owner,payload,attempts,max_attempts "
                     "FROM control_plane_notification WHERE "
                     "(state='PENDING' AND available_at<=%s) OR "
                     "(state='DELIVERING' AND lease_expires_at<=%s) "
@@ -911,7 +982,16 @@ class PostgresControlPlaneStore:
                 row = cur.fetchone()
                 if row is None:
                     break
-                notification_id, task_id, kind, owner, payload, attempts, _maximum = row
+                (
+                    notification_id,
+                    task_id,
+                    component,
+                    kind,
+                    owner,
+                    payload,
+                    attempts,
+                    _maximum,
+                ) = row
                 attempts += 1
                 cur.execute(
                     "UPDATE control_plane_notification SET state='DELIVERING',claimed_by=%s,"
@@ -921,6 +1001,7 @@ class PostgresControlPlaneStore:
             body = {
                 "notification_id": notification_id,
                 "task_id": task_id,
+                "component": component,
                 "kind": kind,
                 "owner": owner,
                 "payload": payload,
@@ -1035,3 +1116,18 @@ class PostgresControlPlaneStore:
                 "jsonb_build_object('detail',%s::text,'failures',%s::integer))",
                 (component, "pass" if ok else "fail", detail, failures),
             )
+            if circuit is not None:
+                cur.execute(
+                    "INSERT INTO control_plane_notification"
+                    "(component,kind,owner,payload,dedupe_key) VALUES "
+                    "(%s,'COMPONENT_CIRCUIT_OPEN','operator',"
+                    "jsonb_build_object('detail',%s::text,'failures',%s::integer,"
+                    "'open_until',%s::timestamptz),%s) ON CONFLICT(dedupe_key) DO NOTHING",
+                    (
+                        component,
+                        detail,
+                        failures,
+                        circuit,
+                        f"component-circuit:{component}:{int(circuit.timestamp())}",
+                    ),
+                )

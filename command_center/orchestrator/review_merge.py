@@ -61,6 +61,7 @@ already-merged PR closes the task once.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -71,6 +72,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from command_center.orchestrator import acceptance_policy
 from command_center.orchestrator import github_app_auth
 from command_center.orchestrator.routing import cascade_for
 
@@ -103,6 +105,14 @@ class LoopReport:
     #: publish_review_verdicts' docstring for why this is a new task, not a
     #: cycle back into the rejected task's own state machine.
     remediated: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewObservation:
+    payload: dict[str, Any]
+    result_id: str
+    reviewer_role: str
+    idempotency_key: str
 
 
 def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
@@ -322,20 +332,21 @@ def review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where_task = " AND t.task_id = %s" if task_id is not None else ""
+    where_task = " AND d.task_id = %s" if task_id is not None else ""
     params: tuple[Any, ...] = (
         (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
     )
     tasks = _rows(
         factory,
-        "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task + " "
-        "ORDER BY t.task_id LIMIT %s",
+        "SELECT d.task_id,d.pr_url,d.head_sha FROM control_plane_delivery_attempt d "
+        "JOIN backlog_task t ON t.task_id=d.task_id "
+        "WHERE d.is_current AND d.stage='CI_GREEN' "
+        "AND t.status='READY_TO_REVIEW'" + where_task + " "
+        "ORDER BY d.task_id LIMIT %s",
         params,
     )
     cascade = cascade_for("review")
-    for task_id, pr_url in tasks:  # noqa: PLR1704 - selected row shadows filter
+    for task_id, pr_url, canonical_head in tasks:  # noqa: PLR1704
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
@@ -349,6 +360,11 @@ def review_once(
             report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
             continue
         diff, head_sha = fetched
+        if head_sha != canonical_head:
+            report.skipped.append(
+                (task_id, f"pr_head_mismatch:{head_sha or 'missing'}")
+            )
+            continue
         if len(diff) > _MAX_DIFF_CHARS:
             report.skipped.append(
                 (task_id, f"diff_too_large: {len(diff)} chars > {_MAX_DIFF_CHARS}")
@@ -412,7 +428,7 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
 
 def _latest_review_result(
     factory: Any, task_id: str, key: str
-) -> dict[str, Any] | None:
+) -> ReviewObservation | None:
     """The succeeded review-class work result for this exact review-cycle
     key (task, PR, head sha, policy version), or None if no review has
     completed for exactly this state yet -- covers both "still running" and
@@ -424,20 +440,28 @@ def _latest_review_result(
     the review-cycle key existed."""
     rows = _rows(
         factory,
-        "SELECT wr.payload FROM work_item i "
+        "SELECT wr.payload,wr.result_id,a.claimed_by_role,i.idempotency_key "
+        "FROM work_item i "
         "JOIN work_result wr ON wr.result_id = i.result_id "
+        "JOIN work_attempt a ON a.attempt_id=wr.attempt_id "
         "WHERE i.task_id = %s AND i.idempotency_key = %s AND i.state = 'succeeded' "
         "ORDER BY wr.created_at DESC LIMIT 1",
         (task_id, key),
     )
     if not rows:
         return None
-    payload = rows[0][0]
-    return json.loads(payload) if isinstance(payload, str) else payload
+    payload, result_id, reviewer_role, idempotency_key = rows[0]
+    decoded = json.loads(payload) if isinstance(payload, str) else payload
+    if not isinstance(decoded, dict):
+        return None
+    return ReviewObservation(decoded, result_id, reviewer_role, idempotency_key)
 
 
 def _accept_marker_on_latest_review(
-    reviews: list[dict[str, Any]], head: str, pr_author_login: str | None
+    reviews: list[dict[str, Any]],
+    head: str,
+    pr_author_login: str | None,
+    policy: acceptance_policy.AcceptancePolicy | None = None,
 ) -> bool:
     """Whether the marker stands on the MOST RECENT review, not merely
     somewhere in the array. A superseded/earlier review carrying the marker
@@ -457,31 +481,80 @@ def _accept_marker_on_latest_review(
     refusing everything -- callers that cannot supply it keep prior
     behavior; `_pr_is_mergeable` and `_has_accept_marker` below always can
     and always do."""
-    if not reviews:
-        return False
-    latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
-    if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
-        return False
-    if pr_author_login is None:
-        return True
-    reviewer_login = (latest.get("author") or {}).get("login")
-    return reviewer_login is not None and reviewer_login != pr_author_login
+    return (
+        _accepted_reviewer_on_latest_review(reviews, head, pr_author_login, policy)
+        is not None
+    )
 
 
-def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
+def _accepted_reviewer_on_latest_review(
+    reviews: list[dict[str, Any]],
+    head: str,
+    pr_author_login: str | None,
+    policy: acceptance_policy.AcceptancePolicy | None = None,
+) -> str | None:
+    if not reviews or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+        return None
+    policy = policy or acceptance_policy.load()
+    if not isinstance(pr_author_login, str) or not pr_author_login:
+        return None
+    author = pr_author_login.casefold()
+    authoritative: list[tuple[str, str, str]] = []
+    for review in reviews:
+        if not isinstance(review, dict) or review.get("state") in {
+            "DISMISSED",
+            "PENDING",
+        }:
+            continue
+        body = review.get("body")
+        reviewer_login = (review.get("author") or {}).get("login")
+        if not isinstance(body, str) or not isinstance(reviewer_login, str):
+            continue
+        reviewer = reviewer_login.casefold()
+        if reviewer not in policy.trusted_reviewer_logins or reviewer == author:
+            continue
+        first_line = body.replace("\r\n", "\n").split("\n", 1)[0]
+        match = re.fullmatch(r"ACCEPTANCE: (ACCEPT|REJECT) ([0-9a-f]{40})", first_line)
+        if match is None or match.group(2) != head:
+            continue
+        authoritative.append(
+            (str(review.get("submittedAt") or ""), match.group(1), reviewer_login)
+        )
+    if not authoritative or any(
+        decision == "REJECT" for _submitted, decision, _reviewer in authoritative
+    ):
+        return None
+    # Only the policy-authorized App can render a verdict. Collaborator reviews
+    # cannot accept, reject, or hide it; any standing trusted REJECT fails closed.
+    _submitted_at, _decision, reviewer_login = max(authoritative)
+    return reviewer_login
+
+
+def _has_accept_marker(
+    repo_path: str, pr_url: str, expected_head: str | None = None
+) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
     job). Returns (has_marker, head_sha)."""
+    reviewer, head = _accept_marker_observation(repo_path, pr_url, expected_head)
+    return reviewer is not None, head
+
+
+def _accept_marker_observation(
+    repo_path: str, pr_url: str, expected_head: str | None = None
+) -> tuple[str | None, str]:
     view = _gh(["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path)
     if view.returncode != 0:
-        return False, ""
+        return None, ""
     data = json.loads(view.stdout or "{}")
     head = data.get("headRefOid", "")
+    if expected_head is not None and head != expected_head:
+        return None, head
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(
+    reviewer = _accepted_reviewer_on_latest_review(
         data.get("reviews", []), head, author_login
     )
-    return accept, head
+    return reviewer, head
 
 
 def _remediate_rejection(
@@ -597,22 +670,61 @@ def publish_review_verdicts(
     marker already posted for the current head are skips, not errors."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where_task = " AND t.task_id = %s" if task_id is not None else ""
+    where_task = " AND d.task_id = %s" if task_id is not None else ""
     params: tuple[Any, ...] = (
         (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
     )
     tasks = _rows(
         factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'"
+        "SELECT d.task_id,d.pr_url,d.head_sha,d.delivery_attempt_id,d.revision,d.stage "
+        "FROM control_plane_delivery_attempt d "
+        "JOIN backlog_task t ON t.task_id=d.task_id "
+        "WHERE d.is_current AND d.stage IN ('CI_GREEN','REVIEWED') "
+        "AND t.status = 'READY_TO_REVIEW'"
         + where_task
-        + " ORDER BY t.updated_at LIMIT %s",
+        + " ORDER BY d.updated_at LIMIT %s",
         params,
     )
-    for task_id, pr_url in tasks:  # noqa: PLR1704 - selected row shadows filter
-        already, current_head = _has_accept_marker(repo_path, pr_url)
-        if already:
+    for (  # noqa: PLR1704
+        task_id,
+        pr_url,
+        canonical_head,
+        delivery_attempt_id,
+        revision,
+        stage,
+    ) in tasks:
+        accepted_reviewer, current_head = _accept_marker_observation(
+            repo_path, pr_url, canonical_head
+        )
+        if current_head != canonical_head:
+            report.skipped.append(
+                (task_id, f"pr_head_mismatch:{current_head or 'missing'}")
+            )
+            continue
+        if accepted_reviewer is not None:
+            if stage == "CI_GREEN":
+                report.skipped.append((task_id, "review_stage_not_durable"))
+                continue
+            policy = acceptance_policy.load()
+            advanced = _rows(
+                factory,
+                "SELECT control_plane_advance_delivery(%s,%s,%s,'ACCEPTED',%s,%s)",
+                (
+                    task_id,
+                    delivery_attempt_id,
+                    revision,
+                    canonical_head,
+                    json.dumps(
+                        {
+                            "policy": policy.version,
+                            "reviewer": accepted_reviewer,
+                        }
+                    ),
+                ),
+            )
+            if not advanced or advanced[0][0] == 0:
+                report.skipped.append((task_id, "acceptance_projection_refused"))
+                continue
             report.skipped.append((task_id, "marker_already_posted"))
             continue
         if not current_head:
@@ -626,7 +738,7 @@ def publish_review_verdicts(
         if result is None:
             report.skipped.append((task_id, "no_review_result_yet"))
             continue
-        text = result.get("result_text") or ""
+        text = result.payload.get("result_text") or ""
         parsed = _parse_verdict(text)
         if parsed is None:
             report.skipped.append(
@@ -658,6 +770,29 @@ def publish_review_verdicts(
                     (task_id, "review_verdict_reject_remediation_already_dispatched")
                 )
             continue
+        if stage == "CI_GREEN":
+            policy = acceptance_policy.load()
+            advanced = _rows(
+                factory,
+                "SELECT control_plane_advance_delivery(%s,%s,%s,'REVIEWED',%s,%s)",
+                (
+                    task_id,
+                    delivery_attempt_id,
+                    revision,
+                    canonical_head,
+                    json.dumps(
+                        {
+                            "policy": policy.version,
+                            "result_id": result.result_id,
+                            "reviewer_role": result.reviewer_role,
+                            "idempotency_key": result.idempotency_key,
+                        }
+                    ),
+                ),
+            )
+            if not advanced or advanced[0][0] == 0:
+                report.skipped.append((task_id, "review_projection_refused"))
+                continue
         creds = _acceptance_app_credentials()
         if creds is None:
             # No acceptance-bot credentials configured on this host.
@@ -738,7 +873,57 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
     return list(latest.values())
 
 
-def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
+def _ci_snapshot(
+    repo_path: str, pr_url: str, expected_head: str
+) -> tuple[bool, str, dict[str, Any] | None]:
+    view = _gh(
+        ["pr", "view", pr_url, "--json", "state,headRefOid,statusCheckRollup"],
+        repo_path,
+    )
+    if view.returncode != 0:
+        return False, f"gh_view_failed:{view.stderr.strip()[:100]}", None
+    try:
+        data = json.loads(view.stdout or "{}")
+        policy = acceptance_policy.load()
+    except (_JSON_ERRORS, ValueError) as exc:
+        return False, f"ci_snapshot_invalid:{exc}", None
+    head = data.get("headRefOid")
+    if head != expected_head:
+        return False, f"pr_head_mismatch:{head or 'missing'}", None
+    if data.get("state") != "OPEN":
+        return False, f"pr_{str(data.get('state')).lower()}", None
+    raw = data.get("statusCheckRollup")
+    if not isinstance(raw, list) or not raw:
+        return False, "required_checks_missing", None
+    latest_by_name = {
+        str(check.get("name") or ""): check for check in _latest_checks_by_name(raw)
+    }
+    missing = sorted(policy.ci_required_check_names - latest_by_name.keys())
+    if missing:
+        return False, f"required_checks_missing:{missing[:3]}", None
+    required = [latest_by_name[name] for name in sorted(policy.ci_required_check_names)]
+    bad = [
+        str(check.get("name") or "?")
+        for check in required
+        if not _check_is_green(check)
+    ]
+    if bad:
+        return False, f"checks_not_green:{bad[:3]}", None
+    checks = [{**check, "head_sha": head} for check in required]
+    encoded = json.dumps(checks, sort_keys=True, separators=(",", ":")).encode()
+    return (
+        True,
+        "checks_green",
+        {
+            "checks": checks,
+            "checks_sha256": hashlib.sha256(encoded).hexdigest(),
+        },
+    )
+
+
+def _pr_is_mergeable(
+    repo_path: str, pr_url: str, expected_head: str | None = None
+) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
     marker -- from a reviewer login that is NOT the PR's own author -- stands
     on the head. `gh pr view` gives all of it in one call.
@@ -772,14 +957,33 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     if state not in {"OPEN", "MERGED"}:
         return False, f"pr_{str(state).lower()}"
     head = data.get("headRefOid", "")
+    if expected_head is not None and head != expected_head:
+        return False, f"pr_head_mismatch:{head or 'missing'}"
     author_login = (data.get("author") or {}).get("login")
+    try:
+        policy = acceptance_policy.load()
+    except ValueError as exc:
+        return False, f"acceptance_policy_invalid:{exc}"
     accept = _accept_marker_on_latest_review(
-        data.get("reviews", []), head, author_login
+        data.get("reviews", []), head, author_login, policy
     )
     if not accept:
         return False, "no_accept_marker_on_head"
-    rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
-    bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
+    raw_rollup = data.get("statusCheckRollup")
+    if not isinstance(raw_rollup, list) or not raw_rollup:
+        return False, "required_checks_missing"
+    latest_by_name = {
+        str(check.get("name") or ""): check
+        for check in _latest_checks_by_name(raw_rollup)
+    }
+    missing = sorted(policy.merge_required_check_names - latest_by_name.keys())
+    if missing:
+        return False, f"required_checks_missing:{missing[:3]}"
+    bad = [
+        name
+        for name in sorted(policy.merge_required_check_names)
+        if not _check_is_green(latest_by_name[name])
+    ]
     if bad:
         return False, f"checks_not_green: {bad[:3]}"
     if state == "MERGED":
@@ -824,24 +1028,29 @@ def merge_once(
     """Request merge for accepted PRs and record only observed merge commits."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where_task = " AND t.task_id = %s" if task_id else ""
+    where_task = " AND d.task_id = %s" if task_id else ""
     params: tuple[Any, ...] = (
         (task_id, cfg.max_per_tick) if task_id else (cfg.max_per_tick,)
     )
     tasks = _rows(
         factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' "
-        "AND NOT EXISTS (SELECT 1 FROM backlog_evidence merged "
-        " WHERE merged.task_id=t.task_id AND merged.kind='ci' "
-        " AND merged.value LIKE 'MERGED:%%')"
+        "SELECT d.task_id,d.pr_url,d.head_sha,d.delivery_attempt_id,d.revision "
+        "FROM control_plane_delivery_attempt d "
+        "JOIN backlog_task t ON t.task_id=d.task_id "
+        "WHERE d.is_current AND d.stage='ACCEPTED' "
+        "AND t.status='READY_TO_REVIEW'"
         + where_task
-        + " ORDER BY t.updated_at LIMIT %s",
+        + " ORDER BY d.updated_at LIMIT %s",
         params,
     )
-    for task_id, pr_url in tasks:  # noqa: PLR1704 - selected row shadows filter
-        ready, detail = _pr_is_mergeable(repo_path, pr_url)
+    for (  # noqa: PLR1704
+        task_id,
+        pr_url,
+        canonical_head,
+        delivery_attempt_id,
+        revision,
+    ) in tasks:
+        ready, detail = _pr_is_mergeable(repo_path, pr_url, canonical_head)
         if not ready:
             report.skipped.append((task_id, detail))
             continue
@@ -866,6 +1075,21 @@ def merge_once(
             conn.autocommit = False
             try:
                 with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT control_plane_advance_delivery("
+                        "%s,%s,%s,'MERGED',%s,%s)",
+                        (
+                            task_id,
+                            delivery_attempt_id,
+                            revision,
+                            canonical_head,
+                            json.dumps({"merge_sha": merge_sha}),
+                        ),
+                    )
+                    if cur.fetchone()[0] == 0:
+                        conn.rollback()
+                        report.skipped.append((task_id, "merge_projection_refused"))
+                        continue
                     cur.execute(
                         "SELECT ok, reason FROM backlog_record_evidence(%s, 'ci', %s)",
                         (task_id, f"MERGED:{merge_sha}"),

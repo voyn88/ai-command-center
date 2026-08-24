@@ -41,8 +41,11 @@ class FakeStore:
     def recover_stalled(self, *, now):
         return self.recovered
 
-    def claim(self, owner, *, now, lease_seconds):
-        return self.lanes.pop(0) if self.lanes else None
+    def claim(self, owner, capabilities, *, now, lease_seconds):
+        for index, lane in enumerate(self.lanes):
+            if lane.action in capabilities:
+                return self.lanes.pop(index)
+        return None
 
     def lane_heartbeat(self, lane, claimant, *, now, lease_seconds):
         return True
@@ -63,6 +66,9 @@ class FakeStore:
     def split_deployment_blocker(self, lane, detail, *, now):
         self.split.append((lane.task_id, detail))
         return f"{lane.task_id}-DEPLOY-BLOCKER"
+
+    def advance_delivery(self, lane, stage, detail):
+        return True
 
     def component_allows_attempt(self, component, *, now):
         return True
@@ -145,15 +151,14 @@ def test_ready_lane_advances_without_waiting_for_an_operator_question():
     assert store.heartbeats[-1][:2] == ("reconciler", "HEALTHY")
 
 
-def test_missing_guarded_publisher_is_a_durable_retry_not_ambient_git_push():
+def test_missing_guarded_publisher_capability_does_not_claim_or_burn_attempt():
     lane = Lane("VOYN-READY", Action.GUARDED_PUBLISH, "guarded-publisher", {}, 2)
     store = FakeStore([lane])
 
     Reconciler(store, FakeUnits(), {}, config(), clock=lambda: NOW).run_once()
 
-    outcome = store.finished[0][1]
-    assert outcome.state == "RETRY"
-    assert outcome.detail == "capability_not_configured:GUARDED_PUBLISH"
+    assert store.finished == []
+    assert store.lanes == [lane]
 
 
 def test_unrelated_deployment_failure_becomes_a_separate_task():

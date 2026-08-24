@@ -137,6 +137,7 @@ def _provision_lock(key: str) -> threading.Lock:
             _provision_locks[key] = lock
         return lock
 
+
 #: BO-S3 result enrichment: the delivery contract for machine-readable
 #: outcomes. A PR reference is extracted by its exact URL shape — nothing
 #: else on GitHub looks like it — and the head SHA ONLY from an explicit
@@ -389,7 +390,9 @@ def _run_agent(
                     )
 
             base_branch = (
-                project_config.get_project_config(request.project_id).get("default_branch")
+                project_config.get_project_config(request.project_id).get(
+                    "default_branch"
+                )
                 or "main"
             )
             spec = workspace_provisioning.WorkspaceSpec(
@@ -482,6 +485,7 @@ def _run_agent(
         result = {
             "cascade_step": attempt_no if link is not None else None,
             "executor": (link or {}).get("executor", "claude"),
+            "worktree_path": str(run_repository.resolve()),
             **_machine_outcome(result_text),
             "status": run.status,
             "exit_code": run.exit_code,
@@ -599,6 +603,8 @@ def _run_agent(
             }
             if pub.pr_url:
                 result["pr_url"] = pub.pr_url
+            if pub.head_sha:
+                result["head_sha"] = pub.head_sha
             # Cleanup is conditioned on the branch actually being durable
             # somewhere else first. `pub.ok` (a real push -- the commit now
             # lives on `origin/backlog/<task>`) and

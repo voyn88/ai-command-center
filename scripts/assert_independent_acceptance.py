@@ -50,8 +50,16 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+# ``python3 scripts/assert_independent_acceptance.py`` makes ``scripts/`` the
+# import root. Add the checked-out repository root explicitly so the workflow
+# and server import the same versioned policy loader instead of duplicating it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from command_center.orchestrator import acceptance_policy  # noqa: E402
 
 # The verdict line. Matched with `fullmatch` against the body's *first line*
 # only: a marker in the middle of a review does not count, because the
@@ -131,7 +139,12 @@ def verdicts_from(reviews: object) -> list[Verdict]:
     return found
 
 
-def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> str:
+def evaluate(
+    reviews: object,
+    head_sha: object,
+    pull_request_author: object,
+    policy: acceptance_policy.AcceptancePolicy | None = None,
+) -> str:
     """Return the accepting reviewer's login, or raise with cause and remedy."""
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
         raise AcceptanceError(f"head sha is not a 40-character commit id: {head_sha!r}")
@@ -141,43 +154,38 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
             "the pull request has no resolvable author, so independence is unprovable"
         )
     author = pull_request_author.casefold()
+    policy = policy or acceptance_policy.load()
 
     verdicts = verdicts_from(reviews)
-    on_head = [
+    current = [
         verdict
         for verdict in verdicts
         if verdict.sha == head and verdict.state != PENDING
     ]
-
-    rejections = [verdict for verdict in on_head if verdict.decision == "REJECT"]
+    authorized = [
+        verdict
+        for verdict in current
+        if verdict.state != DISMISSED
+        and verdict.author
+        and verdict.author.casefold() != author
+        and verdict.author.casefold() in policy.trusted_reviewer_logins
+    ]
+    rejections = [verdict for verdict in authorized if verdict.decision == "REJECT"]
     if rejections:
-        # Checked before any acceptance: a rejection standing on the current
-        # head is the reviewer's live position, and an earlier ACCEPT on the
-        # same commit does not overturn it.
-        who = ", ".join(
-            sorted({verdict.author or "<unknown>" for verdict in rejections})
-        )
+        who = ", ".join(sorted({verdict.author for verdict in rejections}))
         raise AcceptanceError(
             f"acceptance was REJECTED for {head} by {who}. "
             "Address the rejection, push the fix, and obtain a new verdict on the new head commit"
         )
-
-    accepting = [
-        verdict
-        for verdict in on_head
-        if verdict.decision == "ACCEPT"
-        and verdict.state != DISMISSED
-        and verdict.author
-        and verdict.author.casefold() != author
-    ]
+    accepting = [verdict for verdict in authorized if verdict.decision == "ACCEPT"]
     if accepting:
-        return accepting[0].author
+        return accepting[-1].author
 
     # Nothing accepted this commit. Say which of the ways it failed, because a
     # gate whose refusal is unreadable gets routed around instead of fixed.
     self_issued = [
         verdict
-        for verdict in on_head
+        for verdict in current
         if verdict.decision == "ACCEPT" and verdict.author.casefold() == author
     ]
     if self_issued:
@@ -188,7 +196,7 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
         )
     dismissed = [
         verdict
-        for verdict in on_head
+        for verdict in current
         if verdict.decision == "ACCEPT" and verdict.state == DISMISSED
     ]
     if dismissed:
@@ -203,7 +211,7 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
             "head and publish a verdict naming it"
         )
     raise AcceptanceError(
-        f"no acceptance verdict for {head}. A reviewer other than the author must publish a review "
+        f"no acceptance verdict for {head}. A policy-authorized reviewer must publish a review "
         f"whose first line is exactly `ACCEPTANCE: ACCEPT {head}`"
     )
 
@@ -424,9 +432,10 @@ def _bind_queue_heads(
         exact_pull_head = _commit_sha(
             pull_request.get("headRefOid"), f"merge queue pull request #{number} head"
         )
-        if _commit_sha(
-            queued_head_oid, f"merge queue entry #{number} synthetic head"
-        ) != expected_head:
+        if (
+            _commit_sha(queued_head_oid, f"merge queue entry #{number} synthetic head")
+            != expected_head
+        ):
             raise AcceptanceError(
                 f"merge queue entry #{number} head disagrees with the synthetic chain"
             )

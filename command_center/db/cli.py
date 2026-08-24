@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 from command_center.orchestrator.desired_state import load
                 from command_center.orchestrator.review_merge import (
-                    _has_accept_marker,
+                    _ci_snapshot,
                     merge_once,
                     publish_review_verdicts,
                     review_once,
@@ -437,18 +437,6 @@ def main(argv: list[str] | None = None) -> int:
                     max_unit_restarts=registry.control.max_restarts,
                     unit_circuit_seconds=registry.control.circuit_open_seconds,
                 )
-
-                def record_acceptance(task_id, pr_url):
-                    accepted, head = _has_accept_marker(args.repo_path, pr_url)
-                    if not accepted or not head:
-                        return False
-                    with factory() as evidence_conn, evidence_conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT ok FROM backlog_record_evidence(%s,'acceptance',%s)",
-                            (task_id, f"ACCEPTANCE: ACCEPT {head}"),
-                        )
-                        ok = cur.fetchone()[0]
-                    return bool(ok)
 
                 def review_lane(lane, guard):
                     enqueued = guard.effect(
@@ -481,32 +469,8 @@ def main(argv: list[str] | None = None) -> int:
                         for _task, reason in verdict.skipped
                     )
                     if verdict.reviewed or marker_already_exists:
-                        pr_url = (
-                            verdict.reviewed[0][1]
-                            if verdict.reviewed
-                            else lane.payload.get("pr_url")
-                        )
-                        if not pr_url:
-                            with (
-                                factory() as evidence_conn,
-                                evidence_conn.cursor() as cur,
-                            ):
-                                cur.execute(
-                                    "SELECT value FROM backlog_evidence "
-                                    "WHERE task_id=%s AND kind='pr' ORDER BY evidence_id DESC LIMIT 1",
-                                    (lane.task_id,),
-                                )
-                                row = cur.fetchone()
-                            pr_url = row[0] if row else ""
-                        accepted = guard.effect(
-                            lambda: record_acceptance(lane.task_id, pr_url)
-                        )
-                        if not accepted:
-                            return ActionOutcome.retry(
-                                "acceptance_evidence_not_durable"
-                            )
-                        return ActionOutcome.succeeded(
-                            Action.MERGE, owner="merge-controller"
+                        return ActionOutcome.waiting(
+                            seconds=0, detail="review_projection_advanced"
                         )
                     if verdict.remediated:
                         return ActionOutcome.succeeded()
@@ -516,6 +480,25 @@ def main(argv: list[str] | None = None) -> int:
                             seconds=60, detail=detail or "review_enqueued"
                         )
                     return ActionOutcome.retry(detail or "review_not_progressed")
+
+                def acceptance_lane(lane, guard):
+                    verdict = guard.effect(
+                        lambda: publish_review_verdicts(
+                            factory, args.repo_path, task_id=lane.task_id
+                        )
+                    )
+                    detail = ";".join(reason for _task, reason in verdict.skipped)
+                    if "marker_already_posted" in detail:
+                        return ActionOutcome.waiting(
+                            seconds=0, detail="acceptance_projection_advanced"
+                        )
+                    if verdict.reviewed:
+                        return ActionOutcome.waiting(
+                            seconds=30, detail="marker_posted_awaiting_observation"
+                        )
+                    return ActionOutcome.waiting(
+                        seconds=60, detail=detail or "awaiting_acceptance_marker"
+                    )
 
                 def merge_lane(lane, guard):
                     report = guard.effect(
@@ -532,7 +515,9 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                     if report.merged:
-                        return ActionOutcome.succeeded(Action.DEPLOY, owner="deployer")
+                        return ActionOutcome.waiting(
+                            seconds=0, detail="merge_projection_advanced"
+                        )
                     detail = ";".join(reason for _task, reason in report.skipped)
                     if (
                         detail.startswith("checks_not_green")
@@ -542,22 +527,23 @@ def main(argv: list[str] | None = None) -> int:
                         return ActionOutcome.waiting(seconds=60, detail=detail)
                     return ActionOutcome.retry(detail or "merge_not_progressed")
 
-                def ci_wait_lane(_lane, _guard):
-                    # CI/ingest are observed through canonical backlog evidence.
-                    # Waiting is not a failed attempt: discover_ready_lanes will
-                    # replace this action once READY_TO_REVIEW evidence arrives.
-                    return ActionOutcome.waiting(
-                        seconds=60, detail="awaiting_ci_or_backlog_ingest"
+                def ci_wait_lane(lane, guard):
+                    ok, detail, snapshot = guard.effect(
+                        lambda: _ci_snapshot(
+                            args.repo_path,
+                            str(lane.payload.get("pr_url") or ""),
+                            str(lane.payload.get("head_sha") or ""),
+                        )
                     )
-
-                def unavailable_deploy_lane(_lane, _guard):
-                    # Deployment runs under a separate capability/principal. An
-                    # unavailable deployer must not pin an already-merged source
-                    # lane or consume its retry budget; split an idempotent
-                    # operational blocker while the source lane keeps waiting
-                    # on the dedicated deployment capability.
-                    return ActionOutcome.deployment_blocked(
-                        "deployment_capability_not_configured"
+                    if not ok or snapshot is None:
+                        return ActionOutcome.waiting(seconds=60, detail=detail)
+                    advanced = guard.effect(
+                        lambda: store.advance_delivery(lane, "CI_GREEN", snapshot)
+                    )
+                    if not advanced:
+                        return ActionOutcome.retry("ci_projection_refused")
+                    return ActionOutcome.waiting(
+                        seconds=0, detail="ci_projection_advanced"
                     )
 
                 def backlog_sync_lane(_lane, _guard):
@@ -568,9 +554,8 @@ def main(argv: list[str] | None = None) -> int:
                 handlers = {
                     Action.CI_WAIT: ci_wait_lane,
                     Action.INDEPENDENT_REVIEW: review_lane,
-                    Action.ACCEPTANCE: review_lane,
+                    Action.ACCEPTANCE: acceptance_lane,
                     Action.MERGE: merge_lane,
-                    Action.DEPLOY: unavailable_deploy_lane,
                     Action.BACKLOG_SYNC: backlog_sync_lane,
                 }
                 report = Reconciler(

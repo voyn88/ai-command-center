@@ -113,6 +113,35 @@ if (( now < open_until )); then
   exit 1
 fi
 ready_count=$((${#WORKER_UNITS[@]} - ${#unhealthy[@]}))
+if (( ready_count == 0 )); then
+  # With no ready witness there is nothing safe to drain. Bootstrap exactly
+  # one inactive lane, then let the next tick recover another lane while the
+  # newly-ready one proves quorum. An active-but-unhealthy lane is never
+  # killed in this branch because it may still own a long job.
+  target=""
+  for unit in "${unhealthy[@]}"; do
+    active=$($SYSTEMCTL_BIN show "$unit" --property=ActiveState --value) \
+      || fail_recovery "$unit ActiveState probe failed"
+    if [[ "$active" == inactive || "$active" == failed ]]; then
+      target=$unit
+      break
+    fi
+  done
+  [[ -n "$target" ]] \
+    || fail_recovery "zero-ready fleet has no safely startable inactive lane"
+  "$SYSTEMCTL_BIN" reset-failed "$target" || true
+  "$SYSTEMCTL_BIN" start "$target" \
+    || fail_recovery "$target zero-ready bootstrap start failed"
+  deadline=$((now + DRAIN_TIMEOUT_SECONDS))
+  while (( $(date -u +%s) < deadline )); do
+    if unit_healthy "$target"; then
+      write_state 0 0
+      exit 0
+    fi
+    sleep "$POLL_SECONDS"
+  done
+  fail_recovery "$target zero-ready bootstrap timed out"
+fi
 if (( ready_count < MINIMUM_READY_LANES )); then
   fail_recovery "refusing recovery: ready lane quorum would be violated"
 fi

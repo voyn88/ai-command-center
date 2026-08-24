@@ -63,11 +63,10 @@ test ! -L "$CONFIG_TARGET/aicc-desired-state.json"
 /usr/bin/install -o root -g root -m 0644 \
   "$SOURCE_ROOT/deploy/config/voyn-findings-known-hosts" \
   "$CONFIG_TARGET/findings-known-hosts"
-if [[ ! -e "$CONFIG_TARGET/findings-sync.env" ]]; then
-  /usr/bin/install -o root -g root -m 0644 \
-    "$SOURCE_ROOT/deploy/config/voyn-findings-sync.env" \
-    "$CONFIG_TARGET/findings-sync.env"
-fi
+test ! -L "$CONFIG_TARGET/findings-sync.env"
+/usr/bin/install -o root -g root -m 0644 \
+  "$SOURCE_ROOT/deploy/config/voyn-findings-sync.env" \
+  "$CONFIG_TARGET/findings-sync.env"
 unit_sources=()
 for unit in "${UNITS[@]}"; do
   unit_sources+=("$SOURCE_ROOT/deploy/systemd/$unit")

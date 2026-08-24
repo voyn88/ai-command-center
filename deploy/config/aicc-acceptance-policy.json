@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "policy_version": "2026-08-24-v1",
+  "trusted_reviewer_logins": [
+    "voyn88-acceptance-gate[bot]"
+  ],
+  "ci_required_check_names": [
+    "Final merge gate"
+  ],
+  "merge_required_check_names": [
+    "Final merge gate",
+    "Acceptance gate (independent verdict on exact SHA)"
+  ]
+}

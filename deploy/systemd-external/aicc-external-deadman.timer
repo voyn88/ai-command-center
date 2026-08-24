@@ -1,0 +1,12 @@
+[Unit]
+Description=Probe AICC control plane from an independent host
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+RandomizedDelaySec=10s
+Persistent=true
+Unit=aicc-external-deadman.service
+
+[Install]
+WantedBy=timers.target

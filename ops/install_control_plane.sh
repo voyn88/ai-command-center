@@ -6,6 +6,7 @@ readonly EXPECTED_SHA=${2:-}
 readonly TASK_ID=${3:-}
 readonly UNIT_SOURCE="$SOURCE_ROOT/deploy/systemd"
 readonly DESIRED_STATE_SOURCE="$SOURCE_ROOT/deploy/config/aicc-desired-state.json"
+readonly ACCEPTANCE_POLICY_SOURCE="$SOURCE_ROOT/deploy/config/aicc-acceptance-policy.json"
 readonly UNIT_TARGET=/etc/systemd/system
 readonly EVIDENCE_TARGET=/var/lib/aicc-control-plane
 
@@ -13,8 +14,9 @@ if [[ $(id -u) -ne 0 ]]; then
   echo "refusing: install_control_plane.sh must run as root" >&2
   exit 2
 fi
-if [[ "$SOURCE_ROOT" != /opt/aicc ]]; then
-  echo "refusing: versioned units execute only the canonical /opt/aicc checkout" >&2
+if [[ "$SOURCE_ROOT" != "/opt/aicc-releases/$EXPECTED_SHA" \
+      || $(/usr/bin/readlink -f /opt/aicc) != "$SOURCE_ROOT" ]]; then
+  echo "refusing: source is not the active immutable release" >&2
   exit 2
 fi
 if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -67,9 +69,13 @@ run_db_with_env /etc/aicc/app.env status >/dev/null
 }
 /usr/bin/install -o root -g root -m 0444 \
   "$DESIRED_STATE_SOURCE" /etc/aicc/desired-state.json
+/usr/bin/install -o root -g root -m 0444 \
+  "$ACCEPTANCE_POLICY_SOURCE" /etc/aicc/acceptance-policy.json
 [[ $(/usr/bin/stat -c '%U:%a' /etc/aicc/desired-state.json) == root:444 ]]
 "$SOURCE_ROOT/.venv/bin/python" -m command_center.orchestrator.desired_state \
   /etc/aicc/desired-state.json control-units >/dev/null
+"$SOURCE_ROOT/.venv/bin/python" -m command_center.orchestrator.acceptance_policy \
+  /etc/aicc/acceptance-policy.json >/dev/null
 
 UNITS=()
 while IFS= read -r unit; do

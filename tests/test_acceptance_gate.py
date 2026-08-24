@@ -35,7 +35,7 @@ WORKFLOW = ROOT / ".github/workflows/acceptance-gate.yml"
 HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"  # pragma: allowlist secret
 OTHER = "0f1e2d3c4b5a69788796a5b4c3d2e1f098765432"  # pragma: allowlist secret
 AUTHOR = "dimastov-lab"
-REVIEWER = "voyn-acceptance[bot]"
+REVIEWER = "voyn88-acceptance-gate[bot]"
 
 
 def review(body: str, login: str = REVIEWER, state: str = "COMMENTED") -> dict:
@@ -53,6 +53,11 @@ def reject(sha: str = HEAD, **kwargs) -> dict:
 def test_a_verdict_from_a_different_identity_on_the_current_head_passes() -> None:
     """The one accepting case, so the negatives below are not vacuous."""
     assert evaluate([accept()], HEAD, AUTHOR) == REVIEWER
+
+
+def test_a_random_collaborator_cannot_masquerade_as_acceptance() -> None:
+    with pytest.raises(AcceptanceError, match="policy-authorized reviewer"):
+        evaluate([accept(login="helpful-collaborator")], HEAD, AUTHOR)
 
 
 def test_a_verdict_may_carry_its_reasoning_below_the_marker() -> None:
@@ -410,13 +415,9 @@ def queue_response(entries: list[dict]) -> dict:
     }
 
 
-def queue_page(
-    entries: list[dict], *, has_next: bool, cursor: str | None
-) -> dict:
+def queue_page(entries: list[dict], *, has_next: bool, cursor: str | None) -> dict:
     response = queue_response(entries)
-    page_info = response["data"]["repository"]["mergeQueue"]["entries"][
-        "pageInfo"
-    ]
+    page_info = response["data"]["repository"]["mergeQueue"]["entries"]["pageInfo"]
     page_info["hasNextPage"] = has_next
     page_info["endCursor"] = cursor
     return response

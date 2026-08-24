@@ -32,7 +32,6 @@ state_value() {
 }
 
 start() {
-  [[ ! -e "$STATE_FILE" ]] || return 0
   [[ -f "$DEPLOYED_SHA_FILE" && ! -L "$DEPLOYED_SHA_FILE" ]] || {
     echo "missing monitor deployment evidence" >&2
     return 2
@@ -46,7 +45,30 @@ start() {
   /usr/bin/install -d -m 0700 "$STATE_DIR"
   local now
   now=$(date -u +%s)
+  if [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]]; then
+    local prior_sha prior_end prior_attempt history
+    prior_sha=$(state_value deployed_sha)
+    prior_end=$(state_value expected_end_epoch)
+    prior_attempt=$(state_value attempt_id)
+    if [[ "$prior_sha" == "$deployed_sha" && "$prior_end" =~ ^[0-9]+$ \
+          && "$prior_end" -gt "$now" && ! -e "$EVIDENCE_FILE" ]]; then
+      return 0
+    fi
+    [[ "$prior_attempt" =~ ^[A-Za-z0-9._-]+$ ]] || {
+      echo "refusing stale canary state without an attempt identity" >&2
+      return 2
+    }
+    history="$STATE_DIR/history/$prior_attempt"
+    /usr/bin/install -d -m 0700 "$history"
+    for artifact in "$STATE_FILE" "$SAMPLES_FILE" "$EVIDENCE_FILE" \
+      "$EVIDENCE_FILE.sha256"; do
+      [[ ! -e "$artifact" ]] || /usr/bin/mv -- "$artifact" "$history/"
+    done
+  fi
+  local attempt_id
+  attempt_id="${deployed_sha}-${now}-$$"
   {
+    printf 'attempt_id=%s\n' "$attempt_id"
     printf 'started_epoch=%s\n' "$now"
     printf 'expected_end_epoch=%s\n' "$((now + DURATION_SECONDS))"
     printf 'boot_id=%s\n' "$(< /proc/sys/kernel/random/boot_id)"
@@ -142,6 +164,7 @@ max_restarts = {
 }
 evidence = {
     "schema": "voyn.aicc-worker-canary/1",
+    "attempt_id": state["attempt_id"],
     "result": result,
     "started_epoch": int(state["started_epoch"]),
     "expected_end_epoch": int(state["expected_end_epoch"]),
