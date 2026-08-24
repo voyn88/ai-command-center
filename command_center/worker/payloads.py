@@ -13,15 +13,35 @@ change is an explicit refusal to old workers, never undefined behaviour:
 Every refusal is data (a ``PayloadError`` with a reason string), mirroring
 the queue protocol's own refusals-as-data discipline. Parsing never raises
 out of this module.
+
+The same contract runs in the other direction. The queue's terminal
+``succeeded`` state means that a worker durably reported a *result*; it does
+not mean that the model accepted a review or completed a task. The result
+payload therefore carries its own typed provenance -- which transport outcome
+produced it and what kind of executor result it holds -- so a failed or
+signal-killed executor is never promoted merely because its transport
+acknowledgement succeeded. Inbound parsing and outbound result shape are one
+versioned contract and live in one module: splitting them into a second file
+under ``command_center/worker/`` would also grow the frozen AIOS-boundary
+inventory (docs/AIOS_BOUNDARY.md, ADR-0008) for no contract reason.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
-__all__ = ["AgentRunRequest", "PayloadError", "parse_agent_run"]
+__all__ = [
+    "AgentRunRequest",
+    "ExecutorResultKind",
+    "PayloadError",
+    "QueueOutcomeKind",
+    "completed_model_result",
+    "model_result_payload",
+    "parse_agent_run",
+]
 
 AGENT_RUN_SCHEMA_VERSION = 1
 
@@ -32,6 +52,35 @@ AGENT_RUN_SCHEMA_VERSION = 1
 _MAX_TIMEOUT_SECONDS = 3600
 _MIN_TIMEOUT_SECONDS = 30
 _BACKLOG_TASK_ID = re.compile(r"^VOYN-[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+class QueueOutcomeKind(StrEnum):
+    TRANSPORT_SUCCEEDED = "transport_succeeded"
+    EXECUTOR_INFRA_FAILURE = "executor_infrastructure_failure"
+    REQUEST_REJECTED = "request_rejected"
+
+
+class ExecutorResultKind(StrEnum):
+    MODEL_RESULT = "model_result"
+
+
+def model_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a canonical durable payload for one executed model invocation."""
+    payload = dict(result)
+    payload["transport_status"] = QueueOutcomeKind.TRANSPORT_SUCCEEDED.value
+    payload["executor_result_kind"] = ExecutorResultKind.MODEL_RESULT.value
+    return payload
+
+
+def completed_model_result(payload: object) -> bool:
+    """Fail-closed gate used before any model verdict is aggregated."""
+    return (
+        isinstance(payload, dict)
+        and payload.get("transport_status")
+        == QueueOutcomeKind.TRANSPORT_SUCCEEDED.value
+        and payload.get("executor_result_kind") == ExecutorResultKind.MODEL_RESULT.value
+        and payload.get("status") == "completed"
+    )
 
 
 @dataclass(frozen=True, slots=True)

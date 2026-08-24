@@ -52,7 +52,7 @@ from command_center.db.work_queue_store import (
     WorkQueueStore,
 )
 from command_center.worker import sdnotify
-from command_center.worker.outcomes import QueueOutcomeKind, model_result_payload
+from command_center.worker.payloads import QueueOutcomeKind, model_result_payload
 
 logger = logging.getLogger(__name__)
 

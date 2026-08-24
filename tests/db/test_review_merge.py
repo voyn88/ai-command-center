@@ -15,7 +15,7 @@ from command_center.orchestrator.review_merge import (
     publish_review_verdicts,
     review_once,
 )
-from command_center.worker.outcomes import model_result_payload
+from command_center.worker.payloads import model_result_payload
 
 pytest_plugins = ("tests.db.test_backlog_planner",)
 

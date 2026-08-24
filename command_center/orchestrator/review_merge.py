@@ -73,7 +73,7 @@ from typing import Any
 
 from command_center.orchestrator import github_app_auth
 from command_center.orchestrator.routing import cascade_for
-from command_center.worker.outcomes import completed_model_result
+from command_center.worker.payloads import completed_model_result
 
 __all__ = [
     "LoopReport",

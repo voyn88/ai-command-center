@@ -16,7 +16,7 @@ from command_center.worker.daemon import (
     WorkerConfig,
     WorkerDaemon,
 )
-from command_center.worker.outcomes import QueueOutcomeKind
+from command_center.worker.payloads import QueueOutcomeKind
 
 
 def _work(payload: dict, attempt_id: str = "wat-1") -> ClaimedWork:

@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from command_center.orchestrator import planner, review_merge
-from command_center.worker.outcomes import model_result_payload
+from command_center.worker.payloads import model_result_payload
 
 TASK = "VOYN-W0-CHUNKED"
 PR = "https://github.com/voyn88/ai-command-center/pull/380"

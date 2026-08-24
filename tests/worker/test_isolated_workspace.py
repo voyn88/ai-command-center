@@ -23,7 +23,7 @@ import pytest
 
 from command_center import agent_runner, workspace_provisioning
 from command_center.worker.handlers import build_handlers
-from command_center.worker.outcomes import QueueOutcomeKind
+from command_center.worker.payloads import QueueOutcomeKind
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
