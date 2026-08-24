@@ -1,7 +1,23 @@
+import os
 import subprocess
 import time
 
+import pytest
+
 from command_center.runtime import identity
+
+
+def _process_state(pid: int) -> str | None:
+    result = subprocess.run(
+        ["ps", "-o", "state=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    state = result.stdout.strip()
+    return state or None
 
 
 def test_capture_identity_for_running_process():
@@ -22,6 +38,27 @@ def test_capture_identity_returns_none_for_dead_process():
     proc.wait()
     time.sleep(0.2)
     assert identity.capture_identity(proc.pid) is None
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_zombie_is_not_treated_as_a_running_process():
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+
+    try:
+        deadline = time.monotonic() + 2.0
+        state = _process_state(pid)
+        while state is not None and not state.startswith("Z") and time.monotonic() < deadline:
+            time.sleep(0.01)
+            state = _process_state(pid)
+
+        assert state is not None and state.startswith("Z")
+        assert identity.capture_identity(pid) is None
+        assert identity.process_exists(pid) is False
+        assert identity.identity_matches(pid, "stale|identity") is False
+    finally:
+        os.waitpid(pid, 0)
 
 
 def test_process_exists_true_while_running_false_after_exit():
