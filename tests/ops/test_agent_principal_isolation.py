@@ -718,7 +718,15 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     assert "m aicc-worker aicc-publisher" in sysusers
     assert "m voynadmin aicc-publisher" in sysusers
     assert "User=aicc-worker" in worker
-    assert "AICC_AGENT_PRINCIPAL_ISOLATION=required" in worker
+    # The rollout runbook forbids shipping the fail-closed flag inside the
+    # base unit: it arrives only via the final-canary-step drop-in
+    # (independent-review REJECT on b6ea174, chunk 4/9). The base unit must
+    # NOT carry it; the drop-in must.
+    assert "AICC_AGENT_PRINCIPAL_ISOLATION=required" not in worker
+    isolation_dropin = (
+        root / "deploy/systemd/voyn-aicc-worker-principal-isolation.conf"
+    ).read_text()
+    assert "AICC_AGENT_PRINCIPAL_ISOLATION=required" in isolation_dropin
     assert "NoNewPrivileges=true" in worker
     assert (
         "ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker"
