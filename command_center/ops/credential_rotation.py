@@ -144,12 +144,29 @@ class Audit:
         if self._path is None:
             return
         self._path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-        fd = os.open(
-            self._path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC,
-            0o640,
+        # Same TOCTOU/symlink hardening as every other durable writer in this
+        # module: O_NOFOLLOW refuses a symlinked audit path (which would
+        # silently redirect the forensic trail), and O_NONBLOCK keeps a FIFO
+        # planted at the path from blocking a synchronous emit() past the
+        # rotation deadline; the fstat then requires a real regular file
+        # before a byte is written (review finding on 732b765).
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_APPEND
+            | os.O_CLOEXEC
+            | getattr(os, "O_NONBLOCK", 0)
         )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(self._path, flags, 0o640)
         try:
+            info = os.fstat(fd)
+            if not stat_module.S_ISREG(info.st_mode):
+                raise RotationError("rotation audit path is not a regular file")
+            # Clear O_NONBLOCK for the actual write now that the fd is proven
+            # to be a regular file (nonblocking only mattered at open time).
+            os.set_blocking(fd, True)
             os.write(fd, (line + "\n").encode("utf-8"))
             os.fsync(fd)
         finally:
