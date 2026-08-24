@@ -965,21 +965,22 @@ def test_mergeability_uses_latest_check_rerun(monkeypatch):
         body = json.dumps(
             {
                 "state": "OPEN",
+                "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "reviews": [{"author": {"login": "voyn88-acceptance-gate[bot]"}, "submittedAt": "2026-08-23T06:00:00Z", "body": f"ACCEPTANCE: ACCEPT {head}"}],
                 "statusCheckRollup": [
                     {
-                        "name": "Acceptance gate",
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
                         "conclusion": "FAILURE",
                         "startedAt": "2026-08-23T04:29:29Z",
                     },
                     {
-                        "name": "Acceptance gate",
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
                         "conclusion": "SUCCESS",
                         "startedAt": "2026-08-23T05:25:43Z",
                     },
                     {
-                        "name": "CI",
+                        "name": "Final merge gate",
                         "conclusion": "SUCCESS",
                         "startedAt": "2026-08-23T04:29:27Z",
                     },
@@ -1004,16 +1005,22 @@ def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
         body = json.dumps(
             {
                 "state": "OPEN",
+                "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "reviews": [{"author": {"login": "voyn88-acceptance-gate[bot]"}, "submittedAt": "2026-08-23T06:00:00Z", "body": f"ACCEPTANCE: ACCEPT {head}"}],
                 "statusCheckRollup": [
                     {
-                        "name": "Acceptance gate",
+                        "name": "Final merge gate",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
                         "conclusion": "SUCCESS",
                         "startedAt": "2026-08-23T04:29:29Z",
                     },
                     {
-                        "name": "Acceptance gate",
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
                         "conclusion": "FAILURE",
                         "startedAt": "2026-08-23T05:25:43Z",
                     },
@@ -1027,7 +1034,7 @@ def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
         "/tmp", "https://github.com/x/y/pull/10"
     )
     assert not ready
-    assert reason == "checks_not_green: ['Acceptance gate']"
+    assert reason == "checks_not_green: ['Acceptance gate (independent verdict on exact SHA)']"
 
 
 @pytest.mark.parametrize(
@@ -1048,16 +1055,22 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
         body = json.dumps(
             {
                 "state": "OPEN",
+                "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "reviews": [{"author": {"login": "voyn88-acceptance-gate[bot]"}, "submittedAt": "2026-08-23T06:00:00Z", "body": f"ACCEPTANCE: ACCEPT {head}"}],
                 "statusCheckRollup": [
                     {
-                        "name": "Acceptance gate",
+                        "name": "Final merge gate",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-08-23T04:00:00Z",
+                    },
+                    {
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
                         "conclusion": newer_conclusion,
                         "startedAt": "2026-08-23T05:25:43Z",
                     },
                     {
-                        "name": "Acceptance gate",
+                        "name": "Acceptance gate (independent verdict on exact SHA)",
                         "conclusion": older_conclusion,
                         "startedAt": "2026-08-23T04:29:29Z",
                     },
@@ -1076,19 +1089,19 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
     [
         [
             {
-                "name": "Acceptance gate",
+                "name": "Acceptance gate (independent verdict on exact SHA)",
                 "conclusion": "FAILURE",
                 "startedAt": "2026-08-23T05:25:43Z",
             },
             {
-                "name": "Acceptance gate",
+                "name": "Acceptance gate (independent verdict on exact SHA)",
                 "conclusion": "SUCCESS",
                 "startedAt": "2026-08-23T05:25:43Z",
             },
         ],
         [
-            {"name": "Acceptance gate", "conclusion": "FAILURE"},
-            {"name": "Acceptance gate", "conclusion": "SUCCESS"},
+            {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "FAILURE"},
+            {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"},
         ],
     ],
 )
@@ -1101,9 +1114,10 @@ def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, ch
         body = json.dumps(
             {
                 "state": "OPEN",
+                "author": {"login": "dimastov-lab"},
                 "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                "statusCheckRollup": checks,
+                "reviews": [{"author": {"login": "voyn88-acceptance-gate[bot]"}, "submittedAt": "2026-08-23T06:00:00Z", "body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": checks + [{"name": "Final merge gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:00:00Z"}],
             }
         )
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -1113,7 +1127,7 @@ def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, ch
         "/tmp", "https://github.com/x/y/pull/10"
     )
     assert not ready
-    assert reason == "checks_not_green: ['Acceptance gate']"
+    assert reason == "checks_not_green: ['Acceptance gate (independent verdict on exact SHA)']"
 
 
 def test_repo_from_pr_url():

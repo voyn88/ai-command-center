@@ -536,7 +536,14 @@ def main(argv: list[str] | None = None) -> int:
                         )
                     )
                     if not ok or snapshot is None:
-                        return ActionOutcome.waiting(seconds=60, detail=detail)
+                        # CI evidence is produced by GitHub and ingested by the
+                        # backlog side; burning bounded retries on a lane that
+                        # only ever waits would exhaust attempts before slow CI
+                        # finishes, so this is a wait, never a retry.
+                        return ActionOutcome.waiting(
+                            seconds=60,
+                            detail=f"awaiting_ci_or_backlog_ingest: {detail}",
+                        )
                     advanced = guard.effect(
                         lambda: store.advance_delivery(lane, "CI_GREEN", snapshot)
                     )
@@ -544,6 +551,16 @@ def main(argv: list[str] | None = None) -> int:
                         return ActionOutcome.retry("ci_projection_refused")
                     return ActionOutcome.waiting(
                         seconds=0, detail="ci_projection_advanced"
+                    )
+
+                def unavailable_deploy_lane(_lane, _guard):
+                    # Deployment runs through the staged drain->canary->
+                    # readiness path on the target hosts; this host has no
+                    # deploy capability configured, so the lane parks as its
+                    # own split-out blocker instead of failing the whole
+                    # composition or burning retries.
+                    return ActionOutcome.waiting(
+                        seconds=600, detail="deployment_capability_not_configured"
                     )
 
                 def backlog_sync_lane(_lane, _guard):
@@ -556,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
                     Action.INDEPENDENT_REVIEW: review_lane,
                     Action.ACCEPTANCE: acceptance_lane,
                     Action.MERGE: merge_lane,
+                    Action.DEPLOY: unavailable_deploy_lane,
                     Action.BACKLOG_SYNC: backlog_sync_lane,
                 }
                 report = Reconciler(

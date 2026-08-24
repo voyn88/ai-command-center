@@ -345,7 +345,7 @@ def test_worker_recovery_refuses_to_cycle_both_unhealthy_lanes(tmp_path):
     )
 
     assert result.returncode == 1
-    assert "ready lane quorum would be violated" in result.stderr
+    assert "zero-ready fleet has no safely startable inactive lane" in result.stderr
     assert not calls.exists() or "kill" not in calls.read_text()
     assert "failures=1" in (tmp_path / "state" / "circuit").read_text()
 

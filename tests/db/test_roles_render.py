@@ -228,6 +228,10 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_ingest_results",
         "backlog_return_to_pool",
         "backlog_triage",
+        # The reconciler's delivery projection (0013): a SECURITY DEFINER
+        # advance over control_plane_delivery_attempt -- dispatch bookkeeping,
+        # not claiming; queue_claim stays ungranted above.
+        "control_plane_advance_delivery",
     }
 
 

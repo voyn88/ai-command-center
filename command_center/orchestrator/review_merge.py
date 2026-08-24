@@ -964,11 +964,11 @@ def _pr_is_mergeable(
         policy = acceptance_policy.load()
     except ValueError as exc:
         return False, f"acceptance_policy_invalid:{exc}"
-    accept = _accept_marker_on_latest_review(
-        data.get("reviews", []), head, author_login, policy
-    )
-    if not accept:
-        return False, "no_accept_marker_on_head"
+    # Checks are validated BEFORE the marker: a red or ambiguous required
+    # check is the more actionable refusal, and evaluating it first means a
+    # rerun-ordering defect can never hide behind a marker-identity refusal.
+    # The marker (policy-bound bot identity, independent of the PR author)
+    # remains mandatory for readiness below.
     raw_rollup = data.get("statusCheckRollup")
     if not isinstance(raw_rollup, list) or not raw_rollup:
         return False, "required_checks_missing"
@@ -986,6 +986,11 @@ def _pr_is_mergeable(
     ]
     if bad:
         return False, f"checks_not_green: {bad[:3]}"
+    accept = _accept_marker_on_latest_review(
+        data.get("reviews", []), head, author_login, policy
+    )
+    if not accept:
+        return False, "no_accept_marker_on_head"
     if state == "MERGED":
         merge_sha = (data.get("mergeCommit") or {}).get("oid", "")
         if re.fullmatch(r"[0-9a-f]{40}", merge_sha) is None:

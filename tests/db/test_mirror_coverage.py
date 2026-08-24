@@ -69,6 +69,16 @@ class Exclusion:
 # ---------------------------------------------------------------------------
 
 UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
+    "control_plane_delivery_attempt": Exclusion(
+        reason=(
+            "PostgreSQL-native authority from birth (0013): the reconciler's "
+            "current task->attempt->PR->exact-SHA projection is written only "
+            "through the SECURITY DEFINER control_plane_advance_delivery "
+            "function over queue-native rows; no SQLite authority ever held "
+            "delivery attempts, so there is nothing for a mirror to copy from."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RECONCILER",
+    ),
     # The backlog store (0005, BO-S1) is PostgreSQL-native authority from
     # birth, like the work_item family below: there is no SQLite source to
     # dual-write from — the incumbent it replaces is a Markdown FILE, and its

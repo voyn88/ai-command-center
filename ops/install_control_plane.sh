@@ -16,7 +16,7 @@ if [[ $(id -u) -ne 0 ]]; then
 fi
 if [[ "$SOURCE_ROOT" != "/opt/aicc-releases/$EXPECTED_SHA" \
       || $(/usr/bin/readlink -f /opt/aicc) != "$SOURCE_ROOT" ]]; then
-  echo "refusing: source is not the active immutable release" >&2
+  echo "refusing: source is not the active immutable release behind the canonical /opt/aicc checkout" >&2
   exit 2
 fi
 if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then

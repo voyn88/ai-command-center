@@ -55,7 +55,13 @@ def test_control_plane_units_and_installer_are_versioned_and_fail_closed():
     assert "/etc/aicc/migrator.env" in bootstrap
     assert "/etc/aicc/deployer.env" in bootstrap
     assert "status --porcelain)" in bootstrap
-    assert 'exec "$TARGET/ops/install_control_plane.sh"' in bootstrap
+    # Not `exec`: the installer runs inside the bootstrap's own
+    # transactional guard so a failed install triggers rollback_release
+    # instead of replacing the process and losing the trap.
+    assert "trap rollback_release ERR" in bootstrap
+    installer_call = '"$TARGET/ops/install_control_plane.sh" "$TARGET" "$EXPECTED_SHA" "$TASK_ID"'
+    assert installer_call in bootstrap
+    assert bootstrap.index("trap rollback_release ERR") < bootstrap.index(installer_call)
 
 
 def test_watchdog_repairs_once_and_requires_a_fresh_post_repair_probe():
