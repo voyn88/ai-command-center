@@ -54,7 +54,9 @@ def test_workspace_authority_accepts_explicit_32_byte_key(monkeypatch):
 def test_workspace_authority_runtime_and_installer_decoder_accept_same_base64():
     encoded = "base64:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU="
 
-    assert decode_workspace_authority_key(encoded) == b"abcdefghijklmnopqrstuvwxyz012345"
+    assert (
+        decode_workspace_authority_key(encoded) == b"abcdefghijklmnopqrstuvwxyz012345"
+    )
 
 
 def test_installer_rejects_long_encoding_with_short_decoded_key(tmp_path):
@@ -85,9 +87,7 @@ def test_private_authority_write_replaces_final_symlink_without_following(tmp_pa
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Linux worker dirfd boundary")
-def test_private_authority_write_refuses_precreated_temp_symlink(
-    tmp_path, monkeypatch
-):
+def test_private_authority_write_refuses_precreated_temp_symlink(tmp_path, monkeypatch):
     victim = tmp_path / "victim"
     victim.write_bytes(b"preserve")
     marker = tmp_path / "authority.json"
@@ -244,10 +244,16 @@ def test_parallel_tasks_get_separate_worktrees(tmp_path):
     ws_a = tmp_path / "wt" / "a"
     ws_b = tmp_path / "wt" / "b"
     spec_a = wp.WorkspaceSpec(
-        workspace_path=str(ws_a), expected_branch="task/a", base_branch="main", repository_path=str(repo)
+        workspace_path=str(ws_a),
+        expected_branch="task/a",
+        base_branch="main",
+        repository_path=str(repo),
     )
     spec_b = wp.WorkspaceSpec(
-        workspace_path=str(ws_b), expected_branch="task/b", base_branch="main", repository_path=str(repo)
+        workspace_path=str(ws_b),
+        expected_branch="task/b",
+        base_branch="main",
+        repository_path=str(repo),
     )
     wp.provision_and_verify(spec_a)
     wp.provision_and_verify(spec_b)
@@ -290,7 +296,9 @@ def test_main_repository_cannot_be_used_for_a_feature_task(tmp_path):
     """Even when the feature branch is checked out *in the main repo* (branch
     matches), the primary working tree is refused for feature/audit work."""
     repo = _make_repo(tmp_path / "repo")
-    _git(repo, "checkout", "-q", "-b", "audit/execution-queue")  # primary tree, feature branch
+    _git(
+        repo, "checkout", "-q", "-b", "audit/execution-queue"
+    )  # primary tree, feature branch
 
     spec = wp.WorkspaceSpec(
         workspace_path=str(repo),
@@ -458,7 +466,9 @@ def test_remove_workspace_removes_a_clean_pipeline_owned_worktree(tmp_path):
     assert outcome == "removed"
     assert not workspace.exists()
     # No dangling `.git/worktrees/<name>` entry left behind for `task/a`.
-    assert all(entry.get("branch") != "task/a" for entry in git_info.get_worktrees(repo))
+    assert all(
+        entry.get("branch") != "task/a" for entry in git_info.get_worktrees(repo)
+    )
 
 
 def test_remove_workspace_on_an_already_removed_path_does_not_raise(tmp_path):
@@ -545,7 +555,9 @@ def test_remove_workspace_leaves_a_dirty_worktree_for_the_next_reuse(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_prune_repository_reconciles_metadata_left_by_a_directory_that_vanished(tmp_path):
+def test_prune_repository_reconciles_metadata_left_by_a_directory_that_vanished(
+    tmp_path,
+):
     """Simulates the gap `remove_workspace`'s own inline prune cannot reach:
     a worker killed after `provision_workspace` but before any cleanup call,
     which leaves the worktree directory deleted (e.g. by the host reclaiming
@@ -553,14 +565,18 @@ def test_prune_repository_reconciles_metadata_left_by_a_directory_that_vanished(
     repo = _make_repo(tmp_path / "repo")
     workspace = tmp_path / "wt" / "task-d"
     _git(repo, "worktree", "add", "-b", "task/d", str(workspace), "main")
-    assert any(entry.get("branch") == "task/d" for entry in git_info.get_worktrees(repo))
+    assert any(
+        entry.get("branch") == "task/d" for entry in git_info.get_worktrees(repo)
+    )
 
     shutil.rmtree(workspace)  # directory gone; metadata not yet reconciled
 
     outcome = wp.prune_repository(repo)
 
     assert outcome == "pruned"
-    assert all(entry.get("branch") != "task/d" for entry in git_info.get_worktrees(repo))
+    assert all(
+        entry.get("branch") != "task/d" for entry in git_info.get_worktrees(repo)
+    )
 
 
 def test_prune_repository_is_a_noop_when_nothing_is_dangling(tmp_path):
@@ -578,7 +594,9 @@ def test_prune_repository_never_touches_a_live_worktree(tmp_path):
 
     assert outcome == "pruned"
     assert workspace.is_dir()
-    assert any(entry.get("branch") == "task/e" for entry in git_info.get_worktrees(repo))
+    assert any(
+        entry.get("branch") == "task/e" for entry in git_info.get_worktrees(repo)
+    )
 
 
 def test_prune_repository_refuses_a_non_repository_path(tmp_path):

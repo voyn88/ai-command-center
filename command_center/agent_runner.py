@@ -174,6 +174,7 @@ def disable_codex_workspace_write(detail: str = "") -> None:
     with _codex_workspace_write_preflight_lock:
         _codex_workspace_write_preflight_result = (False, reason)
 
+
 # --------------------------------------------------------------------------
 # Execution profiles — named, testable single source of truth for "what can
 # this run touch". Every `claude` invocation this project makes (v1 sync
@@ -230,7 +231,11 @@ def profile_for_task_type(task_type: str) -> str:
     Only reviewed implementation/remediation types receive development
     capabilities. Unknown and future task types fail closed as read-only.
     """
-    return PROFILE_TRUSTED_DEVELOPMENT if task_type in MUTATING_TASK_TYPES else PROFILE_READ_ONLY
+    return (
+        PROFILE_TRUSTED_DEVELOPMENT
+        if task_type in MUTATING_TASK_TYPES
+        else PROFILE_READ_ONLY
+    )
 
 
 def is_untrusted_source(source: str | None) -> bool:
@@ -253,7 +258,9 @@ def is_untrusted_task(task: dict) -> bool:
     return bool(task.get("untrusted_import")) or is_untrusted_source(task.get("source"))
 
 
-def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevated: bool = False) -> str:
+def profile_for_task(
+    task_type: str, *, untrusted: bool = False, operator_elevated: bool = False
+) -> str:
     """Provenance-aware execution profile (audit D7).
 
     Read-only task types are always `PROFILE_READ_ONLY` (they have no dangerous
@@ -267,6 +274,7 @@ def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevat
     if untrusted and not operator_elevated:
         return PROFILE_READ_ONLY
     return PROFILE_TRUSTED_DEVELOPMENT
+
 
 # The *complete* available tool set for read-only task types, passed via `--tools`
 # (not `--allowedTools`/`--disallowedTools`). Per `claude --help`, `--tools` replaces
@@ -419,7 +427,9 @@ def principal_workspace_root(
         if line.strip() and not line.strip().startswith("#")
     ]
     if len(roots) != 1 or not roots[0].is_absolute():
-        raise RunnerError("principal workspace-root config must contain one absolute root")
+        raise RunnerError(
+            "principal workspace-root config must contain one absolute root"
+        )
     return roots[0].resolve(strict=True)
 
 
@@ -608,7 +618,9 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
             )
             diagnostic = "\n".join(part for part in (run.stdout, run.stderr) if part)
             if run.is_executor_sandbox_error:
-                detail = diagnostic[-400:] or "bwrap loopback namespace setup was denied"
+                detail = (
+                    diagnostic[-400:] or "bwrap loopback namespace setup was denied"
+                )
                 _codex_workspace_write_preflight_result = (
                     False,
                     f"Codex workspace-write sandbox unavailable: {detail}",
@@ -625,7 +637,9 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
             else:
                 after = _run_git(["rev-parse", "HEAD"], probe)
                 status = _run_git(["status", "--porcelain"], probe)
-                common = _run_git(["rev-parse", "--path-format=absolute", "--git-common-dir"], probe)
+                common = _run_git(
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"], probe
+                )
                 probe_file = probe / "aicc-codex-commit-probe.txt"
                 try:
                     probe_content = probe_file.read_text(encoding="utf-8")
@@ -641,7 +655,8 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
                     and not status.stdout.strip()
                     and common
                     and common.returncode == 0
-                    and Path(common.stdout.strip()).resolve() == (probe / ".git").resolve()
+                    and Path(common.stdout.strip()).resolve()
+                    == (probe / ".git").resolve()
                     and probe_content == "AICC_CODEX_COMMIT_OK\n"
                 )
                 if not commit_ok:
@@ -676,11 +691,15 @@ def validate_repository(project_id: str, repository_path: str) -> Path:
             "Запуск отклонён."
         )
     if not resolved_configured.is_dir():
-        raise RunnerError(f"Настроенный путь репозитория не существует: {resolved_configured}")
+        raise RunnerError(
+            f"Настроенный путь репозитория не существует: {resolved_configured}"
+        )
     return resolved_configured
 
 
-def _run_git(args: list[str], cwd: Path, timeout: int = 10) -> subprocess.CompletedProcess | None:
+def _run_git(
+    args: list[str], cwd: Path, timeout: int = 10
+) -> subprocess.CompletedProcess | None:
     try:
         return subprocess.run(
             ["git", *args],
@@ -702,17 +721,32 @@ def is_git_repository(repo_path: Path) -> bool:
 def git_snapshot(repo_path: Path) -> dict:
     """Read-only branch/HEAD/status snapshot of `repo_path`, used for pre/post-run records."""
     if not is_git_repository(repo_path):
-        return {"is_git_repo": False, "branch": None, "head": None, "status_summary": None}
+        return {
+            "is_git_repo": False,
+            "branch": None,
+            "head": None,
+            "status_summary": None,
+        }
 
     branch = _run_git(["branch", "--show-current"], cwd=repo_path)
     head = _run_git(["rev-parse", "HEAD"], cwd=repo_path)
     status = _run_git(["status", "--porcelain"], cwd=repo_path)
 
-    status_lines = [line for line in (status.stdout.splitlines() if status and status.returncode == 0 else []) if line]
+    status_lines = [
+        line
+        for line in (
+            status.stdout.splitlines() if status and status.returncode == 0 else []
+        )
+        if line
+    ]
 
     return {
         "is_git_repo": True,
-        "branch": (branch.stdout.strip() if branch and branch.stdout.strip() else "(detached HEAD)"),
+        "branch": (
+            branch.stdout.strip()
+            if branch and branch.stdout.strip()
+            else "(detached HEAD)"
+        ),
         "head": head.stdout.strip() if head and head.returncode == 0 else None,
         "status_summary": "\n".join(status_lines) if status_lines else "(чисто)",
     }
@@ -732,7 +766,11 @@ def build_command(
     capability_override: str | None = None,
 ) -> list[str]:
     if capability_override is not None:
-        profile = PROFILE_READ_ONLY if capability_override.lower() in ("read_only", "readonly") else PROFILE_TRUSTED_DEVELOPMENT
+        profile = (
+            PROFILE_READ_ONLY
+            if capability_override.lower() in ("read_only", "readonly")
+            else PROFILE_TRUSTED_DEVELOPMENT
+        )
     else:
         profile = profile_for_task_type(task_type)
     command = [
@@ -876,14 +914,19 @@ def build_copilot_command(
         command += ["--allow-tool", "read"]
     else:
         command += [
-            "--allow-tool", "read",
-            "--allow-tool", "write",
-            "--allow-tool", "shell",
+            "--allow-tool",
+            "read",
+            "--allow-tool",
+            "write",
+            "--allow-tool",
+            "shell",
             # The agent commits locally; pushing/PR-opening belongs to
             # `publish_run`, which holds the writer lease. Denying the remote-
             # mutating subcommands keeps that boundary technical, not advisory.
-            "--deny-tool", "shell(git push)",
-            "--deny-tool", "shell(git remote)",
+            "--deny-tool",
+            "shell(git push)",
+            "--deny-tool",
+            "shell(git remote)",
         ]
     if model:
         command += ["--model", model]
@@ -1020,7 +1063,9 @@ class RunResult:
         positively confirm a parseable dict payload -- fail safe to today's
         behavior rather than guess.
         """
-        return (self.is_error and self.api_error_status is not None) or self.terminal_reason == "api_error"
+        return (
+            self.is_error and self.api_error_status is not None
+        ) or self.terminal_reason == "api_error"
 
     def is_executor_provider_error(self, executor: str) -> bool:
         """Whether the selected CLI positively reports a provider failure.
@@ -1083,7 +1128,9 @@ def _popen_new_process_group_kwargs() -> dict:
     it, `os.killpg`/`CTRL_BREAK_EVENT` would reach this worker process too."""
     if sys.platform == "win32":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    return {"start_new_session": True}  # POSIX: equivalent to a preexec_fn calling os.setsid()
+    return {
+        "start_new_session": True
+    }  # POSIX: equivalent to a preexec_fn calling os.setsid()
 
 
 def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) -> None:
@@ -1331,7 +1378,9 @@ def run_claude_code(
     status = (
         "failed"
         if all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
-        else "completed" if exit_code == 0 else "failed"
+        else "completed"
+        if exit_code == 0
+        else "failed"
     )
     return RunResult(
         status=status,
@@ -1393,7 +1442,9 @@ def load_runs() -> list[dict]:
     storage.ensure_seeded_jsonl(RUNS_FILE)
     records = storage.read_jsonl(RUNS_FILE)
     latest = storage.fold_latest_by_id(records)
-    return sorted(latest.values(), key=lambda run: run.get("created_at") or "", reverse=True)
+    return sorted(
+        latest.values(), key=lambda run: run.get("created_at") or "", reverse=True
+    )
 
 
 def get_run(run_id: str) -> dict | None:
@@ -1410,7 +1461,11 @@ def get_run(run_id: str) -> dict | None:
 # See `command_center.runtime.reports.REPORTS_ROOT` for why this honors
 # `AICC_REPORTS_ROOT` — same subprocess-isolation gap, same fix, applied here too
 # for consistency between the v1.2 and v2 report-writing paths.
-REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REPORTS_ROOT") else ROOT / "reports"
+REPORTS_ROOT = (
+    Path(os.environ["AICC_REPORTS_ROOT"])
+    if os.environ.get("AICC_REPORTS_ROOT")
+    else ROOT / "reports"
+)
 
 
 # Path components are restricted to this conservative charset so a hand-authored
@@ -1463,48 +1518,48 @@ def render_report_markdown(run: dict, parsed: dict) -> str:
 
     return f"""# Отчёт агента
 
-- Run ID: `{run.get('id', '—')}`
-- Task ID: `{run.get('task_id') or '—'}`
-- Project: {run.get('project', '—')}
-- Agent: {run.get('agent', '—')}
-- Task type: {run.get('task_type', '—')}
-- Repository: `{run.get('repository_path', '—')}`
-- Branch before run: {pre.get('branch') or '—'}
-- HEAD before run: {pre.get('head') or '—'}
-- Branch after run: {post.get('branch') or '—'}
-- HEAD after run: {post.get('head') or '—'}
-- Started: {run.get('started_at') or '—'}
-- Completed: {run.get('completed_at') or '—'}
+- Run ID: `{run.get("id", "—")}`
+- Task ID: `{run.get("task_id") or "—"}`
+- Project: {run.get("project", "—")}
+- Agent: {run.get("agent", "—")}
+- Task type: {run.get("task_type", "—")}
+- Repository: `{run.get("repository_path", "—")}`
+- Branch before run: {pre.get("branch") or "—"}
+- HEAD before run: {pre.get("head") or "—"}
+- Branch after run: {post.get("branch") or "—"}
+- HEAD after run: {post.get("head") or "—"}
+- Started: {run.get("started_at") or "—"}
+- Completed: {run.get("completed_at") or "—"}
 - Duration: {duration_str}
-- Exit code: {run.get('exit_code')}
-- Status: {run.get('status', '—')}
+- Exit code: {run.get("exit_code")}
+- Status: {run.get("status", "—")}
 
 ## Prompt
 
 ```
-{run.get('prompt', '')}
+{run.get("prompt", "")}
 ```
 
 ## Stdout (полный, без сокращений)
 
 ```
-{run.get('stdout', '')}
+{run.get("stdout", "")}
 ```
 
 ## Stderr (полный, без сокращений)
 
 ```
-{run.get('stderr', '')}
+{run.get("stderr", "")}
 ```
 
 ## Извлечённые данные (парсер)
 
-- Verdict: {parsed.get('verdict') or 'не определено'}
-- Confidence: {parsed.get('confidence', 'none')}
-- Commit hash: {parsed.get('commit_hash') or '—'}
-- Branch: {parsed.get('branch') or '—'}
-- Pull Request: {parsed.get('pull_request_url') or '—'}
-- Recommended next action: {parsed.get('recommended_next_action') or '—'}
+- Verdict: {parsed.get("verdict") or "не определено"}
+- Confidence: {parsed.get("confidence", "none")}
+- Commit hash: {parsed.get("commit_hash") or "—"}
+- Branch: {parsed.get("branch") or "—"}
+- Pull Request: {parsed.get("pull_request_url") or "—"}
+- Recommended next action: {parsed.get("recommended_next_action") or "—"}
 
 ### Findings
 
@@ -1513,13 +1568,13 @@ def render_report_markdown(run: dict, parsed: dict) -> str:
 ## Git status до запуска
 
 ```
-{pre.get('status_summary') or '—'}
+{pre.get("status_summary") or "—"}
 ```
 
 ## Git status после запуска
 
 ```
-{post.get('status_summary') or '—'}
+{post.get("status_summary") or "—"}
 ```
 """
 

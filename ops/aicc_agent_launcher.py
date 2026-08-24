@@ -149,9 +149,7 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
         raise LaunchRefused("manifest schema mismatch")
     if value["version"] != 1:
         raise LaunchRefused("unsupported manifest version")
-    if not isinstance(value["run_id"], str) or not RUN_ID_RE.fullmatch(
-        value["run_id"]
-    ):
+    if not isinstance(value["run_id"], str) or not RUN_ID_RE.fullmatch(value["run_id"]):
         raise LaunchRefused("invalid run_id")
     if value["executor"] not in EXECUTOR_BINARIES:
         raise LaunchRefused("executor is not allowlisted")
@@ -168,23 +166,73 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
     ):
         raise LaunchRefused("model is invalid")
     timeout = value["timeout_seconds"]
-    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 30 <= timeout <= 3600:
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or not 30 <= timeout <= 3600
+    ):
         raise LaunchRefused("timeout_seconds is outside 30..3600")
     if not isinstance(value["workspace"], str):
         raise LaunchRefused("workspace must be a string")
     return value
 
 
+def _regular_file_policy(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int | None,
+    exact_mode: int | None,
+    optional: bool = False,
+) -> bool:
+    """Apply one reusable, symlink-safe ownership and mode policy."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return False
+        raise LaunchRefused(f"required protected file is missing: {path}")
+    mode = stat.S_IMODE(info.st_mode)
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != expected_uid
+        or (expected_gid is not None and info.st_gid != expected_gid)
+        or (exact_mode is not None and mode != exact_mode)
+    ):
+        raise LaunchRefused(f"protected file ownership or mode drifted: {path}")
+    return True
+
+
 def _root_owned_regular(path: Path, *, optional: bool = False) -> bool:
     try:
-        info = path.stat()
+        info = path.lstat()
     except FileNotFoundError:
         if optional:
             return False
         raise LaunchRefused(f"required root-owned file is missing: {path}")
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
         raise LaunchRefused(f"file is not root-owned and non-writable: {path}")
     return True
+
+
+def _private_agent_environment(path: Path, *, optional: bool = False) -> bool:
+    try:
+        agent_gid = grp.getgrnam("aicc-agent").gr_gid
+    except KeyError as exc:
+        raise LaunchRefused("aicc-agent group does not exist") from exc
+    return _regular_file_policy(
+        path,
+        expected_uid=0,
+        expected_gid=agent_gid,
+        exact_mode=0o640,
+        optional=optional,
+    )
 
 
 def _workspace_roots(path: Path = ROOTS_FILE) -> tuple[Path, ...]:
@@ -221,7 +269,7 @@ def _validated_workspace(value: str, roots: tuple[Path, ...]) -> Path:
 
 
 def _validate_environment_file(path: Path, executor: str) -> bool:
-    if not _root_owned_regular(path, optional=True):
+    if not _private_agent_environment(path, optional=True):
         return False
     allowed = COMMON_AGENT_ENV_KEYS | PROVIDER_AGENT_ENV_KEYS[executor]
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -231,9 +279,8 @@ def _validate_environment_file(path: Path, executor: str) -> bool:
         if "=" not in stripped:
             raise LaunchRefused(f"invalid environment line {path}:{line_no}")
         key, _value = stripped.split("=", 1)
-        if (
-            key not in allowed
-            or any(key.startswith(prefix) for prefix in FORBIDDEN_ENV_PREFIXES)
+        if key not in allowed or any(
+            key.startswith(prefix) for prefix in FORBIDDEN_ENV_PREFIXES
         ):
             raise LaunchRefused(f"environment key is not allowlisted: {key}")
     return True
@@ -292,6 +339,50 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
     return home
 
 
+def _tracked_executables(workspace: Path) -> frozenset[Path]:
+    """Return executable paths from the trusted index without changing Git state."""
+    command = [
+        "/usr/bin/git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        f"safe.directory={workspace}",
+        "-C",
+        str(workspace),
+        "ls-files",
+        "--stage",
+        "-z",
+    ]
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    result = subprocess.run(command, env=environment, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise LaunchRefused("cannot read the task-local Git executable metadata")
+    executable: set[Path] = set()
+    for raw in result.stdout.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, path_bytes = raw.split(b"\t", 1)
+            mode, _object_id, stage = metadata.split(b" ", 2)
+        except ValueError as exc:
+            raise LaunchRefused("malformed task-local Git index metadata") from exc
+        if stage != b"0":
+            continue
+        relative = Path(os.fsdecode(path_bytes))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise LaunchRefused("Git index path escaped the workspace")
+        candidate = workspace / relative
+        if mode == b"100755":
+            executable.add(candidate)
+    return frozenset(executable)
+
+
 def _prepare_workspace_permissions(workspace: Path) -> None:
     """Grant only the shared workspace group, never a publisher credential group.
 
@@ -304,6 +395,8 @@ def _prepare_workspace_permissions(workspace: Path) -> None:
         workspace_gid = grp.getgrnam("aicc-workspace").gr_gid
     except KeyError as exc:
         raise LaunchRefused("aicc-workspace group does not exist") from exc
+    owner_uid = workspace.lstat().st_uid
+    executable = _tracked_executables(workspace)
     for root, dirs, files in os.walk(workspace, followlinks=False):
         paths = [Path(root), *(Path(root) / name for name in dirs + files)]
         for path in paths:
@@ -312,11 +405,12 @@ def _prepare_workspace_permissions(workspace: Path) -> None:
                 continue
             if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
                 raise LaunchRefused(f"hard-linked workspace file refused: {path}")
-            os.chown(path, -1, workspace_gid, follow_symlinks=False)
+            os.chown(path, owner_uid, workspace_gid, follow_symlinks=False)
             if stat.S_ISDIR(info.st_mode):
                 os.chmod(path, 0o2770, follow_symlinks=False)
             elif stat.S_ISREG(info.st_mode):
-                os.chmod(path, 0o660, follow_symlinks=False)
+                mode = 0o770 if path in executable else 0o660
+                os.chmod(path, mode, follow_symlinks=False)
 
 
 def _provider_command(manifest: dict[str, Any]) -> list[str]:
@@ -521,10 +615,14 @@ def _bounded_collect(
     finally:
         selector.close()
     proc.wait(timeout=25)
-    return bytes(collected[proc.stdout.fileno()]), bytes(collected[proc.stderr.fileno()])
+    return bytes(collected[proc.stdout.fileno()]), bytes(
+        collected[proc.stderr.fileno()]
+    )
 
 
-def _systemctl(args: list[str], *, timeout: float = 10) -> subprocess.CompletedProcess[bytes] | None:
+def _systemctl(
+    args: list[str], *, timeout: float = 10
+) -> subprocess.CompletedProcess[bytes] | None:
     try:
         return subprocess.run(
             [SYSTEMCTL, *args],
@@ -553,9 +651,7 @@ def _unit_is_sealed(unit: str) -> bool:
     active_state = state.stdout.decode("utf-8", "replace").strip()
     if active_state not in {"inactive", "failed"}:
         return False
-    control_group = _systemctl(
-        ["show", unit, "--property=ControlGroup", "--value"]
-    )
+    control_group = _systemctl(["show", unit, "--property=ControlGroup", "--value"])
     if control_group is None:
         return False
     if control_group.returncode != 0:
@@ -637,9 +733,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         _prepare_workspace_permissions(workspace)
         _validate_binary(EXECUTOR_BINARIES[manifest["executor"]])
-        agent_home = _prepare_agent_home(
-            manifest["executor"], manifest["run_id"]
-        )
+        agent_home = _prepare_agent_home(manifest["executor"], manifest["run_id"])
         unit = f"aicc-agent-{manifest['run_id']}-{os.getpid()}.service"
         command = _systemd_command(
             manifest,
@@ -659,9 +753,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
 
         def collect() -> None:
             try:
-                result["value"] = _bounded_collect(
-                    proc, lambda: _seal_unit(unit)
-                )
+                result["value"] = _bounded_collect(proc, lambda: _seal_unit(unit))
             except (LaunchRefused, OSError, subprocess.SubprocessError) as exc:
                 result["error"] = exc
 
@@ -699,17 +791,15 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             "version": 1,
             "exit_code": 125,
             "stdout_b64": "",
-            "stderr_b64": base64.b64encode(
-                f"{FAILURE}: {exc}\n".encode()
-            ).decode("ascii"),
+            "stderr_b64": base64.b64encode(f"{FAILURE}: {exc}\n".encode()).decode(
+                "ascii"
+            ),
         }
     finally:
         if unit is not None:
             try:
                 assert workspace is not None
-                quarantined = _seal_or_quarantine(
-                    unit, workspace, manifest["run_id"]
-                )
+                quarantined = _seal_or_quarantine(unit, workspace, manifest["run_id"])
                 if quarantined is not None:
                     response = {
                         "version": 1,

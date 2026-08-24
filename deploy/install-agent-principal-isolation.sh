@@ -6,11 +6,14 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 workspace_authority_env=/etc/aicc/workspace-authority.env
 state_dir=/var/lib/aicc-principal-isolation
-service_state="$state_dir/service-state"
+baseline_units="$state_dir/baseline-units.json"
+attempt_units="$state_dir/attempt-units.json"
 transaction="$repo_root/ops/aicc_install_transaction.py"
+rollout="$repo_root/ops/aicc_staged_worker_rollout.py"
+repo_lanes="$repo_root/deploy/aicc/worker-lanes"
 
 run_transaction() {
   action=$1
@@ -20,42 +23,31 @@ run_transaction() {
     --authority-env "$workspace_authority_env"
 }
 
-read_state_value() {
-  key=$1
-  sed -n "s/^$key=//p" "$service_state" | tail -n 1
+run_rollout() {
+  python3 "$rollout" "$@"
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
-  [ -f "$service_state" ] || {
-    echo "principal-isolation service state is missing" >&2
+  [ -f "$baseline_units" ] || {
+    echo "principal-isolation baseline state is missing" >&2
     exit 1
   }
-  socket_was_enabled=$(read_state_value socket_enabled)
-  socket_was_active=$(read_state_value socket_active)
-  lane1_was_enabled=$(read_state_value lane1_enabled)
-  lane2_was_enabled=$(read_state_value lane2_enabled)
   systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  systemctl disable aicc-principal-recovery.service >/dev/null 2>&1 || true
   run_transaction uninstall
   systemctl daemon-reload
-  if [ "$lane1_was_enabled" != enabled ]; then
-    systemctl disable voyn-aicc-worker@1.service >/dev/null 2>&1 || true
-  fi
-  if [ "$lane2_was_enabled" != enabled ]; then
-    systemctl disable voyn-aicc-worker@2.service >/dev/null 2>&1 || true
-  fi
-  if [ "$socket_was_enabled" = enabled ]; then
-    systemctl enable aicc-agent-launcher.socket >/dev/null 2>&1 || true
-  fi
-  if [ "$socket_was_active" = active ]; then
-    systemctl start aicc-agent-launcher.socket >/dev/null 2>&1 || true
-  fi
-  rm -f -- "$service_state"
+  run_rollout restore --state "$baseline_units"
+  rm -f -- "$baseline_units" "$attempt_units"
   echo "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED"
   exit 0
 fi
 
-# Validate every secret and versioned input before the first mutation. The
-# installer and runtime call the same decoder, so encoded length cannot drift.
+# A prior SIGKILL leaves a durable write-ahead journal. Recover it before
+# validating or preparing a new versioned generation.
+run_transaction recover
+
+# Validate the stable authority using the exact runtime decoder before any
+# replaceable target is mutated.
 PYTHONPATH="$repo_root" python3 - "$workspace_authority_env" <<'PY'
 import pathlib
 import sys
@@ -78,67 +70,66 @@ done
 run_transaction validate
 sh -n "$repo_root/ops/verify-agent-principal-boundary.sh"
 
-socket_was_enabled=$(systemctl is-enabled aicc-agent-launcher.socket 2>/dev/null || true)
-socket_was_active=$(systemctl is-active aicc-agent-launcher.socket 2>/dev/null || true)
-lane1_was_enabled=$(systemctl is-enabled voyn-aicc-worker@1.service 2>/dev/null || true)
-lane2_was_enabled=$(systemctl is-enabled voyn-aicc-worker@2.service 2>/dev/null || true)
+if [ -e "$state_dir" ]; then
+  [ ! -L "$state_dir" ] && [ -d "$state_dir" ] && \
+    [ "$(stat -c %U:%G:%a "$state_dir")" = root:root:700 ] || {
+      echo "principal-isolation state directory drifted" >&2
+      exit 1
+    }
+else
+  install -d -m 0700 -o root -g root "$state_dir"
+fi
+run_rollout snapshot --lanes "$repo_lanes" --state "$attempt_units" \
+  --include-unit aicc-agent-launcher.socket \
+  --include-unit aicc-principal-recovery.service
 transaction_active=0
+baseline_created=0
 
-restore_service_state() {
-  if [ "$lane1_was_enabled" != enabled ]; then
-    systemctl disable voyn-aicc-worker@1.service >/dev/null 2>&1 || true
-  fi
-  if [ "$lane2_was_enabled" != enabled ]; then
-    systemctl disable voyn-aicc-worker@2.service >/dev/null 2>&1 || true
-  fi
-  if [ "$socket_was_enabled" != enabled ]; then
-    systemctl disable aicc-agent-launcher.socket >/dev/null 2>&1 || true
-  fi
-  if [ "$socket_was_active" = active ]; then
-    systemctl start aicc-agent-launcher.socket >/dev/null 2>&1 || true
-  else
-    systemctl stop aicc-agent-launcher.socket >/dev/null 2>&1 || true
-  fi
-}
+if [ ! -f "$baseline_units" ]; then
+  baseline_tmp="$state_dir/.baseline-units.$$"
+  install -m 0600 "$attempt_units" "$baseline_tmp"
+  mv -f -- "$baseline_tmp" "$baseline_units"
+  sync -f "$state_dir"
+  baseline_created=1
+fi
 
 rollback() {
   result=$?
   trap - EXIT HUP INT TERM
-  if [ "$transaction_active" -eq 1 ]; then
+  if [ "$transaction_active" -eq 1 ] && [ -f "$state_dir/pending.json" ]; then
     systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
-    run_transaction rollback || true
+    run_transaction recover || true
     systemctl daemon-reload || true
-    restore_service_state
-    rm -f -- "$service_state"
+    run_rollout restore --state "$attempt_units" >/dev/null 2>&1 || true
   fi
+  if [ "$baseline_created" -eq 1 ]; then
+    rm -f -- "$baseline_units"
+  fi
+  rm -f -- "$attempt_units"
   exit "$result"
 }
 trap rollback EXIT HUP INT TERM
 
-# Identity and directory creation are additive/idempotent prerequisites. All
-# replaceable files and migrated model credentials are installed only by the
-# reversible transaction below.
+# Identity and directory creation are additive/idempotent prerequisites. Every
+# replaceable file belongs to the versioned, write-ahead transaction below.
 systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
 systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
-run_transaction install
+run_transaction prepare
 transaction_active=1
-
-umask 077
-service_state_tmp="$state_dir/.service-state.$$"
-{
-  printf 'socket_enabled=%s\n' "$socket_was_enabled"
-  printf 'socket_active=%s\n' "$socket_was_active"
-  printf 'lane1_enabled=%s\n' "$lane1_was_enabled"
-  printf 'lane2_enabled=%s\n' "$lane2_was_enabled"
-} > "$service_state_tmp"
-chmod 0600 "$service_state_tmp"
-mv -f -- "$service_state_tmp" "$service_state"
+run_transaction apply
 
 systemctl daemon-reload
-systemctl enable voyn-aicc-worker@1.service voyn-aicc-worker@2.service
+systemctl enable aicc-principal-recovery.service
 systemctl enable --now aicc-agent-launcher.socket
+
+# The orchestrator discovers configured plus already-instantiated lanes, then
+# drains, starts and proves each lane before advancing. Any failure restores
+# the attempt snapshot and the outer trap restores the file generation.
+run_rollout rollout --lanes /etc/aicc/worker-lanes
 "$repo_root/ops/verify-agent-principal-boundary.sh"
 
+run_transaction commit
 transaction_active=0
+rm -f -- "$attempt_units"
 trap - EXIT HUP INT TERM
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"

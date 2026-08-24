@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +14,18 @@ import pytest
 def _module():
     path = Path(__file__).parents[2] / "ops" / "aicc_install_transaction.py"
     spec = importlib.util.spec_from_file_location("aicc_install_transaction", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _generator_module():
+    path = Path(__file__).parents[2] / "ops" / "aicc_principal_recovery_generator.py"
+    spec = importlib.util.spec_from_file_location(
+        "aicc_principal_recovery_generator", path
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -37,32 +51,32 @@ def test_mid_install_failure_restores_every_pretransaction_target(
     source_two = tmp_path / "two"
     source_one.write_bytes(b"after")
     source_two.write_bytes(b"new")
-    real_atomic = module._atomic_bytes
-    calls = 0
-
-    def fail_once(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise OSError("injected staged-install failure")
-        return real_atomic(*args, **kwargs)
-
-    monkeypatch.setattr(module, "_atomic_bytes", fail_once)
     transaction = module.FileTransaction(root, state)
-    with pytest.raises(OSError, match="injected"):
-        transaction.install(
-            (
-                _spec(module, source_one, "/etc/existing"),
-                _spec(module, source_two, "/etc/new"),
-            )
+    transaction.prepare(
+        (
+            _spec(module, source_one, "/etc/existing"),
+            _spec(module, source_two, "/etc/new"),
         )
+    )
+    assert transaction.pending.exists()
+    real_atomic = module._atomic_bytes
+
+    def fail_second_target(path, *args, **kwargs):
+        if path == root / "etc/new":
+            raise OSError("injected staged-install failure")
+        return real_atomic(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_atomic_bytes", fail_second_target)
+    with pytest.raises(OSError, match="injected"):
+        transaction.apply()
 
     assert existing.read_bytes() == b"before"
     assert stat.S_IMODE(existing.stat().st_mode) == 0o600
     assert not (root / "etc/new").exists()
+    assert not transaction.pending.exists()
 
 
-def test_uninstall_restores_replaced_file_and_removes_new_file(tmp_path):
+def test_two_generations_uninstall_to_preinstall_state_without_orphans(tmp_path):
     module = _module()
     root = tmp_path / "root"
     state = tmp_path / "state"
@@ -85,11 +99,191 @@ def test_uninstall_restores_replaced_file_and_removes_new_file(tmp_path):
     assert existing.read_bytes() == b"after"
     assert (root / "etc/new").read_bytes() == b"new"
 
-    transaction.restore()
+    source_one.write_bytes(b"after-two")
+    source_two.write_bytes(b"new-two")
+    transaction.install(
+        (
+            _spec(module, source_one, "/etc/existing"),
+            _spec(module, source_two, "/etc/new"),
+        )
+    )
+    assert existing.read_bytes() == b"after-two"
+
+    transaction.uninstall_all()
 
     assert existing.read_bytes() == b"before"
     assert stat.S_IMODE(existing.stat().st_mode) == 0o600
     assert not (root / "etc/new").exists()
+    assert not transaction.current.exists()
+    assert not transaction.pending.exists()
+    assert not list(state.glob("generation-*"))
+
+
+def test_sigkill_mid_apply_is_recovered_from_write_ahead_journal(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    existing = root / "etc/existing"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"before")
+    existing.chmod(0o600)
+    source_one = tmp_path / "one"
+    source_two = tmp_path / "two"
+    source_one.write_bytes(b"after")
+    source_two.write_bytes(b"new")
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare(
+        (
+            _spec(module, source_one, "/etc/existing"),
+            _spec(module, source_two, "/etc/new"),
+        )
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    first = module.BackupRecord(**payload["records"][0])
+    transaction._write_journal(manifest, "APPLYING", 0)
+    module._atomic_bytes(
+        transaction._target(first.target),
+        Path(first.staged).read_bytes(),
+        first.install_mode,
+        first.install_uid,
+        first.install_gid,
+    )
+    assert existing.read_bytes() == b"after"
+
+    module.FileTransaction(root, state).recover()
+
+    assert existing.read_bytes() == b"before"
+    assert not (root / "etc/new").exists()
+    assert not (state / "pending.json").exists()
+    assert not list(state.glob("generation-*"))
+
+
+def test_applied_generation_is_not_committed_until_explicit_commit(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/new"),))
+    transaction.apply()
+    assert (root / "etc/new").read_bytes() == b"installed"
+    assert transaction.pending.exists()
+    assert not transaction.current.exists()
+
+    transaction.commit()
+
+    assert transaction.current.exists()
+    assert not transaction.pending.exists()
+
+
+def test_first_install_boot_generator_uses_self_contained_recovery(tmp_path):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    generation = state / "generation-0123456789abcdef"
+    generation.mkdir(parents=True)
+    recovery = generation / "recovery.py"
+    recovery.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+    recovery.chmod(0o700)
+    (state / "pending.json").write_text(
+        json.dumps({"recovery": str(recovery)}), encoding="utf-8"
+    )
+    (state / "pending.json").chmod(0o600)
+    destination = tmp_path / "generator"
+
+    assert generator.generate(destination, state, expected_uid=os.getuid())
+
+    unit = (destination / "aicc-principal-recovery.service").read_text()
+    assert f"ExecStart=/usr/bin/python3 {recovery} recover" in unit
+    alias = generation / "alias.py"
+    alias.symlink_to(recovery)
+    (state / "pending.json").write_text(
+        json.dumps({"recovery": str(alias)}), encoding="utf-8"
+    )
+    assert not generator.generate(destination, state, expected_uid=os.getuid())
+
+
+def test_recovery_generator_is_the_first_destination_of_clean_install(tmp_path):
+    module = _module()
+    repo = Path(__file__).parents[2]
+    specs = module.default_specs(
+        repo,
+        authority_env=tmp_path / "authority.env",
+        claude_auth=tmp_path / "claude.json",
+        codex_auth=tmp_path / "codex.json",
+        resolve_identities=False,
+    )
+    assert (
+        specs[0].target == "/usr/lib/systemd/system-generators/aicc-principal-recovery"
+    )
+
+
+def test_boot_recovery_restores_dynamic_worker_and_auxiliary_unit_state(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    },
+                    "aicc-agent-launcher.socket": {
+                        "exists": True,
+                        "enabled": False,
+                        "active": False,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    module.restore_service_snapshot(snapshot, run=run)
+
+    assert calls == [
+        ["/usr/bin/systemctl", "daemon-reload"],
+        ["/usr/bin/systemctl", "enable", "voyn-aicc-worker@blue.service"],
+        ["/usr/bin/systemctl", "start", "voyn-aicc-worker@blue.service"],
+        ["/usr/bin/systemctl", "disable", "aicc-agent-launcher.socket"],
+        ["/usr/bin/systemctl", "stop", "aicc-agent-launcher.socket"],
+    ]
+
+
+def test_failed_boot_service_restore_keeps_journal_for_retry(monkeypatch, tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/new"),))
+    transaction.apply()
+    (state / "attempt-units.json").write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        module,
+        "restore_service_snapshot",
+        lambda path: (_ for _ in ()).throw(RuntimeError("systemd unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="systemd unavailable"):
+        transaction.recover()
+
+    assert transaction.pending.exists()
+    monkeypatch.setattr(module, "restore_service_snapshot", lambda path: None)
+    transaction.recover()
+    assert not (root / "etc/new").exists()
+    assert not transaction.pending.exists()
 
 
 def test_invalid_source_is_rejected_before_any_target_mutation(tmp_path):

@@ -74,7 +74,7 @@ def test_agent_environment_refuses_every_publisher_authority(
 ):
     env_file = tmp_path / "agent.env"
     env_file.write_text(f"{key}=secret\n", encoding="utf-8")
-    monkeypatch.setattr(launcher, "_root_owned_regular", lambda *a, **k: True)
+    monkeypatch.setattr(launcher, "_private_agent_environment", lambda *a, **k: True)
     with pytest.raises(launcher.LaunchRefused, match="not allowlisted"):
         launcher._validate_environment_file(env_file, "codex")
 
@@ -82,7 +82,7 @@ def test_agent_environment_refuses_every_publisher_authority(
 def test_model_auth_allowlist_is_provider_specific(launcher, monkeypatch, tmp_path):
     env_file = tmp_path / "agent.env"
     env_file.write_text("OPENAI_API_KEY=model-only\n", encoding="utf-8")
-    monkeypatch.setattr(launcher, "_root_owned_regular", lambda *a, **k: True)
+    monkeypatch.setattr(launcher, "_private_agent_environment", lambda *a, **k: True)
     assert launcher._validate_environment_file(env_file, "codex")
     with pytest.raises(launcher.LaunchRefused):
         launcher._validate_environment_file(env_file, "claude")
@@ -182,9 +182,7 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
     assert "--property=BindsTo=aicc-agent-launcher@test.service" in command
     assert f"--property=BindPaths={tmp_path}:/workspace" in command
     assert "--property=ReadWritePaths=/workspace /agent-home" in command
-    assert (
-        "--property=BindPaths=/run/aicc-agent-homes/test:/agent-home" in command
-    )
+    assert "--property=BindPaths=/run/aicc-agent-homes/test:/agent-home" in command
     for inaccessible in (
         "/etc/aicc",
         "/var/lib/aicc-worker",
@@ -205,10 +203,7 @@ def test_transient_agent_requires_socket_broker_cgroup(launcher, tmp_path):
         "aicc-agent-launcher@9.service\n",
         encoding="utf-8",
     )
-    assert (
-        launcher._current_broker_unit(cgroup)
-        == "aicc-agent-launcher@9.service"
-    )
+    assert launcher._current_broker_unit(cgroup) == "aicc-agent-launcher@9.service"
     cgroup.write_text("0::/system.slice/ssh.service\n", encoding="utf-8")
     with pytest.raises(launcher.LaunchRefused, match="not inside"):
         launcher._current_broker_unit(cgroup)
@@ -254,9 +249,7 @@ def test_worker_derived_workspace_is_accepted_by_same_canonical_root(
     derived.mkdir(parents=True)
     assert derived.is_relative_to(canonical_root)
     assert launcher._validated_workspace(str(derived), (canonical_root,)) == derived
-    assert str(agent_runner.PRINCIPAL_WORKSPACE_ROOTS_FILE) == str(
-        launcher.ROOTS_FILE
-    )
+    assert str(agent_runner.PRINCIPAL_WORKSPACE_ROOTS_FILE) == str(launcher.ROOTS_FILE)
 
     same_name_repository = tmp_path / "other-tenant" / "ai-command-center"
     same_name_repository.mkdir(parents=True)
@@ -282,12 +275,98 @@ def test_workspace_permission_normalization_clears_inherited_public_bits(
         launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
     )
     monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_tracked_executables", lambda path: frozenset())
 
     launcher._prepare_workspace_permissions(workspace)
 
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o2770
     assert stat.S_IMODE(nested.stat().st_mode) == 0o2770
     assert stat.S_IMODE(payload.stat().st_mode) == 0o660
+
+
+def test_workspace_permission_normalization_preserves_tracked_executable_bit(
+    launcher, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    script = workspace / "run.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    data = workspace / "data.txt"
+    data.write_text("payload\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(workspace), "add", "run.sh", "data.txt"], check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "-c",
+            "user.name=AICC Test",
+            "-c",
+            "user.email=aicc@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    before = subprocess.run(
+        ["git", "-C", str(workspace), "status", "--porcelain=v1"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    assert before == ""
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+
+    launcher._prepare_workspace_permissions(workspace)
+
+    assert stat.S_IMODE(script.stat().st_mode) == 0o770
+    assert stat.S_IMODE(data.stat().st_mode) == 0o660
+    after = subprocess.run(
+        ["git", "-C", str(workspace), "status", "--porcelain=v1"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    assert after == before
+
+
+def test_provider_environment_policy_rejects_public_mode_and_symlink(
+    launcher, tmp_path
+):
+    secret = tmp_path / "provider.env"
+    secret.write_text("OPENAI_API_KEY=model-only\n", encoding="utf-8")
+    secret.chmod(0o644)
+    with pytest.raises(launcher.LaunchRefused, match="drifted"):
+        launcher._regular_file_policy(
+            secret,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            exact_mode=0o640,
+        )
+    secret.chmod(0o640)
+    assert launcher._regular_file_policy(
+        secret,
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        exact_mode=0o640,
+    )
+    alias = tmp_path / "provider-link.env"
+    alias.symlink_to(secret)
+    with pytest.raises(launcher.LaunchRefused, match="drifted"):
+        launcher._regular_file_policy(
+            alias,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            exact_mode=0o640,
+        )
 
 
 def test_output_limit_is_incremental_and_triggers_seal(launcher, monkeypatch):
@@ -314,13 +393,9 @@ def test_output_limit_is_incremental_and_triggers_seal(launcher, monkeypatch):
     assert sealed == [True]
 
 
-def test_sigterm_ignoring_unit_escalates_and_is_proven_inactive(
-    launcher, monkeypatch
-):
+def test_sigterm_ignoring_unit_escalates_and_is_proven_inactive(launcher, monkeypatch):
     sealed_states = iter((False, False, True))
-    monkeypatch.setattr(
-        launcher, "_unit_is_sealed", lambda unit: next(sealed_states)
-    )
+    monkeypatch.setattr(launcher, "_unit_is_sealed", lambda unit: next(sealed_states))
     monotonic = iter((0.0, 0.0, 11.0, 11.0, 12.0))
     monkeypatch.setattr(launcher.time, "monotonic", lambda: next(monotonic))
     monkeypatch.setattr(launcher.time, "sleep", lambda seconds: None)
@@ -389,7 +464,9 @@ def test_control_group_error_or_empty_is_not_proof_when_expected_cgroup_exists(
         if any("LoadState" in value for value in args):
             return subprocess.CompletedProcess(args, 0, stdout=b"loaded\n", stderr=b"")
         if any("ActiveState" in value for value in args):
-            return subprocess.CompletedProcess(args, 0, stdout=b"inactive\n", stderr=b"")
+            return subprocess.CompletedProcess(
+                args, 0, stdout=b"inactive\n", stderr=b""
+            )
         assert any("ControlGroup" in value for value in args)
         return control_group_result
 
@@ -397,9 +474,7 @@ def test_control_group_error_or_empty_is_not_proof_when_expected_cgroup_exists(
     assert not launcher._unit_is_sealed(unit)
 
 
-def test_worker_runtime_sends_secrets_neither_in_argv_nor_env(
-    monkeypatch, tmp_path
-):
+def test_worker_runtime_sends_secrets_neither_in_argv_nor_env(monkeypatch, tmp_path):
     capture = tmp_path / "capture.json"
     fake_launcher = tmp_path / "aicc-agent-launcher"
     fake_launcher.write_text(
@@ -456,13 +531,9 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     root = Path(__file__).parents[2]
     sysusers = (root / "deploy/sysusers.d/aicc-agent.conf").read_text()
     worker = (root / "deploy/systemd/aicc-worker.service").read_text()
-    worker_template = (
-        root / "deploy/systemd/voyn-aicc-worker@.service"
-    ).read_text()
+    worker_template = (root / "deploy/systemd/voyn-aicc-worker@.service").read_text()
     socket_unit = (root / "deploy/systemd/aicc-agent-launcher.socket").read_text()
-    launcher_unit = (
-        root / "deploy/systemd/aicc-agent-launcher@.service"
-    ).read_text()
+    launcher_unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text()
     workspace_roots = (root / "deploy/aicc/agent-workspace-roots").read_text()
     assert "/usr/sbin/nologin" in sysusers
     assert "u aicc-worker " in sysusers
@@ -474,8 +545,14 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     assert "User=aicc-worker" in worker
     assert "AICC_AGENT_PRINCIPAL_ISOLATION=required" in worker
     assert "NoNewPrivileges=true" in worker
-    assert "ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker" in worker_template
-    assert "EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env" in worker_template
+    assert (
+        "ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker"
+        in worker_template
+    )
+    assert (
+        "EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env"
+        in worker_template
+    )
     assert "TimeoutStopSec=3660s" in worker_template
     assert "TimeoutStartSec=180s" in worker_template
     assert "SocketUser=root" in socket_unit
@@ -492,20 +569,25 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     verifier = (root / "ops/verify-agent-principal-boundary.sh").read_text()
     installer = (root / "deploy/install-agent-principal-isolation.sh").read_text()
     transaction = (root / "ops/aicc_install_transaction.py").read_text()
+    rollout = (root / "ops/aicc_staged_worker_rollout.py").read_text()
     assert "agent_uid" in verifier and "publisher_uid" in verifier
     assert "aicc-agent can read" not in verifier
     assert "runuser -u aicc-agent -- test -r" in verifier
     assert "aicc-agent-launcher.socket" in verifier
-    assert "ProtectControlGroups" in verifier
+    assert "ProtectControlGroups" in rollout
     assert "AICC_AGENT_PRINCIPAL_BOUNDARY_OK" in verifier
     assert "load_workspace_authority_environment" in installer
     assert "/etc/aicc/workspace-authority.env" in installer
     assert "voyn-aicc-worker@.service.d/20-principal-isolation.conf" in transaction
     assert "_atomic_bytes" in transaction
     assert "self.restore(manifest)" in transaction
+    assert '"PREPARED"' in transaction
+    assert '"APPLIED"' in transaction
+    assert "run_transaction commit" in installer
     assert '"--uninstall"' in installer
-    assert "run_transaction rollback" in installer
-    assert "voyn-aicc-worker@1.service" in verifier
-    assert "voyn-aicc-worker@2.service" in verifier
+    assert "run_transaction recover" in installer
+    assert "aicc_staged_worker_rollout.py" in verifier
+    assert "discover_units" in rollout
+    assert "for unit in units" in rollout
     assert "voyn-aicc-worker-2.service" not in verifier
     assert "source " not in installer

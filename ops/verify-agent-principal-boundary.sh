@@ -6,7 +6,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 secret_manifest=/etc/aicc/publisher-secret-paths
 worker_template=/etc/systemd/system/voyn-aicc-worker@.service
 worker_dropin=/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
@@ -65,6 +65,13 @@ from command_center.workspace_authority import load_workspace_authority_environm
 load_workspace_authority_environment(Path("/etc/aicc/workspace-authority.env"))
 PY
 
+for provider_env in /etc/aicc/agent.env /etc/aicc/agent-claude.env /etc/aicc/agent-codex.env; do
+  [ -e "$provider_env" ] || continue
+  [ ! -L "$provider_env" ] || fail "provider environment is a symlink: $provider_env"
+  [ "$(stat -c %U:%G:%a "$provider_env")" = root:aicc-agent:640 ] || \
+    fail "provider environment ownership or mode drifted: $provider_env"
+done
+
 # Measured from inside the same mount/capability envelope: the exact workspace
 # is visible, while an equally group-readable sibling under the canonical root
 # is EACCES because the original root is hidden before the exact bind.
@@ -104,26 +111,8 @@ while IFS= read -r secret_path; do
   fi
 done < "$secret_manifest"
 
-for unit in voyn-aicc-worker@1.service voyn-aicc-worker@2.service; do
-  systemctl is-enabled --quiet "$unit" || fail "$unit is not enabled"
-  [ "$(systemctl show "$unit" -p LoadState --value)" = loaded ] || \
-    fail "$unit is not loadable from the versioned template"
-  [ "$(systemctl show "$unit" -p FragmentPath --value)" = "$worker_template" ] || \
-    fail "$unit does not use the versioned template"
-  case "$(systemctl show "$unit" -p DropInPaths --value)" in
-    *"$worker_dropin"*) : ;;
-    *) fail "$unit does not inherit the principal boundary" ;;
-  esac
-  [ "$(systemctl show "$unit" -p NoNewPrivileges --value)" = yes ] || \
-    fail "$unit lacks NoNewPrivileges"
-  [ "$(systemctl show "$unit" -p ProtectHome --value)" = read-only ] || \
-    fail "$unit does not protect home"
-  [ "$(systemctl show "$unit" -p ProtectControlGroups --value)" = yes ] || \
-    fail "$unit does not seal cgroups"
-  groups=$(systemctl show "$unit" -p SupplementaryGroups --value)
-  case " $groups " in *" aicc-publisher "*) : ;; *) fail "$unit lacks publisher group" ;; esac
-  case " $groups " in *" aicc-workspace "*) : ;; *) fail "$unit lacks workspace group" ;; esac
-done
+python3 "$repo_root/ops/aicc_staged_worker_rollout.py" verify \
+  --lanes /etc/aicc/worker-lanes || fail "worker lane readiness or UID isolation failed"
 
 for tool in /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/copilot; do
   resolved=$(readlink -f -- "$tool")

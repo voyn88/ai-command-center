@@ -82,7 +82,9 @@ def handler(monkeypatch, tmp_path):
     monkeypatch.setattr(
         agent_runner, "validate_repository", lambda project_id, path: tmp_path
     )
-    monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda binary=None: (True, "ok"))
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (True, "ok")
+    )
     runs: list[dict] = []
 
     def fake_run(**kwargs):
@@ -153,9 +155,7 @@ def lease_tool(monkeypatch, tmp_path):
     def install(stdout: str = "[]", exit_code: int = 0):
         binary = tmp_path / "fake-voyn-lease"
         binary.write_text(
-            "#!/bin/sh\n"
-            f"cat <<'JSON'\n{stdout}\nJSON\n"
-            f"exit {exit_code}\n"
+            f"#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\nexit {exit_code}\n"
         )
         binary.chmod(0o755)
         monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
@@ -173,9 +173,7 @@ def _lease_row(worktree, **overrides) -> str:
         "session_id": "sess-1",
         "worktree": str(worktree),
         "process_pid": 4242,
-        "expires_at": (
-            datetime.now(UTC) + timedelta(minutes=5)
-        ).isoformat(),
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
     }
     row.update(overrides)
     return json.dumps([row])
@@ -298,7 +296,9 @@ def test_principal_isolation_failure_is_retryable_not_a_task_result(
     assert not removed, "ambiguous launcher failure must preserve task-local work"
 
 
-def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch) -> None:
+def test_api_error_in_cli_output_is_retryable_not_a_success(
+    handler, monkeypatch
+) -> None:
     """Incident 2026-08-21 16:09 UTC (control-01/worker-01): a shared
     Claude-CLI account hit its session/rate limit mid-fleet. The process
     still started and exited non-zero *with* stdout, so the pre-existing
@@ -352,8 +352,9 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch
     assert "session limit" in outcome.reason
 
 
-
-def test_bwrap_loopback_result_is_retryable_infrastructure_failure(handler, monkeypatch):
+def test_bwrap_loopback_result_is_retryable_infrastructure_failure(
+    handler, monkeypatch
+):
     run_agent, _runs = handler
     payload = _cascade_payload()
     payload["cascade"][0]["executor"] = "codex"
@@ -401,7 +402,9 @@ def test_codex_workspace_preflight_skips_to_fallback_without_spending_attempt(
     payload = _cascade_payload()
     payload["cascade"][0]["executor"] = "codex"
     payload["cascade"][0]["task_type"] = "implementation"
-    monkeypatch.setattr(agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap"))
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap")
+    )
     outcome = run_agent(payload, _event(), 1)
     assert outcome.ok
     assert outcome.result["cascade_step"] == 2
@@ -499,7 +502,9 @@ def test_unknown_copilot_failure_is_fail_closed_for_read_only_review(
     assert "unexpected provider-side failure" in outcome.reason
 
 
-def test_genuine_task_failure_with_error_flavoured_text_still_ok(handler, monkeypatch) -> None:
+def test_genuine_task_failure_with_error_flavoured_text_still_ok(
+    handler, monkeypatch
+) -> None:
     """Regression guard for the fix above: a run that genuinely executed and
     the agent's own report happens to mention "error"/"rate limit" in free
     text -- but the CLI's structured payload carries neither `is_error` nor
@@ -1036,7 +1041,11 @@ def test_a_lease_held_by_our_own_supervisor_does_not_block(
     """
     run_agent, runs = handler
     pid = os.getpid()
-    lease_tool(_lease_row(isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)))
+    lease_tool(
+        _lease_row(
+            isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)
+        )
+    )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert outcome.ok, outcome.reason
     assert len(runs) == 1, "the dispatch was refused by its own supervisor's lease"
@@ -1053,7 +1062,11 @@ def test_a_recycled_pid_matching_an_ancestor_still_blocks(
     """
     run_agent, runs = handler
     lease_tool(
-        _lease_row(isolated_path(tmp_path), process_pid=os.getpid(), process_start="not-our-start")
+        _lease_row(
+            isolated_path(tmp_path),
+            process_pid=os.getpid(),
+            process_start="not-our-start",
+        )
     )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
@@ -1095,12 +1108,7 @@ def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
     # `--repo <path> <verb> --repository ... --owner ...` shape instead. One
     # script answers both: it always emits `[]` (the only thing `list`
     # reads) and exits 0.
-    binary.write_text(
-        "#!/bin/sh\n"
-        f'echo "$*" >> {calls}\n'
-        "echo '[]'\n"
-        "exit 0\n"
-    )
+    binary.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho '[]'\nexit 0\n")
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
@@ -1130,8 +1138,7 @@ def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
     # only `publish_run` does, immediately before its push. See
     # `test_hold_never_touches_the_clone_wide_hook_identity_file`.
     assert not any(line.split()[2:3] == ["install-hooks"] for line in lines), (
-        "the full-lifecycle lease must not provision the clone-wide hook "
-        "identity file"
+        "the full-lifecycle lease must not provision the clone-wide hook identity file"
     )
 
 
@@ -1146,7 +1153,7 @@ def test_the_full_lifecycle_lease_is_scoped_to_the_task_not_the_repository(
     run_agent, _runs = handler
     calls = tmp_path / "lease-calls.log"
     binary = tmp_path / "fake-voyn-lease"
-    binary.write_text(f'#!/bin/sh\necho "$*" >> {calls}\necho \'[]\'\nexit 0\n')
+    binary.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho '[]'\nexit 0\n")
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
@@ -1184,7 +1191,7 @@ def test_publish_does_not_release_a_lease_the_caller_still_holds(
     run_agent, _runs = handler
     monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
     binary = tmp_path / "fake-voyn-lease"
-    binary.write_text("#!/bin/sh\nif [ \"$1\" = \"list\" ]; then echo '[]'; fi\nexit 0\n")
+    binary.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo \'[]\'; fi\nexit 0\n')
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
@@ -1227,7 +1234,7 @@ def test_publish_releases_its_own_lease_when_the_scopes_differ(
     run_agent, _runs = handler
     monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
     binary = tmp_path / "fake-voyn-lease"
-    binary.write_text("#!/bin/sh\nif [ \"$1\" = \"list\" ]; then echo '[]'; fi\nexit 0\n")
+    binary.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo \'[]\'; fi\nexit 0\n')
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")

@@ -146,6 +146,7 @@ def _provision_lock(key: str) -> threading.Lock:
             _provision_locks[key] = lock
         return lock
 
+
 #: BO-S3 result enrichment: the delivery contract for machine-readable
 #: outcomes. A PR reference is extracted by its exact URL shape — nothing
 #: else on GitHub looks like it — and the head SHA ONLY from an explicit
@@ -256,8 +257,8 @@ def _run_agent(
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
                 continue
             candidate_task_type = str(candidate.get("task_type", request.task_type))
-            candidate_available, candidate_detail, candidate_reason = _executor_preflight(
-                candidate_executor, candidate_task_type
+            candidate_available, candidate_detail, candidate_reason = (
+                _executor_preflight(candidate_executor, candidate_task_type)
             )
             if not candidate_available:
                 detail, unavailable_reason = candidate_detail, candidate_reason
@@ -445,7 +446,9 @@ def _run_agent(
                     )
 
             base_branch = (
-                project_config.get_project_config(request.project_id).get("default_branch")
+                project_config.get_project_config(request.project_id).get(
+                    "default_branch"
+                )
                 or "main"
             )
             spec = workspace_provisioning.WorkspaceSpec(
@@ -532,9 +535,7 @@ def _run_agent(
                 candidate_executor = str(candidate.get("executor"))
                 if candidate_executor not in agent_runner.COMMAND_BUILDERS:
                     continue
-                candidate_task_type = str(
-                    candidate.get("task_type", request.task_type)
-                )
+                candidate_task_type = str(candidate.get("task_type", request.task_type))
                 candidate_available, _, _ = _executor_preflight(
                     candidate_executor, candidate_task_type
                 )
@@ -666,7 +667,10 @@ def _run_agent(
                     isolated_workspace,
                     repository,
                     verified_clean=True,
-                    verified_inode=(evidence.workspace_device, evidence.workspace_inode),
+                    verified_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
                 )
             return HandlerOutcome(
                 ok=False,
@@ -793,7 +797,10 @@ def _run_agent(
                     start_sha=evidence.start_sha,
                     trusted_base_sha=evidence.base_sha,
                     expected_remote_sha=evidence.remote_task_sha,
-                    expected_inode=(evidence.workspace_device, evidence.workspace_inode),
+                    expected_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
                     expected_candidate_sha=candidate_sha,
                 ) as publish_clone:
                     # The fresh publisher clone above has now proved that the
@@ -820,7 +827,9 @@ def _run_agent(
                             lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
                             repository=publish_repository,
                             owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
-                            session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
+                            session=os.environ.get(
+                                "VOYN_LEASE_SESSION", "server-worker"
+                            ),
                             task=backlog_task,
                             deploy_key=deploy_key,
                             base=base_branch,
@@ -865,7 +874,10 @@ def _run_agent(
                     isolated_workspace,
                     repository,
                     verified_clean=True,
-                    verified_inode=(evidence.workspace_device, evidence.workspace_inode),
+                    verified_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
                 )
             if pub.reason in {
                 "uncommitted_changes",

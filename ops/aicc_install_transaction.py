@@ -7,11 +7,19 @@ import argparse
 import grp
 import json
 import os
+import re
 import secrets
+import shutil
 import stat
+import subprocess
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+RESTORABLE_UNIT_RE = re.compile(
+    r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
+    r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
+)
 
 
 @dataclass(frozen=True)
@@ -29,9 +37,13 @@ class BackupRecord:
     target: str
     existed: bool
     backup: str | None
-    mode: int | None
-    uid: int | None
-    gid: int | None
+    original_mode: int | None
+    original_uid: int | None
+    original_gid: int | None
+    staged: str
+    install_mode: int
+    install_uid: int
+    install_gid: int
 
 
 def _fsync_dir(path: Path) -> None:
@@ -66,6 +78,61 @@ def _atomic_bytes(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> 
             pass
 
 
+def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
+    """Restore the pre-attempt unit state after file generation recovery."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    units = payload.get("units")
+    if payload.get("version") != 2 or not isinstance(units, dict):
+        raise RuntimeError("invalid interrupted-install service snapshot")
+    validated: list[tuple[str, dict[str, bool]]] = []
+    for unit, state in sorted(units.items(), reverse=True):
+        if (
+            not isinstance(unit, str)
+            or not RESTORABLE_UNIT_RE.fullmatch(unit)
+            or not isinstance(state, dict)
+            or not isinstance(state.get("exists"), bool)
+            or not isinstance(state.get("enabled"), bool)
+            or not isinstance(state.get("active"), bool)
+        ):
+            raise RuntimeError("invalid interrupted-install service unit")
+        validated.append((unit, state))
+
+    def systemctl(*arguments: str) -> None:
+        result = run(
+            ["/usr/bin/systemctl", *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                result.stderr.strip()
+                or f"systemctl {' '.join(arguments)} failed during recovery"
+            )
+
+    systemctl("daemon-reload")
+    for unit, state in validated:
+        if state["exists"] is False:
+            run(
+                ["/usr/bin/systemctl", "stop", unit],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            run(
+                ["/usr/bin/systemctl", "disable", unit],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            continue
+        systemctl("enable" if state["enabled"] else "disable", unit)
+        systemctl("start" if state["active"] else "stop", unit)
+
+
 class FileTransaction:
     """Install a complete file set or restore its exact pre-install state."""
 
@@ -73,6 +140,26 @@ class FileTransaction:
         self.root = root.resolve()
         self.state_dir = state_dir.resolve()
         self.current = self.state_dir / "current.json"
+        self.pending = self.state_dir / "pending.json"
+
+    def _write_journal(self, manifest: Path, phase: str, next_index: int = 0) -> None:
+        recovery = manifest.parent / "recovery.py"
+        _atomic_bytes(
+            self.pending,
+            json.dumps(
+                {
+                    "version": 1,
+                    "manifest": str(manifest),
+                    "recovery": str(recovery),
+                    "phase": phase,
+                    "next_index": next_index,
+                },
+                sort_keys=True,
+            ).encode(),
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
 
     def _target(self, absolute: str) -> Path:
         if not absolute.startswith("/") or ".." in Path(absolute).parts:
@@ -120,7 +207,8 @@ class FileTransaction:
             targets.add(spec.target)
         return validated
 
-    def install(self, specs: Iterable[FileSpec]) -> None:
+    def prepare(self, specs: Iterable[FileSpec]) -> Path:
+        """Durably journal backups and staged payloads without touching targets."""
         validated = self.validate_sources(specs)
         source_payloads = {spec.target: spec.source.read_bytes() for spec in validated}
         previous_current = (
@@ -140,76 +228,209 @@ class FileTransaction:
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 raise ValueError(f"existing target is not a regular file: {target}")
         self._prepare_state_dir()
-        transaction = self.state_dir / f"transaction-{secrets.token_hex(8)}"
+        transaction = self.state_dir / f"generation-{secrets.token_hex(8)}"
         backups = transaction / "backups"
+        staged = transaction / "staged"
         backups.mkdir(parents=True, mode=0o700)
+        staged.mkdir(mode=0o700)
         records: list[BackupRecord] = []
 
         # Snapshot every target before the first mutation.
-        for index, spec in enumerate(validated):
-            target = self._target(spec.target)
-            if spec.if_missing and target.exists():
-                continue
-            try:
-                info = target.lstat()
-            except FileNotFoundError:
-                records.append(BackupRecord(spec.target, False, None, None, None, None))
-                continue
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-                raise ValueError(f"existing target is not a regular file: {target}")
-            backup = backups / f"{index:03d}.bin"
-            backup.write_bytes(target.read_bytes())
-            backup.chmod(0o600)
-            records.append(
-                BackupRecord(
-                    spec.target,
-                    True,
-                    str(backup),
-                    stat.S_IMODE(info.st_mode),
-                    info.st_uid,
-                    info.st_gid,
-                )
+        try:
+            _atomic_bytes(
+                transaction / "recovery.py",
+                Path(__file__).read_bytes(),
+                0o700,
+                os.geteuid(),
+                os.getegid(),
             )
+            for index, spec in enumerate(validated):
+                target = self._target(spec.target)
+                if spec.if_missing and target.exists():
+                    continue
+                staged_path = staged / f"{index:03d}.bin"
+                _atomic_bytes(
+                    staged_path,
+                    source_payloads[spec.target],
+                    0o600,
+                    os.geteuid(),
+                    os.getegid(),
+                )
+                try:
+                    info = target.lstat()
+                except FileNotFoundError:
+                    records.append(
+                        BackupRecord(
+                            spec.target,
+                            False,
+                            None,
+                            None,
+                            None,
+                            None,
+                            str(staged_path),
+                            spec.mode,
+                            spec.uid,
+                            spec.gid,
+                        )
+                    )
+                    continue
+                if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    raise ValueError(f"existing target is not a regular file: {target}")
+                backup = backups / f"{index:03d}.bin"
+                _atomic_bytes(
+                    backup,
+                    target.read_bytes(),
+                    0o600,
+                    os.geteuid(),
+                    os.getegid(),
+                )
+                records.append(
+                    BackupRecord(
+                        spec.target,
+                        True,
+                        str(backup),
+                        stat.S_IMODE(info.st_mode),
+                        info.st_uid,
+                        info.st_gid,
+                        str(staged_path),
+                        spec.mode,
+                        spec.uid,
+                        spec.gid,
+                    )
+                )
+        except BaseException:
+            shutil.rmtree(transaction, ignore_errors=True)
+            _fsync_dir(self.state_dir)
+            raise
 
         manifest = transaction / "manifest.json"
-        manifest.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "records": [asdict(record) for record in records],
-                    "previous_current": previous_current,
-                },
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-        manifest.chmod(0o600)
-        _fsync_dir(transaction)
-
         try:
-            record_targets = {record.target for record in records}
-            for spec in validated:
-                if spec.target not in record_targets:
-                    continue
-                _atomic_bytes(
-                    self._target(spec.target),
-                    source_payloads[spec.target],
-                    spec.mode,
-                    spec.uid,
-                    spec.gid,
-                )
             _atomic_bytes(
-                self.current,
-                json.dumps({"manifest": str(manifest)}, sort_keys=True).encode(),
+                manifest,
+                json.dumps(
+                    {
+                        "version": 2,
+                        "generation": transaction.name,
+                        "records": [asdict(record) for record in records],
+                        "previous_current": previous_current,
+                    },
+                    sort_keys=True,
+                ).encode(),
                 0o600,
                 os.geteuid(),
                 os.getegid(),
             )
+            _fsync_dir(transaction)
+            # Durable PREPARED intent is the only gateway to target writes.
+            self._write_journal(manifest, "PREPARED")
+        except BaseException:
+            shutil.rmtree(transaction, ignore_errors=True)
+            _fsync_dir(self.state_dir)
+            raise
+        return manifest
+
+    def _pending_manifest(self) -> Path:
+        value = json.loads(self.pending.read_text(encoding="utf-8"))
+        manifest = Path(value["manifest"]).resolve(strict=True)
+        if (
+            not manifest.is_relative_to(self.state_dir)
+            or manifest.name != "manifest.json"
+        ):
+            raise RuntimeError("pending transaction manifest escaped state directory")
+        return manifest
+
+    def apply(self) -> None:
+        """Apply one prepared generation; recovery stays armed until commit."""
+        manifest = self._pending_manifest()
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        records = [BackupRecord(**value) for value in payload["records"]]
+        try:
+            for index, record in enumerate(records):
+                # Write-ahead index makes every destination mutation recoverable.
+                self._write_journal(manifest, "APPLYING", index)
+                _atomic_bytes(
+                    self._target(record.target),
+                    Path(record.staged).read_bytes(),
+                    record.install_mode,
+                    record.install_uid,
+                    record.install_gid,
+                )
+            self._write_journal(manifest, "APPLIED", len(records))
         except BaseException:
             self.restore(manifest)
+            shutil.rmtree(manifest.parent)
+            _fsync_dir(self.state_dir)
             raise
 
-    def restore(self, manifest: Path | None = None) -> None:
+    def commit(self) -> None:
+        """Publish an applied generation only after service rollout succeeds."""
+        manifest = self._pending_manifest()
+        journal = json.loads(self.pending.read_text(encoding="utf-8"))
+        if journal.get("phase") != "APPLIED":
+            raise RuntimeError("only a fully applied generation can be committed")
+        self._write_journal(manifest, "COMMITTING", journal.get("next_index", 0))
+        _atomic_bytes(
+            self.current,
+            json.dumps({"manifest": str(manifest)}, sort_keys=True).encode(),
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
+        self.pending.unlink()
+        _fsync_dir(self.state_dir)
+
+    def install(self, specs: Iterable[FileSpec]) -> None:
+        self.prepare(specs)
+        self.apply()
+        self.commit()
+
+    def recover(self) -> None:
+        """Idempotently roll back an interrupted prepared/applying generation."""
+        if not self.pending.exists():
+            self._remove_orphan_generations()
+            return
+        manifest = self._pending_manifest()
+        transaction = manifest.parent
+        self.restore(manifest, clear_pending=False)
+        restore_service_snapshot(self.state_dir / "attempt-units.json")
+        self._clear_pending(manifest)
+        shutil.rmtree(transaction)
+        self._remove_orphan_generations()
+        _fsync_dir(self.state_dir)
+
+    def _current_generation_manifests(self) -> set[Path]:
+        manifests: set[Path] = set()
+        pointer = self.current.read_bytes() if self.current.exists() else None
+        while pointer:
+            value = json.loads(pointer)
+            manifest = Path(value["manifest"]).resolve(strict=True)
+            if not manifest.is_relative_to(self.state_dir) or manifest in manifests:
+                raise RuntimeError("installed generation chain is invalid")
+            manifests.add(manifest)
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            previous = payload.get("previous_current")
+            pointer = previous.encode() if previous else None
+        return manifests
+
+    def _remove_orphan_generations(self) -> None:
+        if not self.state_dir.exists():
+            return
+        retained = {path.parent for path in self._current_generation_manifests()}
+        for generation in self.state_dir.glob("generation-*"):
+            if generation not in retained:
+                shutil.rmtree(generation)
+
+    def _clear_pending(self, manifest: Path) -> None:
+        if not self.pending.exists():
+            return
+        pending = json.loads(self.pending.read_text(encoding="utf-8"))
+        if Path(pending.get("manifest", "")).resolve() == manifest.resolve():
+            self.pending.unlink()
+            _fsync_dir(self.state_dir)
+
+    def restore(
+        self, manifest: Path | None = None, *, clear_pending: bool = True
+    ) -> None:
         if manifest is None:
             current = json.loads(self.current.read_text(encoding="utf-8"))
             manifest = Path(current["manifest"])
@@ -219,15 +440,15 @@ class FileTransaction:
             target = self._target(record.target)
             if record.existed:
                 assert record.backup is not None
-                assert record.mode is not None
-                assert record.uid is not None
-                assert record.gid is not None
+                assert record.original_mode is not None
+                assert record.original_uid is not None
+                assert record.original_gid is not None
                 _atomic_bytes(
                     target,
                     Path(record.backup).read_bytes(),
-                    record.mode,
-                    record.uid,
-                    record.gid,
+                    record.original_mode,
+                    record.original_uid,
+                    record.original_gid,
                 )
             else:
                 try:
@@ -252,6 +473,20 @@ class FileTransaction:
                 os.geteuid(),
                 os.getegid(),
             )
+        if clear_pending:
+            self._clear_pending(manifest)
+
+    def uninstall_all(self) -> None:
+        """Unwind every installed generation to the original pre-install state."""
+        self.recover()
+        while self.current.exists():
+            value = json.loads(self.current.read_text(encoding="utf-8"))
+            manifest = Path(value["manifest"]).resolve(strict=True)
+            transaction = manifest.parent
+            self.restore(manifest)
+            shutil.rmtree(transaction)
+            _fsync_dir(self.state_dir)
+        self._remove_orphan_generations()
 
 
 def default_specs(
@@ -266,6 +501,16 @@ def default_specs(
     agent_gid = grp.getgrnam("aicc-agent").gr_gid if resolve_identities else 0
     publisher_gid = grp.getgrnam("aicc-publisher").gr_gid if resolve_identities else 0
     return (
+        # The generator is intentionally the first destination mutation. Once
+        # its atomic rename lands, every later mutation can recover on boot
+        # from the self-contained generation copy referenced by pending.json.
+        FileSpec(
+            repo_root / "ops/aicc_principal_recovery_generator.py",
+            "/usr/lib/systemd/system-generators/aicc-principal-recovery",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
         FileSpec(
             repo_root / "deploy/sysusers.d/aicc-agent.conf",
             "/usr/lib/sysusers.d/aicc-agent.conf",
@@ -284,6 +529,27 @@ def default_specs(
             repo_root / "ops/aicc_agent_launcher.py",
             "/usr/libexec/aicc-agent-launcher",
             0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "ops/aicc_install_transaction.py",
+            "/usr/libexec/aicc-install-transaction",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "ops/aicc_staged_worker_rollout.py",
+            "/usr/libexec/aicc-staged-worker-rollout",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-principal-recovery.service",
+            "/etc/systemd/system/aicc-principal-recovery.service",
+            0o644,
             root_uid,
             root_gid,
         ),
@@ -308,6 +574,20 @@ def default_specs(
             root_uid,
             root_gid,
             True,
+        ),
+        FileSpec(
+            repo_root / "deploy/aicc/worker-lanes",
+            "/etc/aicc/worker-lanes",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/aicc/privileged-principals",
+            "/etc/aicc/privileged-principals",
+            0o644,
+            root_uid,
+            root_gid,
         ),
         FileSpec(
             repo_root / "deploy/aicc/agent.env",
@@ -365,9 +645,19 @@ def default_specs(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "action", choices=("validate", "install", "rollback", "uninstall")
+        "action",
+        choices=(
+            "validate",
+            "prepare",
+            "apply",
+            "commit",
+            "install",
+            "recover",
+            "rollback",
+            "uninstall",
+        ),
     )
-    parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument("--repo-root", type=Path, default=Path("/opt/aicc"))
     parser.add_argument("--root", type=Path, default=Path("/"))
     parser.add_argument(
         "--state-dir", type=Path, default=Path("/var/lib/aicc-principal-isolation")
@@ -387,19 +677,28 @@ def main() -> int:
     )
     args = parser.parse_args()
     transaction = FileTransaction(args.root, args.state_dir)
-    specs = default_specs(
-        args.repo_root,
-        authority_env=args.authority_env,
-        claude_auth=args.claude_auth,
-        codex_auth=args.codex_auth,
-        resolve_identities=args.action != "validate",
-    )
+    if args.action in {"validate", "prepare", "install"}:
+        specs = default_specs(
+            args.repo_root,
+            authority_env=args.authority_env,
+            claude_auth=args.claude_auth,
+            codex_auth=args.codex_auth,
+            resolve_identities=args.action != "validate",
+        )
     if args.action == "validate":
         transaction.validate_sources(specs)
+    elif args.action == "prepare":
+        transaction.prepare(specs)
+    elif args.action == "apply":
+        transaction.apply()
+    elif args.action == "commit":
+        transaction.commit()
     elif args.action == "install":
         transaction.install(specs)
+    elif args.action in {"recover", "rollback"}:
+        transaction.recover()
     else:
-        transaction.restore()
+        transaction.uninstall_all()
     return 0
 
 
