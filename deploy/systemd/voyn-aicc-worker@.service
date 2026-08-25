@@ -1,0 +1,49 @@
+# Versioned registry-driven worker template for VOYN pre-production.
+[Unit]
+Description=AICC preprod worker lane %i
+After=network-online.target voyn-aicc-pgtunnel.service
+Wants=network-online.target
+Requires=voyn-aicc-pgtunnel.service
+
+[Service]
+# Type=notify-reload makes `systemctl reload` wait until the daemon has
+# finished its current attempt, replaced its PostgreSQL pool, authenticated
+# with the new credential and sent READY=1.
+Type=notify-reload
+NotifyAccess=main
+WatchdogSec=240s
+User=aicc-worker
+Group=aicc-worker
+WorkingDirectory=/opt/aicc
+LoadCredential=voyn_lease_pgpass:/etc/voyn/secrets/voyn_lease_pgpass
+RuntimeDirectory=voyn-aicc-worker-%i
+RuntimeDirectoryMode=0750
+Environment=PGPASSFILE=/run/voyn-aicc-worker-%i/pgpass
+Environment=AICC_WORKER_ENV_FILE=/var/lib/voyn-aicc-credential-rotation/worker.env
+EnvironmentFile=/etc/aicc/lease.env
+EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env
+EnvironmentFile=-/etc/aicc/executors.env
+EnvironmentFile=-/etc/aicc/worker-%i.env
+UnsetEnvironment=ANTHROPIC_API_KEY
+ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker-%i/pgpass
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
+
+Restart=always
+RestartSec=10s
+RestartPreventExitStatus=2
+# SIGTERM reaches only the daemon. Its child agent keeps running until the
+# daemon exits naturally; only the final bounded kill reaches the cgroup.
+KillMode=mixed
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+TimeoutStopSec=3660s
+TimeoutStartSec=195s
+
+MemoryMax=6G
+MemoryHigh=5G
+CPUQuota=300%
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target
