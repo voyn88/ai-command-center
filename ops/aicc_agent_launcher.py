@@ -427,9 +427,9 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor = os.open(target, flags, 0o640)
+        descriptor = os.open(target, flags, 0o660)
         try:
-            os.fchmod(descriptor, 0o640)
+            os.fchmod(descriptor, 0o660)
             os.fchown(descriptor, 0, auth_gid)
             with os.fdopen(descriptor, "wb", closefd=False) as stream:
                 stream.write(source_payload)
@@ -441,7 +441,10 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
                 or target_info.st_nlink != 1
                 or target_info.st_uid != 0
                 or target_info.st_gid != auth_gid
-                or stat.S_IMODE(target_info.st_mode) != 0o640
+                # 0660: Claude/Codex rewrite their auth file on token
+                # refresh; 0640 broke refresh mid-run while the 0770 home
+                # let the agent replace the file anyway (review on 67a0a96).
+                or stat.S_IMODE(target_info.st_mode) != 0o660
                 or target_info.st_size != len(source_payload)
             ):
                 raise LaunchRefused("ephemeral model auth target failed validation")
@@ -701,53 +704,73 @@ def _prepare_workspace_permissions(
         raise LaunchRefused("cannot open task workspace safely") from exc
     owner_uid = os.fstat(workspace_fd).st_uid
 
-    def normalize_directory(directory_fd: int, relative: Path) -> None:
-        os.fchown(directory_fd, owner_uid, workspace_gid)
-        os.fchmod(directory_fd, 0o2770)
-        # scandir owns only the duplicate. All mutations below are relative to
-        # the still-open parent descriptor, so renames and symlink swaps do
-        # not redirect root outside the workspace.
-        with os.scandir(os.dup(directory_fd)) as entries:
-            snapshot = list(entries)
-        for entry in snapshot:
-            before = entry.stat(follow_symlinks=False)
-            if stat.S_ISLNK(before.st_mode):
-                continue
-            child_relative = relative / entry.name
-            flags = directory_flags if stat.S_ISDIR(before.st_mode) else file_flags
-            try:
-                child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
-            except OSError as exc:
-                raise LaunchRefused(
-                    f"workspace entry changed while opening: {child_relative}"
-                ) from exc
-            try:
-                current = os.fstat(child_fd)
-                if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
-                    raise LaunchRefused(
-                        f"workspace entry changed while opening: {child_relative}"
-                    )
-                if stat.S_ISDIR(current.st_mode):
-                    normalize_directory(child_fd, child_relative)
-                elif stat.S_ISREG(current.st_mode):
-                    if current.st_nlink != 1:
-                        raise LaunchRefused(
-                            f"hard-linked workspace file refused: {child_relative}"
-                        )
-                    os.fchown(child_fd, owner_uid, workspace_gid)
-                    path = workspace / child_relative
-                    os.fchmod(child_fd, 0o770 if path in executable else 0o660)
-                else:
-                    raise LaunchRefused(
-                        f"unsupported workspace node refused: {child_relative}"
-                    )
-            finally:
-                os.close(child_fd)
-
+    # Iterative walk with an explicit stack: recursion held one descriptor
+    # per nesting level of AGENT-CONTROLLED depth -- a deep tree exhausted
+    # fds/stack inside the root broker (review on 67a0a96). The stack owns
+    # every fd it holds and the depth is bounded outright.
+    max_depth = 128
+    stack: list[tuple[int, Path, int]] = [(workspace_fd, Path(), 0)]
     try:
-        normalize_directory(workspace_fd, Path())
+        while stack:
+            directory_fd, relative, depth = stack.pop()
+            try:
+                if depth > max_depth:
+                    raise LaunchRefused("workspace nesting exceeds supported depth")
+                os.fchown(directory_fd, owner_uid, workspace_gid)
+                os.fchmod(directory_fd, 0o2770)
+                with os.scandir(os.dup(directory_fd)) as entries:
+                    snapshot = list(entries)
+                for entry in snapshot:
+                    before = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(before.st_mode):
+                        continue
+                    child_relative = relative / entry.name
+                    flags = (
+                        directory_flags
+                        if stat.S_ISDIR(before.st_mode)
+                        else file_flags
+                    )
+                    try:
+                        child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+                    except OSError as exc:
+                        raise LaunchRefused(
+                            f"workspace entry changed while opening: {child_relative}"
+                        ) from exc
+                    keep_open = False
+                    try:
+                        current = os.fstat(child_fd)
+                        if (current.st_dev, current.st_ino) != (
+                            before.st_dev,
+                            before.st_ino,
+                        ):
+                            raise LaunchRefused(
+                                f"workspace entry changed while opening: {child_relative}"
+                            )
+                        if stat.S_ISDIR(current.st_mode):
+                            stack.append((child_fd, child_relative, depth + 1))
+                            keep_open = True
+                        elif stat.S_ISREG(current.st_mode):
+                            if current.st_nlink != 1:
+                                raise LaunchRefused(
+                                    f"hard-linked workspace file refused: {child_relative}"
+                                )
+                            os.fchown(child_fd, owner_uid, workspace_gid)
+                            path = workspace / child_relative
+                            os.fchmod(
+                                child_fd, 0o770 if path in executable else 0o660
+                            )
+                        else:
+                            raise LaunchRefused(
+                                f"unsupported workspace node refused: {child_relative}"
+                            )
+                    finally:
+                        if not keep_open:
+                            os.close(child_fd)
+            finally:
+                os.close(directory_fd)
     finally:
-        os.close(workspace_fd)
+        for pending_fd, _pending_relative, _pending_depth in stack:
+            os.close(pending_fd)
 
 
 def _provider_command(manifest: dict[str, Any]) -> list[str]:
@@ -845,6 +868,10 @@ def _systemd_command(
 ) -> list[str]:
     executor = manifest["executor"]
     timeout = int(manifest["timeout_seconds"])
+    # No nesting hazard in this list: EPHEMERAL_HOME_ROOT is
+    # /run/aicc-agent-homes -- a SIBLING of /run/aicc-agent-launcher, not a
+    # child, so systemd never overmounts a parent before lstat'ing a nested
+    # entry (nesting-question raised in review on 67a0a96).
     inaccessible_paths = " ".join(
         (*SENSITIVE_AUTHORITY_TREES, str(EPHEMERAL_HOME_ROOT), str(workspace_root))
     )
@@ -1049,10 +1076,23 @@ def _quarantine_workspace(workspace: Path, run_id: str) -> Path:
 
 
 def _pinned_real_path(workspace_fd: int, workspace_root: Path) -> Path:
-    """The pinned descriptor's CURRENT real path, contained in the root."""
-    real = Path(os.readlink(f"/proc/self/fd/{workspace_fd}"))
+    """The pinned descriptor's CURRENT real path, identity-checked.
+
+    Containment alone left two gaps (review on 67a0a96): an unlinked
+    workspace reads back as "... (deleted)" yet stays inside the root, and a
+    rename+replace between readlink and PID 1's resolution would bind a
+    DIFFERENT inode. The path must still stat to the exact pinned identity.
+    """
+    raw = os.readlink(f"/proc/self/fd/{workspace_fd}")
+    if raw.endswith(" (deleted)"):
+        raise LaunchRefused("pinned workspace was unlinked")
+    real = Path(raw)
     if not real.is_absolute() or not real.is_relative_to(workspace_root):
         raise LaunchRefused("pinned workspace moved outside its root")
+    pinned = os.fstat(workspace_fd)
+    observed = os.stat(real, follow_symlinks=False)
+    if (observed.st_dev, observed.st_ino) != (pinned.st_dev, pinned.st_ino):
+        raise LaunchRefused("pinned workspace path no longer names the pinned inode")
     return real
 
 

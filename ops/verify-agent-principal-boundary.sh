@@ -30,6 +30,7 @@ if id -nG aicc-agent | tr ' ' '\n' | grep -qx aicc-publisher; then
 fi
 id -nG voynadmin | tr ' ' '\n' | grep -qx aicc-publisher || \
   fail "publisher lacks launcher access group"
+getent group aicc-agent-auth >/dev/null || fail "aicc-agent-auth group is missing"
 auth_members=$(getent group aicc-agent-auth | cut -d: -f4) || \
   fail "aicc-agent-auth group is missing"
 [ -z "$auth_members" ] || fail "model-auth group has static members"
