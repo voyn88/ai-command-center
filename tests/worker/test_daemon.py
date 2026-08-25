@@ -12,6 +12,7 @@ from __future__ import annotations
 
 
 from command_center.db.work_queue_store import ClaimedWork, QueueRefusal
+from command_center.observability import WorkerTelemetry
 from command_center.worker.daemon import (
     HandlerOutcome,
     WorkerConfig,
@@ -443,3 +444,72 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
     assert frames[0] == b"READY=1"
     assert frames[-1] == b"STOPPING=1"
     assert b"WATCHDOG=1" in frames
+
+
+def test_telemetry_tracks_the_task_sha_and_lease_of_the_item_in_hand() -> None:
+    """Acceptance (VOYN-W0-AICC-SRV-08): the worker scrape must identify the
+    worker, its task, the source SHA and the lease. The daemon is the only
+    place those are known, so a regression here silently empties the dashboard
+    while every metric still renders."""
+    telemetry = WorkerTelemetry(worker="aicc_w_1")
+    store = ScriptedStore(
+        [_work({"kind": "echo", "backlog_task_id": "TASK-9", "sha": "cafe"})]
+    )
+    mid_flight: list[str] = []
+
+    def echo(payload, lease_lost, attempt_no=1):
+        mid_flight.append(telemetry.render())
+        return HandlerOutcome(ok=True, result={"head_sha": "beef"})
+
+    daemon = WorkerDaemon(
+        store,
+        {"echo": echo},
+        WorkerConfig(visibility_seconds=3),
+        telemetry=telemetry,
+    )
+    _run_until_idle(daemon, store)
+
+    # While the handler runs the item is claimed, named, and its lease is aged.
+    running = mid_flight[0]
+    assert (
+        'aicc_worker_active{attempt="wat-1",sha="cafe",task="TASK-9",'
+        'worker="aicc_w_1"} 1' in running
+    )
+    assert "aicc_worker_lease_age_seconds{" in running
+
+    # Afterwards the worker is idle, and the SHA it actually produced replaces
+    # the one the payload requested.
+    done = telemetry.render()
+    assert 'sha="beef"' in done
+    assert 'aicc_worker_active{attempt="wat-1",sha="beef",task="TASK-9",worker="aicc_w_1"} 0' in done
+    assert 'aicc_worker_tasks_total{outcome="succeeded",worker="aicc_w_1"} 1' in done
+
+
+def test_telemetry_counts_a_lost_lease_as_a_failure_and_goes_idle() -> None:
+    """A worker whose lease lapsed must not keep reporting an active task —
+    `aicc_worker_active` stuck at 1 is indistinguishable from a wedged run."""
+    telemetry = WorkerTelemetry(worker="aicc_w_1")
+    store = ScriptedStore([_work({"kind": "slow"})])
+    store.heartbeat_alive = False
+
+    def slow(payload, lease_lost, attempt_no=1):
+        lease_lost.wait(timeout=5)
+        return HandlerOutcome(ok=True, result={})
+
+    daemon = WorkerDaemon(
+        store,
+        {"slow": slow},
+        WorkerConfig(visibility_seconds=3),
+        telemetry=telemetry,
+    )
+    _run_until_idle(daemon, store)
+
+    body = telemetry.render()
+    # No task id in the payload, so the item id names the task; no SHA was
+    # reported because the outcome was discarded.
+    assert (
+        'aicc_worker_active{attempt="wat-1",sha="unknown",task="wki-10",'
+        'worker="aicc_w_1"} 0' in body
+    )
+    assert 'aicc_worker_tasks_total{outcome="failed",worker="aicc_w_1"} 1' in body
+    assert 'aicc_worker_tasks_total{outcome="succeeded",worker="aicc_w_1"} 0' in body

@@ -490,8 +490,14 @@ def _server_major(conn) -> int:
 
 
 @pytest.mark.skipif(
-    not (shutil.which("pg_dump") and shutil.which("pg_restore") and shutil.which("psql")),
-    reason="PostgreSQL client binaries are not installed",
+    not (
+        shutil.which("pg_dump")
+        and shutil.which("pg_restore")
+        and shutil.which("psql")
+        and shutil.which("age")
+        and shutil.which("age-keygen")
+    ),
+    reason="PostgreSQL client and age binaries are not installed",
 )
 def test_backup_restore_drill_round_trips_data(
     admin_conn, psycopg, test_dsn, role_passwords, pg_database, tmp_path
@@ -525,6 +531,24 @@ def test_backup_restore_drill_round_trips_data(
     }
     repo_root = _repo_root()
     backup_dir = tmp_path / "backups"
+    identity = tmp_path / "recovery.agekey"
+    keygen = subprocess.run(
+        ["age-keygen", "-o", str(identity)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    recipient = next(
+        line.removeprefix("Public key: ")
+        for line in keygen.stderr.splitlines()
+        if line.startswith("Public key: ")
+    )
+    env.update(
+        {
+            "AICC_BACKUP_AGE_RECIPIENT": recipient,
+            "AICC_BACKUP_AGE_IDENTITY_FILE": str(identity),
+        }
+    )
 
     subprocess.run(
         [
@@ -540,7 +564,7 @@ def test_backup_restore_drill_round_trips_data(
 
     from pathlib import Path
 
-    archives = sorted(backup_dir.glob("*.dump"))
+    archives = sorted(backup_dir.glob("*.dump.age"))
     assert len(archives) == 1
     assert Path(f"{archives[0]}.sha256").exists()
 

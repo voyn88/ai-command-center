@@ -8,6 +8,15 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — AICC server observability and encrypted recovery (VOYN-W0-AICC-SRV-08)
+
+- Added Prometheus control and worker scrape surfaces for queue lag, lease age,
+  worker liveness, active task/SHA, task runtime, estimated cost, CPU and memory.
+- Added the Grafana operations dashboard, worker-loss/lease/queue alerts, and
+  per-attempt trace-correlated structured logs.
+- Encrypted PostgreSQL backups with `age`, retained checksum verification, and
+  documented the clean-control recovery drill and evidence checklist.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

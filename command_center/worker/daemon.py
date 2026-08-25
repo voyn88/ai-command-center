@@ -33,6 +33,7 @@ Design decisions, each traceable to the shipped substrate:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 import signal
@@ -45,6 +46,7 @@ from command_center.db.work_queue_store import (
     QueueRefusal,
     WorkQueueStore,
 )
+from command_center.observability import WorkerTelemetry
 from command_center.worker import sdnotify
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,7 @@ class WorkerDaemon:
         *,
         sleep: Callable[[float], None] | None = None,
         notify: Callable[[str], object] | None = None,
+        telemetry: WorkerTelemetry | None = None,
     ) -> None:
         self._store = store
         self._handlers = dict(handlers)
@@ -107,6 +110,7 @@ class WorkerDaemon:
         # Injectable so tests observe pings; the default is a no-op outside
         # systemd (sd_notify returns quietly without NOTIFY_SOCKET).
         self._notify = notify if notify is not None else sdnotify.sd_notify
+        self._telemetry = telemetry
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -155,6 +159,27 @@ class WorkerDaemon:
         self._notify("STOPPING=1")
 
     def _execute(self, work: ClaimedWork) -> None:
+        if self._telemetry is not None:
+            payload = work.payload if isinstance(work.payload, dict) else {}
+            task = (
+                payload.get("backlog_task_id")
+                or payload.get("task_id")
+                or work.work_item_id
+            )
+            sha = payload.get("sha") or payload.get("head_sha") or "unknown"
+            self._telemetry.start(
+                task=task,
+                sha=sha,
+                attempt=work.attempt_id,
+            )
+        trace_id = hashlib.sha256(work.attempt_id.encode()).hexdigest()[:32]
+        logger.info(
+            "trace_start trace_id=%s attempt=%s task=%s sha=%s",
+            trace_id,
+            work.attempt_id,
+            self._telemetry.task if self._telemetry else work.work_item_id,
+            self._telemetry.sha if self._telemetry else "unknown",
+        )
         lease_lost = threading.Event()
         beat_stop = threading.Event()
         beat = threading.Thread(
@@ -179,6 +204,13 @@ class WorkerDaemon:
                 "attempt %s: lease lost mid-execution; outcome discarded",
                 work.attempt_id,
             )
+            if self._telemetry is not None:
+                self._telemetry.finish(succeeded=False)
+            logger.info(
+                "trace_end trace_id=%s attempt=%s outcome=lease_lost",
+                trace_id,
+                work.attempt_id,
+            )
             return
         if outcome.ok:
             accepted = self._store.complete(work, outcome.result)
@@ -198,6 +230,18 @@ class WorkerDaemon:
                 "lapsed lease (handler effects may re-run on the next attempt)",
                 work.attempt_id,
             )
+        if self._telemetry is not None:
+            result = outcome.result if isinstance(outcome.result, dict) else {}
+            self._telemetry.finish(
+                succeeded=outcome.ok and accepted,
+                sha=result.get("head_sha") or result.get("sha"),
+            )
+        logger.info(
+            "trace_end trace_id=%s attempt=%s outcome=%s",
+            trace_id,
+            work.attempt_id,
+            "succeeded" if outcome.ok and accepted else "failed",
+        )
 
     def _dispatch(
         self, work: ClaimedWork, lease_lost: threading.Event

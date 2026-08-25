@@ -27,6 +27,11 @@ WatchdogSec=240s
 User=aicc-worker
 Group=aicc-worker
 EnvironmentFile=/etc/aicc/worker.env
+# Prometheus reaches this port only over the worker's private network.
+Environment=AICC_WORKER_METRICS_HOST=0.0.0.0
+Environment=AICC_WORKER_METRICS_PORT=9108
+# Optional blended infrastructure price; currency is chosen fleet-wide.
+Environment=AICC_WORKER_COST_PER_HOUR=0
 WorkingDirectory=/opt/aicc
 ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
 

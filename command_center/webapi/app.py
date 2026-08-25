@@ -140,6 +140,13 @@ def create_app() -> FastAPI:
         response.status_code = 200 if report.ok else 503
         return report.to_dict()
 
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        """Prometheus scrape surface; contains no payloads or credentials."""
+        from command_center.observability import CONTENT_TYPE, render_control_metrics
+
+        return Response(render_control_metrics(), media_type=CONTENT_TYPE)
+
     # Agent-dispatch policy layer (VOYN-W2-AGENT): `/api/v1/dispatch/*`.
     # Registered before the SPA mount so its routes resolve ahead of the
     # catch-all static handler.

@@ -8,6 +8,7 @@ needs a database to exercise — so they run everywhere, not only where
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,7 @@ _ENV = {
     "AICC_PG_DB": "aicc_live",
     "AICC_PG_USER": "aicc_migrator",
     "AICC_PG_PASSWORD": "irrelevant-for-these-checks",
+    "AICC_BACKUP_AGE_RECIPIENT": "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
 }
 
 
@@ -78,3 +80,36 @@ def test_restore_rejects_a_missing_archive(tmp_path) -> None:
     result = _run(RESTORE, "--archive", str(tmp_path / "absent.dump"), "--target-db", "x")
     assert result.returncode == 2
     assert "archive not found" in result.stderr
+
+
+def test_restore_requires_an_identity_for_an_encrypted_archive(tmp_path) -> None:
+    archive = tmp_path / "backup.dump.age"
+    archive.write_bytes(b"encrypted")
+    result = _run(RESTORE, "--archive", str(archive), "--target-db", "clean")
+    assert result.returncode != 0
+    assert "AICC_BACKUP_AGE_IDENTITY_FILE" in result.stderr
+
+
+def test_backup_plaintext_partial_is_owner_only_from_creation() -> None:
+    script = BACKUP.read_text()
+    assert "umask 077" in script
+    assert script.index("umask 077") < script.index('PGPASSWORD="$AICC_PG_PASSWORD" pg_dump')
+
+
+@pytest.mark.skipif(
+    not (shutil.which("pg_restore") and shutil.which("psql")),
+    reason="PostgreSQL client binaries are not installed",
+)
+def test_restore_names_the_cause_when_the_checksum_does_not_match(tmp_path) -> None:
+    """`sha256sum --check --status` is silent, so a bare `set -e` abort tells a
+    recovering operator nothing. Bit rot must be named, and must stop the
+    restore before the target database is created."""
+    archive = tmp_path / "backup.dump"
+    archive.write_bytes(b"corrupted archive contents")
+    (tmp_path / "backup.dump.sha256").write_text(f"{'0' * 64}  {archive.name}\n")
+
+    result = _run(RESTORE, "--archive", str(archive), "--target-db", "clean")
+
+    assert result.returncode == 5
+    assert "checksum mismatch" in result.stderr
+    assert "refusing to restore a corrupted backup" in result.stderr

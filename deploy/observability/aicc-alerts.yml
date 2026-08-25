@@ -1,0 +1,21 @@
+groups:
+  - name: aicc-p0
+    rules:
+      - alert: AICCWorkerLost
+        expr: up{job="aicc-worker"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "AICC worker {{ $labels.instance }} is unreachable"
+          runbook: "docs/operations/OBSERVABILITY_BACKUP_RECOVERY.md#worker-loss"
+      - alert: AICCLeaseHeartbeatStale
+        expr: aicc_lease_age_seconds > 120
+        for: 1m
+        labels:
+          severity: page
+      - alert: AICCQueueLagHigh
+        expr: aicc_queue_lag_seconds > 300
+        for: 5m
+        labels:
+          severity: warning

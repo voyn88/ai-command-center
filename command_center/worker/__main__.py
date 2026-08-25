@@ -10,7 +10,41 @@ with backoff", which is why auth failure exits instead of retrying.
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from command_center.observability import CONTENT_TYPE, WorkerTelemetry
+
+
+def _start_metrics(telemetry: WorkerTelemetry) -> ThreadingHTTPServer | None:
+    host = os.environ.get("AICC_WORKER_METRICS_HOST", "127.0.0.1")
+    port = int(os.environ.get("AICC_WORKER_METRICS_PORT", "9108"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 -- stdlib handler contract
+            if self.path != "/metrics":
+                self.send_error(404)
+                return
+            body = telemetry.render().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", CONTENT_TYPE)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *args: object) -> None:
+            return
+
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
+    except OSError as error:
+        logging.getLogger(__name__).error("worker metrics listener failed: %s", error)
+        return None
+    threading.Thread(target=server.serve_forever, name="metrics", daemon=True).start()
+    return server
 
 
 def main() -> int:
@@ -35,11 +69,20 @@ def main() -> int:
         print(f"worker: cannot reach PostgreSQL: {error}", file=sys.stderr)
         return 3
 
-    daemon = WorkerDaemon(WorkQueueStore(), handlers=build_handlers())
+    telemetry = WorkerTelemetry(
+        worker=os.environ.get("AICC_WORKER_ID", socket.gethostname()),
+        cost_per_hour=float(os.environ.get("AICC_WORKER_COST_PER_HOUR", "0")),
+    )
+    metrics_server = _start_metrics(telemetry)
+    daemon = WorkerDaemon(
+        WorkQueueStore(), handlers=build_handlers(), telemetry=telemetry
+    )
     daemon.install_signal_handlers()
     try:
         daemon.run_forever()
     finally:
+        if metrics_server is not None:
+            metrics_server.shutdown()
         pool.close_pool()
     return 0
 

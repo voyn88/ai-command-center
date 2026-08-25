@@ -12,7 +12,7 @@
 # corrupted archive fails while the target database is still empty.
 #
 # Usage:
-#   scripts/aicc_pg_restore.sh --archive /var/backups/aicc/aicc-...dump \
+#   scripts/aicc_pg_restore.sh --archive /var/backups/aicc/aicc-...dump.age \
 #       --target-db aicc_restore_check [--allow-overwrite] [--jobs 4]
 
 set -euo pipefail
@@ -54,16 +54,34 @@ if [[ "$TARGET_DB" == "$AICC_PG_DB" && "$ALLOW_OVERWRITE" != "1" ]]; then
     exit 3
 fi
 
+RESTORE_ARCHIVE="$ARCHIVE"
+DECRYPTED=""
+if [[ "$ARCHIVE" == *.age ]]; then
+    : "${AICC_BACKUP_AGE_IDENTITY_FILE:?AICC_BACKUP_AGE_IDENTITY_FILE is required for encrypted archives}"
+    [[ -f "$AICC_BACKUP_AGE_IDENTITY_FILE" ]] || {
+        echo "age identity not found: $AICC_BACKUP_AGE_IDENTITY_FILE" >&2; exit 2;
+    }
+    command -v age >/dev/null || { echo "age not found in PATH" >&2; exit 127; }
+fi
+
 command -v pg_restore >/dev/null || { echo "pg_restore not found in PATH" >&2; exit 127; }
 command -v psql >/dev/null       || { echo "psql not found in PATH" >&2; exit 127; }
 
 CHECKSUM_FILE="${ARCHIVE}.sha256"
 if [[ -f "$CHECKSUM_FILE" ]]; then
     echo "verifying checksum"
+    # `--status` is silent on failure, so `set -e` would abort with no reason
+    # printed — during a recovery that reads as a hang, not as bit rot. Name
+    # the cause explicitly and keep the non-zero exit.
     if command -v sha256sum >/dev/null; then
-        (cd "$(dirname "$ARCHIVE")" && sha256sum --check --status "$(basename "$CHECKSUM_FILE")")
+        checksum_cmd=(sha256sum --check --status)
     else
-        (cd "$(dirname "$ARCHIVE")" && shasum -a 256 --check --status "$(basename "$CHECKSUM_FILE")")
+        checksum_cmd=(shasum -a 256 --check --status)
+    fi
+    if ! (cd "$(dirname "$ARCHIVE")" && "${checksum_cmd[@]}" "$(basename "$CHECKSUM_FILE")"); then
+        echo "checksum mismatch for ${ARCHIVE}: the archive does not match" \
+             "${CHECKSUM_FILE}; refusing to restore a corrupted backup" >&2
+        exit 5
     fi
     echo "checksum ok"
 else
@@ -71,6 +89,16 @@ else
     # without their sidecar, are still restorable — but the operator should
     # know the integrity check did not run.
     echo "WARNING: no checksum file at ${CHECKSUM_FILE}; integrity not verified" >&2
+fi
+
+if [[ "$ARCHIVE" == *.age ]]; then
+    DECRYPTED="$(mktemp "${TMPDIR:-/tmp}/aicc-restore.XXXXXX.dump")"
+    trap 'rm -f "$DECRYPTED"' EXIT
+    chmod 600 "$DECRYPTED"
+    age --decrypt --identity "$AICC_BACKUP_AGE_IDENTITY_FILE" \
+        --output "$DECRYPTED" "$ARCHIVE"
+    RESTORE_ARCHIVE="$DECRYPTED"
+    pg_restore --list "$RESTORE_ARCHIVE" >/dev/null
 fi
 
 run_psql() {
@@ -95,7 +123,7 @@ PGPASSWORD="$AICC_PG_PASSWORD" pg_restore \
     --no-owner \
     --no-privileges \
     --exit-on-error \
-    "$ARCHIVE"
+    "$RESTORE_ARCHIVE"
 
 # Prove the restore produced a usable schema rather than an empty database that
 # pg_restore happened not to complain about.
