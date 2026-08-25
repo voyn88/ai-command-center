@@ -937,7 +937,8 @@ def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
         in worker_template
     )
     assert "TimeoutStopSec=3660s" in worker_template
-    assert "TimeoutStartSec=180s" in worker_template
+    # 195s adopted from main (PR #382) at the merge of the two templates.
+    assert "TimeoutStartSec=195s" in worker_template
     assert "RuntimeDirectory=voyn-aicc-worker/%i" in worker_template
     assert "PGPASSFILE=/run/voyn-aicc-worker/%i/pgpass" in worker_template
     assert "SocketUser=root" in socket_unit
