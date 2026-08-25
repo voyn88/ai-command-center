@@ -1,8 +1,11 @@
 """The proposal family's PostgreSQL mirrors (VOYN-W0-AICC-SRV-01B, slice 15).
 
-The last three tables in the schema: `proposal` and its two append-only
-children, `proposal_event` and `proposal_evidence`. With these declared, all 33
-tables of the accepted correspondence map have mirrors.
+The last three tables in the original correspondence slice: `proposal` and its
+two append-only children, `proposal_event` and `proposal_evidence`. With these
+declared, that slice's shared mirror contract was complete. Current coverage is
+derived from the migration set and signed exclusions by
+`tests/db/test_mirror_coverage.py`; it is never represented by a hand-maintained
+count here.
 
 No new conversion class. Four `jsonb` columns on `proposal` alone, one on each
 child, identity columns on both children (slice 6), a boolean on each of

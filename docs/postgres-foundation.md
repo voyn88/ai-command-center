@@ -19,10 +19,10 @@ independently versioned `aios-db` library. It is consumed through exactly one
 module, `command_center/db/adapter.py`; the architecture-fitness gate fails if
 anything else imports `aios_db`.
 
-What this repository owns is the part only it can: the 33-table schema and its
-migrations, the `aicc_*` roles and their grants, the repositories, the
-backup/restore policy, and the composition that decides what "ready" means for
-this service. AIOS Core knows none of those.
+What this repository owns is the part only it can: the migration-defined schema,
+the `aicc_*` roles and their grants, the repositories, the backup/restore policy,
+and the composition that decides what "ready" means for this service. AIOS Core
+knows none of those.
 
 The wheel is pinned in `aios-db.lock.json` by release tag and SHA-256 and
 fetched by `scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json`, the

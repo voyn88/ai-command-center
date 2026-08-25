@@ -15,6 +15,12 @@ module closes that: every table in the schema is either mirrored or **signed out
 of scope**, with a reason and the task that owns it, and the same rule applies
 to tables created in the runtime database that have no PostgreSQL target at all.
 
+"The schema" is read out of the migration DDL itself, never from a count and
+never from a registry — not even `roles.ALL_TABLES`, which is hand-maintained
+and could forget the same table this gate is asking about. A number edited by
+hand on every migration measures whether someone remembered, which is precisely
+what a gate is for; it cannot also be the gate.
+
 Both gates are proved to bite: `test_the_coverage_gate_fails_on_...` feeds each
 one a table that is neither mirrored nor declared and asserts it is reported. A
 coverage gate that has never been shown to fail is a coverage gate that
@@ -32,13 +38,12 @@ from pathlib import Path
 
 import pytest
 
-from command_center.db import roles
-
 from tests.db.mirror_discovery import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
 COMMAND_CENTER = ROOT / "command_center"
 RUNTIME_DB_PACKAGE = COMMAND_CENTER / "runtime" / "db"
+SQL_DIR = COMMAND_CENTER / "db" / "sql"
 
 #: The ledger is the runner's, not a domain table, on both sides.
 LEDGER_TABLES = frozenset({"schema_migration", "schema_version"})
@@ -47,9 +52,36 @@ LEDGER_TABLES = frozenset({"schema_migration", "schema_version"})
 #: "`CREATE TABLE IF NOT EXISTS`," inside a docstring, and a rule that stops
 #: at the identifier reads the word `IF` as a table nobody declared — a gate
 #: failing on its own documentation, which is how a gate gets weakened.
+#:
+#: The optional `schema.` qualifier is not decoration. Without it the pattern
+#: does not merely mis-name a qualified table, it fails to match the statement
+#: at all — `CREATE TABLE public.thing (` would leave `thing` invisible to a
+#: gate whose entire claim is that no table escapes it. Silently skipping the
+#: one migration written in a different house style is the failure mode this
+#: module exists to prevent, so the qualifier is consumed and the last
+#: identifier is the table.
 _CREATE_TABLE = re.compile(
-    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)\s*\(", re.IGNORECASE
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"(?:[a-z_][a-z0-9_]*\s*\.\s*)?([a-z_][a-z0-9_]*)\s*\(",
+    re.IGNORECASE,
 )
+
+#: `DROP` has no `(` to anchor on, so the terminating `;` plays that role: the
+#: pattern matches a statement, not the phrase. Required because a set that only
+#: ever grows is not "the schema" — it is every table the schema has ever had,
+#: and it would keep demanding a mirror for one that has since been removed.
+_DROP_TABLE = re.compile(
+    r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"
+    r"(?:[a-z_][a-z0-9_]*\s*\.\s*)?([a-z_][a-z0-9_]*)\s*"
+    r"(?:CASCADE|RESTRICT)?\s*;",
+    re.IGNORECASE,
+)
+
+#: A commented-out `CREATE TABLE` is not a table, and a commented-out `DROP` is
+#: not a removal. Reading past `--` would make the gate demand a mirror for the
+#: first and miss the second — and missing a removal is the direction that goes
+#: quiet. Safe on these files: every `--` in them follows a closed literal.
+_SQL_LINE_COMMENT = re.compile(r"--[^\n]*")
 
 
 @dataclass(frozen=True)
@@ -241,20 +273,20 @@ RUNTIME_TABLES_WITHOUT_A_TARGET: dict[str, Exclusion] = {
             "unnoticed omission would be a data-loss migration, not a cosmetic "
             "one."
         ),
-        task="VOYN-W0-AICC-RUNTIME-ADHOC-TABLES",
+        task="VOYN-W0-AICC-DAILY-AUDIT-UNMIRRORED",
     ),
     "daily_audit_campaign": Exclusion(
         reason=(
             "As `daily_audit_schedule`: created ad hoc outside `migrate()` by the "
             "daily-audit daemon, with no PostgreSQL target."
         ),
-        task="VOYN-W0-AICC-RUNTIME-ADHOC-TABLES",
+        task="VOYN-W0-AICC-DAILY-AUDIT-UNMIRRORED",
     ),
 }
 
 
 # ---------------------------------------------------------------------------
-# The gates, as functions, so the tests can feed them a table that is neither
+# Gate helpers: the tests feed them a table that is neither covered nor signed.
 # ---------------------------------------------------------------------------
 
 
@@ -278,7 +310,48 @@ def _stale(
 
 
 def _schema_tables() -> set[str]:
-    return set(roles.ALL_TABLES) - LEDGER_TABLES
+    """Domain tables derived from every PostgreSQL migration's actual DDL.
+
+    ``roles.ALL_TABLES`` is deliberately not the source here. It is another
+    hand-maintained registry (and has its own migration-set parity gate), so
+    using it would let a migration add a table that both the roles registry and
+    the mirror registry forgot. That is the exact omission this gate exists
+    to catch.
+
+    Read in migration order and drops applied, so the answer is what the set
+    *leaves standing* rather than everything it has ever declared. No database
+    and no import of `command_center.db`: the whole point of this module is that
+    it still runs on a laptop with no PostgreSQL client library installed.
+    """
+    tables: set[str] = set()
+    for path in sorted(SQL_DIR.glob("*.up.sql")):
+        ddl = _SQL_LINE_COMMENT.sub("", path.read_text(encoding="utf-8"))
+        tables.update(match.lower() for match in _CREATE_TABLE.findall(ddl))
+        tables.difference_update(match.lower() for match in _DROP_TABLE.findall(ddl))
+    return tables - LEDGER_TABLES
+
+
+def _stage(tmp_path: Path, monkeypatch, **migrations: str) -> Path:
+    """The real migration set plus `migrations`, with `SQL_DIR` pointed at it.
+
+    Copied rather than mocked so the tests below exercise the shipped
+    `_schema_tables` against the shipped DDL: a stub staged *alone* would fail a
+    gate that rejects everything just as readily as it fails the gate we have.
+    Keyword names carry a leading `_` because a migration file starts with a
+    digit and a Python keyword cannot; it is stripped here.
+    """
+    staged = tmp_path / "sql"
+    staged.mkdir(parents=True)
+    for migration in SQL_DIR.glob("*.up.sql"):
+        (staged / migration.name).write_text(
+            migration.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    for name, ddl in migrations.items():
+        (staged / f"{name.lstrip('_')}.up.sql").write_text(ddl + "\n", encoding="utf-8")
+    # `_schema_tables` reads the module global, so redirecting it is what lets
+    # these tests run the shipped gate rather than a paraphrase of it.
+    monkeypatch.setitem(globals(), "SQL_DIR", staged)
+    return staged
 
 
 def _mirrored_tables() -> set[str]:
@@ -342,25 +415,86 @@ def test_no_mirror_exclusion_outlives_its_reason() -> None:
     assert stale == [], f"exclusions for tables that are mirrored or gone: {stale}"
 
 
-def test_the_coverage_gate_fails_on_a_table_that_is_neither() -> None:
-    """The gate, shown to bite.
+def test_the_coverage_gate_fails_on_a_table_that_is_neither(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The gate, shown to bite — on the real schema plus one stub table.
 
     A coverage rule that has only ever been observed passing is indistinguishable
-    from one that computes the empty set. This runs it against a schema carrying
-    a table nobody declared anything about.
+    from one that computes the empty set. So this adds a migration the way a
+    migration is actually added, next to the real ones rather than instead of
+    them, and calls the shipped gate function itself. Staging the stub *alone*
+    would prove far less: a directory holding one undeclared table fails a gate
+    that merely rejects everything just as readily as it fails the gate we have.
     """
-    tables = _schema_tables() | {"a_table_nobody_declared"}
-    assert _uncovered(tables, _mirrored_tables(), UNMIRRORED_SCHEMA_TABLES) == [
-        "a_table_nobody_declared"
-    ]
+    _stage(
+        tmp_path,
+        monkeypatch,
+        _9999_undeclared="CREATE TABLE a_table_nobody_declared (id bigint PRIMARY KEY);",
+    )
 
-    # And the same table, once signed, passes — so the gate is answering the
-    # question it claims to and not simply rejecting anything unfamiliar.
+    assert "a_table_nobody_declared" in _schema_tables(), "the stub was not picked up"
+    with pytest.raises(AssertionError, match="a_table_nobody_declared"):
+        test_every_schema_table_is_mirrored_or_signed_out_of_scope()
+
+    # And the same schema, with that one table signed, passes — so the gate is
+    # answering the question it claims to and not simply rejecting anything
+    # unfamiliar. This half re-proves the real schema alongside the stub, which
+    # is the reason the real migrations were staged rather than replaced.
     signed = dict(
         UNMIRRORED_SCHEMA_TABLES,
         a_table_nobody_declared=Exclusion(reason="test double", task="VOYN-TEST"),
     )
-    assert _uncovered(tables, _mirrored_tables(), signed) == []
+    assert _uncovered(_schema_tables(), _mirrored_tables(), signed) == []
+
+
+def test_a_table_a_later_migration_drops_stops_being_demanded(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Drops are applied, so the gate does not demand a mirror for a dead table.
+
+    Nothing in the live migration set drops a table yet, which is exactly why
+    this is written now: the first migration that does would otherwise turn the
+    gate red for a table that no longer exists, and the cheapest way to quiet
+    that is a signed exclusion for something imaginary — a false signature, in
+    the one registry whose whole value is that its signatures are true.
+    """
+    _stage(
+        tmp_path,
+        monkeypatch,
+        _9998_scaffold="CREATE TABLE a_temporary_scaffold (id bigint PRIMARY KEY);",
+    )
+    assert "a_temporary_scaffold" in _schema_tables()
+
+    _stage(
+        tmp_path / "again",
+        monkeypatch,
+        _9998_scaffold="CREATE TABLE a_temporary_scaffold (id bigint PRIMARY KEY);",
+        _9999_teardown="DROP TABLE a_temporary_scaffold CASCADE;",
+    )
+    assert "a_temporary_scaffold" not in _schema_tables()
+    test_every_schema_table_is_mirrored_or_signed_out_of_scope()
+
+
+def test_commented_out_ddl_is_not_schema(monkeypatch, tmp_path: Path) -> None:
+    """Neither half of a `--` line counts, and the drop half is the dangerous one.
+
+    A commented `CREATE` that counted would demand a mirror for a table that was
+    never created — noisy, but visible. A commented `DROP` that counted would
+    remove a real table from the set and take its coverage requirement with it,
+    which is the same silent hole this module was written to close.
+    """
+    _stage(
+        tmp_path,
+        monkeypatch,
+        _9999_prose=(
+            "-- CREATE TABLE a_table_only_discussed (id bigint PRIMARY KEY);\n"
+            "-- DROP TABLE queue_entry;"
+        ),
+    )
+    tables = _schema_tables()
+    assert "a_table_only_discussed" not in tables
+    assert "queue_entry" in tables
 
 
 def test_the_staleness_gate_fails_on_an_exclusion_for_a_mirrored_table() -> None:
@@ -406,7 +540,7 @@ def test_the_compliance_stores_are_not_dragged_into_this_gate() -> None:
 
 
 def test_every_runtime_table_has_a_postgres_target_or_a_signed_exclusion() -> None:
-    targets = set(roles.ALL_TABLES)
+    targets = _schema_tables()
     uncovered = _uncovered(_runtime_tables(), targets, RUNTIME_TABLES_WITHOUT_A_TARGET)
     assert uncovered == [], (
         "runtime tables with no PostgreSQL target and no signed exclusion: "
@@ -416,9 +550,7 @@ def test_every_runtime_table_has_a_postgres_target_or_a_signed_exclusion() -> No
 
 
 def test_no_runtime_exclusion_outlives_its_reason() -> None:
-    stale = _stale(
-        _runtime_tables(), set(roles.ALL_TABLES), RUNTIME_TABLES_WITHOUT_A_TARGET
-    )
+    stale = _stale(_runtime_tables(), _schema_tables(), RUNTIME_TABLES_WITHOUT_A_TARGET)
     assert stale == [], (
         f"exclusions for runtime tables that are gone or migrated: {stale}"
     )
@@ -426,9 +558,9 @@ def test_no_runtime_exclusion_outlives_its_reason() -> None:
 
 def test_the_runtime_gate_fails_on_an_undeclared_ad_hoc_table() -> None:
     tables = _runtime_tables() | {"another_daemon_table"}
-    assert _uncovered(
-        tables, set(roles.ALL_TABLES), RUNTIME_TABLES_WITHOUT_A_TARGET
-    ) == ["another_daemon_table"]
+    assert _uncovered(tables, _schema_tables(), RUNTIME_TABLES_WITHOUT_A_TARGET) == [
+        "another_daemon_table"
+    ]
 
 
 # ---------------------------------------------------------------------------

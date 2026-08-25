@@ -1,8 +1,10 @@
 """Forward/backward migrations for the AICC server database.
 
-The *schema* is AICC's: 33 tables, their indexes, the `aicc_*` grants that go
-with them, and the plain SQL files in `sql/` named `NNNN_slug.up.sql` with a
-matching `NNNN_slug.down.sql`. AIOS Core knows none of that and must not.
+The *schema* is AICC's: the tables declared by the migration set, their indexes,
+the `aicc_*` grants that go with them, and the plain SQL files in `sql/` named
+`NNNN_slug.up.sql` with a matching `NNNN_slug.down.sql`. AIOS Core knows none of
+that and must not. The table count is deliberately derived from those files by
+the correspondence and mirror-coverage gates, never maintained here by hand.
 
 The *running* of those files is not AICC's. Serializing two migrators in a
 rolling deploy behind an advisory lock, committing each migration together with

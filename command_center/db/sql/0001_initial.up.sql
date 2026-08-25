@@ -1,7 +1,7 @@
 -- AICC PostgreSQL foundation — initial schema (VOYN-W0-AICC-SRV-01a).
 --
 -- This is the PostgreSQL counterpart of the SQLite schema built by
--- `command_center/runtime/db` (SCHEMA_VERSION 23: 33 domain tables, 62
+-- `command_center/runtime/db` (SCHEMA_VERSION 23: the domain tables and 62
 -- indexes). It is NOT a byte-for-byte transliteration: SQLite has no real
 -- date, boolean or JSON type, so the source schema stores timestamps as ISO
 -- TEXT, booleans as INTEGER 0/1 and documents as TEXT. Reproducing that here
