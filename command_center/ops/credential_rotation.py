@@ -1412,9 +1412,12 @@ class RotationController:
                 # resume_config = new_config before this check would trade
                 # that audited recovery for an immediate fleet activation on
                 # a provably short-lived secret.
-                durable_phase = (
-                    "credential_committed" if committed else "database_rotated"
-                )
+                if committed:
+                    durable_phase = "credential_committed"
+                elif database_rotated:
+                    durable_phase = "database_rotated"
+                else:
+                    durable_phase = "mutation_started"
                 raise RotationError(
                     "issued credential expires before safe activation/rollback "
                     f"budget; lanes stay drained with durable phase "

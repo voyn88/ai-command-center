@@ -38,6 +38,7 @@ from command_center.db.config import PostgresConfig, load_config
 __all__ = [
     "PoolNotOpenError",
     "close_pool",
+    "PoolReplacedError",
     "connection",
     "get_pool",
     "open_pool",
@@ -62,6 +63,13 @@ _retired: dict[int, Any] = {}
 
 class PoolNotOpenError(RuntimeError):
     """Raised when the pool is used before `open_pool()` or after `close_pool()`."""
+
+
+class PoolReplacedError(RuntimeError):
+    """Raised when a replacement lost its race: the pool state moved (another
+    replace or a shutdown) while the new pool was being built. Distinct from
+    PoolNotOpenError -- the pool may well be open, just not the state the
+    caller observed (review note on 3a845a3)."""
 
 
 def open_pool(config: PostgresConfig | None = None):
@@ -138,7 +146,7 @@ def replace_pool(config: PostgresConfig):
                 _retired[previous_token] = previous_pool
     if replacement is None:
         orphaned.close()
-        raise PoolNotOpenError(
+        raise PoolReplacedError(
             "PostgreSQL pool state changed during replacement; not installed."
         )
     if close_now is not None:
@@ -148,12 +156,20 @@ def replace_pool(config: PostgresConfig):
 
 
 def get_pool():
-    """Return the open pool, or raise `PoolNotOpenError`."""
-    if _pool is None:
-        raise PoolNotOpenError(
-            "PostgreSQL pool is not open. Call open_pool() during startup."
-        )
-    return _pool[1]
+    """Return the open pool, or raise `PoolNotOpenError`.
+
+    Checkouts taken through this handle bypass the `_active` bookkeeping:
+    during `replace_pool` they are NOT protected by the retire-after-last-
+    return contract -- use `connection()` for anything that outlives a
+    moment (review note on 3a845a3).
+    """
+    with _lock:
+        current = _pool
+        if current is None:
+            raise PoolNotOpenError(
+                "PostgreSQL pool is not open. Call open_pool() during startup."
+            )
+        return current[1]
 
 
 def close_pool() -> None:

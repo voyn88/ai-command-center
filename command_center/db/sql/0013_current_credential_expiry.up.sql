@@ -9,7 +9,7 @@ CREATE FUNCTION identity_current_credential(p_secret text)
         server_now timestamptz,
         refuse_reason text
     )
-    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
     v identity_verdict;
     v_expires timestamptz;

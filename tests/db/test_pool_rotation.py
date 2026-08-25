@@ -168,7 +168,7 @@ def test_replace_pool_refuses_to_resurrect_a_concurrently_closed_pool(
     first_built = True
     try:
         pool.replace_pool(_config("b" * 64))
-    except pool.PoolNotOpenError:
+    except pool.PoolReplacedError:
         pass
     else:
         raise AssertionError("replacement must be refused after shutdown")
