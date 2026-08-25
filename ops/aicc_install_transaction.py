@@ -643,6 +643,10 @@ class FileTransaction:
             )
             self.pending.unlink()
             self.pending_release.unlink(missing_ok=True)
+            # The interrupted commit's service snapshot is spent: leaving it
+            # at the fixed path lets a LATER recover() apply it against a
+            # different generation (review on 0f4d77e).
+            (self.state_dir / "attempt-units.json").unlink(missing_ok=True)
             self._remove_orphan_generations()
             _fsync_dir(self.state_dir)
             return

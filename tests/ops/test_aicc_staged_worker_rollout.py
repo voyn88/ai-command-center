@@ -259,13 +259,15 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
     mutations = [
         call for call in systemd.calls if call[0] in {"enable", "stop", "start"}
     ]
+    # Legacy claimers retire BEFORE the canary lane starts claiming -- no
+    # coexistence window (review on 0f4d77e; runbook step 5 ordering).
     assert mutations == [
         ("enable", units[0]),
         ("stop", units[0]),
-        ("start", units[0]),
         ("stop", "voyn-aicc-worker.service"),
         ("stop", "voyn-aicc-worker-2.service"),
         ("stop", "aicc-worker.service"),
+        ("start", units[0]),
         ("enable", units[1]),
         ("stop", units[1]),
         ("start", units[1]),
@@ -390,9 +392,10 @@ def test_rollout_refuses_to_start_template_lane_while_legacy_pid_survives():
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
             ),
         )
-    # The new lane is deliberately proven as a canary before legacy drain.
-    assert ("start", unit) in systemd.calls
+    # Legacy drain precedes the canary start; the surviving legacy PID must
+    # abort the rollout BEFORE the first template lane ever starts.
     assert ("stop", "voyn-aicc-worker.service") in systemd.calls
+    assert ("start", unit) not in systemd.calls
 
 
 @pytest.mark.parametrize(

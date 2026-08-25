@@ -189,7 +189,11 @@ def verify_legacy_units_retired(systemd: Systemd) -> None:
         main_pid = systemd.run(
             "show", unit, "--property=MainPID", "--value", check=False
         )
-        if active == "active" or enabled == "enabled" or main_pid not in {"", "0"}:
+        if (
+            active in {"active", "activating"}
+            or enabled in {"enabled", "enabled-runtime"}
+            or main_pid not in {"", "0"}
+        ):
             raise RolloutError(f"legacy worker was not drained and disabled: {unit}")
 
 
@@ -569,6 +573,13 @@ def rollout(
             # A daemon-reload or drop-in replacement may race the drain.  The
             # final pre-start check makes that race fail closed too.
             verify_unit_configuration(systemd, unit)
+            if index == 0:
+                # Retire the legacy claimers BEFORE the first templated lane
+                # starts: starting the canary first opened a window where a
+                # legacy worker and a template lane could both claim work --
+                # the exact coexistence verify_legacy_units_retired forbids
+                # (review on 0f4d77e; matches the runbook's step 5 ordering).
+                retire_legacy_units(systemd)
             systemd.run("start", unit)
             verify_unit(
                 systemd,
@@ -579,8 +590,6 @@ def rollout(
                 process_uid=process_uid,
                 process_environment=process_environment,
             )
-            if index == 0:
-                retire_legacy_units(systemd)
     except BaseException:
         # Never restart from a service snapshot while the failed file
         # generation is still installed. The outer write-ahead transaction

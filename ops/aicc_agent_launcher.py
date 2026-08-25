@@ -864,7 +864,7 @@ def _systemd_command(
         "--property=DynamicUser=yes",
         "--working-directory=/workspace",
         "--setenv=HOME=/agent-home",
-        "--setenv=XDG_CONFIG_HOME=/agent-home/config",  # pragma: allowlist secret
+        "--setenv=XDG_CONFIG_HOME=/agent-home/config",
         "--setenv=XDG_CACHE_HOME=/agent-home/cache",
         "--setenv=PATH=/usr/local/bin:/usr/bin:/bin",
         "--setenv=GIT_CONFIG_NOSYSTEM=1",
@@ -1046,6 +1046,14 @@ def _quarantine_workspace(workspace: Path, run_id: str) -> Path:
         marker.chmod(0o600)
         workspace.chmod(0o000)
     return workspace
+
+
+def _pinned_real_path(workspace_fd: int, workspace_root: Path) -> Path:
+    """The pinned descriptor's CURRENT real path, contained in the root."""
+    real = Path(os.readlink(f"/proc/self/fd/{workspace_fd}"))
+    if not real.is_absolute() or not real.is_relative_to(workspace_root):
+        raise LaunchRefused("pinned workspace moved outside its root")
+    return real
 
 
 def _open_pinned_workspace(workspace: Path) -> int:
@@ -1274,10 +1282,16 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         manifest = _load_manifest(_readline_limited(sock.makefile("rb", buffering=0)))
         workspace_roots = _workspace_roots()
         workspace = _validated_workspace(manifest["workspace"], workspace_roots)
-        workspace_fd = _open_pinned_workspace(workspace)
+        # Lock and quarantine-check FIRST, pin under the lock: pinning before
+        # the lock left the two path-based checks guarding a DIFFERENT object
+        # than the pinned inode if the workspace was replaced in between
+        # (review on 0f4d77e).
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         workspace_lock = _open_workspace_lock(workspace)
+        workspace_fd = _open_pinned_workspace(workspace)
+        if _workspace_is_quarantined(workspace):
+            raise LaunchRefused("workspace is quarantined after an unsealed agent")
         _prepare_reusable_workspace(workspace, workspace_fd)
         _validate_binary(EXECUTOR_BINARIES[manifest["executor"]])
         agent_home = _prepare_agent_home(manifest["executor"], manifest["run_id"])
@@ -1291,7 +1305,14 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             unit,
             _current_broker_unit(),
             workspace_roots[0],
-            Path(f"/proc/{os.getpid()}/fd/{workspace_fd}"),
+            # systemd resolves the BindPaths SOURCE during namespace setup;
+            # handing it the /proc/<pid>/fd magic link relied on PID 1
+            # chasing it inside a partially-built namespace where the
+            # workspace root is InaccessiblePaths (review on 0f4d77e). The
+            # pinned fd stays the AUTHORITY: its current real path is read
+            # back via /proc/self and must still resolve inside the root --
+            # a rename between pin and spawn fails closed here.
+            _pinned_real_path(workspace_fd, workspace_roots[0]),
         )
         proc = subprocess.Popen(
             command,
