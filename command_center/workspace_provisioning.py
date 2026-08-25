@@ -1390,27 +1390,63 @@ def provision_and_verify(spec: WorkspaceSpec) -> VerificationEvidence:
 def _read_agent_head(workspace: Path, expected_branch: str) -> str:
     """Resolve HEAD without invoking Git against agent-controlled config."""
     git_dir = workspace / ".git"
-    head_path = git_dir / "HEAD"
+    # The workspace .git tree is agent-writable and this runs inside the
+    # credential-owning publisher clone, so HEAD must never be read by
+    # pathname: an lstat-then-read let the agent win a rename race, redirect
+    # .git/HEAD at a root-owned secret via a symlink, and leak its bytes
+    # through the "unexpected HEAD contents" detail below. Pin .git to a
+    # directory fd, open HEAD *relative to that fd* with O_NOFOLLOW, and
+    # validate each fd's own fstat before reading -- the fd-pinned discipline
+    # aicc_install_transaction._read_regular already uses -- so neither a
+    # swapped parent, a HEAD symlink, nor a hardlink can redirect the read.
+    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    dir_fd: int | None = None
+    head_fd: int | None = None
     try:
-        git_info_stat = git_dir.lstat()
-        head_stat = head_path.lstat()
-        head_text = head_path.read_text(encoding="ascii").strip()
-    except OSError as exc:
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_readable",
-            remediation="Preserve the workspace for inspection and retry on a clean clone.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            detail=f"cannot read task-local HEAD safely: {exc}",
-        ) from exc
-    if not stat.S_ISDIR(git_info_stat.st_mode) or not stat.S_ISREG(head_stat.st_mode):
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_regular",
-            remediation="Preserve the workspace for inspection and retry on a clean clone.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            detail=".git must be a directory and HEAD a regular file",
-        )
+        try:
+            dir_fd = os.open(git_dir, open_flags | os.O_DIRECTORY | nofollow)
+            git_info_stat = os.fstat(dir_fd)
+            head_fd = os.open("HEAD", open_flags | nofollow, dir_fd=dir_fd)
+            head_stat = os.fstat(head_fd)
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_readable",
+                remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                detail=f"cannot read task-local HEAD safely: {exc}",
+            ) from exc
+        if (
+            not stat.S_ISDIR(git_info_stat.st_mode)
+            or not stat.S_ISREG(head_stat.st_mode)
+            or head_stat.st_nlink != 1
+            or head_stat.st_size > 4096
+        ):
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_regular",
+                remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                detail=".git must be a directory and HEAD a small unlinked regular file",
+            )
+        try:
+            head_text = os.read(head_fd, 4096).decode("ascii", "strict").strip()
+        except (OSError, UnicodeDecodeError):
+            # Never echo the bytes: a non-ASCII HEAD is refused without
+            # surfacing its content in the error (or a chained exception).
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_regular",
+                remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                detail="task-local HEAD is not ASCII text",
+            ) from None
+    finally:
+        if head_fd is not None:
+            os.close(head_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
     expected_ref = f"refs/heads/{expected_branch}"
     if any(part in {"", ".", ".."} for part in expected_branch.split("/")):
         raise WorkspaceVerificationError(

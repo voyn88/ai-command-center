@@ -639,3 +639,40 @@ def test_prune_repository_refuses_a_non_repository_path(tmp_path):
 
 def test_prune_repository_refuses_a_missing_path(tmp_path):
     assert wp.prune_repository(tmp_path / "does-not-exist") == "not_a_repository"
+
+
+def test_read_agent_head_refuses_symlinked_head_without_leaking_secret(tmp_path):
+    """A symlinked .git/HEAD must not let the publisher read (and echo) a file
+    outside the workspace. The agent owns .git, so an lstat-then-read HEAD let
+    it redirect the credential-owning publisher at a root-owned secret and leak
+    the bytes through the error detail; O_NOFOLLOW + a pinned .git dir fd close
+    that race."""
+    secret = tmp_path / "root-secret"
+    secret.write_text("SUPER-SECRET-SIGNING-KEY-abc123\n", encoding="ascii")
+    workspace = tmp_path / "ws"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    head = git_dir / "HEAD"
+    head.symlink_to(secret)
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp._read_agent_head(workspace, "feature/x")
+
+    err = exc_info.value
+    # Refused at the read (O_NOFOLLOW), not after echoing content.
+    assert err.failed_step in {"agent_head_readable", "agent_head_regular"}
+    assert "SUPER-SECRET-SIGNING-KEY" not in str(err.detail)
+    assert "SUPER-SECRET-SIGNING-KEY" not in str(err)
+
+
+def test_read_agent_head_reads_a_real_head_via_pinned_fd(tmp_path):
+    """The fd-pinned path still reads a normal branch HEAD."""
+    workspace = tmp_path / "ws"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/x\n", encoding="ascii")
+    refs = git_dir / "refs" / "heads" / "feature"
+    refs.mkdir(parents=True)
+    (refs / "x").write_text("0" * 40 + "\n", encoding="ascii")
+
+    assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
