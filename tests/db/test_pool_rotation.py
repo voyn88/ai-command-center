@@ -102,3 +102,33 @@ def test_close_pool_during_inflight_checkout_does_not_raise(monkeypatch) -> None
     assert fake.closed, "close_pool() owns shutdown of every pool"
     # The regression: this __exit__ raised KeyError before the fix.
     checkout.__exit__(None, None, None)
+
+
+def test_stale_checkout_unwind_cannot_touch_a_reincarnated_pool(monkeypatch) -> None:
+    """id()-keyed bookkeeping was an ABA hazard: after close_pool() and GC, a
+    NEW pool could reuse the dead pool's address, and the dead checkout's
+    finally-block would decrement the new pool's counter (independent-review
+    finding on d6fa8be). Generation tokens make the two pools distinct keys."""
+    first = FakePool("first")
+    second = FakePool("second")
+    generations = iter((first, second))
+    monkeypatch.setattr(pool, "_build_pool", lambda config: next(generations))
+    pool.close_pool()
+    pool.open_pool(_config("a" * 64))
+    stale = pool.connection()
+    assert stale.__enter__() == "first"
+    pool.close_pool()
+    pool.open_pool(_config("b" * 64))
+    live = pool.connection()
+    assert live.__enter__() == "second"
+    # The dead checkout unwinds AFTER the new pool has a live checkout.
+    stale.__exit__(None, None, None)
+    # If the stale unwind had decremented the live token, replace_pool would
+    # see zero active checkouts and close "second" mid-checkout.
+    third = FakePool("third")
+    monkeypatch.setattr(pool, "_build_pool", lambda config: third)
+    pool.replace_pool(_config("c" * 64))
+    assert not second.closed, "live checkout must keep its pool open"
+    live.__exit__(None, None, None)
+    assert second.closed, "retired pool closes after its last return"
+    pool.close_pool()

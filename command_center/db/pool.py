@@ -49,6 +49,12 @@ _LOG = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _pool: Any = None
+# Monotonic generation token identifying each pool object for the checkout
+# bookkeeping below. id() is NOT usable as that key: after a pool is closed
+# and garbage-collected, CPython can hand the same address to a NEW pool,
+# and a still-unwinding checkout of the dead pool would then decrement the
+# new pool's counter (ABA; independent-review finding on d6fa8be).
+_pool_token: int = 0
 _config: PostgresConfig | None = None
 _active: dict[int, int] = {}
 _retired: dict[int, Any] = {}
@@ -64,10 +70,11 @@ def open_pool(config: PostgresConfig | None = None):
 
     with _lock:
         if _pool is not None:
-            return _pool
+            return _pool[1]
         resolved = config or load_config()
         pool = _build_pool(resolved)
-        _pool = pool
+        globals()["_pool_token"] += 1
+        _pool = (globals()["_pool_token"], pool)
         _config = resolved
         _LOG.info("postgres pool open: %s", resolved.redacted())
         return pool
@@ -106,14 +113,15 @@ def replace_pool(config: PostgresConfig):
     close_now: Any | None = None
     with _lock:
         previous = _pool
-        _pool = replacement
+        globals()["_pool_token"] += 1
+        _pool = (globals()["_pool_token"], replacement)
         _config = config
         if previous is not None:
-            previous_id = id(previous)
-            if _active.get(previous_id, 0) == 0:
-                close_now = previous
+            previous_token, previous_pool = previous
+            if _active.get(previous_token, 0) == 0:
+                close_now = previous_pool
             else:
-                _retired[previous_id] = previous
+                _retired[previous_token] = previous_pool
     if close_now is not None:
         close_now.close()
     _LOG.info("postgres pool replaced: %s", config.redacted())
@@ -126,7 +134,7 @@ def get_pool():
         raise PoolNotOpenError(
             "PostgreSQL pool is not open. Call open_pool() during startup."
         )
-    return _pool
+    return _pool[1]
 
 
 def close_pool() -> None:
@@ -135,7 +143,7 @@ def close_pool() -> None:
 
     closing: list[Any]
     with _lock:
-        closing = ([] if _pool is None else [_pool]) + list(_retired.values())
+        closing = ([] if _pool is None else [_pool[1]]) + list(_retired.values())
         _pool = None
         _config = None
         _retired.clear()
@@ -148,12 +156,11 @@ def close_pool() -> None:
 def connection() -> Iterator:
     """Check a connection out of the pool for the duration of the block."""
     with _lock:
-        selected = _pool
-        if selected is None:
+        if _pool is None:
             raise PoolNotOpenError(
                 "PostgreSQL pool is not open. Call open_pool() during startup."
             )
-        selected_id = id(selected)
+        selected_id, selected = _pool
         _active[selected_id] = _active.get(selected_id, 0) + 1
     try:
         with selected.connection() as conn:
