@@ -120,17 +120,27 @@ def prepare_password_update(
     stat = target.stat()
     rendered: list[str] = []
     replacements = 0
-    for raw in target.read_text(encoding="utf-8").splitlines(keepends=True):
+    # The writer must split with the READER's rule (split on newline only):
+    # splitlines() also breaks on \x0b-class bytes that systemd treats as
+    # ordinary value bytes, so a value containing one was rewritten as two
+    # lines -- corrupting the file in a way only detected after the database
+    # verifier had already changed (independent-review finding on fc0c391).
+    original = target.read_text(encoding="utf-8")
+    body, trailing_newline = (
+        (original[:-1], True) if original.endswith("\n") else (original, False)
+    )
+    lines = body.split("\n") if body else []
+    for index, raw in enumerate(lines):
         if raw.strip() and not raw.lstrip().startswith("#") and "=" in raw:
             key = raw.split("=", 1)[0].strip()
             if key == "AICC_PG_PASSWORD":
-                newline = "\n" if raw.endswith("\n") else ""
-                rendered.append(f"AICC_PG_PASSWORD={new_password}{newline}")
+                rendered.append(f"AICC_PG_PASSWORD={new_password}")
                 replacements += 1
                 continue
         rendered.append(raw)
     if replacements != 1:
         raise CredentialFileError("AICC_PG_PASSWORD must occur exactly once")
+    rendered_text = "\n".join(rendered) + ("\n" if trailing_newline else "")
 
     fd, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     temporary = Path(name)
@@ -150,7 +160,7 @@ def prepare_password_update(
         # descriptor number (independent-review finding on 61c73e7).
         fd = -1
         with stream:
-            stream.writelines(rendered)
+            stream.write(rendered_text)
             stream.flush()
             os.fsync(stream.fileno())
     except BaseException:

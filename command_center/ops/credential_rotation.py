@@ -1320,6 +1320,7 @@ class RotationController:
         prepared: PreparedCredentialFile | None = None
         committed = False
         database_rotated = False
+        mutation_attempted = False
         # Until PostgreSQL accepts a new verifier, the old file is durable and
         # is the safe rollback source.  Between DB rotation and the atomic file
         # commit there is deliberately no safe automatic resume: reloading the
@@ -1360,6 +1361,7 @@ class RotationController:
             new_values = dict(values)
             new_values["AICC_PG_PASSWORD"] = new_secret
             new_config = _postgres_config(new_values)
+            mutation_attempted = True
             self.phase_journal.write("mutation_started", prepared.temporary)
             expires = self.authority.rotate(
                 current, new_secret, scram_verifier(new_secret)
@@ -1445,7 +1447,15 @@ class RotationController:
             self.phase_journal.clear()
             raise
         finally:
-            if prepared is not None and not committed and not database_rotated:
+            # Discard is correct only while the DB mutation has provably NOT
+            # been attempted. A lost acknowledgement (network drop after the
+            # server applied ALTER ROLE) leaves database_rotated False while
+            # the DB already holds the new secret -- discarding the temp file
+            # then destroys the only copy and locks the fleet out until a DB
+            # admin intervenes (independent-review finding on fc0c391). A
+            # stale unused secret file is harmless: recovery probes both
+            # candidates.
+            if prepared is not None and not committed and not mutation_attempted:
                 prepared.discard()
         self.phase_journal.clear()
         self._reset_circuit()
