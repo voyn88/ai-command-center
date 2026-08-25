@@ -274,6 +274,60 @@ def test_workspace_allowlist_rejects_symlink_and_sibling(launcher, tmp_path):
         launcher._validated_workspace(str(unsafe), (root,))
 
 
+def test_workspace_bind_mounts_run_in_pid1_mount_namespace(launcher, monkeypatch, tmp_path):
+    # The broker's sandbox (ProtectSystem= etc.) puts it in a slave mount
+    # namespace; a bind created there is invisible to PID 1, which resolves
+    # the BindPaths source to the empty staging directory. Every mount and
+    # umount must therefore enter PID 1's namespace.
+    assert launcher._host_mount_namespace_command(["cmd", "arg"]) == [
+        launcher.NSENTER,
+        "--mount=/proc/1/ns/mnt",
+        "--",
+        "cmd",
+        "arg",
+    ]
+    monkeypatch.setattr(launcher, "WORKSPACE_BIND_ROOT", tmp_path)
+    monkeypatch.setattr(launcher, "_workspace_bind_root_ready", lambda: None)
+    monkeypatch.setattr(launcher, "_recover_workspace_bind_journals", lambda: None)
+    monkeypatch.setattr(
+        launcher, "_workspace_bind_journal", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        launcher, "_validate_workspace_bind", lambda *args, **kwargs: None
+    )
+    commands = []
+
+    def _record(command, **kwargs):
+        commands.append(list(command))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(launcher.subprocess, "run", _record)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        binding = launcher._prepare_workspace_bind(descriptor, "run-nsenter")
+        launcher._cleanup_workspace_bind(binding)
+    finally:
+        os.close(descriptor)
+    assert len(commands) == 2
+    for command in commands:
+        assert command[:3] == [launcher.NSENTER, "--mount=/proc/1/ns/mnt", "--"]
+    assert commands[0][3] == launcher.MOUNT
+    assert commands[1][3] == launcher.UMOUNT
+
+
+def test_lane_registry_parser_survives_set_u_and_detects_duplicates():
+    root = Path(__file__).parents[2]
+    verifier = (root / "ops/verify-agent-principal-boundary.sh").read_text()
+    # Duplicate detection must use the subshell-local newline accumulator:
+    # reading the unset outer variable aborts under `set -u`, and a
+    # space-joined accumulator never matches `grep -Fqx`.
+    assert "seen=''" in verifier
+    assert 'grep -Fqx "$family_unit"' in verifier
+    assert '"$lane_family_units" | grep -Fqx' not in verifier
+
+
 def test_workspace_with_renamable_parent_is_refused(launcher, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
