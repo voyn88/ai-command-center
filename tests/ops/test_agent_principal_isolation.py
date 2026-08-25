@@ -420,6 +420,9 @@ def test_bind_owner_liveness_is_pid_reuse_proof(launcher, monkeypatch):
     assert not launcher._bind_owner_alive(4242, 999, "boot-A")
     # A journal written under a previous boot cannot name a current owner.
     assert not launcher._bind_owner_alive(4242, 555, "boot-B")
+    # An empty recorded boot id means the read failed at journal time -- it
+    # proves nothing about a reboot, so the live owner must be kept.
+    assert launcher._bind_owner_alive(4242, 555, "")
     # Legacy journals (no recorded start-time/boot id) fall back to bare
     # liveness so an in-flight rolling deploy keeps working.
     assert launcher._bind_owner_alive(4242, None, None)

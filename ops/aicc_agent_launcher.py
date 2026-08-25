@@ -1185,7 +1185,15 @@ def _bind_owner_alive(owner_pid: int, recorded_starttime: object, recorded_boot_
     reused PID into a miss, and a changed boot id proves the owner is gone.
     """
     current_boot = _boot_id()
-    if isinstance(recorded_boot_id, str) and current_boot and recorded_boot_id != current_boot:
+    # Both ids must be non-empty: "" means the read failed at journal time (or
+    # now), which proves nothing about a reboot -- treating it as a mismatch
+    # would umount a live owner's bind (review on 61248b7).
+    if (
+        isinstance(recorded_boot_id, str)
+        and recorded_boot_id
+        and current_boot
+        and recorded_boot_id != current_boot
+    ):
         return False
     try:
         os.kill(owner_pid, 0)
