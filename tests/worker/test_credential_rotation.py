@@ -894,7 +894,7 @@ def test_post_rotation_rename_failure_retains_only_recovery_secret(
         raise OSError("filesystem became read-only")
 
     monkeypatch.setattr(PreparedCredentialFile, "commit", fail_commit)
-    with pytest.raises(RotationError, match="recovery file retained"):
+    with pytest.raises(RotationError, match="accepted credential retained"):
         controller.rotate()
 
     assert authority.current_password != OLD_PASSWORD, "database mutation occurred"
@@ -924,8 +924,7 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     assert "Type=notify-reload" in worker
     assert "KillMode=mixed" in worker
     assert "TimeoutStopSec=3660s" in worker
-    assert "TimeoutStartSec=180s" in worker
-    assert "ExecReload=/bin/kill -HUP $MAINPID" in worker
+    assert "TimeoutStartSec=195s" in worker
     assert "--worker-unit" not in rotation, (
         "lane enumeration in the unit file binds the fleet to a fixed size; "
         "lanes come from the root-owned registry"

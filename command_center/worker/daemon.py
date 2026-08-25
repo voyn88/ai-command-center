@@ -178,15 +178,17 @@ class WorkerDaemon:
                 continue
             if self._reload_stop.is_set():
                 return
+            # Clear BEFORE reloading so a SIGHUP arriving mid-reload is
+            # coalesced into a follow-up pass instead of silently dropped
+            # (review finding on c4001c4).
+            self._reload_requested.clear()
             try:
                 self._reload_credentials()
             except Exception:  # reload failure is surfaced to systemd by no READY
                 logger.exception("credential reload failed")
                 self._notify("STATUS=aicc-reload-failed")
-                self._reload_requested.clear()
                 continue
             with self._claim_gate_lock:
-                self._reload_requested.clear()
                 self._drain.clear()
                 self._drain_closed.clear()
                 self._notify("READY=1")

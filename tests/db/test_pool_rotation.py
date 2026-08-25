@@ -117,12 +117,23 @@ def test_stale_checkout_unwind_cannot_touch_a_reincarnated_pool(monkeypatch) -> 
     pool.open_pool(_config("a" * 64))
     stale = pool.connection()
     assert stale.__enter__() == "first"
+    first_token = pool._pool[0]
     pool.close_pool()
     pool.open_pool(_config("b" * 64))
     live = pool.connection()
     assert live.__enter__() == "second"
+    second_token = pool._pool[0]
+    # The discriminating assertions target the KEY itself: under id()-keyed
+    # bookkeeping two co-resident FakePools can never collide, so only
+    # asserting on close behaviour would pass on the buggy implementation
+    # too (review finding on the first version of this test). Generation
+    # tokens must differ across reopen, and the stale unwind must leave the
+    # live token's count untouched.
+    assert first_token != second_token
+    assert pool._active == {second_token: 1}
     # The dead checkout unwinds AFTER the new pool has a live checkout.
     stale.__exit__(None, None, None)
+    assert pool._active == {second_token: 1}, "stale unwind touched live key"
     # If the stale unwind had decremented the live token, replace_pool would
     # see zero active checkouts and close "second" mid-checkout.
     third = FakePool("third")

@@ -27,7 +27,6 @@ EnvironmentFile=-/etc/aicc/worker-%i.env
 UnsetEnvironment=ANTHROPIC_API_KEY
 ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker-%i/pgpass
 ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
-ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always
 RestartSec=10s
@@ -39,7 +38,7 @@ KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 SendSIGKILL=yes
 TimeoutStopSec=3660s
-TimeoutStartSec=180s
+TimeoutStartSec=195s
 
 MemoryMax=6G
 MemoryHigh=5G

@@ -285,7 +285,7 @@ class _FileLeaseStore:
         attempt_no = int(attempts.read_text()) + 1 if attempts.exists() else 1
         attempts.write_text(str(attempt_no))
         attempt_id = f"attempt-{attempt_no}"
-        lease.write_text(str(now + float(visibility_seconds)))
+        self._publish(lease, str(now + float(visibility_seconds)))
         (self.root / "claimed").write_text(attempt_id)
         return ClaimedWork(
             work_item_id="job-3600",
@@ -297,8 +297,16 @@ class _FileLeaseStore:
         )
 
     def heartbeat(self, work):
-        (self.root / "lease").write_text(str(time.monotonic() + 1.0))
+        self._publish(self.root / "lease", str(time.monotonic() + 1.0))
         return True
+
+    def _publish(self, path, text):
+        # Atomic rename: a SIGKILL landing mid-write must never leave an
+        # empty/half file for the parent process's cross-process read
+        # (review finding on c4001c4).
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(text)
+        os.replace(temporary, path)
 
     def complete(self, work, result):
         (self.root / "done").write_text(work.attempt_id)
@@ -328,6 +336,7 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
         daemon.run_forever()
         os._exit(0)
 
+    reaped = False
     try:
         deadline = time.monotonic() + 5
         while not (tmp_path / "claimed").exists() and time.monotonic() < deadline:
@@ -342,12 +351,16 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
         kill_started = time.monotonic()
         os.kill(pid, signal.SIGKILL)
         waited, status = os.waitpid(pid, 0)
+        reaped = True
         assert waited == pid and os.WIFSIGNALED(status)
         assert os.WTERMSIG(status) == signal.SIGKILL
         assert time.monotonic() - kill_started < 1.0
 
         # The killed owner cannot report. Once its bounded visibility lease
         # expires, the same item is safely delivered as attempt 2.
+        # The child publishes the lease via atomic rename (write to a temp
+        # name, os.replace) so a SIGKILL can never leave a half-written file
+        # for this read (review finding on c4001c4).
         expiry = float((tmp_path / "lease").read_text())
         time.sleep(max(0.0, expiry - time.monotonic()) + 0.05)
         redelivered = _FileLeaseStore(tmp_path).claim("execution", visibility_seconds=1)
@@ -356,7 +369,10 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
         assert redelivered.attempt_no == 2
     finally:
         try:
-            os.kill(pid, signal.SIGKILL)
+            # Signalling an already-reaped PID is a PID-reuse hazard against
+            # an unrelated process (review finding on c4001c4).
+            if not reaped:
+                os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         try:
@@ -469,7 +485,7 @@ def test_the_claim_loop_feeds_the_watchdog_between_claims() -> None:
 
     assert pings[0] == "READY=1", "readiness must precede the first claim"
     assert pings[-1] == "STOPPING=1", "a clean exit must announce itself"
-    watchdog = [p for p in pings if p.startswith("WATCHDOG=1")]
+    watchdog = [p for p in pings if p == "WATCHDOG=1" or p.startswith("WATCHDOG=1\n")]
     claims = [c for c in store.calls if c[0] == "claim"]
     assert len(watchdog) == len(claims), "one ping per loop iteration"
 
@@ -643,4 +659,4 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
 
     assert frames[0] == b"READY=1"
     assert frames[-1] == b"STOPPING=1"
-    assert any(frame.startswith(b"WATCHDOG=1") for frame in frames)
+    assert any(frame == b"WATCHDOG=1" or frame.startswith(b"WATCHDOG=1\n") for frame in frames)
