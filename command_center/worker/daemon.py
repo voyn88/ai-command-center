@@ -21,14 +21,30 @@ Design decisions, each traceable to the shipped substrate:
   first-writer-wins); hammering the server with a dead secret is
   indistinguishable from an attack, so the daemon exits non-zero and leaves
   restart pacing to systemd.
-* **The watchdog is fed from both threads, because each covers the other's
-  blind spot** (SRV-06). The claim loop pings between claims but blocks for
-  the whole of a handler's run; the heartbeat thread pings during exactly
-  that run but exists only while an item is held. Together every healthy
-  state pings within one heartbeat interval, so a wedged process — a handler
-  that hangs *and* takes the beat thread with it, a claim loop stuck in a
-  driver call — misses two pings and systemd restarts the unit. Restart is
-  safe by the same construction as SIGKILL: lease expiry plus the reaper.
+* **The watchdog is fed by a thread that cannot block** (SRV-06, revised by
+  VOYN-W0-AICC-WATCHDOG-KILLS-REAL-RUNS). The claim loop pings between
+  claims but blocks for the whole of a handler's run, so a second thread
+  pings during exactly that run. That thread does two things — ping, and
+  subtract two clock readings — and in particular never touches PostgreSQL.
+  It used to: the ping rode the *lease* beat, which shares its thread with a
+  database round trip and returns the moment the lease is declared lost. So
+  a hung socket to the database, or one superseded attempt, silenced this
+  process's liveness while a perfectly healthy agent session was running,
+  and systemd shot the whole unit at ``WatchdogSec`` — mid-session, every
+  time, for runs measured in tens of minutes. Liveness now answers "is this
+  process alive", which is the only question the watchdog asks; the lease
+  answers its own question on its own thread.
+* **The ticker owns the lease deadline, because the beat cannot time its own
+  hang.** A beat blocked inside the driver counts no seconds; the ticker
+  does, and raises ``lease_lost`` once a full visibility window has passed
+  with no renewal the database accepted — so a handler whose lease has
+  provably lapsed still stops before its effects become a stale write.
+* **A handler that hangs forever is not the watchdog's to kill.** Its ticker
+  keeps pinging, so systemd will not restart us for it. That is deliberate:
+  the runner's own ``timeout_seconds`` bounds a stuck run, and the
+  alternative — shooting the process at ``WatchdogSec`` — is precisely the
+  failure this design exists to stop. A wedged *claim loop* is still caught:
+  between claims the loop is the only pinger, and no ticker exists then.
 """
 
 from __future__ import annotations
@@ -37,6 +53,7 @@ import logging
 import random
 import signal
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -75,6 +92,16 @@ class Handler(Protocol):
         lease_lost: threading.Event,
         attempt_no: int,
     ) -> HandlerOutcome: ...
+
+
+@dataclass(slots=True)
+class _LeaseClock:
+    """The monotonic time of the last renewal the database *accepted*, handed
+    from the beat thread that writes it to the ticker thread that times it.
+    Mutable and lock-free on purpose: one float, one writer, and an
+    assignment the GIL already makes atomic."""
+
+    renewed_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,19 +183,34 @@ class WorkerDaemon:
 
     def _execute(self, work: ClaimedWork) -> None:
         lease_lost = threading.Event()
-        beat_stop = threading.Event()
+        dispatch_over = threading.Event()
+        lease = _LeaseClock(renewed_at=time.monotonic())
         beat = threading.Thread(
             target=self._heartbeat_loop,
-            args=(work, lease_lost, beat_stop),
+            args=(work, lease, lease_lost, dispatch_over),
             name=f"heartbeat-{work.attempt_id}",
             daemon=True,
         )
+        # The ticker covers exactly the window the claim loop cannot ping
+        # through, and it is stopped by the handler RETURNING — not by the
+        # lease, not by the database. A handler still winding down after
+        # `lease_lost` is a live process doing accountable work (unwinding,
+        # closing a subprocess), and letting systemd shoot it there is how
+        # this daemon used to lose half-finished agent sessions.
+        ticker = threading.Thread(
+            target=self._watchdog_loop,
+            args=(work, lease, lease_lost, dispatch_over),
+            name=f"watchdog-{work.attempt_id}",
+            daemon=True,
+        )
         beat.start()
+        ticker.start()
         try:
             outcome = self._dispatch(work, lease_lost)
         finally:
-            beat_stop.set()
+            dispatch_over.set()
             beat.join(timeout=5)
+            ticker.join(timeout=5)
 
         if lease_lost.is_set():
             # The database already gave this attempt to someone else (or will,
@@ -228,44 +270,82 @@ class WorkerDaemon:
             logger.exception("handler for %r raised", kind)
             return HandlerOutcome(ok=False, reason=repr(error), retryable=True)
 
-    def _heartbeat_loop(
-        self,
-        work: ClaimedWork,
-        lease_lost: threading.Event,
-        beat_stop: threading.Event,
-    ) -> None:
-        # A third of the window: two consecutive beats may fail (a restarting
-        # PostgreSQL, a network blip) before the lease actually lapses. The
-        # watchdog cap can shorten the wait — an extra lease renewal is
-        # harmless, a missed watchdog deadline during a long run is a restart.
+    def _tick_interval(self) -> float:
+        """The cadence both per-run threads wake on: a third of the visibility
+        window, shortened when systemd's deadline is the tighter one.
+
+        One number for both, because the two threads check each other's work —
+        the ticker times the beat's silence, so it must not wake more slowly
+        than the beat renews, or a lapsed lease would go unnoticed for a whole
+        extra tick.
+        """
         interval = max(self._config.visibility_seconds / 3.0, 1.0)
         watchdog = sdnotify.watchdog_interval_seconds()
         if watchdog is not None:
+            # An extra lease renewal is harmless; a missed watchdog deadline
+            # during a long run is systemd killing a live agent session.
             interval = min(interval, max(watchdog, 1.0))
-        consecutive_errors = 0
-        while not beat_stop.wait(interval):
-            # Fed even when the database is unreachable: the watchdog answers
-            # "is the process alive", not "is PostgreSQL up" — restarting the
-            # unit cures a wedged process and cures nothing about a DB outage,
-            # which the lease-lapse logic below already handles.
+        return interval
+
+    def _watchdog_loop(
+        self,
+        work: ClaimedWork,
+        lease: _LeaseClock,
+        lease_lost: threading.Event,
+        dispatch_over: threading.Event,
+    ) -> None:
+        """Liveness for the length of a handler's run, and the lease's own
+        deadline. Nothing in here can block: a ping and a subtraction, no
+        database call, no handler state. That is the entire point — see the
+        module docstring for the runs this cost us."""
+        interval = self._tick_interval()
+        while not dispatch_over.wait(interval):
             self._notify("WATCHDOG=1")
+            if lease_lost.is_set():
+                continue
+            stale_for = time.monotonic() - lease.renewed_at
+            if stale_for >= self._config.visibility_seconds:
+                # A full visibility window with no renewal the database
+                # accepted: the lease has provably lapsed on the server,
+                # whatever the local reason — a beat erroring every tick, or
+                # one still blocked inside the driver. The handler must stop
+                # before its outcome becomes a stale write. The beat cannot
+                # raise this itself: a thread wedged in a socket read counts
+                # no seconds, and that hang is exactly the case that used to
+                # end with systemd shooting the process instead.
+                logger.warning(
+                    "attempt %s: no lease renewal accepted for %.0fs "
+                    "(visibility %ss); declaring the lease lost",
+                    work.attempt_id,
+                    stale_for,
+                    self._config.visibility_seconds,
+                )
+                lease_lost.set()
+
+    def _heartbeat_loop(
+        self,
+        work: ClaimedWork,
+        lease: _LeaseClock,
+        lease_lost: threading.Event,
+        dispatch_over: threading.Event,
+    ) -> None:
+        # A third of the window: two consecutive beats may fail (a restarting
+        # PostgreSQL, a network blip) before the lease actually lapses.
+        interval = self._tick_interval()
+        while not dispatch_over.wait(interval):
+            if lease_lost.is_set():
+                # Renewing a lease we no longer hold writes nothing and asks
+                # the database a question the ticker already answered.
+                return
             try:
                 alive = self._store.heartbeat(work)
             except Exception:  # noqa: BLE001 -- transient DB errors must not kill the beat
-                consecutive_errors += 1
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
-                # Errors are not refusals, but they are not free either: after
-                # a full visibility window without one successful beat the
-                # lease has provably lapsed on the server, whatever the reason
-                # here — and the handler must stop before its outcome becomes
-                # a stale write. Review found the interleaving this closes:
-                # DB down through the lapse, recovered before the handler
-                # finished, result refused as stale with no trace.
-                if consecutive_errors * interval >= self._config.visibility_seconds:
-                    lease_lost.set()
-                    return
+                # Errors are not refusals, and timing them is not this
+                # thread's job — the ticker holds the deadline, and holds it
+                # for a hung beat as well as a loud one.
                 continue
-            consecutive_errors = 0
             if not alive:
                 lease_lost.set()
                 return
+            lease.renewed_at = time.monotonic()

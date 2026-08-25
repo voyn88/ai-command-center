@@ -17,12 +17,19 @@ Wants=network-online.target
 [Service]
 Type=notify
 # The daemon sends READY=1 when its claim loop starts and feeds the watchdog
-# from BOTH its threads (claim loop between claims, heartbeat thread during a
-# run), so every healthy state pings within one heartbeat interval
-# (visibility/3 = 100s by default). Two consecutive missed pings mean the
-# process is wedged, and restart is safe by the same construction as SIGKILL:
-# lease expiry plus the reaper timer (aicc-queue-reaper.timer) resume the item
-# elsewhere. 240s = two heartbeat intervals plus slack.
+# from the claim loop between claims and from a dedicated ticker thread for
+# exactly the length of a handler's run, so every healthy state pings within
+# one tick (visibility/3 = 100s by default). Two consecutive missed pings mean
+# the process is wedged, and restart is safe by the same construction as
+# SIGKILL: lease expiry plus the reaper timer (aicc-queue-reaper.timer) resume
+# the item elsewhere. 240s = two ticks plus slack.
+#
+# This value is NOT a run-length budget, and must not be raised to cover one
+# (VOYN-W0-AICC-WATCHDOG-KILLS-REAL-RUNS). Runs here are agent sessions of
+# 5-30+ minutes; the ticker pings straight through them, including through a
+# lost lease and an unreachable database, because liveness asks "is this
+# process alive" and nothing else. A run that outlives WatchdogSec is not the
+# failure mode this deadline is for — a run's own timeout_seconds bounds it.
 WatchdogSec=240s
 User=aicc-worker
 Group=aicc-worker

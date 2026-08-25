@@ -443,3 +443,105 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
     assert frames[0] == b"READY=1"
     assert frames[-1] == b"STOPPING=1"
     assert b"WATCHDOG=1" in frames
+
+
+# -- the watchdog must not shoot a live run (VOYN-W0-AICC-WATCHDOG-KILLS-REAL-RUNS)
+
+
+def test_the_watchdog_keeps_pinging_after_the_lease_is_lost() -> None:
+    """The regression this task exists for, half one: a lost lease must not
+    silence the process.
+
+    The ping used to ride the lease beat, and that beat RETURNS the moment
+    the database says the attempt is superseded. Everything after that point
+    — a handler noticing `lease_lost`, closing a subprocess, unwinding — ran
+    with nothing feeding systemd, so a `WatchdogSec` deadline landed on a
+    process that was alive and working. Pings are pinned to the handler's
+    run, not to the lease's life.
+    """
+    import threading
+    import time
+
+    store = ScriptedStore([_work({"kind": "slow"})])
+    store.heartbeat_alive = False  # the database supersedes the attempt
+    lease_gone = threading.Event()
+    pings_after_loss: list[str] = []
+
+    def notify(state: str) -> None:
+        if (
+            state == "WATCHDOG=1"
+            and lease_gone.is_set()
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            pings_after_loss.append(state)
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert lease_lost.wait(timeout=10), "the beat never signalled loss"
+        lease_gone.set()
+        time.sleep(2.2)  # the handler is still winding down: two more ticks
+        return HandlerOutcome(ok=True, result={"too": "late"})
+
+    daemon = WorkerDaemon(
+        store, {"slow": slow}, WorkerConfig(visibility_seconds=3), notify=notify
+    )
+    _run_until_idle(daemon, store)
+
+    # visibility 3s -> 1s ticks. The old design pinged zero times here.
+    assert len(pings_after_loss) >= 2, pings_after_loss
+    assert not any(c[0] == "complete" for c in store.calls), (
+        "a lost lease still discards the outcome; only the pinging changed"
+    )
+
+
+def test_a_hung_heartbeat_neither_silences_the_watchdog_nor_hides_the_lapse() -> None:
+    """The regression this task exists for, half two: a database that stops
+    ANSWERING, rather than refusing.
+
+    A beat blocked in a socket read (a dead tunnel: `connect_timeout` is not
+    a read timeout) raises no exception, so the old error-counting deadline
+    never fired and the old ping — the next statement in that same blocked
+    loop — never ran either. Systemd killed the unit at `WatchdogSec` mid
+    agent session, and that kill was the only thing bounding the lapsed
+    lease. Both jobs move to a thread that cannot block: pings keep coming,
+    and the lease is declared lost on the clock rather than on a signal.
+    """
+    import threading
+
+    store = ScriptedStore([_work({"kind": "slow"})])
+    released = threading.Event()
+    handler_running = threading.Event()
+    pings_while_hung: list[str] = []
+
+    def hung_heartbeat(work):
+        store.calls.append(("heartbeat", work.attempt_id))
+        released.wait(timeout=30)  # the socket that never answers
+        return True
+
+    store.heartbeat = hung_heartbeat  # type: ignore[method-assign]
+
+    def notify(state: str) -> None:
+        if (
+            state == "WATCHDOG=1"
+            and handler_running.is_set()
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            pings_while_hung.append(state)
+
+    def slow(payload, lease_lost, attempt_no=1):
+        handler_running.set()
+        assert lease_lost.wait(timeout=10), (
+            "the hung beat was never timed out: only systemd would have "
+            "ended this attempt, by killing the whole daemon"
+        )
+        released.set()
+        return HandlerOutcome(ok=True, result={"too": "late"})
+
+    daemon = WorkerDaemon(
+        store, {"slow": slow}, WorkerConfig(visibility_seconds=3), notify=notify
+    )
+    _run_until_idle(daemon, store)
+
+    assert len(pings_while_hung) >= 2, pings_while_hung
+    assert len([c for c in store.calls if c[0] == "heartbeat"]) == 1, (
+        "the beat is stuck in one call — the pings came from elsewhere"
+    )
