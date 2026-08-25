@@ -33,7 +33,7 @@ UnsetEnvironment=ANTHROPIC_API_KEY
 NoNewPrivileges=yes
 ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker/%i/pgpass
 # This final argv assignment cannot be overridden by EnvironmentFile values.
-ExecStart=/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required /opt/aicc/current/.venv/bin/python -m command_center.worker
+ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.worker
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always

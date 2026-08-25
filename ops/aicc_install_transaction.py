@@ -593,6 +593,14 @@ class FileTransaction:
             elif current.exists():
                 raise RuntimeError("current release selector is not a symlink")
         else:
+            # Repointing the LIVE selector at a release that does not exist
+            # would leave every worker ExecStart dereferencing a missing
+            # directory (review on 6e22b93): the target must exist first.
+            release_target = current.parent / selector
+            if not release_target.is_dir():
+                raise RuntimeError(
+                    "pending release selector points at a missing release"
+                )
             temporary = current.parent / f".current-recover-{os.getpid()}"
             temporary.unlink(missing_ok=True)
             temporary.symlink_to(selector)

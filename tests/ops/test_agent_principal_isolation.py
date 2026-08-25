@@ -819,9 +819,10 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     }
     assert "NoNewPrivileges=true" in worker
     assert (
-        "ExecStart=/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required "
-        "/opt/aicc/current/.venv/bin/python -m command_center.worker" in worker_template
+        "ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.worker"
+        in worker_template
     )
+    assert "AICC_AGENT_PRINCIPAL_ISOLATION" not in worker_template
     assert (
         "EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env"
         in worker_template

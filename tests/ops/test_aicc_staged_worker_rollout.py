@@ -35,7 +35,6 @@ class FakeSystemd:
                     "/etc/aicc/workspace-authority.env (ignore_errors=no)"
                 ),
                 "ExecStart": (
-                    "/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required "
                     "/opt/aicc/current/.venv/bin/python -m command_center.worker"
                 ),
                 "ActiveState": "active",
@@ -279,8 +278,7 @@ def test_verifier_accepts_real_systemctl_execstart_serialization():
     systemd = FakeSystemd((unit,))
     systemd.states[unit]["ExecStart"] = (
         "{ path=/usr/bin/env ; "
-        "argv[]=/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required "
-        "/opt/aicc/current/.venv/bin/python -m command_center.worker ; "
+        "argv[]=/opt/aicc/current/.venv/bin/python -m command_center.worker ; "
         "ignore_errors=no ; pid=321 ; code=(null) ; status=0/0 }"
     )
 

@@ -32,8 +32,11 @@ WORKER_TEMPLATE = Path("/etc/systemd/system/voyn-aicc-worker@.service")
 WORKER_DROPIN = Path(
     "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf"
 )
+# ONE delivery story for the fail-closed flag: the drop-in supplies
+# Environment= (REQUIRED_ISOLATION_ENVIRONMENT below is verified from it);
+# an env-baked ExecStart made the staged drop-in decorative for the template
+# family and enshrined two contradictory rollouts (review on 6e22b93).
 EXPECTED_WORKER_EXECSTART = (
-    "/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required "
     "/opt/aicc/current/.venv/bin/python -m command_center.worker"
 )
 REQUIRED_ISOLATION_ENVIRONMENT = "AICC_AGENT_PRINCIPAL_ISOLATION=required"

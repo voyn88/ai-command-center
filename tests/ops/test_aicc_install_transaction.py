@@ -497,6 +497,7 @@ def test_recover_restores_release_selector_before_any_service_snapshot(tmp_path)
     current.parent.mkdir(parents=True)
     current.symlink_to(f"releases/{'b' * 40}")
     state.mkdir()
+    (current.parent / "releases" / ("a" * 40)).mkdir(parents=True)
     pending_release = state / "pending-release"
     pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
     pending_release.chmod(0o600)
@@ -506,3 +507,23 @@ def test_recover_restores_release_selector_before_any_service_snapshot(tmp_path)
 
     assert current.readlink() == Path(f"releases/{'a' * 40}")
     assert not pending_release.exists()
+
+
+def test_recover_refuses_a_selector_to_a_missing_release(tmp_path):
+    """A stale pending-release must not point the live selector into a
+    missing directory -- every worker ExecStart would dereference it
+    (independent-review finding on 6e22b93)."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    state.mkdir()
+    pending = state / "pending-release"
+    pending.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
+    pending.chmod(0o600)
+    transaction = module.FileTransaction(root, state)
+    with pytest.raises(RuntimeError, match="missing release"):
+        transaction.recover()
+    assert current.readlink() == Path(f"releases/{'b' * 40}")

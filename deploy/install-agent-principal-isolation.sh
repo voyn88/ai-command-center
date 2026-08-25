@@ -39,6 +39,10 @@ stage_immutable_release() {
   case "$release_id" in
     *[!0-9a-f]*|'') echo "invalid release commit" >&2; exit 1 ;;
   esac
+  # The previous/baseline selectors only accept ^releases/[0-9a-f]{40}$; a
+  # non-40 hex id written here would self-lockout a later run or uninstall
+  # (review on 6e22b93).
+  [ "${#release_id}" -eq 40 ] || { echo "invalid release commit length" >&2; exit 1; }
   release_dir="$release_root/$release_id"
   install -d -m 0755 -o root -g root "$release_root"
   if [ ! -d "$release_dir" ]; then
@@ -254,6 +258,9 @@ run_rollout rollout --lanes /etc/aicc/worker-lanes
 
 run_transaction commit
 transaction_active=0
+# The committed install owns its state: a stale pending-release would point
+# boot recovery at the PREVIOUS release after success (review on 6e22b93).
+rm -f -- "$pending_release"
 rm -f -- "$attempt_units"
 trap - EXIT HUP INT TERM
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"

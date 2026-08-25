@@ -253,7 +253,19 @@ def task_workspace_path(
     if clone_root is None:
         parent = repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
     else:
-        root = Path(clone_root).expanduser().resolve(strict=True)
+        try:
+            root = Path(clone_root).expanduser().resolve(strict=True)
+        except OSError as error:
+            # A missing clone root must surface as the structured refusal
+            # callers handle, not a bare FileNotFoundError that bypasses the
+            # verification error path (review on 6e22b93).
+            raise WorkspaceVerificationError(
+                failed_step="task_clone_root_exists",
+                remediation="Create the task clone root directory on this host.",
+                expected_workspace=str(clone_root),
+                expected_branch="",
+                detail=f"task clone root is unusable: {error}",
+            ) from error
         repository_id = sha256(str(repo).encode("utf-8")).hexdigest()[:16]
         repository_slug = re.sub(r"[^A-Za-z0-9._-]", "-", repo.name)
         parent = root / f"{repository_slug}-{repository_id}"
@@ -1992,12 +2004,21 @@ def remove_workspace(
         # (independent-review finding on 09554a1). O_NOFOLLOW+O_DIRECTORY
         # refuses a symlink at open time; the fstat validates the very
         # object the dst_dir_fd rename below will use.
-        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
         if hasattr(os, "O_NOFOLLOW"):
             directory_flags |= os.O_NOFOLLOW
         try:
             quarantine_fd = os.open(quarantine_root, directory_flags)
         except OSError:
+            return "remove_failed"
+        except NotImplementedError:
+            # dir_fd-relative rename/lstat below are POSIX-only; Windows
+            # raises NotImplementedError, which is not an OSError and would
+            # escape the cleanup path (review on 6e22b93).
             return "remove_failed"
         try:
             try:
@@ -2017,11 +2038,18 @@ def remove_workspace(
             quarantine_name = f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
             quarantine = quarantine_root / quarantine_name
             try:
-                os.rename(
-                    raw_workspace,
-                    quarantine_name,
-                    dst_dir_fd=quarantine_fd,
-                )
+                try:
+                    os.rename(
+                        raw_workspace,
+                        quarantine_name,
+                        dst_dir_fd=quarantine_fd,
+                    )
+                except NotImplementedError:
+                    return "remove_failed"
+                # Residual: shutil.rmtree below re-resolves the quarantine
+                # by pathname; acceptable because the DESTINATION directory
+                # was fd-pinned for the move and the clone is already out of
+                # the agent-writable parent by then (review on 6e22b93).
                 quarantine_stat = os.lstat(quarantine_name, dir_fd=quarantine_fd)
                 if (quarantine_stat.st_dev, quarantine_stat.st_ino) != inode:
                     return "remove_failed"

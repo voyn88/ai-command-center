@@ -660,7 +660,10 @@ def _run_agent(
             # empty one behind for every failed launch attempt. "Safe" is
             # keyed to freshness, not to the provisioning mode: a workspace
             # this attempt just created ("cloned"/"created"/"attached")
-            # holds nothing, while a "reused" one may carry a preserved
+            # holds nothing ("attached" included: provision_workspace's
+            # contract defines it as `git worktree add` of a NEW directory
+            # for an existing branch -- the directory itself is created by
+            # this attempt), while a "reused" one may carry a preserved
             # unpublished commit from an earlier attempt and must survive
             # for the retry to publish (review finding on 363e91d: the old
             # `== "cloned"` gate leaked every legacy fresh worktree).
