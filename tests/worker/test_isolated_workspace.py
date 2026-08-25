@@ -344,6 +344,10 @@ def test_agent_git_config_cannot_redirect_guarded_publish(
         # regressed publish that ran `git push` FROM this workspace would
         # never touch it (review finding on 8a881d3). pre-push fires on
         # exactly that regression, so plant both probes.
+        # The probe only means something against a standalone clone; a
+        # gitlink-file .git would both break mkdir and resolve hooks from
+        # the common dir, silently disarming the probe (review on c00fc46).
+        assert (workspace / ".git").is_dir(), "probe requires a standalone clone"
         hooks_dir = workspace / ".git" / "hooks"
         hooks_dir.mkdir(parents=True, exist_ok=True)
         pre_push = hooks_dir / "pre-push"

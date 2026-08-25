@@ -10,6 +10,8 @@ fell back to `repository_path`.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import os
 import shutil
 import stat
@@ -187,9 +189,7 @@ def test_standalone_clone_under_canonical_worker_root_is_exact_and_reusable(
     assert (workspace / ".git").is_dir()
     assert wp.provision_and_verify(spec).provision_outcome == "reused"
 
-    wrong = wp.WorkspaceSpec(
-        **{**spec.__dict__, "workspace_path": str(canonical_root / "attacker")}
-    )
+    wrong = replace(spec, workspace_path=str(canonical_root / "attacker"))
     with pytest.raises(wp.WorkspaceVerificationError, match="trusted path"):
         wp.verify_workspace(wrong)
 

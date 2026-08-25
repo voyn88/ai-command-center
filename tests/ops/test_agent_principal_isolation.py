@@ -727,6 +727,29 @@ def test_deployment_definitions_pin_separate_non_login_identity():
         root / "deploy/systemd/voyn-aicc-worker-principal-isolation.conf"
     ).read_text()
     assert "AICC_AGENT_PRINCIPAL_ISOLATION=required" in isolation_dropin
+    # The flag is only real if the transaction DELIVERS the drop-in to both
+    # unit families -- asserting file contents alone proved nothing about
+    # aicc-worker.service (independent-review finding on c00fc46).
+    import sys
+
+    sys.path.insert(0, str(root / "ops"))
+    import aicc_install_transaction as _tx
+
+    destinations = {
+        str(spec.target)
+        for spec in _tx.default_specs(
+            root,
+            authority_env=root / "x-authority.env",
+            claude_auth=root / "x-claude.json",
+            codex_auth=root / "x-codex.json",
+            resolve_identities=False,
+        )
+        if str(spec.source).endswith("voyn-aicc-worker-principal-isolation.conf")
+    }
+    assert destinations == {
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf",
+        "/etc/systemd/system/aicc-worker.service.d/20-principal-isolation.conf",
+    }
     assert "NoNewPrivileges=true" in worker
     assert (
         "ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker"
@@ -743,7 +766,9 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     assert "SocketMode=0660" in socket_unit
     assert "User=root" in launcher_unit
     assert "ExecStart=/usr/libexec/aicc-agent-launcher --serve-socket" in launcher_unit
-    assert "DynamicUser=yes" in (root / "ops/aicc_agent_launcher.py").read_text()
+    # The rendered-command assertion above (--property=DynamicUser=yes in the
+    # built argv) is the real control; a raw-source substring is satisfied by
+    # a comment (review note on c00fc46).
     assert "/srv/aicc-workspaces" in workspace_roots
     assert "/home/" not in workspace_roots
 

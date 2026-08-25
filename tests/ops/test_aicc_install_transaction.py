@@ -447,7 +447,7 @@ def test_target_rejects_or_contains_double_leading_slash(tmp_path):
     module = _module()
     transaction = module.FileTransaction(tmp_path / "root", tmp_path / "state")
     contained = transaction._target("//etc/x")
-    assert str(contained).startswith(str(tmp_path / "root"))
+    assert contained.is_relative_to(tmp_path / "root")
     with pytest.raises(ValueError):
         transaction._target("///")
 
