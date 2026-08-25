@@ -68,8 +68,11 @@ EXECUTOR_BINARIES = {
 }
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
+MOUNT = "/usr/bin/mount"
+UMOUNT = "/usr/bin/umount"
 QUARANTINE_ROOT = Path("/srv/aicc-quarantine")
 ACTIVE_UNIT_ROOT = Path("/run/aicc-agent-launcher/active")
+WORKSPACE_BIND_ROOT = Path("/run/aicc-agent-workspace-binds")
 CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_PROMPT_BYTES = 128 * 1024
@@ -142,6 +145,7 @@ SENSITIVE_AUTHORITY_TREES = (
     "/var/lib/aicc-agent",
     "/var/lib/voyn-aicc-credential-rotation",
     "/run/aicc-agent-launcher",
+    "/run/aicc-agent-workspace-binds",
     "/run/credentials",
     "/run/voyn-aicc-worker",
     "/srv/aicc-quarantine",
@@ -172,6 +176,17 @@ CLAUDE_GIT_DENIES = [
 
 class LaunchRefused(RuntimeError):
     pass
+
+
+class WorkspaceBind:
+    """A broker-owned mount whose root is the already verified workspace fd."""
+
+    __slots__ = ("identity", "journal", "path")
+
+    def __init__(self, path: Path, journal: Path, identity: tuple[int, int]):
+        self.path = path
+        self.journal = journal
+        self.identity = identity
 
 
 def _readline_limited(stream) -> bytes:
@@ -875,12 +890,11 @@ def _current_broker_unit(cgroup_file: Path = Path("/proc/self/cgroup")) -> str:
 
 def _systemd_command(
     manifest: dict[str, Any],
-    workspace: Path,
     agent_home: Path,
     unit: str,
     broker_unit: str,
     workspace_root: Path,
-    workspace_source: Path | None = None,
+    workspace_source: Path,
 ) -> list[str]:
     executor = manifest["executor"]
     timeout = int(manifest["timeout_seconds"])
@@ -954,7 +968,10 @@ def _systemd_command(
         f"--property=RuntimeMaxSec={timeout + 30}",
         "--property=TimeoutStopSec=20",
         f"--property=InaccessiblePaths={inaccessible_paths}",
-        f"--property=BindPaths={workspace_source or workspace}:/workspace",
+        # The source is always a broker-created bind mount. There is no
+        # pathname fallback: PID 1 must never resolve the mutable workspace
+        # argument supplied by the publisher.
+        f"--property=BindPaths={workspace_source}:/workspace",
         f"--property=BindPaths={agent_home}:/agent-home",
         "--property=ReadWritePaths=/workspace /agent-home",
     ]
@@ -1099,25 +1116,172 @@ def _quarantine_workspace(workspace: Path, run_id: str) -> Path:
     return workspace
 
 
-def _pinned_real_path(workspace_fd: int, workspace_root: Path) -> Path:
-    """The pinned descriptor's CURRENT real path, identity-checked.
+def _workspace_bind_root_ready() -> None:
+    """Create and verify the root-only parent for broker-owned bind mounts."""
+    try:
+        WORKSPACE_BIND_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = WORKSPACE_BIND_ROOT.lstat()
+    except OSError as exc:
+        raise LaunchRefused("workspace bind staging root is unavailable") from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise LaunchRefused("workspace bind staging root is not immutable root-owned")
 
-    Containment alone left two gaps (review on 67a0a96): an unlinked
-    workspace reads back as "... (deleted)" yet stays inside the root, and a
-    rename+replace between readlink and PID 1's resolution would bind a
-    DIFFERENT inode. The path must still stat to the exact pinned identity.
+
+def _workspace_bind_journal(path: Path, *, phase: str, pid: int) -> Path:
+    journal = path.with_suffix(".json")
+    payload = json.dumps(
+        {
+            "version": 1,
+            "phase": phase,
+            "pid": pid,
+            "path": str(path),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    _atomic_root_state(journal, payload)
+    return journal
+
+
+def _recover_workspace_bind_journals() -> None:
+    """Unmount bind staging left by a broker killed before its finally block."""
+    _workspace_bind_root_ready()
+    for journal in WORKSPACE_BIND_ROOT.glob("*.json"):
+        try:
+            info = journal.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or info.st_gid != 0
+                or stat.S_IMODE(info.st_mode) & 0o022
+                or info.st_size > 4096
+            ):
+                raise LaunchRefused("workspace bind recovery journal drifted")
+            record = json.loads(journal.read_text(encoding="utf-8"))
+            owner_pid = record.get("pid") if isinstance(record, dict) else None
+            staging = Path(record.get("path", "")) if isinstance(record, dict) else Path()
+            if not isinstance(record, dict) or (
+                record.get("version") != 1
+                or record.get("phase") not in {"PREPARED", "MOUNTED"}
+                or not isinstance(owner_pid, int)
+                or staging.parent != WORKSPACE_BIND_ROOT
+                or staging.with_suffix(".json") != journal
+            ):
+                raise LaunchRefused("workspace bind recovery journal is invalid")
+            if owner_pid != os.getpid():
+                try:
+                    os.kill(owner_pid, 0)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    continue
+                else:
+                    continue
+            # PREPARED may already be mounted if the broker died between the
+            # mount syscall and the journal phase transition; umount is
+            # harmless for the plain directory and removes that race too.
+            subprocess.run(
+                [UMOUNT, "--", str(staging)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            journal.unlink(missing_ok=True)
+            staging.rmdir()
+        except FileNotFoundError:
+            journal.unlink(missing_ok=True)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LaunchRefused("workspace bind recovery failed") from exc
+
+
+def _validate_workspace_bind(binding: WorkspaceBind, workspace_fd: int) -> None:
+    """Prove the staging mount still names exactly the pinned workspace inode."""
+    try:
+        parent = binding.path.parent.lstat()
+        staging = binding.path.lstat()
+        current = os.stat(binding.path, follow_symlinks=False)
+        pinned = os.fstat(workspace_fd)
+    except OSError as exc:
+        raise LaunchRefused("workspace bind staging disappeared") from exc
+    if (
+        binding.path.parent != WORKSPACE_BIND_ROOT
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or parent.st_gid != 0
+        or stat.S_IMODE(parent.st_mode) != 0o700
+        or stat.S_ISLNK(staging.st_mode)
+        or not stat.S_ISDIR(staging.st_mode)
+        or (current.st_dev, current.st_ino) != binding.identity
+        or (pinned.st_dev, pinned.st_ino) != binding.identity
+    ):
+        raise LaunchRefused("workspace bind no longer names the verified inode")
+
+
+def _prepare_workspace_bind(workspace_fd: int, run_id: str) -> WorkspaceBind:
+    """Create an immutable mount source for PID 1 instead of passing a pathname.
+
+    PID 1 cannot dereference the broker's ``/proc/self/fd/N``.  The broker
+    therefore creates the bind mount while it still owns the verified fd and
+    gives ``systemd-run`` only this root-owned staging mount.  The original fd
+    remains open until cleanup, and the journal makes a killed broker's mount
+    recoverable by the next socket activation.
     """
-    raw = os.readlink(f"/proc/self/fd/{workspace_fd}")
-    if raw.endswith(" (deleted)"):
-        raise LaunchRefused("pinned workspace was unlinked")
-    real = Path(raw)
-    if not real.is_absolute() or not real.is_relative_to(workspace_root):
-        raise LaunchRefused("pinned workspace moved outside its root")
-    pinned = os.fstat(workspace_fd)
-    observed = os.stat(real, follow_symlinks=False)
-    if (observed.st_dev, observed.st_ino) != (pinned.st_dev, pinned.st_ino):
-        raise LaunchRefused("pinned workspace path no longer names the pinned inode")
-    return real
+    _workspace_bind_root_ready()
+    _recover_workspace_bind_journals()
+    staging = WORKSPACE_BIND_ROOT / f"{run_id}-{os.getpid()}"
+    journal = staging.with_suffix(".json")
+    try:
+        staging.mkdir(mode=0o700)
+        identity_info = os.fstat(workspace_fd)
+        identity = (identity_info.st_dev, identity_info.st_ino)
+        _workspace_bind_journal(staging, phase="PREPARED", pid=os.getpid())
+        result = subprocess.run(
+            [MOUNT, "--bind", f"/proc/self/fd/{workspace_fd}", str(staging)],
+            check=False,
+            pass_fds=(workspace_fd,),
+            capture_output=True,
+            env=SYSTEMD_RUN_ENVIRONMENT,
+        )
+        if result.returncode:
+            raise LaunchRefused("cannot create workspace bind staging mount")
+        binding = WorkspaceBind(staging, journal, identity)
+        _validate_workspace_bind(binding, workspace_fd)
+        _workspace_bind_journal(staging, phase="MOUNTED", pid=os.getpid())
+        return binding
+    except (FileExistsError, OSError) as exc:
+        raise LaunchRefused("cannot prepare workspace bind staging mount") from exc
+    except BaseException:
+        subprocess.run(
+            [UMOUNT, "--", str(staging)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        journal.unlink(missing_ok=True)
+        staging.rmdir()
+        raise
+
+
+def _cleanup_workspace_bind(binding: WorkspaceBind) -> None:
+    result = subprocess.run(
+        [UMOUNT, "--", str(binding.path)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode:
+        raise LaunchRefused(
+            "workspace bind staging mount could not be unmounted; journal retained"
+        )
+    binding.journal.unlink(missing_ok=True)
+    binding.path.rmdir()
 
 
 def _open_pinned_workspace(workspace: Path) -> int:
@@ -1338,6 +1502,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
     workspace: Path | None = None
     workspace_lock: int | None = None
     workspace_fd: int | None = None
+    workspace_bind: WorkspaceBind | None = None
     unit_recorded = False
     try:
         peer = _peer_uid(sock)
@@ -1360,24 +1525,23 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         _validate_binary(EXECUTOR_BINARIES[manifest["executor"]])
         agent_home = _prepare_agent_home(manifest["executor"], manifest["run_id"])
         unit = f"aicc-agent-{manifest['run_id']}-{os.getpid()}.service"
+        workspace_bind = _prepare_workspace_bind(workspace_fd, manifest["run_id"])
         _write_active_workspace_unit(workspace, unit)
         unit_recorded = True
         command = _systemd_command(
             manifest,
-            workspace,
             agent_home,
             unit,
             _current_broker_unit(),
             workspace_roots[0],
-            # systemd resolves the BindPaths SOURCE during namespace setup;
-            # handing it the /proc/<pid>/fd magic link relied on PID 1
-            # chasing it inside a partially-built namespace where the
-            # workspace root is InaccessiblePaths (review on 0f4d77e). The
-            # pinned fd stays the AUTHORITY: its current real path is read
-            # back via /proc/self and must still resolve inside the root --
-            # a rename between pin and spawn fails closed here.
-            _pinned_real_path(workspace_fd, workspace_roots[0]),
+            # PID 1 receives only the broker-created mount, never the mutable
+            # workspace pathname. Revalidate the mount and fd immediately
+            # before constructing the request to PID 1.
+            workspace_bind.path,
         )
+        # Keep this check adjacent to the syscall that hands the source to
+        # PID 1; a future command-builder refactor must not move it earlier.
+        _validate_workspace_bind(workspace_bind, workspace_fd)
         proc = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -1462,6 +1626,18 @@ def _serve_connected_socket(sock: socket.socket) -> int:
                 }
         if agent_home is not None:
             shutil.rmtree(agent_home, ignore_errors=True)
+        if workspace_bind is not None:
+            try:
+                _cleanup_workspace_bind(workspace_bind)
+            except (LaunchRefused, OSError) as exc:
+                response = {
+                    "version": 1,
+                    "exit_code": 125,
+                    "stdout_b64": "",
+                    "stderr_b64": base64.b64encode(
+                        f"{FAILURE}: workspace bind cleanup failed: {exc}\n".encode()
+                    ).decode("ascii"),
+                }
         if workspace_lock is not None:
             os.close(workspace_lock)
         if workspace_fd is not None:

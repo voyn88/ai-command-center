@@ -168,11 +168,11 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
     )
     command = launcher._systemd_command(
         _manifest(tmp_path),
-        tmp_path,
         Path("/run/aicc-agent-homes/test"),
         "aicc-agent-test.service",
         "aicc-agent-launcher@test.service",
         tmp_path.parent,
+        tmp_path,
     )
     joined = "\n".join(command)
     assert "--property=DynamicUser=yes" in command
@@ -212,6 +212,7 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
         "/var/lib/aicc-agent",
         "/var/lib/voyn-aicc-credential-rotation",
         "/run/aicc-agent-launcher",
+        "/run/aicc-agent-workspace-binds",
         "/run/credentials",
         "/run/voyn-aicc-worker",
         "/run/aicc-agent-homes",
@@ -309,7 +310,6 @@ def test_systemd_bind_uses_explicit_pinned_workspace_source(
     pinned = Path(f"/proc/{os.getpid()}/fd/123")
     command = launcher._systemd_command(
         _manifest(tmp_path),
-        tmp_path,
         Path("/run/aicc-agent-homes/test"),
         "aicc-agent-test.service",
         "aicc-agent-launcher@test.service",
@@ -318,6 +318,29 @@ def test_systemd_bind_uses_explicit_pinned_workspace_source(
     )
     assert f"--property=BindPaths={pinned}:/workspace" in command
     assert f"--property=BindPaths={tmp_path}:/workspace" not in command
+
+
+def test_workspace_bind_refuses_deterministic_symlink_replacement(launcher, tmp_path):
+    bind_root = tmp_path / "binds"
+    bind_root.mkdir(mode=0o700)
+    launcher.WORKSPACE_BIND_ROOT = bind_root
+    staging = bind_root / "run-a"
+    staging.mkdir(mode=0o700)
+    descriptor = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        info = os.fstat(descriptor)
+        binding = launcher.WorkspaceBind(
+            staging,
+            staging.with_suffix(".json"),
+            (info.st_dev, info.st_ino),
+        )
+        displaced = bind_root / "displaced"
+        staging.rename(displaced)
+        staging.symlink_to(displaced, target_is_directory=True)
+        with pytest.raises(launcher.LaunchRefused, match="no longer names"):
+            launcher._validate_workspace_bind(binding, descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def test_worker_derived_workspace_is_accepted_by_same_canonical_root(
@@ -901,3 +924,8 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "run_rollout rollout --lanes /etc/aicc/worker-lanes" in installer
     assert "repo_lanes=" not in installer
     assert "source " not in installer
+    assert "O_NOFOLLOW" in verifier
+    assert "st_uid != 0" in verifier
+    assert "st_gid != 0" in verifier
+    assert "st_ino" in verifier
+    assert "changed while being read" in verifier

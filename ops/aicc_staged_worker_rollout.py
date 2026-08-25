@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import pwd
@@ -119,21 +120,9 @@ class Systemd:
 
 
 def _configured_units(path: Path) -> set[str]:
-    try:
-        info = path.lstat()
-    except OSError as exc:
-        raise RolloutError(f"worker lane registry is unavailable: {path}") from exc
-    if stat.S_ISLNK(info.st_mode):
-        raise RolloutError(f"worker lane registry is a symlink: {path}")
-    if not stat.S_ISREG(info.st_mode):
-        raise RolloutError(f"worker lane registry is not a regular file: {path}")
-
+    raw_registry = _read_lane_registry(path)
     units: set[str] = set()
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise RolloutError(f"worker lane registry cannot be read: {path}") from exc
-    for raw in lines:
+    for raw in raw_registry.splitlines():
         value = raw.strip()
         if not value or value.startswith("#"):
             continue
@@ -146,6 +135,82 @@ def _configured_units(path: Path) -> set[str]:
             raise RolloutError(f"duplicate worker lane: {value}")
         units.add(unit)
     return units
+
+
+def _read_lane_registry(path: Path) -> str:
+    """Read the canonical lane registry through one stable, trusted fd.
+
+    ``lstat(); path.read_text()`` is not an ownership check: an unprivileged
+    writer can replace the pathname between those calls.  Open the final
+    component relative to a no-follow parent, validate the opened inode, read
+    only that descriptor, and compare both the descriptor and pathname after
+    the read.  A replacement therefore fails closed instead of changing the
+    lanes used by a rollout.
+    """
+    parent_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        parent_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    parent_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        parent_fd = os.open(path.parent, parent_flags)
+        # The basename is intentionally opened with O_NOFOLLOW.  fstat below,
+        # rather than lstat alone, is the authority for every byte consumed.
+        descriptor = os.open(path.name, file_flags, dir_fd=parent_fd)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != 0
+            or before.st_gid != 0
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or before.st_size > 64 * 1024
+        ):
+            raise RolloutError(
+                "worker lane registry must be root:root regular and not writable"
+            )
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 16 * 1024))
+            if not chunk:
+                raise RolloutError("worker lane registry was truncated while read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        try:
+            named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RolloutError("worker lane registry pathname disappeared") from exc
+        identity = (before.st_dev, before.st_ino)
+        if (
+            (after.st_dev, after.st_ino) != identity
+            or (named.st_dev, named.st_ino) != identity
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_ctime_ns != before.st_ctime_ns
+            or after.st_uid != 0
+            or after.st_gid != 0
+            or stat.S_IMODE(after.st_mode) & 0o022
+        ):
+            raise RolloutError("worker lane registry changed while being read")
+        try:
+            return b"".join(chunks).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RolloutError("worker lane registry is not valid UTF-8") from exc
+    except RolloutError:
+        raise
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RolloutError(f"worker lane registry is a symlink: {path}") from exc
+        raise RolloutError(f"worker lane registry cannot be read safely: {path}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def _configured_users(path: Path) -> tuple[str, ...]:

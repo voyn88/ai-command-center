@@ -11,7 +11,7 @@ secret_manifest=/etc/aicc/publisher-secret-paths
 lane_registry=/etc/aicc/worker-lanes
 worker_template=/etc/systemd/system/voyn-aicc-worker@.service
 worker_dropin=/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
-principal_inaccessible_paths="/etc/aicc /etc/voyn /home /root /var/lib/aicc-worker /var/lib/aicc-agent /var/lib/voyn-aicc-credential-rotation /run/aicc-agent-launcher /run/credentials /run/voyn-aicc-worker /srv/aicc-quarantine"
+principal_inaccessible_paths="/etc/aicc /etc/voyn /home /root /var/lib/aicc-worker /var/lib/aicc-agent /var/lib/voyn-aicc-credential-rotation /run/aicc-agent-launcher /run/aicc-agent-workspace-binds /run/credentials /run/voyn-aicc-worker /srv/aicc-quarantine"
 
 fail() {
   echo "AICC_AGENT_PRINCIPAL_BOUNDARY_FAIL: $*" >&2
@@ -176,29 +176,91 @@ worker_family_units="aicc-worker.service"
 # disabled them, degenerating this loop to a vacuous single-unit check;
 # review on 27c06df). Read the enabled lanes from the root-owned registry,
 # the same authority the rotator uses, and refuse an empty lane set.
-[ -r "$lane_registry" ] || fail "worker lane registry is missing: $lane_registry"
-[ ! -L "$lane_registry" ] || fail "worker lane registry is a symlink: $lane_registry"
-[ -f "$lane_registry" ] || fail "worker lane registry is not a regular file: $lane_registry"
-lane_family_units=
-while IFS= read -r lane || [ -n "$lane" ]; do
+# Read through one O_NOFOLLOW fd.  The Python fleet verifier has the same
+# contract; keeping this shell gate on the exact bytes read from that fd means
+# a pathname replacement cannot alter the units selected by this verifier.
+lane_registry_contents=$(python3 - "$lane_registry" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+parent_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+if hasattr(os, "O_NOFOLLOW"):
+    parent_flags |= os.O_NOFOLLOW
+    file_flags |= os.O_NOFOLLOW
+parent = os.open(path.parent, parent_flags)
+fd = None
+try:
+    fd = os.open(path.name, file_flags, dir_fd=parent)
+    before = os.fstat(fd)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != 0
+        or before.st_gid != 0
+        or stat.S_IMODE(before.st_mode) & 0o022
+        or before.st_size > 65536
+    ):
+        raise RuntimeError("registry is not root:root regular and non-writable")
+    chunks = []
+    remaining = before.st_size
+    while remaining:
+        chunk = os.read(fd, min(remaining, 16384))
+        if not chunk:
+            raise RuntimeError("registry was truncated while being read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    after = os.fstat(fd)
+    named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+    identity = (before.st_dev, before.st_ino)
+    if (
+        len(payload) != before.st_size
+        or (after.st_dev, after.st_ino) != identity
+        or (named.st_dev, named.st_ino) != identity
+        or after.st_size != before.st_size
+        or after.st_mtime_ns != before.st_mtime_ns
+        or after.st_ctime_ns != before.st_ctime_ns
+        or after.st_uid != 0
+        or after.st_gid != 0
+        or stat.S_IMODE(after.st_mode) & 0o022
+    ):
+        raise RuntimeError("registry changed while being read")
+    sys.stdout.write(payload.decode("utf-8"))
+finally:
+    if fd is not None:
+        os.close(fd)
+    os.close(parent)
+PY
+) || fail "worker lane registry is unavailable or changed while being read"
+lane_family_units=$(printf '%s\n' "$lane_registry_contents" | while IFS= read -r lane || [ -n "$lane" ]; do
   lane=$(printf '%s' "$lane" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-  case "$lane" in
-    ''|'#'*) continue ;;
-  esac
-  case "$lane" in
-    voyn-aicc-worker@*.service)
-      lane=${lane#voyn-aicc-worker@}
-      lane=${lane%.service}
-      ;;
-  esac
+  if [ -z "$lane" ]; then
+    continue
+  fi
+  if [ "${lane#\#}" != "$lane" ]; then
+    lane=
+  fi
+  if [ -z "$lane" ]; then
+    continue
+  fi
+  if printf '%s\n' "$lane" | grep -Eq '^voyn-aicc-worker@[^/@[:space:]]+\.service$'; then
+    lane=${lane#voyn-aicc-worker@}
+    lane=${lane%.service}
+  fi
   printf '%s\n' "$lane" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$' || \
     fail "invalid worker lane in registry: $lane"
   family_unit="voyn-aicc-worker@$lane.service"
-  case " $lane_family_units " in
-    *" $family_unit "*) fail "duplicate worker lane in registry: $lane" ;;
-  esac
+  if printf '%s\n' "$lane_family_units" | grep -Fqx "$family_unit"; then
+    fail "duplicate worker lane in registry: $lane"
+  fi
   lane_family_units="$lane_family_units $family_unit"
-done < "$lane_registry"
+  printf '%s\n' "$family_unit"
+done
+) || fail "worker lane registry entries could not be parsed safely"
 [ -n "$lane_family_units" ] || fail "no worker lanes found in the registry to verify"
 for family_unit in $worker_family_units $lane_family_units; do
   family_env=$(systemctl show "$family_unit" --property=Environment --value)
