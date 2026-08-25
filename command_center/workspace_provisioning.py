@@ -1237,6 +1237,13 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     evidence.git_common_dir = str(git_common_dir) if git_common_dir else None
 
     # 3. Workspace belongs to the expected repository.
+    # Task-local standalone clones never reach this comparison: they return
+    # through _verify_task_local_workspace at the top of this function, which
+    # carries the signed ownership-marker and canonical-remote validation a
+    # clone needs (its .git common dir is intentionally distinct from the
+    # source repository's, so THIS check would indeed refuse it -- reviewed
+    # on bedb7a1: the dispatch line sits outside changed hunks, so a chunk
+    # showing only the removal cannot see it).
     if repo_resolved is not None and git_info.get_status(repo_resolved).get("is_repo"):
         workspace_common = _git_common_dir(workspace_resolved)
         repo_common = _git_common_dir(repo_resolved)
