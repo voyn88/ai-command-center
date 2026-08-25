@@ -26,11 +26,17 @@ DEFER_PROJECT_BUDGET = "project_budget_exceeded"
 DEFER_AGENT_CAPACITY = "agent_capacity_reached"
 DEFER_NO_ELIGIBLE_EXECUTOR = "no_eligible_executor"
 DEFER_NO_AVAILABLE_EXECUTOR = "no_available_executor"
+# The trailing-24h spend could not be established while a ceiling is
+# configured. Distinct from DEFER_DAILY_BUDGET on purpose: the gate fails
+# closed either way, but "the budget is spent" and "we cannot see the budget"
+# are different facts and only one of them is about money already gone.
+DEFER_SPEND_UNKNOWN = "daily_spend_unknown"
 
 DEFER_REASONS = frozenset(
     {
         DEFER_KILL_SWITCH,
         DEFER_DAILY_BUDGET,
+        DEFER_SPEND_UNKNOWN,
         DEFER_AGENT_BUDGET,
         DEFER_PROJECT_BUDGET,
         DEFER_AGENT_CAPACITY,
@@ -48,6 +54,10 @@ REASON_EXPLANATIONS: dict[str, str] = {
     ),
     DEFER_DAILY_BUDGET: (
         "Assigning any eligible executor would exceed the daily spend budget."
+    ),
+    DEFER_SPEND_UNKNOWN: (
+        "Today's spend could not be read, so the daily budget cannot be "
+        "checked; dispatch is held rather than risking an overspend."
     ),
     DEFER_AGENT_BUDGET: (
         "Every eligible executor is at or over its per-agent spend limit."
@@ -67,6 +77,24 @@ REASON_EXPLANATIONS: dict[str, str] = {
 
 def explanation_for(reason: str) -> str:
     return REASON_EXPLANATIONS.get(reason, reason)
+
+
+# --------------------------------------------------------------------------
+# How to read the plan's `daily_spend_usd`
+# --------------------------------------------------------------------------
+
+# The trailing-24h spend was read and is the number in the plan.
+SPEND_MEASURED = "measured"
+# No ceiling is configured (`max_daily_spend_usd <= 0`), so there is nothing to
+# compare a spend against and it was deliberately not measured. Not measuring
+# is what removes the whole failure class from the default configuration.
+SPEND_NOT_MEASURED = "not_measured"
+# A ceiling IS configured but the spend could not be established. The money
+# gate fails closed on this, and says so in these words rather than claiming
+# the budget was exhausted.
+SPEND_UNKNOWN = "unknown"
+
+SPEND_STATUSES = frozenset({SPEND_MEASURED, SPEND_NOT_MEASURED, SPEND_UNKNOWN})
 
 
 # --------------------------------------------------------------------------
@@ -281,13 +309,22 @@ class DispatchDecision:
 
 @dataclass(frozen=True)
 class DispatchPlan:
-    """The whole plan: one decision per task plus the budget arithmetic."""
+    """The whole plan: one decision per task plus the budget arithmetic.
+
+    `daily_spend_usd` / `projected_spend_usd` are `None` when the trailing-24h
+    spend was not established — either because no ceiling is configured and it
+    was deliberately not measured, or because measuring it failed.
+    `spend_status` says which, so no reader has to infer an absent number's
+    meaning. `plan_cost_usd` is always a number: it is this plan's own cost,
+    which is knowable regardless of the baseline.
+    """
 
     decisions: tuple[DispatchDecision, ...]
     kill_switch_engaged: bool
-    daily_spend_usd: float
+    daily_spend_usd: float | None
     max_daily_spend_usd: float
-    projected_spend_usd: float
+    projected_spend_usd: float | None
+    plan_cost_usd: float = 0.0
 
     @property
     def assignments(self) -> tuple[DispatchDecision, ...]:
@@ -298,18 +335,33 @@ class DispatchPlan:
         return tuple(d for d in self.decisions if not d.assigned)
 
     @property
-    def budget_remaining_usd(self) -> float:
+    def spend_status(self) -> str:
+        """How to read `daily_spend_usd`: measured, deliberately not measured
+        (no ceiling to check it against), or unknown (measurement failed while
+        a ceiling *is* configured — the fail-closed case)."""
+        if self.daily_spend_usd is not None:
+            return SPEND_MEASURED
+        return (
+            SPEND_UNKNOWN if self.max_daily_spend_usd > 0 else SPEND_NOT_MEASURED
+        )
+
+    @property
+    def budget_remaining_usd(self) -> float | None:
         if self.max_daily_spend_usd <= 0:
             return float("inf")
+        if self.projected_spend_usd is None:
+            return None  # unknowable, not unlimited
         return self.max_daily_spend_usd - self.projected_spend_usd
 
     def as_dict(self) -> dict:
         remaining = self.budget_remaining_usd
         return {
             "kill_switch_engaged": self.kill_switch_engaged,
+            "spend_status": self.spend_status,
             "daily_spend_usd": self.daily_spend_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,
+            "plan_cost_usd": self.plan_cost_usd,
             "budget_remaining_usd": (None if remaining == float("inf") else remaining),
             "assignment_count": len(self.assignments),
             "deferred_count": len(self.deferred),

@@ -311,3 +311,142 @@ def test_plan_is_deterministic_for_identical_input():
     assert [d.as_dict() for d in first.decisions] == [
         d.as_dict() for d in second.decisions
     ]
+
+
+# --------------------------------------------------------------------------
+# An unknown spend is carried as unknown — never substituted with a number
+#
+# The three ceiling/price configurations below are the ones that made the old
+# `except Exception: spend = max_daily_spend_usd or 0.0` substitution a
+# *fail-open*: with no ceiling, and with a ceiling plus any free executor, the
+# "fail closed" branch assigned exactly as many tasks as "nothing was spent".
+# --------------------------------------------------------------------------
+
+
+def test_unknown_spend_under_a_ceiling_defers_every_task_with_its_own_reason():
+    policy = DispatchPolicy()
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    tasks = [_task("t1"), _task("t2")]
+
+    plan = _plan(
+        tasks, executors, policy, daily_spend_usd=None, max_daily_spend_usd=5.0
+    )
+
+    # Fail closed: the free executor does not sidestep an unreadable budget.
+    assert plan.assignments == ()
+    assert {d.reason for d in plan.deferred} == {models.DEFER_SPEND_UNKNOWN}
+    # ...and it is NOT reported as an exhausted budget.
+    assert models.DEFER_DAILY_BUDGET not in {d.reason for d in plan.deferred}
+
+
+def test_unknown_spend_under_a_ceiling_defers_paid_and_free_executors_alike():
+    """The old substitution let a zero-cost executor through: `projected+0 >
+    max` is false however high the substituted baseline is. A free pool is
+    exactly the default pool, so this was the common case."""
+    policy = DispatchPolicy()
+    executors = [
+        _executor("ollama", cost=0.0, is_local=True),
+        _executor("claude_code", cost=0.5),
+    ]
+
+    plan = _plan(
+        [_task("t1"), _task("t2")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=5.0,
+    )
+
+    assert len(plan.assignments) == 0
+    assert plan.spend_status == models.SPEND_UNKNOWN
+
+
+def test_unknown_spend_with_no_ceiling_does_not_block_dispatch():
+    """`max_daily_spend_usd <= 0` means no ceiling, so there is no comparison
+    to make and an unknown baseline constrains nothing. Blocking here would
+    stop the default configuration for a number nobody asked for."""
+    policy = DispatchPolicy()
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+
+    plan = _plan(
+        [_task("t1"), _task("t2")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=0.0,
+    )
+
+    assert len(plan.assignments) == 2
+    assert plan.spend_status == models.SPEND_NOT_MEASURED
+
+
+def test_unknown_spend_is_reported_as_null_never_as_a_substituted_number():
+    policy = DispatchPolicy(cost_matrix={"claude_code": 0.4})
+    executors = [_executor("claude_code", cost=0.4)]
+
+    plan = _plan(
+        [_task("t1")], executors, policy, daily_spend_usd=None, max_daily_spend_usd=0.0
+    )
+    body = plan.as_dict()
+
+    assert body["daily_spend_usd"] is None
+    assert body["projected_spend_usd"] is None
+    # The plan's own cost is knowable even when the baseline is not.
+    assert body["plan_cost_usd"] == 0.4
+    assert body["spend_status"] == models.SPEND_NOT_MEASURED
+
+
+def test_unknown_spend_under_a_ceiling_reports_remaining_budget_as_null():
+    """`None` means unknowable. It must not collapse into the same `None` an
+    *unlimited* budget produces — `spend_status` is what tells them apart."""
+    policy = DispatchPolicy()
+    plan = _plan(
+        [_task("t1")],
+        [_executor("ollama", cost=0.0, is_local=True)],
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=5.0,
+    )
+    body = plan.as_dict()
+
+    assert body["budget_remaining_usd"] is None
+    assert body["spend_status"] == models.SPEND_UNKNOWN
+    assert body["max_daily_spend_usd"] == 5.0
+
+
+def test_known_spend_still_reports_measured_status_and_real_numbers():
+    policy = DispatchPolicy(cost_matrix={"claude_code": 0.4})
+    executors = [_executor("claude_code", cost=0.4)]
+
+    plan = _plan(
+        [_task("t1")], executors, policy, daily_spend_usd=0.1, max_daily_spend_usd=5.0
+    )
+    body = plan.as_dict()
+
+    assert body["spend_status"] == models.SPEND_MEASURED
+    assert body["daily_spend_usd"] == 0.1
+    assert body["projected_spend_usd"] == 0.5
+    assert body["plan_cost_usd"] == 0.4
+    assert body["budget_remaining_usd"] == 4.5
+
+
+def test_kill_switch_still_wins_over_an_unknown_spend():
+    policy = DispatchPolicy()
+    plan = _plan(
+        [_task("t1")],
+        [_executor("ollama", cost=0.0, is_local=True)],
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=5.0,
+        kill_switch_engaged=True,
+    )
+
+    assert plan.deferred[0].reason == models.DEFER_KILL_SWITCH
+
+
+def test_spend_unknown_has_its_own_operator_explanation():
+    assert models.DEFER_SPEND_UNKNOWN in models.DEFER_REASONS
+    unknown = models.explanation_for(models.DEFER_SPEND_UNKNOWN)
+    exhausted = models.explanation_for(models.DEFER_DAILY_BUDGET)
+    assert unknown != exhausted
+    assert unknown != models.DEFER_SPEND_UNKNOWN  # not the bare code

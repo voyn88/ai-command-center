@@ -6,7 +6,10 @@ never reimplementing them:
 * queued tasks       -> `tasks_repository.load_tasks` (single reader of the board)
 * executor pool      -> `executors.EXECUTORS` + their live availability probes
 * permitted per task -> `project_config.allowed_execution_providers`
-* daily spend        -> `task_pipeline.daily_spend_usd` (the trailing-24h primitive)
+* daily spend        -> `task_pipeline.daily_spend_usd` (the trailing-24h
+                        primitive), read only when a ceiling is configured,
+                        and carried to the engine as `None` — "unknown" — when
+                        it raises `SpendUnknownError`, never substituted
 * spend ceiling      -> `pipeline_settings.max_daily_spend_usd`
 * kill switch        -> `pipeline_settings.enabled` (the master switch the
                         `task_pipeline.kill_switch` sets off)
@@ -23,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from command_center import activity_log
 from command_center import executors as executors_module
 from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
@@ -46,6 +50,10 @@ QUEUED_STATUSES = frozenset({"Backlog", "Next"})
 
 # Run states that occupy an executor's concurrency slot right now.
 _ACTIVE_RUN_STATES = frozenset(runtime_db.EXECUTION_CENTER_ACTIVE_STATES)
+
+# Activity-log event type appended when the money gate cannot read the spend.
+# Uses the existing append-only activity log rather than a new primitive.
+EV_DISPATCH_SPEND_UNKNOWN = "dispatch_spend_unknown"
 
 
 # --------------------------------------------------------------------------
@@ -166,10 +174,26 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # `enabled=False`. Dispatch must never launch while it is off.
     kill_switch_engaged = not settings.enabled
 
-    try:
-        spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed (assume ceiling hit)
-        spend = settings.max_daily_spend_usd or 0.0
+    # The trailing-24h spend is only worth reading when there is a ceiling to
+    # compare it against. With none configured (the default) it is not
+    # measured at all, which removes that whole class of failure from the
+    # default configuration rather than handling it.
+    spend: float | None = None
+    if settings.max_daily_spend_usd > 0:
+        try:
+            spend = task_pipeline.daily_spend_usd(resolved_db)
+        except task_pipeline.SpendUnknownError as exc:
+            # `None` — carried to the engine as "unknown", never substituted
+            # with a number. Only this error is caught: an `AttributeError` or
+            # a `KeyError` from the primitive is a bug and must still surface.
+            spend = None
+            activity_log.log_event(
+                EV_DISPATCH_SPEND_UNKNOWN,
+                message=(
+                    f"trailing-24h spend unknown ({exc.kind}); "
+                    "dispatch plan held closed"
+                ),
+            )
 
     return plan_dispatch(
         collect_queued_tasks(root),

@@ -1339,3 +1339,122 @@ def test_the_dispatcher_passes_the_configured_timeout(tmp_path, git_repo, api, m
         PipelineSettings(enabled=True, auto_launch=True, run_timeout_seconds=3600),
     )
     assert seen["timeout_seconds"] == 3600
+
+
+# --------------------------------------------------------------------------
+# VOYN-W0-AICC-SPEND-CAP — `daily_spend_usd` is trustworthy or it raises
+#
+# The gap this closes: an unreadable cost event used to be silently skipped
+# (understating spend) or to raise a bare `AttributeError` that both callers
+# swallowed into a budget verdict. Neither is a number a money gate may act on.
+# --------------------------------------------------------------------------
+
+
+def _seed_cost_event(api, payload, *, project: str = "AIOS"):
+    """A completed run inside the trailing-24h window carrying `payload` as its
+    single stream event, written through the real runtime.db writers."""
+    task = runtime_db.create_task(
+        api.db_path, project=project, title="prior", task_type="implementation"
+    )
+    session = runtime_db.create_session(
+        api.db_path, task_id=task["id"], project=project, repository_path="/tmp/x"
+    )
+    run = runtime_db.create_run(
+        api.db_path, session_id=session["id"], task_id=task["id"], project=project,
+        task_type="implementation", repository_path="/tmp/x", prompt="p",
+        is_resume=False,
+    )
+    runtime_db.append_run_event(api.db_path, run["id"], "stream_event", payload)
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (models.iso_now(), run["id"]),
+            )
+    return run
+
+
+def _overwrite_payload(api, run_id: str, raw) -> None:
+    """Replace a stored payload with bytes/text the writers would never
+    produce — the on-disk corruption this function must survive truthfully."""
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run_event SET payload_json=? WHERE run_id=?", (raw, run_id)
+            )
+
+
+def test_daily_spend_returns_zero_for_a_window_with_no_cost_events(api):
+    """No data is a fact, not an error: an empty (but migrated) database is
+    `0.0`. This is why the old `except` branch guarded a state that does not
+    exist — and why every state it *did* catch was mishandled."""
+    assert task_pipeline.daily_spend_usd(api.db_path) == 0.0
+
+
+def test_daily_spend_sums_reported_costs(api):
+    _seed_cost_event(api, {"type": "result", "total_cost_usd": 1.5})
+    _seed_cost_event(api, {"type": "result", "total_cost_usd": 0.25})
+
+    assert task_pipeline.daily_spend_usd(api.db_path) == pytest.approx(1.75)
+
+
+def test_daily_spend_raises_on_a_non_object_json_payload(api):
+    """Valid JSON that is not an object. `payload.get(...)` raised
+    `AttributeError` here — outside the old `try` — and both callers swallowed
+    it into a budget verdict."""
+    run = _seed_cost_event(api, {"type": "result", "total_cost_usd": 1.0})
+    _overwrite_payload(api, run["id"], json.dumps([{"total_cost_usd": 1.0}]))
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(api.db_path)
+
+    assert excinfo.value.kind == task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_raises_on_a_bare_scalar_json_payload(api):
+    run = _seed_cost_event(api, {"type": "result", "total_cost_usd": 1.0})
+    _overwrite_payload(api, run["id"], '"total_cost_usd"')
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(api.db_path)
+
+    assert excinfo.value.kind == task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_raises_on_invalid_utf8_payload_bytes(api):
+    """Invalid UTF-8 surfaces as `UnicodeDecodeError`, a `ValueError` subclass
+    — caught as corruption, not as a crash and not silently skipped."""
+    run = _seed_cost_event(api, {"type": "result", "total_cost_usd": 1.0})
+    _overwrite_payload(api, run["id"], b'{"total_cost_usd": 1.0, "x": "\xff\xfe"}')
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(api.db_path)
+
+    assert excinfo.value.kind == task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_raises_on_truncated_json_payload(api):
+    run = _seed_cost_event(api, {"type": "result", "total_cost_usd": 1.0})
+    _overwrite_payload(api, run["id"], '{"total_cost_usd": 1.0')
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(api.db_path)
+
+    assert excinfo.value.kind == task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_raises_storage_unavailable_on_an_uninitialised_database(tmp_path):
+    """A path that was never migrated: no `run_event` table. The distinct kind
+    matters — the operator's remedy is not the same as for a corrupt event."""
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(tmp_path / "never-migrated.db")
+
+    assert excinfo.value.kind == task_pipeline.SpendUnknownError.STORAGE_UNAVAILABLE
+
+
+def test_spend_unknown_error_does_not_mask_ordinary_bugs():
+    """`SpendUnknownError` is narrow on purpose: the callers catch it and only
+    it, so a programming error still travels as itself."""
+    assert issubclass(task_pipeline.SpendUnknownError, RuntimeError)
+    assert not issubclass(AttributeError, task_pipeline.SpendUnknownError)
+    assert not issubclass(KeyError, task_pipeline.SpendUnknownError)

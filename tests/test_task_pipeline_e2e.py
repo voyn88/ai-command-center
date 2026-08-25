@@ -513,3 +513,70 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     )
     ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert [d.task_id for d in ungated.launched()] == ["s"]
+
+
+def test_unreadable_spend_holds_the_tick_closed_and_says_which(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    """VOYN-W0-AICC-SPEND-CAP: with a ceiling set and the trailing-24h spend
+    unreadable, a tick launches nothing — and reports `daily_spend_unknown`,
+    not `daily_spend_budget_exhausted`. Both fail closed; only one of them
+    claims money was actually spent."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-su")
+    wt = tmp_path / "wt" / "su"
+    task = _task("su", "AIOS", wt, branch="task/su")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"su": task})
+    configs = project_config.load_project_configs()
+
+    def _unknown(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT, "seeded by test"
+        )
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _unknown)
+
+    held = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+
+    assert held.launched() == []
+    assert held.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN
+    assert held.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+
+
+def test_tick_does_not_swallow_a_programming_error_from_the_spend_primitive(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    """The old `except Exception` turned any bug in the primitive into
+    "budget exhausted". Only `SpendUnknownError` is caught now."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-sb")
+    wt = tmp_path / "wt" / "sb"
+    task = _task("sb", "AIOS", wt, branch="task/sb")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"sb": task})
+    configs = project_config.load_project_configs()
+
+    def _bug(*_a, **_k):
+        raise AttributeError("'list' object has no attribute 'get'")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _bug)
+
+    with pytest.raises(AttributeError):
+        task_pipeline.tick(
+            tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+        )

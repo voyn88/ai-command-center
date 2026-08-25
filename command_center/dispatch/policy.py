@@ -18,6 +18,14 @@ The hard guarantees, enforced structurally here:
    the configured daily ceiling — and likewise under the per-agent and
    per-project ceilings. The check happens before the assignment is recorded,
    so an over-budget assignment cannot be produced.
+2b. **An unknown spend is not a number.** When a daily ceiling is configured
+   but the trailing-24h spend could not be established, the function returns
+   before any assignment with `DEFER_SPEND_UNKNOWN` — fail closed, because
+   overspending is irreversible and skipping a tick is not, and with its own
+   reason code, because "we cannot see the budget" is not "the budget is
+   spent". No substitute value is invented: a low one would silently fail
+   *open* on the money gate, and a high one would be indistinguishable from a
+   genuinely exhausted budget.
 3. **SLA/priority is never bypassed.** Tasks are consumed in a fixed order:
    priority weight (desc), then SLA deadline (earliest first), then age. A
    lower-priority task can never take capacity a higher-priority task in the
@@ -37,6 +45,7 @@ from command_center.dispatch.models import (
     DEFER_NO_AVAILABLE_EXECUTOR,
     DEFER_NO_ELIGIBLE_EXECUTOR,
     DEFER_PROJECT_BUDGET,
+    DEFER_SPEND_UNKNOWN,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
@@ -100,39 +109,60 @@ def plan_dispatch(
     executors: list[ExecutorProfile],
     policy: DispatchPolicy,
     *,
-    daily_spend_usd: float,
+    daily_spend_usd: float | None,
     max_daily_spend_usd: float,
     kill_switch_engaged: bool,
     active_by_executor: dict[str, int] | None = None,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
-    guarantees this function structurally enforces."""
+    guarantees this function structurally enforces.
+
+    `daily_spend_usd=None` means the trailing-24h spend is not known. It is
+    carried as "unknown" all the way here rather than being substituted with a
+    number, because every substitute lies: a low one fails open on the money
+    gate, a high one is indistinguishable from a real exhausted budget.
+    """
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
+    spend_known = daily_spend_usd is not None
+
+    def _all_deferred(reason: str, *, projected: float | None) -> DispatchPlan:
+        return DispatchPlan(
+            decisions=tuple(
+                DispatchDecision(
+                    task_id=t.id,
+                    project=t.project,
+                    priority=t.priority,
+                    reason=reason,
+                )
+                for t in sorted(tasks, key=lambda t: _task_sort_key(t, policy))
+            ),
+            kill_switch_engaged=kill_switch_engaged,
+            daily_spend_usd=daily_spend_usd,
+            max_daily_spend_usd=max_daily_spend_usd,
+            projected_spend_usd=projected,
+            plan_cost_usd=0.0,
+        )
 
     # (1) Kill switch first: no assignment is even considered.
     if kill_switch_engaged:
-        decisions = tuple(
-            DispatchDecision(
-                task_id=t.id,
-                project=t.project,
-                priority=t.priority,
-                reason=DEFER_KILL_SWITCH,
-            )
-            for t in sorted(tasks, key=lambda t: _task_sort_key(t, policy))
-        )
-        return DispatchPlan(
-            decisions=decisions,
-            kill_switch_engaged=True,
-            daily_spend_usd=daily_spend_usd,
-            max_daily_spend_usd=max_daily_spend_usd,
-            projected_spend_usd=daily_spend_usd,
-        )
+        return _all_deferred(DEFER_KILL_SWITCH, projected=daily_spend_usd)
+
+    # (1b) The money gate needs a number it does not have. Fail closed, and
+    #      with its own reason: an unreadable spend is not an exhausted budget.
+    #      Only when a ceiling exists — with none configured there is no
+    #      comparison to make and the unknown spend constrains nothing.
+    if not spend_known and max_daily_spend_usd > 0:
+        return _all_deferred(DEFER_SPEND_UNKNOWN, projected=None)
 
     # (3) SLA/priority order.
     ordered = sorted(tasks, key=lambda t: _task_sort_key(t, policy))
 
-    projected = daily_spend_usd
+    # Reaching here with an unknown spend implies no daily ceiling, so the
+    # baseline never enters a decision — it only feeds the reported projection,
+    # which stays `None` to avoid presenting `0 + plan` as a real total.
+    baseline = daily_spend_usd if spend_known else 0.0
+    projected = baseline
     agent_spend: dict[str, float] = {}
     agent_assigned: dict[str, int] = {}
     project_spend: dict[str, float] = {}
@@ -212,7 +242,8 @@ def plan_dispatch(
         kill_switch_engaged=False,
         daily_spend_usd=daily_spend_usd,
         max_daily_spend_usd=max_daily_spend_usd,
-        projected_spend_usd=projected,
+        projected_spend_usd=projected if spend_known else None,
+        plan_cost_usd=projected - baseline,
     )
 
 

@@ -168,6 +168,11 @@ TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
 LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
+# Distinct from LAUNCH_BUDGET_EXHAUSTED on purpose: "we measured the spend and
+# it is at/over the ceiling" and "we could not establish the spend at all" are
+# different operator facts with different remedies. Both fail closed (no
+# launch); only one of them means the money was actually spent.
+LAUNCH_SPEND_UNKNOWN = "daily_spend_unknown"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -184,6 +189,10 @@ EV_PIPELINE_COMPLETED = "pipeline_task_completed"
 EV_PIPELINE_REWORK = "pipeline_rework"
 EV_PIPELINE_REMEDIATED = "pipeline_workspace_remediated"
 EV_PIPELINE_REVIEW = "pipeline_review"
+# The money gate could not read the trailing-24h spend. Durable because "the
+# autopilot launched nothing and the budget was not the reason" is otherwise
+# invisible to the operator.
+EV_PIPELINE_SPEND_UNKNOWN = "pipeline_spend_unknown"
 
 # Operator remediation per machine-readable reason code — the "and what do I do
 # about it?" half of every DEFER/BLOCKED/SKIPPED decision. Kept as data here
@@ -2224,19 +2233,34 @@ def _locked_tick(
     #    and only while the daily spend budget (when set) has headroom. The
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
+    #
+    #    With no ceiling configured (`max_daily_spend_usd <= 0`) the spend is
+    #    not measured at all — there is nothing to compare it against, and not
+    #    measuring removes a whole class of failure from the default config.
     spend_budget_exhausted = False
+    spend_unknown = False
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
         try:
             spend_budget_exhausted = (
                 daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
             )
-        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+        except SpendUnknownError as exc:
+            # Fail closed on the money gate — but say the truthful thing. The
+            # budget is not known to be exhausted; the spend is not known at
+            # all. Only this error is caught: a programming error inside the
+            # primitive must still surface as a crash, not as a budget verdict.
             _record(exc, "daily_spend_budget")
-            spend_budget_exhausted = True
-    if settings.auto_launch_active and not spend_budget_exhausted:
+            activity_log.log_event(
+                EV_PIPELINE_SPEND_UNKNOWN,
+                message=f"trailing-24h spend unknown ({exc.kind}); no launch this tick",
+            )
+            spend_unknown = True
+    if settings.auto_launch_active and not spend_budget_exhausted and not spend_unknown:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
+    elif spend_unknown:
+        launch_status = LAUNCH_SPEND_UNKNOWN
     else:
         launch_status = (
             LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
@@ -2401,12 +2425,47 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     }
 
 
+class SpendUnknownError(RuntimeError):
+    """`daily_spend_usd` could not establish the trailing-24h spend.
+
+    Raised **only** when the answer is genuinely unknowable — never for "no
+    runs cost anything", which is the honest number `0.0` and is returned as
+    such. Two kinds, because the operator's remedy differs:
+
+    * ``storage_unavailable`` — runtime.db could not be opened or queried
+      (missing, locked, unmigrated, corrupt file).
+    * ``corrupt_cost_event`` — a cost-bearing ``run_event`` payload could not
+      be decoded, or decoded to something that is not a JSON object, so the
+      cost it carries is unreadable and the sum would silently *understate*
+      real spend.
+
+    Deliberately narrow: a caller catches this and only this, so an
+    ``AttributeError``, a ``KeyError`` or a typo in the call still propagates
+    as the bug it is instead of being laundered into a budget verdict.
+    """
+
+    STORAGE_UNAVAILABLE = "storage_unavailable"
+    CORRUPT_COST_EVENT = "corrupt_cost_event"
+
+    def __init__(self, kind: str, detail: str = "") -> None:
+        self.kind = kind
+        self.detail = detail
+        super().__init__(f"{kind}: {detail}" if detail else kind)
+
+
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
     work started in it). Reads only the final `result` stream events, which are
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
+
+    A window with no cost-bearing events is `0.0` — a fact, not an error. When
+    the sum cannot be *trusted* (storage unreachable, or a cost event whose
+    payload is unreadable) this raises :class:`SpendUnknownError` rather than
+    returning a number that would understate real spend. Money decisions are
+    asymmetric: overspending is irreversible, skipping a tick is not, so an
+    untrustworthy total must never be passed off as a trustworthy one.
     """
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
@@ -2414,21 +2473,44 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     anchor = _dt.fromisoformat(now) if now else _dt.now()
     cutoff = (anchor - _td(hours=24)).isoformat(timespec="seconds")
     total = 0.0
-    with runtime_db.connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT run_event.payload_json AS payload FROM run_event
-              JOIN run ON run.id = run_event.run_id
-               AND run_event.payload_json LIKE '%total_cost_usd%'
-               AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
-            """,
-            (cutoff, cutoff),
-        ).fetchall()
+    try:
+        with runtime_db.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT run_event.payload_json AS payload FROM run_event
+                  JOIN run ON run.id = run_event.run_id
+                   AND CAST(run_event.payload_json AS TEXT) LIKE '%total_cost_usd%'
+                   AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
+                """,
+                (cutoff, cutoff),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — any storage failure is one fact
+        raise SpendUnknownError(
+            SpendUnknownError.STORAGE_UNAVAILABLE, f"{type(exc).__name__}: {exc}"
+        ) from exc
     for row in rows:
-        try:
-            payload = _json.loads(row["payload"])
-        except (TypeError, ValueError):
-            continue
+        payload = row["payload"]
+        # An already-decoded mapping (a driver that adapts JSON columns) needs
+        # no decoding; only text/bytes go through the parser, and only its
+        # own `ValueError` family — which includes `UnicodeDecodeError` for
+        # invalid UTF-8 — counts as "unreadable".
+        if isinstance(payload, (str, bytes, bytearray)):
+            try:
+                payload = _json.loads(payload)
+            except ValueError as exc:
+                raise SpendUnknownError(
+                    SpendUnknownError.CORRUPT_COST_EVENT,
+                    f"undecodable cost event payload: {type(exc).__name__}",
+                ) from exc
+        if not isinstance(payload, dict):
+            # Valid JSON that is not an object (a list, a bare number, null) —
+            # or a column type nothing can read a cost out of. Explicit,
+            # because `payload.get(...)` on it used to raise `AttributeError`
+            # and get swallowed by the callers' bare `except Exception`.
+            raise SpendUnknownError(
+                SpendUnknownError.CORRUPT_COST_EVENT,
+                f"cost event payload is {type(payload).__name__}, not an object",
+            )
         cost = payload.get("total_cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             total += float(cost)

@@ -224,3 +224,143 @@ def test_assign_is_a_noop_while_kill_switch_engaged(monkeypatch, pool):
     assert result["reason"] == "kill_switch_engaged"
     stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
     assert stored.get("executor") in (None, "")
+
+
+# --------------------------------------------------------------------------
+# VOYN-W0-AICC-SPEND-CAP / -DISPATCH-FAILCLOSED — the caller no longer
+# swallows, and no longer substitutes a number for an unknown spend.
+# --------------------------------------------------------------------------
+
+
+def _set_ceiling(value: float):
+    import dataclasses
+
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=value)
+    )
+
+
+def _raise_spend_unknown(monkeypatch, kind: str):
+    def _boom(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(kind, "seeded by test")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _boom)
+
+
+def test_plan_holds_closed_when_the_spend_cannot_be_read(monkeypatch, pool):
+    """The regression: the old handler substituted `max_daily_spend_usd or
+    0.0`, and with a free executor in the pool that assigned *every* task —
+    byte-identical to "nothing was spent". Nothing may be assigned here."""
+    _enable_master_switch()
+    _set_ceiling(5.0)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _raise_spend_unknown(
+        monkeypatch, task_pipeline.SpendUnknownError.STORAGE_UNAVAILABLE
+    )
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert {d.reason for d in plan.deferred} == {models.DEFER_SPEND_UNKNOWN}
+
+
+def test_plan_reports_an_unknown_spend_as_unknown_not_as_budget_exhausted(
+    monkeypatch, pool
+):
+    _enable_master_switch()
+    _set_ceiling(5.0)
+    _raise_spend_unknown(
+        monkeypatch, task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+    )
+    _queued_task(title="t1")
+
+    body = service.plan(ROOT).as_dict()
+
+    assert body["spend_status"] == models.SPEND_UNKNOWN
+    assert body["daily_spend_usd"] is None
+    assert body["decisions"][0]["reason"] == models.DEFER_SPEND_UNKNOWN
+    assert body["decisions"][0]["reason"] != models.DEFER_DAILY_BUDGET
+
+
+def test_unknown_spend_is_recorded_in_the_existing_activity_log(monkeypatch, pool):
+    from command_center import activity_log
+
+    _enable_master_switch()
+    _set_ceiling(5.0)
+    _raise_spend_unknown(
+        monkeypatch, task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+    )
+    _queued_task(title="t1")
+
+    service.plan(ROOT)
+
+    events = activity_log.load_activity(limit=50)
+    logged = [e for e in events if e.get("type") == service.EV_DISPATCH_SPEND_UNKNOWN]
+    assert logged, [e.get("type") for e in events]
+    # The kind is in the message so the operator can tell a corrupt event from
+    # an unreachable store without reading code.
+    assert task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT in logged[0]["message"]
+
+
+def test_assign_applies_nothing_when_the_spend_is_unknown(monkeypatch, pool):
+    _enable_master_switch()
+    _set_ceiling(5.0)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _raise_spend_unknown(
+        monkeypatch, task_pipeline.SpendUnknownError.STORAGE_UNAVAILABLE
+    )
+    task = _queued_task(title="t1")
+
+    result = service.assign(ROOT, CALLER, confirmed=True)
+
+    # `assign` is allowed to run (the kill switch is off) but the plan it
+    # applies contains no assignment, so nothing reaches the board.
+    assert result["assigned_task_ids"] == []
+    stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
+    assert stored.get("executor") in (None, "")
+
+
+def test_plan_does_not_measure_spend_when_no_ceiling_is_configured(monkeypatch, pool):
+    """`max_daily_spend_usd <= 0` is "no ceiling". Not measuring is what
+    removes this whole failure class from the default configuration — so the
+    primitive must not even be called, and a plan must still be produced."""
+    _enable_master_switch()
+    _set_ceiling(0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    calls: list[object] = []
+
+    def _record_call(*a, **k):
+        calls.append(a)
+        raise AssertionError("daily_spend_usd must not be called without a ceiling")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _record_call)
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert calls == []
+    assert len(plan.assignments) == 1
+    assert plan.spend_status == models.SPEND_NOT_MEASURED
+    assert plan.as_dict()["daily_spend_usd"] is None
+
+
+def test_plan_does_not_swallow_a_programming_error_from_the_spend_primitive(
+    monkeypatch, pool
+):
+    """The old `except Exception` laundered `AttributeError`, `KeyError` and a
+    misspelled call into a budget verdict. Only `SpendUnknownError` is caught
+    now, so a bug travels as a bug."""
+    _enable_master_switch()
+    _set_ceiling(5.0)
+
+    def _bug(*_a, **_k):
+        raise AttributeError("'list' object has no attribute 'get'")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _bug)
+    _queued_task(title="t1")
+
+    with pytest.raises(AttributeError):
+        service.plan(ROOT)
