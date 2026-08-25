@@ -199,7 +199,10 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
         for value in command
         if value.startswith("--property=InaccessiblePaths=")
     )
-    masked = set(inaccessible_prop.split())
+    # Optional trees carry a leading '-' (tolerate-absent); strip it for the
+    # membership check. The two mandatory roots (workspace, ephemeral home)
+    # have no prefix.
+    masked = {entry.lstrip("-") for entry in inaccessible_prop.split()}
     for inaccessible in (
         "/etc/aicc",
         "/etc/voyn",
@@ -216,6 +219,9 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
         str(tmp_path.parent),
     ):
         assert inaccessible in masked
+    raw_entries = inaccessible_prop.split()
+    assert "-/etc/aicc" in raw_entries, "optional trees must tolerate absence"
+    assert str(tmp_path.parent) in raw_entries or f"{tmp_path.parent}" in raw_entries
     assert "AICC_WORKSPACE_AUTHORITY_KEY" not in joined
     assert "VOYN_LEASE_DSN" not in joined
     assert "AICC_PG_PASSWORD" not in joined

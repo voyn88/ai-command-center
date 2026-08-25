@@ -278,8 +278,11 @@ def test_verifier_accepts_real_systemctl_execstart_serialization():
     module = _module()
     unit = "voyn-aicc-worker@1.service"
     systemd = FakeSystemd((unit,))
+    # Post-unbake serialization: plain ExecStart, so path= EQUALS argv[0]
+    # (the /usr/bin/env prefix is gone). A path= that diverges from argv[0]
+    # is the @-decouple attack the verifier now rejects.
     systemd.states[unit]["ExecStart"] = (
-        "{ path=/usr/bin/env ; "
+        "{ path=/opt/aicc/current/.venv/bin/python ; "
         "argv[]=/opt/aicc/current/.venv/bin/python -m command_center.worker ; "
         "ignore_errors=no ; pid=321 ; code=(null) ; status=0/0 }"
     )
@@ -494,3 +497,19 @@ def test_rollout_failure_restores_all_lane_states():
     lanes = {name: state for name, state in systemd.states.items() if "@" in name}
     assert all(not state["enabled"] for state in lanes.values())
     assert all(state["ActiveState"] == "inactive" for state in lanes.values())
+
+
+def test_verifier_rejects_execstart_path_decoupled_from_argv():
+    """systemd's @ prefix runs path= while argv[] still matches the expected
+    command; the verifier must reject a path= that diverges from argv[0]
+    (independent-review finding on 4a0a878)."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    systemd.states[unit]["ExecStart"] = (
+        "{ path=/usr/bin/evil ; "
+        "argv[]=/opt/aicc/current/.venv/bin/python -m command_center.worker ; "
+        "ignore_errors=no ; pid=321 ; code=(null) ; status=0/0 }"
+    )
+    with pytest.raises(module.RolloutError, match="path="):
+        module.verify_unit_configuration(systemd, unit)

@@ -709,6 +709,7 @@ def _prepare_workspace_permissions(
     # fds/stack inside the root broker (review on 67a0a96). The stack owns
     # every fd it holds and the depth is bounded outright.
     max_depth = 128
+    max_open_dirs = 256
     stack: list[tuple[int, Path, int]] = [(workspace_fd, Path(), 0)]
     try:
         while stack:
@@ -758,6 +759,15 @@ def _prepare_workspace_permissions(
                                 f"workspace entry changed while opening: {child_relative}"
                             )
                         if stat.S_ISDIR(current.st_mode):
+                            # Bound the descriptors this walk holds at once: a
+                            # pathologically wide/deep agent tree otherwise
+                            # pins one fd per pending directory and exhausts
+                            # the root broker (review on 4a0a878). Fail closed
+                            # past the budget rather than run out of fds.
+                            if len(stack) >= max_open_dirs:
+                                raise LaunchRefused(
+                                    "workspace directory fan-out exceeds supported budget"
+                                )
                             stack.append((child_fd, child_relative, depth + 1))
                             keep_open = True
                         elif stat.S_ISREG(current.st_mode):
@@ -883,8 +893,16 @@ def _systemd_command(
     # /run/aicc-agent-homes -- a SIBLING of /run/aicc-agent-launcher, not a
     # child, so systemd never overmounts a parent before lstat'ing a nested
     # entry (nesting-question raised in review on 67a0a96).
+    # systemd fails a unit when a non-ignored InaccessiblePaths entry is
+    # missing; several of these trees are created lazily (/srv/aicc-quarantine
+    # on first quarantine, /run/credentials only under LoadCredential=), so a
+    # fresh host would hard-fail every launch. The '-' prefix tolerates
+    # absence while still masking the path when it exists (review on
+    # 4a0a878). The workspace root and ephemeral home root always exist by
+    # this point, so they stay mandatory.
+    optional_trees = " ".join(f"-{tree}" for tree in SENSITIVE_AUTHORITY_TREES)
     inaccessible_paths = " ".join(
-        (*SENSITIVE_AUTHORITY_TREES, str(EPHEMERAL_HOME_ROOT), str(workspace_root))
+        (optional_trees, str(EPHEMERAL_HOME_ROOT), str(workspace_root))
     )
     command = [
         SYSTEMD_RUN,

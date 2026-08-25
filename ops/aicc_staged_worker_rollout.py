@@ -353,7 +353,18 @@ def _execstart_argv(value: str, *, unit: str) -> str:
     matches = re.findall(r"(?:^|;\s*)argv\[\]=([^;]*?)(?=\s*;|$)", value)
     if len(matches) != 1:
         raise RolloutError(f"{unit} ExecStart is not the versioned worker command")
-    return matches[0].strip()
+    argv = matches[0].strip()
+    # systemd's @/! prefixes decouple the executed binary (path=) from argv0:
+    # `ExecStart=@/usr/bin/evil <argv...>` runs /usr/bin/evil while argv[]
+    # still matches the expected command. Assert path= equals argv0 so the
+    # gate checks the binary that actually runs (review on 4a0a878).
+    paths = re.findall(r"(?:^|[;{]\s*)path=([^;]*?)(?=\s*;|$)", value)
+    if len(paths) != 1:
+        raise RolloutError(f"{unit} ExecStart has no single path= field")
+    path = paths[0].strip()
+    if path != argv.split(" ", 1)[0]:
+        raise RolloutError(f"{unit} ExecStart path= does not match argv[0]")
+    return argv
 
 
 def _environment_file_paths(value: str, *, unit: str) -> tuple[str, ...]:
@@ -362,6 +373,11 @@ def _environment_file_paths(value: str, *, unit: str) -> tuple[str, ...]:
     paths = tuple(word for word in words if word.startswith("/"))
     if any(not word.startswith(("/", "(ignore_errors=")) for word in words):
         raise RolloutError(f"{unit} EnvironmentFiles is malformed")
+    # NB: a blanket ignore_errors=no check was rejected -- the shipped units
+    # legitimately mark executors.env and worker-%i.env optional (-prefix);
+    # the REQUIRED authority files are proven present by _expected_environment
+    # _files membership below, not by their optionality flag (review on
+    # 4a0a878, applied narrowly).
     return paths
 
 
@@ -565,7 +581,7 @@ def rollout(
         # (runbook step 5; review on d8920b6) -- and before the loop, so an
         # empty lane set cannot leave them enabled via a silent no-op.
         retire_legacy_units(systemd)
-        for index, unit in enumerate(units):
+        for unit in units:
             systemd.run("enable", unit)
             # A blocking stop is the drain barrier. TimeoutStopSec remains
             # longer than the maximum job, so PID 1 waits before lane advance.
