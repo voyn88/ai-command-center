@@ -15,7 +15,6 @@ attempt_units="$state_dir/attempt-units.json"
 pending_release="$state_dir/pending-release"
 transaction="$repo_root/ops/aicc_install_transaction.py"
 rollout="$repo_root/ops/aicc_staged_worker_rollout.py"
-repo_lanes="$repo_root/deploy/aicc/worker-lanes"
 release_root=/opt/aicc/releases
 current_release=/opt/aicc/current
 release_staging=
@@ -156,10 +155,10 @@ else
 fi
 # NOTE: snapshot's own discover_units() additionally folds in every loaded/
 # enabled voyn-aicc-worker@* template instance, so runtime-only lanes are
-# snapshotted even when absent from the repo lane file. The two legacy units
-# below mirror LEGACY_WORKER_UNITS in ops/aicc_staged_worker_rollout.py --
-# keep the lists in lockstep.
-run_rollout snapshot --lanes "$repo_lanes" --state "$attempt_units" \
+# snapshotted even when absent from the installed lane registry. The two
+# legacy units below mirror LEGACY_WORKER_UNITS in
+# ops/aicc_staged_worker_rollout.py -- keep the lists in lockstep.
+run_rollout snapshot --lanes /etc/aicc/worker-lanes --state "$attempt_units" \
   --include-unit aicc-agent-launcher.socket \
   --include-unit aicc-principal-recovery.service \
   --include-unit voyn-aicc-worker.service \

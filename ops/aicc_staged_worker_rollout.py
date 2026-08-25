@@ -9,6 +9,7 @@ import os
 import pwd
 import re
 import shlex
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -20,11 +21,10 @@ from pathlib import Path
 # (review on d8920b6). Both scripts are invoked by absolute path, so add
 # this file's own directory to the path before importing its sibling.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from aicc_install_transaction import (  # noqa: E402
-    SNAPSHOT_PROPERTIES as SNAPSHOT_PROPERTIES,
-)
+from aicc_install_transaction import SNAPSHOT_PROPERTIES
 
-UNIT_RE = re.compile(r"voyn-aicc-worker@[^/@\s]+\.service")
+LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
+UNIT_RE = re.compile(r"voyn-aicc-worker@([A-Za-z0-9][A-Za-z0-9_-]{0,62})\.service")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 RESTORABLE_UNIT_RE = re.compile(
     r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
@@ -119,16 +119,31 @@ class Systemd:
 
 
 def _configured_units(path: Path) -> set[str]:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RolloutError(f"worker lane registry is unavailable: {path}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise RolloutError(f"worker lane registry is a symlink: {path}")
+    if not stat.S_ISREG(info.st_mode):
+        raise RolloutError(f"worker lane registry is not a regular file: {path}")
+
     units: set[str] = set()
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RolloutError(f"worker lane registry cannot be read: {path}") from exc
+    for raw in lines:
         value = raw.strip()
         if not value or value.startswith("#"):
             continue
-        unit = (
-            value if UNIT_RE.fullmatch(value) else f"voyn-aicc-worker@{value}.service"
-        )
-        if not UNIT_RE.fullmatch(unit):
+        match = UNIT_RE.fullmatch(value)
+        lane = match.group(1) if match else value
+        if not LANE_RE.fullmatch(lane):
             raise RolloutError(f"invalid worker lane: {value}")
+        unit = f"voyn-aicc-worker@{lane}.service"
+        if unit in units:
+            raise RolloutError(f"duplicate worker lane: {value}")
         units.add(unit)
     return units
 

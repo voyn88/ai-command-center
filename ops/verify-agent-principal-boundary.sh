@@ -8,6 +8,7 @@ fi
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 secret_manifest=/etc/aicc/publisher-secret-paths
+lane_registry=/etc/aicc/worker-lanes
 worker_template=/etc/systemd/system/voyn-aicc-worker@.service
 worker_dropin=/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
 principal_inaccessible_paths="/etc/aicc /etc/voyn /home /root /var/lib/aicc-worker /var/lib/aicc-agent /var/lib/voyn-aicc-credential-rotation /run/aicc-agent-launcher /run/credentials /run/voyn-aicc-worker /srv/aicc-quarantine"
@@ -175,7 +176,29 @@ worker_family_units="aicc-worker.service"
 # disabled them, degenerating this loop to a vacuous single-unit check;
 # review on 27c06df). Read the enabled lanes from the root-owned registry,
 # the same authority the rotator uses, and refuse an empty lane set.
-lane_family_units=$(grep -vE '^[[:space:]]*(#|$)' /etc/voyn/aicc-worker-lanes.conf 2>/dev/null || true)
+[ -r "$lane_registry" ] || fail "worker lane registry is missing: $lane_registry"
+[ ! -L "$lane_registry" ] || fail "worker lane registry is a symlink: $lane_registry"
+[ -f "$lane_registry" ] || fail "worker lane registry is not a regular file: $lane_registry"
+lane_family_units=
+while IFS= read -r lane || [ -n "$lane" ]; do
+  lane=$(printf '%s' "$lane" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  case "$lane" in
+    ''|'#'*) continue ;;
+  esac
+  case "$lane" in
+    voyn-aicc-worker@*.service)
+      lane=${lane#voyn-aicc-worker@}
+      lane=${lane%.service}
+      ;;
+  esac
+  printf '%s\n' "$lane" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$' || \
+    fail "invalid worker lane in registry: $lane"
+  family_unit="voyn-aicc-worker@$lane.service"
+  case " $lane_family_units " in
+    *" $family_unit "*) fail "duplicate worker lane in registry: $lane" ;;
+  esac
+  lane_family_units="$lane_family_units $family_unit"
+done < "$lane_registry"
 [ -n "$lane_family_units" ] || fail "no worker lanes found in the registry to verify"
 for family_unit in $worker_family_units $lane_family_units; do
   family_env=$(systemctl show "$family_unit" --property=Environment --value)
@@ -206,7 +229,7 @@ while IFS= read -r secret_path; do
 done < "$secret_manifest"
 
 python3 "$repo_root/ops/aicc_staged_worker_rollout.py" verify \
-  --lanes /etc/aicc/worker-lanes || fail "worker lane readiness or UID isolation failed"
+  --lanes "$lane_registry" || fail "worker lane readiness or UID isolation failed"
 
 for tool in /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/copilot; do
   resolved=$(readlink -f -- "$tool")

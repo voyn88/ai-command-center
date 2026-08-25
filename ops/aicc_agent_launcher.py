@@ -727,8 +727,7 @@ def _prepare_workspace_permissions(
                         continue
                     child_relative = relative / entry.name
                     if not (
-                        stat.S_ISDIR(before.st_mode)
-                        or stat.S_ISREG(before.st_mode)
+                        stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)
                     ):
                         # A socket/FIFO/device left in the workspace is a
                         # permanent condition, not a TOCTOU race: refuse it by
@@ -738,9 +737,7 @@ def _prepare_workspace_permissions(
                             f"unsupported workspace node refused: {child_relative}"
                         )
                     flags = (
-                        directory_flags
-                        if stat.S_ISDIR(before.st_mode)
-                        else file_flags
+                        directory_flags if stat.S_ISDIR(before.st_mode) else file_flags
                     )
                     try:
                         child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
@@ -777,9 +774,7 @@ def _prepare_workspace_permissions(
                                 )
                             os.fchown(child_fd, owner_uid, workspace_gid)
                             path = workspace / child_relative
-                            os.fchmod(
-                                child_fd, 0o770 if path in executable else 0o660
-                            )
+                            os.fchmod(child_fd, 0o770 if path in executable else 0o660)
                         else:
                             raise LaunchRefused(
                                 f"unsupported workspace node refused: {child_relative}"

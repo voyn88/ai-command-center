@@ -170,6 +170,48 @@ def test_discovery_combines_configured_and_existing_lanes(tmp_path):
     )
 
 
+def test_registry_expands_arbitrary_lane_and_rejects_duplicates(tmp_path):
+    module = _module()
+    lanes = tmp_path / "lanes"
+    lanes.write_text("gpu-east-7\nvoyn-aicc-worker@batch_9.service\n", encoding="utf-8")
+
+    assert module._configured_units(lanes) == {
+        "voyn-aicc-worker@gpu-east-7.service",
+        "voyn-aicc-worker@batch_9.service",
+    }
+
+    lanes.write_text(
+        "gpu-east-7\nvoyn-aicc-worker@gpu-east-7.service\n", encoding="utf-8"
+    )
+    with pytest.raises(module.RolloutError, match="duplicate worker lane"):
+        module._configured_units(lanes)
+
+
+@pytest.mark.parametrize("entry", ["", "bad/lane", "voyn-aicc-worker@bad/lane.service"])
+def test_registry_rejects_invalid_lane_entries(tmp_path, entry):
+    module = _module()
+    lanes = tmp_path / "lanes"
+    lanes.write_text(f"{entry}\n", encoding="utf-8")
+    if not entry:
+        # An empty registry is rejected by discovery, while blank lines alone
+        # remain valid input for the registry parser.
+        assert module._configured_units(lanes) == set()
+        return
+    with pytest.raises(module.RolloutError, match="invalid worker lane"):
+        module._configured_units(lanes)
+
+
+def test_registry_rejects_symlink(tmp_path):
+    module = _module()
+    target = tmp_path / "real-lanes"
+    target.write_text("1\n", encoding="utf-8")
+    lanes = tmp_path / "lanes"
+    lanes.symlink_to(target)
+
+    with pytest.raises(module.RolloutError, match="registry is a symlink"):
+        module._configured_units(lanes)
+
+
 def test_privileged_principal_set_is_versioned_and_extensible(tmp_path):
     module = _module()
     principals = tmp_path / "principals"

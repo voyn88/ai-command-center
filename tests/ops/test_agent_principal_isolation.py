@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import json
 import os
 import stat
@@ -895,4 +895,9 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "discover_units" in rollout
     assert "for unit in units" in rollout
     assert "voyn-aicc-worker-2.service" not in verifier
+    assert "lane_registry=/etc/aicc/worker-lanes" in verifier
+    assert "/etc/voyn/aicc-worker-lanes.conf" not in verifier
+    assert "run_rollout snapshot --lanes /etc/aicc/worker-lanes" in installer
+    assert "run_rollout rollout --lanes /etc/aicc/worker-lanes" in installer
+    assert "repo_lanes=" not in installer
     assert "source " not in installer
