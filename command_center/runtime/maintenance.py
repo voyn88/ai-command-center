@@ -6,13 +6,12 @@ module adds the W4 retention contract (NIGHT-W4-AICC-RETENTION):
 
 * **backup** — a SQLite-API snapshot of the live database is taken first;
   the maintenance run refuses to touch the original without it;
-* **cold archive** — every row that will be pruned is exported to a
-  compressed JSONL archive (with a SHA-256 digest and row count) *in the
-  same transaction scope* that deletes it, so the archive and the deletion
-  can never disagree;
-* **integrity** — `PRAGMA integrity_check` must return ``ok`` and the
-  archived row count must equal the deleted row count, else the transaction
-  is rolled back and the report says so;
+* **cold archive** — every row that will be pruned is streamed to a
+  compressed JSONL archive (with a SHA-256 digest and row count) in fixed-size
+  batches; each batch is deleted by id in the transaction that selected it;
+* **integrity** — every batch's archived row count must equal its deleted row
+  count, and `PRAGMA integrity_check` must return ``ok`` before success is
+  reported;
 * **optional VACUUM** — only after a clean prune, and only when asked;
 * **rehearsal** — `rehearse()` runs the identical sequence against a copy
   of the database and proves the original is byte-identical afterwards.
@@ -31,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from command_center.runtime.db import (
+    RETENTION_BATCH_SIZE,
     TERMINAL_STATES,
     connect,
     retention_cutoff,
@@ -45,22 +45,13 @@ _ARCHIVE_SELECT = """
            AND completed_at IS NOT NULL
            AND completed_at < ?
      )
-     ORDER BY run_id, seq
-"""
-
-_ARCHIVE_DELETE = """
-    DELETE FROM run_event
-     WHERE run_id IN (
-        SELECT id FROM run
-         WHERE state IN ({placeholders})
-           AND completed_at IS NOT NULL
-           AND completed_at < ?
-     )
+     ORDER BY run_event.id
+     LIMIT ?
 """
 
 
 class MaintenanceError(RuntimeError):
-    """A retention step failed; the database was left unmodified."""
+    """A retention step failed; the pre-maintenance backup remains available."""
 
 
 def _timestamp() -> str:
@@ -109,28 +100,40 @@ def archive_and_prune(
     archive_path = archive_dir / f"run-events-{stamp}.jsonl.gz"
     digest = hashlib.sha256()
     archived = 0
+    batches = 0
 
     with connect(db_path) as conn:
-        with transaction(conn):
-            rows = conn.execute(
-                _ARCHIVE_SELECT.format(placeholders=placeholders),
-                (*TERMINAL_STATES, cutoff),
-            ).fetchall()
-            with gzip.open(archive_path, "wt", encoding="utf-8") as handle:
-                for row in rows:
-                    line = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
-                    handle.write(line + "\n")
-                    digest.update(line.encode("utf-8"))
-                    archived += 1
-            deleted = conn.execute(
-                _ARCHIVE_DELETE.format(placeholders=placeholders),
-                (*TERMINAL_STATES, cutoff),
-            ).rowcount
-            if deleted != archived:
-                # Roll the deletion back rather than lose unarchived history.
-                raise MaintenanceError(
-                    f"archived {archived} rows but deletion matched {deleted}"
-                )
+        with gzip.open(archive_path, "wt", encoding="utf-8") as handle:
+            while True:
+                with transaction(conn):
+                    row_cursor = conn.execute(
+                        _ARCHIVE_SELECT.format(placeholders=placeholders),
+                        (*TERMINAL_STATES, cutoff, RETENTION_BATCH_SIZE),
+                    )
+                    event_ids: list[int] = []
+                    for row in row_cursor:
+                        event_ids.append(row["id"])
+                        line = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
+                        handle.write(line + "\n")
+                        digest.update(line.encode("utf-8"))
+                    if not event_ids:
+                        break
+                    # Push this batch through gzip before committing its delete.
+                    handle.flush()
+                    id_placeholders = ",".join("?" for _ in event_ids)
+                    deleted = conn.execute(
+                        f"DELETE FROM run_event WHERE id IN ({id_placeholders})",
+                        event_ids,
+                    ).rowcount
+                    if deleted != len(event_ids):
+                        # Roll this batch back rather than lose an event that was
+                        # not written to the archive.
+                        raise MaintenanceError(
+                            f"archived {len(event_ids)} rows in batch but deletion "
+                            f"matched {deleted}"
+                        )
+                    archived += len(event_ids)
+                    batches += 1
         integrity = _integrity_ok(conn)
     if not integrity:
         raise MaintenanceError("integrity_check failed after prune")
@@ -150,6 +153,7 @@ def archive_and_prune(
         "cutoff_timezone_source": cutoff_zone_source,
         "archived_events": archived,
         "pruned_events": archived,
+        "retention_batches": batches,
         "integrity_check": "ok",
         "vacuum": bool(vacuum),
     }

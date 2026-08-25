@@ -290,6 +290,8 @@ environment variables, so existing installs and the test suite are unaffected:
 - `AICC_RUNTIME_RETENTION_DAYS=<N>` — on startup (after schema migration), delete `run_event` rows
   for runs terminal longer than `N` days. The terminal run row itself is kept (it stays visible in
   the Execution Center and to reconciliation); only the bulky per-output event history is pruned.
+  Pruning uses fixed-size batches so database size does not determine transaction size. The
+  maintenance archive path also streams rows into its compressed JSONL archive one batch at a time.
 - `AICC_RUNTIME_VACUUM_ON_START=1` — run `VACUUM` after pruning to reclaim disk. VACUUM rewrites the
   database under an exclusive lock, so enable it only on a single-host install that can briefly pause
   other writers.

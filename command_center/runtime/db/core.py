@@ -65,6 +65,12 @@ RUN_STATES: list[str] = [
 
 TERMINAL_STATES: frozenset[str] = frozenset({"COMPLETED", "FAILED", "CANCELLED", "INTERRUPTED", "UNKNOWN"})
 
+# Keep retention transactions and their in-memory id lists bounded.  This is
+# deliberately a code constant rather than operator input: every retention
+# invocation must have a safe upper bound, including the automatic startup
+# path.
+RETENTION_BATCH_SIZE = 500
+
 EXECUTION_CENTER_ACTIVE_STATES: frozenset[str] = frozenset({"PREPARED", "QUEUED", "RUNNING"})
 
 # Explicit allow-list of state transitions. Anything not listed here is refused
@@ -601,6 +607,8 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     `run_event` rows removed.
 
     Bounded and conservative:
+      * selection and deletion use fixed-size batches, so a long-neglected
+        database cannot create one unbounded transaction;
       * only *terminal* runs are eligible (their events are historical audit
         trail, not live state);
       * the cutoff comes from `retention_cutoff`, which renders it in the zone
@@ -623,21 +631,40 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
         db_path, retention_days=retention_days
     )
     placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
+    removed = 0
     with db.connect(db_path) as conn:
-        with db.transaction(conn):
-            cur = conn.execute(
-                f"""
-                DELETE FROM run_event
-                 WHERE run_id IN (
-                    SELECT id FROM run
-                     WHERE state IN ({placeholders})
-                       AND completed_at IS NOT NULL
-                       AND completed_at < ?
-                 )
-                """,
-                (*db.TERMINAL_STATES, cutoff),
-            )
-            removed = cur.rowcount
+        while True:
+            with db.transaction(conn):
+                event_ids = [
+                    row["id"]
+                    for row in conn.execute(
+                        f"""
+                        SELECT run_event.id FROM run_event
+                         WHERE run_id IN (
+                            SELECT id FROM run
+                             WHERE state IN ({placeholders})
+                               AND completed_at IS NOT NULL
+                               AND completed_at < ?
+                         )
+                         ORDER BY run_event.id
+                         LIMIT ?
+                        """,
+                        (*db.TERMINAL_STATES, cutoff, db.RETENTION_BATCH_SIZE),
+                    )
+                ]
+                if not event_ids:
+                    break
+                id_placeholders = ",".join("?" for _ in event_ids)
+                cur = conn.execute(
+                    f"DELETE FROM run_event WHERE id IN ({id_placeholders})",
+                    event_ids,
+                )
+                if cur.rowcount != len(event_ids):
+                    raise RuntimeError(
+                        f"retention selected {len(event_ids)} rows but deleted "
+                        f"{cur.rowcount}"
+                    )
+                removed += cur.rowcount
         # `report` rows cascade-delete with `run` via FK, but a terminal run's
         # report file on disk is also historical; leave the DB row (the path is
         # small) — only events are bulky.

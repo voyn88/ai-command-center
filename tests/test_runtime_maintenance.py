@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -87,6 +88,32 @@ def test_archive_and_prune_archives_exactly_what_it_deletes(tmp_path):
     assert digest.hexdigest() == report["archive_sha256"]
 
 
+def test_archive_and_prune_uses_fixed_batches(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    old_run, _ = _seed(db_path, old_events=7, fresh_events=0)
+    monkeypatch.setattr(maintenance, "RETENTION_BATCH_SIZE", 2)
+
+    report = maintenance.archive_and_prune(
+        db_path, retention_days=30, archive_dir=tmp_path / "cold"
+    )
+
+    assert report["retention_batches"] == 4
+    assert report["archived_events"] == report["pruned_events"] == 7
+    assert _event_count(db_path, old_run) == 0
+
+    with gzip.open(report["archive_path"], "rt", encoding="utf-8") as handle:
+        assert [json.loads(line)["seq"] for line in handle] == list(range(1, 8))
+
+
+def test_startup_retention_uses_fixed_batches(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    old_run, _ = _seed(db_path, old_events=7, fresh_events=0)
+    monkeypatch.setattr(db, "RETENTION_BATCH_SIZE", 2)
+
+    assert db.apply_runtime_retention(db_path, retention_days=30) == 7
+    assert _event_count(db_path, old_run) == 0
+
+
 def test_rehearsal_runs_on_a_copy_and_proves_original_untouched(tmp_path):
     db_path = tmp_path / "runtime.db"
     old_run, _ = _seed(db_path, old_events=5, fresh_events=2)
@@ -134,3 +161,88 @@ def test_restore_refuses_missing_or_corrupt_backup(tmp_path):
     corrupt.write_bytes(b"not a database")
     with pytest.raises((maintenance.MaintenanceError, sqlite3.DatabaseError)):
         maintenance.restore_backup(corrupt, db_path)
+
+
+class _FailingArchive:
+    """A gzip handle that refuses to write past `fail_after` lines.
+
+    Stands in for the archive volume filling up part-way through a prune.
+    """
+
+    def __init__(self, inner, fail_after: int) -> None:
+        self._inner = inner
+        self._fail_after = fail_after
+        self.writes = 0
+
+    def write(self, data):
+        self.writes += 1
+        if self.writes > self._fail_after:
+            raise OSError("archive volume full")
+        return self._inner.write(data)
+
+    def flush(self):
+        return self._inner.flush()
+
+    def __enter__(self):
+        self._inner.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._inner.__exit__(*exc_info)
+
+
+def test_archive_and_prune_commits_each_batch_separately(tmp_path, monkeypatch):
+    """Failing part-way keeps the batches that already committed — and every
+    row it deleted is in the archive. That is what "bounded" buys: the unit of
+    work is a batch, not the whole database.
+    """
+    db_path = tmp_path / "runtime.db"
+    old_run, _ = _seed(db_path, old_events=7, fresh_events=0)
+    monkeypatch.setattr(maintenance, "RETENTION_BATCH_SIZE", 2)
+    real_open = gzip.open
+    # Two whole batches (4 rows) get written; the first row of batch 3 fails.
+    monkeypatch.setattr(
+        maintenance.gzip,
+        "open",
+        lambda *a, **kw: _FailingArchive(real_open(*a, **kw), fail_after=4),
+    )
+
+    with pytest.raises(OSError, match="archive volume full"):
+        maintenance.archive_and_prune(
+            db_path, retention_days=30, archive_dir=tmp_path / "cold"
+        )
+    monkeypatch.undo()
+
+    assert _event_count(db_path, old_run) == 3  # batch 3 rolled back, 1-2 kept
+    (archive,) = sorted((tmp_path / "cold").glob("run-events-*.jsonl.gz"))
+    with real_open(archive, "rt", encoding="utf-8") as handle:
+        archived = [json.loads(line)["seq"] for line in handle]
+    assert archived == [1, 2, 3, 4]  # nothing was deleted without being archived
+
+
+def test_startup_retention_commits_each_batch_separately(tmp_path, monkeypatch):
+    """Same bound on the automatic startup path, and it resumes where it
+    stopped — a neglected database is drained over several runs if need be.
+    """
+    db_path = tmp_path / "runtime.db"
+    old_run, _ = _seed(db_path, old_events=7, fresh_events=0)
+    monkeypatch.setattr(db, "RETENTION_BATCH_SIZE", 2)
+    real_transaction = db.transaction
+    seen = {"batches": 0}
+
+    @contextmanager
+    def failing_transaction(conn):
+        seen["batches"] += 1
+        with real_transaction(conn) as inner:
+            yield inner
+            if seen["batches"] == 3:
+                raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(db, "transaction", failing_transaction)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        db.apply_runtime_retention(db_path, retention_days=30)
+    assert _event_count(db_path, old_run) == 3  # batches 1-2 survived the abort
+
+    monkeypatch.setattr(db, "transaction", real_transaction)
+    assert db.apply_runtime_retention(db_path, retention_days=30) == 3
+    assert _event_count(db_path, old_run) == 0
