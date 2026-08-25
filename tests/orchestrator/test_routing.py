@@ -48,7 +48,7 @@ def test_every_cascade_is_non_empty_and_typed():
 def test_cascade_for_returns_copies_not_the_matrix():
     first = cascade_for("review")
     first[0]["executor"] = "mutated"
-    assert ROUTING_MATRIX["review"][0]["executor"] == "copilot"
+    assert ROUTING_MATRIX["review"][0]["executor"] == "codex"
 
 
 def test_review_uses_copilot_then_claude_once_each():

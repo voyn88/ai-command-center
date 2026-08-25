@@ -206,8 +206,10 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
         _snapshot(head, huge_diff), "VOYN-W0-R4",
         "https://github.com/x/repo-d2/pull/13"
     )
-    assert len(calls) == len(chunks) > 1
-    assert all(len(call[2]["review_chunk"]["content_hash"]) == 64 for call in calls)
+    chunk_calls = [c for c in calls if "review_chunk" in c[2]]
+    assert len(chunk_calls) == len(chunks) > 1
+    assert len(calls) == len(chunks) + 1  # + one full-context adjudication
+    assert all(len(call[2]["review_chunk"]["content_hash"]) == 64 for call in chunk_calls)
     assert all(
         len(call[2]["prompt"].encode("utf-8"))
         <= review_merge._MAX_REVIEW_PROMPT_BYTES
@@ -1101,7 +1103,7 @@ def test_review_once_enqueues_a_full_context_adjudication_for_multichunk(rig, _t
     `adjudicate:...`) for a PR that splits into more than one chunk, and none
     for a single-chunk PR (which is already full-context)."""
     app_factory, store, _ = rig
-    pr_url = "https://github.com/x/repo-x/pull/31"
+    pr_url = "https://github.com/x/repo-d2/pull/31"
     _ready(store, app_factory, "VOYN-W0-ADJ-D", pr_url)
     head = "d" * 40
     snap = _snapshot(head)
