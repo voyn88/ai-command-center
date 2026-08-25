@@ -84,9 +84,22 @@ def verify_immutable_release() -> None:
     ):
         raise RolloutError("current AICC release selector is not immutable")
     executable = target / ".venv/bin/python"
-    for path in (CURRENT_RELEASE.parent, RELEASE_ROOT, target, executable):
+    # Walk the FULL chain, including the intermediate .venv and .venv/bin:
+    # directory-write permission on ANY ancestor lets an attacker rename the
+    # interpreter out and drop a replacement, independent of the file's own
+    # mode (review on 52ced1f). Endpoints-only validation missed exactly
+    # those two directories.
+    chain = (
+        CURRENT_RELEASE.parent,
+        RELEASE_ROOT,
+        target,
+        target / ".venv",
+        target / ".venv/bin",
+        executable,
+    )
+    for path in chain:
         try:
-            info = path.stat()
+            info = path.lstat()
         except OSError as exc:
             raise RolloutError(f"AICC release path is unavailable: {path}") from exc
         if info.st_uid != 0 or info.st_mode & 0o022:

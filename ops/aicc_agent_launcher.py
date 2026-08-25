@@ -1298,7 +1298,33 @@ def _open_pinned_workspace(workspace: Path) -> int:
     if (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
         os.close(descriptor)
         raise LaunchRefused("task workspace was replaced before pinning")
+    # Exclude the rename/replace race on the BindPaths source: systemd
+    # resolves the bind SOURCE by path in PID 1 after this call, and
+    # close_fds means the pinned descriptor is not conveyed to it (review on
+    # 52ced1f). A rename can only happen if the PARENT directory is writable
+    # by a non-root principal; require it rename-proof so the untrusted agent
+    # cannot swap the workspace entry between here and PID 1's resolution.
+    if not _parent_is_rename_proof(workspace):
+        os.close(descriptor)
+        raise LaunchRefused("task workspace parent is renamable by non-root")
     return descriptor
+
+
+def _parent_is_rename_proof(workspace: Path) -> bool:
+    """True iff the workspace's parent is root-owned and not group/other-
+    writable -- i.e. no non-root principal can rename the workspace entry."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(workspace.parent, flags)
+    except OSError as exc:
+        raise LaunchRefused("task workspace parent is unavailable") from exc
+    try:
+        parent = os.fstat(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return parent.st_uid == 0 and not (parent.st_mode & 0o022)
 
 
 def _workspace_is_quarantined(workspace: Path) -> bool:

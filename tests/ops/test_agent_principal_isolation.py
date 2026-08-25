@@ -274,9 +274,17 @@ def test_workspace_allowlist_rejects_symlink_and_sibling(launcher, tmp_path):
         launcher._validated_workspace(str(unsafe), (root,))
 
 
+def test_workspace_with_renamable_parent_is_refused(launcher, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with pytest.raises(launcher.LaunchRefused, match="renamable"):
+        launcher._open_pinned_workspace(workspace)
+
+
 def test_workspace_bind_source_stays_on_pinned_inode_after_path_replacement(
-    launcher, tmp_path
+    launcher, monkeypatch, tmp_path
 ):
+    monkeypatch.setattr(launcher, "_parent_is_rename_proof", lambda workspace: True)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "identity").write_text("original", encoding="utf-8")
