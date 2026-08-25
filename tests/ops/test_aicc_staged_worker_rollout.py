@@ -262,11 +262,11 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
     # Legacy claimers retire BEFORE the canary lane starts claiming -- no
     # coexistence window (review on 0f4d77e; runbook step 5 ordering).
     assert mutations == [
-        ("enable", units[0]),
-        ("stop", units[0]),
         ("stop", "voyn-aicc-worker.service"),
         ("stop", "voyn-aicc-worker-2.service"),
         ("stop", "aicc-worker.service"),
+        ("enable", units[0]),
+        ("stop", units[0]),
         ("start", units[0]),
         ("enable", units[1]),
         ("stop", units[1]),

@@ -23,21 +23,21 @@ RESTORABLE_UNIT_RE = re.compile(
     r"aicc-worker\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
 )
-SNAPSHOT_PROPERTIES = frozenset(
-    {
-        "FragmentPath",
-        "DropInPaths",
-        "User",
-        "Group",
-        "ExecStart",
-        "WorkingDirectory",
-        "EnvironmentFiles",
-        "SupplementaryGroups",
-        "NoNewPrivileges",
-        "ProtectSystem",
-        "ProtectHome",
-        "ProtectControlGroups",
-    }
+# Ordered: aicc_staged_worker_rollout imports this and iterates it; every
+# set-equality check wraps it in set(...). One definition, no drift.
+SNAPSHOT_PROPERTIES = (
+    "FragmentPath",
+    "DropInPaths",
+    "User",
+    "Group",
+    "ExecStart",
+    "WorkingDirectory",
+    "EnvironmentFiles",
+    "SupplementaryGroups",
+    "NoNewPrivileges",
+    "ProtectSystem",
+    "ProtectHome",
+    "ProtectControlGroups",
 )
 
 
@@ -187,7 +187,7 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
                     not isinstance(state.get("properties"), dict)
                     or (
                         state["exists"]
-                        and set(state["properties"]) != SNAPSHOT_PROPERTIES
+                        and set(state["properties"]) != set(SNAPSHOT_PROPERTIES)
                     )
                     or any(
                         not isinstance(name, str) or not isinstance(value, str)
@@ -567,6 +567,10 @@ class FileTransaction:
         )
         self.pending_release.unlink(missing_ok=True)
         self.pending.unlink()
+        # The snapshot is spent once committed; leaving it at the fixed path
+        # lets a later recover() apply a stale snapshot against a different
+        # generation (review on d8920b6).
+        (self.state_dir / "attempt-units.json").unlink(missing_ok=True)
         _fsync_dir(self.state_dir)
 
     def _restore_release_selector(self) -> None:

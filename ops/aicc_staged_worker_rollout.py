@@ -10,8 +10,19 @@ import pwd
 import re
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+# Single source of truth for the snapshot property set: import the ordered
+# tuple from the install-transaction module (same ops/ directory) so the two
+# cannot drift and trip the cross-module set-equality check at recovery time
+# (review on d8920b6). Both scripts are invoked by absolute path, so add
+# this file's own directory to the path before importing its sibling.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from aicc_install_transaction import (  # noqa: E402
+    SNAPSHOT_PROPERTIES as SNAPSHOT_PROPERTIES,
+)
 
 UNIT_RE = re.compile(r"voyn-aicc-worker@[^/@\s]+\.service")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
@@ -49,20 +60,6 @@ EXPECTED_ENVIRONMENT_FILES = (
 EXPECTED_GROUPS = frozenset({"aicc-workspace", "aicc-publisher"})
 CURRENT_RELEASE = Path("/opt/aicc/current")
 RELEASE_ROOT = Path("/opt/aicc/releases")
-SNAPSHOT_PROPERTIES = (
-    "FragmentPath",
-    "DropInPaths",
-    "User",
-    "Group",
-    "ExecStart",
-    "WorkingDirectory",
-    "EnvironmentFiles",
-    "SupplementaryGroups",
-    "NoNewPrivileges",
-    "ProtectSystem",
-    "ProtectHome",
-    "ProtectControlGroups",
-)
 
 
 class RolloutError(RuntimeError):
@@ -430,7 +427,12 @@ def verify_unit_configuration(systemd: Systemd, unit: str) -> None:
         unit=unit,
         property_name="DropInPaths",
     )
-    if dropins != (str(WORKER_DROPIN),):
+    # Present AND last, not exact-set: distros ship global drop-ins (e.g.
+    # Ubuntu's 10-timeout-abort.conf) that DropInPaths lists for every
+    # service; requiring equality aborted healthy hosts. Last-wins ordering
+    # plus the effective-property assertions above still catch relaxation
+    # (review on d8920b6).
+    if not dropins or dropins[-1] != str(WORKER_DROPIN):
         raise RolloutError(f"{unit} does not inherit the principal boundary")
 
     if not _protect_home_is_safe(systemd.property(unit, "ProtectHome")):
@@ -559,8 +561,10 @@ def rollout(
     try:
         agent_uid = uid_for_user(agent_user)
         privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
-        # Prove one canary before retiring the incumbent fleet. This keeps
-        # capacity available while the new generation establishes readiness.
+        # Legacy claimers retire BEFORE any templated lane starts claiming
+        # (runbook step 5; review on d8920b6) -- and before the loop, so an
+        # empty lane set cannot leave them enabled via a silent no-op.
+        retire_legacy_units(systemd)
         for index, unit in enumerate(units):
             systemd.run("enable", unit)
             # A blocking stop is the drain barrier. TimeoutStopSec remains
@@ -573,13 +577,6 @@ def rollout(
             # A daemon-reload or drop-in replacement may race the drain.  The
             # final pre-start check makes that race fail closed too.
             verify_unit_configuration(systemd, unit)
-            if index == 0:
-                # Retire the legacy claimers BEFORE the first templated lane
-                # starts: starting the canary first opened a window where a
-                # legacy worker and a template lane could both claim work --
-                # the exact coexistence verify_legacy_units_retired forbids
-                # (review on 0f4d77e; matches the runbook's step 5 ordering).
-                retire_legacy_units(systemd)
             systemd.run("start", unit)
             verify_unit(
                 systemd,

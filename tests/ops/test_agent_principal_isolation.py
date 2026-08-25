@@ -499,10 +499,19 @@ def test_workspace_index_fifo_is_refused_without_blocking(launcher, tmp_path):
     git_dir = workspace / ".git"
     git_dir.mkdir(parents=True)
     os.mkfifo(git_dir / "index")
-    started = __import__("time").monotonic()
-    with pytest.raises(launcher.LaunchRefused, match="shape"):
-        launcher._tracked_executables(workspace)
-    assert __import__("time").monotonic() - started < 1.0
+    import signal as _signal
+
+    def _hang(_s, _f):
+        raise AssertionError("FIFO open blocked -- non-blocking guarantee lost")
+
+    prev = _signal.signal(_signal.SIGALRM, _hang)
+    _signal.alarm(5)
+    try:
+        with pytest.raises(launcher.LaunchRefused, match="shape"):
+            launcher._tracked_executables(workspace)
+    finally:
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, prev)
 
 
 def test_workspace_index_open_is_fd_relative(launcher, monkeypatch, tmp_path):
@@ -769,7 +778,7 @@ def test_worker_runtime_sends_secrets_neither_in_argv_nor_env(monkeypatch, tmp_p
     assert "HOME" not in observed["env"]
 
 
-def test_deployment_definitions_pin_separate_non_login_identity():
+def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
     root = Path(__file__).parents[2]
     sysusers = (root / "deploy/sysusers.d/aicc-agent.conf").read_text()
     worker = (root / "deploy/systemd/aicc-worker.service").read_text()
@@ -797,9 +806,7 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     # The flag is only real if the transaction DELIVERS the drop-in to both
     # unit families -- asserting file contents alone proved nothing about
     # aicc-worker.service (independent-review finding on c00fc46).
-    import sys
-
-    sys.path.insert(0, str(root / "ops"))
+    monkeypatch.syspath_prepend(str(root / "ops"))
     import aicc_install_transaction as _tx
 
     destinations = {

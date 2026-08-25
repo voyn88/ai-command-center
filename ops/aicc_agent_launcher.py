@@ -725,6 +725,17 @@ def _prepare_workspace_permissions(
                     if stat.S_ISLNK(before.st_mode):
                         continue
                     child_relative = relative / entry.name
+                    if not (
+                        stat.S_ISDIR(before.st_mode)
+                        or stat.S_ISREG(before.st_mode)
+                    ):
+                        # A socket/FIFO/device left in the workspace is a
+                        # permanent condition, not a TOCTOU race: refuse it by
+                        # kind BEFORE open() so the diagnosis is honest and
+                        # os.open won't hang/ENXIO on it (review on d8920b6).
+                        raise LaunchRefused(
+                            f"unsupported workspace node refused: {child_relative}"
+                        )
                     flags = (
                         directory_flags
                         if stat.S_ISDIR(before.st_mode)
