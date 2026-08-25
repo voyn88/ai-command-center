@@ -340,6 +340,15 @@ def test_agent_git_config_cannot_redirect_guarded_publish(
         hook.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n")
         hook.chmod(0o755)
         _git(workspace, "config", "core.fsmonitor", str(hook))
+        # core.fsmonitor only fires on index-refreshing commands; a
+        # regressed publish that ran `git push` FROM this workspace would
+        # never touch it (review finding on 8a881d3). pre-push fires on
+        # exactly that regression, so plant both probes.
+        hooks_dir = workspace / ".git" / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        pre_push = hooks_dir / "pre-push"
+        pre_push.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n")
+        pre_push.chmod(0o755)
         return result
 
     monkeypatch.setattr(agent_runner, "run_claude_code", poisoned)

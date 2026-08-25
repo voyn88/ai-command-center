@@ -450,3 +450,40 @@ def test_target_rejects_or_contains_double_leading_slash(tmp_path):
     assert str(contained).startswith(str(tmp_path / "root"))
     with pytest.raises(ValueError):
         transaction._target("///")
+
+
+def test_recover_finishes_an_interrupted_commit_instead_of_reverting_it(
+    monkeypatch, tmp_path
+):
+    """A crash between commit()'s current.json write and pending.json unlink
+    must not make the next recover() revert the already-live generation
+    (independent-review finding on 8a881d3)."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    existing = root / "etc/existing"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"before")
+    source = tmp_path / "one"
+    source.write_bytes(b"after")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/existing"),))
+    transaction.apply()
+    real_unlink = module.Path.unlink
+
+    def crash_on_pending_unlink(self, *args, **kwargs):
+        if self == transaction.pending:
+            raise OSError("injected crash between current.json and unlink")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "unlink", crash_on_pending_unlink)
+    with pytest.raises(OSError, match="injected crash"):
+        transaction.commit()
+    monkeypatch.setattr(module.Path, "unlink", real_unlink)
+    assert transaction.pending.exists() and transaction.current.exists()
+
+    transaction.recover()
+
+    assert existing.read_bytes() == b"after", "live generation must survive recover"
+    assert not transaction.pending.exists()
+    assert json.loads(transaction.current.read_text())["manifest"]

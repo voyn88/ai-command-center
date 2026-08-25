@@ -518,11 +518,16 @@ def _parse_git_index_payload(data: bytes, workspace: Path) -> frozenset[Path]:
         # executable bit. Other optional extensions only cache derived data.
         if extension in {b"link", b"sdir"}:
             raise LaunchRefused("unsupported task-local Git index extension")
-        # Git's on-disk contract: an UPPERCASE-first signature is MANDATORY --
-        # a reader that does not understand it must fail; a lowercase-first
-        # one is OPTIONAL and safe to skip (read-cache.c). The earlier code
-        # had this inverted, refusing benign optional extensions and silently
-        # skipping unknown mandatory ones (review finding on 6218a21).
+        # Git's on-disk contract (read-cache.c, read_index_extension):
+        # an UPPERCASE-first signature is OPTIONAL -- readers that do not
+        # understand it skip it ("All optional extensions are named with
+        # capital letters"); a lowercase-first signature is MANDATORY -- a
+        # reader that does not understand it must refuse the index. link/
+        # sdir above are exactly such mandatory extensions, split out only
+        # for their precise error messages. (A round-5 review claimed the
+        # opposite polarity while citing read-cache.c; the code below
+        # matches the actual reference implementation: skip unknown
+        # uppercase, refuse unknown lowercase.)
         first = extension[:1]
         if not (b"A" <= first <= b"Z"):
             raise LaunchRefused("unknown mandatory task-local Git index extension")

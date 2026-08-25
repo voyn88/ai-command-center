@@ -565,6 +565,15 @@ def _workspace_authority_key() -> bytes | None:
     # rotating database credential would invalidate every persisted task
     # checkpoint during routine lease-password rotation and couples a DB
     # secret to an unrelated signing purpose.
+    #
+    # Reading from the WORKER's own environment is safe against the same-UID
+    # agent because the agent process never inherits it:
+    # agent_runner.scrub_vcs_credentials() strips
+    # AICC_WORKSPACE_AUTHORITY_KEY (with the lease/publish variables) from
+    # every launch environment, and the systemd units source the key from a
+    # root-owned 0640 EnvironmentFile the agent cannot read (reviewed on
+    # 8a881d3: the forgery path claimed there requires env inheritance that
+    # the launch path explicitly removes).
     return decode_workspace_authority_key(
         os.environ.get("AICC_WORKSPACE_AUTHORITY_KEY")
     )

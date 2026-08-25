@@ -143,6 +143,9 @@ systemctl enable --now aicc-agent-launcher.socket
 # The orchestrator discovers configured plus already-instantiated lanes, then
 # drains, starts and proves each lane before advancing. Any failure restores
 # the attempt snapshot and the outer trap restores the file generation.
+# /etc/aicc/worker-lanes is installed by the transaction itself (default_specs
+# maps deploy/aicc/worker-lanes onto it) before this rollout runs on
+# a fresh host and matches the snapshot origin (reviewed on 8a881d3).
 run_rollout rollout --lanes /etc/aicc/worker-lanes
 "$repo_root/ops/verify-agent-principal-boundary.sh"
 

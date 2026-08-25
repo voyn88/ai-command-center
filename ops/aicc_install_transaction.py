@@ -528,6 +528,29 @@ class FileTransaction:
             return
         manifest = self._pending_manifest()
         transaction = manifest.parent
+        journal = json.loads(self.pending.read_text(encoding="utf-8"))
+        current_manifest = None
+        if self.current.exists():
+            current_manifest = json.loads(self.current.read_text(encoding="utf-8")).get(
+                "manifest"
+            )
+        if journal.get("phase") == "COMMITTING" or current_manifest == str(manifest):
+            # commit() already durably published current.json but crashed
+            # before unlinking pending.json. Restoring here would silently
+            # revert a completed, live installation on the next boot
+            # (independent-review finding on 8a881d3): finish the commit
+            # instead of undoing it.
+            _atomic_bytes(
+                self.current,
+                json.dumps({"manifest": str(manifest)}, sort_keys=True).encode(),
+                0o600,
+                os.geteuid(),
+                os.getegid(),
+            )
+            self.pending.unlink()
+            self._remove_orphan_generations()
+            _fsync_dir(self.state_dir)
+            return
         self.restore(manifest, clear_pending=False)
         restore_service_snapshot(self.state_dir / "attempt-units.json")
         self._clear_pending(manifest)

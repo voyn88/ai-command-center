@@ -51,7 +51,7 @@ TimeoutStopSec=330s
 # nothing here needs privileges, a home, or a writable system.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectProc=invisible
