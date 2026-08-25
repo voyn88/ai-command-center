@@ -218,19 +218,29 @@ class WorkerDaemon:
         drain_thread.start()
         try:
             while not self._stop.is_set():
-                if self._drain.is_set():
-                    status = (
-                        "aicc-drained"
-                        if self._drain_closed.is_set()
-                        else "aicc-drain-requested"
-                    )
-                    self._notify(f"WATCHDOG=1\nSTATUS={status}")
+                # Both the flag read and the notify happen under the gate
+                # lock: an unlocked snapshot could interleave with the
+                # reload loop's clear-flags-then-READY sequence and stamp a
+                # stale aicc-drained STATUS over the fresh aicc-ready
+                # (independent-review finding on 61c73e7).
+                with self._claim_gate_lock:
+                    draining = self._drain.is_set()
+                    if draining:
+                        status = (
+                            "aicc-drained"
+                            if self._drain_closed.is_set()
+                            else "aicc-drain-requested"
+                        )
+                        self._notify(f"WATCHDOG=1\nSTATUS={status}")
+                if draining:
                     self._sleep(min(self._config.idle_min_seconds, cap))
                     continue
                 with self._claim_gate_lock:
                     if self._drain.is_set() or self._drain_closed.is_set():
                         continue
-                    self._notify("WATCHDOG=1")
+                    # STATUS travels with every claim-path ping so a status
+                    # written by a dying drain cycle can never stick.
+                    self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
                     claimed = self._store.claim(
                         self._config.queue,
                         visibility_seconds=self._config.visibility_seconds,

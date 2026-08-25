@@ -1349,9 +1349,19 @@ class RotationController:
             except OSError as error:
                 # This file is now the only durable copy of the accepted new
                 # plaintext secret. Never clean it as an ordinary temp file.
+                # After os.replace() the temporary path no longer exists --
+                # the new credential is already live at the target and only
+                # the directory fsync failed. Point the operator at the path
+                # that actually holds the secret in each window
+                # (independent-review finding on 61c73e7).
+                location = (
+                    prepared.temporary
+                    if prepared.temporary.exists()
+                    else prepared.target
+                )
                 raise RotationError(
                     "credential file commit failed after database rotation; "
-                    f"recovery file retained at {prepared.temporary}"
+                    f"accepted credential retained at {location}"
                 ) from error
             committed = True
             self.phase_journal.write("credential_committed")
@@ -1485,8 +1495,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # A concurrent invocation (ExecStopPost racing a manual run) is a
+            # benign overlap, not a unit failure: under Restart=on-failure a
+            # non-zero code here would feed a restart loop for a condition
+            # that resolves itself (independent-review finding on 61c73e7).
             audit.emit("rotation_refused", error="rotation already running")
-            return 75
+            return 0
         controller: RotationController | None = None
         try:
             controller = RotationController(

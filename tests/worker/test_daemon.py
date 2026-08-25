@@ -469,7 +469,7 @@ def test_the_claim_loop_feeds_the_watchdog_between_claims() -> None:
 
     assert pings[0] == "READY=1", "readiness must precede the first claim"
     assert pings[-1] == "STOPPING=1", "a clean exit must announce itself"
-    watchdog = [p for p in pings if p == "WATCHDOG=1"]
+    watchdog = [p for p in pings if p.startswith("WATCHDOG=1")]
     claims = [c for c in store.calls if c[0] == "claim"]
     assert len(watchdog) == len(claims), "one ping per loop iteration"
 
@@ -643,4 +643,4 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
 
     assert frames[0] == b"READY=1"
     assert frames[-1] == b"STOPPING=1"
-    assert b"WATCHDOG=1" in frames
+    assert any(frame.startswith(b"WATCHDOG=1") for frame in frames)
