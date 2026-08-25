@@ -37,6 +37,28 @@ class FakeSystemd:
             }
             for index, unit in enumerate(units)
         }
+        # The legacy single-lane units are REAL rollout targets (drained and
+        # disabled before template start); a strict fake must declare them
+        # with the full key set instead of silently no-opping mutations on
+        # unknown names (review on fd5de6b). Retired state: not running.
+        for legacy in ("voyn-aicc-worker.service", "voyn-aicc-worker-2.service"):
+            self.states.setdefault(
+                legacy,
+                {
+                    "enabled": False,
+                    "LoadState": "loaded",
+                    "FragmentPath": f"/etc/systemd/system/{legacy}",
+                    "DropInPaths": "",
+                    "ActiveState": "inactive",
+                    "SubState": "dead",
+                    "NoNewPrivileges": "yes",
+                    "ProtectHome": "read-only",
+                    "ProtectControlGroups": "yes",
+                    "SupplementaryGroups": "aicc-workspace aicc-publisher",
+                    "User": "aicc-worker",
+                    "MainPID": "0",
+                },
+            )
 
     def run(self, *args: str, check: bool = True) -> str:
         self.calls.append(args)
@@ -53,7 +75,17 @@ class FakeSystemd:
                 if value.startswith("--property=")
             )
             if unit not in self.states:
-                return "0" if name == "MainPID" else "not-found"
+                # Real systemctl show on an absent unit reports
+                # ActiveState=inactive (LoadState carries not-found); an
+                # ActiveState=not-found fake inverts any
+                # `!= "inactive"` predicate (review on fd5de6b).
+                if name == "MainPID":
+                    return "0"
+                if name == "ActiveState":
+                    return "inactive"
+                if name == "LoadState":
+                    return "not-found"
+                return "not-found"
             return str(self.states[unit][name])
         unit = args[-1]
         if unit not in self.states:
@@ -61,6 +93,10 @@ class FakeSystemd:
                 return "disabled"
             if action == "is-active":
                 return "inactive"
+            # Mutating a unit this fake never declared is a typo'd rollout
+            # target, not a no-op (review on fd5de6b).
+            if action in {"start", "stop", "enable", "disable", "restart"}:
+                raise KeyError(unit)
             return ""
         state = self.states[unit]
         if action == "is-enabled":
@@ -282,5 +318,10 @@ def test_rollout_failure_restores_all_lane_states():
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
         )
-    assert all(state["enabled"] for state in systemd.states.values())
-    assert all(state["ActiveState"] == "active" for state in systemd.states.values())
+    # Lane units are restored to their pre-rollout snapshot; the legacy
+    # single-lane units were retired (disabled, inactive) BEFORE the failure
+    # and correctly stay retired -- resurrecting them on rollback would be a
+    # second incident (fake now declares them; review on fd5de6b).
+    lanes = {name: state for name, state in systemd.states.items() if "@" in name}
+    assert all(state["enabled"] for state in lanes.values())
+    assert all(state["ActiveState"] == "active" for state in lanes.values())

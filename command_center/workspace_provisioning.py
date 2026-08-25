@@ -731,7 +731,8 @@ def _provision_task_local_clone(
         repo, spec.expected_branch or "", clone_root=spec.task_clone_root
     )
     if (
-        Path(os.path.abspath(raw_workspace)) != expected_path
+        raw_workspace.parent.resolve() != expected_path.parent.resolve()
+        or raw_workspace.name != expected_path.name
         or raw_workspace.is_symlink()
     ):
         raise WorkspaceVerificationError(
@@ -928,17 +929,13 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
     Never rewrites `workspace_path` to the source repository: an unprovisioned
     workspace becomes a hard verification failure, never a silent fallback."""
     workspace = Path(spec.workspace_path).expanduser()
-    if not spec.task_local_git_metadata:
-        # The legacy contract, unchanged: an already-existing workspace is
-        # "reused" REGARDLESS of whether the authority fields are complete
-        # (verify_workspace judges it), and disabled provisioning
-        # short-circuits before any repository access. Splicing the
-        # task-local branch in must not reorder this pre-existing path
-        # (independent-review finding on d661d8f).
-        if workspace.exists():
-            return "reused"
-        if not spec.allow_provision:
-            return "skipped"
+    # Byte-for-byte the base ordering (65710ca): the authority-completeness
+    # check runs FIRST and an incomplete spec is "skipped" regardless of the
+    # directory; existing-workspace reuse is decided further down, exactly
+    # where the base decided it. An earlier remediation inserted an
+    # exists->"reused" fast path here on a reviewer's recollection of the
+    # legacy contract; the base bytes say otherwise, and the comment claiming
+    # "unchanged" was wrong with it (independent-review finding on fd5de6b).
     if not (spec.repository_path and spec.expected_branch and spec.base_branch):
         return "skipped"
 
@@ -950,6 +947,11 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
         if not spec.allow_provision and not workspace.exists():
             return "skipped"
         return _provision_task_local_clone(spec, repo, workspace)
+
+    if workspace.exists():
+        return "reused"
+    if not spec.allow_provision:
+        return "skipped"
 
     workspace_target = workspace.resolve()
     branch_exists = spec.expected_branch in git_info.get_branches(repo)
@@ -1998,11 +2000,20 @@ def remove_workspace(
         except OSError:
             return "remove_failed"
         try:
-            root_stat = os.fstat(quarantine_fd)
-            if not stat.S_ISDIR(root_stat.st_mode):
+            try:
+                root_stat = os.fstat(quarantine_fd)
+                if not stat.S_ISDIR(root_stat.st_mode):
+                    return "remove_failed"
+                # An attacker-OWNED real directory passes every shape check
+                # and would receive the credential-bearing clone; the
+                # quarantine root must belong to this privileged process
+                # (independent-review finding on fd5de6b).
+                if root_stat.st_uid not in {0, os.geteuid()}:
+                    return "remove_failed"
+                if stat.S_IMODE(root_stat.st_mode) != 0o700:
+                    os.fchmod(quarantine_fd, 0o700)
+            except OSError:
                 return "remove_failed"
-            if stat.S_IMODE(root_stat.st_mode) != 0o700:
-                os.fchmod(quarantine_fd, 0o700)
             quarantine_name = f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
             quarantine = quarantine_root / quarantine_name
             try:
@@ -2014,8 +2025,11 @@ def remove_workspace(
                 quarantine_stat = os.lstat(quarantine_name, dir_fd=quarantine_fd)
                 if (quarantine_stat.st_dev, quarantine_stat.st_ino) != inode:
                     return "remove_failed"
-                _task_local_marker_path(raw_workspace).unlink(missing_ok=True)
                 shutil.rmtree(quarantine)
+                # Marker last: a failed rmtree must not leave a quarantined
+                # clone whose ownership marker is already destroyed
+                # (independent-review finding on fd5de6b).
+                _task_local_marker_path(raw_workspace).unlink(missing_ok=True)
             except OSError:
                 return "remove_failed"
         finally:

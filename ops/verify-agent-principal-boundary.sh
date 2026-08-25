@@ -131,6 +131,15 @@ for principal_unit in "$principal_unit_a" "$principal_unit_b"; do
     --property=CapabilityBoundingSet= \
     -- /bin/sleep 30 || fail "cannot start dynamic-principal canary"
 done
+# The fail-closed flag travels only via a drop-in; a host where the drop-in
+# is absent, reverted, or masked silently starts WITHOUT isolation. Prove the
+# flag reached systemd for every worker unit family (review on fd5de6b).
+for isolated_unit in aicc-worker.service "$principal_unit_a" "$principal_unit_b"; do
+  systemctl show "$isolated_unit" --property=Environment --value \
+      | tr ' ' '\n' | grep -qx 'AICC_AGENT_PRINCIPAL_ISOLATION=required' \
+    || fail "isolation flag did not reach $isolated_unit"
+done
+
 principal_pid_a=$(systemctl show "$principal_unit_a" --property=MainPID --value)
 principal_pid_b=$(systemctl show "$principal_unit_b" --property=MainPID --value)
 case "$principal_pid_a:$principal_pid_b" in
