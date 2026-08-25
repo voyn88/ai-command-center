@@ -53,7 +53,7 @@ def test_cascade_for_returns_copies_not_the_matrix():
 
 def test_review_uses_copilot_then_claude_once_each():
     cascade = cascade_for("review")
-    assert [link["executor"] for link in cascade] == ["copilot", "claude"]
+    assert [link["executor"] for link in cascade] == ["codex", "copilot", "claude"]
     assert all(link["task_type"] == "review" for link in cascade)
 
 

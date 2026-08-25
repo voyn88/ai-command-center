@@ -113,8 +113,8 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
         f"review:VOYN-W0-R1:7:{head}:{review_merge._REVIEW_POLICY_VERSION}:base:{BASE}:diff:"
     )
     assert task_id == "VOYN-W0-R1"
-    assert [link["executor"] for link in payload["cascade"]] == ["copilot", "claude"]
-    assert max_attempts == len(payload["cascade"]) == 2
+    assert [link["executor"] for link in payload["cascade"]] == ["codex", "copilot", "claude"]
+    assert max_attempts == len(payload["cascade"]) == 3
     assert payload["task_type"] == "independent_review"
     assert payload["untrusted"] is True
     assert "pull/7" in payload["prompt"]
