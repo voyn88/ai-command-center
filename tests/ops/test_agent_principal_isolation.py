@@ -177,6 +177,7 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
     joined = "\n".join(command)
     assert "--property=DynamicUser=yes" in command
     assert "--uid=aicc-agent" not in command
+    assert not any("User=aicc-agent" in value for value in command)
     assert "--property=NoNewPrivileges=yes" in command
     assert "--property=CapabilityBoundingSet=" in command
     assert "--property=AmbientCapabilities=" in command
@@ -189,6 +190,16 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
     assert f"--property=BindPaths={tmp_path}:/workspace" in command
     assert "--property=ReadWritePaths=/workspace /agent-home" in command
     assert "--property=BindPaths=/run/aicc-agent-homes/test:/agent-home" in command
+    # Check membership against the EXACT InaccessiblePaths value, not a
+    # substring of the whole argv: /run/aicc-agent-homes also appears in the
+    # BindPaths line above, so `in joined` reported it masked even if the
+    # mask were dropped (review on 27c06df).
+    inaccessible_prop = next(
+        value[len("--property=InaccessiblePaths=") :]
+        for value in command
+        if value.startswith("--property=InaccessiblePaths=")
+    )
+    masked = set(inaccessible_prop.split())
     for inaccessible in (
         "/etc/aicc",
         "/etc/voyn",
@@ -204,7 +215,7 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
         "/srv/aicc-quarantine",
         str(tmp_path.parent),
     ):
-        assert inaccessible in joined
+        assert inaccessible in masked
     assert "AICC_WORKSPACE_AUTHORITY_KEY" not in joined
     assert "VOYN_LEASE_DSN" not in joined
     assert "AICC_PG_PASSWORD" not in joined

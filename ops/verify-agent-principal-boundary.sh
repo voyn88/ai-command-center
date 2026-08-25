@@ -170,7 +170,13 @@ done
 # before its measurement ran (review on 9de8193); template lanes went
 # unverified for the same reason.
 worker_family_units="aicc-worker.service"
-lane_family_units=$(systemctl list-units --all --no-legend --plain 'voyn-aicc-worker@*.service' 2>/dev/null | awk '{print $1}')
+# list-unit-files enumerates INSTALLED template instances (list-units shows
+# only loaded ones -- empty before rollout or after a failed rollout
+# disabled them, degenerating this loop to a vacuous single-unit check;
+# review on 27c06df). Read the enabled lanes from the root-owned registry,
+# the same authority the rotator uses, and refuse an empty lane set.
+lane_family_units=$(grep -vE '^[[:space:]]*(#|$)' /etc/voyn/aicc-worker-lanes.conf 2>/dev/null || true)
+[ -n "$lane_family_units" ] || fail "no worker lanes found in the registry to verify"
 for family_unit in $worker_family_units $lane_family_units; do
   family_env=$(systemctl show "$family_unit" --property=Environment --value)
   family_flag=$(printf '%s\n' "$family_env" | tr ' ' '\n' | \
