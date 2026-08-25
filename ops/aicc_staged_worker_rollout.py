@@ -67,6 +67,12 @@ class RolloutError(RuntimeError):
     pass
 
 
+# Test seam: the lane-registry ownership authority. Patched per-module by
+# tests to simulate non-root/root registries WITHOUT mutating the global os
+# module (which leaked suite-wide; review on 7d4391c). Production == os.fstat.
+_registry_fstat = os.fstat
+
+
 def verify_immutable_release() -> None:
     """Prove the selected worker executable belongs to one immutable commit release."""
     try:
@@ -172,7 +178,7 @@ def _read_lane_registry(path: Path) -> str:
         # The basename is intentionally opened with O_NOFOLLOW.  fstat below,
         # rather than lstat alone, is the authority for every byte consumed.
         descriptor = os.open(path.name, file_flags, dir_fd=parent_fd)
-        before = os.fstat(descriptor)
+        before = _registry_fstat(descriptor)
         if (
             not stat.S_ISREG(before.st_mode)
             or before.st_nlink != 1
@@ -192,7 +198,7 @@ def _read_lane_registry(path: Path) -> str:
                 raise RolloutError("worker lane registry was truncated while read")
             chunks.append(chunk)
             remaining -= len(chunk)
-        after = os.fstat(descriptor)
+        after = _registry_fstat(descriptor)
         try:
             named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         except OSError as exc:

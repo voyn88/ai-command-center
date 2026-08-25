@@ -236,7 +236,11 @@ finally:
     os.close(parent)
 PY
 ) || fail "worker lane registry is unavailable or changed while being read"
-lane_family_units=$(printf '%s\n' "$lane_registry_contents" | while IFS= read -r lane || [ -n "$lane" ]; do
+# The subshell keeps its own newline-separated accumulator: under `set -u`
+# reading the outer (still unset) $lane_family_units would abort on the first
+# entry, and a space-joined accumulator can never match `grep -Fqx` anyway
+# (review on 7d4391c).
+lane_family_units=$(printf '%s\n' "$lane_registry_contents" | { seen=''; while IFS= read -r lane || [ -n "$lane" ]; do
   lane=$(printf '%s' "$lane" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   if [ -z "$lane" ]; then
     continue
@@ -254,12 +258,13 @@ lane_family_units=$(printf '%s\n' "$lane_registry_contents" | while IFS= read -r
   printf '%s\n' "$lane" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$' || \
     fail "invalid worker lane in registry: $lane"
   family_unit="voyn-aicc-worker@$lane.service"
-  if printf '%s\n' "$lane_family_units" | grep -Fqx "$family_unit"; then
+  if printf '%s\n' "$seen" | grep -Fqx "$family_unit"; then
     fail "duplicate worker lane in registry: $lane"
   fi
-  lane_family_units="$lane_family_units $family_unit"
+  seen="$seen
+$family_unit"
   printf '%s\n' "$family_unit"
-done
+done; }
 ) || fail "worker lane registry entries could not be parsed safely"
 [ -n "$lane_family_units" ] || fail "no worker lanes found in the registry to verify"
 for family_unit in $worker_family_units $lane_family_units; do

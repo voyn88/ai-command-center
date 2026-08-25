@@ -70,6 +70,8 @@ SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
 MOUNT = "/usr/bin/mount"
 UMOUNT = "/usr/bin/umount"
+NSENTER = "/usr/bin/nsenter"
+HOST_MOUNT_NAMESPACE = "/proc/1/ns/mnt"
 QUARANTINE_ROOT = Path("/srv/aicc-quarantine")
 ACTIVE_UNIT_ROOT = Path("/run/aicc-agent-launcher/active")
 WORKSPACE_BIND_ROOT = Path("/run/aicc-agent-workspace-binds")
@@ -1188,7 +1190,7 @@ def _recover_workspace_bind_journals() -> None:
             # mount syscall and the journal phase transition; umount is
             # harmless for the plain directory and removes that race too.
             subprocess.run(
-                [UMOUNT, "--", str(staging)],
+                _host_mount_namespace_command([UMOUNT, "--", str(staging)]),
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -1224,6 +1226,18 @@ def _validate_workspace_bind(binding: WorkspaceBind, workspace_fd: int) -> None:
         raise LaunchRefused("workspace bind no longer names the verified inode")
 
 
+def _host_mount_namespace_command(command: list[str]) -> list[str]:
+    """Run a mount operation in PID 1's mount namespace, not the broker's.
+
+    The broker unit uses ProtectSystem= and friends, so it lives in a slave
+    mount namespace: mounts it creates never propagate back to the host, and
+    PID 1 would resolve the BindPaths source to the empty staging directory
+    underneath (review on 7d4391c).  Entering PID 1's namespace makes the
+    bind visible to PID 1 and, through slave propagation, to the broker too.
+    """
+    return [NSENTER, f"--mount={HOST_MOUNT_NAMESPACE}", "--", *command]
+
+
 def _prepare_workspace_bind(workspace_fd: int, run_id: str) -> WorkspaceBind:
     """Create an immutable mount source for PID 1 instead of passing a pathname.
 
@@ -1243,7 +1257,9 @@ def _prepare_workspace_bind(workspace_fd: int, run_id: str) -> WorkspaceBind:
         identity = (identity_info.st_dev, identity_info.st_ino)
         _workspace_bind_journal(staging, phase="PREPARED", pid=os.getpid())
         result = subprocess.run(
-            [MOUNT, "--bind", f"/proc/self/fd/{workspace_fd}", str(staging)],
+            _host_mount_namespace_command(
+                [MOUNT, "--bind", f"/proc/self/fd/{workspace_fd}", str(staging)]
+            ),
             check=False,
             pass_fds=(workspace_fd,),
             capture_output=True,
@@ -1259,7 +1275,7 @@ def _prepare_workspace_bind(workspace_fd: int, run_id: str) -> WorkspaceBind:
         raise LaunchRefused("cannot prepare workspace bind staging mount") from exc
     except BaseException:
         subprocess.run(
-            [UMOUNT, "--", str(staging)],
+            _host_mount_namespace_command([UMOUNT, "--", str(staging)]),
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1271,7 +1287,7 @@ def _prepare_workspace_bind(workspace_fd: int, run_id: str) -> WorkspaceBind:
 
 def _cleanup_workspace_bind(binding: WorkspaceBind) -> None:
     result = subprocess.run(
-        [UMOUNT, "--", str(binding.path)],
+        _host_mount_namespace_command([UMOUNT, "--", str(binding.path)]),
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,

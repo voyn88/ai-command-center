@@ -19,7 +19,7 @@ def _module():
     # macOS that is not root:root). Simulate the installed canonical file's
     # owner so ordinary parser tests exercise content handling; dedicated
     # tests below override this seam to prove ownership rejection.
-    real_fstat = module.os.fstat
+    real_fstat = module._registry_fstat
 
     class RootRegistryStat:
         def __init__(self, value):
@@ -30,7 +30,7 @@ def _module():
         def __getattr__(self, name):
             return getattr(self._value, name)
 
-    module.os.fstat = lambda fd: RootRegistryStat(real_fstat(fd))
+    module._registry_fstat = lambda fd: RootRegistryStat(real_fstat(fd))
     return module
 
 
@@ -243,7 +243,7 @@ def test_registry_rejects_non_root_owner(tmp_path, monkeypatch):
     module = _module()
     lanes = tmp_path / "lanes"
     lanes.write_text("1\n", encoding="utf-8")
-    real_fstat = module.os.fstat
+    real_fstat = module._registry_fstat
 
     class NonRootStat:
         def __init__(self, value):
@@ -253,7 +253,7 @@ def test_registry_rejects_non_root_owner(tmp_path, monkeypatch):
         def __getattr__(self, name):
             return getattr(self._value, name)
 
-    monkeypatch.setattr(module.os, "fstat", lambda fd: NonRootStat(real_fstat(fd)))
+    monkeypatch.setattr(module, "_registry_fstat", lambda fd: NonRootStat(real_fstat(fd)))
     with pytest.raises(module.RolloutError, match="root:root regular"):
         module._configured_units(lanes)
 
@@ -264,7 +264,7 @@ def test_registry_replacement_during_read_fails_closed(tmp_path, monkeypatch):
     lanes.write_text("1\n", encoding="utf-8")
     displaced = tmp_path / "displaced"
     real_stat = module.os.stat
-    real_fstat = module.os.fstat
+    real_fstat = module._registry_fstat
     replaced = False
 
     class RootStat:
@@ -287,7 +287,7 @@ def test_registry_replacement_during_read_fails_closed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(module.os, "stat", replace_before_named_stat)
     monkeypatch.setattr(
-        module.os, "fstat", lambda fd: RootStat(real_fstat(fd))
+        module, "_registry_fstat", lambda fd: RootStat(real_fstat(fd))
     )
     with pytest.raises(module.RolloutError, match="changed while being read"):
         module._configured_units(lanes)
