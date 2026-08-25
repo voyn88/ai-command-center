@@ -164,6 +164,18 @@ def _controller(tmp_path: Path, events: list[tuple]):
     return controller, systemd, authority
 
 
+def _directives(unit_text: str) -> dict[str, list[str]]:
+    """Every occurrence of every key -- a dict() would keep only the LAST
+    ExecStopPost=, which is exactly where an unreviewed privileged command
+    could hide (independent-review finding on a915297)."""
+    collected: dict[str, list[str]] = {}
+    for line in unit_text.splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, value = line.split("=", 1)
+            collected.setdefault(key, []).append(value)
+    return collected
+
+
 def test_both_lanes_reload_new_credential_without_simultaneous_restart(
     tmp_path: Path,
 ) -> None:
@@ -268,6 +280,46 @@ def test_open_circuit_cli_retry_does_not_extend_cooldown(
 
     assert result == 1
     assert recorded == []
+
+
+def test_cli_records_an_ordinary_failure_into_the_circuit_journal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The positive twin the negative control above needs: if main() never
+    fed record_failure for ordinary RotationErrors, the breaker would never
+    open and Restart=on-failure would hammer the identity authority every
+    two minutes forever -- and the negative test alone stays green on that
+    broken code (independent-review finding on a915297)."""
+    recorded: list[Exception] = []
+
+    def explode(self) -> None:
+        raise RotationError("ordinary failure")
+
+    monkeypatch.setattr(RotationController, "rotate", explode)
+    monkeypatch.setattr(
+        RotationController,
+        "record_failure",
+        lambda self, error: recorded.append(error),
+    )
+    result = main(
+        [
+            "--env-file",
+            str(_environment(tmp_path / "worker.env")),
+            "--lock-file",
+            str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
+            "--circuit-file",
+            str(tmp_path / "circuit.json"),
+            "--tunnel-unit",
+            TUNNEL,
+            "--lane-registry",
+            str(_lane_registry(tmp_path, monkeypatch)),
+        ]
+    )
+
+    assert result == 1
+    assert len(recorded) == 1 and isinstance(recorded[0], RotationError)
 
 
 def test_expired_circuit_allows_half_open_success_and_clears_latch(
@@ -939,11 +991,15 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
         "--circuit-file /var/lib/voyn-aicc-credential-rotation/circuit.json" in rotation
     )
     assert "daemon.err" in alert
-    lines = dict(line.split("=", 1) for line in rotation.splitlines() if "=" in line)
-    assert lines["Restart"] == "on-failure"
-    assert lines["RestartSec"] == "2min"
-    argv = shlex.split(lines["ExecStart"])
-    recovery_argv = shlex.split(lines["ExecStopPost"])
+    lines = _directives(rotation)
+    assert lines["Restart"] == ["on-failure"]
+    assert lines["RestartSec"] == ["2min"]
+    assert len(lines["ExecStart"]) == 1, "exactly one ExecStart"
+    # exactly ONE ExecStopPost -- a second one is where an unreviewed
+    # privileged command would hide (independent-review finding on a915297).
+    assert len(lines["ExecStopPost"]) == 1, "exactly one ExecStopPost"
+    argv = shlex.split(lines["ExecStart"][0])
+    recovery_argv = shlex.split(lines["ExecStopPost"][0])
     assert [argument for argument in recovery_argv if argument != "--recover-only"] == (
         argv
     )
@@ -956,7 +1012,7 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     drain_timeout = option("--drain-timeout")
     reload_timeout = option("--reload-timeout")
     restart_timeout = option("--restart-timeout")
-    systemd_timeout = float(lines["TimeoutStartSec"].removesuffix("s"))
+    systemd_timeout = float(lines["TimeoutStartSec"][0].removesuffix("s"))
     registry_text = (root / "deploy/voyn-aicc-worker-lanes.conf").read_text()
     deployed_lanes = [
         line.strip()
@@ -968,7 +1024,7 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     cohort_size = int(option("--activation-cohort-size"))
     waves = 1 + (lane_count - 1 + cohort_size - 1) // cohort_size
     stop_budget = float(argv[argv.index("--stop-budget") + 1])
-    systemd_stop = float(lines["TimeoutStopSec"].removesuffix("s"))
+    systemd_stop = float(lines["TimeoutStopSec"][0].removesuffix("s"))
     assert systemd_stop >= stop_budget + SYSTEMD_EXIT_MARGIN_SECONDS
     authority_timeout = 10 + 30
     safe_post_rotation = (
