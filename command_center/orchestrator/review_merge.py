@@ -218,9 +218,9 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # incrementing this constant, forcing every task to be re-reviewed under the
 # new contract rather than silently reusing a verdict given for an older,
 # looser policy.
-_REVIEW_POLICY_VERSION = "v5"
+_REVIEW_POLICY_VERSION = "v6"
 
-_MODEL_ONLY_REVIEW_EXECUTORS = frozenset({"copilot", "claude"})
+_MODEL_ONLY_REVIEW_EXECUTORS = frozenset({"copilot", "claude", "codex"})
 
 
 def _model_only_review_cascade() -> list[dict[str, Any]]:
@@ -358,6 +358,42 @@ def _render_review_prompt(
         + _REVIEW_PROMPT
         + _REVIEW_INPUT_MARKER
         + _review_input_envelope(task_id, pr_url, snapshot, chunk)
+    )
+
+
+def _adjudicate_key(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
+    """A full-context adjudication review, keyed distinctly from the per-chunk
+    reviews but on the SAME (task, PR, exact head, policy, diff digest) identity
+    -- so a new head, policy bump, or changed diff invalidates it exactly as it
+    does the chunk reviews. Chunk verdicts judge each chunk in isolation and so
+    flag cross-chunk context and minor items as REJECT; this reviewer re-reads
+    the whole change in context and is the tiebreaker consulted before a
+    chunk-REJECT is allowed to block + remediate (VOYN-W0-AICC-REVIEW-ADJUDICATE;
+    durable follow-up VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE)."""
+    base = _review_key(task_id, pr_url, snapshot)
+    return None if base is None else "adjudicate:" + base[len("review:") :]
+
+
+def _render_adjudication_prompt(
+    task_id: str, pr_url: str, snapshot: _PRSnapshot
+) -> str:
+    """A small full-context prompt: the reviewer reconstructs the whole diff
+    from the checkout itself (no diff embedded, so no prompt-byte budget wall)
+    and judges the change AS A WHOLE, blocking only on a real defect."""
+    return (
+        "You are an independent, full-context acceptance reviewer for "
+        f"{pr_url} at head {snapshot.head}. Your working directory is a "
+        "checkout at this exact head. Reconstruct the COMPLETE change with "
+        f"`git diff {snapshot.base}..{snapshot.head}` and review it in full "
+        "context -- read every affected file as needed and judge the change "
+        "AS A WHOLE, not chunk by chunk. Return VERDICT: REJECT ONLY for a "
+        "real, blocking security or correctness defect that must be fixed "
+        "before merge. Do NOT reject for style, test-hygiene nits, "
+        "non-blocking hardening, or a concern that is actually mitigated "
+        "elsewhere in the change or by the surrounding system -- those are "
+        "acceptable and are at most follow-ups. End with EXACTLY two lines:\n"
+        "VERDICT: ACCEPT or VERDICT: REJECT (with the blocking reason)\n"
+        f"HEAD_SHA: {snapshot.head}"
     )
 
 
@@ -612,6 +648,32 @@ def review_once(
         if not prepared:
             report.skipped.append((task_id, "review_prompt_budget_invariant_failed"))
             continue
+        # For a multi-chunk PR (the only case that suffers per-chunk isolation),
+        # enqueue one extra full-context adjudication review alongside the
+        # chunks. It runs in parallel and is consulted by publish_review_verdicts
+        # only if the chunk aggregation comes back non-ACCEPT, so a chunk-REJECT
+        # caused purely by isolation no longer blocks + remediates on its own
+        # (VOYN-W0-AICC-REVIEW-ADJUDICATE). Its prompt embeds no diff, so it is
+        # never subject to the per-chunk byte budget that forced chunking.
+        if len(chunks) > 1:
+            adj_key = _adjudicate_key(task_id, pr_url, snapshot)
+            if adj_key is not None:
+                prepared.append(
+                    (
+                        adj_key,
+                        {
+                            "kind": "agent_run", "v": 1, "project_id": project_id,
+                            "repository_path": repository_path,
+                            "task_type": "independent_review",
+                            "prompt": _render_adjudication_prompt(
+                                task_id, pr_url, snapshot
+                            ),
+                            "timeout_seconds": cfg.review_timeout,
+                            "untrusted": True,
+                            "cascade": cascade,
+                        },
+                    )
+                )
         for review_key, payload in prepared:
             enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
@@ -1047,6 +1109,24 @@ def publish_review_verdicts(
                     (task_id, f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}")
                 )
                 continue
+        if verdict != "ACCEPT" and chunk_rows:
+            # Chunk verdicts judge each chunk in isolation, so cross-chunk
+            # context and minor items surface as REJECT even when the change is
+            # acceptable as a whole. Consult the full-context adjudication
+            # review enqueued alongside the chunks before letting a chunk-REJECT
+            # block + remediate (VOYN-W0-AICC-REVIEW-ADJUDICATE). A missing
+            # adjudication result is a WAIT, not a REJECT; an ACCEPT on the
+            # current head supersedes the isolated chunk verdicts; anything else
+            # falls through to remediation below. (A single-chunk review is
+            # already full-context, so this override never applies to it.)
+            adj_key = _adjudicate_key(task_id, pr_url, snapshot)
+            adj = _latest_review_result(factory, task_id, adj_key) if adj_key else None
+            adj_parsed = _parse_verdict(adj.get("result_text") or "") if adj else None
+            if adj_parsed is None:
+                report.skipped.append((task_id, "adjudication_pending"))
+                continue
+            if adj_parsed[0] == "ACCEPT" and adj_parsed[1] == current_head:
+                verdict, sha = "ACCEPT", current_head
         if verdict != "ACCEPT":
             new_task_id = _remediate_rejection(factory, task_id, pr_url, current_head, text)
             if new_task_id:

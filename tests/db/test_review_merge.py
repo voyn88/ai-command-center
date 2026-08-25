@@ -1002,3 +1002,117 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
     keys = {key for _q, key, _p, _tid, _attempts in calls}
     assert len(keys) == 2  # two distinct review-cycle identities, not deduped
     assert all(k.startswith("review:VOYN-W0-R5:20:") for k in keys)
+
+
+# --- VOYN-W0-AICC-REVIEW-ADJUDICATE: full-context adjudication gate ---------
+
+def _force_chunk_reject(monkeypatch, adjudication):
+    """Drive publish_review_verdicts down the multi-chunk REJECT path and make
+    the adjudication lookup return `adjudication` ((verdict_text) or None)."""
+    monkeypatch.setattr(
+        review_merge, "_chunk_review_rows",
+        lambda factory, task_id, pr_url, snapshot: ("prefix", [{"chunk": 0}]),
+    )
+    monkeypatch.setattr(
+        review_merge, "_aggregate_chunk_verdict",
+        lambda rows, snapshot, prefix: ("REJECT", "isolated-chunk finding text"),
+    )
+
+    def fake_latest(factory, task_id, key):
+        # Only the adjudication key is ever looked up on the multi-chunk path.
+        assert key.startswith("adjudicate:"), key
+        return {"result_text": adjudication} if adjudication is not None else None
+
+    monkeypatch.setattr(review_merge, "_latest_review_result", fake_latest)
+
+
+def _fake_pr_view(head):
+    import subprocess as sp
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+    return fake_gh
+
+
+def test_chunk_reject_overridden_by_full_context_adjudication_accept(rig, monkeypatch):  # noqa: F811, E501
+    """A multi-chunk PR whose chunk aggregation REJECTs on isolation artifacts
+    must still be accepted when the full-context adjudication review ACCEPTs:
+    the marker is posted and NO remediation is dispatched."""
+    app_factory, store, _ = rig
+    head = "a" * 40
+    pr_url = "https://github.com/x/y/pull/21"
+    _ready(store, app_factory, "VOYN-W0-ADJ-A", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, f"All findings are chunk-isolation artifacts.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append((pr, decision, sha)) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert posted == [(pr_url, "ACCEPT", head)]
+    assert not report.remediated
+
+
+def test_chunk_reject_confirmed_by_adjudication_reject_remediates(rig, monkeypatch):  # noqa: F811, E501
+    """When the full-context adjudication also REJECTs (a real blocking
+    defect), the chunk-REJECT stands: remediation is dispatched, no marker."""
+    app_factory, store, _ = rig
+    head = "b" * 40
+    pr_url = "https://github.com/x/y/pull/22"
+    _ready(store, app_factory, "VOYN-W0-ADJ-B", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, f"Real blocker: unauthenticated RCE path.\nVERDICT: REJECT\nHEAD_SHA: {head}\n")
+    posted = []
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (posted.append(a) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-ADJ-B", "VOYN-W0-ADJ-B-REM") in report.remediated
+    assert not posted
+
+
+def test_chunk_reject_waits_while_adjudication_pending(rig, monkeypatch):  # noqa: F811, E501
+    """No adjudication result yet is a WAIT, never a REJECT: the task is
+    skipped as `adjudication_pending` with no remediation and no marker, so a
+    later tick can still ACCEPT once the full-context review lands."""
+    app_factory, store, _ = rig
+    head = "c" * 40
+    pr_url = "https://github.com/x/y/pull/23"
+    _ready(store, app_factory, "VOYN-W0-ADJ-C", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, None)
+    posted = []
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (posted.append(a) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-ADJ-C", "adjudication_pending") in report.skipped
+    assert not report.remediated
+    assert not posted
+
+
+def test_review_once_enqueues_a_full_context_adjudication_for_multichunk(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """review_once must enqueue exactly one extra adjudication item (keyed
+    `adjudicate:...`) for a PR that splits into more than one chunk, and none
+    for a single-chunk PR (which is already full-context)."""
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/repo-x/pull/31"
+    _ready(store, app_factory, "VOYN-W0-ADJ-D", pr_url)
+    head = "d" * 40
+    snap = _snapshot(head)
+    SNAPSHOTS[pr_url] = snap
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda _r, _p: snap)
+    # three chunks -> multi-chunk
+    monkeypatch.setattr(review_merge, "_review_chunks", lambda s, t, p: review_merge._make_diff_chunks(["a", "b", "c"]))
+    monkeypatch.setattr(review_merge, "_render_review_prompt", lambda t, p, s, c: "prompt")
+    monkeypatch.setattr(review_merge, "_prompt_size_bytes", lambda s: 1)
+    enq = []
+    report = review_once(app_factory, lambda q, k, pay, task_id, mx: enq.append(k), "/tmp")
+    assert ("VOYN-W0-ADJ-D", pr_url) in report.reviewed
+    adj = [k for k in enq if k.startswith("adjudicate:")]
+    assert len(adj) == 1, enq
