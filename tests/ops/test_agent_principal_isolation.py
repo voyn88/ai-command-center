@@ -256,6 +256,53 @@ def test_workspace_allowlist_rejects_symlink_and_sibling(launcher, tmp_path):
         launcher._validated_workspace(str(unsafe), (root,))
 
 
+def test_workspace_bind_source_stays_on_pinned_inode_after_path_replacement(
+    launcher, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "identity").write_text("original", encoding="utf-8")
+    descriptor = launcher._open_pinned_workspace(workspace)
+    try:
+        original = os.fstat(descriptor)
+        displaced = tmp_path / "displaced"
+        workspace.rename(displaced)
+        workspace.mkdir()
+        (workspace / "identity").write_text("replacement", encoding="utf-8")
+        replacement = workspace.stat()
+        assert (original.st_dev, original.st_ino) != (
+            replacement.st_dev,
+            replacement.st_ino,
+        )
+        child = os.open("identity", os.O_RDONLY, dir_fd=descriptor)
+        try:
+            assert os.read(child, 32) == b"original"
+        finally:
+            os.close(child)
+    finally:
+        os.close(descriptor)
+
+
+def test_systemd_bind_uses_explicit_pinned_workspace_source(
+    launcher, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        launcher, "_validate_environment_file", lambda *args, **kwargs: False
+    )
+    pinned = Path(f"/proc/{os.getpid()}/fd/123")
+    command = launcher._systemd_command(
+        _manifest(tmp_path),
+        tmp_path,
+        Path("/run/aicc-agent-homes/test"),
+        "aicc-agent-test.service",
+        "aicc-agent-launcher@test.service",
+        tmp_path.parent,
+        pinned,
+    )
+    assert f"--property=BindPaths={pinned}:/workspace" in command
+    assert f"--property=BindPaths={tmp_path}:/workspace" not in command
+
+
 def test_worker_derived_workspace_is_accepted_by_same_canonical_root(
     launcher, monkeypatch, tmp_path
 ):
@@ -772,8 +819,8 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     }
     assert "NoNewPrivileges=true" in worker
     assert (
-        "ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker"
-        in worker_template
+        "ExecStart=/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required "
+        "/opt/aicc/current/.venv/bin/python -m command_center.worker" in worker_template
     )
     assert (
         "EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env"

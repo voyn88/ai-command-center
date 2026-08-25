@@ -487,3 +487,22 @@ def test_recover_finishes_an_interrupted_commit_instead_of_reverting_it(
     assert existing.read_bytes() == b"after", "live generation must survive recover"
     assert not transaction.pending.exists()
     assert json.loads(transaction.current.read_text())["manifest"]
+
+
+def test_recover_restores_release_selector_before_any_service_snapshot(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    state.mkdir()
+    pending_release = state / "pending-release"
+    pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
+    pending_release.chmod(0o600)
+
+    transaction = module.FileTransaction(root, state)
+    transaction.recover()
+
+    assert current.readlink() == Path(f"releases/{'a' * 40}")
+    assert not pending_release.exists()

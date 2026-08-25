@@ -20,7 +20,24 @@ from pathlib import Path
 RESTORABLE_UNIT_RE = re.compile(
     r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
     r"voyn-aicc-worker(?:-2)?\.service|"
+    r"aicc-worker\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
+)
+SNAPSHOT_PROPERTIES = frozenset(
+    {
+        "FragmentPath",
+        "DropInPaths",
+        "User",
+        "Group",
+        "ExecStart",
+        "WorkingDirectory",
+        "EnvironmentFiles",
+        "SupplementaryGroups",
+        "NoNewPrivileges",
+        "ProtectSystem",
+        "ProtectHome",
+        "ProtectControlGroups",
+    }
 )
 
 
@@ -152,7 +169,8 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
     except FileNotFoundError:
         return
     units = payload.get("units")
-    if payload.get("version") != 2 or not isinstance(units, dict):
+    version = payload.get("version")
+    if version not in {2, 3} or not isinstance(units, dict):
         raise RuntimeError("invalid interrupted-install service snapshot")
     validated: list[tuple[str, dict[str, bool]]] = []
     for unit, state in sorted(units.items(), reverse=True):
@@ -163,6 +181,20 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
             or not isinstance(state.get("exists"), bool)
             or not isinstance(state.get("enabled"), bool)
             or not isinstance(state.get("active"), bool)
+            or (
+                version == 3
+                and (
+                    not isinstance(state.get("properties"), dict)
+                    or (
+                        state["exists"]
+                        and set(state["properties"]) != SNAPSHOT_PROPERTIES
+                    )
+                    or any(
+                        not isinstance(name, str) or not isinstance(value, str)
+                        for name, value in state["properties"].items()
+                    )
+                )
+            )
         ):
             raise RuntimeError("invalid interrupted-install service unit")
         validated.append((unit, state))
@@ -219,6 +251,16 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
             raise RuntimeError(f"service snapshot did not restore exactly: {unit}")
         if active != "active" and main_pid not in {"", "0"}:
             raise RuntimeError(f"inactive restored service retains MainPID: {unit}")
+        if version == 3 and state["exists"]:
+            properties = state["properties"]
+            for name, expected in properties.items():
+                property_rc, actual = probe(
+                    "show", unit, f"--property={name}", "--value"
+                )
+                if property_rc or actual != expected:
+                    raise RuntimeError(
+                        f"service snapshot property did not restore: {unit} {name}"
+                    )
 
     systemctl("daemon-reload")
     for unit, state in validated:
@@ -231,6 +273,15 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
             probe("disable", unit)
             assert_restored(unit, state)
             continue
+        if version == 3:
+            for name, expected in state["properties"].items():
+                property_rc, actual = probe(
+                    "show", unit, f"--property={name}", "--value"
+                )
+                if property_rc or actual != expected:
+                    raise RuntimeError(
+                        f"refusing unsafe snapshot restart: {unit} {name}"
+                    )
         systemctl("enable" if state["enabled"] else "disable", unit)
         systemctl("start" if state["active"] else "stop", unit)
         assert_restored(unit, state)
@@ -244,6 +295,7 @@ class FileTransaction:
         self.state_dir = state_dir.resolve()
         self.current = self.state_dir / "current.json"
         self.pending = self.state_dir / "pending.json"
+        self.pending_release = self.state_dir / "pending-release"
 
     def _write_journal(self, manifest: Path, phase: str, next_index: int = 0) -> None:
         recovery = manifest.parent / "recovery.py"
@@ -513,7 +565,40 @@ class FileTransaction:
             os.geteuid(),
             os.getegid(),
         )
+        self.pending_release.unlink(missing_ok=True)
         self.pending.unlink()
+        _fsync_dir(self.state_dir)
+
+    def _restore_release_selector(self) -> None:
+        if not self.pending_release.exists():
+            return
+        info = self.pending_release.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > 64
+        ):
+            raise RuntimeError("pending release selector drifted")
+        selector = self.pending_release.read_text(encoding="ascii").strip()
+        if selector != "ABSENT" and not re.fullmatch(
+            r"releases/[0-9a-f]{40}", selector
+        ):
+            raise RuntimeError("pending release selector is invalid")
+        current = self._target("/opt/aicc/current")
+        current.parent.mkdir(parents=True, exist_ok=True)
+        if selector == "ABSENT":
+            if current.is_symlink():
+                current.unlink()
+            elif current.exists():
+                raise RuntimeError("current release selector is not a symlink")
+        else:
+            temporary = current.parent / f".current-recover-{os.getpid()}"
+            temporary.unlink(missing_ok=True)
+            temporary.symlink_to(selector)
+            os.replace(temporary, current)
+        self.pending_release.unlink()
+        _fsync_dir(current.parent)
         _fsync_dir(self.state_dir)
 
     def install(self, specs: Iterable[FileSpec]) -> None:
@@ -524,6 +609,7 @@ class FileTransaction:
     def recover(self) -> None:
         """Idempotently roll back an interrupted prepared/applying generation."""
         if not self.pending.exists():
+            self._restore_release_selector()
             self._remove_orphan_generations()
             return
         manifest = self._pending_manifest()
@@ -548,10 +634,12 @@ class FileTransaction:
                 os.getegid(),
             )
             self.pending.unlink()
+            self.pending_release.unlink(missing_ok=True)
             self._remove_orphan_generations()
             _fsync_dir(self.state_dir)
             return
         self.restore(manifest, clear_pending=False)
+        self._restore_release_selector()
         restore_service_snapshot(self.state_dir / "attempt-units.json")
         self._clear_pending(manifest)
         shutil.rmtree(transaction)

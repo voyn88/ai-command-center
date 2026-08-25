@@ -162,11 +162,20 @@ for isolated_unit in "$principal_unit_a" "$principal_unit_b"; do
   if printf '%s\n' "$unit_groups" | tr ' ' '\n' | grep -qx aicc-publisher; then
     fail "transient executor inherited publisher group: $isolated_unit"
   fi
-  unit_environment=$(systemctl show "$isolated_unit" --property=Environment --value)
-  isolation_values=$(printf '%s\n' "$unit_environment" | tr ' ' '\n' | \
+done
+# The fail-closed flag travels via the drop-in to the WORKER unit families --
+# the legacy single unit and every template lane. Transient canaries never
+# carry the drop-in, and demanding the flag there failed a healthy host
+# before its measurement ran (review on 9de8193); template lanes went
+# unverified for the same reason.
+worker_family_units="aicc-worker.service"
+lane_family_units=$(systemctl list-units --all --no-legend --plain 'voyn-aicc-worker@*.service' 2>/dev/null | awk '{print $1}')
+for family_unit in $worker_family_units $lane_family_units; do
+  family_env=$(systemctl show "$family_unit" --property=Environment --value)
+  family_flag=$(printf '%s\n' "$family_env" | tr ' ' '\n' | \
     grep '^AICC_AGENT_PRINCIPAL_ISOLATION=' || true)
-  [ "$isolation_values" = 'AICC_AGENT_PRINCIPAL_ISOLATION=required' ] || \
-    fail "isolation flag did not reach $isolated_unit exactly"
+  [ "$family_flag" = 'AICC_AGENT_PRINCIPAL_ISOLATION=required' ] || \
+    fail "isolation flag did not reach $family_unit exactly"
 done
 
 principal_pid_a=$(systemctl show "$principal_unit_a" --property=MainPID --value)

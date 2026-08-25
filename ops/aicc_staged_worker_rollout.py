@@ -18,11 +18,13 @@ USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 RESTORABLE_UNIT_RE = re.compile(
     r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
     r"voyn-aicc-worker(?:-2)?\.service|"
+    r"aicc-worker\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
 )
 LEGACY_WORKER_UNITS = (
     "voyn-aicc-worker.service",
     "voyn-aicc-worker-2.service",
+    "aicc-worker.service",
 )
 DEFAULT_LANES = Path("/etc/aicc/worker-lanes")
 DEFAULT_PRIVILEGED_USERS = Path("/etc/aicc/privileged-principals")
@@ -30,12 +32,66 @@ WORKER_TEMPLATE = Path("/etc/systemd/system/voyn-aicc-worker@.service")
 WORKER_DROPIN = Path(
     "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf"
 )
-EXPECTED_WORKER_EXECSTART = "/opt/aicc/.venv/bin/python -m command_center.worker"
+EXPECTED_WORKER_EXECSTART = (
+    "/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required "
+    "/opt/aicc/current/.venv/bin/python -m command_center.worker"
+)
 REQUIRED_ISOLATION_ENVIRONMENT = "AICC_AGENT_PRINCIPAL_ISOLATION=required"
+EXPECTED_ENVIRONMENT_FILES = (
+    "/etc/aicc/lease.env",
+    "/var/lib/voyn-aicc-credential-rotation/worker.env",
+    "/etc/aicc/executors.env",
+    "/etc/aicc/workspace-authority.env",
+)
+EXPECTED_GROUPS = frozenset({"aicc-workspace", "aicc-publisher"})
+CURRENT_RELEASE = Path("/opt/aicc/current")
+RELEASE_ROOT = Path("/opt/aicc/releases")
+SNAPSHOT_PROPERTIES = (
+    "FragmentPath",
+    "DropInPaths",
+    "User",
+    "Group",
+    "ExecStart",
+    "WorkingDirectory",
+    "EnvironmentFiles",
+    "SupplementaryGroups",
+    "NoNewPrivileges",
+    "ProtectSystem",
+    "ProtectHome",
+    "ProtectControlGroups",
+)
 
 
 class RolloutError(RuntimeError):
     pass
+
+
+def verify_immutable_release() -> None:
+    """Prove the selected worker executable belongs to one immutable commit release."""
+    try:
+        link = CURRENT_RELEASE.lstat()
+        target_text = os.readlink(CURRENT_RELEASE)
+        target = CURRENT_RELEASE.resolve(strict=True)
+    except OSError as exc:
+        raise RolloutError("current AICC release is unavailable") from exc
+    if (
+        not CURRENT_RELEASE.is_symlink()
+        or link.st_uid != 0
+        or target.parent != RELEASE_ROOT
+        or not re.fullmatch(r"[0-9a-f]{40}", target.name)
+        or target_text != f"releases/{target.name}"
+    ):
+        raise RolloutError("current AICC release selector is not immutable")
+    executable = target / ".venv/bin/python"
+    for path in (CURRENT_RELEASE.parent, RELEASE_ROOT, target, executable):
+        try:
+            info = path.stat()
+        except OSError as exc:
+            raise RolloutError(f"AICC release path is unavailable: {path}") from exc
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise RolloutError(f"AICC release path is mutable: {path}")
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RolloutError("AICC release interpreter is not executable")
 
 
 @dataclass(frozen=True)
@@ -135,25 +191,34 @@ def verify_legacy_units_retired(systemd: Systemd) -> None:
 
 
 def snapshot(systemd: Systemd, units: tuple[str, ...]) -> dict[str, object]:
-    return {
-        "version": 2,
-        "units": {
-            unit: {
-                "exists": systemd.run(
-                    "show", unit, "--property=LoadState", "--value", check=False
+    def unit_state(unit: str) -> dict[str, object]:
+        exists = systemd.run(
+            "show", unit, "--property=LoadState", "--value", check=False
+        ) not in {"", "not-found"}
+        return {
+            "exists": exists,
+            "enabled": systemd.run("is-enabled", unit, check=False) == "enabled",
+            "active": systemd.run("is-active", unit, check=False) == "active",
+            "properties": {
+                name: systemd.run(
+                    "show", unit, f"--property={name}", "--value", check=False
                 )
-                not in {"", "not-found"},
-                "enabled": systemd.run("is-enabled", unit, check=False) == "enabled",
-                "active": systemd.run("is-active", unit, check=False) == "active",
+                for name in SNAPSHOT_PROPERTIES
             }
-            for unit in units
-        },
+            if exists
+            else {},
+        }
+
+    return {
+        "version": 3,
+        "units": {unit: unit_state(unit) for unit in units},
     }
 
 
 def restore(systemd: Systemd, state: dict[str, object]) -> None:
     raw_units = state.get("units")
-    if state.get("version") != 2 or not isinstance(raw_units, dict):
+    version = state.get("version")
+    if version not in {2, 3} or not isinstance(raw_units, dict):
         raise RolloutError("invalid service snapshot")
     for unit, raw in sorted(raw_units.items(), reverse=True):
         if (
@@ -161,6 +226,16 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
             or not RESTORABLE_UNIT_RE.fullmatch(unit)
             or not isinstance(raw, dict)
             or not isinstance(raw.get("exists"), bool)
+            or (
+                version == 3
+                and (
+                    not isinstance(raw.get("properties"), dict)
+                    or any(
+                        not isinstance(name, str) or not isinstance(value, str)
+                        for name, value in raw["properties"].items()
+                    )
+                )
+            )
         ):
             raise RolloutError("invalid service snapshot unit")
         if raw["exists"] is False:
@@ -187,6 +262,20 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
             ):
                 raise RolloutError(f"service snapshot did not restore exactly: {unit}")
             continue
+        if version == 3:
+            properties = raw["properties"]
+            if set(properties) != set(SNAPSHOT_PROPERTIES):
+                raise RolloutError(
+                    f"service snapshot properties are incomplete: {unit}"
+                )
+            for name, expected in properties.items():
+                actual = systemd.run(
+                    "show", unit, f"--property={name}", "--value", check=False
+                )
+                if actual != expected:
+                    raise RolloutError(
+                        f"refusing unsafe snapshot restart: {unit} {name}"
+                    )
         systemd.run("enable" if raw.get("enabled") is True else "disable", unit)
         systemd.run("start" if raw.get("active") is True else "stop", unit)
         active = systemd.run("is-active", unit, check=False)
@@ -204,6 +293,15 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
             or (active != "active" and main_pid not in {"", "0"})
         ):
             raise RolloutError(f"service snapshot did not restore exactly: {unit}")
+        if version == 3:
+            for name, expected in properties.items():
+                actual = systemd.run(
+                    "show", unit, f"--property={name}", "--value", check=False
+                )
+                if actual != expected:
+                    raise RolloutError(
+                        f"service snapshot property did not restore: {unit} {name}"
+                    )
 
 
 def _uid_for_user(user: str) -> int:
@@ -225,6 +323,17 @@ def _process_uid(pid: int) -> int:
     raise RolloutError(f"MainPID {pid} has no Uid field")
 
 
+def _process_environment(pid: int) -> tuple[str, ...]:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError as exc:
+        raise RolloutError(f"cannot prove MainPID environment for {pid}") from exc
+    try:
+        return tuple(value.decode("utf-8") for value in raw.split(b"\0") if value)
+    except UnicodeDecodeError as exc:
+        raise RolloutError(f"MainPID {pid} environment is malformed") from exc
+
+
 def _systemd_words(value: str, *, unit: str, property_name: str) -> tuple[str, ...]:
     """Parse a systemd ``show`` word list without accepting malformed quoting."""
     try:
@@ -243,6 +352,33 @@ def _execstart_argv(value: str, *, unit: str) -> str:
     return matches[0].strip()
 
 
+def _environment_file_paths(value: str, *, unit: str) -> tuple[str, ...]:
+    """Return paths from systemd's EnvironmentFiles property serialization."""
+    words = _systemd_words(value, unit=unit, property_name="EnvironmentFiles")
+    paths = tuple(word for word in words if word.startswith("/"))
+    if any(not word.startswith(("/", "(ignore_errors=")) for word in words):
+        raise RolloutError(f"{unit} EnvironmentFiles is malformed")
+    return paths
+
+
+def _protect_home_is_safe(value: str) -> bool:
+    # `ProtectHome=true` is serialized as `yes`; older versions may report
+    # the equivalent read-only mount using the explicit enum spelling.
+    return value in {"yes", "read-only"}
+
+
+def _expected_environment_files(unit: str) -> tuple[str, ...]:
+    match = UNIT_RE.fullmatch(unit)
+    if match is None:
+        raise RolloutError(f"unsupported worker unit: {unit}")
+    instance = unit.removeprefix("voyn-aicc-worker@").removesuffix(".service")
+    return (
+        *EXPECTED_ENVIRONMENT_FILES[:-1],
+        f"/etc/aicc/worker-{instance}.env",
+        EXPECTED_ENVIRONMENT_FILES[-1],
+    )
+
+
 def verify_unit_configuration(systemd: Systemd, unit: str) -> None:
     """Fail closed on the exact effective worker isolation configuration.
 
@@ -255,18 +391,53 @@ def verify_unit_configuration(systemd: Systemd, unit: str) -> None:
     expected = {
         "LoadState": "loaded",
         "FragmentPath": str(WORKER_TEMPLATE),
+        "User": "aicc-worker",
+        "Group": "aicc-worker",
+        "WorkingDirectory": "/opt/aicc/current",
+        "NoNewPrivileges": "yes",
+        "ProtectSystem": "strict",
+        "ProtectControlGroups": "yes",
+        "PrivateTmp": "yes",
+        "PrivateDevices": "yes",
+        "ProtectProc": "invisible",
+        "ProcSubset": "pid",
+        "ProtectKernelTunables": "yes",
+        "ProtectKernelModules": "yes",
+        "ProtectKernelLogs": "yes",
+        "ProtectClock": "yes",
+        "ProtectHostname": "yes",
+        "RestrictSUIDSGID": "yes",
+        "LockPersonality": "yes",
+        "KeyringMode": "private",
+        "CapabilityBoundingSet": "",
+        "AmbientCapabilities": "",
+        "UMask": "0077",
     }
     for name, value in expected.items():
         if systemd.property(unit, name) != value:
-            raise RolloutError(f"{unit} {name} is not {value}")
+            qualifier = "isolated " if name == "User" else ""
+            raise RolloutError(f"{unit} {name} is not {qualifier}{value}")
 
     dropins = _systemd_words(
         systemd.property(unit, "DropInPaths"),
         unit=unit,
         property_name="DropInPaths",
     )
-    if dropins.count(str(WORKER_DROPIN)) != 1:
+    if dropins != (str(WORKER_DROPIN),):
         raise RolloutError(f"{unit} does not inherit the principal boundary")
+
+    if not _protect_home_is_safe(systemd.property(unit, "ProtectHome")):
+        raise RolloutError(f"{unit} ProtectHome is not isolated")
+
+    environment_files = _environment_file_paths(
+        systemd.property(unit, "EnvironmentFiles"), unit=unit
+    )
+    if environment_files != _expected_environment_files(unit):
+        raise RolloutError(f"{unit} EnvironmentFiles is not the versioned set")
+
+    groups = frozenset(systemd.property(unit, "SupplementaryGroups").split())
+    if groups != EXPECTED_GROUPS:
+        raise RolloutError(f"{unit} SupplementaryGroups is not the versioned set")
 
     environment = _systemd_words(
         systemd.property(unit, "Environment"),
@@ -295,23 +466,21 @@ def verify_unit(
     privileged_uids: frozenset[int],
     uid_for_user=None,
     process_uid=None,
+    process_environment=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
+    process_environment = process_environment or _process_environment
     verify_unit_configuration(systemd, unit)
     expected = {
         "ActiveState": "active",
         "SubState": "running",
         "NoNewPrivileges": "yes",
-        "ProtectHome": "read-only",
         "ProtectControlGroups": "yes",
     }
     for name, value in expected.items():
         if systemd.property(unit, name) != value:
             raise RolloutError(f"{unit} {name} is not {value}")
-    groups = set(systemd.property(unit, "SupplementaryGroups").split())
-    if not {"aicc-publisher", "aicc-workspace"}.issubset(groups):
-        raise RolloutError(f"{unit} lacks required authority groups")
     user = systemd.property(unit, "User")
     unit_uid = uid_for_user(user)
     if unit_uid == agent_uid or unit_uid in privileged_uids:
@@ -323,6 +492,13 @@ def verify_unit(
         raise RolloutError(f"{unit} has no live MainPID")
     if process_uid(int(raw_pid)) != unit_uid:
         raise RolloutError(f"{unit} MainPID UID does not match systemd User")
+    isolation = tuple(
+        value
+        for value in process_environment(int(raw_pid))
+        if value.startswith("AICC_AGENT_PRINCIPAL_ISOLATION=")
+    )
+    if isolation != (REQUIRED_ISOLATION_ENVIRONMENT,):
+        raise RolloutError(f"{unit} MainPID principal-isolation flag is not required")
 
 
 def verify_all(
@@ -333,9 +509,11 @@ def verify_all(
     privileged_users: tuple[str, ...],
     uid_for_user=None,
     process_uid=None,
+    process_environment=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
+    process_environment = process_environment or _process_environment
     verify_legacy_units_retired(systemd)
     agent_uid = uid_for_user(agent_user)
     privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
@@ -349,6 +527,7 @@ def verify_all(
             privileged_uids=privileged_uids,
             uid_for_user=uid_for_user,
             process_uid=process_uid,
+            process_environment=process_environment,
         )
 
 
@@ -360,20 +539,22 @@ def rollout(
     privileged_users: tuple[str, ...],
     uid_for_user=None,
     process_uid=None,
+    process_environment=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
+    process_environment = process_environment or _process_environment
     # Validate the complete discovered fleet before the first mutation.
     # In particular, do not retire a healthy legacy fleet and then learn that
     # a configured/live template lane is masked or fail-open.
     for unit in units:
         verify_unit_configuration(systemd, unit)
-    original = snapshot(systemd, (*units, *LEGACY_WORKER_UNITS))
     try:
-        retire_legacy_units(systemd)
         agent_uid = uid_for_user(agent_user)
         privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
-        for unit in units:
+        # Prove one canary before retiring the incumbent fleet. This keeps
+        # capacity available while the new generation establishes readiness.
+        for index, unit in enumerate(units):
             systemd.run("enable", unit)
             # A blocking stop is the drain barrier. TimeoutStopSec remains
             # longer than the maximum job, so PID 1 waits before lane advance.
@@ -393,25 +574,19 @@ def rollout(
                 privileged_uids=privileged_uids,
                 uid_for_user=uid_for_user,
                 process_uid=process_uid,
+                process_environment=process_environment,
             )
+            if index == 0:
+                retire_legacy_units(systemd)
     except BaseException:
-        # Never reactivate a lane while its effective configuration is known
-        # to be fail-open.  The outer installation WAL restores the previous
-        # file generation; until that recovery completes, draining every
-        # template lane is safer than resurrecting the snapshot with a masked
-        # or overridden isolation drop-in.
-        unsafe_configuration = False
-        for unit in units:
-            try:
-                verify_unit_configuration(systemd, unit)
-            except RolloutError:
-                unsafe_configuration = True
-        if unsafe_configuration:
-            for unit in units:
-                systemd.run("stop", unit, check=False)
-                systemd.run("disable", unit, check=False)
-        else:
-            restore(systemd, original)
+        # Never restart from a service snapshot while the failed file
+        # generation is still installed. The outer write-ahead transaction
+        # first restores the exact prior files and only then restores the
+        # attempt snapshot. Until that ordered recovery, every touched worker
+        # stays fail-closed.
+        for unit in (*units, *LEGACY_WORKER_UNITS):
+            systemd.run("stop", unit, check=False)
+            systemd.run("disable", unit, check=False)
         raise
 
 
@@ -434,6 +609,8 @@ def main() -> int:
         restore(systemd, json.loads(args.state.read_text(encoding="utf-8")))
         return 0
     units = discover_units(systemd, args.lanes)
+    if args.action in {"rollout", "verify"}:
+        verify_immutable_release()
     if args.action == "snapshot":
         if args.state is None:
             parser.error("snapshot requires --state")

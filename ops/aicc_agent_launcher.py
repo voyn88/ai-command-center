@@ -567,7 +567,9 @@ def _parse_git_index_payload(data: bytes, workspace: Path) -> frozenset[Path]:
     return frozenset(executable)
 
 
-def _tracked_executables(workspace: Path) -> frozenset[Path]:
+def _tracked_executables(
+    workspace: Path, workspace_fd: int | None = None
+) -> frozenset[Path]:
     """Safely parse executable bits without invoking Git as root.
 
     The index is agent-controlled input. Running even a read-only Git command
@@ -583,7 +585,11 @@ def _tracked_executables(workspace: Path) -> frozenset[Path]:
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
     try:
-        workspace_descriptor = os.open(workspace, directory_flags)
+        workspace_descriptor = (
+            os.dup(workspace_fd)
+            if workspace_fd is not None
+            else os.open(workspace, directory_flags)
+        )
     except OSError as exc:
         raise LaunchRefused("task workspace is not a stable real directory") from exc
     try:
@@ -661,7 +667,9 @@ def _tracked_executables(workspace: Path) -> frozenset[Path]:
     raise LaunchRefused("task-local Git index checksum or format is ambiguous")
 
 
-def _prepare_workspace_permissions(workspace: Path) -> None:
+def _prepare_workspace_permissions(
+    workspace: Path, pinned_workspace_fd: int | None = None
+) -> None:
     """Grant only the shared workspace group, never a publisher credential group.
 
     Each agent unit sees only its exact bind mount, so membership in
@@ -673,14 +681,22 @@ def _prepare_workspace_permissions(workspace: Path) -> None:
         workspace_gid = grp.getgrnam("aicc-workspace").gr_gid
     except KeyError as exc:
         raise LaunchRefused("aicc-workspace group does not exist") from exc
-    executable = _tracked_executables(workspace)
+    executable = (
+        _tracked_executables(workspace, pinned_workspace_fd)
+        if pinned_workspace_fd is not None
+        else _tracked_executables(workspace)
+    )
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     file_flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
         file_flags |= os.O_NOFOLLOW
     try:
-        workspace_fd = os.open(workspace, directory_flags)
+        workspace_fd = (
+            os.dup(pinned_workspace_fd)
+            if pinned_workspace_fd is not None
+            else os.open(workspace, directory_flags)
+        )
     except OSError as exc:
         raise LaunchRefused("cannot open task workspace safely") from exc
     owner_uid = os.fstat(workspace_fd).st_uid
@@ -825,6 +841,7 @@ def _systemd_command(
     unit: str,
     broker_unit: str,
     workspace_root: Path,
+    workspace_source: Path | None = None,
 ) -> list[str]:
     executor = manifest["executor"]
     timeout = int(manifest["timeout_seconds"])
@@ -886,7 +903,7 @@ def _systemd_command(
         f"--property=RuntimeMaxSec={timeout + 30}",
         "--property=TimeoutStopSec=20",
         f"--property=InaccessiblePaths={inaccessible_paths}",
-        f"--property=BindPaths={workspace}:/workspace",
+        f"--property=BindPaths={workspace_source or workspace}:/workspace",
         f"--property=BindPaths={agent_home}:/agent-home",
         "--property=ReadWritePaths=/workspace /agent-home",
     ]
@@ -1028,7 +1045,24 @@ def _quarantine_workspace(workspace: Path, run_id: str) -> Path:
         marker.write_text(str(workspace), encoding="utf-8")
         marker.chmod(0o600)
         workspace.chmod(0o000)
-        return workspace
+    return workspace
+
+
+def _open_pinned_workspace(workspace: Path) -> int:
+    """Pin the validated directory inode until PID 1 consumes the bind source."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        before = workspace.stat(follow_symlinks=False)
+        descriptor = os.open(workspace, flags)
+        current = os.fstat(descriptor)
+    except OSError as exc:
+        raise LaunchRefused("task workspace changed before pinning") from exc
+    if (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
+        os.close(descriptor)
+        raise LaunchRefused("task workspace was replaced before pinning")
+    return descriptor
 
 
 def _workspace_is_quarantined(workspace: Path) -> bool:
@@ -1213,12 +1247,17 @@ def _seal_previous_workspace_agent(workspace: Path) -> None:
     _clear_active_workspace_unit(workspace, previous)
 
 
-def _prepare_reusable_workspace(workspace: Path) -> None:
+def _prepare_reusable_workspace(
+    workspace: Path, workspace_fd: int | None = None
+) -> None:
     # Never recurse over/chmod a workspace while a prior agent could still be
     # mutating it. The durable active-unit record survives a broker SIGKILL;
     # BindsTo normally kills that cgroup, and this check proves the result.
     _seal_previous_workspace_agent(workspace)
-    _prepare_workspace_permissions(workspace)
+    if workspace_fd is None:
+        _prepare_workspace_permissions(workspace)
+    else:
+        _prepare_workspace_permissions(workspace, workspace_fd)
 
 
 def _serve_connected_socket(sock: socket.socket) -> int:
@@ -1226,6 +1265,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
     unit: str | None = None
     workspace: Path | None = None
     workspace_lock: int | None = None
+    workspace_fd: int | None = None
     unit_recorded = False
     try:
         peer = _peer_uid(sock)
@@ -1234,10 +1274,11 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         manifest = _load_manifest(_readline_limited(sock.makefile("rb", buffering=0)))
         workspace_roots = _workspace_roots()
         workspace = _validated_workspace(manifest["workspace"], workspace_roots)
+        workspace_fd = _open_pinned_workspace(workspace)
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         workspace_lock = _open_workspace_lock(workspace)
-        _prepare_reusable_workspace(workspace)
+        _prepare_reusable_workspace(workspace, workspace_fd)
         _validate_binary(EXECUTOR_BINARIES[manifest["executor"]])
         agent_home = _prepare_agent_home(manifest["executor"], manifest["run_id"])
         unit = f"aicc-agent-{manifest['run_id']}-{os.getpid()}.service"
@@ -1250,6 +1291,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             unit,
             _current_broker_unit(),
             workspace_roots[0],
+            Path(f"/proc/{os.getpid()}/fd/{workspace_fd}"),
         )
         proc = subprocess.Popen(
             command,
@@ -1337,6 +1379,8 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             shutil.rmtree(agent_home, ignore_errors=True)
         if workspace_lock is not None:
             os.close(workspace_lock)
+        if workspace_fd is not None:
+            os.close(workspace_fd)
     try:
         sock.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
     except OSError:

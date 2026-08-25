@@ -27,14 +27,42 @@ class FakeSystemd:
                 "FragmentPath": "/etc/systemd/system/voyn-aicc-worker@.service",
                 "DropInPaths": "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf",
                 "Environment": "AICC_AGENT_PRINCIPAL_ISOLATION=required",
-                "ExecStart": "/opt/aicc/.venv/bin/python -m command_center.worker",
+                "EnvironmentFiles": (
+                    "/etc/aicc/lease.env (ignore_errors=no) "
+                    "/var/lib/voyn-aicc-credential-rotation/worker.env (ignore_errors=no) "
+                    "/etc/aicc/executors.env (ignore_errors=yes) "
+                    f"/etc/aicc/worker-{unit.removeprefix('voyn-aicc-worker@').removesuffix('.service')}.env (ignore_errors=yes) "
+                    "/etc/aicc/workspace-authority.env (ignore_errors=no)"
+                ),
+                "ExecStart": (
+                    "/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required "
+                    "/opt/aicc/current/.venv/bin/python -m command_center.worker"
+                ),
                 "ActiveState": "active",
                 "SubState": "running",
                 "NoNewPrivileges": "yes",
-                "ProtectHome": "read-only",
+                "ProtectSystem": "strict",
+                "ProtectHome": "yes",
                 "ProtectControlGroups": "yes",
+                "PrivateTmp": "yes",
+                "PrivateDevices": "yes",
+                "ProtectProc": "invisible",
+                "ProcSubset": "pid",
+                "UMask": "0077",
                 "SupplementaryGroups": "aicc-workspace aicc-publisher",
                 "User": "aicc-worker",
+                "Group": "aicc-worker",
+                "WorkingDirectory": "/opt/aicc/current",
+                "ProtectKernelTunables": "yes",
+                "ProtectKernelModules": "yes",
+                "ProtectKernelLogs": "yes",
+                "ProtectClock": "yes",
+                "ProtectHostname": "yes",
+                "RestrictSUIDSGID": "yes",
+                "LockPersonality": "yes",
+                "KeyringMode": "private",
+                "CapabilityBoundingSet": "",
+                "AmbientCapabilities": "",
                 "MainPID": str(2000 + index),
             }
             for index, unit in enumerate(units)
@@ -43,7 +71,11 @@ class FakeSystemd:
         # disabled before template start); a strict fake must declare them
         # with the full key set instead of silently no-opping mutations on
         # unknown names (review on fd5de6b). Retired state: not running.
-        for legacy in ("voyn-aicc-worker.service", "voyn-aicc-worker-2.service"):
+        for legacy in (
+            "voyn-aicc-worker.service",
+            "voyn-aicc-worker-2.service",
+            "aicc-worker.service",
+        ):
             self.states.setdefault(
                 legacy,
                 {
@@ -167,6 +199,7 @@ def test_snapshot_and_restore_tolerate_unit_absent_on_clean_host():
         "exists": False,
         "enabled": False,
         "active": False,
+        "properties": {},
     }
     module.restore(systemd, state)
     assert ("stop", unit) in systemd.calls
@@ -193,6 +226,22 @@ def test_absent_baseline_unit_restore_fails_if_unit_remains_active():
         module.restore(systemd, state)
 
 
+def test_versioned_restore_refuses_property_drift_before_restart():
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    state = module.snapshot(systemd, (unit,))
+    systemd.states[unit]["DropInPaths"] = ""
+    systemd.states[unit]["ActiveState"] = "inactive"
+    systemd.states[unit]["MainPID"] = "0"
+    systemd.calls.clear()
+
+    with pytest.raises(module.RolloutError, match="unsafe snapshot restart"):
+        module.restore(systemd, state)
+
+    assert ("start", unit) not in systemd.calls
+
+
 def test_staged_rollout_drains_and_proves_each_lane_before_next():
     module = _module()
     units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
@@ -205,17 +254,19 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
         privileged_users=("root", "voynadmin"),
         uid_for_user=_uid,
         process_uid=lambda pid: 1002,
+        process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
     )
 
     mutations = [
         call for call in systemd.calls if call[0] in {"enable", "stop", "start"}
     ]
     assert mutations == [
-        ("stop", "voyn-aicc-worker.service"),
-        ("stop", "voyn-aicc-worker-2.service"),
         ("enable", units[0]),
         ("stop", units[0]),
         ("start", units[0]),
+        ("stop", "voyn-aicc-worker.service"),
+        ("stop", "voyn-aicc-worker-2.service"),
+        ("stop", "aicc-worker.service"),
         ("enable", units[1]),
         ("stop", units[1]),
         ("start", units[1]),
@@ -227,8 +278,9 @@ def test_verifier_accepts_real_systemctl_execstart_serialization():
     unit = "voyn-aicc-worker@1.service"
     systemd = FakeSystemd((unit,))
     systemd.states[unit]["ExecStart"] = (
-        "{ path=/opt/aicc/.venv/bin/python ; "
-        "argv[]=/opt/aicc/.venv/bin/python -m command_center.worker ; "
+        "{ path=/usr/bin/env ; "
+        "argv[]=/usr/bin/env AICC_AGENT_PRINCIPAL_ISOLATION=required "
+        "/opt/aicc/current/.venv/bin/python -m command_center.worker ; "
         "ignore_errors=no ; pid=321 ; code=(null) ; status=0/0 }"
     )
 
@@ -270,6 +322,9 @@ def test_rollout_refuses_fail_open_lane_before_first_mutation(change, message):
             privileged_users=("root", "voynadmin"),
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
         )
 
     assert not any(
@@ -297,6 +352,9 @@ def test_rollout_revalidates_configuration_after_drain_before_start():
             privileged_users=("root", "voynadmin"),
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
         )
 
     assert ("start", unit) not in systemd.calls
@@ -330,10 +388,13 @@ def test_rollout_refuses_to_start_template_lane_while_legacy_pid_survives():
             privileged_users=("root", "voynadmin"),
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
         )
-    # Snapshot rollback may restore an originally active template unit, but
-    # the forward drain/start sequence must not begin.
-    assert ("stop", unit) not in systemd.calls
+    # The new lane is deliberately proven as a canary before legacy drain.
+    assert ("start", unit) in systemd.calls
+    assert ("stop", "voyn-aicc-worker.service") in systemd.calls
 
 
 @pytest.mark.parametrize(
@@ -357,6 +418,9 @@ def test_verifier_rejects_stopped_stale_or_uid_aliased_unit(change, message):
             privileged_uids=frozenset({0, 1000}),
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
         )
 
 
@@ -376,6 +440,27 @@ def test_verifier_rejects_named_privileged_alias_of_agent_uid():
             privileged_users=("root", "voynadmin"),
             uid_for_user=aliased_uid,
             process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
+        )
+
+
+def test_verifier_rejects_environment_file_override_in_live_mainpid():
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    with pytest.raises(module.RolloutError, match="MainPID principal-isolation"):
+        module.verify_unit(
+            systemd,
+            unit,
+            agent_uid=1001,
+            privileged_uids=frozenset({0, 1000}),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=optional",
+            ),
         )
 
 
@@ -399,11 +484,12 @@ def test_rollout_failure_restores_all_lane_states():
             privileged_users=("root", "voynadmin"),
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
         )
-    # Lane units are restored to their pre-rollout snapshot; the legacy
-    # single-lane units were retired (disabled, inactive) BEFORE the failure
-    # and correctly stay retired -- resurrecting them on rollback would be a
-    # second incident (fake now declares them; review on fd5de6b).
+    # Failed generation remains fail-closed. The outer file transaction
+    # restores files before it restores the captured service snapshot.
     lanes = {name: state for name, state in systemd.states.items() if "@" in name}
-    assert all(state["enabled"] for state in lanes.values())
-    assert all(state["ActiveState"] == "active" for state in lanes.values())
+    assert all(not state["enabled"] for state in lanes.values())
+    assert all(state["ActiveState"] == "inactive" for state in lanes.values())
