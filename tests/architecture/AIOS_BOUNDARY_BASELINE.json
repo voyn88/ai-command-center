@@ -87,6 +87,9 @@
     "command_center/db/audit_store.py": [
       "audit"
     ],
+    "command_center/db/legacy_migration.py": [
+      "memory"
+    ],
     "command_center/db/provenance_store.py": [
       "audit"
     ],

@@ -208,6 +208,77 @@ The client must be at least as new as the server; `pg_dump` refuses to dump a
 newer server outright. CI installs `postgresql-client-17` to match the pinned
 server image.
 
+## Legacy-state migration and rollback
+
+The cutover is three explicit commands. Run them in the timezone of the process
+that wrote the legacy timestamps (those timestamps are naive local time). Stop
+legacy writers before taking the snapshot and keep them stopped through
+`legacy-freeze`.
+
+```bash
+python -m command_center.db legacy-snapshot \
+  --data-dir data --output /var/backups/aicc/legacy-20260824T120000Z
+
+AICC_PG_USER=aicc_migrator AICC_PG_PASSWORD=... \
+python -m command_center.db legacy-import \
+  --snapshot /var/backups/aicc/legacy-20260824T120000Z \
+  --report /var/backups/aicc/legacy-20260824T120000Z-reconciliation.json
+
+# Repeat legacy-import: it must remain clean. Inspect its report, then cut over.
+python -m command_center.db legacy-freeze --data-dir data \
+  --snapshot /var/backups/aicc/legacy-20260824T120000Z \
+  --report /var/backups/aicc/legacy-20260824T120000Z-reconciliation.json
+```
+
+`legacy-import` verifies every snapshot checksum before opening a target
+transaction. It imports parents before children, preserves primary keys,
+repairs all seven identity sequences, preserves queue position, and compares
+counts, keys, converted values, relationships, and event order. A mismatch
+writes a red report and exits non-zero. Repeating it uses the same upserts and
+atomic queue replacement; it neither appends nor remints IDs.
+
+### What `legacy-freeze` retires, and what it deliberately does not
+
+PostgreSQL is authoritative for exactly two legacy stores: `data/runtime.db`
+(the 32 mirrored tables) and `data/execution_queue.json` (`queue_entry`). Only
+those are retired, and each by the mechanism that actually works on it:
+
+| Store | Retired by | Why not the other way |
+| --- | --- | --- |
+| `runtime.db` | write bits cleared, file left in place | SQLite opens the file itself, so mode 440 is a real refusal. Moving it aside would let the app create a fresh empty v2 store — a *new* writable authority, which is worse than a stale one. |
+| `execution_queue.json` | renamed to `execution_queue.json.retired`, write bits cleared | Clearing write bits alone does nothing: `save_queue` goes through `storage.atomic_write_json`, which `os.replace`s a temp file over the target. POSIX checks the directory for that rename, never the target's mode. |
+
+Every other file in `data/` — `activity.jsonl`, `tasks.json`, `chats.json`,
+`project_config.json`, the v1.2 `runs.jsonl` journal `runs_read` still merges —
+has no table in this schema and is still the live authority for a feature
+PostgreSQL does not yet cover. Freezing those would not finish a migration, it
+would break them: `storage.append_jsonl` opens for append and *does* honour the
+mode bit. They are archived and checksummed for rollback, left writable, and
+listed under `retained_writable` in the marker so the gate states it rather
+than hiding it.
+
+Because a rename cannot stop a legacy process nobody stopped, retirement is a
+standing property rather than a one-time event:
+
+```bash
+python -m command_center.db legacy-verify --data-dir data
+```
+
+This re-reads `data/.legacy-authority-retired.json` and refuses if a retired
+store became writable again, drifted from the snapshot, or — the case mode bits
+can never prevent — if `execution_queue.json` reappeared, which means a legacy
+writer is still running. Run it after cutover and from monitoring.
+
+The snapshot is the rollback. Its files and manifest are read-only, and legacy
+JSON/JSONL files without a PostgreSQL row mapping are checksummed into it too,
+so the archive is a complete `data/` and not just the migrated part.
+`legacy-freeze` refuses a report made from another snapshot, and re-running it
+is idempotent. To roll back before PostgreSQL-native writes begin, stop the
+service, copy the archived files back into `data/`, restore their owner write
+bit, move `execution_queue.json.retired` back to `execution_queue.json`, and
+start the legacy deployment. Never point a running deployment at the snapshot
+itself.
+
 ## Running the tests
 
 `tests/db` skips itself unless a server is provided:

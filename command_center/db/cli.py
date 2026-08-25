@@ -35,6 +35,29 @@ def build_parser() -> argparse.ArgumentParser:
         "upgrade",
         help="Apply pending migrations and re-assert table grants (as the migrator).",
     )
+    snapshot = sub.add_parser(
+        "legacy-snapshot",
+        help="Create a checksummed, read-only legacy rollback snapshot.",
+    )
+    snapshot.add_argument("--data-dir", default="data")
+    snapshot.add_argument("--output", required=True)
+    legacy_import = sub.add_parser(
+        "legacy-import",
+        help="Deterministically import a verified snapshot and reconcile it.",
+    )
+    legacy_import.add_argument("--snapshot", required=True)
+    legacy_import.add_argument("--report", required=True)
+    freeze = sub.add_parser(
+        "legacy-freeze", help="Retire legacy writable authority after a clean import."
+    )
+    freeze.add_argument("--data-dir", default="data")
+    freeze.add_argument("--snapshot", required=True)
+    freeze.add_argument("--report", required=True)
+    verify = sub.add_parser(
+        "legacy-verify",
+        help="Re-check that no retired legacy store became writable again.",
+    )
+    verify.add_argument("--data-dir", default="data")
 
     # The queue's recovery surface (SRV-06). These run as `aicc_app` — the
     # role the SQL protocol granted queue_reap/queue_redrive/work_dlq to —
@@ -127,6 +150,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = build_parser().parse_args(argv)
 
+    # These three touch only the filesystem: the snapshot, the cutover and its
+    # re-check need no PostgreSQL connection, so they must not require one.
+    if args.command in {"legacy-snapshot", "legacy-freeze", "legacy-verify"}:
+        from pathlib import Path
+
+        from command_center.db.legacy_migration import (
+            MigrationRefused,
+            create_snapshot,
+            retire_legacy_authority,
+            verify_retirement,
+        )
+
+        # A refusal is the expected answer to an unsafe cutover, not a crash;
+        # an operator reads the reason, not a traceback.
+        try:
+            if args.command == "legacy-snapshot":
+                snapshot = create_snapshot(Path(args.data_dir), Path(args.output))
+                print(f"snapshot: {snapshot.directory}")
+                print(f"files: {len(snapshot.manifest['files'])}")
+            elif args.command == "legacy-freeze":
+                marker = retire_legacy_authority(
+                    Path(args.data_dir), Path(args.snapshot), Path(args.report)
+                )
+                print(f"legacy authority retired: {marker}")
+            else:
+                state = verify_retirement(Path(args.data_dir))
+                for entry in state["retired"]:
+                    print(f"retired: {entry['file']} ({entry['how']})")
+                for name in state["retained_writable"]:
+                    print(f"retained (no PostgreSQL mapping): {name}")
+        except MigrationRefused as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
     try:
         config = load_config()
     except ConfigError as exc:
@@ -156,6 +214,16 @@ def main(argv: list[str] | None = None) -> int:
                 # app" the same state.
                 count = roles.apply_table_grants(conn)
                 print(f"re-asserted {count} table grants")
+                return 0
+
+            if args.command == "legacy-import":
+                from pathlib import Path
+
+                from command_center.db.legacy_migration import migrate
+
+                report = migrate(Path(args.snapshot), conn, Path(args.report))
+                print(f"reconciliation: clean ({len(report['tables'])} tables)")
+                print(f"report: {args.report}")
                 return 0
 
             if args.command == "queue-reap":

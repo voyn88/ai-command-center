@@ -183,6 +183,17 @@ section below for why it exists at all):
   frozen runner (`agent_runner.run_claude_code`) unchanged — sandbox
   profiles, credential scrubbing and timeouts stay the legacy engine's
   decisions; the bridge owns only payload validation and outcome folding.
+- **Legacy-state migration (SRV lane)** —
+  `command_center/db/legacy_migration.py` (VOYN-W0-AICC-SRV-07). Classified
+  `memory` because it imports `sqlite3`, which it must: it is the one-way
+  cutover that *reads* the frozen SQLite/JSON authority, imports it into the
+  accepted PostgreSQL schema, reconciles the two, and then retires the legacy
+  copies. It owns no persistence of its own — it opens the legacy database
+  read-only (`mode=ro`), writes through the existing mirrors, and its only
+  durable outputs are a checksummed rollback snapshot and a reconciliation
+  report. This is the *shrink* direction the procedure below calls the desired
+  one: it exists to end the frozen stores' authority, and it retires with them
+  once no deployment needs a cutover.
   `command_center/db/work_queue_read.py` (status reads over the public
   views) and `command_center/webapi/queue_routes.py`
   (VOYN-W0-APP-CONTROL-S1) are the HTTP presentation of the same authority —
