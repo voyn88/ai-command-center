@@ -16,9 +16,12 @@ User=aicc-worker
 Group=aicc-worker
 WorkingDirectory=/opt/aicc
 LoadCredential=voyn_lease_pgpass:/etc/voyn/secrets/voyn_lease_pgpass
-RuntimeDirectory=voyn-aicc-worker-%i
+# All lane credentials live below one stable tree.  This is both scalable for
+# arbitrary lane counts and lets transient agents mask the authority root once
+# instead of maintaining an unsafe per-lane path list.
+RuntimeDirectory=voyn-aicc-worker/%i
 RuntimeDirectoryMode=0750
-Environment=PGPASSFILE=/run/voyn-aicc-worker-%i/pgpass
+Environment=PGPASSFILE=/run/voyn-aicc-worker/%i/pgpass
 Environment=AICC_WORKER_ENV_FILE=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=/etc/aicc/lease.env
 EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env
@@ -28,7 +31,7 @@ UnsetEnvironment=ANTHROPIC_API_KEY
 # ADR-0010 invariant: the worker neither receives sudo nor selects a
 # privileged command (review finding on 6218a21).
 NoNewPrivileges=yes
-ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker-%i/pgpass
+ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker/%i/pgpass
 ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
 ExecReload=/bin/kill -HUP $MAINPID
 

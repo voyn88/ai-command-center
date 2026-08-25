@@ -10,6 +10,7 @@ repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 secret_manifest=/etc/aicc/publisher-secret-paths
 worker_template=/etc/systemd/system/voyn-aicc-worker@.service
 worker_dropin=/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
+principal_inaccessible_paths="/etc/aicc /etc/voyn /home /root /var/lib/aicc-worker /var/lib/aicc-agent /var/lib/voyn-aicc-credential-rotation /run/aicc-agent-launcher /run/credentials /run/voyn-aicc-worker /srv/aicc-quarantine"
 
 fail() {
   echo "AICC_AGENT_PRINCIPAL_BOUNDARY_FAIL: $*" >&2
@@ -29,6 +30,14 @@ if id -nG aicc-agent | tr ' ' '\n' | grep -qx aicc-publisher; then
 fi
 id -nG voynadmin | tr ' ' '\n' | grep -qx aicc-publisher || \
   fail "publisher lacks launcher access group"
+auth_members=$(getent group aicc-agent-auth | cut -d: -f4) || \
+  fail "aicc-agent-auth group is missing"
+[ -z "$auth_members" ] || fail "model-auth group has static members"
+for static_principal in aicc-agent aicc-worker voynadmin; do
+  if id -nG "$static_principal" | tr ' ' '\n' | grep -qx aicc-agent-auth; then
+    fail "$static_principal is a static member of model-auth group"
+  fi
+done
 
 systemctl is-active --quiet aicc-agent-launcher.socket || \
   fail "launcher socket is not active"
@@ -100,10 +109,11 @@ cleanup_canary() {
 trap cleanup_canary EXIT HUP INT TERM
 systemd-run --quiet --wait --pipe --collect \
   --property=DynamicUser=yes \
-  --property=SupplementaryGroups=aicc-workspace \
+  --property=SupplementaryGroups=aicc-workspace\ aicc-agent-auth \
+  --setenv=AICC_AGENT_PRINCIPAL_ISOLATION=required \
   --property=NoNewPrivileges=yes \
   --property=ProtectSystem=strict \
-  --property="InaccessiblePaths=/srv/aicc-workspaces" \
+  --property="InaccessiblePaths=$principal_inaccessible_paths /srv/aicc-workspaces" \
   --property="BindPaths=$canary_workspace:/workspace" \
   -- /bin/sh -c \
   'test -r /workspace/visible && ! test -r /srv/aicc-workspaces/.principal-boundary.*/sibling/must-not-read' || \
@@ -117,27 +127,46 @@ trap - EXIT HUP INT TERM
 # accepted as evidence.
 principal_unit_a="aicc-principal-canary-a-$$.service"
 principal_unit_b="aicc-principal-canary-b-$$.service"
+principal_secret=$(mktemp /etc/aicc/.principal-boundary-secret.XXXXXX)
+chown root:aicc-agent-auth "$principal_secret"
+chmod 0640 "$principal_secret"
 cleanup_principal_units() {
   systemctl stop "$principal_unit_a" "$principal_unit_b" >/dev/null 2>&1 || true
   systemctl reset-failed "$principal_unit_a" "$principal_unit_b" >/dev/null 2>&1 || true
+  rm -f -- "$principal_secret"
 }
 trap cleanup_principal_units EXIT HUP INT TERM
 for principal_unit in "$principal_unit_a" "$principal_unit_b"; do
   systemd-run --quiet --unit="$principal_unit" \
     --property=DynamicUser=yes \
+    --property=SupplementaryGroups=aicc-workspace\ aicc-agent-auth \
+    --setenv=AICC_AGENT_PRINCIPAL_ISOLATION=required \
+    --property="InaccessiblePaths=$principal_inaccessible_paths" \
     --property=ProtectProc=invisible \
     --property=ProcSubset=pid \
     --property=NoNewPrivileges=yes \
     --property=CapabilityBoundingSet= \
-    -- /bin/sleep 30 || fail "cannot start dynamic-principal canary"
+    -- /bin/sh -c "test ! -r '$principal_secret' && sleep 30" || \
+    fail "cannot start sealed dynamic-principal canary"
 done
-# The fail-closed flag travels only via a drop-in; a host where the drop-in
-# is absent, reverted, or masked silently starts WITHOUT isolation. Prove the
-# flag reached systemd for every worker unit family (review on fd5de6b).
-for isolated_unit in aicc-worker.service "$principal_unit_a" "$principal_unit_b"; do
-  systemctl show "$isolated_unit" --property=Environment --value \
-      | tr ' ' '\n' | grep -qx 'AICC_AGENT_PRINCIPAL_ISOLATION=required' \
-    || fail "isolation flag did not reach $isolated_unit"
+# Prove the exact effective transient executor identity and model-auth group,
+# not merely the command text used to request them. The Python fleet verifier
+# below separately applies the same fail-closed check to every discovered
+# worker lane before rollout and after each start.
+for isolated_unit in "$principal_unit_a" "$principal_unit_b"; do
+  [ "$(systemctl show "$isolated_unit" --property=DynamicUser --value)" = yes ] || \
+    fail "transient executor is not DynamicUser: $isolated_unit"
+  unit_groups=$(systemctl show "$isolated_unit" --property=SupplementaryGroups --value)
+  printf '%s\n' "$unit_groups" | tr ' ' '\n' | grep -qx aicc-agent-auth || \
+    fail "transient executor lacks model-auth group: $isolated_unit"
+  if printf '%s\n' "$unit_groups" | tr ' ' '\n' | grep -qx aicc-publisher; then
+    fail "transient executor inherited publisher group: $isolated_unit"
+  fi
+  unit_environment=$(systemctl show "$isolated_unit" --property=Environment --value)
+  isolation_values=$(printf '%s\n' "$unit_environment" | tr ' ' '\n' | \
+    grep '^AICC_AGENT_PRINCIPAL_ISOLATION=' || true)
+  [ "$isolation_values" = 'AICC_AGENT_PRINCIPAL_ISOLATION=required' ] || \
+    fail "isolation flag did not reach $isolated_unit exactly"
 done
 
 principal_pid_a=$(systemctl show "$principal_unit_a" --property=MainPID --value)

@@ -41,6 +41,8 @@ from pathlib import Path
 
 from command_center.worker import lease_client
 
+_PR_VIEW_DECODE_ERRORS = (TypeError, ValueError)
+
 __all__ = ["PublishConfig", "PublishResult", "publish_run"]
 
 
@@ -86,7 +88,9 @@ class PublishResult:
     reason: str = ""
 
 
-def _run(argv: list[str], cwd: Path, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    argv: list[str], cwd: Path, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     import os
 
     env = dict(os.environ)
@@ -103,8 +107,11 @@ def _lease_argv(cfg: PublishConfig, verb: str, repo_path: Path) -> list[str]:
     # lease held across the whole provision->agent->tests->publish
     # lifecycle, not just this push) can never drift apart.
     identity = lease_client.LeaseIdentity(
-        lease_tool=cfg.lease_tool, repository=cfg.repository,
-        owner=cfg.owner, session=cfg.session, task=cfg.task,
+        lease_tool=cfg.lease_tool,
+        repository=cfg.repository,
+        owner=cfg.owner,
+        session=cfg.session,
+        task=cfg.task,
         ttl=cfg.ttl,
     )
     return lease_client.lease_argv(identity, verb, repo_path)
@@ -128,7 +135,7 @@ def _https_push_target(repo_path: Path) -> str | None:
     url = remote.stdout.strip()
     prefix = "git@github.com:"
     if url.startswith(prefix):
-        return "https://github.com/" + url[len(prefix):]
+        return "https://github.com/" + url[len(prefix) :]
     if url.startswith("https://github.com/"):
         return url
     return None
@@ -147,9 +154,7 @@ def _remote_branch_sha(
     writer racing us.  Any malformed or ambiguous answer fails closed.
     """
     ref = f"refs/heads/{branch}"
-    remote = _run(
-        ["git", "ls-remote", "--heads", target, ref], repo_path, env_extra
-    )
+    remote = _run(["git", "ls-remote", "--heads", target, ref], repo_path, env_extra)
     if remote.returncode != 0:
         return False, ""
     lines = [line.split() for line in remote.stdout.splitlines() if line.strip()]
@@ -179,7 +184,7 @@ def _pr_snapshot(repo_path: Path, reference: str) -> tuple[int, dict[str, str] |
         return result.returncode, None
     try:
         value = json.loads(result.stdout)
-    except (TypeError, ValueError):
+    except _PR_VIEW_DECODE_ERRORS:
         return 0, None
     return 0, value if isinstance(value, dict) else None
 
@@ -227,7 +232,10 @@ def _verified_pr_result(
         pr_reference = created.stdout.strip()
         if not pr_reference:
             return PublishResult(
-                ok=False, branch=branch, head_sha=head_sha, reason="pr_create_missing_url"
+                ok=False,
+                branch=branch,
+                head_sha=head_sha,
+                reason="pr_create_missing_url",
             )
         view_status, snapshot = _pr_snapshot(repo_path, pr_reference)
         if view_status != 0:
@@ -283,19 +291,27 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
 
     status = _run(["git", "status", "--porcelain"], repo_path)
     if status.returncode != 0:
-        return PublishResult(ok=False, reason="cannot_read_worktree_status", head_sha=head_sha)
+        return PublishResult(
+            ok=False, reason="cannot_read_worktree_status", head_sha=head_sha
+        )
     if status.stdout.strip():
         return PublishResult(ok=False, reason="uncommitted_changes", head_sha=head_sha)
 
     if cfg.base_sha is not None:
         base_sha_value = cfg.base_sha
-        base_present = _run(["git", "cat-file", "-e", f"{base_sha_value}^{{commit}}"], repo_path)
+        base_present = _run(
+            ["git", "cat-file", "-e", f"{base_sha_value}^{{commit}}"], repo_path
+        )
         if base_present.returncode != 0:
-            return PublishResult(ok=False, reason="pinned_base_sha_missing", head_sha=head_sha)
+            return PublishResult(
+                ok=False, reason="pinned_base_sha_missing", head_sha=head_sha
+            )
     else:
         base_sha = _run(["git", "rev-parse", f"origin/{cfg.base}"], repo_path)
         if base_sha.returncode != 0:
-            return PublishResult(ok=False, reason="cannot_read_base_sha", head_sha=head_sha)
+            return PublishResult(
+                ok=False, reason="cannot_read_base_sha", head_sha=head_sha
+            )
         base_sha_value = base_sha.stdout.strip()
 
     already_durable = (
@@ -310,7 +326,9 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
             ["git", "merge-base", "--is-ancestor", base_sha_value, head_sha], repo_path
         )
         if ancestry.returncode != 0:
-            return PublishResult(ok=False, reason="head_not_descendant_of_pinned_base", head_sha=head_sha)
+            return PublishResult(
+                ok=False, reason="head_not_descendant_of_pinned_base", head_sha=head_sha
+            )
 
     branch = f"backlog/{cfg.task}"
     if already_durable:
@@ -319,9 +337,7 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         if durable_target is None:
             durable_target = "origin"
             durable_env = {
-                "GIT_SSH_COMMAND": (
-                    f"ssh -i {cfg.deploy_key} -o IdentitiesOnly=yes"
-                )
+                "GIT_SSH_COMMAND": (f"ssh -i {cfg.deploy_key} -o IdentitiesOnly=yes")
             }
         durable, durable_sha = _remote_branch_sha(
             repo_path, durable_target, branch, durable_env
@@ -334,7 +350,9 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     if lease.returncode != 0:
         # The lease is held by another writer: a data refusal, the attempt
         # returns to the pool and a later tick retries — never a forced push.
-        return PublishResult(ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}")
+        return PublishResult(
+            ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}"
+        )
     # Live-reproduced 2026-08-21: `install-hooks` is what writes the
     # pre-push hook's `voyn-lease.env` (repository/owner/session/task/pid/
     # process-start) -- and it had only ever been run once, at whatever
@@ -365,7 +383,9 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
             pinned_remote_sha = cfg.remote_sha or ""
             https_target = _https_push_target(repo_path)
             if https_target is not None:
-                observed, observed_sha = _remote_branch_sha(repo_path, https_target, branch)
+                observed, observed_sha = _remote_branch_sha(
+                    repo_path, https_target, branch
+                )
                 if not observed:
                     return PublishResult(
                         ok=False, reason="cannot_read_remote_branch_for_force_lease"
@@ -379,8 +399,13 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
                     pinned_remote_sha if cfg.remote_sha_known else observed_sha
                 )
                 push = _run(
-                    ["git", "push", f"--force-with-lease={branch_ref}:{expected_remote_sha}",
-                     https_target, f"HEAD:{branch_ref}"],
+                    [
+                        "git",
+                        "push",
+                        f"--force-with-lease={branch_ref}:{expected_remote_sha}",
+                        https_target,
+                        f"HEAD:{branch_ref}",
+                    ],
                     repo_path,
                 )
                 durable_target = https_target
@@ -419,7 +444,9 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
                 durable_target = "origin"
                 durable_env = ssh_env
         if push is not None and push.returncode != 0:
-            return PublishResult(ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}")
+            return PublishResult(
+                ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}"
+            )
         if push is not None:
             durable, durable_sha = _remote_branch_sha(
                 repo_path, durable_target, branch, durable_env

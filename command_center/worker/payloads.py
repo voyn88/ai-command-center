@@ -146,9 +146,7 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         cascade.append(dict(link))
 
     backlog_task_id = _string(payload, "backlog_task_id")
-    if backlog_task_id is not None and not _BACKLOG_TASK_ID.fullmatch(
-        backlog_task_id
-    ):
+    if backlog_task_id is not None and not _BACKLOG_TASK_ID.fullmatch(backlog_task_id):
         return PayloadError(
             reason=("backlog_task_id must use the canonical VOYN-... identifier format")
         )

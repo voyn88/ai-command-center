@@ -8,6 +8,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,8 @@ WORKER_TEMPLATE = Path("/etc/systemd/system/voyn-aicc-worker@.service")
 WORKER_DROPIN = Path(
     "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf"
 )
+EXPECTED_WORKER_EXECSTART = "/opt/aicc/.venv/bin/python -m command_center.worker"
+REQUIRED_ISOLATION_ENVIRONMENT = "AICC_AGENT_PRINCIPAL_ISOLATION=required"
 
 
 class RolloutError(RuntimeError):
@@ -222,6 +225,68 @@ def _process_uid(pid: int) -> int:
     raise RolloutError(f"MainPID {pid} has no Uid field")
 
 
+def _systemd_words(value: str, *, unit: str, property_name: str) -> tuple[str, ...]:
+    """Parse a systemd ``show`` word list without accepting malformed quoting."""
+    try:
+        return tuple(shlex.split(value))
+    except ValueError as exc:
+        raise RolloutError(f"{unit} {property_name} is malformed") from exc
+
+
+def _execstart_argv(value: str, *, unit: str) -> str:
+    """Extract the effective argv from ``systemctl show -p ExecStart`` output."""
+    if value == EXPECTED_WORKER_EXECSTART:
+        return value
+    matches = re.findall(r"(?:^|;\s*)argv\[\]=([^;]*?)(?=\s*;|$)", value)
+    if len(matches) != 1:
+        raise RolloutError(f"{unit} ExecStart is not the versioned worker command")
+    return matches[0].strip()
+
+
+def verify_unit_configuration(systemd: Systemd, unit: str) -> None:
+    """Fail closed on the exact effective worker isolation configuration.
+
+    This check is deliberately independent from liveness.  The rollout calls
+    it for *every discovered lane* before retiring or starting anything, then
+    repeats it immediately before and after each start.  A missing, masked or
+    later-overridden drop-in therefore cannot turn a rollout into a fail-open
+    worker start.
+    """
+    expected = {
+        "LoadState": "loaded",
+        "FragmentPath": str(WORKER_TEMPLATE),
+    }
+    for name, value in expected.items():
+        if systemd.property(unit, name) != value:
+            raise RolloutError(f"{unit} {name} is not {value}")
+
+    dropins = _systemd_words(
+        systemd.property(unit, "DropInPaths"),
+        unit=unit,
+        property_name="DropInPaths",
+    )
+    if dropins.count(str(WORKER_DROPIN)) != 1:
+        raise RolloutError(f"{unit} does not inherit the principal boundary")
+
+    environment = _systemd_words(
+        systemd.property(unit, "Environment"),
+        unit=unit,
+        property_name="Environment",
+    )
+    isolation_values = tuple(
+        item
+        for item in environment
+        if item.startswith("AICC_AGENT_PRINCIPAL_ISOLATION=")
+    )
+    if isolation_values != (REQUIRED_ISOLATION_ENVIRONMENT,):
+        raise RolloutError(f"{unit} effective principal-isolation flag is not required")
+
+    if _execstart_argv(systemd.property(unit, "ExecStart"), unit=unit) != (
+        EXPECTED_WORKER_EXECSTART
+    ):
+        raise RolloutError(f"{unit} ExecStart is not the versioned worker command")
+
+
 def verify_unit(
     systemd: Systemd,
     unit: str,
@@ -233,9 +298,8 @@ def verify_unit(
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
+    verify_unit_configuration(systemd, unit)
     expected = {
-        "LoadState": "loaded",
-        "FragmentPath": str(WORKER_TEMPLATE),
         "ActiveState": "active",
         "SubState": "running",
         "NoNewPrivileges": "yes",
@@ -245,8 +309,6 @@ def verify_unit(
     for name, value in expected.items():
         if systemd.property(unit, name) != value:
             raise RolloutError(f"{unit} {name} is not {value}")
-    if str(WORKER_DROPIN) not in systemd.property(unit, "DropInPaths").split():
-        raise RolloutError(f"{unit} does not inherit the principal boundary")
     groups = set(systemd.property(unit, "SupplementaryGroups").split())
     if not {"aicc-publisher", "aicc-workspace"}.issubset(groups):
         raise RolloutError(f"{unit} lacks required authority groups")
@@ -301,6 +363,11 @@ def rollout(
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
+    # Validate the complete discovered fleet before the first mutation.
+    # In particular, do not retire a healthy legacy fleet and then learn that
+    # a configured/live template lane is masked or fail-open.
+    for unit in units:
+        verify_unit_configuration(systemd, unit)
     original = snapshot(systemd, (*units, *LEGACY_WORKER_UNITS))
     try:
         retire_legacy_units(systemd)
@@ -315,6 +382,9 @@ def rollout(
                 raise RolloutError(f"{unit} did not drain to inactive")
             if systemd.property(unit, "MainPID") != "0":
                 raise RolloutError(f"{unit} retained a stale MainPID after drain")
+            # A daemon-reload or drop-in replacement may race the drain.  The
+            # final pre-start check makes that race fail closed too.
+            verify_unit_configuration(systemd, unit)
             systemd.run("start", unit)
             verify_unit(
                 systemd,
@@ -325,7 +395,23 @@ def rollout(
                 process_uid=process_uid,
             )
     except BaseException:
-        restore(systemd, original)
+        # Never reactivate a lane while its effective configuration is known
+        # to be fail-open.  The outer installation WAL restores the previous
+        # file generation; until that recovery completes, draining every
+        # template lane is safer than resurrecting the snapshot with a masked
+        # or overridden isolation drop-in.
+        unsafe_configuration = False
+        for unit in units:
+            try:
+                verify_unit_configuration(systemd, unit)
+            except RolloutError:
+                unsafe_configuration = True
+        if unsafe_configuration:
+            for unit in units:
+                systemd.run("stop", unit, check=False)
+                systemd.run("disable", unit, check=False)
+        else:
+            restore(systemd, original)
         raise
 
 

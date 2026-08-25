@@ -102,6 +102,14 @@ from pathlib import Path
 
 from command_center import models, project_config, storage
 
+# Ruff targets the product's Python 3.14 desktop runtime and would otherwise
+# apply PEP 758's optional-parentheses rewrite.  Worker/control hosts and CI
+# still execute this module on Python 3.13, so named exception tuples keep the
+# source valid on every supported delivery runtime after ``ruff format``.
+_OS_SUBPROCESS_ERRORS = (OSError, subprocess.SubprocessError)
+_JSON_ERRORS = (json.JSONDecodeError, ValueError)
+_OS_VALUE_ERRORS = (OSError, ValueError)
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = storage.resolve_data_dir(ROOT)
 RUNS_FILE = DATA_DIR / "runs.jsonl"
@@ -352,6 +360,7 @@ _VCS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "AICC_WORKSPACE_AUTHORITY_KEY",
         "AICC_PUBLISH_DEPLOY_KEY",
         "AICC_PUBLISH_OWNER",
+        "PGPASSFILE",
         "VOYN_LEASE_DSN",
         "VOYN_LEASE_TOOL",
         "VOYN_LEASE_SESSION",
@@ -368,7 +377,10 @@ def scrub_vcs_credentials(environment: dict[str, str]) -> dict[str, str]:
         key: value
         for key, value in environment.items()
         if key not in _VCS_CREDENTIAL_ENV_VARS
-        and not key.startswith(("GIT_CONFIG_", "AICC_PUBLISH_", "VOYN_LEASE_"))
+        and not key.startswith(
+            ("GIT_CONFIG_", "AICC_PG_", "AICC_PUBLISH_", "VOYN_LEASE_")
+        )
+        and not key.endswith("_DSN")
     }
     # Ignore machine/user Git config and the host gh credential store for the
     # model process.  The task clone carries only the local identity needed to
@@ -716,7 +728,7 @@ def _run_git(
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except _OS_SUBPROCESS_ERRORS:
         return None
 
 
@@ -973,7 +985,7 @@ def extract_result_text(stdout: str) -> str:
     """
     try:
         data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
+    except _JSON_ERRORS:
         return stdout
     if isinstance(data, list):
         for item in reversed(data):
@@ -1001,7 +1013,7 @@ def _parse_cli_result_payload(stdout: str) -> dict | None:
         return None
     try:
         data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
+    except _JSON_ERRORS:
         return None
     return data if isinstance(data, dict) else None
 
@@ -1157,7 +1169,7 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
     if sys.platform == "win32":
         try:
             proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-        except (OSError, ValueError):
+        except _OS_VALUE_ERRORS:
             pass
     else:
         try:
@@ -1299,6 +1311,7 @@ def run_claude_code(
             # authenticate to a remote, and the completion pipeline (not the
             # agent) owns push/merge. See scrub_vcs_credentials.
             env=launch_environment,
+            close_fds=True,
             **_popen_new_process_group_kwargs(),
         )
     except OSError as exc:
@@ -1326,7 +1339,7 @@ def run_claude_code(
     def _collect() -> None:
         try:
             out, err = proc.communicate(input=launcher_input)
-        except (OSError, ValueError):
+        except _OS_VALUE_ERRORS:
             out, err = "", ""
         collected["stdout"] = out or ""
         collected["stderr"] = err or ""

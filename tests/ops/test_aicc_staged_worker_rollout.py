@@ -26,6 +26,8 @@ class FakeSystemd:
                 "LoadState": "loaded",
                 "FragmentPath": "/etc/systemd/system/voyn-aicc-worker@.service",
                 "DropInPaths": "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf",
+                "Environment": "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "ExecStart": "/opt/aicc/.venv/bin/python -m command_center.worker",
                 "ActiveState": "active",
                 "SubState": "running",
                 "NoNewPrivileges": "yes",
@@ -218,6 +220,86 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
         ("stop", units[1]),
         ("start", units[1]),
     ]
+
+
+def test_verifier_accepts_real_systemctl_execstart_serialization():
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    systemd.states[unit]["ExecStart"] = (
+        "{ path=/opt/aicc/.venv/bin/python ; "
+        "argv[]=/opt/aicc/.venv/bin/python -m command_center.worker ; "
+        "ignore_errors=no ; pid=321 ; code=(null) ; status=0/0 }"
+    )
+
+    module.verify_unit_configuration(systemd, unit)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"LoadState": "masked"}, "LoadState"),
+        ({"DropInPaths": ""}, "principal boundary"),
+        (
+            {"Environment": "AICC_AGENT_PRINCIPAL_ISOLATION=optional"},
+            "flag is not required",
+        ),
+        (
+            {
+                "Environment": (
+                    "AICC_AGENT_PRINCIPAL_ISOLATION=required "
+                    "AICC_AGENT_PRINCIPAL_ISOLATION=optional"
+                )
+            },
+            "flag is not required",
+        ),
+        ({"ExecStart": "/bin/true"}, "ExecStart"),
+    ],
+)
+def test_rollout_refuses_fail_open_lane_before_first_mutation(change, message):
+    module = _module()
+    units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
+    systemd = FakeSystemd(units)
+    systemd.states[units[1]].update(change)
+
+    with pytest.raises(module.RolloutError, match=message):
+        module.rollout(
+            systemd,
+            units,
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+        )
+
+    assert not any(
+        call[0] in {"start", "stop", "enable", "disable"} for call in systemd.calls
+    )
+
+
+def test_rollout_revalidates_configuration_after_drain_before_start():
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+
+    class DriftAfterDrain(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            value = super().run(*args, check=check)
+            if args == ("stop", unit):
+                self.states[unit]["DropInPaths"] = ""
+            return value
+
+    systemd = DriftAfterDrain((unit,))
+    with pytest.raises(module.RolloutError, match="principal boundary"):
+        module.rollout(
+            systemd,
+            (unit,),
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+        )
+
+    assert ("start", unit) not in systemd.calls
 
 
 def test_rollout_refuses_to_start_template_lane_while_legacy_pid_survives():

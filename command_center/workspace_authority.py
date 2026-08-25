@@ -8,6 +8,7 @@ import stat
 from pathlib import Path
 
 AUTHORITY_ENV = "AICC_WORKSPACE_AUTHORITY_KEY"
+_AUTHORITY_DECODE_ERRORS = (ValueError, binascii.Error)
 
 
 def decode_workspace_authority_key(value: str | None) -> bytes | None:
@@ -21,7 +22,7 @@ def decode_workspace_authority_key(value: str | None) -> bytes | None:
             key = base64.b64decode(value.removeprefix("base64:"), validate=True)
         else:
             return None
-    except (ValueError, binascii.Error):
+    except _AUTHORITY_DECODE_ERRORS:
         return None
     return key if len(key) >= 32 else None
 

@@ -442,7 +442,7 @@ def test_prepare_refuses_to_clobber_a_pending_transaction(tmp_path):
 
 
 def test_target_rejects_or_contains_double_leading_slash(tmp_path):
-    """"//etc/x" minus one slash is still absolute and would discard root in
+    """ "//etc/x" minus one slash is still absolute and would discard root in
     the join, escaping the sandbox root entirely (review finding on d661d8f)."""
     module = _module()
     transaction = module.FileTransaction(tmp_path / "root", tmp_path / "state")

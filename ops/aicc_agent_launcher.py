@@ -117,6 +117,7 @@ PROVIDER_AGENT_ENV_KEYS = {
     "codex": frozenset({"OPENAI_API_KEY"}),
 }
 FORBIDDEN_ENV_PREFIXES = (
+    "AICC_PG_",
     "AICC_PUBLISH_",
     "AICC_WORKSPACE_AUTHORITY_",
     "VOYN_LEASE_",
@@ -125,6 +126,31 @@ FORBIDDEN_ENV_PREFIXES = (
     "GIT_",
     "SSH_",
 )
+
+# Host authority trees are denied independently of their current ownership or
+# mode.  Some credentials are intentionally group-readable by the worker or by
+# the transient model-auth group; a mode-only check would therefore regress as
+# soon as the executor joins that group.  Keep this list explicit and rooted at
+# durable authorities rather than individual filenames so rotations and new
+# credential generations remain covered automatically.
+SENSITIVE_AUTHORITY_TREES = (
+    "/etc/aicc",
+    "/etc/voyn",
+    "/home",
+    "/root",
+    "/var/lib/aicc-worker",
+    "/var/lib/aicc-agent",
+    "/var/lib/voyn-aicc-credential-rotation",
+    "/run/aicc-agent-launcher",
+    "/run/credentials",
+    "/run/voyn-aicc-worker",
+    "/srv/aicc-quarantine",
+)
+SYSTEMD_RUN_ENVIRONMENT = {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+}
 
 READ_ONLY_TOOLS = ["Read", "Grep", "Glob"]
 CLAUDE_GIT_DENIES = [
@@ -802,6 +828,9 @@ def _systemd_command(
 ) -> list[str]:
     executor = manifest["executor"]
     timeout = int(manifest["timeout_seconds"])
+    inaccessible_paths = " ".join(
+        (*SENSITIVE_AUTHORITY_TREES, str(EPHEMERAL_HOME_ROOT), str(workspace_root))
+    )
     command = [
         SYSTEMD_RUN,
         "--quiet",
@@ -856,7 +885,7 @@ def _systemd_command(
         "--property=TasksMax=512",
         f"--property=RuntimeMaxSec={timeout + 30}",
         "--property=TimeoutStopSec=20",
-        f"--property=InaccessiblePaths=/etc/aicc /var/lib/aicc-worker /var/lib/aicc-agent /run/aicc-agent-launcher {EPHEMERAL_HOME_ROOT} {workspace_root}",
+        f"--property=InaccessiblePaths={inaccessible_paths}",
         f"--property=BindPaths={workspace}:/workspace",
         f"--property=BindPaths={agent_home}:/agent-home",
         "--property=ReadWritePaths=/workspace /agent-home",
@@ -1227,6 +1256,8 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=SYSTEMD_RUN_ENVIRONMENT,
+            close_fds=True,
         )
         result: dict[str, tuple[bytes, bytes] | BaseException] = {}
 

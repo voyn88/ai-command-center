@@ -67,6 +67,9 @@ def test_manifest_has_closed_schema_and_no_command_or_environment(launcher, tmp_
         "GIT_ASKPASS",
         "SSH_AUTH_SOCK",
         "VOYN_LEASE_DSN",
+        "AICC_PG_PASSWORD",
+        "AICC_REVIEW_DSN",
+        "PGPASSFILE",
         "AICC_PUBLISH_DEPLOY_KEY",
         "AICC_WORKSPACE_AUTHORITY_KEY",
     ],
@@ -188,16 +191,33 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
     assert "--property=BindPaths=/run/aicc-agent-homes/test:/agent-home" in command
     for inaccessible in (
         "/etc/aicc",
+        "/etc/voyn",
+        "/home",
+        "/root",
         "/var/lib/aicc-worker",
         "/var/lib/aicc-agent",
+        "/var/lib/voyn-aicc-credential-rotation",
         "/run/aicc-agent-launcher",
+        "/run/credentials",
+        "/run/voyn-aicc-worker",
         "/run/aicc-agent-homes",
+        "/srv/aicc-quarantine",
         str(tmp_path.parent),
     ):
         assert inaccessible in joined
     assert "AICC_WORKSPACE_AUTHORITY_KEY" not in joined
     assert "VOYN_LEASE_DSN" not in joined
+    assert "AICC_PG_PASSWORD" not in joined
+    assert "PGPASSFILE" not in joined
     assert "GH_TOKEN" not in joined
+
+
+def test_broker_systemd_client_environment_is_closed_allowlist(launcher):
+    assert launcher.SYSTEMD_RUN_ENVIRONMENT == {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
 
 
 def test_transient_agent_requires_socket_broker_cgroup(launcher, tmp_path):
@@ -761,6 +781,8 @@ def test_deployment_definitions_pin_separate_non_login_identity():
     )
     assert "TimeoutStopSec=3660s" in worker_template
     assert "TimeoutStartSec=180s" in worker_template
+    assert "RuntimeDirectory=voyn-aicc-worker/%i" in worker_template
+    assert "PGPASSFILE=/run/voyn-aicc-worker/%i/pgpass" in worker_template
     assert "SocketUser=root" in socket_unit
     assert "SocketGroup=aicc-publisher" in socket_unit
     assert "SocketMode=0660" in socket_unit
