@@ -103,7 +103,7 @@ class WorkerDaemon:
     ) -> None:
         self._store = store
         self._handlers = dict(handlers)
-        self._config = config or WorkerConfig()
+        self._config = config if config is not None else WorkerConfig()
         self._stop = threading.Event()
         self._drain = threading.Event()
         self._drain_closed = threading.Event()

@@ -89,16 +89,37 @@ def resolve(verb: str, unit: str, lanes: tuple[str, ...]) -> list[str]:
     return VERB_ARGV[verb](unit)
 
 
+def resolve_many(verb: str, units: tuple[str, ...], lanes: tuple[str, ...]) -> list[str]:
+    """Resolve a registry-derived multi-unit reload as one systemd transaction.
+
+    Only reload is batchable: drain/restart remain deliberately single-lane,
+    and show has a single response shape. Every unit is independently checked
+    before any argv is returned, so one injected/out-of-registry name refuses
+    the whole transaction.
+    """
+    if verb != "reload" or not units:
+        raise ValueError("only a non-empty reload may address multiple units")
+    for unit in units:
+        if unit not in lanes:
+            raise ValueError(f"unit is not in the lane registry: {unit!r}")
+    if len(set(units)) != len(units):
+        raise ValueError("duplicate unit in reload transaction")
+    return ["reload", *units]
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
+    if len(argv) < 3:
         print(
-            "usage: voyn-aicc-rotation-helper {show|drain|reload|restart} <unit>",
+            "usage: voyn-aicc-rotation-helper {show|drain|reload|restart} <unit>...",
             file=sys.stderr,
         )
         return 64
     try:
         lanes = read_registry()
-        arguments = resolve(argv[1], argv[2], lanes)
+        if len(argv) == 3:
+            arguments = resolve(argv[1], argv[2], lanes)
+        else:
+            arguments = resolve_many(argv[1], tuple(argv[2:]), lanes)
     except (OSError, ValueError) as error:
         print(f"refused: {error}", file=sys.stderr)
         return 77

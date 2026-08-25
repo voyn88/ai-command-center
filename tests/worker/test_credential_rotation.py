@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import shlex
 import signal
@@ -60,6 +61,70 @@ def _environment(path: Path) -> Path:
     )
     path.chmod(0o600)
     return path
+
+
+def test_audit_retries_eintr_and_short_writes_without_truncating_jsonl(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import command_center.ops.credential_rotation as rotation_module
+
+    target = tmp_path / "audit.jsonl"
+    real_write = os.write
+    calls = [0]
+
+    def interrupted_then_short(descriptor: int, payload) -> int:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise InterruptedError
+        view = memoryview(payload)
+        return real_write(descriptor, view[: max(1, len(view) // 3)])
+
+    monkeypatch.setattr(rotation_module.os, "write", interrupted_then_short)
+    Audit(target).emit("rotation_test", lane=LANE_1)
+
+    document = json.loads(target.read_text(encoding="utf-8"))
+    assert document["schema_version"] == 1
+    assert document["event"] == "rotation_test"
+    assert document["lane"] == LANE_1
+    assert calls[0] > 2
+
+
+def test_audit_quarantines_crash_tail_and_repairs_jsonl(tmp_path: Path) -> None:
+    target = tmp_path / "audit.jsonl"
+    first = '{"schema_version":1,"event":"prior"}\n'
+    tail = b'{"schema_version":1,"event":"cut'
+    target.write_bytes(first.encode("utf-8") + tail)
+    target.chmod(0o640)
+
+    Audit(target).emit("after_restart")
+
+    documents = [json.loads(line) for line in target.read_text().splitlines()]
+    assert [record["event"] for record in documents] == [
+        "prior",
+        "rotation_audit_tail_quarantined",
+        "after_restart",
+    ]
+    repair = documents[1]
+    assert repair["discarded_bytes"] == len(tail)
+    assert repair["whole_generation"] is False
+    assert (tmp_path / "audit.jsonl.corrupt.1").read_bytes() == tail
+
+
+def test_audit_rotation_is_bounded_and_every_generation_is_complete_jsonl(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "audit.jsonl"
+    audit = Audit(target, max_bytes=64 * 1024, backups=2)
+    for sequence in range(4):
+        audit.emit("large", sequence=sequence, payload="x" * 40_000)
+
+    generations = [target, tmp_path / "audit.jsonl.1", tmp_path / "audit.jsonl.2"]
+    assert all(path.exists() for path in generations)
+    assert not (tmp_path / "audit.jsonl.3").exists()
+    for path in generations:
+        assert path.read_bytes().endswith(b"\n")
+        for line in path.read_text().splitlines():
+            assert json.loads(line)["schema_version"] == 1
 
 
 @pytest.mark.parametrize("journal_kind", ["phase", "circuit"])
@@ -137,7 +202,6 @@ def _config(tmp_path: Path, **changes) -> RotationConfig:
         tunnel_port=5433,
         worker_units=(LANE_1, LANE_2),
         prerequisite_timeout=10,
-        drain_timeout=180,
         reload_timeout=10,
         restart_timeout=3720,
         rotation_threshold_seconds=SELF_CREDENTIAL_TTL_SECONDS,
@@ -175,6 +239,11 @@ class FakeSystemd:
         if unit in self.reload_fail:
             raise RotationError("reload failed")
         self.status[unit] = "aicc-ready"
+
+    def reload_many(self, units: tuple[str, ...], timeout: float) -> None:
+        self.events.append(("reload_many", units, timeout))
+        for unit in units:
+            self.reload(unit, timeout)
 
     def restart(self, unit: str, timeout: float) -> None:
         self.events.append(("restart", unit, timeout))
@@ -249,10 +318,10 @@ def test_both_lanes_reload_new_credential_without_simultaneous_restart(
     lane 1 has passed readiness/auth."""
 
     events: list[tuple] = []
-    controller, _, authority = _controller(tmp_path, events)
+    controller, systemd, authority = _controller(tmp_path, events)
     controller.rotate()
 
-    assert ("drain", LANE_1) in events and ("drain", LANE_2) in events
+    assert not any(event[0] == "drain" for event in events)
     assert not any(event[0] == "restart" for event in events)
     lane_1_reload = events.index(("reload", LANE_1, 10))
     lane_2_reload = events.index(("reload", LANE_2, 10))
@@ -412,7 +481,6 @@ def test_canary_then_bounded_cohort_rotates_nine_lane_fleet(
     controller.config = replace(
         controller.config,
         worker_units=lanes,
-        activation_cohort_size=8,
         reload_timeout=180,
     )
 
@@ -431,7 +499,72 @@ def test_canary_then_bounded_cohort_rotates_nine_lane_fleet(
     assert not any(event[0] == "restart" for event in events)
 
 
-def test_single_lane_tail_cohort_never_uses_restart_fallback(tmp_path: Path) -> None:
+def test_singleton_hot_swap_never_closes_its_only_ready_lane(tmp_path: Path) -> None:
+    events: list[tuple] = []
+    controller, systemd, _ = _controller(tmp_path, events)
+    controller.config = replace(controller.config, worker_units=(LANE_1,))
+    systemd.status = {LANE_1: "aicc-ready"}
+
+    controller.rotate()
+
+    assert ("reload", LANE_1, 10) in events
+    assert not any(event[0] in {"drain", "restart"} for event in events)
+    assert systemd.status == {LANE_1: "aicc-ready"}
+
+
+def test_hot_budget_has_no_lane_count_ceiling() -> None:
+    config = load_config(
+        {
+            "AICC_PG_HOST": "127.0.0.1",
+            "AICC_PG_PORT": "5433",
+            "AICC_PG_DB": "aicc_preprod",
+            "AICC_PG_USER": "aicc_w_test",
+            "AICC_PG_PASSWORD": OLD_PASSWORD,
+            "AICC_PG_SSLMODE": "disable",
+        }
+    )
+
+    def budget_for(count: int) -> float:
+        lanes = tuple(
+            f"voyn-aicc-worker@{number}.service" for number in range(1, count + 1)
+        )
+        controller = RotationController.__new__(RotationController)
+        controller.config = RotationConfig(
+            env_file=Path("worker.env"),
+            lock_file=Path("rotation.lock"),
+            phase_file=Path("phase.json"),
+            circuit_file=Path("circuit.json"),
+            audit_file=None,
+            tunnel_unit=TUNNEL,
+            tunnel_host="127.0.0.1",
+            tunnel_port=5433,
+            worker_units=lanes,
+            reload_timeout=180,
+        )
+        return controller._post_rotation_budget(config)[0]
+
+    assert budget_for(26) == budget_for(1_000)
+
+
+def test_retry_lifetime_covers_every_failed_attempt_and_all_delays(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, _, _ = _controller(tmp_path, events)
+    config = load_config(read_environment_file(controller.config.env_file))
+
+    one_attempt = (
+        2 * controller.config.prerequisite_timeout
+        + 2 * authority_timeout_seconds(config)
+    )
+    assert controller._failed_pre_mutation_attempt_budget(config) == one_attempt
+    assert controller._retry_lifetime_budget(config) == (
+        controller.config.circuit_failure_threshold * one_attempt
+        + controller.config.failure_retry_window_seconds
+    )
+
+
+def test_batch_failure_fails_closed_for_whole_unproved_generation(tmp_path: Path) -> None:
     events: list[tuple] = []
     controller, systemd, authority = _controller(tmp_path, events)
     lanes = tuple(f"voyn-aicc-worker@{number}.service" for number in range(1, 11))
@@ -441,7 +574,6 @@ def test_single_lane_tail_cohort_never_uses_restart_fallback(tmp_path: Path) -> 
     controller.config = replace(
         controller.config,
         worker_units=lanes,
-        activation_cohort_size=8,
     )
     controller._set_credential_deadline(
         authority.current_expires_at,
@@ -454,7 +586,8 @@ def test_single_lane_tail_cohort_never_uses_restart_fallback(tmp_path: Path) -> 
         load_config(read_environment_file(controller.config.env_file))
     )
 
-    assert len(failures) == 1 and tail in failures[0]
+    assert len(failures) == len(lanes) - 1
+    assert all(unit in " ".join(failures) for unit in lanes[1:])
     assert not any(event[0] == "restart" and event[1] == tail for event in events)
 
 
@@ -481,7 +614,7 @@ def test_failed_canary_defers_cohorts_until_durable_recovery(
     with pytest.raises(RotationError, match="restart fallback exceeds"):
         controller.rotate()
 
-    assert "worker_activation_cohorts_deferred" in audit_events
+    assert "worker_activation_fleet_deferred" in audit_events
     assert controller.config.phase_file.exists(), "failed recovery keeps the latch"
 
 
@@ -541,22 +674,16 @@ def test_tunnel_boot_race_uses_bounded_backoff_then_rotates(tmp_path: Path) -> N
 
 def test_long_jobs_do_not_delay_hot_credential_handoff(tmp_path: Path) -> None:
     events: list[tuple] = []
-    controller, systemd, _ = _controller(tmp_path, events)
-    # `aicc-draining` means the claim gate is closed; a current 3600-second
-    # handler may still be alive. Rotation must not wait for that handler or
-    # the one-hour credential would expire before it could be reloaded.
-    original_drain = systemd.drain
-
-    def drain(unit: str) -> None:
-        original_drain(unit)
-        systemd.status[unit] = "aicc-drained"
-
-    systemd.drain = drain  # type: ignore[method-assign]
+    controller, _, _ = _controller(tmp_path, events)
+    # The hot path never closes the claim gate or waits for a 3600-second
+    # handler. Existing checkouts retire after return while the replacement
+    # pool is authenticated before the atomic process-local swap.
     controller.rotate()
 
     rotate_index = next(i for i, event in enumerate(events) if event[0] == "rotate")
-    assert events.index(("drain", LANE_1)) < rotate_index
-    assert events.index(("drain", LANE_2)) < rotate_index
+    assert not any(event[0] == "drain" for event in events)
+    assert events.index(("reload", LANE_1, 10)) > rotate_index
+    assert events.index(("reload", LANE_2, 10)) > rotate_index
     assert not any(event[0] == "restart" for event in events)
 
 
@@ -579,7 +706,7 @@ def test_tunnel_timeout_fails_before_any_drain_or_rotation(tmp_path: Path) -> No
     assert not any(event[0] in {"drain", "rotate"} for event in events)
 
 
-def test_current_expiry_before_late_drain_ack_recovers_without_mutation(
+def test_missed_timer_refuses_when_current_ttl_cannot_cover_mutation_attempt(
     tmp_path: Path,
 ) -> None:
     events: list[tuple] = []
@@ -588,7 +715,6 @@ def test_current_expiry_before_late_drain_ack_recovers_without_mutation(
     controller.config = replace(
         controller.config,
         prerequisite_timeout=10,
-        drain_timeout=180,
         reload_timeout=10,
         poll_initial=10,
         poll_max=10,
@@ -596,33 +722,18 @@ def test_current_expiry_before_late_drain_ack_recovers_without_mutation(
     controller.monotonic = lambda: clock[0]
     controller.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
     authority.now = lambda: NOW + timedelta(seconds=clock[0])
-    authority.current_expires_at = NOW + timedelta(seconds=900)
-    original_state = systemd.state
+    authority.current_expires_at = NOW + timedelta(seconds=320)
 
-    def drain(unit: str) -> None:
-        events.append(("drain", unit))
-        systemd.status[unit] = "aicc-draining"
-
-    def state(unit: str) -> UnitState:
-        if unit in systemd.status and clock[0] >= 1000:
-            systemd.status[unit] = "aicc-drained"
-        return original_state(unit)
-
-    systemd.drain = drain  # type: ignore[method-assign]
-    systemd.state = state  # type: ignore[method-assign]
-
-    with pytest.raises(RotationError, match="timed out waiting"):
+    with pytest.raises(RotationError, match="pre-mutation attempt"):
         controller.rotate()
 
-    assert clock[0] == 180
-    assert clock[0] < 900
     assert authority.current_password == OLD_PASSWORD
     assert not any(event[0] == "rotate" for event in events)
     assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
     assert not controller.config.phase_file.exists()
 
 
-def test_readiness_delay_refreshes_expiry_and_refuses_before_drain(
+def test_readiness_delay_refreshes_expiry_and_rotates_when_mutation_still_fits(
     tmp_path: Path,
 ) -> None:
     events: list[tuple] = []
@@ -648,42 +759,35 @@ def test_readiness_delay_refreshes_expiry_and_refuses_before_drain(
 
     systemd.state = state  # type: ignore[method-assign]
 
-    with pytest.raises(RotationError, match="expires before drain"):
-        controller.rotate()
+    controller.rotate()
 
     assert clock[0] == 300
-    assert not any(event[0] in {"drain", "rotate"} for event in events)
+    assert not any(event[0] == "drain" for event in events)
+    assert any(event[0] == "rotate" for event in events)
     assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
     assert not controller.config.phase_file.exists()
 
 
-def test_post_drain_prerequisite_failure_resumes_both_lanes_with_verified_auth(
+def test_mutation_transport_failure_preserves_ready_fleet_and_durable_candidates(
     tmp_path: Path,
 ) -> None:
     events: list[tuple] = []
-    controller, systemd, _ = _controller(tmp_path, events)
-    tunnel_checks = [0]
+    controller, systemd, authority = _controller(tmp_path, events)
 
-    def state(unit: str) -> UnitState:
-        if unit == TUNNEL:
-            tunnel_checks[0] += 1
-            # Initial preflight succeeds; the post-drain proof fails.
-            systemd.tunnel_ready = tunnel_checks[0] == 1
-        return FakeSystemd.state(systemd, unit)
+    def lost_ack(config, new_secret: str, verifier: str):
+        events.append(("rotate", config.password))
+        raise RotationError("tunnel lost after mutation may have committed")
 
-    clock = [0.0]
-    systemd.state = state  # type: ignore[method-assign]
-    controller.config = replace(controller.config, prerequisite_timeout=2)
-    controller.monotonic = lambda: clock[0]
-    controller.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    authority.rotate = lost_ack  # type: ignore[method-assign]
 
-    with pytest.raises(RotationError, match="tunnel readiness"):
+    with pytest.raises(RotationError, match="may have committed"):
         controller.rotate()
 
     assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
-    for lane in (LANE_1, LANE_2):
-        assert ("reload", lane, 10) in events
-    assert not any(event[0] == "rotate" for event in events)
+    assert not any(event[0] in {"drain", "reload", "restart"} for event in events)
+    phase = PhaseJournal(controller.config.phase_file).load()
+    assert phase is not None and phase.phase == "mutation_started"
+    assert phase.recovery_file is not None and phase.recovery_file.exists()
 
 
 def test_post_rotation_activation_failure_rolls_every_lane_to_verified_new_auth(
@@ -714,7 +818,7 @@ def test_post_rotation_activation_failure_rolls_every_lane_to_verified_new_auth(
     assert events.count(("reload", LANE_2, 10)) == 1
 
 
-def test_one_hour_expiry_bounds_both_lanes_and_rollback_before_long_restart(
+def test_one_hour_expiry_refuses_long_restart_without_zero_ready_lane(
     tmp_path: Path,
 ) -> None:
     """A 3600-second job cannot fit after a one-hour credential is issued.
@@ -756,7 +860,7 @@ def test_one_hour_expiry_bounds_both_lanes_and_rollback_before_long_restart(
         controller.rotate()
 
     assert not any(event[0] == "restart" for event in events)
-    assert systemd.status == {LANE_1: "aicc-drained", LANE_2: "aicc-ready"}
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
     assert events.count(("reload", LANE_2, 180)) == 1
     usable_until = SELF_CREDENTIAL_TTL_SECONDS - CREDENTIAL_SAFETY_MARGIN_SECONDS
     new_probes = [
@@ -773,24 +877,25 @@ def test_controller_refuses_mutation_when_preflight_consumed_recovery_budget(
     tmp_path: Path,
 ) -> None:
     events: list[tuple] = []
-    controller, _, authority = _controller(tmp_path, events)
+    controller, systemd, authority = _controller(tmp_path, events)
     clock = [0.0]
     controller.config = replace(
         controller.config,
         controller_timeout=1000,
-        drain_timeout=10,
         reload_timeout=10,
     )
     controller.monotonic = lambda: clock[0]
 
-    tunnel_calls = [0]
+    original_state = systemd.state
+    advanced = [False]
 
-    def port_probe(host: str, port: int, timeout: float) -> None:
-        tunnel_calls[0] += 1
-        if tunnel_calls[0] == 2:
-            clock[0] = 500.0
+    def state(unit: str) -> UnitState:
+        if unit == LANE_1 and not advanced[0]:
+            advanced[0] = True
+            clock[0] = 700.0
+        return original_state(unit)
 
-    controller.port_probe = port_probe
+    systemd.state = state  # type: ignore[method-assign]
 
     with pytest.raises(RotationError, match="before credential mutation"):
         controller.rotate()
@@ -817,7 +922,7 @@ def test_unexpected_short_expiry_commits_recovery_secret_and_keeps_phase_durable
         controller.rotate()
 
     assert authority.current_password != OLD_PASSWORD
-    assert systemd.status == {LANE_1: "aicc-drained", LANE_2: "aicc-drained"}
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
     assert (
         read_environment_file(controller.config.env_file)["AICC_PG_PASSWORD"]
         == authority.current_password
@@ -1076,7 +1181,6 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
 
     controller_timeout = option("--controller-timeout")
     prerequisite_timeout = option("--prerequisite-timeout")
-    drain_timeout = option("--drain-timeout")
     reload_timeout = option("--reload-timeout")
     restart_timeout = option("--restart-timeout")
     systemd_timeout = float(lines["TimeoutStartSec"][0].removesuffix("s"))
@@ -1088,8 +1192,7 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
     ]
     assert deployed_lanes == [LANE_1, LANE_2]
     lane_count = len(deployed_lanes)
-    cohort_size = int(option("--activation-cohort-size"))
-    waves = 1 + (lane_count - 1 + cohort_size - 1) // cohort_size
+    waves = 1 if lane_count == 1 else 2
     stop_budget = float(argv[argv.index("--stop-budget") + 1])
     systemd_stop = float(lines["TimeoutStopSec"][0].removesuffix("s"))
     assert systemd_stop >= stop_budget + SYSTEMD_EXIT_MARGIN_SECONDS
@@ -1108,10 +1211,7 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
         + CREDENTIAL_SAFETY_MARGIN_SECONDS
     )
     complete_rotation = (
-        (waves + 2) * prerequisite_timeout
-        + drain_timeout
-        + 3 * authority_timeout
-        + safe_post_rotation
+        2 * prerequisite_timeout + 3 * authority_timeout + safe_post_rotation
     )
     assert systemd_timeout >= controller_timeout + SYSTEMD_EXIT_MARGIN_SECONDS
     assert controller_timeout >= complete_rotation
@@ -1139,20 +1239,23 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
         in (expiry_migration)
     )
     assert "OnUnitInactiveSec=25min" in timer
-    resume_budget = waves * (2 * reload_timeout + authority_timeout)
-    current_pre_drain = (
-        drain_timeout + prerequisite_timeout + 2 * authority_timeout + resume_budget
-    )
     rotation_threshold = option("--rotation-threshold")
     retry_window = option("--failure-retry-window")
+    retry_attempts = int(option("--circuit-failure-threshold"))
+    failed_pre_mutation = 2 * prerequisite_timeout + 2 * authority_timeout
+    assert retry_window >= retry_attempts * 120, (
+        "retry window must include every two-minute RestartSec delay"
+    )
     normal_delay = 25 * 60
     timer_slack = 60 + 15
     remaining_at_next_tick = SELF_CREDENTIAL_TTL_SECONDS - normal_delay - timer_slack
     assert remaining_at_next_tick <= rotation_threshold
     assert (
-        current_pre_drain + CREDENTIAL_SAFETY_MARGIN_SECONDS + retry_window
-        <= remaining_at_next_tick
-    ), "normal cadence must retain three bounded failure retries"
+        retry_attempts * failed_pre_mutation
+        + retry_window
+        + CREDENTIAL_SAFETY_MARGIN_SECONDS
+        <= rotation_threshold
+    ), "threshold must cover every failed attempt, recovery split, and delay"
     assert "OnUnitActiveSec" not in timer
     assert "10.20." not in worker
     assert (
@@ -1231,6 +1334,17 @@ def test_rotation_helper_resolves_exact_systemctl_argv() -> None:
     assert helper.resolve("show", TUNNEL, lanes)[0] == "show"
     assert helper.resolve("reload", LANE_2, lanes) == ["reload", LANE_2]
     assert helper.resolve("restart", LANE_2, lanes) == ["restart", LANE_2]
+    assert helper.resolve_many("reload", lanes, lanes) == ["reload", *lanes]
+
+
+def test_rotation_helper_batch_refuses_transaction_if_any_lane_is_unauthorized() -> None:
+    helper = _helper_module()
+    with pytest.raises(ValueError, match="not in the lane registry"):
+        helper.resolve_many(
+            "reload",
+            (LANE_1, "voyn-aicc-worker@999.service"),
+            (LANE_1, LANE_2),
+        )
 
 
 @pytest.mark.parametrize(

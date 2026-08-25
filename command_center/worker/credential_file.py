@@ -65,6 +65,16 @@ def parse_environment_text(text: str) -> dict[str, str]:
     # validation below and parse a different language than systemd
     # (independent-review finding on 61c73e7).
     lines = text.split("\n")
+    for number, raw in enumerate(lines, 1):
+        # systemd's EnvironmentFile joins a trailing-backslash line with the
+        # next one; this reader does not, and silently parsing a DIFFERENT
+        # language than systemd is exactly what this module refuses to do
+        # (independent-review finding on 40a08bb). Continuations are never
+        # needed in a file this code itself writes -- refuse them.
+        if raw.endswith("\\"):
+            raise CredentialFileError(
+                f"line {number}: backslash continuations are not supported"
+            )
     values: dict[str, str] = {}
     for number, raw in enumerate(lines, 1):
         stripped = raw.strip()

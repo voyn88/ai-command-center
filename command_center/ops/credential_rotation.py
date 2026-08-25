@@ -4,10 +4,10 @@ The old host-local script changed PostgreSQL's verifier and restarted both
 workers immediately.  This controller instead uses an explicit protocol:
 
 1. prove the tunnel, current credential and every registered lane are healthy;
-2. ask every lane to close its claim gate while current jobs continue;
-3. prepare the new EnvironmentFile, rotate through the authenticated session,
+2. prepare the new EnvironmentFile, rotate through the authenticated session,
    and atomically publish the already-fsynced file;
-4. hot-reload and authenticate a canary, then bounded cohorts. Existing database
+3. hot-reload and authenticate a canary, then one registry-derived systemd
+   transaction. Existing database
    checkouts retire only when returned, so a running job and its heartbeat are
    not cut.
 
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -36,7 +37,6 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -50,7 +50,6 @@ from command_center.worker.credential_file import (
     read_environment_file,
 )
 
-_DRAINED = "aicc-drained"
 _READY = "aicc-ready"
 
 # enroll_rotate_self() grants a fixed one-hour credential. Keep this contract
@@ -59,6 +58,10 @@ _READY = "aicc-ready"
 SELF_CREDENTIAL_TTL_SECONDS = 3600.0
 CREDENTIAL_SAFETY_MARGIN_SECONDS = 300.0
 SYSTEMD_EXIT_MARGIN_SECONDS = 600.0
+AUDIT_SCHEMA_VERSION = 1
+AUDIT_MAX_BYTES = 8 * 1024 * 1024
+AUDIT_BACKUPS = 5
+AUDIT_MAX_RECORD_BYTES = 64 * 1024
 
 
 class RotationError(RuntimeError):
@@ -95,12 +98,10 @@ class RotationConfig:
     # the phase journal survives, and the next timer start recovers under the
     # full controller budget. This is what keeps a static unit file correct
     # for an arbitrary lane count.
-    drain_timeout: float = 180.0
     reload_timeout: float = 120.0
     restart_timeout: float = 3720.0
     controller_timeout: float = 7200.0
     stop_budget: float = 1140.0
-    activation_cohort_size: int = 8
     rotation_threshold_seconds: float = 2100.0
     failure_retry_window_seconds: float = 360.0
     circuit_failure_threshold: int = 3
@@ -116,6 +117,8 @@ class Systemd(Protocol):
 
     def reload(self, unit: str, timeout: float) -> None: ...
 
+    def reload_many(self, units: tuple[str, ...], timeout: float) -> None: ...
+
     def restart(self, unit: str, timeout: float) -> None: ...
 
 
@@ -130,11 +133,178 @@ class CredentialAuthority(Protocol):
 
 
 class Audit:
-    def __init__(self, path: Path | None = None) -> None:
+    """Crash-tolerant, bounded JSONL audit sink.
+
+    A separate inode-stable lock serialises open/repair/rotate/write. Locking the
+    data inode is insufficient because a concurrent writer can open the newly
+    created path immediately after rotation and bypass the lock held on the old
+    inode. Every durable path is opened with ``O_NOFOLLOW`` and accepted only
+    when it is a safely-owned regular file.
+    """
+
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        max_bytes: int = AUDIT_MAX_BYTES,
+        backups: int = AUDIT_BACKUPS,
+    ) -> None:
         self._path = path
+        self._max_bytes = max_bytes
+        self._backups = backups
+
+    @staticmethod
+    def _write_all(descriptor: int, payload: bytes) -> None:
+        remaining = memoryview(payload)
+        while remaining:
+            try:
+                written = os.write(descriptor, remaining)
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise OSError(errno.EIO, "audit write made no progress")
+            remaining = remaining[written:]
+
+    @staticmethod
+    def _validate_file(descriptor: int, description: str) -> os.stat_result:
+        info = os.fstat(descriptor)
+        if not stat_module.S_ISREG(info.st_mode):
+            raise RotationError(f"{description} is not a regular file")
+        if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+            raise RotationError(f"{description} ownership/mode is unsafe")
+        return info
+
+    @staticmethod
+    def _sync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _safe_existing(path: Path, description: str) -> bool:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return False
+        if (
+            not stat_module.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+        ):
+            raise RotationError(f"{description} ownership/type is unsafe")
+        return True
+
+    def _shift_backups(self, stem: Path) -> None:
+        if self._backups < 1:
+            raise RotationError("audit backup count must be positive")
+        oldest = stem.with_name(f"{stem.name}.{self._backups}")
+        if self._safe_existing(oldest, "rotation audit backup"):
+            oldest.unlink()
+        for number in range(self._backups - 1, 0, -1):
+            source = stem.with_name(f"{stem.name}.{number}")
+            target = stem.with_name(f"{stem.name}.{number + 1}")
+            if self._safe_existing(source, "rotation audit backup"):
+                if self._safe_existing(target, "rotation audit backup"):
+                    target.unlink()
+                os.replace(source, target)
+
+    def _quarantine_tail(self, descriptor: int, size: int) -> dict[str, object] | None:
+        if size == 0 or os.pread(descriptor, 1, size - 1) == b"\n":
+            return None
+        window_start = max(0, size - AUDIT_MAX_RECORD_BYTES)
+        window = os.pread(descriptor, size - window_start, window_start)
+        newline = window.rfind(b"\n")
+        if newline < 0 and window_start:
+            # A record larger than the schema limit cannot be trusted. Preserve
+            # the whole current generation as one bounded quarantine backup and
+            # start a new JSONL generation instead of guessing a truncate point.
+            truncate_at = 0
+            corrupt = b""
+            whole_generation = True
+        else:
+            truncate_at = window_start + newline + 1
+            corrupt = window[newline + 1 :]
+            whole_generation = False
+
+        assert self._path is not None
+        quarantine = self._path.with_name(f"{self._path.name}.corrupt")
+        self._shift_backups(quarantine)
+        target = quarantine.with_name(f"{quarantine.name}.1")
+        if whole_generation:
+            os.fsync(descriptor)
+            os.replace(self._path, target)
+        else:
+            temporary_fd, temporary_name = tempfile.mkstemp(
+                prefix=f".{quarantine.name}.", dir=quarantine.parent
+            )
+            temporary = Path(temporary_name)
+            try:
+                os.fchmod(temporary_fd, 0o600)
+                self._write_all(temporary_fd, corrupt)
+                os.fsync(temporary_fd)
+                os.close(temporary_fd)
+                temporary_fd = -1
+                os.replace(temporary, target)
+                os.ftruncate(descriptor, truncate_at)
+                os.fsync(descriptor)
+            finally:
+                if temporary_fd != -1:
+                    os.close(temporary_fd)
+                temporary.unlink(missing_ok=True)
+        self._sync_directory(self._path.parent)
+        return {
+            "discarded_bytes": size - truncate_at,
+            "quarantine": target.name,
+            "whole_generation": whole_generation,
+        }
+
+    def _open_data_file(self) -> int:
+        assert self._path is not None
+        try:
+            self._path.lstat()
+            created = False
+        except FileNotFoundError:
+            created = True
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_APPEND
+            | os.O_CLOEXEC
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self._path, flags, 0o640)
+        try:
+            self._validate_file(descriptor, "rotation audit path")
+            os.set_blocking(descriptor, True)
+            if created:
+                self._sync_directory(self._path.parent)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _rotate_if_needed(self, descriptor: int, incoming: int) -> int:
+        assert self._path is not None
+        if self._max_bytes < AUDIT_MAX_RECORD_BYTES:
+            raise RotationError("rotation audit size bound is below one record")
+        size = os.fstat(descriptor).st_size
+        if size == 0 or size + incoming <= self._max_bytes:
+            return descriptor
+        os.fsync(descriptor)
+        os.close(descriptor)
+        self._shift_backups(self._path)
+        target = self._path.with_name(f"{self._path.name}.1")
+        os.replace(self._path, target)
+        self._sync_directory(self._path.parent)
+        return self._open_data_file()
 
     def emit(self, event: str, **fields: object) -> None:
         record = {
+            "schema_version": AUDIT_SCHEMA_VERSION,
             "ts": datetime.now(UTC).isoformat(),
             "event": event,
             **fields,
@@ -143,34 +313,52 @@ class Audit:
         print(line, flush=True)
         if self._path is None:
             return
+        payload = (line + "\n").encode("utf-8")
+        if len(payload) > AUDIT_MAX_RECORD_BYTES:
+            raise RotationError("rotation audit record exceeds schema bound")
         self._path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
-        # Same TOCTOU/symlink hardening as every other durable writer in this
-        # module: O_NOFOLLOW refuses a symlinked audit path (which would
-        # silently redirect the forensic trail), and O_NONBLOCK keeps a FIFO
-        # planted at the path from blocking a synchronous emit() past the
-        # rotation deadline; the fstat then requires a real regular file
-        # before a byte is written (review finding on 732b765).
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_APPEND
-            | os.O_CLOEXEC
-            | getattr(os, "O_NONBLOCK", 0)
-        )
+        lock_path = self._path.with_name(f".{self._path.name}.lock")
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(self._path, flags, 0o640)
+        lock_fd = os.open(lock_path, flags, 0o600)
         try:
-            info = os.fstat(fd)
-            if not stat_module.S_ISREG(info.st_mode):
-                raise RotationError("rotation audit path is not a regular file")
-            # Clear O_NONBLOCK for the actual write now that the fd is proven
-            # to be a regular file (nonblocking only mattered at open time).
-            os.set_blocking(fd, True)
-            os.write(fd, (line + "\n").encode("utf-8"))
-            os.fsync(fd)
+            self._validate_file(lock_fd, "rotation audit lock")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            descriptor = self._open_data_file()
+            try:
+                repair = self._quarantine_tail(
+                    descriptor, os.fstat(descriptor).st_size
+                )
+                if repair is not None and repair["whole_generation"]:
+                    os.close(descriptor)
+                    descriptor = self._open_data_file()
+                repair_payload = b""
+                if repair is not None:
+                    repair_payload = (
+                        json.dumps(
+                            {
+                                "schema_version": AUDIT_SCHEMA_VERSION,
+                                "ts": datetime.now(UTC).isoformat(),
+                                "event": "rotation_audit_tail_quarantined",
+                                **repair,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                descriptor = self._rotate_if_needed(
+                    descriptor, len(repair_payload) + len(payload)
+                )
+                if repair_payload:
+                    self._write_all(descriptor, repair_payload)
+                self._write_all(descriptor, payload)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         finally:
-            os.close(fd)
+            os.close(lock_fd)
 
 
 _RECOVERABLE_PHASES = frozenset(
@@ -493,6 +681,15 @@ class SubprocessSystemd:
     def reload(self, unit: str, timeout: float) -> None:
         self._run("reload", unit, timeout=timeout)
 
+    def reload_many(self, units: tuple[str, ...], timeout: float) -> None:
+        if not units:
+            return
+        # The root-owned helper validates every argument against the same lane
+        # registry before issuing one systemd transaction. systemd starts the
+        # reload jobs concurrently, so the wall-clock safety budget is constant
+        # instead of growing by one full timeout per lane.
+        self._run("reload", *units, timeout=timeout)
+
     def restart(self, unit: str, timeout: float) -> None:
         self._run("restart", unit, timeout=timeout)
 
@@ -687,17 +884,40 @@ class RotationController:
         )
 
     def _activation_waves(self) -> tuple[tuple[str, ...], ...]:
-        """Canary first, then bounded cohorts from the registry order."""
+        """One canary, then one systemd-managed fleet transaction.
+
+        The old fixed-size cohorts made the one-hour credential lifetime impose
+        a hidden fleet ceiling (26 lanes at the deployed settings). systemd is
+        already the concurrency authority for service jobs, so one validated
+        multi-unit transaction scales with fleet size without spawning a Python
+        thread per lane or multiplying the credential deadline by lane count.
+        """
         units = self.config.worker_units
         if not units:
             return ()
-        cohort_size = self.config.activation_cohort_size
-        if cohort_size < 1 or cohort_size > 64:
-            raise RotationError("activation cohort size must be between 1 and 64")
         waves: list[tuple[str, ...]] = [(units[0],)]
-        for start in range(1, len(units), cohort_size):
-            waves.append(units[start : start + cohort_size])
+        if len(units) > 1:
+            waves.append(units[1:])
         return tuple(waves)
+
+    def _failed_pre_mutation_attempt_budget(self, config: PostgresConfig) -> float:
+        """Worst case before PostgreSQL may have accepted a new verifier.
+
+        There is no rollback term: no claim gate is closed before mutation and
+        no worker state has changed. Once ``rotate`` is called, a lost reply is
+        treated as mutation and recovery is charged to the newly issued
+        credential by ``_post_rotation_budget`` instead.
+        """
+
+        authority_timeout = self._authority_timeout(config)
+        return 2 * self.config.prerequisite_timeout + 2 * authority_timeout
+
+    def _retry_lifetime_budget(self, config: PostgresConfig) -> float:
+        return (
+            self.config.circuit_failure_threshold
+            * self._failed_pre_mutation_attempt_budget(config)
+            + self.config.failure_retry_window_seconds
+        )
 
     def _server_now_estimate(self) -> datetime | None:
         if self._last_server_now is None or self._last_server_monotonic is None:
@@ -769,7 +989,6 @@ class RotationController:
         *every* attempt could take that path and the entire sequence would
         still fit the database's fixed credential lifetime.
         """
-        lanes = len(self.config.worker_units)
         waves = len(self._activation_waves())
         authority_timeout = self._authority_timeout(config)
         hot_budget = (
@@ -777,7 +996,10 @@ class RotationController:
             + (2 * waves + 1) * authority_timeout
             + CREDENTIAL_SAFETY_MARGIN_SECONDS
         )
-        restart_budget = hot_budget + 2 * lanes * self.config.restart_timeout
+        # Restart fallback is intentionally only a canary operation. The fleet
+        # transaction never serialises long graceful stops, and a singleton is
+        # never restarted because that would create a zero-ready interval.
+        restart_budget = hot_budget + 2 * self.config.restart_timeout
         # Rotation can issue the credential at any point during its bounded DB
         # operation, so reserve one more authority operation before the
         # returned expiry becomes visible to the controller.
@@ -795,22 +1017,12 @@ class RotationController:
             2 * self.config.reload_timeout + authority_timeout
         )
 
-    def _current_pre_drain_budget(self, config: PostgresConfig) -> float:
-        authority_timeout = self._authority_timeout(config)
-        return (
-            self.config.drain_timeout
-            + self.config.prerequisite_timeout
-            + 2 * authority_timeout
-            + self._resume_budget(config)
-        )
-
-    def _require_current_pre_drain_budget(
-        self, current: PostgresConfig, remaining: float
+    def _require_current_attempt_budget(
+        self, current: PostgresConfig, remaining: float, required: float
     ) -> None:
-        required = self._current_pre_drain_budget(current)
         available = self._bounded_timeout(
             required,
-            "current credential pre-drain recovery",
+            "current credential pre-mutation attempt",
             credential=True,
         )
         if available < required:
@@ -820,7 +1032,7 @@ class RotationController:
                 required=required + CREDENTIAL_SAFETY_MARGIN_SECONDS,
             )
             raise RotationError(
-                "current credential expires before drain/rotation recovery budget"
+                "current credential expires before pre-mutation attempt budget"
             )
 
     def _bounded_timeout(
@@ -892,57 +1104,32 @@ class RotationController:
         self.audit.emit("tunnel_ready", unit=self.config.tunnel_unit)
 
     def _wait_workers_healthy(self) -> None:
-        def wait_one(unit: str) -> None:
-            self._wait(
-                f"{unit} readiness",
-                self._bounded_timeout(
-                    self.config.prerequisite_timeout, f"{unit} readiness"
-                ),
-                lambda: self._healthy(self.systemd.state(unit)),
-            )
-
-        for wave in self._activation_waves():
-            if len(wave) == 1:
-                wait_one(wave[0])
-                continue
-            with ThreadPoolExecutor(max_workers=len(wave)) as executor:
-                futures = {executor.submit(wait_one, unit): unit for unit in wave}
-                errors: dict[str, Exception] = {}
-                for future in as_completed(futures):
-                    try:
-                        future.result()
-                    except Exception as error:  # noqa: BLE001 - aggregate the wave
-                        errors[futures[future]] = error
-                if errors:
-                    raise RotationError(
-                        "worker readiness failed: "
-                        + "; ".join(
-                            f"{unit}: {errors[unit]}" for unit in wave if unit in errors
-                        )
-                    )
-
-    def _drain_all(self) -> None:
-        drain_deadline = self.monotonic() + self._bounded_timeout(
-            self.config.drain_timeout, "worker claim-gate drain", credential=True
+        pending = set(self.config.worker_units)
+        deadline = self.monotonic() + self._bounded_timeout(
+            self.config.prerequisite_timeout, "fleet readiness"
         )
-        for unit in self.config.worker_units:
-            self.systemd.drain(unit)
-            self.audit.emit("worker_drain_requested", unit=unit)
-        for unit in self.config.worker_units:
-
-            def claim_gate_closed(current_unit: str = unit) -> bool:
-                return self.systemd.state(current_unit).status == _DRAINED
-
-            self._wait(
-                f"{unit} drain",
-                self._bounded_timeout(
-                    drain_deadline - self.monotonic(),
-                    f"{unit} drain",
-                    credential=True,
-                ),
-                claim_gate_closed,
+        delay = self.config.poll_initial
+        last_errors: dict[str, str] = {}
+        while pending and self.monotonic() < deadline:
+            for unit in tuple(pending):
+                try:
+                    if self._healthy(self.systemd.state(unit)):
+                        pending.remove(unit)
+                        last_errors.pop(unit, None)
+                except Exception as error:  # noqa: BLE001 - final diagnosis below
+                    last_errors[unit] = str(error)
+            if pending:
+                remaining = deadline - self.monotonic()
+                if remaining > 0:
+                    self.sleep(min(delay, remaining))
+                delay = min(delay * 2, self.config.poll_max)
+        if pending:
+            details = "; ".join(
+                f"{unit}: {last_errors.get(unit, 'not ready')}"
+                for unit in self.config.worker_units
+                if unit in pending
             )
-            self.audit.emit("worker_claim_gate_closed", unit=unit)
+            raise RotationError(f"worker readiness failed: {details}")
 
     def _activate_lane(
         self, unit: str, new_config: PostgresConfig, *, allow_restart: bool = True
@@ -958,9 +1145,9 @@ class RotationController:
         except Exception as reload_error:
             self.audit.emit("worker_reload_failed", unit=unit, error=str(reload_error))
             if not allow_restart:
-                self.audit.emit("worker_restart_refused_cohort", unit=unit)
+                self.audit.emit("worker_restart_refused_fleet_batch", unit=unit)
                 raise RotationError(
-                    f"{unit}: restart fallback is serialized outside cohort rollout"
+                    f"{unit}: restart fallback is outside fleet batch rollout"
                 ) from reload_error
             # A restart may wait for a 3600-second job. Start it only when both
             # the controller and the newly issued credential can cover the
@@ -1029,11 +1216,12 @@ class RotationController:
         failure_event: str = "worker_activation_failed",
         stop_after_canary_failure: bool = False,
     ) -> list[str]:
-        """Activate a canary, then hot-reload bounded cohorts in parallel.
+        """Hot-reload a canary, then the remaining registry in one transaction.
 
-        Restart fallback is allowed only for the single-lane canary wave. A
-        cohort never starts concurrent graceful restarts: any reload failure
-        leaves that lane drained and the durable recovery path handles it.
+        No claim gate closes for the hot path: ``replace_pool`` authenticates a
+        replacement before swapping it and lets established sessions finish.
+        Thus a singleton never has a zero-ready interval, while a larger fleet
+        preserves canary semantics without a fleet-wide drain.
         """
         failures: list[str] = []
         for wave_number, wave in enumerate(self._activation_waves(), 1):
@@ -1049,26 +1237,29 @@ class RotationController:
                     self._activate_lane(
                         unit,
                         config,
-                        allow_restart=wave_number == 1,
+                        allow_restart=(
+                            wave_number == 1
+                            and len(self.config.worker_units) > 1
+                        ),
                     )
                 except Exception as error:  # noqa: BLE001 - audited below
                     errors[unit] = error
             else:
-                with ThreadPoolExecutor(max_workers=len(wave)) as executor:
-                    futures = {
-                        executor.submit(
-                            self._activate_lane,
-                            unit,
-                            config,
-                            allow_restart=False,
-                        ): unit
-                        for unit in wave
-                    }
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except Exception as error:  # noqa: BLE001 - aggregate wave
-                            errors[futures[future]] = error
+                try:
+                    timeout = self._bounded_timeout(
+                        self.config.reload_timeout,
+                        "fleet credential reload",
+                        credential=True,
+                    )
+                    self.systemd.reload_many(wave, timeout)
+                    self._wait_workers_healthy()
+                    self.authority.probe(config)
+                    for unit in wave:
+                        self.audit.emit(
+                            "worker_credential_active", unit=unit, method="reload"
+                        )
+                except Exception as error:  # noqa: BLE001 - audited per lane below
+                    errors.update(dict.fromkeys(wave, error))
             for unit in wave:
                 if unit in errors:
                     failures.append(f"{unit}: {errors[unit]}")
@@ -1082,7 +1273,7 @@ class RotationController:
                 failures=len(errors),
             )
             if wave_number == 1 and errors and stop_after_canary_failure:
-                self.audit.emit("worker_activation_cohorts_deferred")
+                self.audit.emit("worker_activation_fleet_deferred")
                 break
         return failures
 
@@ -1151,6 +1342,28 @@ class RotationController:
             candidates.append((path, config))
         return candidates
 
+    def _sweep_stale_prepared_files(self) -> None:
+        """Remove secret-bearing temp files no longer named by the journal.
+
+        Failed rotations deliberately retain their prepared file (it may be
+        the only copy of a live secret); once a later rotation SUCCEEDS the
+        journal no longer references older leftovers and they are dead
+        plaintext accumulating at 0640 (review note on 40a08bb). Bounded and
+        best-effort: only this rotator's own naming pattern, only while no
+        recovery is pending.
+        """
+        if self.phase_journal.load() is not None:
+            return
+        pattern = f".{self.config.env_file.name}.*"
+        for stale in sorted(self.config.env_file.parent.glob(pattern)):
+            try:
+                stale.unlink()
+                self.audit.emit(
+                    "rotation_stale_prepared_removed", file=stale.name
+                )
+            except OSError:
+                continue
+
     def recover_interrupted(self) -> bool:
         """Reopen claim gates from a durable interrupted-rotation phase."""
         if self._controller_deadline is None:
@@ -1215,8 +1428,8 @@ class RotationController:
         return True
 
     def rotate(self) -> None:
-        if len(self.config.worker_units) < 2:
-            raise RotationError("at least two worker lanes are required")
+        if not self.config.worker_units:
+            raise RotationError("at least one worker lane is required")
         if len(set(self.config.worker_units)) != len(self.config.worker_units):
             raise RotationError("worker units must be distinct")
         if self.config.controller_timeout <= CREDENTIAL_SAFETY_MARGIN_SECONDS:
@@ -1239,13 +1452,14 @@ class RotationController:
         ):
             raise RotationError("failure retry window must not be negative")
         self._controller_deadline = self.monotonic() + self.config.controller_timeout
+        self._sweep_stale_prepared_files()
         self._credential_deadline = None
         self._last_server_now = None
         self._last_server_monotonic = None
         self._restart_fallback_allowed = False
 
         # A previous SIGTERM/SIGKILL is recovered as its own audited operation.
-        # Do not immediately drain the just-reopened workers a second time.
+        # Do not immediately rotate the just-reloaded workers a second time.
         if self.recover_interrupted():
             return
 
@@ -1260,9 +1474,7 @@ class RotationController:
             current, "current credential"
         )
         minimum_rotation_threshold = (
-            self._current_pre_drain_budget(current)
-            + CREDENTIAL_SAFETY_MARGIN_SECONDS
-            + self.config.failure_retry_window_seconds
+            self._retry_lifetime_budget(current) + CREDENTIAL_SAFETY_MARGIN_SECONDS
         )
         if self.config.rotation_threshold_seconds < minimum_rotation_threshold:
             raise RotationError(
@@ -1286,20 +1498,18 @@ class RotationController:
             # failures accumulated across healthy timer ticks.
             self._reset_circuit()
             return
-        # The current credential must remain valid through a shared claim-gate
-        # drain, post-drain tunnel/auth proof and the rotation statement. If any
-        # one fails, enough old-credential lifetime remains to reopen and prove
-        # every lane. The five-minute safety margin was already subtracted when
-        # the monotonic credential deadline was installed.
-        self._require_current_pre_drain_budget(current, current_remaining)
+        # The threshold covers every configured failed pre-mutation attempt and
+        # all systemd retry delays. No fleet state changes in that phase. After
+        # PostgreSQL may have accepted a verifier, the new credential's own TTL
+        # independently covers activation plus rollback.
+        self._require_current_attempt_budget(
+            current,
+            current_remaining,
+            self.config.prerequisite_timeout + 2 * authority_timeout,
+        )
 
-        # From this point the controller still owes per-lane health checks, one
-        # shared drain, a second tunnel/expiry proof, the rotation query and the
-        # complete post-rotation recovery budget.
         remaining_protocol = (
-            len(self._activation_waves()) * self.config.prerequisite_timeout
-            + self.config.drain_timeout
-            + self.config.prerequisite_timeout
+            2 * self.config.prerequisite_timeout
             + 3 * authority_timeout
             + safe_post_rotation
         )
@@ -1309,12 +1519,15 @@ class RotationController:
             raise RotationError("controller budget is below complete rotation budget")
         self._wait_workers_healthy()
         # Worker readiness may legitimately consume most of its bounded wait.
-        # Refresh the server-clock proof immediately before the first gate is
-        # touched, then repeat the full mutation+reopen budget check.
+        # Refresh the server-clock proof immediately before the mutation.
         _, current_remaining = self._load_credential_deadline(
-            current, "pre-drain current credential"
+            current, "pre-mutation current credential"
         )
-        self._require_current_pre_drain_budget(current, current_remaining)
+        self._require_current_attempt_budget(
+            current,
+            current_remaining,
+            authority_timeout,
+        )
         self.audit.emit("rotation_preflight_ok", lanes=len(self.config.worker_units))
 
         prepared: PreparedCredentialFile | None = None
@@ -1326,16 +1539,9 @@ class RotationController:
         # commit there is deliberately no safe automatic resume: reloading the
         # old file would advertise readiness with a dead credential.
         resume_config: PostgresConfig | None = current
-        self.phase_journal.write("draining")
         try:
-            self._drain_all()
-            self.phase_journal.write("gates_closed")
-            # Re-prove the prerequisite after all claim gates close; an in-flight
-            # job is deliberately still running and does not delay this step.
-            self._wait_tunnel(credential=True)
-            self._load_credential_deadline(current, "post-drain current credential")
             # The credential mutation is the point of no return. Refuse it if
-            # preflight/drain consumed so much of the controller deadline that
+            # preflight consumed so much of the controller deadline that
             # a full activation plus rollback no longer fits. This guarantees
             # systemd's outer deadline cannot kill us mid-recovery.
             mutation_budget = authority_timeout + safe_post_rotation
@@ -1346,7 +1552,7 @@ class RotationController:
                 raise RotationError(
                     "controller budget exhausted before credential mutation"
                 )
-            current_mutation_budget = authority_timeout + self._resume_budget(current)
+            current_mutation_budget = authority_timeout
             current_budget = self._bounded_timeout(
                 current_mutation_budget,
                 "current credential mutation rollback",
@@ -1483,12 +1689,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tunnel-port", type=int, default=5433)
     parser.add_argument("--lane-registry", type=Path, required=True)
     parser.add_argument("--prerequisite-timeout", type=float, default=120.0)
-    parser.add_argument("--drain-timeout", type=float, default=180.0)
     parser.add_argument("--reload-timeout", type=float, default=120.0)
     parser.add_argument("--restart-timeout", type=float, default=3720.0)
     parser.add_argument("--controller-timeout", type=float, default=7200.0)
     parser.add_argument("--stop-budget", type=float, default=1140.0)
-    parser.add_argument("--activation-cohort-size", type=int, default=8)
     parser.add_argument("--rotation-threshold", type=float, default=2100.0)
     parser.add_argument("--failure-retry-window", type=float, default=360.0)
     parser.add_argument("--circuit-failure-threshold", type=int, default=3)
@@ -1524,12 +1728,10 @@ def main(argv: list[str] | None = None) -> int:
         tunnel_port=args.tunnel_port,
         worker_units=worker_units,
         prerequisite_timeout=args.prerequisite_timeout,
-        drain_timeout=args.drain_timeout,
         reload_timeout=args.reload_timeout,
         restart_timeout=args.restart_timeout,
         controller_timeout=controller_timeout,
         stop_budget=args.stop_budget,
-        activation_cohort_size=args.activation_cohort_size,
         rotation_threshold_seconds=args.rotation_threshold,
         failure_retry_window_seconds=args.failure_retry_window,
         circuit_failure_threshold=args.circuit_failure_threshold,
