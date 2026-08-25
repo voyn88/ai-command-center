@@ -1,4 +1,4 @@
-# Versioned registry-driven worker template for VOYN pre-production.
+# Versioned two-lane worker template for VOYN pre-production.
 [Unit]
 Description=AICC preprod worker lane %i
 After=network-online.target voyn-aicc-pgtunnel.service
@@ -14,19 +14,27 @@ NotifyAccess=main
 WatchdogSec=240s
 User=aicc-worker
 Group=aicc-worker
-WorkingDirectory=/opt/aicc
+WorkingDirectory=/opt/aicc/current
 LoadCredential=voyn_lease_pgpass:/etc/voyn/secrets/voyn_lease_pgpass
-RuntimeDirectory=voyn-aicc-worker-%i
+# All lane credentials live below one stable tree.  This is both scalable for
+# arbitrary lane counts and lets transient agents mask the authority root once
+# instead of maintaining an unsafe per-lane path list.
+RuntimeDirectory=voyn-aicc-worker/%i
 RuntimeDirectoryMode=0750
-Environment=PGPASSFILE=/run/voyn-aicc-worker-%i/pgpass
+Environment=PGPASSFILE=/run/voyn-aicc-worker/%i/pgpass
 Environment=AICC_WORKER_ENV_FILE=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=/etc/aicc/lease.env
 EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=-/etc/aicc/executors.env
 EnvironmentFile=-/etc/aicc/worker-%i.env
 UnsetEnvironment=ANTHROPIC_API_KEY
-ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker-%i/pgpass
-ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
+# ADR-0010 invariant: the worker neither receives sudo nor selects a
+# privileged command (review finding on 6218a21).
+NoNewPrivileges=yes
+ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker/%i/pgpass
+# This final argv assignment cannot be overridden by EnvironmentFile values.
+ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.worker
+ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=always
 RestartSec=10s

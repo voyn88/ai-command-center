@@ -15,12 +15,16 @@ def _configure_repo(monkeypatch, repo_path):
         cfg["repository_path"] = str(repo_path)
         return cfg
 
-    monkeypatch.setattr(agent_runner.project_config, "get_project_config", fake_get_project_config)
+    monkeypatch.setattr(
+        agent_runner.project_config, "get_project_config", fake_get_project_config
+    )
 
 
 def _init_git_repo(path):
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"], cwd=path, check=True
+    )
     subprocess.run(["git", "config", "user.name", "test"], cwd=path, check=True)
     (path / "f.txt").write_text("hello")
     subprocess.run(["git", "add", "f.txt"], cwd=path, check=True)
@@ -34,14 +38,17 @@ def _init_git_repo(path):
 
 def test_validate_repository_rejects_when_project_unconfigured(monkeypatch):
     monkeypatch.setattr(
-        agent_runner.project_config, "get_project_config",
+        agent_runner.project_config,
+        "get_project_config",
         lambda project_id: project_config.default_project_config(project_id),
     )
     with pytest.raises(agent_runner.RunnerError):
         agent_runner.validate_repository("AIOS", "/some/path")
 
 
-def test_validate_repository_rejects_path_not_matching_configured(monkeypatch, tmp_path):
+def test_validate_repository_rejects_path_not_matching_configured(
+    monkeypatch, tmp_path
+):
     configured = tmp_path / "configured-repo"
     configured.mkdir()
     other = tmp_path / "other-repo"
@@ -105,7 +112,9 @@ def _disallowed_tools_argument(command: list[str]) -> list[str]:
 def test_read_only_task_types_never_receive_unrestricted_bash(task_type):
     command = agent_runner.build_command("review this", task_type=task_type)
     tools = _tools_argument(command)
-    assert "Bash" not in tools, f"{task_type} must not have the Bash tool available at all"
+    assert "Bash" not in tools, (
+        f"{task_type} must not have the Bash tool available at all"
+    )
     # Also assert no unrestricted `Bash(...)`-shaped entry (i.e. it isn't merely
     # renamed/wrapped) and that this task type isn't instead relying on the weaker
     # `--disallowedTools` denylist mechanism.
@@ -150,10 +159,14 @@ def test_review_final_gate_and_architecture_review_share_the_identical_policy():
 
 
 @pytest.mark.parametrize("task_type", ["implementation", "remediation"])
-def test_implementation_and_remediation_allow_local_commit_but_block_dangerous_git_writes(task_type):
+def test_implementation_and_remediation_allow_local_commit_but_block_dangerous_git_writes(
+    task_type,
+):
     command = agent_runner.build_command("implement this", task_type=task_type)
     tools = _tools_argument(command)
-    assert tools == [], "implementation/remediation must not be tool-set-restricted (they need Bash/Edit/Write)"
+    assert tools == [], (
+        "implementation/remediation must not be tool-set-restricted (they need Bash/Edit/Write)"
+    )
     disallowed = _disallowed_tools_argument(command)
     for pattern in agent_runner.GIT_WRITE_DISALLOWED_TOOLS:
         assert pattern in disallowed
@@ -161,9 +174,22 @@ def test_implementation_and_remediation_allow_local_commit_but_block_dangerous_g
     assert not any("git commit" in pattern for pattern in disallowed)
     # The task agent owns its local task commit. History/branch/remote mutation
     # remains outside its authority.
-    required_git_ops = ["apply", "checkout", "restore", "switch", "stash", "push", "merge", "reset", "rebase", "clean"]
+    required_git_ops = [
+        "apply",
+        "checkout",
+        "restore",
+        "switch",
+        "stash",
+        "push",
+        "merge",
+        "reset",
+        "rebase",
+        "clean",
+    ]
     for op in required_git_ops:
-        assert any(f"git {op}" in pattern for pattern in disallowed), f"missing disallow pattern for git {op}"
+        assert any(f"git {op}" in pattern for pattern in disallowed), (
+            f"missing disallow pattern for git {op}"
+        )
     assert any("branch -d" in pattern.lower() for pattern in disallowed)
     assert any("branch -D" in pattern for pattern in disallowed)
 
@@ -176,6 +202,35 @@ def test_implementation_and_remediation_do_not_block_edit_or_write(task_type):
     assert "Write" not in disallowed
 
 
+def test_agent_environment_keeps_model_auth_but_strips_publisher_authority():
+    scrubbed = agent_runner.scrub_vcs_credentials(
+        {
+            "ANTHROPIC_API_KEY": "model-only",  # pragma: allowlist secret
+            "AICC_PUBLISH_DEPLOY_KEY": "/secret/publisher-key",
+            "AICC_WORKSPACE_AUTHORITY_KEY": "marker-secret",
+            "VOYN_LEASE_DSN": "postgresql://lease-secret",
+            "VOYN_LEASE_TOOL": "/trusted/voyn-lease",
+            "AICC_PG_PASSWORD": "database-secret",
+            "AICC_REVIEW_DSN": "postgresql://review-secret",
+            "PGPASSFILE": "/run/credentials/worker/pgpass",
+            "GH_TOKEN": "github-secret",
+        }
+    )
+
+    assert scrubbed["ANTHROPIC_API_KEY"] == "model-only"  # pragma: allowlist secret
+    for secret in (
+        "AICC_PUBLISH_DEPLOY_KEY",
+        "AICC_WORKSPACE_AUTHORITY_KEY",
+        "VOYN_LEASE_DSN",
+        "VOYN_LEASE_TOOL",
+        "AICC_PG_PASSWORD",
+        "AICC_REVIEW_DSN",
+        "PGPASSFILE",
+        "GH_TOKEN",
+    ):
+        assert secret not in scrubbed
+
+
 # --------------------------------------------------------------------------
 # Execution profiles (Required fix 1): named, testable read_only vs.
 # trusted_development, and the permission-mode fix (Required fix 3).
@@ -184,16 +239,24 @@ def test_implementation_and_remediation_do_not_block_edit_or_write(task_type):
 
 @pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
 def test_profile_for_task_type_read_only(task_type):
-    assert agent_runner.profile_for_task_type(task_type) == agent_runner.PROFILE_READ_ONLY
+    assert (
+        agent_runner.profile_for_task_type(task_type) == agent_runner.PROFILE_READ_ONLY
+    )
 
 
 @pytest.mark.parametrize("task_type", ["implementation", "remediation"])
 def test_profile_for_task_type_trusted_development(task_type):
-    assert agent_runner.profile_for_task_type(task_type) == agent_runner.PROFILE_TRUSTED_DEVELOPMENT
+    assert (
+        agent_runner.profile_for_task_type(task_type)
+        == agent_runner.PROFILE_TRUSTED_DEVELOPMENT
+    )
 
 
 def test_profile_for_unknown_task_type_fails_closed_as_read_only():
-    assert agent_runner.profile_for_task_type("some_future_task_type") == agent_runner.PROFILE_READ_ONLY
+    assert (
+        agent_runner.profile_for_task_type("some_future_task_type")
+        == agent_runner.PROFILE_READ_ONLY
+    )
 
 
 def test_trusted_development_profile_permits_read_search_edit_write_bash():
@@ -203,10 +266,14 @@ def test_trusted_development_profile_permits_read_search_edit_write_bash():
     the full built-in tool set — including every one of these — stays
     available; only specific git-write Bash subcommands are denied."""
     command = agent_runner.build_command("implement this", task_type="implementation")
-    assert "--tools" not in command, "trusted_development must not be tool-set-restricted"
+    assert "--tools" not in command, (
+        "trusted_development must not be tool-set-restricted"
+    )
     disallowed = _disallowed_tools_argument(command)
     for tool in ("Read", "Glob", "Grep", "Edit", "Write", "Bash"):
-        assert tool not in disallowed, f"{tool} must remain available to trusted_development"
+        assert tool not in disallowed, (
+            f"{tool} must remain available to trusted_development"
+        )
 
 
 def test_read_only_profile_has_no_write_or_shell_permissions():
@@ -220,7 +287,10 @@ def test_read_only_profile_has_no_write_or_shell_permissions():
     assert set(tools) == {"Read", "Grep", "Glob"}
 
 
-@pytest.mark.parametrize("task_type", ["review", "final_gate", "architecture_review", "implementation", "remediation"])
+@pytest.mark.parametrize(
+    "task_type",
+    ["review", "final_gate", "architecture_review", "implementation", "remediation"],
+)
 def test_build_command_always_sets_permission_mode(task_type):
     """The v1 executor already did this; pinned here so it can never silently
     regress the way `runtime.supervisor.build_claude_command` had (missing
@@ -228,7 +298,10 @@ def test_build_command_always_sets_permission_mode(task_type):
     command = agent_runner.build_command("x", task_type=task_type)
     assert "--permission-mode" in command
     profile = agent_runner.profile_for_task_type(task_type)
-    assert command[command.index("--permission-mode") + 1] == agent_runner.PERMISSION_MODE_BY_PROFILE[profile]
+    assert (
+        command[command.index("--permission-mode") + 1]
+        == agent_runner.PERMISSION_MODE_BY_PROFILE[profile]
+    )
 
 
 def test_build_command_includes_model_only_when_given():
@@ -287,31 +360,40 @@ def test_run_claude_code_never_uses_shell_true(monkeypatch, tmp_path):
 
     monkeypatch.setattr(agent_runner.subprocess, "Popen", _spy_popen)
     monkeypatch.setattr(
-        agent_runner, "build_command",
-        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
-            "import sys; sys.exit(0)"
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: (
+            _fake_command("import sys; sys.exit(0)")
         ),
     )
     result = agent_runner.run_claude_code(
-        repository_path=tmp_path, prompt="hello", task_type="implementation", timeout_seconds=30
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=30,
     )
     assert result.status == "completed"
     assert isinstance(captured["command"], list)
     assert captured["kwargs"].get("shell", False) is False
+    assert captured["kwargs"]["close_fds"] is True
     assert captured["kwargs"]["cwd"] == tmp_path
     # Process-group leader kwargs (VOYN-W0-AICC-FORCED-AGENT-CANCELLATION):
     # without this, group-wide termination would also reach the test runner.
     if sys.platform == "win32":
-        assert captured["kwargs"].get("creationflags", 0) & subprocess.CREATE_NEW_PROCESS_GROUP
+        assert (
+            captured["kwargs"].get("creationflags", 0)
+            & subprocess.CREATE_NEW_PROCESS_GROUP
+        )
     else:
         assert captured["kwargs"].get("start_new_session") is True
 
 
 def test_run_claude_code_handles_nonzero_exit(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        agent_runner, "build_command",
-        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
-            "import sys; sys.stderr.write('boom'); sys.exit(1)"
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: (
+            _fake_command("import sys; sys.stderr.write('boom'); sys.exit(1)")
         ),
     )
     result = agent_runner.run_claude_code(
@@ -328,14 +410,19 @@ def test_run_claude_code_classifies_bwrap_loopback_as_failed_even_with_zero_exit
     monkeypatch.setattr(
         agent_runner,
         "build_command",
-        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
-            "import sys; sys.stderr.write("
-            "'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted'); "
-            "sys.exit(0)"
+        lambda prompt, *, task_type, model=None, capability_override=None: (
+            _fake_command(
+                "import sys; sys.stderr.write("
+                "'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted'); "
+                "sys.exit(0)"
+            )
         ),
     )
     result = agent_runner.run_claude_code(
-        repository_path=tmp_path, prompt="hello", task_type="implementation", timeout_seconds=5
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=5,
     )
     assert result.status == "failed"
     assert result.exit_code == 0
@@ -344,9 +431,12 @@ def test_run_claude_code_classifies_bwrap_loopback_as_failed_even_with_zero_exit
 
 def test_run_claude_code_handles_missing_binary(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        agent_runner, "build_command",
+        agent_runner,
+        "build_command",
         lambda prompt, *, task_type, model=None, capability_override=None: [
-            "/no/such/claude-binary-for-test", "-p", prompt
+            "/no/such/claude-binary-for-test",
+            "-p",
+            prompt,
         ],
     )
     result = agent_runner.run_claude_code(
@@ -356,21 +446,27 @@ def test_run_claude_code_handles_missing_binary(monkeypatch, tmp_path):
     assert result.exit_code is None
 
 
-def test_run_claude_code_handles_timeout_and_kills_the_process_group(monkeypatch, tmp_path):
+def test_run_claude_code_handles_timeout_and_kills_the_process_group(
+    monkeypatch, tmp_path
+):
     """The existing `timeout_seconds` path, preserved: a run that outlives its
     timeout is reported `timed_out` with `exit_code is None`, exactly as the
     previous `subprocess.run(timeout=...)` implementation reported it — but
     now the process is actually confirmed terminated (group-wide) rather than
     merely abandoned to its own devices once `TimeoutExpired` was raised."""
     monkeypatch.setattr(
-        agent_runner, "build_command",
-        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
-            "import time; time.sleep(60)"
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: (
+            _fake_command("import time; time.sleep(60)")
         ),
     )
     started = time.monotonic()
     result = agent_runner.run_claude_code(
-        repository_path=tmp_path, prompt="hello", task_type="implementation", timeout_seconds=1
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=1,
     )
     elapsed = time.monotonic() - started
     assert result.status == "timed_out"
@@ -394,15 +490,19 @@ def test_run_claude_code_completed_process_is_never_signaled(monkeypatch, tmp_pa
         monkeypatch.setattr(agent_runner.os, "killpg", _spy_killpg)
 
     monkeypatch.setattr(
-        agent_runner, "build_command",
-        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
-            "import sys; sys.stdout.write('done'); sys.exit(0)"
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: (
+            _fake_command("import sys; sys.stdout.write('done'); sys.exit(0)")
         ),
     )
     cancel_event = threading.Event()  # never set
     result = agent_runner.run_claude_code(
-        repository_path=tmp_path, prompt="hello", task_type="implementation",
-        timeout_seconds=30, cancel_event=cancel_event,
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=30,
+        cancel_event=cancel_event,
     )
     assert result.status == "completed"
     assert result.exit_code == 0
@@ -410,17 +510,22 @@ def test_run_claude_code_completed_process_is_never_signaled(monkeypatch, tmp_pa
     assert killpg_calls == []
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM/killpg semantics are POSIX-specific")
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="SIGTERM/killpg semantics are POSIX-specific"
+)
 def test_run_claude_code_cancel_event_sigterms_a_running_process(monkeypatch, tmp_path):
     """A process still running when `cancel_event` fires gets SIGTERM'd and
     exits within the grace period — SIGKILL is never needed."""
     monkeypatch.setattr(
-        agent_runner, "build_command",
-        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
-            # No custom handler: the platform default action for SIGTERM
-            # (immediate termination) is exactly what "responds to SIGTERM"
-            # means for this test.
-            "import time; time.sleep(60)"
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: (
+            _fake_command(
+                # No custom handler: the platform default action for SIGTERM
+                # (immediate termination) is exactly what "responds to SIGTERM"
+                # means for this test.
+                "import time; time.sleep(60)"
+            )
         ),
     )
     cancel_event = threading.Event()
@@ -433,8 +538,11 @@ def test_run_claude_code_cancel_event_sigterms_a_running_process(monkeypatch, tm
 
     started = time.monotonic()
     result = agent_runner.run_claude_code(
-        repository_path=tmp_path, prompt="hello", task_type="implementation",
-        timeout_seconds=300, cancel_event=cancel_event,
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=300,
+        cancel_event=cancel_event,
         termination_grace_seconds=10,
     )
     elapsed = time.monotonic() - started
@@ -445,16 +553,23 @@ def test_run_claude_code_cancel_event_sigterms_a_running_process(monkeypatch, tm
     assert elapsed < 8
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM/killpg semantics are POSIX-specific")
-def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(monkeypatch, tmp_path):
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="SIGTERM/killpg semantics are POSIX-specific"
+)
+def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(
+    monkeypatch, tmp_path
+):
     """A process that ignores SIGTERM is SIGKILL'd once the grace period
     elapses, and the run is still reported (never hangs forever)."""
     monkeypatch.setattr(
-        agent_runner, "build_command",
-        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
-            "import signal, time; "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "time.sleep(60)"
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: (
+            _fake_command(
+                "import signal, time; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(60)"
+            )
         ),
     )
     cancel_event = threading.Event()
@@ -462,8 +577,11 @@ def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(monkeypat
 
     started = time.monotonic()
     result = agent_runner.run_claude_code(
-        repository_path=tmp_path, prompt="hello", task_type="implementation",
-        timeout_seconds=300, cancel_event=cancel_event,
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=300,
+        cancel_event=cancel_event,
         termination_grace_seconds=1.0,
     )
     elapsed = time.monotonic() - started
@@ -474,8 +592,12 @@ def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(monkeypat
     assert elapsed < 10
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="process-group semantics are POSIX-specific")
-def test_run_claude_code_cancellation_kills_the_whole_process_group(monkeypatch, tmp_path, tmp_path_factory):
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="process-group semantics are POSIX-specific"
+)
+def test_run_claude_code_cancellation_kills_the_whole_process_group(
+    monkeypatch, tmp_path, tmp_path_factory
+):
     """The actual defect class under test: killing only the direct child PID
     (what a plain `Popen.kill()`/`proc.terminate()` would do) leaves a
     grandchild the CLI spawned running and orphaned. This spawns a real
@@ -490,8 +612,13 @@ def test_run_claude_code_cancellation_kills_the_whole_process_group(monkeypatch,
         "time.sleep(60)\n"
     )
     monkeypatch.setattr(
-        agent_runner, "build_command",
-        lambda prompt, *, task_type, model=None, capability_override=None: [sys.executable, "-c", script],
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: [
+            sys.executable,
+            "-c",
+            script,
+        ],
     )
     cancel_event = threading.Event()
 
@@ -502,8 +629,11 @@ def test_run_claude_code_cancellation_kills_the_whole_process_group(monkeypatch,
     threading.Thread(target=_trigger_cancel_once_child_exists, daemon=True).start()
 
     result = agent_runner.run_claude_code(
-        repository_path=tmp_path, prompt="hello", task_type="implementation",
-        timeout_seconds=300, cancel_event=cancel_event,
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=300,
+        cancel_event=cancel_event,
         termination_grace_seconds=10,
     )
     assert result.status == "cancelled"
@@ -533,14 +663,81 @@ def test_claude_cli_preflight_reports_available_for_an_existing_binary():
     assert message == ""
 
 
+def test_codex_workspace_preflight_requires_a_real_clean_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _binary: "/usr/bin/codex")
+    monkeypatch.setattr(agent_runner, "_codex_workspace_write_preflight_result", None)
+
+    def committed(**kwargs):
+        repo = kwargs["repository_path"]
+        (repo / "aicc-codex-commit-probe.txt").write_text("AICC_CODEX_COMMIT_OK\n")
+        subprocess.run(
+            ["git", "add", "aicc-codex-commit-probe.txt"], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "--quiet", "-m", "aicc codex commit probe"],
+            cwd=repo,
+            check=True,
+        )
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout="AICC_CODEX_WORKSPACE_WRITE_OK",
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", committed)
+    assert agent_runner.codex_workspace_write_preflight() == (True, "")
+
+
+def test_codex_workspace_preflight_rejects_completed_without_commit(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _binary: "/usr/bin/codex")
+    monkeypatch.setattr(agent_runner, "_codex_workspace_write_preflight_result", None)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **_kwargs: agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout="AICC_CODEX_WORKSPACE_WRITE_OK",
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:01+00:00",
+        ),
+    )
+
+    ok, reason = agent_runner.codex_workspace_write_preflight()
+    assert ok is False
+    assert "clean local commit" in reason
+
+
+def test_runtime_bwrap_failure_opens_codex_workspace_write_circuit(monkeypatch):
+    monkeypatch.setattr(
+        agent_runner, "_codex_workspace_write_preflight_result", (True, "")
+    )
+    agent_runner.disable_codex_workspace_write("bwrap: loopback denied")
+
+    ok, reason = agent_runner.codex_workspace_write_preflight()
+    assert ok is False
+    assert "sandbox unavailable" in reason
+    assert "loopback" in reason
+
+
 def test_claude_cli_preflight_names_the_missing_binary_and_how_to_fix_it():
-    available, message = agent_runner.claude_cli_preflight("claude-not-installed-for-test")
+    available, message = agent_runner.claude_cli_preflight(
+        "claude-not-installed-for-test"
+    )
     assert available is False
     assert "claude-not-installed-for-test" in message
     assert "PATH" in message
 
 
-def test_claude_cli_probe_follows_path_and_defaults_to_the_module_binary(monkeypatch, tmp_path):
+def test_claude_cli_probe_follows_path_and_defaults_to_the_module_binary(
+    monkeypatch, tmp_path
+):
     """With nothing on PATH the default probe must fail, and it must succeed
     again once `CLAUDE_BINARY` is resolvable there — i.e. the check really is
     a PATH lookup of the executable the runner would exec, not a constant."""
@@ -600,7 +797,12 @@ def test_git_snapshot_on_non_repo(tmp_path):
 
 def test_append_run_and_load_runs_folds_to_latest_status(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_runner, "RUNS_FILE", tmp_path / "runs.jsonl")
-    run = {"id": "r1", "project": "AIOS", "status": "queued", "created_at": "2026-01-01T00:00:00"}
+    run = {
+        "id": "r1",
+        "project": "AIOS",
+        "status": "queued",
+        "created_at": "2026-01-01T00:00:00",
+    }
     agent_runner.append_run(run)
     run["status"] = "running"
     agent_runner.append_run(run)
@@ -626,11 +828,23 @@ def test_save_report_never_truncates_large_stdout(tmp_path, monkeypatch):
     monkeypatch.setattr(agent_runner, "REPORTS_ROOT", tmp_path)
     huge_output = "X" * 200_000
     run = {
-        "id": "r1", "project": "AIOS", "task_id": "t1", "agent": "claude_code", "task_type": "review",
-        "repository_path": "/tmp/x", "prompt": "p", "status": "completed", "exit_code": 0,
-        "started_at": "2026-01-01T00:00:00", "completed_at": "2026-01-01T00:05:00",
-        "duration_seconds": 300.0, "stdout": huge_output, "stderr": "",
-        "pre_run": {}, "post_run": {}, "created_at": "2026-01-01T00:00:00",
+        "id": "r1",
+        "project": "AIOS",
+        "task_id": "t1",
+        "agent": "claude_code",
+        "task_type": "review",
+        "repository_path": "/tmp/x",
+        "prompt": "p",
+        "status": "completed",
+        "exit_code": 0,
+        "started_at": "2026-01-01T00:00:00",
+        "completed_at": "2026-01-01T00:05:00",
+        "duration_seconds": 300.0,
+        "stdout": huge_output,
+        "stderr": "",
+        "pre_run": {},
+        "post_run": {},
+        "created_at": "2026-01-01T00:00:00",
     }
     parsed = report_parser.empty_parsed_result()
     path = agent_runner.save_report(run, parsed)
@@ -640,8 +854,12 @@ def test_save_report_never_truncates_large_stdout(tmp_path, monkeypatch):
 
 def test_report_path_uses_project_task_and_agent():
     run = {
-        "id": "r1", "project": "AIOS", "task_id": "task123", "agent": "claude_code",
-        "started_at": "2026-03-04T10:20:30", "created_at": "2026-03-04T10:20:30",
+        "id": "r1",
+        "project": "AIOS",
+        "task_id": "task123",
+        "agent": "claude_code",
+        "started_at": "2026-03-04T10:20:30",
+        "created_at": "2026-03-04T10:20:30",
     }
     path = agent_runner.report_path_for(run)
     assert path.parent.name == "AIOS"
@@ -654,7 +872,9 @@ def test_report_path_uses_project_task_and_agent():
 # --------------------------------------------------------------------------
 
 
-def test_resolve_report_path_accepts_a_real_report_under_reports_root(tmp_path, monkeypatch):
+def test_resolve_report_path_accepts_a_real_report_under_reports_root(
+    tmp_path, monkeypatch
+):
     from command_center.runtime import reports
 
     monkeypatch.setattr(reports, "REPORTS_ROOT", tmp_path / "reports")
@@ -665,7 +885,9 @@ def test_resolve_report_path_accepts_a_real_report_under_reports_root(tmp_path, 
     assert resolved == (tmp_path / "reports" / "AIOS" / "report.md").resolve()
 
 
-def test_resolve_report_path_rejects_traversal_outside_reports_root(tmp_path, monkeypatch):
+def test_resolve_report_path_rejects_traversal_outside_reports_root(
+    tmp_path, monkeypatch
+):
     from command_center.runtime import reports
 
     monkeypatch.setattr(reports, "REPORTS_ROOT", tmp_path / "reports")
@@ -690,6 +912,7 @@ def test_resolve_report_path_returns_none_when_missing():
 
 def test_timeout_for_task_is_200pct_of_estimate():
     from command_center import agent_runner
+
     # 0.5h estimate → 200% = 1h = 3600s (also the max cap)
     assert agent_runner.timeout_for_task({"estimate_hours": 0.5}) == 3600
     # 0.1h = 6min → 200% = 12min = 720s
@@ -698,7 +921,10 @@ def test_timeout_for_task_is_200pct_of_estimate():
     assert agent_runner.timeout_for_task({}) == agent_runner.DEFAULT_TIMEOUT_SECONDS
     assert agent_runner.timeout_for_task(None) == agent_runner.DEFAULT_TIMEOUT_SECONDS
     # huge estimate clamps to the max
-    assert agent_runner.timeout_for_task({"estimate_hours": 10}) == agent_runner.MAX_TIMEOUT_SECONDS
+    assert (
+        agent_runner.timeout_for_task({"estimate_hours": 10})
+        == agent_runner.MAX_TIMEOUT_SECONDS
+    )
 
 
 # --------------------------------------------------------------------------

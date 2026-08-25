@@ -354,6 +354,12 @@
     "command_center/worktree_launcher.py": [
       "orchestration"
     ],
+    "ops/aicc_agent_launcher.py": [
+      "orchestration"
+    ],
+    "ops/aicc_staged_worker_rollout.py": [
+      "orchestration"
+    ],
     "scripts/daily_audit_daemon.py": [
       "audit",
       "orchestration"
