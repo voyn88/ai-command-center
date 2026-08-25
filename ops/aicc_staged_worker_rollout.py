@@ -466,18 +466,47 @@ def _execstart_argv(value: str, *, unit: str) -> str:
     return argv
 
 
-def _environment_file_paths(value: str, *, unit: str) -> tuple[str, ...]:
-    """Return paths from systemd's EnvironmentFiles property serialization."""
+def _environment_file_entries(value: str, *, unit: str) -> tuple[tuple[str, bool], ...]:
+    """Return ``(path, optional)`` pairs from EnvironmentFiles serialization.
+
+    systemd renders each file as ``<path> (ignore_errors=<yes|no>)``.  Verifying
+    the path alone is fail-open: a required authority file (lease.env, the
+    rotation worker.env, workspace-authority.env) marked optional with a ``-``
+    prefix keeps the identical path but flips ignore_errors to ``yes``, so a
+    tampered unit whose missing authority file is silently skipped would still
+    pass a path-only check.  Pairing the flag with its path closes that hole;
+    the required/optional split is enforced by the caller.
+    """
     words = _systemd_words(value, unit=unit, property_name="EnvironmentFiles")
-    paths = tuple(word for word in words if word.startswith("/"))
-    if any(not word.startswith(("/", "(ignore_errors=")) for word in words):
-        raise RolloutError(f"{unit} EnvironmentFiles is malformed")
-    # NB: a blanket ignore_errors=no check was rejected -- the shipped units
-    # legitimately mark executors.env and worker-%i.env optional (-prefix);
-    # the REQUIRED authority files are proven present by _expected_environment
-    # _files membership below, not by their optionality flag (review on
-    # 4a0a878, applied narrowly).
-    return paths
+    entries: list[tuple[str, bool]] = []
+    index = 0
+    while index < len(words):
+        path = words[index]
+        if not path.startswith("/") or index + 1 >= len(words):
+            raise RolloutError(f"{unit} EnvironmentFiles is malformed")
+        flag = words[index + 1]
+        if flag == "(ignore_errors=no)":
+            optional = False
+        elif flag == "(ignore_errors=yes)":
+            optional = True
+        else:
+            raise RolloutError(f"{unit} EnvironmentFiles is malformed")
+        entries.append((path, optional))
+        index += 2
+    return tuple(entries)
+
+
+def _optional_environment_files(unit: str) -> frozenset[str]:
+    """The only EnvironmentFiles that may be ``ignore_errors=yes`` (``-`` prefix).
+
+    Everything else in the versioned set is a required authority file whose
+    absence must fail the worker start closed, never be silently skipped.
+    """
+    match = UNIT_RE.fullmatch(unit)
+    if match is None:
+        raise RolloutError(f"unsupported worker unit: {unit}")
+    instance = unit.removeprefix("voyn-aicc-worker@").removesuffix(".service")
+    return frozenset({"/etc/aicc/executors.env", f"/etc/aicc/worker-{instance}.env"})
 
 
 def _protect_home_is_safe(value: str) -> bool:
@@ -553,11 +582,18 @@ def verify_unit_configuration(systemd: Systemd, unit: str) -> None:
     if not _protect_home_is_safe(systemd.property(unit, "ProtectHome")):
         raise RolloutError(f"{unit} ProtectHome is not isolated")
 
-    environment_files = _environment_file_paths(
+    environment_entries = _environment_file_entries(
         systemd.property(unit, "EnvironmentFiles"), unit=unit
     )
+    environment_files = tuple(path for path, _ in environment_entries)
     if environment_files != _expected_environment_files(unit):
         raise RolloutError(f"{unit} EnvironmentFiles is not the versioned set")
+    optional_allowed = _optional_environment_files(unit)
+    for path, optional in environment_entries:
+        if optional and path not in optional_allowed:
+            raise RolloutError(
+                f"{unit} EnvironmentFiles marks required {path} optional"
+            )
 
     groups = frozenset(systemd.property(unit, "SupplementaryGroups").split())
     if groups != EXPECTED_GROUPS:

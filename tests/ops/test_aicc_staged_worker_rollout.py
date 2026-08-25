@@ -432,6 +432,22 @@ def test_verifier_accepts_real_systemctl_execstart_serialization():
             "flag is not required",
         ),
         ({"ExecStart": "/bin/true"}, "ExecStart"),
+        # A required authority file downgraded to optional (`-` prefix, i.e.
+        # ignore_errors=yes) keeps the same path but would let a missing
+        # lease.env be silently skipped: the verifier must reject it, not accept
+        # it on path membership alone.
+        (
+            {
+                "EnvironmentFiles": (
+                    "/etc/aicc/lease.env (ignore_errors=yes) "
+                    "/var/lib/voyn-aicc-credential-rotation/worker.env (ignore_errors=no) "
+                    "/etc/aicc/executors.env (ignore_errors=yes) "
+                    "/etc/aicc/worker-2.env (ignore_errors=yes) "
+                    "/etc/aicc/workspace-authority.env (ignore_errors=no)"
+                )
+            },
+            "optional",
+        ),
     ],
 )
 def test_rollout_refuses_fail_open_lane_before_first_mutation(change, message):

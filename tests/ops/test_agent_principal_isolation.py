@@ -405,6 +405,32 @@ def test_workspace_bind_refuses_deterministic_symlink_replacement(launcher, tmp_
         os.close(descriptor)
 
 
+def test_bind_owner_liveness_is_pid_reuse_proof(launcher, monkeypatch):
+    # Host-independent: drive the identity helpers directly so the /proc-backed
+    # branches are exercised on Linux and macOS alike.
+    monkeypatch.setattr(launcher, "_boot_id", lambda: "boot-A")
+    monkeypatch.setattr(launcher.os, "kill", lambda pid, sig: None)  # PID is live
+    monkeypatch.setattr(launcher, "_proc_starttime", lambda pid: 555)
+
+    # Same live PID, matching recorded start-time -> still the original owner.
+    assert launcher._bind_owner_alive(4242, 555, "boot-A")
+    # Live PID but the recorded start-time differs: the PID was reused by a
+    # different process, so the original bind owner is gone and the stale mount
+    # must be reclaimed rather than skipped forever.
+    assert not launcher._bind_owner_alive(4242, 999, "boot-A")
+    # A journal written under a previous boot cannot name a current owner.
+    assert not launcher._bind_owner_alive(4242, 555, "boot-B")
+    # Legacy journals (no recorded start-time/boot id) fall back to bare
+    # liveness so an in-flight rolling deploy keeps working.
+    assert launcher._bind_owner_alive(4242, None, None)
+
+    def _dead(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(launcher.os, "kill", _dead)
+    assert not launcher._bind_owner_alive(4242, None, None)
+
+
 def test_worker_derived_workspace_is_accepted_by_same_canonical_root(
     launcher, monkeypatch, tmp_path
 ):

@@ -1135,6 +1135,71 @@ def _workspace_bind_root_ready() -> None:
         raise LaunchRefused("workspace bind staging root is not immutable root-owned")
 
 
+def _proc_starttime(pid: int) -> int | None:
+    """Field 22 of ``/proc/<pid>/stat``: boot-relative start ticks.
+
+    A bare PID is reusable, so ``kill(pid, 0)`` succeeding does not prove the
+    *original* owner is still alive -- after the broker dies and its PID is
+    reassigned, recovery would skip the stale journal forever and leak the
+    mount.  The start-time is not reused within a boot, so pairing it with the
+    PID gives a reuse-proof identity.
+    """
+    try:
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except OSError:
+        return None
+    # comm (field 2) is parenthesised and may contain spaces/parens; the safe
+    # split point is after the final ')'.  starttime is field 22, i.e. index 19
+    # counting fields from 3 (state) after that split.
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None
+    fields = data[rparen + 2 :].split()
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def _boot_id() -> str:
+    """Per-boot random id; empty when unavailable so callers fail closed."""
+    try:
+        return (
+            Path("/proc/sys/kernel/random/boot_id")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except OSError:
+        return ""
+
+
+def _bind_owner_alive(owner_pid: int, recorded_starttime: object, recorded_boot_id: object) -> bool:
+    """Is the journal's recorded owner still the live process that staged it?
+
+    Liveness is kill-based so it keeps working under a hardened ``/proc``; the
+    recorded start-time (when both it and the live one are readable) turns a
+    reused PID into a miss, and a changed boot id proves the owner is gone.
+    """
+    current_boot = _boot_id()
+    if isinstance(recorded_boot_id, str) and current_boot and recorded_boot_id != current_boot:
+        return False
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # a live process owned by someone we cannot signal
+    if isinstance(recorded_starttime, int):
+        current_starttime = _proc_starttime(owner_pid)
+        if current_starttime is not None and current_starttime != recorded_starttime:
+            return False  # PID reused by a different process
+    return True
+
+
 def _workspace_bind_journal(path: Path, *, phase: str, pid: int) -> Path:
     journal = path.with_suffix(".json")
     payload = json.dumps(
@@ -1142,6 +1207,8 @@ def _workspace_bind_journal(path: Path, *, phase: str, pid: int) -> Path:
             "version": 1,
             "phase": phase,
             "pid": pid,
+            "pid_starttime": _proc_starttime(pid),
+            "boot_id": _boot_id(),
             "path": str(path),
         },
         sort_keys=True,
@@ -1177,15 +1244,12 @@ def _recover_workspace_bind_journals() -> None:
                 or staging.with_suffix(".json") != journal
             ):
                 raise LaunchRefused("workspace bind recovery journal is invalid")
-            if owner_pid != os.getpid():
-                try:
-                    os.kill(owner_pid, 0)
-                except ProcessLookupError:
-                    pass
-                except PermissionError:
-                    continue
-                else:
-                    continue
+            if owner_pid != os.getpid() and _bind_owner_alive(
+                owner_pid,
+                record.get("pid_starttime"),
+                record.get("boot_id"),
+            ):
+                continue
             # PREPARED may already be mounted if the broker died between the
             # mount syscall and the journal phase transition; umount is
             # harmless for the plain directory and removes that race too.

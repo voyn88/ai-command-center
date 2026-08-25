@@ -428,9 +428,13 @@ def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
     # falls through to the remaining links (review finding on b311666), so
     # the copilot binary is probed FIRST and the terminal reason belongs to
     # the last exhausted candidate.
-    assert checked[0] == agent_runner.COPILOT_BINARY
-    assert len(checked) >= 2, "cascade must try the later links"
-    assert "unavailable" in outcome.reason
+    # Pin the WHOLE probe sequence, not just the first link: copilot is tried
+    # first, then the one remaining claude candidate (default binary), and the
+    # cascade neither stops early nor probes anything extra.
+    assert checked == [agent_runner.COPILOT_BINARY, None]
+    # The terminal reason must belong to the LAST exhausted candidate (claude),
+    # not the copilot link that merely started the cascade.
+    assert "claude cli unavailable" in outcome.reason
     assert runs == []
 
 
