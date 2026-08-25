@@ -1398,9 +1398,7 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
             detail=".git must be a directory and HEAD a regular file",
         )
     expected_ref = f"refs/heads/{expected_branch}"
-    if any(
-        part in {"", ".", ".."} for part in expected_branch.split("/")
-    ):
+    if any(part in {"", ".", ".."} for part in expected_branch.split("/")):
         raise WorkspaceVerificationError(
             failed_step="agent_head_branch",
             remediation="Use a branch name without empty or dot path components.",
@@ -2005,9 +2003,7 @@ def remove_workspace(
                 return "remove_failed"
             if stat.S_IMODE(root_stat.st_mode) != 0o700:
                 os.fchmod(quarantine_fd, 0o700)
-            quarantine_name = (
-                f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
-            )
+            quarantine_name = f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
             quarantine = quarantine_root / quarantine_name
             try:
                 os.rename(

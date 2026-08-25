@@ -822,6 +822,17 @@ def default_specs(
             root_uid,
             root_gid,
         ),
+        # The same fail-closed drop-in must reach the legacy single-lane unit
+        # too -- asserting it only on the template family left
+        # aicc-worker.service without a delivery path for the flag (review
+        # finding on 63cb072).
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-worker-principal-isolation.conf",
+            "/etc/systemd/system/aicc-worker.service.d/20-principal-isolation.conf",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
         FileSpec(
             authority_env,
             "/etc/aicc/workspace-authority.env",

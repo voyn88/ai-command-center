@@ -134,7 +134,7 @@ done
 principal_pid_a=$(systemctl show "$principal_unit_a" --property=MainPID --value)
 principal_pid_b=$(systemctl show "$principal_unit_b" --property=MainPID --value)
 case "$principal_pid_a:$principal_pid_b" in
-  *[!0-9:]*|0:*|*:0) fail "dynamic-principal canary has no live PID" ;;
+  ''|*:|:*|*[!0-9:]*|0:*|*:0) fail "dynamic-principal canary has no live PID" ;;
 esac
 principal_uid_a=$(stat -c %u "/proc/$principal_pid_a")
 principal_uid_b=$(stat -c %u "/proc/$principal_pid_b")

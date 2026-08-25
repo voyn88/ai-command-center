@@ -31,7 +31,9 @@ AGENT_RUN_SCHEMA_VERSION = 1
 # the operator can see why, instead of timing out opaquely mid-run.
 _MAX_TIMEOUT_SECONDS = 3600
 _MIN_TIMEOUT_SECONDS = 30
-_BACKLOG_TASK_ID = re.compile(r"^VOYN-[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Dot-runs are excluded by construction (separators carry exactly one
+# non-alphanumeric), so no separate ".." check is needed.
+_BACKLOG_TASK_ID = re.compile(r"^VOYN-[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,8 +146,8 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         cascade.append(dict(link))
 
     backlog_task_id = _string(payload, "backlog_task_id")
-    if backlog_task_id is not None and (
-        not _BACKLOG_TASK_ID.fullmatch(backlog_task_id) or ".." in backlog_task_id
+    if backlog_task_id is not None and not _BACKLOG_TASK_ID.fullmatch(
+        backlog_task_id
     ):
         return PayloadError(
             reason=("backlog_task_id must use the canonical VOYN-... identifier format")
