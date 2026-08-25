@@ -106,6 +106,36 @@ def test_a_verdict_published_by_the_pull_requests_author_is_refused() -> None:
         evaluate([accept(login=AUTHOR)], HEAD, AUTHOR)
 
 
+def test_a_verdict_published_by_the_merger_is_refused() -> None:
+    """The unattended merge loop passes the account about to press merge. An
+    identity that publishes a verdict and then acts on it has reviewed nobody."""
+    with pytest.raises(AcceptanceError, match="who would merge this"):
+        evaluate([accept(login="merge-operator")], HEAD, AUTHOR, "merge-operator")
+
+
+def test_merger_comparison_ignores_login_case() -> None:
+    with pytest.raises(AcceptanceError, match="who would merge this"):
+        evaluate([accept(login="Merge-Operator")], HEAD, AUTHOR, "merge-operator")
+
+
+def test_a_verdict_independent_of_both_author_and_merger_passes() -> None:
+    """So the two refusals above are not refusing every third-party verdict."""
+    assert evaluate([accept()], HEAD, AUTHOR, "merge-operator") == REVIEWER
+
+
+@pytest.mark.parametrize("merger", ["", 0, ["merge-operator"]])
+def test_a_caller_that_merges_but_cannot_name_itself_is_refused(merger: object) -> None:
+    """Distinct from `None`, which means the caller does not merge at all:
+    independence from an unnameable account cannot be established."""
+    with pytest.raises(AcceptanceError, match="merger has no resolvable identity"):
+        evaluate([accept()], HEAD, AUTHOR, merger)
+
+
+def test_omitting_the_merger_judges_author_independence_only() -> None:
+    """The CI gate's caller: it reads the verdict, it does not merge."""
+    assert evaluate([accept(login="merge-operator")], HEAD, AUTHOR) == "merge-operator"
+
+
 def test_author_comparison_ignores_login_case() -> None:
     """GitHub logins are case-insensitive; the bypass would be `DiMaStOv-Lab`."""
     with pytest.raises(AcceptanceError, match="who authored this"):
@@ -146,6 +176,14 @@ def test_a_dismissed_acceptance_no_longer_accepts() -> None:
 def test_an_unsubmitted_draft_verdict_does_not_accept() -> None:
     with pytest.raises(AcceptanceError, match="no acceptance verdict"):
         evaluate([accept(state="PENDING")], HEAD, AUTHOR)
+
+
+@pytest.mark.parametrize("state", ["", "UNKNOWN", None])
+def test_only_known_submitted_review_states_can_accept(state: object) -> None:
+    candidate = accept()
+    candidate["state"] = state
+    with pytest.raises(AcceptanceError, match="no acceptance verdict"):
+        evaluate([candidate], HEAD, AUTHOR)
 
 
 def test_an_unattributable_verdict_cannot_establish_independence() -> None:

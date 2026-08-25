@@ -25,9 +25,20 @@ though it is invisible to branch protection: the app reviews under its own
 request's author `login` — not `authorAssociation`, which is exactly the field
 that made the built-in route unusable.
 
-Everything it cannot establish is a refusal: no review, no marker, a marker for
-a different commit, an unparseable sha, a missing token, an API error. A gate
-that guesses accepts nothing in particular.
+`evaluate` is also the merge loop's gateway
+(`command_center/orchestrator/review_merge.py`), which passes the identity that
+is about to press merge as `merger`. Author-independence alone is not enough
+once a server merges unattended: an account that can publish a verdict and then
+act on it is a single identity closing the loop on itself, whatever the pull
+request's author was. Callers that do not merge — this workflow — leave `merger`
+unset and are judged on author-independence only. One implementation for both,
+so a verdict cannot be admissible to one and inadmissible to the other.
+
+Everything it cannot establish is a refusal: no review, no marker, a marker
+anywhere but the review's first line, a marker for a different commit, a review
+that was never submitted or has since been dismissed, an unparseable sha, an
+unattributable review, a missing token, an API error. A gate that guesses
+accepts nothing in particular.
 """
 
 from __future__ import annotations
@@ -51,6 +62,10 @@ MARKER = re.compile(r"ACCEPTANCE: (ACCEPT|REJECT) ([0-9a-fA-F]{40})[ \t]*")
 DISMISSED = "DISMISSED"
 # Not yet submitted; it is a draft visible only to its author.
 PENDING = "PENDING"
+# GitHub's submitted review states. An allowlist rather than a denylist of
+# DISMISSED: a state this file has never heard of — misspelt, absent, or newly
+# introduced by GitHub — must not become merge-authorising evidence by default.
+SUBMITTED = frozenset({"APPROVED", "CHANGES_REQUESTED", "COMMENTED"})
 
 _PER_PAGE = 100
 _MAX_PAGES = 50
@@ -93,7 +108,13 @@ def verdicts_from(reviews: object) -> list[Verdict]:
         parsed = parse_marker(review.get("body"))
         if parsed is None:
             continue
+        # REST reviews name the reviewer `user`; `gh pr view --json reviews`
+        # names the same identity `author`. Both routes feed this gateway, and
+        # a review read through the wrong one would be unattributable — which
+        # is a refusal, so the fallback is what keeps the merge loop working.
         user = review.get("user")
+        if not isinstance(user, dict):
+            user = review.get("author")
         author = user.get("login") if isinstance(user, dict) else None
         state = review.get("state")
         found.append(
@@ -108,14 +129,29 @@ def verdicts_from(reviews: object) -> list[Verdict]:
     return found
 
 
-def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> str:
-    """Return the accepting reviewer's login, or raise with cause and remedy."""
+def evaluate(
+    reviews: object,
+    head_sha: object,
+    pull_request_author: object,
+    merger: object | None = None,
+) -> str:
+    """Return the accepting reviewer's login, or raise with cause and remedy.
+
+    `merger`, when given, is the identity that would perform the merge; a
+    verdict it published itself is refused. Passing `None` means the caller does
+    not merge and asks only for author-independence — passing an empty or
+    non-string login means the caller *does* merge but cannot say as whom, which
+    is a refusal.
+    """
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
         raise AcceptanceError(f"head sha is not a 40-character commit id: {head_sha!r}")
     head = head_sha.lower()
     if not isinstance(pull_request_author, str) or not pull_request_author:
         raise AcceptanceError("the pull request has no resolvable author, so independence is unprovable")
     author = pull_request_author.casefold()
+    if merger is not None and (not isinstance(merger, str) or not merger):
+        raise AcceptanceError("the merger has no resolvable identity, so independence is unprovable")
+    merger_login = merger.casefold() if isinstance(merger, str) else None
 
     verdicts = verdicts_from(reviews)
     on_head = [verdict for verdict in verdicts if verdict.sha == head and verdict.state != PENDING]
@@ -135,9 +171,10 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
         verdict
         for verdict in on_head
         if verdict.decision == "ACCEPT"
-        and verdict.state != DISMISSED
+        and verdict.state in SUBMITTED
         and verdict.author
         and verdict.author.casefold() != author
+        and verdict.author.casefold() != merger_login
     ]
     if accepting:
         return accepting[0].author
@@ -154,6 +191,18 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
             f"the only ACCEPT for {head} was published by {self_issued[0].author}, who authored this "
             "pull request. Acceptance must come from an identity that is not the author; have the "
             "acceptance reviewer publish the verdict"
+        )
+    merger_issued = [
+        verdict
+        for verdict in on_head
+        if verdict.decision == "ACCEPT"
+        and merger_login is not None
+        and verdict.author.casefold() == merger_login
+    ]
+    if merger_issued:
+        raise AcceptanceError(
+            f"the only ACCEPT for {head} was published by {merger_issued[0].author}, who would merge "
+            "this pull request. Acceptance must come from an identity that is not the merger"
         )
     dismissed = [
         verdict

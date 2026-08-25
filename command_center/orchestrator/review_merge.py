@@ -13,6 +13,18 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
 
+Independence of the verdict is not this module's own judgement. Merging used to
+be a self-check — any review body anywhere containing the marker text let the
+merger proceed, including a marker the merging account had published itself —
+so the loop could close on evidence it produced. The decision now goes through
+the same gateway the CI acceptance gate runs
+(:mod:`scripts.assert_independent_acceptance`), which reads the marker only as a
+review's opening line, only from a submitted, undismissed review, only for the
+exact head being merged, and only from a login that is neither the pull
+request's author nor the authenticated identity about to merge it. One
+implementation, so a verdict that would fail the branch gate cannot pass the
+merge loop.
+
 Both are refusal-as-data, driven by oneshot timers, and idempotent: a task
 already reviewed is skipped, an already-merged PR closes the task once.
 """
@@ -23,6 +35,8 @@ import json
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any
+
+from scripts.assert_independent_acceptance import AcceptanceError, evaluate
 
 __all__ = ["LoopReport", "ReviewConfig", "merge_once", "review_once"]
 
@@ -98,13 +112,35 @@ def review_once(factory: Any, enqueue: Any, cfg: ReviewConfig | None = None) -> 
 
 # -- Part 3: merge ------------------------------------------------------------
 
+# The one check this loop may disregard: `acceptance-gate.yml` is red for the
+# whole window between opening the pull request and the verdict landing, and it
+# re-runs only on a review event, so a merge tick that waited for it could wait
+# on a run that has already been superseded. The loop re-derives that gate's
+# conclusion below, from the same reviews and the same gateway code, under a
+# stricter rule (it also excludes the merger), so skipping the check is not
+# skipping the judgement. Matched on the gate's own check name rather than on
+# the substring "acceptance", which would also have silenced a red test job
+# named for what it tests.
+_ACCEPTANCE_CHECK = "Acceptance gate"
+
+_GREEN = (None, "SUCCESS", "NEUTRAL", "SKIPPED")
+
 
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
-    """A PR is ready to merge iff its required checks are green and an ACCEPT
-    marker stands on the head. `gh pr view` gives both in one call."""
+    """A PR is ready iff checks pass and an independent reviewer accepts it.
+
+    The authenticated GitHub identity is the prospective merger. The shared
+    acceptance gateway validates review state, marker position, exact head, and
+    independence from both that identity and the pull-request author — this
+    function decides nothing about the verdict itself, so the merge loop and the
+    branch gate cannot drift apart.
+
+    A merger whose own identity cannot be read is a refusal, not a pass:
+    independence from an unknown account is unprovable.
+    """
     view = _gh(
         ["pr", "view", pr_url, "--json",
-         "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid"],
+         "author,reviews,statusCheckRollup,mergeStateStatus,state,headRefOid"],
         repo_path,
     )
     if view.returncode != 0:
@@ -113,17 +149,20 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     if data.get("state") != "OPEN":
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
-    accept = any(
-        f"ACCEPTANCE: ACCEPT {head}" in (r.get("body") or "")
-        for r in data.get("reviews", [])
-    )
-    if not accept:
-        return False, "no_accept_marker_on_head"
+    merger = _gh(["api", "user", "--jq", ".login"], repo_path)
+    if merger.returncode != 0 or not merger.stdout.strip():
+        return False, "merger_identity_unavailable"
+    author = data.get("author")
+    author_login = author.get("login") if isinstance(author, dict) else None
+    try:
+        evaluate(data.get("reviews"), head, author_login, merger.stdout.strip())
+    except AcceptanceError as error:
+        return False, f"acceptance_refused: {error}"
     rollup = data.get("statusCheckRollup") or []
     bad = [
         c.get("name", "?") for c in rollup
-        if c.get("conclusion") not in (None, "SUCCESS", "NEUTRAL", "SKIPPED")
-        and "cceptance" not in c.get("name", "")
+        if c.get("conclusion") not in _GREEN
+        and not str(c.get("name", "")).startswith(_ACCEPTANCE_CHECK)
     ]
     if bad:
         return False, f"checks_not_green: {bad[:3]}"
