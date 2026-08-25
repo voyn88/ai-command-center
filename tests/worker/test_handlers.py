@@ -424,8 +424,13 @@ def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
     payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
     outcome = run_agent(payload, _event(), 1)
     assert not outcome.ok and outcome.retryable
-    assert "copilot cli unavailable" in outcome.reason
-    assert checked == [agent_runner.COPILOT_BINARY]
+    # The unavailable copilot no longer dead-ends the attempt: the cascade
+    # falls through to the remaining links (review finding on b311666), so
+    # the copilot binary is probed FIRST and the terminal reason belongs to
+    # the last exhausted candidate.
+    assert checked[0] == agent_runner.COPILOT_BINARY
+    assert len(checked) >= 2, "cascade must try the later links"
+    assert "unavailable" in outcome.reason
     assert runs == []
 
 

@@ -240,7 +240,7 @@ def _run_agent(
         return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
-    if not available and executor == "codex" and link is not None:
+    if not available and link is not None:
         # An open Codex circuit is a routing fact, not a consumed model
         # attempt. Select the next healthy cascade link inside this already
         # claimed delivery instead of returning it just to increment the

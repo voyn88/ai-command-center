@@ -125,11 +125,13 @@ PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     "claude": "/usr/local/bin/claude",
     "codex": "/usr/local/bin/codex",
-    # Every supported executor must map, or principal_isolation turns each
-    # dispatch of the missing one into an unbreakable retry loop -- the
-    # generic gate applies to all three, so its allowlist must too
-    # (review finding on 6218a21).
-    "copilot": "/usr/local/bin/copilot",
+    # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
+    # principal isolation because its login credential carries GitHub /
+    # repository authority -- staging it would hand untrusted model code the
+    # exact capability this boundary exists to withhold (review finding on
+    # b311666). The retry-loop hazard that once motivated listing it is
+    # closed in handlers instead: an unavailable executor falls through the
+    # cascade to the next link rather than respinning forever.
 }
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 

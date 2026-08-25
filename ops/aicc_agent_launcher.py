@@ -52,16 +52,14 @@ PROVIDER_ENV_FILES = {
 MODEL_AUTH_SOURCES = {
     "claude": Path("/var/lib/aicc-agent/claude/.claude/.credentials.json"),
     "codex": Path("/var/lib/aicc-agent/codex/.codex/auth.json"),
-    # Copilot joined PRINCIPAL_EXECUTOR_BINARIES; without a source entry the
-    # root broker raised a bare KeyError instead of a refusal (review finding
-    # on 63cb072). Provisioning the root-owned copy is the deploy runbook's
-    # job; until it exists the broker refuses copilot launches cleanly.
-    "copilot": Path("/var/lib/aicc-agent/copilot/.config/github-copilot/apps.json"),
+    # No copilot entry: ADR-0010 keeps it disabled under principal isolation
+    # (its credential carries GitHub authority). The .get() guard below turns
+    # an unknown executor into a clean LaunchRefused (review findings on
+    # 63cb072 and b311666).
 }
 MODEL_AUTH_TARGETS = {
     "claude": Path(".claude/.credentials.json"),
     "codex": Path(".codex/auth.json"),
-    "copilot": Path(".config/github-copilot/apps.json"),
 }
 EPHEMERAL_HOME_ROOT = Path("/run/aicc-agent-homes")
 EXECUTOR_BINARIES = {
