@@ -1362,12 +1362,18 @@ class RotationController:
             new_values["AICC_PG_PASSWORD"] = new_secret
             new_config = _postgres_config(new_values)
             mutation_attempted = True
+            # From this line the OLD credential may already be dead on the
+            # server even if rotate() raises (lost acknowledgement over the
+            # SSH tunnel). Rolling the fleet back onto it would restart-loop
+            # every lane against a verifier that no longer matches; recovery
+            # must instead fall through to recover_interrupted(), which
+            # probes BOTH candidates (independent-review finding on 13b7738).
+            resume_config = None
             self.phase_journal.write("mutation_started", prepared.temporary)
             expires = self.authority.rotate(
                 current, new_secret, scram_verifier(new_secret)
             )
             database_rotated = True
-            resume_config = None
             self.phase_journal.write("database_rotated", prepared.temporary)
             try:
                 prepared.commit()
@@ -1412,12 +1418,11 @@ class RotationController:
                 # resume_config = new_config before this check would trade
                 # that audited recovery for an immediate fleet activation on
                 # a provably short-lived secret.
-                if committed:
-                    durable_phase = "credential_committed"
-                elif database_rotated:
-                    durable_phase = "database_rotated"
-                else:
-                    durable_phase = "mutation_started"
+                # committed is unconditionally True on this path (the
+                # commit above precedes the expiry check); the durable phase
+                # is stated literally rather than via dead branches.
+                assert committed and database_rotated
+                durable_phase = "credential_committed"
                 raise RotationError(
                     "issued credential expires before safe activation/rollback "
                     f"budget; lanes stay drained with durable phase "
