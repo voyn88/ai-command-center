@@ -1986,23 +1986,44 @@ def remove_workspace(
             quarantine_root.mkdir(mode=0o700, exist_ok=True)
         except OSError:
             return "remove_failed"
-        root_stat = quarantine_root.lstat()
-        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
-            return "remove_failed"
-        if stat.S_IMODE(root_stat.st_mode) != 0o700:
-            os.chmod(quarantine_root, 0o700)
-        quarantine = (
-            quarantine_root / f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
-        )
+        # Pin the validated directory with a DESCRIPTOR: a pathname check
+        # followed by a pathname os.replace() left a swap window in which an
+        # agent controlling the parent redirects the privileged move
+        # (independent-review finding on 09554a1). O_NOFOLLOW+O_DIRECTORY
+        # refuses a symlink at open time; the fstat validates the very
+        # object the dst_dir_fd rename below will use.
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
         try:
-            os.replace(raw_workspace, quarantine)
-            quarantine_stat = quarantine.lstat()
-            if (quarantine_stat.st_dev, quarantine_stat.st_ino) != inode:
-                return "remove_failed"
-            _task_local_marker_path(raw_workspace).unlink(missing_ok=True)
-            shutil.rmtree(quarantine)
+            quarantine_fd = os.open(quarantine_root, directory_flags)
         except OSError:
             return "remove_failed"
+        try:
+            root_stat = os.fstat(quarantine_fd)
+            if not stat.S_ISDIR(root_stat.st_mode):
+                return "remove_failed"
+            if stat.S_IMODE(root_stat.st_mode) != 0o700:
+                os.fchmod(quarantine_fd, 0o700)
+            quarantine_name = (
+                f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
+            )
+            quarantine = quarantine_root / quarantine_name
+            try:
+                os.rename(
+                    raw_workspace,
+                    quarantine_name,
+                    dst_dir_fd=quarantine_fd,
+                )
+                quarantine_stat = os.lstat(quarantine_name, dir_fd=quarantine_fd)
+                if (quarantine_stat.st_dev, quarantine_stat.st_ino) != inode:
+                    return "remove_failed"
+                _task_local_marker_path(raw_workspace).unlink(missing_ok=True)
+                shutil.rmtree(quarantine)
+            except OSError:
+                return "remove_failed"
+        finally:
+            os.close(quarantine_fd)
         return "removed"
     workspace = raw_workspace.resolve()
     if not is_pipeline_owned_worktree(workspace, repository_path):
