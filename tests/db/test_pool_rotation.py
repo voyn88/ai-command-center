@@ -143,3 +143,34 @@ def test_stale_checkout_unwind_cannot_touch_a_reincarnated_pool(monkeypatch) -> 
     live.__exit__(None, None, None)
     assert second.closed, "retired pool closes after its last return"
     pool.close_pool()
+
+
+def test_replace_pool_refuses_to_resurrect_a_concurrently_closed_pool(
+    monkeypatch,
+) -> None:
+    """close_pool() racing _build_pool() must not let replace_pool() install a
+    live pool after shutdown (independent-review finding on 0e3dad6): the
+    generation captured before the build is re-checked under the lock, and a
+    mismatch discards the freshly built replacement."""
+    first = FakePool("first")
+    replacement = FakePool("replacement")
+
+    def build_then_shutdown(config):
+        if not first_built:
+            return first
+        pool.close_pool()  # the race: shutdown lands mid-build
+        return replacement
+
+    first_built = False
+    monkeypatch.setattr(pool, "_build_pool", build_then_shutdown)
+    pool.close_pool()
+    pool.open_pool(_config("a" * 64))
+    first_built = True
+    try:
+        pool.replace_pool(_config("b" * 64))
+    except pool.PoolNotOpenError:
+        pass
+    else:
+        raise AssertionError("replacement must be refused after shutdown")
+    assert replacement.closed, "orphaned replacement must be closed"
+    assert pool._pool is None, "shutdown must stay shut down"

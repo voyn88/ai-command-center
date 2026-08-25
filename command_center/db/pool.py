@@ -109,19 +109,38 @@ def replace_pool(config: PostgresConfig):
 
     global _pool, _config
 
+    with _lock:
+        if _pool is None:
+            raise PoolNotOpenError(
+                "PostgreSQL pool is not open. Call open_pool() during startup."
+            )
+        expected_token = _pool[0]
     replacement = _build_pool(config)
     close_now: Any | None = None
     with _lock:
-        previous = _pool
-        globals()["_pool_token"] += 1
-        _pool = (globals()["_pool_token"], replacement)
-        _config = config
-        if previous is not None:
+        if _pool is None or _pool[0] != expected_token:
+            # close_pool() (or another replace) won the race while the
+            # replacement was being built. Installing it anyway would
+            # resurrect a live database pool after shutdown -- new work could
+            # start during process teardown (independent-review finding on
+            # 0e3dad6). Fail closed: discard the replacement.
+            orphaned = replacement
+            replacement = None
+        else:
+            previous = _pool
+            globals()["_pool_token"] += 1
+            _pool = (globals()["_pool_token"], replacement)
+            _config = config
             previous_token, previous_pool = previous
             if _active.get(previous_token, 0) == 0:
                 close_now = previous_pool
             else:
                 _retired[previous_token] = previous_pool
+    if replacement is None:
+        orphaned.close()
+        raise PoolNotOpenError(
+            "PostgreSQL pool state changed during replacement; not installed."
+        )
     if close_now is not None:
         close_now.close()
     _LOG.info("postgres pool replaced: %s", config.redacted())
