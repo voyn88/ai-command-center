@@ -46,7 +46,7 @@ KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 SendSIGKILL=yes
 TimeoutStopSec=3660s
-TimeoutStartSec=180s
+TimeoutStartSec=195s
 
 MemoryMax=6G
 MemoryHigh=5G

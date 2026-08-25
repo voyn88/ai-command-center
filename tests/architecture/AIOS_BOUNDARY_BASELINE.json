@@ -132,6 +132,9 @@
     "command_center/http_auth/routing.py": [
       "authz"
     ],
+    "command_center/ops/credential_rotation.py": [
+      "memory"
+    ],
     "command_center/orchestrator/__init__.py": [
       "orchestration"
     ],
@@ -322,6 +325,9 @@
       "orchestration"
     ],
     "command_center/worker/__main__.py": [
+      "orchestration"
+    ],
+    "command_center/worker/credential_file.py": [
       "orchestration"
     ],
     "command_center/worker/daemon.py": [
