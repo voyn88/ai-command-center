@@ -19,8 +19,8 @@ from command_center.ops.credential_rotation import (
     SELF_CREDENTIAL_TTL_SECONDS,
     SYSTEMD_EXIT_MARGIN_SECONDS,
     Audit,
-    CircuitOpen,
     CircuitJournal,
+    CircuitOpen,
     CircuitState,
     PhaseJournal,
     RotationConfig,
@@ -28,6 +28,8 @@ from command_center.ops.credential_rotation import (
     RotationError,
     RotationPhase,
     UnitState,
+    _postgres_config,
+    authority_timeout_seconds,
     load_lane_registry,
     main,
 )
@@ -58,6 +60,69 @@ def _environment(path: Path) -> Path:
     )
     path.chmod(0o600)
     return path
+
+
+@pytest.mark.parametrize("journal_kind", ["phase", "circuit"])
+def test_journal_write_failure_never_recloses_fd_owned_by_stream(
+    tmp_path: Path, monkeypatch, journal_kind: str
+) -> None:
+    """fdopen() owns the descriptor even when a later durability step fails.
+
+    Retrying os.close() from the outer exception handler can close an unrelated
+    descriptor if the kernel has already recycled the number.
+    """
+    import command_center.ops.credential_rotation as rotation_module
+
+    journal = (
+        PhaseJournal(tmp_path / "phase.json")
+        if journal_kind == "phase"
+        else CircuitJournal(tmp_path / "circuit.json")
+    )
+    explicit_closes: list[int] = []
+    real_close = os.close
+
+    def recording_close(descriptor: int) -> None:
+        explicit_closes.append(descriptor)
+        real_close(descriptor)
+
+    def fail_directory_sync() -> None:
+        raise OSError("directory fsync failed")
+
+    monkeypatch.setattr(rotation_module.os, "close", recording_close)
+    monkeypatch.setattr(journal, "_sync_directory", fail_directory_sync)
+
+    with pytest.raises(OSError, match="directory fsync failed"):
+        if journal_kind == "phase":
+            journal.write("draining")
+        else:
+            journal.write(CircuitState(1, None, "RotationError"))
+
+    assert explicit_closes == []
+
+
+@pytest.mark.parametrize("journal_kind", ["phase", "circuit"])
+def test_oversized_journal_read_never_recloses_fd_owned_by_stream(
+    tmp_path: Path, monkeypatch, journal_kind: str
+) -> None:
+    import command_center.ops.credential_rotation as rotation_module
+
+    path = tmp_path / f"{journal_kind}.json"
+    path.write_text("x" * 4097, encoding="utf-8")
+    path.chmod(0o600)
+    journal = PhaseJournal(path) if journal_kind == "phase" else CircuitJournal(path)
+    explicit_closes: list[int] = []
+    real_close = os.close
+
+    def recording_close(descriptor: int) -> None:
+        explicit_closes.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(rotation_module.os, "close", recording_close)
+
+    with pytest.raises(RotationError, match="unexpectedly large"):
+        journal.load()
+
+    assert explicit_closes == []
 
 
 def _config(tmp_path: Path, **changes) -> RotationConfig:
@@ -962,7 +1027,9 @@ def test_post_rotation_rename_failure_retains_only_recovery_secret(
     )
 
 
-def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
+def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
+    tmp_path: Path,
+) -> None:
     root = Path(__file__).parents[2]
     worker = (root / "deploy/systemd/voyn-aicc-worker@.service").read_text()
     rotation = (
@@ -1026,7 +1093,15 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer() -> None:
     stop_budget = float(argv[argv.index("--stop-budget") + 1])
     systemd_stop = float(lines["TimeoutStopSec"][0].removesuffix("s"))
     assert systemd_stop >= stop_budget + SYSTEMD_EXIT_MARGIN_SECONDS
-    authority_timeout = 10 + 30
+    # Derived through the controller's own formula and the real env parser,
+    # so a change to connect/statement timeouts moves this proof with it.
+    # The VALUES are the test environment's; the production numbers live in
+    # the deployed env file this test cannot read.
+    authority_timeout = authority_timeout_seconds(
+        _postgres_config(
+            read_environment_file(_environment(tmp_path / "authority.env"))
+        )
+    )
     safe_post_rotation = (
         waves * 4 * reload_timeout
         + (2 * waves + 1) * authority_timeout

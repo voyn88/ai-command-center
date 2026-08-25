@@ -215,15 +215,18 @@ class PhaseJournal:
                 raise RotationError("rotation phase journal is not a regular file")
             if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
                 raise RotationError("rotation phase journal ownership/mode is unsafe")
-            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            stream = os.fdopen(fd, "r", encoding="utf-8")
+            fd = -1
+            with stream:
                 raw = stream.read(4097)
             if len(raw) > 4096:
                 raise RotationError("rotation phase journal is unexpectedly large")
         except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             raise
         try:
             document = json.loads(raw)
@@ -262,17 +265,20 @@ class PhaseJournal:
         temporary = Path(temporary_name)
         try:
             os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+            fd = -1
+            with stream:
                 stream.write(document + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
             self._sync_directory()
         except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             temporary.unlink(missing_ok=True)
             raise
 
@@ -328,15 +334,18 @@ class CircuitJournal:
                 raise RotationError("rotation circuit journal is not a regular file")
             if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
                 raise RotationError("rotation circuit journal ownership/mode is unsafe")
-            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            stream = os.fdopen(fd, "r", encoding="utf-8")
+            fd = -1
+            with stream:
                 raw = stream.read(4097)
             if len(raw) > 4096:
                 raise RotationError("rotation circuit journal is unexpectedly large")
         except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             raise
         try:
             document = json.loads(raw)
@@ -392,17 +401,20 @@ class CircuitJournal:
         temporary = Path(temporary_name)
         try:
             os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream = os.fdopen(fd, "w", encoding="utf-8")
+            fd = -1
+            with stream:
                 stream.write(document + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
             self._sync_directory()
         except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             temporary.unlink(missing_ok=True)
             raise
 
@@ -605,6 +617,17 @@ def _postgres_config(values: dict[str, str]) -> PostgresConfig:
     return load_config(values)
 
 
+def authority_timeout_seconds(config: PostgresConfig) -> float:
+    """Upper bound for one identity-authority connect plus one statement.
+
+    Exported so the unit-budget test derives the SAME number the controller
+    enforces instead of hardcoding it (independent-review finding on
+    f7515b5): a change to the connect/statement timeouts moves the safety
+    proof with it.
+    """
+    return config.connect_timeout + config.statement_timeout_ms / 1000.0
+
+
 class RotationController:
     def __init__(
         self,
@@ -635,7 +658,7 @@ class RotationController:
     @staticmethod
     def _authority_timeout(config: PostgresConfig) -> float:
         """Upper bound for one connect plus one statement."""
-        return config.connect_timeout + config.statement_timeout_ms / 1000.0
+        return authority_timeout_seconds(config)
 
     def _load_credential_deadline(
         self, config: PostgresConfig, description: str

@@ -283,10 +283,10 @@ class _FileLeaseStore:
             return QueueRefusal(reason="no_work")
         attempts = self.root / "attempts"
         attempt_no = int(attempts.read_text()) + 1 if attempts.exists() else 1
-        attempts.write_text(str(attempt_no))
+        self._publish(attempts, str(attempt_no))
         attempt_id = f"attempt-{attempt_no}"
         self._publish(lease, str(now + float(visibility_seconds)))
-        (self.root / "claimed").write_text(attempt_id)
+        self._publish(self.root / "claimed", attempt_id)
         return ClaimedWork(
             work_item_id="job-3600",
             attempt_id=attempt_id,
@@ -309,7 +309,7 @@ class _FileLeaseStore:
         os.replace(temporary, path)
 
     def complete(self, work, result):
-        (self.root / "done").write_text(work.attempt_id)
+        self._publish(self.root / "done", work.attempt_id)
         return True
 
     def fail(self, work, *, reason, retryable):
@@ -322,18 +322,27 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
     """Scaled systemd lifecycle: 3600s job survives TERM, then lease retries."""
     pid = os.fork()
     if pid == 0:  # pragma: no cover - assertions are in the supervising parent
-        daemon = WorkerDaemon(
-            _FileLeaseStore(tmp_path),
-            {
-                "long": lambda payload, lost, attempt=1: (
-                    time.sleep(3600) or HandlerOutcome(ok=True)
-                )
-            },
-            WorkerConfig(visibility_seconds=1, idle_min_seconds=0.01),
-            notify=lambda _state: None,
-        )
-        daemon.install_signal_handlers()
-        daemon.run_forever()
+        # Any exception escaping this block would let the CHILD continue the
+        # pytest session -- duplicated run, interleaved capture, misleading
+        # parent failure (independent-review finding on f7515b5). The child
+        # only ever exits through os._exit.
+        try:
+            daemon = WorkerDaemon(
+                _FileLeaseStore(tmp_path),
+                {
+                    "long": lambda payload, lost, attempt=1: (
+                        (tmp_path / "handler-entered").write_text("1"),
+                        time.sleep(3600),
+                        HandlerOutcome(ok=True),
+                    )[-1]
+                },
+                WorkerConfig(visibility_seconds=1, idle_min_seconds=0.01),
+                notify=lambda _state: None,
+            )
+            daemon.install_signal_handlers()
+            daemon.run_forever()
+        except BaseException:
+            os._exit(1)
         os._exit(0)
 
     reaped = False
@@ -342,10 +351,18 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
         while not (tmp_path / "claimed").exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert (tmp_path / "claimed").read_text() == "attempt-1"
+        while not (tmp_path / "handler-entered").exists() and (
+            time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert (tmp_path / "handler-entered").exists(), "job never started"
 
         os.kill(pid, signal.SIGTERM)
         time.sleep(0.2)
         waited, _status = os.waitpid(pid, os.WNOHANG)
+        # If the child died here it was ALSO reaped -- the finally must not
+        # SIGKILL a recycled PID on this failure path (review on f7515b5).
+        reaped = waited == pid
         assert waited == 0, "SIGTERM must let the in-hand 3600s job continue"
 
         kill_started = time.monotonic()
@@ -659,4 +676,6 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
 
     assert frames[0] == b"READY=1"
     assert frames[-1] == b"STOPPING=1"
-    assert any(frame == b"WATCHDOG=1" or frame.startswith(b"WATCHDOG=1\n") for frame in frames)
+    assert any(
+        frame == b"WATCHDOG=1" or frame.startswith(b"WATCHDOG=1\n") for frame in frames
+    )
