@@ -152,6 +152,61 @@ def test_zero_ceiling_means_no_budget_limit():
 
 
 # --------------------------------------------------------------------------
+# Spend status: "unknown" defers everything with its OWN typed reason — never
+# assigns against a guessed number, and never masquerades as DEFER_DAILY_BUDGET
+# (VOYN-W0-AICC-REPORT-319-REM: spend-unknown is not a verdict).
+# --------------------------------------------------------------------------
+
+
+def test_spend_status_defaults_to_known():
+    policy = DispatchPolicy(cost_matrix={"claude_code": 0.4})
+    executors = [_executor("claude_code", cost=0.4)]
+    plan = _plan([_task("t1")], executors, policy, max_daily_spend_usd=1.0)
+
+    assert plan.spend_status == models.SPEND_STATUS_KNOWN
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_spend_unknown_defers_everything_with_typed_reason_not_daily_budget():
+    # Same ceiling/cost as a would-be over-budget scenario, but the caller
+    # marks spend as unknown — nothing may be assigned, and the reason must
+    # say *why* honestly rather than lying that the budget was checked and
+    # found exhausted.
+    policy = DispatchPolicy(cost_matrix={"claude_code": 0.1})
+    executors = [_executor("claude_code", cost=0.1)]
+    tasks = [_task("t1"), _task("t2")]
+    plan = _plan(
+        tasks,
+        executors,
+        policy,
+        max_daily_spend_usd=1.0,
+        spend_status=models.SPEND_STATUS_UNKNOWN,
+    )
+
+    assert plan.assignments == ()
+    assert plan.spend_status == models.SPEND_STATUS_UNKNOWN
+    assert {d.reason for d in plan.decisions} == {models.DEFER_SPEND_UNKNOWN}
+    assert all(d.reason != models.DEFER_DAILY_BUDGET for d in plan.decisions)
+
+
+def test_spend_unknown_is_checked_even_when_kill_switch_is_off():
+    policy = DispatchPolicy()
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        kill_switch_engaged=False,
+        max_daily_spend_usd=1.0,
+        spend_status=models.SPEND_STATUS_UNKNOWN,
+    )
+
+    assert plan.kill_switch_engaged is False
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_SPEND_UNKNOWN
+
+
+# --------------------------------------------------------------------------
 # Kill switch is respected — nothing is assigned while engaged
 # --------------------------------------------------------------------------
 

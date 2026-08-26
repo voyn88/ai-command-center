@@ -6,7 +6,11 @@ never reimplementing them:
 * queued tasks       -> `tasks_repository.load_tasks` (single reader of the board)
 * executor pool      -> `executors.EXECUTORS` + their live availability probes
 * permitted per task -> `project_config.allowed_execution_providers`
-* daily spend        -> `task_pipeline.daily_spend_usd` (the trailing-24h primitive)
+* daily spend        -> `task_pipeline.daily_spend_usd` (the trailing-24h primitive;
+                        raises `task_pipeline.SpendUnknownError` rather than a
+                        number that isn't trustworthy — this layer turns that
+                        into an honest `spend_status: unknown` on the plan,
+                        never a false "budget exhausted")
 * spend ceiling      -> `pipeline_settings.max_daily_spend_usd`
 * kill switch        -> `pipeline_settings.enabled` (the master switch the
                         `task_pipeline.kill_switch` sets off)
@@ -29,6 +33,8 @@ from command_center import task_pipeline
 from command_center.project_config import is_sensitive
 from command_center.dispatch import policy_config
 from command_center.dispatch.models import (
+    SPEND_STATUS_KNOWN,
+    SPEND_STATUS_UNKNOWN,
     DispatchPlan,
     DispatchPolicy,
     ExecutorProfile,
@@ -166,10 +172,21 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # `enabled=False`. Dispatch must never launch while it is off.
     kill_switch_engaged = not settings.enabled
 
-    try:
-        spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed (assume ceiling hit)
-        spend = settings.max_daily_spend_usd or 0.0
+    # Spend only needs to be trustworthy while it can actually gate something:
+    # with no ceiling configured, nothing downstream reads the number.
+    spend = 0.0
+    spend_status = SPEND_STATUS_KNOWN
+    if settings.max_daily_spend_usd > 0:
+        try:
+            spend = task_pipeline.daily_spend_usd(resolved_db)
+        except task_pipeline.SpendUnknownError as exc:
+            # Diagnostic branch, not a blanket `except Exception`: only "spend
+            # could not be computed as a trustworthy number" is treated as
+            # spend_status=unknown (which `plan_dispatch` defers on honestly,
+            # never as a fabricated "budget exhausted"). Any other exception
+            # here is a real bug and must propagate, not be disguised as one.
+            spend = 0.0
+            spend_status = SPEND_STATUS_UNKNOWN
 
     return plan_dispatch(
         collect_queued_tasks(root),
@@ -179,6 +196,7 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         max_daily_spend_usd=settings.max_daily_spend_usd,
         kill_switch_engaged=kill_switch_engaged,
         active_by_executor=active_by_executor(resolved_db),
+        spend_status=spend_status,
     )
 
 

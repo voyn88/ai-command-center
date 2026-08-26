@@ -513,3 +513,80 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     )
     ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert [d.task_id for d in ungated.launched()] == ["s"]
+
+
+def _completed_run_with_cost(api, project, cost):
+    """A COMPLETED run whose provider reported `total_cost_usd = cost`
+    (whatever shape `cost` is — including malformed ones)."""
+    task = runtime_db.create_task(
+        api.db_path, project=project, title="prior", task_type="implementation"
+    )
+    session = runtime_db.create_session(
+        api.db_path, task_id=task["id"], project=project, repository_path="/tmp/x"
+    )
+    run = runtime_db.create_run(
+        api.db_path, session_id=session["id"], task_id=task["id"],
+        project=project, task_type="implementation", repository_path="/tmp/x",
+        prompt="prior", is_resume=False,
+    )
+    runtime_db.append_run_event(
+        api.db_path, run["id"], "stream_event",
+        {"type": "result", "total_cost_usd": cost, "usage": {"input_tokens": 1}},
+    )
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (models.iso_now(), run["id"]),
+            )
+    return run
+
+
+@pytest.mark.parametrize(
+    "bad_cost",
+    [float("nan"), float("inf"), -1.0, "1.50", None, True],
+    ids=["nan", "inf", "negative", "string", "null", "bool"],
+)
+def test_daily_spend_usd_raises_rather_than_fails_open_on_untrustworthy_cost(
+    tmp_path, api, bad_cost
+):
+    """Follow-up on the adversarial rejection of #387: a `total_cost_usd` that
+    is non-finite, negative, or not actually a number must raise
+    `SpendUnknownError` — silently skipping it (fail-open, permits launches)
+    or accepting `NaN`/negative values (comparisons against the ceiling then
+    go quietly false) would defeat the daily budget entirely."""
+    _completed_run_with_cost(api, "AIOS", bad_cost)
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(api.db_path)
+    assert excinfo.value.reason == task_pipeline.SpendUnknownReason.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_unknown_defers_launch_without_claiming_budget_exhausted(
+    tmp_path, api
+):
+    """A corrupt cost event must not make the tick fail open (launch anyway)
+    NOR make it lie that the budget was checked and found exhausted — it must
+    report the distinct, honest `LAUNCH_SPEND_UNKNOWN` status."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-u")
+    wt = tmp_path / "wt" / "u"
+    task = _task("u", "AIOS", wt, branch="task/u")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"u": task})
+    configs = project_config.load_project_configs()
+
+    _completed_run_with_cost(api, "AIOS", float("nan"))
+
+    result = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+    assert result.launched() == []
+    assert result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN
+    assert result.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED

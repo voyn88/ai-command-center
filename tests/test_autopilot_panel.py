@@ -228,6 +228,17 @@ def test_auto_launch_disabled_is_explained_rather_than_looking_broken(isolated_d
     assert "Автозапуск выключен" in _captions(at)
 
 
+def test_spend_unknown_is_explained_and_not_shown_as_budget_exhausted(isolated_data_dir):
+    """VOYN-W0-AICC-REPORT-319-REM: an operator must see that spend could not
+    be computed, distinct from every other reason nothing launched."""
+    result = _tick_result(
+        decisions=(_decision(),), launch_status=task_pipeline.LAUNCH_SPEND_UNKNOWN
+    )
+    at = _at(**{autopilot_panel.TICK_RESULT_KEY: result})
+    warnings = "\n".join(w.value for w in at.warning)
+    assert "не удалось достоверно посчитать" in warnings
+
+
 def test_busy_tick_is_reported_as_information_not_failure(isolated_data_dir):
     result = _tick_result(ran=False, status=task_pipeline.TICK_BUSY)
     at = _at(**{autopilot_panel.TICK_RESULT_KEY: result})

@@ -168,6 +168,11 @@ TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
 LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
+# Distinct from LAUNCH_BUDGET_EXHAUSTED on purpose: this means the trailing-24h
+# spend could not be computed as a trustworthy number (SpendUnknownError), not
+# that it was computed and found at/over the ceiling. Conflating the two would
+# tell the operator a false "budget exhausted" story instead of the true one.
+LAUNCH_SPEND_UNKNOWN = "daily_spend_unknown"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -2225,21 +2230,33 @@ def _locked_tick(
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
     spend_budget_exhausted = False
+    spend_unknown = False
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
         try:
             spend_budget_exhausted = (
                 daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
             )
-        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+        except SpendUnknownError as exc:
+            # Diagnostic branch, not a blanket `except Exception`: only "spend
+            # could not be computed as a trustworthy number" lands here and is
+            # reported as its own true state. Fails closed the same as a
+            # budget-exhausted verdict (no launch either way) but never lies
+            # about *why* — and any other, unexpected fault in this call is a
+            # real bug that must propagate rather than being hidden behind a
+            # fabricated "budget exhausted".
             _record(exc, "daily_spend_budget")
-            spend_budget_exhausted = True
-    if settings.auto_launch_active and not spend_budget_exhausted:
+            spend_unknown = True
+    if settings.auto_launch_active and not spend_budget_exhausted and not spend_unknown:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
     else:
         launch_status = (
-            LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
+            LAUNCH_SPEND_UNKNOWN
+            if spend_unknown
+            else LAUNCH_BUDGET_EXHAUSTED
+            if spend_budget_exhausted
+            else LAUNCH_DISABLED
         )
 
     # 9b. Nothing silently stuck: compute, from the post-dispatch state, every
@@ -2401,35 +2418,80 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     }
 
 
+class SpendUnknownReason:
+    """Typed reasons `daily_spend_usd` cannot answer trustworthily."""
+
+    QUERY_FAILED = "spend_query_failed"
+    CORRUPT_COST_EVENT = "corrupt_cost_event"
+
+
+class SpendUnknownError(RuntimeError):
+    """Raised by `daily_spend_usd` instead of returning a number that is not
+    trustworthy. Trailing-24h spend gates a real safety property (whether
+    auto-launch may spend more money), so "could not compute it" must never be
+    silently coerced into "$0 spent" (fails open) or "at the budget ceiling"
+    (a false budget-exhausted verdict) — a caller must observe this as its own
+    explicit, diagnosable state (`spend_status: unknown`)."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        self.reason = reason
+        self.detail = detail
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
     work started in it). Reads only the final `result` stream events, which are
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
+
+    Trustworthy or raises: a matched event whose `total_cost_usd` cannot be
+    read as a finite, non-negative number — a string, `null`, a bool, JSON
+    `NaN`/`Infinity`, or a negative value — raises `SpendUnknownError` instead
+    of silently contributing 0 or a value that would understate real spend.
+    A query/decode fault raises too, for the same reason. See
+    `SpendUnknownError`.
     """
     import json as _json
+    import math as _math
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
     cutoff = (anchor - _td(hours=24)).isoformat(timespec="seconds")
     total = 0.0
-    with runtime_db.connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT run_event.payload_json AS payload FROM run_event
-              JOIN run ON run.id = run_event.run_id
-               AND run_event.payload_json LIKE '%total_cost_usd%'
-               AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
-            """,
-            (cutoff, cutoff),
-        ).fetchall()
+    try:
+        with runtime_db.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT run_event.payload_json AS payload FROM run_event
+                  JOIN run ON run.id = run_event.run_id
+                   AND run_event.payload_json LIKE '%total_cost_usd%'
+                   AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
+                """,
+                (cutoff, cutoff),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — diagnosed and re-raised typed, not swallowed
+        raise SpendUnknownError(SpendUnknownReason.QUERY_FAILED, str(exc)) from exc
     for row in rows:
         try:
             payload = _json.loads(row["payload"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            raise SpendUnknownError(
+                SpendUnknownReason.CORRUPT_COST_EVENT, "unparseable run_event payload"
+            ) from exc
+        if not isinstance(payload, dict) or "total_cost_usd" not in payload:
             continue
         cost = payload.get("total_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total += float(cost)
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, (int, float))
+            or not _math.isfinite(cost)
+            or cost < 0
+        ):
+            raise SpendUnknownError(
+                SpendUnknownReason.CORRUPT_COST_EVENT,
+                f"non-finite/negative/non-numeric total_cost_usd: {cost!r}",
+            )
+        total += float(cost)
     return total

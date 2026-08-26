@@ -37,6 +37,9 @@ from command_center.dispatch.models import (
     DEFER_NO_AVAILABLE_EXECUTOR,
     DEFER_NO_ELIGIBLE_EXECUTOR,
     DEFER_PROJECT_BUDGET,
+    DEFER_SPEND_UNKNOWN,
+    SPEND_STATUS_KNOWN,
+    SPEND_STATUS_UNKNOWN,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
@@ -104,9 +107,18 @@ def plan_dispatch(
     max_daily_spend_usd: float,
     kill_switch_engaged: bool,
     active_by_executor: dict[str, int] | None = None,
+    spend_status: str = SPEND_STATUS_KNOWN,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
-    guarantees this function structurally enforces."""
+    guarantees this function structurally enforces.
+
+    `spend_status` is `SPEND_STATUS_UNKNOWN` when the caller could not compute
+    `daily_spend_usd` as a trustworthy number (see
+    `task_pipeline.SpendUnknownError`) — `daily_spend_usd` is then a
+    placeholder, not a real trailing-24h figure. This function never treats a
+    placeholder as real spend; it defers every task with `DEFER_SPEND_UNKNOWN`
+    instead, the same structural fail-closed treatment the kill switch gets.
+    """
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
 
@@ -127,6 +139,30 @@ def plan_dispatch(
             daily_spend_usd=daily_spend_usd,
             max_daily_spend_usd=max_daily_spend_usd,
             projected_spend_usd=daily_spend_usd,
+            spend_status=spend_status,
+        )
+
+    # (1b) Spend status must be known before any budget arithmetic is trusted.
+    # Unknown means `daily_spend_usd` is a placeholder — assigning against it,
+    # or reporting the budget as exhausted, would both be false claims. Every
+    # task defers with the typed DEFER_SPEND_UNKNOWN reason instead.
+    if spend_status == SPEND_STATUS_UNKNOWN:
+        decisions = tuple(
+            DispatchDecision(
+                task_id=t.id,
+                project=t.project,
+                priority=t.priority,
+                reason=DEFER_SPEND_UNKNOWN,
+            )
+            for t in sorted(tasks, key=lambda t: _task_sort_key(t, policy))
+        )
+        return DispatchPlan(
+            decisions=decisions,
+            kill_switch_engaged=False,
+            daily_spend_usd=daily_spend_usd,
+            max_daily_spend_usd=max_daily_spend_usd,
+            projected_spend_usd=daily_spend_usd,
+            spend_status=SPEND_STATUS_UNKNOWN,
         )
 
     # (3) SLA/priority order.
@@ -213,6 +249,7 @@ def plan_dispatch(
         daily_spend_usd=daily_spend_usd,
         max_daily_spend_usd=max_daily_spend_usd,
         projected_spend_usd=projected,
+        spend_status=spend_status,
     )
 
 

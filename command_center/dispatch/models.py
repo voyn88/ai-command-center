@@ -26,6 +26,11 @@ DEFER_PROJECT_BUDGET = "project_budget_exceeded"
 DEFER_AGENT_CAPACITY = "agent_capacity_reached"
 DEFER_NO_ELIGIBLE_EXECUTOR = "no_eligible_executor"
 DEFER_NO_AVAILABLE_EXECUTOR = "no_available_executor"
+# Distinct from DEFER_DAILY_BUDGET on purpose: the trailing-24h spend could not
+# be computed as a trustworthy number (see `task_pipeline.SpendUnknownError`),
+# not computed and found at/over the ceiling. Every task defers rather than
+# assigning against a guessed number, but the *reason* stays honest.
+DEFER_SPEND_UNKNOWN = "daily_spend_unknown"
 
 DEFER_REASONS = frozenset(
     {
@@ -36,8 +41,16 @@ DEFER_REASONS = frozenset(
         DEFER_AGENT_CAPACITY,
         DEFER_NO_ELIGIBLE_EXECUTOR,
         DEFER_NO_AVAILABLE_EXECUTOR,
+        DEFER_SPEND_UNKNOWN,
     }
 )
+
+# `DispatchPlan.spend_status`: whether `daily_spend_usd` on the plan is a real,
+# trustworthy trailing-24h figure or a placeholder because it could not be
+# computed. Never inferred from the number itself (a placeholder 0.0 must not
+# be read as "nothing spent") — always carried as its own explicit field.
+SPEND_STATUS_KNOWN = "known"
+SPEND_STATUS_UNKNOWN = "unknown"
 
 # Human-readable one-liners, kept next to the codes so both the API and the
 # operator UI render the same explanation.
@@ -62,6 +75,11 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "No executor is permitted for this task by project/pin policy."
     ),
     DEFER_NO_AVAILABLE_EXECUTOR: "No permitted executor is currently available.",
+    DEFER_SPEND_UNKNOWN: (
+        "Trailing 24h spend could not be computed as a trustworthy number "
+        "(corrupt cost data or a database fault): deferring rather than "
+        "assigning against a guessed figure or a false budget-exhausted verdict."
+    ),
 }
 
 
@@ -288,6 +306,11 @@ class DispatchPlan:
     daily_spend_usd: float
     max_daily_spend_usd: float
     projected_spend_usd: float
+    # SPEND_STATUS_KNOWN or SPEND_STATUS_UNKNOWN. When unknown, `daily_spend_usd`
+    # / `projected_spend_usd` are placeholders (not a real trailing-24h figure)
+    # and every decision defers with DEFER_SPEND_UNKNOWN — read this field
+    # first, never infer "known" from the numbers looking plausible.
+    spend_status: str = SPEND_STATUS_KNOWN
 
     @property
     def assignments(self) -> tuple[DispatchDecision, ...]:
@@ -307,6 +330,7 @@ class DispatchPlan:
         remaining = self.budget_remaining_usd
         return {
             "kill_switch_engaged": self.kill_switch_engaged,
+            "spend_status": self.spend_status,
             "daily_spend_usd": self.daily_spend_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,

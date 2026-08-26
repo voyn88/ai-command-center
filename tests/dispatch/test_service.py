@@ -178,6 +178,62 @@ def test_plan_enforces_daily_budget_from_pipeline_settings(monkeypatch, pool):
     assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
 
 
+def test_plan_defers_with_spend_unknown_rather_than_a_false_budget_verdict(
+    monkeypatch, pool
+):
+    """When `task_pipeline.daily_spend_usd` cannot answer trustworthily, the
+    service must surface `spend_status: unknown` / `DEFER_SPEND_UNKNOWN` —
+    never fabricate "spent == the ceiling" and report a false
+    `DEFER_DAILY_BUDGET` (VOYN-W0-AICC-REPORT-319-REM)."""
+    import dataclasses
+
+    _enable_master_switch()
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=0.4)
+    )
+
+    def _raise(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SpendUnknownReason.CORRUPT_COST_EVENT, "nan cost"
+        )
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert plan.spend_status == models.SPEND_STATUS_UNKNOWN
+    assert plan.decisions[0].reason == models.DEFER_SPEND_UNKNOWN
+    assert plan.decisions[0].reason != models.DEFER_DAILY_BUDGET
+
+
+def test_plan_ignores_a_spend_error_when_no_budget_ceiling_is_configured(
+    monkeypatch, pool
+):
+    """No ceiling means nothing downstream reads the daily-spend figure, so an
+    unreadable one must not block dispatch — mirrors the same short-circuit
+    `task_pipeline.tick` already applies before ever calling
+    `daily_spend_usd`."""
+    _enable_master_switch()
+
+    def _raise(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SpendUnknownReason.QUERY_FAILED, "db locked"
+        )
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert plan.spend_status == models.SPEND_STATUS_KNOWN
+    assert plan.assignments[0].assigned_executor == "ollama"
+
+
 # --------------------------------------------------------------------------
 # assign() applies through tasks_repository
 # --------------------------------------------------------------------------
