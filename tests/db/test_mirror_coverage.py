@@ -33,8 +33,7 @@ from pathlib import Path
 import pytest
 
 from command_center.db import roles
-
-from tests.db.mirror_discovery import mirror_classes
+from command_center.db.mirror_registry import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
 COMMAND_CENTER = ROOT / "command_center"

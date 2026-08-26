@@ -34,11 +34,13 @@ from pathlib import Path
 import pytest
 
 from command_center import record_mirror
-from command_center.db.table_mirror import MirroredTable, PostgresTableMirror
-from command_center.db.table_mirror import divergence_against
+from command_center.db.mirror_registry import mirror_classes
+from command_center.db.table_mirror import (
+    MirroredTable,
+    PostgresTableMirror,
+    divergence_against,
+)
 from command_center.runtime.db import core as runtime_core
-
-from tests.db.mirror_discovery import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
 DDL = (ROOT / "command_center/db/sql/0001_initial.up.sql").read_text(encoding="utf-8")
@@ -75,7 +77,7 @@ def _discover() -> list[tuple[str, type[PostgresTableMirror]]]:
     """Every declared mirror, found rather than listed.
 
     Membership is decided by what a class *is*, not by what its file is called
-    — see `mirror_discovery`, which both this suite and the stored-reader
+    — see `mirror_registry`, which both this suite and the stored-reader
     fitness gate now share. The earlier rule read `command_center/db/*_store.py`
     in each of them, and slice 9's acceptance used it to relocate the very
     defect that slice had just fixed: a mirror declared elsewhere in the package

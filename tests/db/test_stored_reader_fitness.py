@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.db.mirror_discovery import mirror_classes
+from command_center.db.mirror_registry import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
 AUTHORITY = ROOT / "command_center/runtime/db"
@@ -35,7 +35,7 @@ def _mirrored_tables() -> dict[str, object]:
 
     Both suites used to carry their own `command_center/db/*_store.py` scan.
     Slice 9's acceptance defeated that rule by putting a mirror in a file with
-    another name, so the rule now lives once, in `mirror_discovery`, and is
+    another name, so the rule now lives once, in `mirror_registry`, and is
     about what a class is rather than where it sits.
     """
     return {table: module for table, (_mirror, module) in mirror_classes().items()}

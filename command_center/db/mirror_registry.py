@@ -1,16 +1,22 @@
 """Which classes are mirrors — asked once, answered the same way everywhere.
 
-Two suites need this list: the contract, which enrols every mirror in the
-per-table checks, and the stored-reader fitness gate, which asks the authority
-package a question per mirrored table. They had a copy each, and both copies
-read `command_center/db/*_store.py`.
+Originally a test helper (`tests/db/mirror_discovery.py`): two suites needed
+this list, the contract that enrols every mirror in the per-table checks and
+the stored-reader fitness gate that asks the authority package a question per
+mirrored table. A third consumer arrived with the cutover reconciliation gate
+(`command_center.db.reconcile`, VOYN-W0-AICC-SRV-07b) — production code that
+must discover every mirrored table to run its own `divergence` function
+against it, and production code cannot depend on `tests/`. Moved rather than
+imported across the boundary, so the one rule about what counts as a mirror
+has one home instead of a production copy drifting from the test one.
 
-Slice 9's acceptance showed what that costs. A mirror declared in
-`command_center/db/run_mirror.py` with a deliberately wrong key was collected by
-neither, passed everything, and the contract still reported seventeen tables —
-the blocking defect of that slice, relocated by renaming a file. Fixing one copy
-would have left the other, which is the argument for this module existing at
-all: a rule with two implementations has two answers eventually.
+Slice 9's acceptance showed what a second implementation costs. A mirror
+declared in `command_center/db/run_mirror.py` with a deliberately wrong key was
+collected by neither existing copy, passed everything, and the contract still
+reported seventeen tables — the blocking defect of that slice, relocated by
+renaming a file. Fixing one copy would have left the other, which is the
+argument for this module existing at all: a rule with two implementations has
+two answers eventually.
 
 Slice 10's acceptance then showed that the first fix was still a rule about
 *spelling*. Membership was decided by the literal text `PostgresTableMirror`
@@ -24,9 +30,9 @@ read only to choose which modules to *import*, and the set itself comes from
 
 Sources are still read rather than the package imported wholesale:
 `command_center/db/pool.py` imports `aios_db`, so importing everything would
-make both suites collectible only on a machine with a PostgreSQL client library
-— and the serverless configuration is exactly where the declaration checks are
-the only ones still running.
+make every consumer collectible only on a machine with a PostgreSQL client
+library — and the serverless configuration is exactly where the declaration
+checks are the only ones still running.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from __future__ import annotations
 import importlib
 import sys
 from pathlib import Path
+from typing import TypeVar
 
 from command_center.db.table_mirror import PostgresTableMirror
 
@@ -71,9 +78,19 @@ def modules_declaring_mirrors() -> list[str]:
     return found
 
 
-def _every_subclass(root: type) -> list[type]:
-    """`root`'s subclasses, transitively — a subclass of a mirror is a mirror."""
-    seen: list[type] = []
+_M = TypeVar("_M", bound=PostgresTableMirror)
+
+
+def _every_subclass(root: type[_M]) -> list[type[_M]]:
+    """`root`'s subclasses, transitively — a subclass of a mirror is a mirror.
+
+    Bound to `PostgresTableMirror` rather than plain `type` so the result
+    still carries `.spec` for `mirror_classes()` below — a bare `type` return
+    would type-check `mirror_classes()`'s `subclass.spec.table` as an error on
+    every call rather than the missing declaration `__init_subclass__` already
+    refuses at import time.
+    """
+    seen: list[type[_M]] = []
     for subclass in root.__subclasses__():
         seen.append(subclass)
         seen.extend(_every_subclass(subclass))

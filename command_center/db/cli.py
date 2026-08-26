@@ -142,6 +142,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    sub.add_parser(
+        "reconcile",
+        help="Zero-tolerance parity gate (VOYN-W0-AICC-SRV-07b): compare "
+        "every mirrored table's SQLite authority row by row against its "
+        "PostgreSQL mirror. Exits non-zero if a single row anywhere "
+        "disagrees -- the cutover is gated on a clean run of this.",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -411,6 +419,28 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "reconcile":
+                from command_center.db.reconcile import reconcile, targets_from_registry
+                from command_center.runtime.db import core as runtime_core
+
+                targets = targets_from_registry(lambda: nullcontext(conn))
+                with runtime_core.connect(runtime_core.resolve_db_path()) as sqlite_conn:
+                    report = reconcile(sqlite_conn, targets)
+                for table_report in report.tables:
+                    status = "CLEAN" if table_report.clean else "DIRTY"
+                    print(
+                        f"{status:5} {table_report.table} "
+                        f"({len(table_report.differences)} difference(s))"
+                    )
+                    for difference in table_report.differences:
+                        print(f"      id={difference['id']} fields={difference['fields']}")
+                print(
+                    f"{'CLEAN' if report.clean else 'DIRTY'} overall: "
+                    f"{len(report.dirty)}/{len(report.tables)} table(s) diverge"
+                )
+                # Zero tolerance: any divergence anywhere is a failed run.
+                return 0 if report.clean else 1
 
             if args.command == "downgrade":
                 if not args.confirmed:
