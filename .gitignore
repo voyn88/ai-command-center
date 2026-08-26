@@ -75,3 +75,8 @@ runtime.db-wal
 .aider.tags.cache.v4/
 data/integration_registry.json
 data/integration_registry.lock
+.artifacts/
+
+# pytest-testmon's local coverage-derived test<->source dependency cache
+# (`make test-impacted`). Per-checkout, never shared — CI does not use it.
+.testmondata

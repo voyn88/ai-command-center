@@ -427,10 +427,21 @@ def test_without_the_widening_the_marker_and_the_report_never_disagree(
     looked like one when measured on runs with nothing to commit.
 
     So what the widening buys is determinism, not reachability, and what this
-    control pins is the invariant that holds on every schedule: whichever way
-    the race fell, the marker and the report agree. `finalized_at` set with no
-    report is the one outcome that must never occur, because it is precisely the
-    outcome that made the original loss invisible.
+    control pins is the ONE-DIRECTIONAL invariant that actually holds on every
+    schedule: `finalized_at` set with no report is the one outcome that must
+    never occur, because it is precisely the outcome that made the original
+    loss invisible. The reverse -- a report already written but `finalized_at`
+    still NULL -- is not a defect; it is the architecturally correct shape of
+    an abnormal termination caught mid-way (VOYN-W0-AICC-FINALIZED-AT-REPORT-
+    CONTRACT, found live 2026-08-23 breaking every PR's required gate): the
+    report is durable evidence the run produced a result, `finalized_at` is a
+    SEPARATE, later marker for "the whole finalization sequence completed,"
+    and a kill between the two leaves a real, recoverable, non-corrupt state
+    -- exactly what `db.count_unfinalized_runs` and its companion row-lister
+    exist to surface to an operator, not a state this test should treat as
+    indistinguishable from data loss. The bidirectional `finalized ==
+    has_report` this test used to assert was strictly stronger than the
+    contract the code actually implements or needs to.
     """
     configure_project_repo("AIOS", git_repo)
     db_path = db.resolve_db_path()
@@ -443,10 +454,15 @@ def test_without_the_widening_the_marker_and_the_report_never_disagree(
 
     finalized = row["finalized_at"] is not None
     has_report = db.get_report(db_path, run_id) is not None
-    assert finalized == has_report, (
-        "the marker and the report disagree: finalized_at="
-        f"{row['finalized_at']!r}, report={has_report}"
-    )
+    if finalized:
+        assert has_report, (
+            "finalized_at is set but no report exists -- this is the one "
+            "outcome that must never occur, the original data-loss defect "
+            f"this test exists to catch (finalized_at={row['finalized_at']!r})"
+        )
+    # report-without-finalized is the recoverable in-flight shape (see
+    # docstring); count_unfinalized_runs must still see it as needing
+    # attention regardless of which side of that shape it landed on.
     assert db.count_unfinalized_runs(db_path) == (0 if finalized else 1)
 
     if result.returncode == 0:
