@@ -398,11 +398,16 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     # keeps exactly the checks that treat the tree as DATA (ruff: parse +
     # lint, which also catches syntax errors), run by the worker's own
     # trusted interpreter with explicit argv and a minimal explicit env --
-    # nothing inherited or worktree-resident can redirect them. The
-    # impacted-TEST phase lives where candidate code already executes: the
-    # agent's own sandboxed run, and the interactive band (`make prepush`).
-    # `already_durable` redeliveries skip the gate: that head's verdict was
-    # taken before the original push.
+    # nothing inherited or worktree-resident can redirect them. NOTHING on
+    # this publish path runs the impacted-TEST phase: enforcing it for
+    # agents requires an allowlisted profile in the privileged
+    # principal-isolation launcher (candidate code may only execute under
+    # the isolated principal), which is VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS
+    # -- a separate security-designed task. Until it lands, tests pre-push
+    # exist only in interactive `make prepush`, and the authoritative
+    # enforcement remains the required CI suite. `already_durable`
+    # redeliveries skip the gate: that head's verdict was taken before the
+    # original push.
     if not already_durable:
         gate_failure = _static_quality_gate(repo_path, head_sha)
         if gate_failure is not None:

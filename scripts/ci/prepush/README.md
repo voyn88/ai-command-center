@@ -15,16 +15,22 @@ costs an agent a full diagnose → fix → new SHA → CI → review cycle.
 
 - Interactive writers: `make prepush` (the full band, including the
   impacted-test phases — a human running their own code).
-- The agent's own sandboxed run is the other place candidate tests execute.
+- Agents may run it inside their own sandboxed run (the script is in their
+  worktree); nothing on the publish path enforces that today.
 - `publish_run` (`command_center/orchestrator/publish.py`) does **not**
   execute this script: in that credentialed worker context the worktree is
   candidate content, and executing it would be candidate-controlled host
   command execution (verification finding on head `254154a`). The publish
-  side instead runs `_static_quality_gate` — ruff (parse + lint, catches
+  side enforces only `_static_quality_gate` — ruff (parse + lint, catches
   syntax errors) from the worker's own trusted interpreter with explicit
   argv and a minimal explicit env, treating the tree strictly as data. A red
   gate refuses the publish with `reason=quality_band_failed: …` before the
-  lease is acquired.
+  lease is acquired. Enforced pre-push impacted tests for the agent path
+  require an allowlisted profile in the privileged principal-isolation
+  launcher — that is VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS, a separate,
+  security-designed task; until it lands, the impacted-test half of the
+  red-rate reduction is delivered by CI (authoritative) and interactive
+  `make prepush` only.
 
 ## What it is not
 
@@ -32,5 +38,5 @@ A gate. The required CI suite is unchanged and authoritative. The band can
 only fail *sooner*, never *instead*: trigger-all selections (`mode=all`) and
 hosts without a `.venv` defer to CI rather than blocking, and
 `VOYN_QUALITY_BAND=off` bypasses it (printed, never silent).
-`VOYN_QUALITY_BAND_BASE` pins the selection base; `publish_run` sets it to its
-pinned base SHA so selection matches the exact publish diff.
+`VOYN_QUALITY_BAND_BASE` pins the selection base for direct invocations;
+`publish_run` neither runs this script nor sets any of its environment.

@@ -11,9 +11,12 @@ PY := .venv/bin/python
 preflight:
 	./scripts/preflight.sh
 
-## The full pre-push quality band: preflight plus the impacted tests for the
-## current diff vs origin/main (what `publish_run` runs before every agent
-## push). See scripts/ci/prepush/README.md.
+## The full pre-push quality band for INTERACTIVE writers: preflight plus the
+## impacted tests for the current diff vs origin/main. `publish_run` runs only
+## the non-executing ruff gate (candidate trees are data in that credentialed
+## context); impacted tests pre-push for agents arrive with the sandboxed
+## launcher profile (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS). See
+## scripts/ci/prepush/README.md.
 prepush:
 	./scripts/ci/prepush/quality_band.sh
 
