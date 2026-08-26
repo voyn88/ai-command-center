@@ -1,0 +1,18 @@
+# Per-host self-deploy tick (VOYN-W0-AICC-DEPLOY-AUTOMATION).
+#
+# Template: each host installs this with ITS OWN --restart list appended to
+# ExecStart -- the control host (database owner, oneshot ticks) adds
+# `--migrate` and no --restart; a worker host lists its worker daemons:
+#   --restart voyn-aicc-worker.service --restart voyn-aicc-worker-2.service ...
+# The command is fail-closed (diverged/dirty checkout, dependency-manifest
+# change) and rolls back checkout + services on migration/smoke/restart
+# failure; a non-zero exit marks the tick failed in systemd for the operator.
+[Unit]
+Description=AICC per-host self-deploy tick (merged -> deployed)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=voynadmin
+WorkingDirectory=/home/voynadmin/aicc-preprod/repo
+ExecStart=/bin/bash -lc "set -a && source /home/voynadmin/aicc-preprod/.env 2>/dev/null; set +a; exec /home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.db self-deploy --repo-path /home/voynadmin/aicc-preprod/repo"

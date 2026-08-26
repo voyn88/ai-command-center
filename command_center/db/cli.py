@@ -103,6 +103,33 @@ def build_parser() -> argparse.ArgumentParser:
         "(aicc-backlog-merge.timer). Needs --repo-path.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
 
+    self_deploy = sub.add_parser(
+        "self-deploy",
+        help="One self-deploy tick (VOYN-W0-AICC-DEPLOY-AUTOMATION): fast-"
+        "forward this host's checkout to the remote default branch, run "
+        "migrations when asked, restart the named services, smoke, and roll "
+        "back on failure (voyn-aicc-self-deploy.timer). Fail-closed: refuses "
+        "diverged/dirty checkouts and dependency-manifest changes.",
+    )
+    self_deploy.add_argument(
+        "--repo-path", default=".", help="This host's runtime checkout."
+    )
+    self_deploy.add_argument(
+        "--restart",
+        action="append",
+        default=[],
+        metavar="SERVICE",
+        help="systemd service to restart after the checkout moves "
+        "(repeatable; worker hosts list their daemons, control hosts whose "
+        "ticks are oneshot need none).",
+    )
+    self_deploy.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Run `command_center.db upgrade` after moving the checkout "
+        "(the database-owning control host only).",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -311,6 +338,28 @@ def main(argv: list[str] | None = None) -> int:
                 for task_id, reason in marker_report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 return 0
+
+            if args.command == "self-deploy":
+                from command_center.orchestrator.self_deploy import (
+                    SelfDeployConfig,
+                    self_deploy_once,
+                )
+
+                deploy_report = self_deploy_once(
+                    args.repo_path,
+                    SelfDeployConfig(
+                        services=tuple(args.restart), migrate=args.migrate
+                    ),
+                )
+                print(
+                    f"{deploy_report.outcome.upper():10} {deploy_report.detail}"
+                )
+                for step in deploy_report.steps:
+                    print(f"STEP      {step}")
+                # A refusal or rollback is a fact for the operator (non-zero
+                # so systemd marks the tick failed and it is visible), a
+                # noop/deployed tick is success.
+                return 0 if deploy_report.outcome in ("noop", "deployed") else 1
 
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
