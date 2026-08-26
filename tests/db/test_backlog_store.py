@@ -210,6 +210,32 @@ def test_import_is_idempotent_and_loses_nothing(store) -> None:
     assert store.get_task("VOYN-W0-G1")["kind"] == "gate"
 
 
+def test_export_round_trips_the_whole_store_through_the_projection(store) -> None:
+    """BO-S4: `export_tasks` plus `render_backlog` plus a re-import must be a
+    no-op — the property that makes the generated file trustworthy as a read
+    projection rather than a lossy summary."""
+    from command_center.db.backlog_parser import parse_backlog
+    from command_center.db.backlog_projection import render_backlog
+
+    text = FIXTURE.read_text(encoding="utf-8")
+    first = store.import_markdown(text)
+    assert first.inserted > 0
+
+    exported = store.export_tasks()
+    assert len(exported) == first.inserted
+    assert all("body" in task for task in exported), "export must carry body"
+
+    rendered = render_backlog(exported, generated_at="2026-08-26T00:00:00+00:00")
+    reparsed = parse_backlog(rendered)
+    assert reparsed.unparsed == [], "a generated file must always re-parse clean"
+    assert {t.task_id for t in reparsed.tasks} == {t["task_id"] for t in exported}
+
+    # Feeding the generated file back through the importer changes nothing:
+    # the store, exported and re-imported, is a fixed point.
+    reimported = store.import_markdown(rendered)
+    assert reimported.changed == 0, "export -> import must be a no-op"
+
+
 def test_import_reports_a_record_the_schema_refuses(store) -> None:
     """The parser and the CHECKs are two fences; a record that leaps the
     first must still be caught, reported and not half-written by the second."""

@@ -72,6 +72,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    exp = sub.add_parser(
+        "backlog-export",
+        help="Render the structured store back to the Markdown projection "
+        "(BO-S4; run by aicc-backlog-export.timer during the bidirectional "
+        "migration period).",
+    )
+    exp.add_argument("path", help="Path to write VOYN_TASKS_BACKLOG.md to")
     plan = sub.add_parser(
         "backlog-plan",
         help="One planner tick (BO-S2): release finished lanes, dispatch "
@@ -226,6 +233,20 @@ def main(argv: list[str] | None = None) -> int:
                     BacklogStore(lambda: nullcontext(conn)).counts_by_status().items()
                 ):
                     print(f"{status}: {count}")
+                return 0
+
+            if args.command == "backlog-export":
+                from datetime import UTC, datetime
+                from pathlib import Path
+
+                from command_center.db.backlog_projection import render_backlog
+                from command_center.db.backlog_store import BacklogStore
+
+                tasks = BacklogStore(lambda: nullcontext(conn)).export_tasks()
+                generated_at = datetime.now(UTC).isoformat(timespec="seconds")
+                text = render_backlog(tasks, generated_at=generated_at)
+                Path(args.path).write_text(text, encoding="utf-8")
+                print(f"exported {len(tasks)} tasks to {args.path}")
                 return 0
 
             if args.command == "backlog-plan":

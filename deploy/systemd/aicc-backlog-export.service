@@ -1,0 +1,16 @@
+# The backlog export tick (VOYN-W0-BACKLOG-ORCHESTRATOR BO-S4): renders the
+# structured store back to the Markdown projection the file's owner reads.
+# Only live during the bidirectional migration period, alongside
+# aicc-backlog-import (BO-S4's IMPORT_SUNSET_DATE in
+# command_center/db/backlog_projection.py names when import retires); after
+# that date this unit's output is the only truth.
+
+[Unit]
+Description=AICC backlog Markdown export tick (BO-S4)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=aicc-worker
+EnvironmentFile=-/etc/ai-command-center.env
+ExecStart=/usr/bin/python -m command_center.db backlog-export /srv/voyn-backlog/outputs/VOYN_TASKS_BACKLOG.md

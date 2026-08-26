@@ -202,6 +202,34 @@ class BacklogStore:
                 tasks = [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
         return tasks, total
 
+    def export_tasks(self) -> list[dict[str, Any]]:
+        """Every task, with ``body``, for the Markdown projection (BO-S4).
+
+        Unlike :meth:`list_tasks` this is unpaginated and carries the field
+        the projection needs to reproduce prose (and therefore the ``repo``
+        hint embedded in it) — the caller renders the whole store in one
+        pass, not a page of it. Ordering is left to the renderer, which
+        groups by wave and cannot do that from a single SQL ``ORDER BY``
+        over the wave column's mixed numeric/named shape.
+        """
+        keys = (
+            "task_id",
+            "wave",
+            "priority",
+            "status",
+            "kind",
+            "title",
+            "body",
+            "repo",
+        )
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT task_id, wave, priority, status, kind, title, body, "
+                    "repo FROM backlog_task"
+                )
+                return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
     def list_events(self, task_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
         keys = ("event", "outcome", "reason", "actor", "detail", "created_at")
         with self._connection() as conn:

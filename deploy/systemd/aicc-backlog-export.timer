@@ -1,0 +1,13 @@
+# Schedule for aicc-backlog-export.service (BO-S4). Cadence bounds how stale
+# the read projection can get, not correctness — a render is a pure function
+# of the store, so a missed tick delays freshness and never corrupts output.
+
+[Unit]
+Description=Run the backlog Markdown export periodically (BO-S4)
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
