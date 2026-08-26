@@ -1017,6 +1017,14 @@ def get_reports_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
     return {row["run_id"]: db._row_to_dict(row) for row in rows}
 
 
+def list_reports(db_path: Path) -> list[dict]:
+    """Every report row, in the shape SQLite stores (`report_divergence`'s
+    expected input — see `command_center.db.run_children_store`)."""
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM report").fetchall()
+        return [dict(row) for row in rows]
+
+
 # --------------------------------------------------------------------------
 # Execution queue (ADR 0007) — the SQLite home of `execution_queue.json`
 #

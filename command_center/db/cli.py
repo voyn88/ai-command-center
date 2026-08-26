@@ -17,6 +17,7 @@ import argparse
 import logging
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 
 from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
@@ -94,6 +95,22 @@ def build_parser() -> argparse.ArgumentParser:
         "marker and checks are green, closing the task DONE "
         "(aicc-backlog-merge.timer). Needs --repo-path.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+
+    # The Execution Center's SQLite-authority-vs-PostgreSQL-mirror check
+    # (VOYN-W0-AICC-SRV-09-READ-POOL): a cutover of any of these tables' reads
+    # is gated on this reporting no divergence.
+    mirror_status = sub.add_parser(
+        "mirror-status",
+        help="Reconcile the Execution Center's SQLite authority (task/session/"
+        "run/report) against its PostgreSQL mirror; exits 1 if any table "
+        "disagrees.",
+    )
+    mirror_status.add_argument(
+        "--runtime-db",
+        type=Path,
+        default=None,
+        help="Path to runtime.db (defaults to the resolved per-install data dir).",
+    )
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -289,6 +306,23 @@ def main(argv: list[str] | None = None) -> int:
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 return 0
+
+            if args.command == "mirror-status":
+                from command_center.db.execution_reconciliation import (
+                    reconcile_execution_center,
+                )
+                from command_center.runtime.db import resolve_db_path
+
+                db_path = args.runtime_db or resolve_db_path()
+                report = reconcile_execution_center(db_path)
+                diverged = False
+                for table, differences in report.items():
+                    print(f"{table}: {len(differences)} divergent row(s)")
+                    for entry in differences[:20]:
+                        print(f"  {entry['id']}: {entry['fields']}")
+                    if differences:
+                        diverged = True
+                return 1 if diverged else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:

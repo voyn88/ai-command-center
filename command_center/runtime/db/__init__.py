@@ -116,6 +116,7 @@ from command_center.runtime.db.execution import (  # noqa: F401
     get_task,
     latest_events_for_runs,
     list_queue_entries,
+    list_reports,
     list_run_events,
     list_run_events_stored,
     list_runs,
