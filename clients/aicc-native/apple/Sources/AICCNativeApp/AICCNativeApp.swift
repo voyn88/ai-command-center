@@ -198,7 +198,25 @@ private struct WorkView: View {
 
     private var attention: [AICCNativeCore.Task] { tasks.filter { $0.blocker != nil } }
     private var active: [AICCNativeCore.Task] {
-        tasks.filter { $0.blocker == nil && $0.evidence.derivedStatus != .completed }
+        tasks
+            .filter { task in
+                task.blocker == nil
+                    && task.state != .done
+                    && task.evidence.derivedStatus != .completed
+            }
+            .sorted { rank($0) < rank($1) }
+    }
+
+    // What moves today first: doing > reviewing > queued > someday.
+    private func rank(_ task: AICCNativeCore.Task) -> Int {
+        switch task.state {
+        case .inProgress: 0
+        case .review: 1
+        case .next: 2
+        case .backlog, .deferred: 3
+        case .done: 4
+        case nil: 2
+        }
     }
 
     var body: some View {
@@ -207,21 +225,94 @@ private struct WorkView: View {
                 CompanionCard(title: "Пока пусто", detail: "Задачи появятся, как только сервер передаст картину.", tint: .gray)
             }
             ForEach(attention.prefix(5)) { task in
-                CompanionCard(title: task.title, detail: task.blocker ?? "Нужно ваше внимание.", tint: .orange, badge: "Внимание")
+                NavigationLink(value: task) {
+                    CompanionCard(title: task.title, detail: task.blocker ?? "Нужно ваше внимание.", tint: .orange, badge: "Внимание")
+                }.buttonStyle(.plain)
             }
             ForEach(active.prefix(20)) { task in
-                CompanionCard(title: task.title, detail: statusLine(for: task), tint: AICCTheme.plum)
+                NavigationLink(value: task) {
+                    CompanionCard(title: task.title, detail: statusLine(for: task), tint: AICCTheme.plum)
+                }.buttonStyle(.plain)
             }
         }
     }
 
     private func statusLine(for task: AICCNativeCore.Task) -> String {
+        TaskStateText.line(for: task)
+    }
+}
+
+enum TaskStateText {
+    static func line(for task: AICCNativeCore.Task) -> String {
+        if let state = task.state {
+            switch state {
+            case .backlog: return "В планах."
+            case .next: return "Следующая в очереди."
+            case .inProgress: return "В работе."
+            case .review: return "На проверке."
+            case .done: return "Завершена."
+            case .deferred: return "Ждёт вашего решения."
+            }
+        }
         switch task.evidence.derivedStatus {
-        case .inProgress: "В работе."
-        case .awaitingCI: "Идут проверки."
-        case .awaitingAcceptance: "Ждёт приёмки."
-        case .completed: "Завершена."
-        case .unknown: "Состояние уточняется."
+        case .inProgress: return "В работе."
+        case .awaitingCI: return "Идут проверки."
+        case .awaitingAcceptance: return "Ждёт приёмки."
+        case .completed: return "Завершена."
+        case .unknown: return "Состояние уточняется."
+        }
+    }
+}
+
+struct TaskDetailView: View {
+    let task: AICCNativeCore.Task
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text(task.title)
+                    .font(.system(.largeTitle, design: .serif, weight: .medium))
+                Text(TaskStateText.line(for: task))
+                    .font(.title3).foregroundStyle(.secondary)
+                if let blocker = task.blocker {
+                    CompanionCard(title: "Что требуется", detail: blocker, tint: .orange, badge: "Внимание")
+                }
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("ХОД ДОСТАВКИ").font(.caption2.weight(.bold)).tracking(1).foregroundStyle(.secondary)
+                    detailRow("Идентификатор", task.id)
+                    detailRow("Проверки (CI)", evidenceText(task.evidence.ci))
+                    detailRow("Приёмка", evidenceText(task.evidence.acceptance))
+                    if let pr = task.evidence.pullRequest { detailRow("Изменение", pr) }
+                    if let merged = task.evidence.mergedSHA { detailRow("Влито", String(merged.prefix(10))) }
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AICCTheme.lilac, in: RoundedRectangle(cornerRadius: 20))
+                Spacer()
+            }
+            .padding()
+        }
+        .navigationTitle("Задача")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+    }
+
+    private func detailRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top) {
+            Text(label).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).multilineTextAlignment(.trailing)
+        }
+    }
+
+    private func evidenceText(_ state: EvidenceState) -> String {
+        switch state {
+        case .unknown: "нет данных"
+        case .observed: "замечены"
+        case .verified: "пройдены"
+        case .rejected: "отклонены"
+        case .pending: "идут"
         }
     }
 }
@@ -297,7 +388,11 @@ private struct CompanionPage<Content: View>: View {
                     Text(subtitle).font(.title3).foregroundStyle(.secondary).padding(.bottom, 12)
                     content
                 }.padding()
-            }.navigationTitle("AICC")
+            }
+            .navigationTitle("AICC")
+            .navigationDestination(for: AICCNativeCore.Task.self) { task in
+                TaskDetailView(task: task)
+            }
         }
     }
 }

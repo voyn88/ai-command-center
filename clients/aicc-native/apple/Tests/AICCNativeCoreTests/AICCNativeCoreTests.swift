@@ -85,3 +85,17 @@ import Testing
     #expect(SnapshotCache.clear(at: url))
     #expect(SnapshotCache.load(from: url) == nil)
 }
+
+@Test func taskStateDecodesKnownAndTolatesUnknown() throws {
+    let known = Data("""
+    {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
+    """.utf8)
+    let task = try JSONDecoder().decode(AICCNativeCore.Task.self, from: known)
+    #expect(task.state == .deferred)
+
+    let future = Data("""
+    {"id":"X","title":"T","blocker":null,"state":"paused","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
+    """.utf8)
+    let tolerant = try JSONDecoder().decode(AICCNativeCore.Task.self, from: future)
+    #expect(tolerant.state == nil)
+}

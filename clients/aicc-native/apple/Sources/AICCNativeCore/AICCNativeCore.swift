@@ -1,11 +1,11 @@
 import Foundation
 import Security
 
-public enum EvidenceState: String, Codable, Sendable { case unknown, observed, verified, rejected, pending }
+public enum EvidenceState: String, Codable, Hashable, Sendable { case unknown, observed, verified, rejected, pending }
 public enum Freshness: String, Codable, Sendable { case fresh, stale, offline, degraded }
 public enum TaskStatus: String, Codable, Sendable { case inProgress = "in_progress", awaitingCI = "awaiting_ci", awaitingAcceptance = "awaiting_acceptance", completed, unknown }
 
-public struct DeliveryEvidence: Codable, Equatable, Sendable {
+public struct DeliveryEvidence: Codable, Hashable, Sendable {
     public let headSHA: String?
     public let pullRequest: String?
     public let ci: EvidenceState
@@ -30,11 +30,31 @@ public struct DeliveryEvidence: Codable, Equatable, Sendable {
     }
 }
 
-public struct Task: Codable, Identifiable, Equatable, Sendable {
+public enum TaskState: String, Codable, Hashable, Sendable {
+    case backlog, next, inProgress = "in_progress", review, done, deferred
+}
+
+public struct Task: Codable, Identifiable, Hashable, Sendable {
     public let id: String
     public let title: String
     public let blocker: String?
+    /// Additive in DTO 1.0: the backlog's execution state, when known.
+    public let state: TaskState?
     public let evidence: DeliveryEvidence
+
+    public init(id: String, title: String, blocker: String?, state: TaskState? = nil, evidence: DeliveryEvidence) {
+        self.id = id; self.title = title; self.blocker = blocker; self.state = state; self.evidence = evidence
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        blocker = try container.decodeIfPresent(String.self, forKey: .blocker)
+        // Unknown future states decode as nil rather than failing the snapshot.
+        state = try? container.decodeIfPresent(TaskState.self, forKey: .state)
+        evidence = try container.decode(DeliveryEvidence.self, forKey: .evidence)
+    }
 }
 
 public struct AgentLane: Codable, Identifiable, Equatable, Sendable {
