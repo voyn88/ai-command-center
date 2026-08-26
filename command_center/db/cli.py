@@ -129,6 +129,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run `command_center.db upgrade` after moving the checkout "
         "(the database-owning control host only).",
     )
+    self_deploy.add_argument(
+        "--branch",
+        default="main",
+        help="Remote branch to deploy from (the repository's default branch).",
+    )
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -153,6 +158,32 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
     )
     args = build_parser().parse_args(argv)
+
+    if args.command == "self-deploy":
+        # Deliberately BEFORE any database configuration or pool: a deploy
+        # must work when the database is down or this host has no DB role
+        # at all -- restoring a broken host is exactly when it runs
+        # (VOYN-W0-AICC-DEPLOY-AUTOMATION). The --migrate subprocess opens
+        # its own pool from the environment on the host that has one.
+        from command_center.orchestrator.self_deploy import (
+            SelfDeployConfig,
+            self_deploy_once,
+        )
+
+        deploy_report = self_deploy_once(
+            args.repo_path,
+            SelfDeployConfig(
+                branch=args.branch,
+                services=tuple(args.restart),
+                migrate=args.migrate,
+            ),
+        )
+        print(f"{deploy_report.outcome.upper():10} {deploy_report.detail}")
+        for step in deploy_report.steps:
+            print(f"STEP      {step}")
+        # A refusal or rollback exits non-zero so systemd surfaces the
+        # failed tick to the operator; noop/deployed is success.
+        return 0 if deploy_report.outcome in ("noop", "deployed") else 1
 
     try:
         config = load_config()
@@ -338,28 +369,6 @@ def main(argv: list[str] | None = None) -> int:
                 for task_id, reason in marker_report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 return 0
-
-            if args.command == "self-deploy":
-                from command_center.orchestrator.self_deploy import (
-                    SelfDeployConfig,
-                    self_deploy_once,
-                )
-
-                deploy_report = self_deploy_once(
-                    args.repo_path,
-                    SelfDeployConfig(
-                        services=tuple(args.restart), migrate=args.migrate
-                    ),
-                )
-                print(
-                    f"{deploy_report.outcome.upper():10} {deploy_report.detail}"
-                )
-                for step in deploy_report.steps:
-                    print(f"STEP      {step}")
-                # A refusal or rollback is a fact for the operator (non-zero
-                # so systemd marks the tick failed and it is visible), a
-                # noop/deployed tick is success.
-                return 0 if deploy_report.outcome in ("noop", "deployed") else 1
 
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc

@@ -1,12 +1,18 @@
 # Per-host self-deploy tick (VOYN-W0-AICC-DEPLOY-AUTOMATION).
 #
-# Template: each host installs this with ITS OWN --restart list appended to
-# ExecStart -- the control host (database owner, oneshot ticks) adds
-# `--migrate` and no --restart; a worker host lists its worker daemons:
-#   --restart voyn-aicc-worker.service --restart voyn-aicc-worker-2.service ...
+# Two install variants -- the difference is ONLY the ExecStart flags, and the
+# committed default is the CONTROL host (database owner: migrations run,
+# no restarts -- its ticks are oneshot units that re-exec from the checkout
+# on their next firing). A WORKER host replaces ExecStart with the variant
+# below: no --migrate (the worker role holds no DDL privilege) and its own
+# --restart list (SIGTERM is a graceful drain for the daemons):
+#
+#   ExecStart=/bin/bash -lc "exec /home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.db self-deploy --repo-path /home/voynadmin/aicc-preprod/repo --restart voyn-aicc-worker.service --restart voyn-aicc-worker-2.service --restart voyn-aicc-worker@3.service --restart voyn-aicc-worker@4.service"
+#
 # The command is fail-closed (diverged/dirty checkout, dependency-manifest
 # change) and rolls back checkout + services on migration/smoke/restart
 # failure; a non-zero exit marks the tick failed in systemd for the operator.
+# `--branch` selects the remote branch when the default branch is not main.
 [Unit]
 Description=AICC per-host self-deploy tick (merged -> deployed)
 After=network-online.target
@@ -15,4 +21,4 @@ After=network-online.target
 Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
-ExecStart=/bin/bash -lc "set -a && source /home/voynadmin/aicc-preprod/.env 2>/dev/null; set +a; exec /home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.db self-deploy --repo-path /home/voynadmin/aicc-preprod/repo"
+ExecStart=/bin/bash -lc "set -a && source /home/voynadmin/aicc-preprod/.env && set +a && exec /home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.db self-deploy --repo-path /home/voynadmin/aicc-preprod/repo --migrate"

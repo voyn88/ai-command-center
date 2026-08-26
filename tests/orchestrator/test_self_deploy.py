@@ -55,8 +55,9 @@ def calls(monkeypatch, tmp_path):
         out = "active" if args[0] == "is-active" and rc == 0 else ""
         return subprocess.CompletedProcess(args, rc, out, "" if rc == 0 else "boom")
 
-    def fake_migrations(timeout):
+    def fake_migrations(repo_path, timeout):
         recorded["migrate"] += 1
+        recorded["migrate_cwd"] = repo_path
         return subprocess.CompletedProcess([], 0, "", "")
 
     def fake_smoke(repo_path, timeout):
@@ -92,6 +93,7 @@ def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_pat
     assert report.previous_sha == first
     assert _git(clone, "rev-parse", "HEAD") == new
     assert calls["migrate"] == 1
+    assert calls["migrate_cwd"] == str(clone)  # the NEW tree, review of f794b3e
     assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
     rows = [
         json.loads(line)
@@ -162,7 +164,7 @@ def test_failed_migrations_roll_back_before_services_restart(
     _commit(origin, "advance with migration")
     monkeypatch.setattr(
         self_deploy, "_run_migrations",
-        lambda timeout: subprocess.CompletedProcess([], 1, "", "DDL boom"),
+        lambda repo_path, timeout: subprocess.CompletedProcess([], 1, "", "DDL boom"),
     )
     cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
     report = self_deploy_once(str(clone), cfg)
@@ -171,3 +173,42 @@ def test_failed_migrations_roll_back_before_services_restart(
     assert _git(clone, "rev-parse", "HEAD") == first
     # Services were never restarted onto the failed deploy.
     assert ["restart", "voyn-aicc-worker.service"] not in calls["systemctl"]
+
+
+def test_a_timeout_after_reset_still_rolls_back(pair, calls, tmp_path, monkeypatch):
+    """Review of f794b3e: subprocess timeouts must become ordinary failures,
+    not raises -- a raise after `reset --hard` would bypass rollback and
+    leave the host half-deployed. `_run_bounded` converts TimeoutExpired to
+    rc 124, and the ordinary rollback path handles that result."""
+    origin, clone, first = pair
+    _commit(origin, "advance")
+
+    # The smoke seam yields exactly what _run_bounded yields on a timeout.
+    monkeypatch.setattr(
+        self_deploy, "_import_smoke",
+        lambda repo_path, timeout: subprocess.CompletedProcess(
+            ["python"], 124, "", "timed out after 1s"
+        ),
+    )
+    report = self_deploy_once(str(clone), _cfg(tmp_path))
+    assert report.outcome == "rolled_back"
+    assert "import_smoke_failed" in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first
+
+    # And the wrapper itself, against a genuinely overrunning command:
+    bounded = self_deploy._run_bounded(["sleep", "5"], 1)
+    assert bounded.returncode == 124
+    assert "timed out" in bounded.stderr
+
+
+def test_branch_is_configurable(pair, calls, tmp_path):
+    """--branch plumbs through: a repository whose default branch is not
+    `main` deploys from its own branch (review of f794b3e)."""
+    origin, clone, _first = pair
+    _git(origin, "checkout", "-q", "-b", "trunk")
+    new = _commit(origin, "trunk advance")
+    report = self_deploy_once(
+        str(clone), _cfg(tmp_path, branch="trunk")
+    )
+    assert (report.outcome, report.detail) == ("deployed", new)
+    assert _git(clone, "rev-parse", "HEAD") == new

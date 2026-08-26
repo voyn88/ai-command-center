@@ -75,41 +75,59 @@ class SelfDeployReport:
     steps: list[str] = field(default_factory=list)
 
 
+def _run_bounded(
+    args: list[str], timeout: int, cwd: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """subprocess.run that converts TimeoutExpired into an ordinary failed
+    result (rc 124, the shell `timeout` convention) instead of raising --
+    review of f794b3e: a raise AFTER `reset --hard` (during migrations,
+    smoke, or restart) would bypass rollback and provenance entirely,
+    leaving the host half-deployed -- exactly what this module promises
+    never to happen."""
+    try:
+        return subprocess.run(
+            args, cwd=cwd, capture_output=True, text=True,
+            check=False, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args, 124, "", f"timed out after {timeout}s"
+        )
+
+
 def _git(repo_path: str, args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args], cwd=repo_path, capture_output=True, text=True,
-        check=False, timeout=timeout,
-    )
+    return _run_bounded(["git", *args], timeout, cwd=repo_path)
 
 
 def _systemctl(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     """Passwordless-sudo systemctl -- the exact grant the hosts already carry
     (`sudo -n`: never prompt; a missing grant is a refusal, not a hang)."""
-    return subprocess.run(
-        ["sudo", "-n", "systemctl", *args], capture_output=True, text=True,
-        check=False, timeout=timeout,
-    )
+    return _run_bounded(["sudo", "-n", "systemctl", *args], timeout)
 
 
-def _run_migrations(timeout: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def _run_migrations(repo_path: str, timeout: int) -> subprocess.CompletedProcess[str]:
+    # cwd=repo_path is load-bearing (review of f794b3e): the runtime package
+    # is imported from the checkout, not installed into the venv -- without
+    # it a fresh interpreter could execute the OLD tree's migration code.
+    return _run_bounded(
         [sys.executable, "-m", "command_center.db", "upgrade"],
-        capture_output=True, text=True, check=False, timeout=timeout,
+        timeout,
+        cwd=repo_path,
     )
 
 
 def _import_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess[str]:
     """The cheapest deploy smoke that still catches a broken checkout: the
     modules every tick and worker imports must import from the NEW tree."""
-    return subprocess.run(
+    return _run_bounded(
         [
             sys.executable, "-c",
             "import command_center.orchestrator.review_merge, "
             "command_center.orchestrator.planner, "
             "command_center.worker.handlers",
         ],
-        cwd=repo_path, capture_output=True, text=True, check=False,
-        timeout=timeout,
+        timeout,
+        cwd=repo_path,
     )
 
 
@@ -202,7 +220,7 @@ def self_deploy_once(
     report.steps.append(f"checkout_moved:{report.target_sha}")
 
     if cfg.migrate:
-        migrated = _run_migrations(timeout)
+        migrated = _run_migrations(repo_path, timeout)
         if migrated.returncode != 0:
             _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
             return finish(
