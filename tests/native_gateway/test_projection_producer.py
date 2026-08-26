@@ -170,3 +170,43 @@ def test_rich_execution_status_wins_and_maps_to_state(tmp_path, monkeypatch):
     assert backlog_project["needs_attention"] >= 1
     ops_project = next(p for p in projection["projects"] if p["id"] == "ops")
     assert ops_project["active_tasks"] >= 1
+
+
+def test_goal_is_the_earliest_unfinished_wave(tmp_path, monkeypatch):
+    root = _seed_root(tmp_path, monkeypatch)
+    backlog = tmp_path / "backlog.md"
+    backlog.write_text(
+        "- **VOYN-W0-G-A** | Wave 0 | DONE | P1 | X | `a` | t\n"
+        "- **VOYN-W0-G-B** | Wave 0 | DONE | P1 | X | `b` | t\n"
+        "- **VOYN-W1-G-C** | Wave 1 | IN_PROGRESS | P1 | X | `c` | t\n"
+        "- **VOYN-W1-G-D** | Wave 1 | OPEN | P1 | X | `d` | t\n"
+        "- **VOYN-W1-G-E** | Wave 1 | READY_TO_REVIEW | P1 | X | `e` | t\n",
+        encoding="utf-8",
+    )
+    projection = build_projection(root, backlog_path=backlog)
+    goal = projection["goal"]
+    # Wave 0 is fully done -> the goal is Wave 1 with its real counts.
+    assert goal == {
+        "title": "Волна 1",
+        "done": 0,
+        "total": 3,
+        "in_progress": 1,
+        "review": 1,
+    }
+
+
+def test_goal_survives_round_trip_to_snapshot(tmp_path, monkeypatch):
+    root = _seed_root(tmp_path, monkeypatch)
+    backlog = tmp_path / "backlog.md"
+    backlog.write_text(
+        "- **VOYN-W0-RT-A** | Wave 0 | DONE | P1 | X | `a` | t\n"
+        "- **VOYN-W0-RT-B** | Wave 0 | OPEN | P1 | X | `b` | t\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "projection.json"
+    write_projection(root, out, backlog_path=backlog)
+    settings = GatewaySettings(projection_path=out, token_file=tmp_path / "unused")
+    snapshot = FileProjectionSource(settings).load().snapshot
+    assert snapshot.goal is not None
+    assert snapshot.goal.title == "Волна 0"
+    assert (snapshot.goal.done, snapshot.goal.total) == (1, 2)

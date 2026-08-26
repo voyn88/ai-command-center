@@ -87,6 +87,17 @@ class BacklogStore:
         )
         return bool(ok), str(reason or ""), revision
 
+    def resume_deferred(self, task_id: str) -> tuple[bool, str, int | None]:
+        """DEFER_TO_USER -> OPEN through the 0014 machine gate: granted only
+        for a task whose latest park was a technical `cascade_exhausted:%`
+        return_to_pool, within the bounded resume budget. Owner-decision
+        parks and machine-evidence-free parks come back as refusals
+        (`owner_decision_park` / `no_machine_park_evidence`), audited."""
+        ok, reason, revision = self._row(
+            "SELECT * FROM backlog_resume_deferred(%s)", (task_id,)
+        )
+        return bool(ok), str(reason or ""), revision
+
     def record_evidence(self, task_id: str, kind: str, value: str) -> tuple[bool, str]:
         ok, reason, _revision = self._row(
             "SELECT * FROM backlog_record_evidence(%s, %s, %s)",
