@@ -1039,9 +1039,9 @@ def _remediate_rejection(
             conn.autocommit = True
 
 
-def _rerun_failing_acceptance_gate(repo_path: str, sha: str) -> None:
+def _rerun_failing_acceptance_gate(repo_path: str, pr_url: str, sha: str) -> None:
     """After posting the marker, re-run the Acceptance-gate run that failed on
-    this exact head before the marker existed.
+    this PR's exact head before the marker existed.
 
     The gate subscribes to pull_request_review and that event does fire a fresh
     run -- but a separate one. GitHub branch protection keeps evaluating the
@@ -1050,13 +1050,25 @@ def _rerun_failing_acceptance_gate(repo_path: str, sha: str) -> None:
     (live-confirmed on #383/#392/#393: the merge queue refused with "Required
     status check Acceptance gate is failing" until this run was re-run).
     Re-running that failing pull_request run makes it re-evaluate on the
-    now-present marker and go green. Best-effort and idempotent -- any failure
-    just leaves the event-driven or a manual re-run to cover it.
+    now-present marker and go green. The lookup is scoped to the PR's own head
+    branch, so a different PR that happens to share the head sha (a different
+    base branch) is never touched and the run-list window cannot be exhausted
+    by unrelated PRs' runs on an active repo. Best-effort and idempotent -- any
+    failure just leaves the event-driven or a manual re-run to cover it.
     (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
     """
+    view = _gh(["pr", "view", pr_url, "--json", "headRefName"], repo_path)
+    if view.returncode != 0:
+        return
+    try:
+        branch = (json.loads(view.stdout or "{}")).get("headRefName")
+    except json.JSONDecodeError:
+        return
+    if not branch:
+        return
     listing = _gh(
-        ["run", "list", "--workflow", "acceptance-gate.yml", "--limit", "20",
-         "--json", "databaseId,headSha,event,conclusion,status"],
+        ["run", "list", "--workflow", "acceptance-gate.yml", "--branch", branch,
+         "--limit", "30", "--json", "databaseId,headSha,event,conclusion,status"],
         repo_path,
     )
     if listing.returncode != 0:
@@ -1203,7 +1215,7 @@ def publish_review_verdicts(
         # Drive the required Acceptance-gate check green now that the marker
         # stands, so branch protection stops blocking merge on the stale
         # pre-marker run. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
-        _rerun_failing_acceptance_gate(repo_path, sha)
+        _rerun_failing_acceptance_gate(repo_path, pr_url, sha)
         report.reviewed.append((task_id, pr_url))
     return report
 

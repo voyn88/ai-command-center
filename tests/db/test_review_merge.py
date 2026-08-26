@@ -1265,8 +1265,14 @@ def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch
     sha = "a" * 40
     reran = []
 
+    branches = []
+
     def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"headRefName": "feature/x"}), "")
         if argv[:2] == ["run", "list"]:
+            branches.append(argv)  # must be scoped to the PR's branch
             body = json.dumps([
                 {"databaseId": 111, "headSha": sha, "event": "pull_request",
                  "status": "completed", "conclusion": "failure"},
@@ -1282,5 +1288,6 @@ def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    review_merge._rerun_failing_acceptance_gate("/tmp", sha)
+    review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/1", sha)
     assert reran == ["111"]  # only the failing pull_request run for THIS head
+    assert branches and "--branch" in branches[0] and "feature/x" in branches[0]
