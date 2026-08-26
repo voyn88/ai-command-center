@@ -40,7 +40,7 @@ struct AICCNativeShell: View {
         TabView(selection: $tab) {
             OverviewView(snapshot: model.snapshot, connection: model.connection)
                 .tabItem { Label(AppTab.overview.title, systemImage: AppTab.overview.icon) }.tag(AppTab.overview)
-            WorkView()
+            WorkView(tasks: model.snapshot.tasks)
                 .tabItem { Label(AppTab.work.title, systemImage: AppTab.work.icon) }.tag(AppTab.work)
             DialoguesView()
                 .tabItem { Label(AppTab.dialogues.title, systemImage: AppTab.dialogues.icon) }.tag(AppTab.dialogues)
@@ -120,11 +120,34 @@ private struct ProjectRow: View {
 }
 
 private struct WorkView: View {
+    let tasks: [AICCNativeCore.Task]
+
+    private var attention: [AICCNativeCore.Task] { tasks.filter { $0.blocker != nil } }
+    private var active: [AICCNativeCore.Task] {
+        tasks.filter { $0.blocker == nil && $0.evidence.derivedStatus != .completed }
+    }
+
     var body: some View {
         CompanionPage(title: "Работа", subtitle: "То, что движется сегодня. Без технических деталей.") {
-            CompanionCard(title: "AICC Native", detail: "Следующий шаг — посмотреть обновлённый дизайн.", tint: AICCTheme.plum)
-            CompanionCard(title: "AIOS", detail: "План выполняется, критичных препятствий нет.", tint: AICCTheme.forest)
-            CompanionCard(title: "План недели", detail: "Три важных направления в понятном порядке.", tint: .gray)
+            if tasks.isEmpty {
+                CompanionCard(title: "Пока пусто", detail: "Задачи появятся, как только сервер передаст картину.", tint: .gray)
+            }
+            ForEach(attention.prefix(5)) { task in
+                CompanionCard(title: task.title, detail: task.blocker ?? "Нужно ваше внимание.", tint: .orange, badge: "Внимание")
+            }
+            ForEach(active.prefix(20)) { task in
+                CompanionCard(title: task.title, detail: statusLine(for: task), tint: AICCTheme.plum)
+            }
+        }
+    }
+
+    private func statusLine(for task: AICCNativeCore.Task) -> String {
+        switch task.evidence.derivedStatus {
+        case .inProgress: "В работе."
+        case .awaitingCI: "Идут проверки."
+        case .awaitingAcceptance: "Ждёт приёмки."
+        case .completed: "Завершена."
+        case .unknown: "Состояние уточняется."
         }
     }
 }
