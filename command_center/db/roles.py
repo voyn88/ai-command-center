@@ -248,12 +248,14 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
 # execution host has no business reading the programme's plan, and a
 # compromised one must not learn it.
 #
-# TODO(VOYN-W0-BACKLOG-ORCHESTRATOR BO-S1, after #321 merged): #321's grant
-# compliance checker now verifies this matrix against the live catalog;
-# extend tests/db/test_grant_compliance.py's provisioning coverage to the
-# backlog tables/functions in the first post-#321 slice. [#321 merged
-# 2026-08-19 as 8b9c89d — the extension rides the next BO slice to keep this
-# PR's surface reviewable.]
+# #321's grant compliance checker verifies this matrix against the live
+# catalog, and the generic MISSING/EXTRA diff already covers every table and
+# function declared below. VOYN-W0-AICC-GRANTS-ARE-CORRECTNESS-NOT-HYGIENE
+# added the same *reproduction* #321 gave queue_redrive — an under-privileged
+# role reaching a live escalation, not just a catalog diff — for
+# backlog_resume_deferred (tests/db/test_grant_compliance.py:
+# test_worker_can_call_backlog_resume_deferred_without_grants /
+# test_worker_cannot_call_backlog_resume_deferred_when_grants_are_applied).
 _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _READ,
     "backlog_dependency": _READ,
