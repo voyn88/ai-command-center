@@ -448,9 +448,18 @@ This is a local-only speedup; CI intentionally keeps its serial `pytest -q` run.
 `.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
 compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
 Python 3.14, plus a `windows-latest` job covering the automated half of the desktop leg. The workflow
-uses a read-only token, pins actions to commit SHAs, and cancels superseded runs for the same ref. It
-does not itself configure branch protection; repository settings must separately require the check if
-merges are to be blocked on it.
+uses a read-only token, pins actions to commit SHAs, and cancels superseded runs for the same ref.
+
+The workflow does not itself configure branch protection — that lives in repository settings, not in
+the checked-in YAML. `main` requires `Final merge gate` (`ci.yml`) and `Acceptance gate (independent
+verdict on exact SHA)` (`acceptance-gate.yml`) to pass, with `strict: true` so a queued branch must be
+current with `main` before it counts. Approvals are intentionally set to 0: every agent shares the
+account that opens the pull request, so GitHub self-approval is structurally impossible here, and the
+acceptance verdict above is what actually gates the merge instead. A GitHub merge queue sits in front
+of `main` (`maximumEntriesToBuild: 5`, squash merges): it tests each entry against the prospective
+merged result rather than the branch in isolation, and evicts an entry that conflicts with the rest of
+the batch without stalling the others — the `merge_group` trigger in `ci.yml` is what lets those queued
+checks run at all.
 
 ## Current limitations and risks
 
@@ -466,8 +475,6 @@ merges are to be blocked on it.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
 - A static type checker is configured (permissive, non-strict) via `pyproject.toml` and surfaced as a
   non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
-- The checked-in CI workflow does not itself enforce branch protection. Enable "Require status checks
-  to pass before merging" on `main` with the `Quality gates` check to make it a real gate.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass it,
   and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and

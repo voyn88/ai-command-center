@@ -119,8 +119,11 @@ Current boundaries:
   only exact-workspace exclusion is enforced transactionally by the runtime launch path.
 - Fail-closed workspace verification is scoped to normal task-v2 callers that supply
   `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
-- The current private-repository plan does not expose branch protection/rulesets, so CI is
-  automatic but required-check enforcement remains an operator merge discipline.
+- `main` has branch protection (required checks `Final merge gate` + `Acceptance gate (independent
+  verdict on exact SHA)`, strict, 0 required approvals since every agent shares the PR author's
+  account) and an active merge queue (`maximumEntriesToBuild: 5`, squash) in front of it — enabled
+  by the repo owner 2026-08-23 (`VOYN-W0-AICC-MERGE-QUEUE-ENABLE`). The queue tests each entry
+  against the prospective merged batch and evicts a conflicting one without stalling the rest.
 - Git worktree creation, push, pull-request creation and merge are privileged capabilities with
   confirmation or policy safeguards.
 - The native PySide6 desktop client remains documentation and design work only.
