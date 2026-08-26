@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
         # at all -- restoring a broken host is exactly when it runs
         # (VOYN-W0-AICC-DEPLOY-AUTOMATION). The --migrate subprocess opens
         # its own pool from the environment on the host that has one.
-        from command_center.orchestrator.self_deploy import (
+        from command_center.deployment.self_deploy import (
             SelfDeployConfig,
             self_deploy_once,
         )

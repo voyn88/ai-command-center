@@ -10,8 +10,8 @@ import subprocess
 
 import pytest
 
-from command_center.orchestrator import self_deploy
-from command_center.orchestrator.self_deploy import (
+from command_center.deployment import self_deploy
+from command_center.deployment.self_deploy import (
     SelfDeployConfig,
     self_deploy_once,
 )
