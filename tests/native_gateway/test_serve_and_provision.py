@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import stat
 
@@ -45,8 +46,9 @@ def test_mint_stores_only_hash_with_tight_permissions(tmp_path):
     entry = json.loads(stored)["devices"][0]
     assert entry["token_sha256"] == hashlib.sha256(token.encode()).hexdigest()
     assert entry["scope"] == "read"
-    mode = stat.S_IMODE(registry_path.stat().st_mode)
-    assert mode == 0o600
+    if os.name == "posix":  # permission bits are only meaningful on POSIX
+        mode = stat.S_IMODE(registry_path.stat().st_mode)
+        assert mode == 0o600
 
 
 def test_mint_rejects_duplicate_device(tmp_path):
