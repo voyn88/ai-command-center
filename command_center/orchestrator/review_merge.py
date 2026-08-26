@@ -1517,11 +1517,14 @@ def _post_auto_accept_audit(
     tag = f"AUTO-ACCEPT-AUDIT {sha} findings:{findings_hash}"
     view = _gh(["pr", "view", pr_url, "--json", "comments"], repo_path)
     if view.returncode != 0:
-        return False, True
+        # A failed READ before any write was attempted: costs the caller's
+        # write budget nothing (review of 9098d44 -- a transient lookup
+        # failure must not block later eligible tasks in the same tick).
+        return False, False
     try:
         comments = (json.loads(view.stdout or "{}")).get("comments") or []
     except json.JSONDecodeError:
-        return False, True
+        return False, False
     if any(tag in ((c or {}).get("body") or "") for c in comments):
         # Already posted by an earlier tick: no write happened, so this
         # costs the caller's write budget nothing (review of 2d1bc89's

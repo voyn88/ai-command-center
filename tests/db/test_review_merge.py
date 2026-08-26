@@ -2408,3 +2408,64 @@ def test_churn_before_a_waiter_cannot_starve_it(rig, monkeypatch):  # noqa: F811
         if "VOYN-W0-ZWAITER" in seen:
             break
     assert "VOYN-W0-ZWAITER" in seen
+
+
+def test_a_failed_audit_lookup_does_not_burn_the_write_budget(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 9098d44 (CONFIRMED): a failed comments READ before any
+    write returned wrote=True and consumed max_per_tick, blocking later
+    eligible tasks. A pure read failure now costs nothing: task A's audit
+    lookup fails, task B still receives its marker in the same cap-1 tick."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    # Task A: override path (verification ACCEPT) whose audit lookup fails.
+    head_a = "3c" * 20
+    pr_a = "https://github.com/x/y/pull/96"
+    _ready(store, app_factory, "VOYN-W0-AA", pr_a)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-AA", pr_a, head_a,
+        f"claim.\nVERDICT: REJECT\nHEAD_SHA: {head_a}\n",
+    )
+    from command_center.db.work_queue_store import WorkQueueStore
+    vkey = review_merge._verification_key(
+        "VOYN-W0-AA", pr_a, _snapshot(head_a),
+        f"claim.\nVERDICT: REJECT\nHEAD_SHA: {head_a}\n",
+    )
+    vstore = WorkQueueStore(app_factory)
+    vstore.enqueue("execution", idempotency_key=vkey,
+                   payload={"kind": "agent_run"}, task_id="VOYN-W0-AA")
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert worker.complete(claimed, {
+        "status": "completed",
+        "result_text": f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head_a}",
+    })
+    # Task B: plain ACCEPT.
+    head_b = "4d" * 20
+    pr_b = "https://github.com/x/y/pull/97"
+    _ready(store, app_factory, "VOYN-W0-BB", pr_b)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-BB", pr_b, head_b,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head_b}\n",
+    )
+    heads = {pr_a: head_a, pr_b: head_b}
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        if argv[:2] == ["pr", "view"] and "comments" in argv[-1]:
+            return sp.CompletedProcess(argv, 1, "", "comments lookup down")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert ("VOYN-W0-AA", "auto_accept_audit_post_failed") in report.skipped
+    assert posted == [pr_b]  # B's marker landed despite A's failed lookup
