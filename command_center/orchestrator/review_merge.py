@@ -1294,40 +1294,41 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     )
     branch_updates = 0
     for task_id, pr_url in tasks:
-        # Merge-train coordinator: decide on the PR's mergeStateStatus FIRST,
-        # in one snapshot, before the acceptance/checks readiness probe. A PR
-        # that is behind or conflicting can never merge no matter its marker,
-        # and the ready-but-behind case (a valid marker that fell behind main)
-        # must be UPDATED, not sent to `gh pr merge` where it just fails --
-        # checking readiness first would misroute exactly the PRs closest to
-        # merging. (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)
+        # Readiness FIRST: only a PR that already carries an independent ACCEPT
+        # marker on its head with green required checks is the merge tick's
+        # business. An un-accepted or failing PR is reviewed by the review tick
+        # straight from its own diff -- regardless of how far behind main it is
+        # -- so it needs nothing here; it returns as a ready-but-behind PR once
+        # accepted. Updating an un-accepted PR now would spend CI and the update
+        # quota on a PR that may never be accepted and starve the accepted-
+        # but-behind PRs that are one base-merge from landing.
+        # (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)
+        ready, detail = _pr_is_mergeable(repo_path, pr_url)
+        if not ready:
+            report.skipped.append((task_id, detail))
+            continue
+        # Merge-ready. If it has merely fallen BEHIND main since it was accepted,
+        # bring its branch current with a GitHub-side base merge (no local
+        # writer lease) so it can land; the new head re-runs CI and review
+        # head-keyed. The cap counts ATTEMPTS -- incremented before the call --
+        # so repeated failures cannot exceed the per-tick mutation budget. DIRTY
+        # here would be a real conflict, left for a rebase.
         state = _merge_state(repo_path, pr_url)
         if state == "DIRTY":
-            # A real conflict: never auto-resolved. Left for a rebase.
             report.skipped.append((task_id, "branch_dirty_needs_rebase"))
             continue
         if state == "BEHIND":
-            # Base advanced after it branched. Bring it current with a
-            # GitHub-side base merge (no local writer lease); the new head
-            # re-runs CI and review head-keyed so the normal marker->merge path
-            # takes over next tick. Bounded so a moving base cannot thrash.
             if branch_updates >= cfg.max_branch_updates_per_tick:
                 report.skipped.append((task_id, "branch_behind_update_capped"))
                 continue
+            branch_updates += 1
             updated = _gh(["pr", "update-branch", pr_url], repo_path)
             if updated.returncode == 0:
-                branch_updates += 1
                 report.skipped.append((task_id, "branch_updated_behind_main"))
             else:
                 report.skipped.append(
                     (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
                 )
-            continue
-        # Up to date (CLEAN/BLOCKED/UNKNOWN/""): the normal merge path decides
-        # on the exact acceptance marker + green required checks.
-        ready, detail = _pr_is_mergeable(repo_path, pr_url)
-        if not ready:
-            report.skipped.append((task_id, detail))
             continue
         merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
         if merged.returncode != 0:
