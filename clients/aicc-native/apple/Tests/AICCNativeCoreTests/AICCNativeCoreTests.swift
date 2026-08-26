@@ -74,3 +74,14 @@ import Testing
     let unpinned = try GatewayConfiguration(baseURL: URL(string: rawURL)!, deviceToken: token)
     await #expect(throws: (any Error).self) { _ = try await SnapshotRemoteStore(configuration: unpinned).fetchSnapshot() }
 }
+
+@Test func snapshotCacheRoundTripsThroughTheSameGuardAsNetwork() throws {
+    let snapshot = try Fixture.healthySnapshot()
+    let url = FileManager.default.temporaryDirectory
+        .appending(path: "aicc-test-\(UUID().uuidString)/snap.json")
+    #expect(SnapshotCache.save(snapshot, to: url))
+    let loaded = SnapshotCache.load(from: url)
+    #expect(loaded == snapshot)
+    #expect(SnapshotCache.clear(at: url))
+    #expect(SnapshotCache.load(from: url) == nil)
+}

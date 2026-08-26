@@ -27,7 +27,14 @@ final class AICCAppModel: ObservableObject {
     @Published private(set) var connection: ConnectionState = .fixture
 
     init() {
-        snapshot = (try? Fixture.healthySnapshot()) ?? .preview
+        // Start from the owner's last real picture when we have one; the
+        // demo fixture is only the very-first-launch fallback.
+        if let cached = SnapshotCache.load() {
+            snapshot = cached
+            connection = .offline
+        } else {
+            snapshot = (try? Fixture.healthySnapshot()) ?? .preview
+        }
     }
 
     /// Whether any device credential is available (env override or Keychain).
@@ -74,6 +81,7 @@ final class AICCAppModel: ObservableObject {
         do {
             snapshot = try await store.fetchSnapshot(revision: snapshot.revision)
             connection = .live
+            SnapshotCache.save(snapshot)
         } catch GatewayError.notModified {
             connection = .live
         } catch GatewayError.unauthorized {

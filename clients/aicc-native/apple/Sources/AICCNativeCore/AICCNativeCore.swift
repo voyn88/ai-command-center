@@ -322,3 +322,50 @@ extension SnapshotRemoteStore {
         try await fetchPage("v1/dialogs", as: DialogSummary.self).items
     }
 }
+
+// MARK: - Last-snapshot persistence (offline start)
+
+/// Persists the last successfully fetched snapshot so a restart without
+/// network shows the owner their latest real picture instead of a fixture.
+/// The DTO is already redacted by the gateway, so nothing sensitive is
+/// written; the file lives in Application Support, private to the app.
+public enum SnapshotCache {
+    static func defaultURL() -> URL? {
+        guard
+            let base = FileManager.default.urls(
+                for: .applicationSupportDirectory, in: .userDomainMask
+            ).first
+        else { return nil }
+        return base.appending(path: "AICC/last-snapshot.json")
+    }
+
+    @discardableResult
+    public static func save(_ snapshot: Snapshot, to url: URL? = nil) -> Bool {
+        guard let target = url ?? defaultURL() else { return false }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(snapshot) else { return false }
+        do {
+            try FileManager.default.createDirectory(
+                at: target.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try data.write(to: target, options: .atomic)
+            return true
+        } catch { return false }
+    }
+
+    public static func load(from url: URL? = nil) -> Snapshot? {
+        guard let target = url ?? defaultURL(),
+              let data = try? Data(contentsOf: target)
+        else { return nil }
+        // The same guard the network path uses: a cached body that would be
+        // rejected fresh must be rejected from disk too.
+        return try? SnapshotDecoder.decode(data)
+    }
+
+    @discardableResult
+    public static func clear(at url: URL? = nil) -> Bool {
+        guard let target = url ?? defaultURL() else { return false }
+        return (try? FileManager.default.removeItem(at: target)) != nil
+    }
+}
