@@ -3,7 +3,8 @@
 One tick, no loop: the schedule is a systemd oneshot timer
 (deploy/systemd/aicc-backlog-planner.timer), the reaper's pattern — a missed
 tick delays planning and never corrupts it, because every mutating step is
-one call to ``backlog_dispatch`` (0006), which is atomic or refused.
+one call to ``backlog_dispatch`` (0006, reordered by 0010), which is atomic
+or refused.
 
 Single planner, machine-held: the tick first takes the ``planner:global``
 lease. A second control host running the same timer gets ``planner_busy``
@@ -52,6 +53,13 @@ class PlanReport:
     refused: list[tuple[str, str]] = field(default_factory=list)
     undispatchable: list[tuple[str, str]] = field(default_factory=list)
     ingested: list[tuple[str, str]] = field(default_factory=list)  # (task, action)
+    #: (task, reason) for a task `backlog_ingest_results` could not advance at
+    #: all — refused per row rather than aborting the tick (0010,
+    #: VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS). Its own bucket rather than an
+    #: `ingested` entry: a task the machine could not advance is exactly the
+    #: "why is my task waiting" case this report exists to answer, and it
+    #: stays stuck across every subsequent tick until an operator reads it.
+    ingest_refused: list[tuple[str, str]] = field(default_factory=list)
     planner_busy: bool = False
 
 
@@ -164,10 +172,15 @@ class Planner:
             # Ingest finished work first (BO-S3): evidence + READY_TO_REVIEW
             # for the succeeded, return-to-pool (or park) for the dead, lanes
             # freed — so this very tick can refill them.
-            for task_id, queue_state, action, _detail in self._rows(
+            for task_id, queue_state, action, detail in self._rows(
                 "SELECT * FROM backlog_ingest_results(%s)", (limits.planner,)
             ):
-                report.ingested.append((task_id, action))
+                if action == "ingest_refused":
+                    report.ingest_refused.append(
+                        (task_id, str((detail or {}).get("refused") or "unspecified"))
+                    )
+                else:
+                    report.ingested.append((task_id, action))
 
             candidates = self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable "

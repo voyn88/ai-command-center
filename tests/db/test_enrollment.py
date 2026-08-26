@@ -866,6 +866,75 @@ def test_rotating_with_a_superseded_secret_is_refused_and_audited(
         assert _count_events(admin_conn) > before, "the refusal rolled its own audit back"
 
 
+def test_identity_refusal_audit_survives_every_public_call_layer(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Neither the identity gate nor a caller may raise after writing a denial.
+
+    The identity layer's half of VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS. The
+    refusal of a single-use ticket IS the theft signal, so a signal that rolls
+    itself back is not a signal -- which is why 0003 built `identity_assert()`
+    to RETURN a verdict and deliberately built no raising wrapper around it.
+    That is a property of the whole call chain, not of one function: a
+    hypothetical `identity_assert_strict()` that turned the returned verdict
+    back into an exception would look fail-closed at the direct call while
+    deleting the audit row `identity_assert()` had just written, and the same
+    defect would then reappear one layer up in every function that used such
+    a wrapper -- which is exactly what 0006 and 0009 did at the backlog layer
+    (see `tests/db/test_backlog_planner.py`).
+
+    Both public layers are exercised -- the gate called directly, and
+    `enroll_rotate_self()` calling it -- and the committed rows are inspected
+    from ANOTHER connection, so an exception or a subtransaction rollback at
+    either boundary makes this fail. The static half, over the deployed
+    schema and every layer at once, is
+    `test_refusal_audit_survives.py::test_no_deployed_function_that_audits_can_raise`.
+    """
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        with psycopg.connect(
+            _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
+        ) as app:
+            row, old_secret = _enrol(app, _unique())
+
+        with psycopg.connect(
+            _as_role(test_dsn, row[1], old_secret), autocommit=True
+        ) as host, host.cursor() as cur:
+            # Layer 1: the gate itself, refusing a secret it has never seen.
+            cur.execute("SELECT ok, reason FROM identity_assert(%s)", ("unknown",))
+            assert cur.fetchone() == (False, "unknown_credential")
+
+            # Layer 2: a caller of the gate. Rotate once so the presented
+            # secret is superseded, then rotate again with it -- the refusal
+            # now comes from `identity_assert()` inside `enroll_rotate_self()`.
+            new_secret, new_hash = _secret()
+            cur.execute(
+                "SELECT * FROM enroll_rotate_self(%s, %s, %s)",
+                (old_secret, new_hash, _scram_verifier(new_secret)),
+            )
+            assert cur.fetchone()[1] is None
+
+            newer_secret, newer_hash = _secret()
+            cur.execute(
+                "SELECT * FROM enroll_rotate_self(%s, %s, %s)",
+                (old_secret, newer_hash, _scram_verifier(newer_secret)),
+            )
+            assert cur.fetchone() == (None, "credential_revoked")
+
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT to_regprocedure('identity_assert_strict(text)')")
+            assert cur.fetchone()[0] is None, "a raising audit wrapper was introduced"
+            cur.execute(
+                "SELECT reason, count(*) FROM principal_event "
+                "WHERE outcome = 'rejected' "
+                "AND reason IN ('unknown_credential', 'credential_revoked') "
+                "GROUP BY reason"
+            )
+            assert dict(cur.fetchall()) == {
+                "unknown_credential": 1,
+                "credential_revoked": 1,
+            }, "a refusal rolled its own audit back"
+
+
 # ---------------------------------------------------------------------------
 # The network expectation declared at enrolment
 # ---------------------------------------------------------------------------

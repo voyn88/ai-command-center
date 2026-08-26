@@ -560,3 +560,281 @@ def test_an_unrouted_repo_is_reported_not_dead_lettered(rig, monkeypatch) -> Non
     with app_factory() as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM work_item WHERE task_id = %s", ("VOYN-W0-RR",))
         assert cur.fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# The refusal audit must outlive the refusal (VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS)
+# ---------------------------------------------------------------------------
+# The backlog layer's half of the class. The queue layer states and measures
+# the rule in 0002, identity restates it in 0003, and these two functions were
+# where it was disobeyed: each turned a RETURNED verdict back into an
+# exception, and the exception rolled back the audit row the verdict's own
+# function had just written. The class guard over the deployed schema lives in
+# `test_refusal_audit_survives.py`; what is pinned here is the behaviour.
+
+
+def _events(app_factory, task_id):
+    """Read on a FRESH connection: committed, not merely visible to the
+    transaction that wrote them."""
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT event, outcome, reason FROM backlog_event "
+            "WHERE task_id = %s ORDER BY event_id",
+            (task_id,),
+        )
+        return cur.fetchall()
+
+
+def test_a_wedged_gate_row_is_refused_per_row_and_keeps_its_audit(rig) -> None:
+    """One poisoned row must cost one row, not the tick and not the record.
+
+    A `kind = 'gate'` record parked in IN_PROGRESS is reachable through the
+    importer -- `backlog_upsert_task` may set any status directly, the CHECK
+    constraints allow the combination, and the ingest loop selects every
+    IN_PROGRESS task with a terminal work item without filtering on kind.
+    `backlog_transition` then refuses it with `gate_is_control_record`.
+    Before 0010 that refusal was raised: the tick died at this row, the
+    healthy task's ingest died with it, the dispatch phase never ran, and
+    every audit row of the whole attempt -- including the one naming the
+    reason -- was rolled back. Tick after tick, identically, because the
+    poisoned row is still there on the next pass.
+    """
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-GA", repo="repo-ga"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-GA")[0]
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-GA",
+        {"status": "completed", "pr_url": "https://x/pull/1", "head_sha": "abc123"},
+    )
+
+    assert store.upsert_task(_task("VOYN-W0-GB", kind="gate", status="IN_PROGRESS", repo="repo-gb"))[0]
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT queue_enqueue('execution', %s, '{}'::jsonb, %s, %s, 3)",
+            ("gate-item", "VOYN-W0-GB", "repo-gb"),
+        )
+        # The lane this row occupies, held by the planner about to refuse it.
+        # Without it the "lane freed" assertion below would pass on a
+        # repository that never had a lease.
+        cur.execute(
+            "SELECT ok FROM backlog_lease_acquire('repo:repo-gb', 'planner-t', 3600)"
+        )
+        assert cur.fetchone()[0]
+    # A payload that reaches the TRANSITION arm (0009 requires status
+    # `completed` before it will try READY_TO_REVIEW); `backlog_transition`
+    # is the auditing callee whose refusal must survive.
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-GB",
+        {"status": "completed", "pr_url": "https://x/pull/2", "head_sha": "def456"},
+    )
+
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+        rows = {r[0]: (r[2], r[3]) for r in cur.fetchall()}
+
+    # The healthy task is ingested in the SAME tick that refuses the gate.
+    assert rows["VOYN-W0-GA"][0] == "ready_to_review"
+    assert store.get_task("VOYN-W0-GA")["status"] == "READY_TO_REVIEW"
+
+    action, detail = rows["VOYN-W0-GB"]
+    assert action == "ingest_refused"
+    assert detail["refused"] == "gate_is_control_record"
+    assert detail["at"] == "transition_refused"
+    assert store.get_task("VOYN-W0-GB")["status"] == "IN_PROGRESS"
+
+    assert ("transition", "rejected", "gate_is_control_record") in _events(
+        app_factory, "VOYN-W0-GB"
+    ), "the callee's denial audit did not survive the caller's refusal"
+    assert ("ingest", "rejected", "transition_refused") in _events(
+        app_factory, "VOYN-W0-GB"
+    )
+
+    # A refused ingest advances nothing, so it must record nothing either:
+    # the evidence write moved BEHIND the transition when the abort that used
+    # to discard it went away.
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence WHERE task_id = %s", ("VOYN-W0-GB",)
+        )
+        assert cur.fetchone()[0] == 0, "a refused ingest left evidence behind"
+        # And the lane is FREED rather than wedged for every other task in
+        # that repository: the work item is terminal either way, so nothing
+        # is running there, and holding the lease because one row cannot be
+        # advanced is the same tick-wide damage narrowed to one repo.
+        cur.execute(
+            "SELECT count(*) FROM backlog_writer_lease WHERE authority = %s",
+            ("repo:repo-gb",),
+        )
+        assert cur.fetchone()[0] == 0, "a refused ingest wedged the lane"
+        cur.execute(
+            "SELECT detail FROM backlog_event WHERE task_id = %s "
+            "AND event = 'ingest' AND outcome = 'rejected'",
+            ("VOYN-W0-GB",),
+        )
+        assert cur.fetchone()[0]["lease_released"] is True
+
+
+def test_a_dispatch_that_cannot_transition_refuses_as_data_and_leaves_nothing(
+    rig, admin_conn
+) -> None:
+    """The dispatch layer, by fault injection.
+
+    `backlog_dispatch` re-checks OPEN under the row lock, so its transition
+    can only refuse if that invariant is broken by a future edit -- which is
+    exactly the case the old `RAISE EXCEPTION` was written for, and exactly
+    the case in which an operator has nothing but the audit to read. Injected
+    rather than left unproven: a defence-in-depth branch that no test can
+    reach is a branch a refactor deletes for free.
+
+    Fail-closed is asserted alongside it -- no work item, no lease, status
+    unchanged -- because that is what the reordering (transition BEFORE
+    enqueue, lease released by a compensating call) buys instead of the abort
+    that used to provide it.
+    """
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-GC", repo="repo-gc"))[0]
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION backlog_transition(
+                p_task_id text, p_to_status text, p_expected_revision bigint
+            ) RETURNS backlog_verdict
+                LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+                SET search_path = pg_catalog, public AS $$
+            DECLARE v backlog_verdict;
+            BEGIN
+                PERFORM _backlog_audit(p_task_id, 'transition', 'rejected',
+                                       'injected_refusal');
+                v.ok := false; v.reason := 'injected_refusal';
+                RETURN v;
+            END
+            $$;
+            """
+        )
+
+    ok, reason, work_item_id, _revision = _dispatch(app_factory, "VOYN-W0-GC")
+    assert not ok and reason == "transition_refused: injected_refusal"
+    assert work_item_id is None
+    assert store.get_task("VOYN-W0-GC")["status"] == "OPEN"
+
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM work_item WHERE task_id = %s", ("VOYN-W0-GC",))
+        assert cur.fetchone()[0] == 0, "a refused dispatch left a work item"
+        cur.execute(
+            "SELECT count(*) FROM backlog_writer_lease WHERE authority = %s",
+            ("repo:repo-gc",),
+        )
+        assert cur.fetchone()[0] == 0, "a refused dispatch left the lane held"
+
+    events = _events(app_factory, "VOYN-W0-GC")
+    assert ("transition", "rejected", "injected_refusal") in events, (
+        "the callee's denial audit did not survive the caller's refusal"
+    )
+    assert ("dispatch", "rejected", "transition_refused") in events
+
+
+def test_a_dispatch_refusal_does_not_release_a_lease_it_did_not_take(
+    rig, admin_conn
+) -> None:
+    """The compensation must not become a second defect.
+
+    Two tasks in ONE repository: the first is dispatched and holds the lane.
+    `backlog_lease_acquire` succeeds for the second as well -- a lease that is
+    already ours is renewed, not refused -- so if the second's transition then
+    refuses, an unconditional release would hand the FIRST task's repository
+    to another writer while its run is still in flight: the two-writer outcome
+    the lease exists to prevent, introduced by the fix for a lease leak. The
+    release is therefore conditional on this call being what acquired it.
+    """
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-D3", repo="repo-shared"))[0]
+    assert store.upsert_task(_task("VOYN-W0-D4", repo="repo-shared"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-D3", planner="planner-s")[0]
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE OR REPLACE FUNCTION backlog_transition(
+                p_task_id text, p_to_status text, p_expected_revision bigint
+            ) RETURNS backlog_verdict
+                LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+                SET search_path = pg_catalog, public AS $$
+            DECLARE v backlog_verdict;
+            BEGIN
+                v.ok := false; v.reason := 'injected_refusal';
+                RETURN v;
+            END
+            $$;
+            """
+        )
+    ok, reason, *_ = _dispatch(app_factory, "VOYN-W0-D4", planner="planner-s")
+    assert not ok and reason == "transition_refused: injected_refusal"
+
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT owner FROM backlog_writer_lease WHERE authority = %s",
+            ("repo:repo-shared",),
+        )
+        assert cur.fetchall() == [("planner-s",)], (
+            "the refusal released the lease the FIRST dispatch is still using"
+        )
+
+
+def test_a_wedged_row_costs_one_task_and_the_tick_still_dispatches(rig) -> None:
+    """The whole-tick damage, at the composition layer.
+
+    The unit of the old defect was not one refusal but one TICK.
+    `backlog_ingest_results` loops over every in-flight task, so the
+    exception that a single unadvanceable row produced took the healthy
+    tasks' ingest with it, and because ingest runs FIRST in `plan_once`, the
+    dispatch phase never ran either -- for as long as the poisoned row sat
+    there. Assert the composition, not just the function: the wedged row is
+    reported by name, the healthy task is still ingested, and the tick still
+    dispatches.
+    """
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-GA", repo="repo-ga"))[0]
+    assert store.upsert_task(_task("VOYN-W0-GB", kind="gate", status="IN_PROGRESS", repo="repo-gb"))[0]
+
+    limits = PlanLimits(planner="planner-t", wip_limit=4, max_dispatches_per_tick=4)
+    assert [t for t, _ in plan_once(app_factory, limits).dispatched] == ["VOYN-W0-GA"]
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-GA",
+        {"status": "completed", "pr_url": "https://x/pull/1", "head_sha": "abc123"},
+    )
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT queue_enqueue('execution', %s, '{}'::jsonb, %s, %s, 3)",
+            ("gate-item", "VOYN-W0-GB", "repo-gb"),
+        )
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-GB",
+        {"status": "completed", "pr_url": "https://x/pull/2", "head_sha": "def456"},
+    )
+
+    # A third task, OPEN, dispatchable only if the tick gets past ingest.
+    assert store.upsert_task(_task("VOYN-W0-TT", repo="repo-tt"))[0]
+
+    report = plan_once(app_factory, limits)
+    assert report.ingested == [("VOYN-W0-GA", "ready_to_review")]
+    assert report.ingest_refused == [("VOYN-W0-GB", "gate_is_control_record")], (
+        "the unadvanceable row must be named in the report, not buried in "
+        "`ingested` and not thrown as an exception"
+    )
+    assert [t for t, _ in report.dispatched] == ["VOYN-W0-TT"], (
+        "the dispatch phase did not run after a refused ingest"
+    )
+
+    # And it is stable: a second tick sees the same wedged row, reports it
+    # again, and still does the rest of its work.
+    assert plan_once(app_factory, limits).ingest_refused == [
+        ("VOYN-W0-GB", "gate_is_control_record")
+    ]
