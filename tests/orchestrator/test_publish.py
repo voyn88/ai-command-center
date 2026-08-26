@@ -479,3 +479,125 @@ def test_stale_hook_identity_fails_closed_without_pushing(repo, monkeypatch):
         check=False,
     ).stdout
     assert "backlog" not in out  # never pushed
+
+
+# --- pre-push quality band (VOYN-W0-AICC-PREPUSH-FAST-GATE) ---------------
+# The band script is repo-content: absent in every fixture repo above, so all
+# earlier tests double as the "no band script -> phase skipped" case.
+
+
+def _install_band(work, body):
+    band = work / "scripts" / "ci" / "prepush" / "quality_band.sh"
+    band.parent.mkdir(parents=True)
+    band.write_text(body)
+    band.chmod(0o755)
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "band")
+
+
+def test_quality_band_failure_refuses_publish_before_lease(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    marker = work.parent / "band.ran"
+    _install_band(
+        work,
+        f'#!/bin/sh\ntouch {marker}\n'
+        'echo "QUALITY_BAND: fail phase=tests"\nexit 1\n',
+    )
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_failed:")
+    assert "fail phase=tests" in r.reason
+    assert marker.exists()
+    # A red band must cost zero lease traffic and zero gh traffic: it runs
+    # before acquire, so the calls log was never written.
+    assert not calls.exists()
+
+
+def test_quality_band_pass_publishes_and_pins_selection_base(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    envfile = work.parent / "band.base"
+    _install_band(
+        work, f'#!/bin/sh\necho "$VOYN_QUALITY_BAND_BASE" > {envfile}\nexit 0\n'
+    )
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "origin/main"],
+        cwd=work,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+    # publish_run hands the band its own resolved base so test selection
+    # matches the exact diff being published.
+    assert envfile.read_text().strip() == base_sha
+
+
+def test_quality_band_env_bypass_reaches_the_script(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    # Fails unless the caller's VOYN_QUALITY_BAND=off made it through: the
+    # bypass is the script's decision (it prints it), publish only inherits.
+    _install_band(
+        work, '#!/bin/sh\n[ "$VOYN_QUALITY_BAND" = "off" ] && exit 0\nexit 1\n'
+    )
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+    monkeypatch.setenv("VOYN_QUALITY_BAND", "off")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_real_band_script_defers_without_venv_and_honours_bypass(tmp_path):
+    """The committed quality_band.sh itself: venv-less hosts defer to CI
+    (exit 0, printed) and VOYN_QUALITY_BAND=off is a printed bypass."""
+    import pathlib
+
+    script = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "ci"
+        / "prepush"
+        / "quality_band.sh"
+    )
+    probe = tmp_path / "probe"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(probe)], check=True, capture_output=True
+    )
+    target = probe / "scripts" / "ci" / "prepush" / "quality_band.sh"
+    target.parent.mkdir(parents=True)
+    target.write_text(script.read_text())
+    target.chmod(0o755)
+    (probe / "scripts" / "preflight.sh").write_text("#!/bin/sh\nexit 1\n")
+
+    no_venv = subprocess.run(
+        ["bash", str(target)], cwd=probe, capture_output=True, text=True, check=False
+    )
+    assert no_venv.returncode == 0
+    assert "skipped (no .venv" in no_venv.stdout
+
+    bypass = subprocess.run(
+        ["bash", str(target)],
+        cwd=probe,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "VOYN_QUALITY_BAND": "off"},
+    )
+    assert bypass.returncode == 0
+    assert "bypassed" in bypass.stdout

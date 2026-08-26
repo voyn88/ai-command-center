@@ -35,6 +35,7 @@ not an error — a review/analysis task legitimately changes no files.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,8 +92,6 @@ class PublishResult:
 def _run(
     argv: list[str], cwd: Path, env_extra: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    import os
-
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
@@ -328,6 +327,46 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         if ancestry.returncode != 0:
             return PublishResult(
                 ok=False, reason="head_not_descendant_of_pinned_base", head_sha=head_sha
+            )
+
+    # Pre-push quality band (VOYN-W0-AICC-PREPUSH-FAST-GATE): preflight plus
+    # the impacted tests for this exact diff, in the worktree, BEFORE the
+    # lease is acquired -- a minutes-long test phase must never sit inside
+    # the lease TTL, and a red band should not consume a lease round-trip at
+    # all. The band is an economy device, not a gate: the script itself
+    # defers to CI for trigger-all selections and venv-less hosts, and a
+    # missing script (older checkouts, other repositories) skips the phase
+    # entirely, so the required CI suite stays authoritative either way.
+    # VOYN_QUALITY_BAND=off is honoured inside the script so the bypass is
+    # printed by the band itself, never silently absorbed here.
+    # `already_durable` is a redelivery of a head the remote already holds:
+    # the band verdict for that sha was already taken before the original
+    # push, so re-running it would only tax the retry path.
+    band = repo_path / "scripts" / "ci" / "prepush" / "quality_band.sh"
+    if band.is_file() and not already_durable:
+        band_env = dict(os.environ)
+        band_env.setdefault("VOYN_QUALITY_BAND_BASE", base_sha_value)
+        try:
+            band_run = subprocess.run(
+                ["bash", str(band)],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=band_env,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired:
+            return PublishResult(
+                ok=False, head_sha=head_sha, reason="quality_band_timeout"
+            )
+        if band_run.returncode != 0:
+            tail = (band_run.stdout + band_run.stderr).strip().splitlines()
+            detail = " | ".join(tail[-3:]) if tail else "no output"
+            return PublishResult(
+                ok=False,
+                head_sha=head_sha,
+                reason=f"quality_band_failed: {detail[:160]}",
             )
 
     branch = f"backlog/{cfg.task}"
