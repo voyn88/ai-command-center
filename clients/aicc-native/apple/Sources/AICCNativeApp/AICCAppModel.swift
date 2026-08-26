@@ -62,10 +62,15 @@ final class AICCAppModel: ObservableObject {
         let rawURL = environment["AICC_SERVER_URL"]
             ?? (Bundle.main.object(forInfoDictionaryKey: "AICCServerURL") as? String)
         let token = environment["AICC_DEVICE_TOKEN"] ?? DeviceTokenStore.load()
+        // Pin sources, most explicit first: dev env path, bundled resource,
+        // then a base64 Info.plist value injected at build time
+        // (AICC_GATEWAY_PIN_B64) — the path that works on a real device.
         let pin = environment["AICC_GATEWAY_PIN_FILE"]
             .flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }
             ?? Bundle.main.url(forResource: "AICCGatewayPin", withExtension: "der")
                 .flatMap { try? Data(contentsOf: $0) }
+            ?? (Bundle.main.object(forInfoDictionaryKey: "AICCGatewayPinB64") as? String)
+                .flatMap { Data(base64Encoded: $0) }
         guard
             let rawURL,
             let url = URL(string: rawURL),

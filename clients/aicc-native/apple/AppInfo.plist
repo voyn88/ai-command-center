@@ -6,5 +6,7 @@
 <string>AICC</string>
 <key>AICCServerURL</key>
 <string>$(AICC_SERVER_URL)</string>
+<key>AICCGatewayPinB64</key>
+<string>$(AICC_GATEWAY_PIN_B64)</string>
 </dict>
 </plist>
