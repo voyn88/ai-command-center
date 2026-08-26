@@ -68,7 +68,6 @@ import json
 import os
 import re
 import subprocess
-import time
 import urllib.error
 import urllib.request
 from contextlib import nullcontext
@@ -768,33 +767,37 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
 
 
 def _scan_window(
-    factory: Any, count_sql: str, params: tuple, scan_cap: int, step: int
+    factory: Any, cursor_name: str, count_sql: str, params: tuple,
+    scan_cap: int, step: int
 ) -> tuple[int, int]:
-    """The deterministic sliding-window schedule for a tick's scan
-    (reviews of 24c124b and 2199a56, both CONFIRMED: per-minute md5
-    sampling was pseudo-random, and a FIXED page still starved its own
-    tail whenever the rows at the page's head kept consuming the action
-    cap every visit -- persistently failing merges stay READY and stay
-    first). Stateless HARD guarantee instead: over the stable task_id
-    total order, the window START advances by `step` (= max_per_tick, the
-    action cap) positions per nominal 5-minute tick interval, wrapping
-    modulo N. Every task therefore lands at the FRONT of the window --
-    examined before anything else can consume the cap -- within
-    ceil(N / step) consecutive ticks, no matter how the rows around it
-    behave; membership churn delays a task by at most one lap. The window
-    itself stays scan_cap wide, bounding per-tick gh API cost. Returns
-    (offset, total)."""
+    """The sliding-window schedule for a tick's scan, driven by the
+    PERSISTED cursor of migration 0015. Four reviewed counterexamples
+    killed every stateless variant: per-minute md5 sampling was
+    pseudo-random (24c124b); a fixed page starved its own tail behind
+    rows consuming the action cap on every visit (2199a56); a stride
+    above the window width left permanent holes (cadc595); and
+    wall-clock-derived offsets alias against the actual tick cadence --
+    15-minute ticks over 12 rows with stride 4 resonate to offset 0
+    forever -- and are not restart-safe (2f7ac9c). `backlog_scan_advance`
+    returns this tick's offset and atomically advances the cursor by the
+    stride PER ACTUAL INVOCATION, so the guarantee holds under any
+    cadence, delays, restarts, or concurrent ticks: every task lands at
+    the FRONT of the window -- examined before anything can spend the
+    action cap -- within ceil(N / stride) invocations; membership churn
+    delays a task by at most one lap. The stride is clamped to the window
+    width (no holes), and the window stays scan_cap wide, bounding
+    per-tick gh API cost. Returns (offset, total)."""
     rows = _rows(factory, count_sql, params)
     total = int(rows[0][0]) if rows else 0
     if total <= 0:
         return 0, 0
-    # The stride must never exceed the window width, or the sliding leaves
-    # permanent holes (review of cadc595: N=12, step=4, cap=3 skipped
-    # positions 3, 7, 11 forever). Clamped, coverage is contiguous for
-    # every configuration.
     stride = max(1, min(step, scan_cap))
-    offset = (int(time.time() // 300) * stride) % total
-    return offset, total
+    advanced = _rows(
+        factory,
+        "SELECT backlog_scan_advance(%s, %s, %s)",
+        (cursor_name, stride, total),
+    )
+    return int(advanced[0][0]), total
 
 
 def review_once(
@@ -855,6 +858,7 @@ def review_once(
     )
     offset, total = _scan_window(
         factory,
+        "scan:review_once",
         "SELECT count(*) FROM ("
         "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
         "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
@@ -1571,6 +1575,7 @@ def publish_review_verdicts(
     )
     offset, total = _scan_window(
         factory,
+        "scan:publish_review_verdicts",
         "SELECT count(*) FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'" + where_task,
@@ -1961,6 +1966,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     )
     offset, total = _scan_window(
         factory,
+        "scan:merge_once",
         "SELECT count(*) FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'",

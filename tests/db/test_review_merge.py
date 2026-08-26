@@ -2094,8 +2094,7 @@ def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa:
             return sorted(rows, key=lambda r: r[0] == "VOYN-W0-PNOK")
         return rows
 
-    monkeypatch.setattr(review_merge, "_rows", ordered_rows)
-    monkeypatch.setattr(review_merge.time, "time", lambda: 0)  # offset 0: one batch
+    monkeypatch.setattr(review_merge, "_rows", ordered_rows)  # fresh DB: cursor at 0, one batch
     enq = []
     report = publish_review_verdicts(
         app_factory, "/tmp", ReviewConfig(max_per_tick=1),
@@ -2166,8 +2165,7 @@ def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa:
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     seen: set[str] = set()
-    for page in range(3):  # ceil(12 / 5) = 3 pages
-        monkeypatch.setattr(review_merge.time, "time", lambda p=page: p * 300)
+    for _tick in range(3):  # cursor advances per invocation: 3 calls cover 12
         report = publish_review_verdicts(
             app_factory, "/tmp", ReviewConfig(max_per_tick=5, scan_cap=5)
         )
@@ -2226,10 +2224,9 @@ def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch)
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     merged_tasks = []
-    # cap 1: each tick one merge attempt. Slide start by 1 per tick -> the
-    # victim is FIRST within 6 ticks and merges despite five eternal hogs.
-    for tick in range(7):
-        monkeypatch.setattr(review_merge.time, "time", lambda t=tick: t * 300)
+    # cap 1: each invocation advances the cursor by 1 -> the victim is
+    # FIRST within 6 invocations and merges despite five eternal hogs.
+    for _tick in range(7):
         report = merge_once(
             app_factory, "/tmp",
             ReviewConfig(max_per_tick=1, scan_cap=3, max_branch_updates_per_tick=0),
@@ -2256,8 +2253,7 @@ def test_stride_clamped_to_window_width_covers_every_position(rig, monkeypatch):
         lambda argv, repo: sp.CompletedProcess(argv, 1, "", "fails -> pure skip"),
     )
     seen: set[str] = set()
-    for tick in range(4):  # ceil(12 / min(4,3)=3) = 4 ticks
-        monkeypatch.setattr(review_merge.time, "time", lambda t=tick: t * 300)
+    for _tick in range(4):  # stride min(4,3)=3: 4 invocations cover 12
         report = publish_review_verdicts(
             app_factory, "/tmp", ReviewConfig(max_per_tick=4, scan_cap=3)
         )
@@ -2326,7 +2322,6 @@ def test_a_failed_marker_post_attempt_still_consumes_the_cap(rig, monkeypatch): 
         return sp.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    monkeypatch.setattr(review_merge.time, "time", lambda: 0)
     monkeypatch.setattr(
         review_merge, "_acceptance_app_credentials",
         lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
@@ -2354,7 +2349,6 @@ def test_override_audit_and_marker_are_separate_write_budget_units(rig, monkeypa
     _ready(store, app_factory, "VOYN-W0-OB", pr_url)
     SNAPSHOTS[pr_url] = _snapshot(head)
     _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
-    monkeypatch.setattr(review_merge.time, "time", lambda: 0)
     monkeypatch.setattr(
         review_merge, "_acceptance_app_credentials",
         lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
