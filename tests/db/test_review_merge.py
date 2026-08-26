@@ -2095,6 +2095,7 @@ def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa:
         return rows
 
     monkeypatch.setattr(review_merge, "_rows", ordered_rows)
+    monkeypatch.setattr(review_merge.time, "time", lambda: 0)  # offset 0: one batch
     enq = []
     report = publish_review_verdicts(
         app_factory, "/tmp", ReviewConfig(max_per_tick=1),
@@ -2172,3 +2173,68 @@ def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa:
         )
         seen |= {task_id for task_id, _ in report.skipped}
     assert seen == set(ids)  # every task examined within one full cycle
+
+
+def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 2199a56 (CONFIRMED): a FIXED page starved its own tail when
+    its head rows consumed the action cap on every visit (persistently
+    failing merges stay READY and stay first). The sliding window's start
+    advances by max_per_tick per tick, so the tail task periodically sits
+    at the FRONT -- merged before the hogs can spend the cap."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    # Five hog tasks: ACCEPT marker present, checks green, but `gh pr merge`
+    # always fails -> each visit consumes a merge-attempt action forever.
+    heads = {}
+    for i in range(5):
+        pr_url = f"https://github.com/x/y/pull/{300 + i}"
+        heads[pr_url] = f"{i}b" * 10 + "a" * 20
+        _ready(store, app_factory, f"VOYN-W0-HOG{i}", pr_url)
+    # The victim, LAST in task_id order.
+    victim_url = "https://github.com/x/y/pull/399"
+    heads[victim_url] = "cd" * 20
+    _ready(store, app_factory, "VOYN-W0-ZVICTIM", victim_url)
+
+    merged_prs = []
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        head = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and "state,mergeCommit" in argv[-1]:
+            if url in merged_prs:
+                return sp.CompletedProcess(argv, 0, json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": "ef" * 20},
+                    "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                }), "")
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "OPEN"}), "")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "mergeStateStatus": "CLEAN",
+            }), "")
+        if argv[:2] == ["pr", "merge"]:
+            if url == victim_url:
+                merged_prs.append(url)
+                return sp.CompletedProcess(argv, 0, "merged", "")
+            return sp.CompletedProcess(argv, 1, "", "spurious merge failure")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    merged_tasks = []
+    # cap 1: each tick one merge attempt. Slide start by 1 per tick -> the
+    # victim is FIRST within 6 ticks and merges despite five eternal hogs.
+    for tick in range(7):
+        monkeypatch.setattr(review_merge.time, "time", lambda t=tick: t * 300)
+        report = merge_once(
+            app_factory, "/tmp",
+            ReviewConfig(max_per_tick=1, scan_cap=3, max_branch_updates_per_tick=0),
+        )
+        merged_tasks += [t for t, _ in report.merged]
+        if merged_tasks:
+            break
+    assert merged_tasks == ["VOYN-W0-ZVICTIM"]

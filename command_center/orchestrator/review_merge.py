@@ -767,22 +767,29 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
 
 
-def _scan_window(factory: Any, count_sql: str, params: tuple, scan_cap: int) -> tuple[int, int]:
-    """The deterministic partition schedule for a tick's scan window
-    (review of 24c124b, CONFIRMED: per-minute md5 sampling was pseudo-random
-    -- with more tasks than scan_cap a task could stay unsampled
-    indefinitely and same-minute ticks shared one window). Stateless
-    GUARANTEE instead: a stable total order (task_id) is cut into
-    ceil(N / scan_cap) pages and the page index advances with wall time
-    (one page per nominal 5-minute tick interval), so every task is
-    examined within `pages` consecutive ticks while membership is stable;
-    churn can shift a task across a page boundary at most into the next
-    cycle. Returns (offset, pages)."""
+def _scan_window(
+    factory: Any, count_sql: str, params: tuple, scan_cap: int, step: int
+) -> tuple[int, int]:
+    """The deterministic sliding-window schedule for a tick's scan
+    (reviews of 24c124b and 2199a56, both CONFIRMED: per-minute md5
+    sampling was pseudo-random, and a FIXED page still starved its own
+    tail whenever the rows at the page's head kept consuming the action
+    cap every visit -- persistently failing merges stay READY and stay
+    first). Stateless HARD guarantee instead: over the stable task_id
+    total order, the window START advances by `step` (= max_per_tick, the
+    action cap) positions per nominal 5-minute tick interval, wrapping
+    modulo N. Every task therefore lands at the FRONT of the window --
+    examined before anything else can consume the cap -- within
+    ceil(N / step) consecutive ticks, no matter how the rows around it
+    behave; membership churn delays a task by at most one lap. The window
+    itself stays scan_cap wide, bounding per-tick gh API cost. Returns
+    (offset, total)."""
     rows = _rows(factory, count_sql, params)
     total = int(rows[0][0]) if rows else 0
-    pages = max(1, -(-total // scan_cap))
-    page = int(time.time() // 300) % pages
-    return page * scan_cap, pages
+    if total <= 0:
+        return 0, 0
+    offset = (int(time.time() // 300) * max(1, step)) % total
+    return offset, total
 
 
 def review_once(
@@ -828,28 +835,31 @@ def review_once(
     # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
     # UNBOUNDED scan costs one gh API round-trip per task per tick
     # (review of ce948c0) -- also wrong. So: examinations are bounded by
-    # scan_cap, MUTATIONS by max_per_tick, and coverage across ticks is
-    # GUARANTEED by the deterministic partition schedule in _scan_window
-    # (stable task_id order cut into pages, page index advancing with wall
-    # time): every task is examined within pages consecutive ticks, no
-    # state, no permanently-starved tail (review of 24c124b).
-    offset, _pages = _scan_window(
+    # scan_cap, MUTATIONS by max_per_tick, and coverage is a HARD
+    # guarantee from _scan_window's sliding schedule: the window start
+    # advances by max_per_tick per tick interval (wrapping), so every task
+    # periodically sits at the FRONT of the window, examined before
+    # anything else can spend the action cap -- immune even to rows that
+    # consume actions on every visit (reviews of 24c124b and 2199a56).
+    base_sql = (
+        "SELECT task_id, value FROM ("
+        "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
+        "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
+        "  WHERE t.status = 'READY_TO_REVIEW'" + where_task + ") pairs "
+        "ORDER BY task_id OFFSET %s LIMIT %s"
+    )
+    offset, total = _scan_window(
         factory,
         "SELECT count(*) FROM ("
         "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
         "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
         "  WHERE t.status = 'READY_TO_REVIEW'" + where_task + ") pairs",
-        params, cfg.scan_cap,
+        params, cfg.scan_cap, cfg.max_per_tick,
     )
-    tasks = _rows(
-        factory,
-        "SELECT task_id, value FROM ("
-        "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
-        "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
-        "  WHERE t.status = 'READY_TO_REVIEW'" + where_task + ") pairs "
-        "ORDER BY task_id OFFSET %s LIMIT %s",
-        params + (offset, cfg.scan_cap),
-    )
+    tasks = _rows(factory, base_sql, params + (offset, cfg.scan_cap))
+    short = cfg.scan_cap - len(tasks)
+    if short > 0 and offset > 0 and total > len(tasks):
+        tasks += _rows(factory, base_sql, params + (0, min(short, offset)))
     cascade = _model_only_review_cascade()
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
@@ -1534,26 +1544,29 @@ def publish_review_verdicts(
     # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
     # UNBOUNDED scan costs one gh API round-trip per task per tick
     # (review of ce948c0) -- also wrong. So: examinations are bounded by
-    # scan_cap, MUTATIONS by max_per_tick, and coverage across ticks is
-    # GUARANTEED by the deterministic partition schedule in _scan_window
-    # (stable task_id order cut into pages, page index advancing with wall
-    # time): every task is examined within pages consecutive ticks, no
-    # state, no permanently-starved tail (review of 24c124b).
-    offset, _pages = _scan_window(
+    # scan_cap, MUTATIONS by max_per_tick, and coverage is a HARD
+    # guarantee from _scan_window's sliding schedule: the window start
+    # advances by max_per_tick per tick interval (wrapping), so every task
+    # periodically sits at the FRONT of the window, examined before
+    # anything else can spend the action cap -- immune even to rows that
+    # consume actions on every visit (reviews of 24c124b and 2199a56).
+    base_sql = (
+        "SELECT t.task_id, e.value FROM backlog_task t "
+        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+        "WHERE t.status = 'READY_TO_REVIEW'" + where_task
+        + " ORDER BY t.task_id OFFSET %s LIMIT %s"
+    )
+    offset, total = _scan_window(
         factory,
         "SELECT count(*) FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'" + where_task,
-        params, cfg.scan_cap,
+        params, cfg.scan_cap, cfg.max_per_tick,
     )
-    tasks = _rows(
-        factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task
-        + " ORDER BY t.task_id OFFSET %s LIMIT %s",
-        params + (offset, cfg.scan_cap),
-    )
+    tasks = _rows(factory, base_sql, params + (offset, cfg.scan_cap))
+    short = cfg.scan_cap - len(tasks)
+    if short > 0 and offset > 0 and total > len(tasks):
+        tasks += _rows(factory, base_sql, params + (0, min(short, offset)))
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
         if actions >= cfg.max_per_tick:
@@ -1907,25 +1920,28 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
     # UNBOUNDED scan costs one gh API round-trip per task per tick
     # (review of ce948c0) -- also wrong. So: examinations are bounded by
-    # scan_cap, MUTATIONS by max_per_tick, and coverage across ticks is
-    # GUARANTEED by the deterministic partition schedule in _scan_window
-    # (stable task_id order cut into pages, page index advancing with wall
-    # time): every task is examined within pages consecutive ticks, no
-    # state, no permanently-starved tail (review of 24c124b).
-    offset, _pages = _scan_window(
+    # scan_cap, MUTATIONS by max_per_tick, and coverage is a HARD
+    # guarantee from _scan_window's sliding schedule: the window start
+    # advances by max_per_tick per tick interval (wrapping), so every task
+    # periodically sits at the FRONT of the window, examined before
+    # anything else can spend the action cap -- immune even to rows that
+    # consume actions on every visit (reviews of 24c124b and 2199a56).
+    base_sql = (
+        "SELECT t.task_id, e.value FROM backlog_task t "
+        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.task_id OFFSET %s LIMIT %s"
+    )
+    offset, total = _scan_window(
         factory,
         "SELECT count(*) FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'",
-        (), cfg.scan_cap,
+        (), cfg.scan_cap, cfg.max_per_tick,
     )
-    tasks = _rows(
-        factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.task_id OFFSET %s LIMIT %s",
-        (offset, cfg.scan_cap),
-    )
+    tasks = _rows(factory, base_sql, (offset, cfg.scan_cap))
+    short = cfg.scan_cap - len(tasks)
+    if short > 0 and offset > 0 and total > len(tasks):
+        tasks += _rows(factory, base_sql, (0, min(short, offset)))
     branch_updates = 0
     actions = 0
     for task_id, pr_url in tasks:
