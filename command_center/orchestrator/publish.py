@@ -355,6 +355,62 @@ def _static_quality_gate(repo_path: Path, head_sha: str) -> PublishResult | None
     )
 
 
+def _leak_guard_gate(
+    repo_path: Path, head_sha: str, base_sha: str
+) -> PublishResult | None:
+    """Public-repo leak guard on the publish path
+    (VOYN-OPS-PUBLIC-REPO-CLAUDE-MD-LEAK, verification finding 3 on
+    f24d081: preflight/make alone meant an ordinary agent publish never
+    executed the guard). Runs the TRUSTED copy of
+    scripts/ci/prepush/leak_guard.sh -- the one shipped with the worker's
+    own checkout of this module, resolved from ``__file__``, never the
+    candidate worktree's copy (same trust rule as the ruff gate: the
+    candidate tree contributes data, not code). The script itself only
+    reads the tree through git; the candidate repository path is its $1.
+    Missing trusted script (older install): defer to CI. A refusal names
+    the leak; ``VOYN_LEAK_GUARD=off`` inside the script stays the printed
+    operator bypass."""
+    trusted = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "ci"
+        / "prepush"
+        / "leak_guard.sh"
+    )
+    if not trusted.is_file():
+        return None
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "VOYN_LEAK_GUARD_BASE": base_sha,
+    }
+    if os.environ.get("VOYN_LEAK_GUARD"):
+        env["VOYN_LEAK_GUARD"] = os.environ["VOYN_LEAK_GUARD"]
+    try:
+        run = subprocess.run(
+            ["bash", str(trusted), str(repo_path)],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return PublishResult(
+            ok=False, head_sha=head_sha, reason="leak_guard_timeout"
+        )
+    if run.returncode == 0:
+        return None
+    tail = (run.stdout + (run.stderr or "")).strip().splitlines()
+    detail = " | ".join(tail[-3:]) if tail else "no output"
+    return PublishResult(
+        ok=False,
+        head_sha=head_sha,
+        reason=f"leak_guard_failed: {detail[:160]}",
+    )
+
+
 def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     """Acquire the lease, push a branch, open a PR. Idempotent on the branch
     name (``backlog/<task>``): a re-run force-updates the same branch and
@@ -432,6 +488,9 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         gate_failure = _static_quality_gate(repo_path, head_sha)
         if gate_failure is not None:
             return gate_failure
+        leak_failure = _leak_guard_gate(repo_path, head_sha, base_sha_value)
+        if leak_failure is not None:
+            return leak_failure
 
     branch = f"backlog/{cfg.task}"
     if already_durable:

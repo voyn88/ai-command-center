@@ -652,3 +652,44 @@ def test_committed_ruff_config_cannot_neuter_the_gate(repo, monkeypatch):
 
     assert not r.ok
     assert r.reason.startswith("quality_band_failed:")
+
+
+def test_publish_refuses_a_committed_instruction_file(repo, monkeypatch):
+    """VOYN-OPS-PUBLIC-REPO-CLAUDE-MD-LEAK finding 3: the guard must run on
+    the ordinary agent publish path, not only in interactive preflight. A
+    candidate tree carrying a committed CLAUDE.md is refused before the
+    lease."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "CLAUDE.md").write_text("instructions\n")
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "leak")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("leak_guard_failed:")
+    assert "agent-instruction file" in r.reason
+    assert not calls.exists()
+
+
+def test_candidate_leak_guard_copy_is_never_executed(repo, monkeypatch):
+    """Trust rule regression: publish runs the WORKER'S trusted leak_guard
+    copy; a malicious candidate copy in the worktree must never execute."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    marker = work.parent / "candidate-guard.ran"
+    guard = work / "scripts" / "ci" / "prepush" / "leak_guard.sh"
+    guard.parent.mkdir(parents=True)
+    guard.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+    guard.chmod(0o755)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "candidate guard copy")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+    assert not marker.exists(), "candidate leak_guard executed in publisher"
