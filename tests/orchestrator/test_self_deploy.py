@@ -94,6 +94,7 @@ def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_pat
     assert _git(clone, "rev-parse", "HEAD") == new
     assert calls["migrate"] == 1
     assert calls["migrate_cwd"] == str(clone)  # the NEW tree, review of f794b3e
+    assert report.steps.index("import_smoke_passed") < report.steps.index("migrations_applied")
     assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
     rows = [
         json.loads(line)
@@ -128,17 +129,20 @@ def test_dependency_manifest_changes_refuse(pair, calls, tmp_path):
     assert _git(clone, "rev-parse", "HEAD") == first  # checkout untouched
 
 
-def test_failed_smoke_rolls_back_checkout_and_services(pair, calls, tmp_path):
+def test_failed_smoke_rolls_back_before_anything_else_ran(pair, calls, tmp_path):
+    """Smoke runs FIRST (review of cff672a): a broken tree is discovered
+    while the database is untouched and no service was restarted -- the
+    rollback has nothing to unwind but the checkout itself."""
     origin, clone, first = pair
     _commit(origin, "broken advance")
     calls["smoke_rc"] = 1
-    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",))
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
     report = self_deploy_once(str(clone), cfg)
     assert report.outcome == "rolled_back"
     assert "import_smoke_failed" in report.detail
     assert _git(clone, "rev-parse", "HEAD") == first
-    # Services restarted on the rolled-back code -- never left half-deployed.
-    assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
+    assert calls["migrate"] == 0  # smoke precedes migrations
+    assert calls["systemctl"] == []  # and precedes any restart
     rows = [
         json.loads(line)
         for line in (tmp_path / "provenance.jsonl").read_text().splitlines()

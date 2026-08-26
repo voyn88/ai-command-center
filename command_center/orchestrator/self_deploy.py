@@ -219,6 +219,17 @@ def self_deploy_once(
         return finish("failed", f"reset_failed: {moved.stderr.strip()[:100]}")
     report.steps.append(f"checkout_moved:{report.target_sha}")
 
+    # Smoke BEFORE migrations (review of cff672a): a broken tree must be
+    # discovered while the database is still untouched -- the cheapest
+    # failure order is the one with nothing to unwind.
+    smoke = _import_smoke(repo_path, timeout)
+    if smoke.returncode != 0:
+        _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
+        return finish(
+            "rolled_back", f"import_smoke_failed: {smoke.stderr.strip()[:150]}"
+        )
+    report.steps.append("import_smoke_passed")
+
     if cfg.migrate:
         migrated = _run_migrations(repo_path, timeout)
         if migrated.returncode != 0:
@@ -229,12 +240,15 @@ def self_deploy_once(
             )
         report.steps.append("migrations_applied")
 
-    smoke = _import_smoke(repo_path, timeout)
-    failure = (
-        f"import_smoke_failed: {smoke.stderr.strip()[:150]}"
-        if smoke.returncode != 0
-        else _restart_services(cfg, report)
-    )
+    # Applied migrations are deliberately NOT rolled back on a later restart
+    # failure: this codebase's migration policy is expand-contract (each
+    # migration is backward-compatible with the previous code, and the
+    # legacy path is removed only by a separately accepted change), so the
+    # PREVIOUS code running against the migrated schema is the supported
+    # state by design. An automatic `downgrade` here would be the opposite
+    # of safety: it is the one operation that can DROP data, which is why
+    # the CLI gates it behind --yes-i-understand-this-drops-data.
+    failure = _restart_services(cfg, report)
     if failure is not None:
         _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
         # Best effort: put the services back on the previous code too --
