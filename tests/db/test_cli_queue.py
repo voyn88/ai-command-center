@@ -22,6 +22,16 @@ def test_queue_reap_takes_no_arguments() -> None:
     assert args.command == "queue-reap"
 
 
+def test_backlog_review_can_target_one_exact_task() -> None:
+    args = build_parser().parse_args(
+        ["backlog-review", "--repo-path", "/srv/aicc", "--task-id", "VOYN-W0-X"]
+    )
+    assert args.command == "backlog-review"
+    assert args.repo_path == "/srv/aicc"
+    assert args.task_id == "VOYN-W0-X"
+    assert build_parser().parse_args(["backlog-review"]).task_id is None
+
+
 def test_queue_dlq_defaults_to_every_queue_fifty_rows() -> None:
     args = build_parser().parse_args(["queue-dlq"])
     assert args.command == "queue-dlq"
