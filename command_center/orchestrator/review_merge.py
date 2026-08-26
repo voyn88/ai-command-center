@@ -428,6 +428,23 @@ _MAX_VERIFICATION_FINDINGS_BYTES = 45_000
 
 _VERIFICATION_INPUT_MARKER = "\nFINDINGS_ENVELOPE_JSON:\n"
 
+#: The per-finding classification vocabulary the verification prompt
+#: requires. An ACCEPT whose body carries NONE of these is a degenerate
+#: transcript (e.g. bare trailer lines) that classified nothing -- it must
+#: never override a REJECT (independent review of this very change, chunk 0
+#: at 32bf893: "an empty or partial verifier response can auto-accept
+#: unresolved findings"). Substring presence is deliberately the weakest
+#: check that kills that failure mode: findings are free text, so a
+#: per-finding structural match cannot be enforced mechanically without
+#: restructuring review output itself (that is
+#: VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE territory).
+_VERIFICATION_CLASSIFICATIONS = (
+    "CONFIRMED_BLOCKING",
+    "CONFIRMED_MINOR",
+    "ARTIFACT",
+    "UNVERIFIABLE",
+)
+
 
 def _verification_key(
     task_id: str, pr_url: str, snapshot: _PRSnapshot, findings: str
@@ -1230,6 +1247,15 @@ def _verified_rejection_outcome(
         if parsed is None or parsed[1] != snapshot.head:
             return "REMEDIATE", findings
         if parsed[0] == "ACCEPT":
+            if not any(
+                token in verification_text
+                for token in _VERIFICATION_CLASSIFICATIONS
+            ):
+                # A verdict with no classification work behind it (bare
+                # trailer lines, truncated transcript) is malformed output,
+                # not an override -- same fail-closed leg as an unparseable
+                # verdict. See _VERIFICATION_CLASSIFICATIONS.
+                return "REMEDIATE", findings
             return "ACCEPT", verification_text
         return "REJECT", (
             f"{findings}\n\n--- Verification confirmed a blocking finding "

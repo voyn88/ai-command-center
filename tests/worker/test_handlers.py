@@ -1406,6 +1406,56 @@ def test_review_head_runs_in_the_pinned_checkout_and_cleans_up(
     assert removed == [(tmp_path, pin)]
 
 
+def test_review_head_checkout_is_removed_on_failure_paths_too(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Cleanup is owned by the handler's ExitStack, so it must run when the
+    agent run FAILS and when the runner RAISES -- not only after a success
+    (independent review of this change, chunk 1 at 32bf893: a success-only
+    test would pass an implementation that leaks the worktree on failure)."""
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, _runs = handler
+    pin = tmp_path / "verify-42-pin"
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda repository, pr_number, head_sha: (pin, None),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_remove_review_head_checkout",
+        lambda repository, target: removed.append((repository, target)),
+    )
+    payload = _payload(
+        task_type="verification_review",
+        untrusted=True,
+        review_head={"pr_number": "42", "head_sha": "b" * 40},
+    )
+
+    def failed_run(**kwargs):
+        return agent_runner.RunResult(
+            status="failed", exit_code=1, stdout="", stderr="agent died",
+            duration_seconds=0.1,
+            started_at="2026-08-26T12:00:00+00:00",
+            completed_at="2026-08-26T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_run)
+    run_agent(payload, _event())
+    assert removed == [(tmp_path, pin)]
+
+    def raising_run(**kwargs):
+        raise RuntimeError("runner blew up")
+
+    removed.clear()
+    monkeypatch.setattr(agent_runner, "run_claude_code", raising_run)
+    with pytest.raises(RuntimeError):
+        run_agent(payload, _event())
+    assert removed == [(tmp_path, pin)]
+
+
 def test_review_head_pin_is_refused_for_a_mutating_task(handler) -> None:
     """A mutating run pinned to a detached head has no branch to publish --
     the combination is a payload defect, never silently ignored."""

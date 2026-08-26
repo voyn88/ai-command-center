@@ -1090,7 +1090,7 @@ def test_auto_accept_is_conditioned_on_the_audit_comment(rig, monkeypatch):  # n
     pr_url = "https://github.com/x/y/pull/24"
     _ready(store, app_factory, "VOYN-W0-ADJ-E", pr_url)
     SNAPSHOTS[pr_url] = _snapshot(head)
-    _force_chunk_reject(monkeypatch, f"VERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
 
     def failing_gh(argv, repo):
         if argv[:2] == ["pr", "view"]:
@@ -1288,6 +1288,27 @@ def test_malformed_verifier_output_never_auto_accepts(rig, monkeypatch):  # noqa
                         lambda *a: (posted.append(a) or (True, "")))
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-ADJ-I", "VOYN-W0-ADJ-I-REM") in report.remediated
+    assert not posted
+
+
+def test_a_classification_free_accept_never_auto_accepts(rig, monkeypatch):  # noqa: F811
+    """Independent review of this very change (chunk 0 at 32bf893): a
+    degenerate verifier transcript -- bare VERDICT/HEAD_SHA trailer lines
+    with no per-finding classification work -- must be treated as malformed
+    output, not an override. Fail closed to remediation on the original
+    findings."""
+    app_factory, store, _ = rig
+    head = "5" * 40
+    pr_url = "https://github.com/x/y/pull/29"
+    _ready(store, app_factory, "VOYN-W0-ADJ-J", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, f"VERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    posted = []
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (posted.append(a) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-ADJ-J", "VOYN-W0-ADJ-J-REM") in report.remediated
     assert not posted
 
 
