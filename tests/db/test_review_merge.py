@@ -2338,3 +2338,49 @@ def test_a_failed_marker_post_attempt_still_consumes_the_cap(rig, monkeypatch): 
     )
     publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
     assert len(attempts) == 1  # the failed attempt consumed the only action
+
+
+def test_override_audit_and_marker_are_separate_write_budget_units(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 2d1bc89 (CONFIRMED): audit+marker bundled under one action
+    let cap=1 perform two external writes. Budgeted separately: at cap 1
+    the audit posts on tick one (marker deferred, stated loudly) and the
+    idempotent sequence completes with the marker on tick two -- never more
+    than max_per_tick external writes per tick."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "5e" * 20
+    pr_url = "https://github.com/x/y/pull/95"
+    _ready(store, app_factory, "VOYN-W0-OB", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    monkeypatch.setattr(review_merge.time, "time", lambda: 0)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    writes = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = {"headRefOid": head, "reviews": [], "comments": []}
+            if "comments" in argv[-1] and writes:
+                body["comments"] = [{"body": writes[0][1]}]
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[:2] == ["pr", "comment"]:
+            writes.append(("audit", argv[-1]))
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_post_marker_as_bot",
+        lambda creds, pr, decision, sha: (writes.append(("marker", sha)) or (True, "")),
+    )
+    first = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert [k for k, _ in writes] == ["audit"]  # exactly ONE external write
+    assert ("VOYN-W0-OB", "marker_deferred_write_budget") in first.skipped
+
+    publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    # Tick two: the audit already stands (idempotent), the marker is the
+    # tick's single write.
+    assert [k for k, _ in writes] == ["audit", "marker"]

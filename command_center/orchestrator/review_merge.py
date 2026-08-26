@@ -1489,18 +1489,25 @@ def _post_auto_accept_audit(
     (head, findings): the tag line is searched in existing comments first,
     so a tick that posted the audit but failed on the marker does not stack
     duplicates. The same evidence is durable in PostgreSQL regardless, as
-    the verification work_result addressed by `verification_key`."""
+    the verification work_result addressed by `verification_key`.
+    Returns ``(ok, wrote)`` -- ``wrote`` is False only for the idempotent
+    already-posted case, which must not consume the caller's per-tick
+    write budget."""
     findings_hash = hashlib.sha256(findings.encode("utf-8")).hexdigest()[:16]
     tag = f"AUTO-ACCEPT-AUDIT {sha} findings:{findings_hash}"
     view = _gh(["pr", "view", pr_url, "--json", "comments"], repo_path)
     if view.returncode != 0:
-        return False
+        return False, True
     try:
         comments = (json.loads(view.stdout or "{}")).get("comments") or []
     except json.JSONDecodeError:
-        return False
+        return False, True
     if any(tag in ((c or {}).get("body") or "") for c in comments):
-        return True
+        # Already posted by an earlier tick: no write happened, so this
+        # costs the caller's write budget nothing (review of 2d1bc89's
+        # follow-through: an idempotent no-op must not defer the marker
+        # forever at max_per_tick=1).
+        return True, False
     body = (
         f"{tag}\n\n"
         f"Task: {task_id}\n"
@@ -1516,7 +1523,7 @@ def _post_auto_accept_audit(
         f"{_truncated_for_audit(verification_text)}\n"
     )
     posted = _gh(["pr", "comment", pr_url, "--body", body], repo_path)
-    return posted.returncode == 0
+    return posted.returncode == 0, True
 
 
 def publish_review_verdicts(
@@ -1671,19 +1678,31 @@ def publish_review_verdicts(
             # than a silently-ineffective marker.
             report.skipped.append((task_id, "acceptance_bot_not_configured"))
             continue
-        # The external write ATTEMPT is the action (review of cadc595:
-        # counting only successes let a failing poster spend up to scan_cap
-        # write attempts in one tick despite the advertised cap).
+        # EVERY external write attempt is one budget unit, success or not
+        # (reviews of cadc595 and 2d1bc89: success-only counting let a
+        # failing poster spend scan_cap attempts, and bundling audit+marker
+        # under one unit let cap=1 perform two writes). An override's audit
+        # comment and the marker are therefore budgeted separately; when
+        # the budget runs out between them, the marker honestly lands on a
+        # later tick -- the audit post is idempotent, so the sequence
+        # resumes exactly where it stopped.
+        if override_audit is not None:
+            audit_ok, audit_wrote = _post_auto_accept_audit(
+                repo_path, pr_url, task_id, sha,
+                override_audit[0], override_audit[1], override_audit[2],
+            )
+            if audit_wrote:
+                actions += 1
+            if not audit_ok:
+                # The audit trail is a precondition of the override, not a
+                # best-effort side effect: no audit comment, no marker. The
+                # verification verdict is durable, so a later tick retries.
+                report.skipped.append((task_id, "auto_accept_audit_post_failed"))
+                continue
+            if actions >= cfg.max_per_tick:
+                report.skipped.append((task_id, "marker_deferred_write_budget"))
+                continue
         actions += 1
-        if override_audit is not None and not _post_auto_accept_audit(
-            repo_path, pr_url, task_id, sha,
-            override_audit[0], override_audit[1], override_audit[2],
-        ):
-            # The audit trail is a precondition of the override, not a
-            # best-effort side effect: no audit comment, no marker. The
-            # verification verdict is durable, so the next tick retries.
-            report.skipped.append((task_id, "auto_accept_audit_post_failed"))
-            continue
         # The independent identity: posts as `voyn88-acceptance-gate[bot]`,
         # never the operational identity that authored and will merge this
         # PR -- closes the self-issued-marker gap live-confirmed on PRs
