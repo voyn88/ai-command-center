@@ -1288,30 +1288,39 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     )
     branch_updates = 0
     for task_id, pr_url in tasks:
+        # Merge-train coordinator: decide on the PR's mergeStateStatus FIRST,
+        # in one snapshot, before the acceptance/checks readiness probe. A PR
+        # that is behind or conflicting can never merge no matter its marker,
+        # and the ready-but-behind case (a valid marker that fell behind main)
+        # must be UPDATED, not sent to `gh pr merge` where it just fails --
+        # checking readiness first would misroute exactly the PRs closest to
+        # merging. (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)
+        state = _merge_state(repo_path, pr_url)
+        if state == "DIRTY":
+            # A real conflict: never auto-resolved. Left for a rebase.
+            report.skipped.append((task_id, "branch_dirty_needs_rebase"))
+            continue
+        if state == "BEHIND":
+            # Base advanced after it branched. Bring it current with a
+            # GitHub-side base merge (no local writer lease); the new head
+            # re-runs CI and review head-keyed so the normal marker->merge path
+            # takes over next tick. Bounded so a moving base cannot thrash.
+            if branch_updates >= cfg.max_branch_updates_per_tick:
+                report.skipped.append((task_id, "branch_behind_update_capped"))
+                continue
+            updated = _gh(["pr", "update-branch", pr_url], repo_path)
+            if updated.returncode == 0:
+                branch_updates += 1
+                report.skipped.append((task_id, "branch_updated_behind_main"))
+            else:
+                report.skipped.append(
+                    (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
+                )
+            continue
+        # Up to date (CLEAN/BLOCKED/UNKNOWN/""): the normal merge path decides
+        # on the exact acceptance marker + green required checks.
         ready, detail = _pr_is_mergeable(repo_path, pr_url)
         if not ready:
-            # Merge-train coordinator: a PR merely BEHIND main (its base moved
-            # after it branched) can never merge until its branch is updated --
-            # the queue only accepts up-to-date PRs. Bring a bounded number
-            # current with `gh pr update-branch`, a GitHub-side base merge that
-            # takes no local writer lease. The new head re-runs CI and review
-            # head-keyed, so the normal path takes over next tick. DIRTY PRs
-            # have a real conflict and are left for a rebase, never
-            # auto-resolved. (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)
-            state = _merge_state(repo_path, pr_url)
-            if state == "BEHIND" and branch_updates < cfg.max_branch_updates_per_tick:
-                updated = _gh(["pr", "update-branch", pr_url], repo_path)
-                if updated.returncode == 0:
-                    branch_updates += 1
-                    report.skipped.append((task_id, "branch_updated_behind_main"))
-                else:
-                    report.skipped.append(
-                        (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
-                    )
-                continue
-            if state == "DIRTY":
-                report.skipped.append((task_id, "branch_dirty_needs_rebase"))
-                continue
             report.skipped.append((task_id, detail))
             continue
         merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
