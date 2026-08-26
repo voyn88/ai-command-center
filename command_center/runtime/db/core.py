@@ -595,6 +595,15 @@ def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, s
     return cutoff, zone_name, source
 
 
+#: Rows removed per transaction. A bare `DELETE ... WHERE run_id IN (...)`
+#: with no bound takes and holds a write lock for as long as a long-neglected
+#: database has terminal history to remove, which is exactly the case
+#: retention exists to handle — the single worst moment to also be the
+#: longest write-lock hold. Batching keeps each transaction short so other
+#: writers interleave between batches instead of queuing behind one giant one.
+_RETENTION_BATCH_SIZE = 500
+
+
 def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     """Delete `run_event` rows (and orphaned `report` rows) for runs that have
     been terminal for longer than `retention_days`, returning the number of
@@ -612,7 +621,11 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
       * the run row itself is kept (its `state`/`completed_at` remain visible
         in the Execution Center and to reconciliation); only the bulky
         per-output-event history is pruned;
-      * runs with a NULL `completed_at` are left untouched.
+      * runs with a NULL `completed_at` are left untouched;
+      * the delete runs in `_RETENTION_BATCH_SIZE`-row transactions rather than
+        one unbounded transaction, so a database with years of unpruned
+        history is removed in short, interleavable steps instead of one long
+        write-lock hold (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`).
 
     Does not VACUUM here — reclaiming disk is a separate, heavier, lock-holding
     operation the operator should run deliberately (see `maybe_apply_runtime_retention`).
@@ -623,21 +636,30 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
         db_path, retention_days=retention_days
     )
     placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
+    removed = 0
     with db.connect(db_path) as conn:
-        with db.transaction(conn):
-            cur = conn.execute(
-                f"""
-                DELETE FROM run_event
-                 WHERE run_id IN (
-                    SELECT id FROM run
-                     WHERE state IN ({placeholders})
-                       AND completed_at IS NOT NULL
-                       AND completed_at < ?
-                 )
-                """,
-                (*db.TERMINAL_STATES, cutoff),
-            )
-            removed = cur.rowcount
+        while True:
+            with db.transaction(conn):
+                cur = conn.execute(
+                    f"""
+                    DELETE FROM run_event
+                     WHERE id IN (
+                        SELECT id FROM run_event
+                         WHERE run_id IN (
+                            SELECT id FROM run
+                             WHERE state IN ({placeholders})
+                               AND completed_at IS NOT NULL
+                               AND completed_at < ?
+                         )
+                         LIMIT ?
+                     )
+                    """,
+                    (*db.TERMINAL_STATES, cutoff, db._RETENTION_BATCH_SIZE),
+                )
+                batch_removed = cur.rowcount
+            removed += batch_removed
+            if batch_removed < db._RETENTION_BATCH_SIZE:
+                break
         # `report` rows cascade-delete with `run` via FK, but a terminal run's
         # report file on disk is also historical; leave the DB row (the path is
         # small) — only events are bulky.

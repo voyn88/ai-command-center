@@ -6,13 +6,15 @@ module adds the W4 retention contract (NIGHT-W4-AICC-RETENTION):
 
 * **backup** — a SQLite-API snapshot of the live database is taken first;
   the maintenance run refuses to touch the original without it;
-* **cold archive** — every row that will be pruned is exported to a
-  compressed JSONL archive (with a SHA-256 digest and row count) *in the
-  same transaction scope* that deletes it, so the archive and the deletion
-  can never disagree;
-* **integrity** — `PRAGMA integrity_check` must return ``ok`` and the
-  archived row count must equal the deleted row count, else the transaction
-  is rolled back and the report says so;
+* **cold archive** — rows that will be pruned are exported to a compressed
+  JSONL archive (with a SHA-256 digest and row count), `_BATCH_SIZE` rows at
+  a time; each batch's archive member is fully written, flushed and fsynced
+  — durably finalized — *before* that batch's deletion is committed, so a
+  crash or a full disk can lose at most the batch in flight, never a
+  committed one, and the archive and the deletion can never disagree;
+* **integrity** — `PRAGMA integrity_check` must return ``ok`` and each
+  batch's archived row count must equal its deleted row count, else that
+  batch's transaction is rolled back and the report says so;
 * **optional VACUUM** — only after a clean prune, and only when asked;
 * **rehearsal** — `rehearse()` runs the identical sequence against a copy
   of the database and proves the original is byte-identical afterwards.
@@ -26,6 +28,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -37,7 +40,16 @@ from command_center.runtime.db import (
     transaction,
 )
 
-_ARCHIVE_SELECT = """
+#: Rows archived and deleted per batch. A single unbounded transaction that
+#: reads every doomed row into memory (`fetchall()`) and then deletes them all
+#: at once is exactly the failure mode this module exists to avoid: a
+#: long-neglected database gets pruned in one pass that holds a write lock for
+#: as long as the whole backlog takes and peaks memory at the full row count
+#: (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`). Batching keeps memory bounded
+#: to one batch and each transaction short.
+_BATCH_SIZE = 500
+
+_ARCHIVE_BATCH_SELECT = """
     SELECT run_event.* FROM run_event
      WHERE run_id IN (
         SELECT id FROM run
@@ -45,18 +57,40 @@ _ARCHIVE_SELECT = """
            AND completed_at IS NOT NULL
            AND completed_at < ?
      )
-     ORDER BY run_id, seq
+     ORDER BY run_event.id
+     LIMIT ?
 """
 
-_ARCHIVE_DELETE = """
-    DELETE FROM run_event
-     WHERE run_id IN (
-        SELECT id FROM run
-         WHERE state IN ({placeholders})
-           AND completed_at IS NOT NULL
-           AND completed_at < ?
-     )
-"""
+
+def _append_archive_batch(archive_path: Path, rows: list, digest) -> None:
+    """Append one batch to `archive_path` as an independently finalized gzip
+    member, fsynced to disk before returning.
+
+    The gzip container format is a concatenation of independent members —
+    a reader decompresses them back-to-back transparently, which is exactly
+    what `gzip.open(..., "rt")` does on read. That lets each batch open its
+    own member, write it, and fully close it (footer written) *before* the
+    caller commits that batch's deletion, instead of one member left open
+    across every batch and finalized only once at the very end.
+
+    That ordering is the fix for the data-loss path an earlier version of
+    this function had: it committed each batch's deletion while the archive
+    stream was still open, so a crash or a full disk during the *final*
+    close — after every batch had already been deleted — lost committed rows
+    with no way to recover them from a truncated, unreadable archive. Here,
+    if finalizing a member raises (disk full, I/O error), it raises before
+    that batch's `DELETE` even runs, so the transaction rolls back and the
+    rows are simply pruned on the next run instead of being lost.
+    """
+    mode = "ab" if archive_path.exists() else "wb"
+    with open(archive_path, mode) as raw:
+        with gzip.GzipFile(fileobj=raw, mode="wb") as member:
+            for row in rows:
+                line = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
+                member.write((line + "\n").encode("utf-8"))
+                digest.update(line.encode("utf-8"))
+        raw.flush()
+        os.fsync(raw.fileno())
 
 
 class MaintenanceError(RuntimeError):
@@ -111,26 +145,31 @@ def archive_and_prune(
     archived = 0
 
     with connect(db_path) as conn:
-        with transaction(conn):
-            rows = conn.execute(
-                _ARCHIVE_SELECT.format(placeholders=placeholders),
-                (*TERMINAL_STATES, cutoff),
-            ).fetchall()
-            with gzip.open(archive_path, "wt", encoding="utf-8") as handle:
-                for row in rows:
-                    line = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
-                    handle.write(line + "\n")
-                    digest.update(line.encode("utf-8"))
-                    archived += 1
-            deleted = conn.execute(
-                _ARCHIVE_DELETE.format(placeholders=placeholders),
-                (*TERMINAL_STATES, cutoff),
-            ).rowcount
-            if deleted != archived:
-                # Roll the deletion back rather than lose unarchived history.
-                raise MaintenanceError(
-                    f"archived {archived} rows but deletion matched {deleted}"
-                )
+        while True:
+            with transaction(conn):
+                rows = conn.execute(
+                    _ARCHIVE_BATCH_SELECT.format(placeholders=placeholders),
+                    (*TERMINAL_STATES, cutoff, _BATCH_SIZE),
+                ).fetchall()
+                if not rows:
+                    # Always leave behind a valid (possibly empty) archive,
+                    # even when nothing matched the cutoff.
+                    if archived == 0:
+                        _append_archive_batch(archive_path, [], digest)
+                    break
+                _append_archive_batch(archive_path, rows, digest)
+                ids = [row["id"] for row in rows]
+                id_placeholders = ",".join("?" for _ in ids)
+                deleted = conn.execute(
+                    f"DELETE FROM run_event WHERE id IN ({id_placeholders})",
+                    ids,
+                ).rowcount
+                if deleted != len(rows):
+                    # Roll this batch back rather than lose unarchived history.
+                    raise MaintenanceError(
+                        f"archived {len(rows)} rows but deletion matched {deleted}"
+                    )
+                archived += len(rows)
         integrity = _integrity_ok(conn)
     if not integrity:
         raise MaintenanceError("integrity_check failed after prune")

@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -164,6 +165,65 @@ def test_apply_runtime_retention_deletes_the_same_rows_in_every_process_tz(
 
     expected = {"off-4h", "off-1h"}
     assert pruned_by_tz == {tz: expected for tz in PRUNE_TZS}
+
+
+def test_apply_runtime_retention_batches_instead_of_one_unbounded_delete(
+    tmp_path, monkeypatch
+):
+    """A bare `DELETE ... WHERE run_id IN (...)` with no bound holds its write
+    lock for as long as the whole unpruned backlog takes to delete -- exactly
+    the worst moment for the longest lock hold, since retention only has real
+    work to do on a long-neglected database. Force a batch size far smaller
+    than the row count and check it actually ran in multiple bounded
+    transactions, not one pass that merely produced the right end state."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    task = db.create_task(
+        db_path, project="AIOS", title="old", task_type="implementation"
+    )
+    session = db.create_session(
+        db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/repo"
+    )
+    run = db.create_run(
+        db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        task_type="implementation",
+        repository_path="/tmp/repo",
+        prompt="old",
+        is_resume=False,
+    )
+    for i in range(11):
+        db.append_run_event(db_path, run["id"], "stream_event", {"n": i})
+    stale = (datetime.now() - timedelta(days=90)).isoformat(timespec="seconds")
+    with db.connect(db_path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (stale, run["id"]),
+            )
+
+    monkeypatch.setattr(db, "_RETENTION_BATCH_SIZE", 3)
+    transaction_calls = {"n": 0}
+    real_transaction = db.transaction
+
+    @contextmanager
+    def spying_transaction(conn):
+        transaction_calls["n"] += 1
+        with real_transaction(conn) as c:
+            yield c
+
+    monkeypatch.setattr(db, "transaction", spying_transaction)
+
+    removed = db.apply_runtime_retention(db_path, retention_days=30)
+
+    assert removed == 11
+    # 11 rows at a batch size of 3: four bounded transactions, not one.
+    assert transaction_calls["n"] == 4
+    with db.connect(db_path) as conn:
+        (n,) = conn.execute("SELECT COUNT(*) FROM run_event").fetchone()
+        assert n == 0
 
 
 def test_report_records_the_zone_the_cutoff_was_rendered_in(tmp_path, _restore_tz):

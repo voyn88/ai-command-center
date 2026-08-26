@@ -125,6 +125,93 @@ def test_zero_or_negative_retention_is_refused(tmp_path):
         )
 
 
+def test_archive_and_prune_batches_instead_of_one_unbounded_pass(tmp_path, monkeypatch):
+    """The whole point of batching: memory and lock-hold are bounded by the
+    batch size, not by how much unpruned history has piled up. Force a batch
+    size far smaller than the row count and check the fixed-size batches are
+    what actually ran, not just that the end state matches a single pass."""
+    db_path = tmp_path / "runtime.db"
+    old_run, fresh_run = _seed(db_path, old_events=11, fresh_events=2)
+    monkeypatch.setattr(maintenance, "_BATCH_SIZE", 3)
+
+    batch_sizes = []
+    real_append = maintenance._append_archive_batch
+
+    def spying_append(archive_path, rows, digest):
+        batch_sizes.append(len(rows))
+        return real_append(archive_path, rows, digest)
+
+    monkeypatch.setattr(maintenance, "_append_archive_batch", spying_append)
+
+    report = maintenance.archive_and_prune(
+        db_path, retention_days=30, archive_dir=tmp_path / "cold"
+    )
+
+    assert report["archived_events"] == report["pruned_events"] == 11
+    assert _event_count(db_path, old_run) == 0
+    assert _event_count(db_path, fresh_run) == 2
+    # 11 rows at a batch size of 3: four batches of [3, 3, 3, 2].
+    assert batch_sizes == [3, 3, 3, 2]
+
+    with gzip.open(report["archive_path"], "rt", encoding="utf-8") as handle:
+        lines = [json.loads(line) for line in handle]
+    assert len(lines) == 11
+    assert {line["run_id"] for line in lines} == {old_run}
+
+
+def test_batch_finalize_failure_does_not_lose_already_committed_batches(
+    tmp_path, monkeypatch
+):
+    """Regression for the rejected PR #386 finding: a prior version committed
+    every batch's deletion while the gzip stream stayed open, so a failure
+    finalizing the archive (footer write, disk full) after the fact could
+    lose already-committed rows with an unreadable archive to show for it.
+
+    Failing inside the gzip handle's `close()` -- not `write()` -- targets
+    exactly the finalize-on-`__exit__` path the rejected PR's failure test
+    did not cover. The second batch's footer write is made to fail; the
+    first batch must already be durably archived (readable on its own) and
+    deleted, and the second batch's rows must still be in the database (its
+    transaction never committed) instead of vanished.
+    """
+    db_path = tmp_path / "runtime.db"
+    old_run, _ = _seed(db_path, old_events=7, fresh_events=0)
+    monkeypatch.setattr(maintenance, "_BATCH_SIZE", 3)
+
+    real_close = gzip.GzipFile.close
+    calls = {"n": 0}
+
+    def flaky_close(self):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("simulated disk-full while finalizing gzip footer")
+        return real_close(self)
+
+    monkeypatch.setattr(gzip.GzipFile, "close", flaky_close)
+
+    with pytest.raises(OSError, match="simulated disk-full"):
+        maintenance.archive_and_prune(
+            db_path, retention_days=30, archive_dir=tmp_path / "cold"
+        )
+
+    # First batch (3 rows) finalized and committed before the second batch's
+    # finalize failed -- it must survive, not roll back with everything else.
+    assert _event_count(db_path, old_run) == 4  # 7 - 3 (first batch only)
+    # The second batch was never deleted, so nothing is lost -- only its
+    # archive attempt is an incomplete trailing member in this run's file;
+    # a retry starts a fresh, timestamped archive file.
+
+    archive_path = next((tmp_path / "cold").glob("run-events-*.jsonl.gz"))
+    lines = []
+    with pytest.raises(EOFError):
+        with gzip.open(archive_path, "rt", encoding="utf-8") as handle:
+            for line in handle:
+                lines.append(json.loads(line))
+    # The already-finalized first batch is intact and readable up to the
+    # truncated second member -- the failure does not corrupt or hide it.
+    assert len(lines) == 3
+
+
 def test_restore_refuses_missing_or_corrupt_backup(tmp_path):
     db_path = tmp_path / "runtime.db"
     _seed(db_path, old_events=1, fresh_events=0)
