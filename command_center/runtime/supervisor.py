@@ -2200,9 +2200,17 @@ class Supervisor:
         RUNNING for a later reconcile to reclassify)."""
         if pid is None:
             return True  # nothing to signal; safe to terminalize
-        current = identity.capture_identity(pid)
-        if current is None:
+        process_query = identity.query_identity(pid)
+        if process_query.status in {
+            identity.ProcessQueryStatus.ABSENT,
+            identity.ProcessQueryStatus.ZOMBIE,
+        }:
             return True  # already gone; terminalize
+        if process_query.status is identity.ProcessQueryStatus.UNKNOWN:
+            return False  # unreadable is not safe to signal or terminalize
+        current = process_query.identity
+        if current is None:  # defensive: LIVE always carries an identity
+            return False
         if recorded_identity and current.as_string() != recorded_identity:
             return False  # pid reused since classification — must not signal it
         try:
@@ -2460,14 +2468,23 @@ class Supervisor:
                     looks_gone = True
                     detail = "no pid recorded for this run"
                 else:
-                    current_identity = identity.capture_identity(pid)
-                    if current_identity is None:
+                    process_query = identity.query_identity(pid)
+                    if process_query.status in {
+                        identity.ProcessQueryStatus.ABSENT,
+                        identity.ProcessQueryStatus.ZOMBIE,
+                    }:
                         looks_gone = True
-                        detail = "pid no longer exists"
+                        detail = "pid no longer executes"
+                    elif process_query.status is identity.ProcessQueryStatus.UNKNOWN:
+                        classification = "UNKNOWN"
+                        detail = "pid identity could not be queried safely"
+                    elif process_query.identity is None:
+                        classification = "UNKNOWN"
+                        detail = "live pid query returned no identity"
                     elif not recorded_identity:
                         classification = "UNKNOWN"
                         detail = "pid exists but no identity was recorded at launch time"
-                    elif current_identity.as_string() == recorded_identity:
+                    elif process_query.identity.as_string() == recorded_identity:
                         classification = "RUNNING"
                         detail = "pid exists and identity matches; orphaned from this supervisor instance"
                     else:

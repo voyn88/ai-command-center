@@ -83,13 +83,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Report the eligible set without dispatching.",
     )
-    sub.add_parser(
+    review = sub.add_parser(
         "backlog-review",
         help="One review tick (BO-S3b): enqueue an adversarial review run for "
         "each READY_TO_REVIEW task carrying a PR, then publish the ACCEPT "
         "marker for any task whose review already returned a verdict "
         "(aicc-backlog-review.timer). Needs --repo-path.",
-    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    )
+    review.add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    review.add_argument(
+        "--task-id",
+        default=None,
+        help="Review and publish a verdict only for this exact backlog task id.",
+    )
     sub.add_parser(
         "backlog-merge",
         help="One merge tick (BO-S3b): merge every reviewed PR whose ACCEPT "
@@ -277,16 +283,20 @@ def main(argv: list[str] | None = None) -> int:
                 store = WorkQueueStore(lambda: _nc(conn))
                 report = review_once(
                     lambda: _nc(conn),
-                    lambda q, k, pl, tid: store.enqueue(
-                        q, idempotency_key=k, payload=pl, task_id=tid
+                    lambda q, k, pl, tid, attempts: store.enqueue(
+                        q, idempotency_key=k, payload=pl, task_id=tid,
+                        max_attempts=attempts,
                     ),
                     args.repo_path,
+                    task_id=args.task_id,
                 )
                 for task_id, pr in report.reviewed:
                     print(f"REVIEW    {task_id} -> {pr}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
-                marker_report = publish_review_verdicts(lambda: _nc(conn), args.repo_path)
+                marker_report = publish_review_verdicts(
+                    lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                )
                 for task_id, pr in marker_report.reviewed:
                     print(f"MARKER    {task_id} -> {pr}")
                 for task_id, new_task_id in marker_report.remediated:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -13,7 +15,9 @@ CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 
 EXPECTED_CONTEXTS = {
-    "quality-gates": "Quality gates (whitespace · Ruff · compile · pytest)",
+    "quality-gates": "Linux quality shard ${{ matrix.shard }} of 4",
+    "manifest-gate": "Linux manifest gate (exactly once)",
+    "coverage-gate": "Main coverage aggregation",
     "windows-quality-gates": "Windows quality gates (Ruff · compile · pytest)",
     "security-gates": "Security gates (workflow policy · provenance · supply chain)",
     "build-gates": "Build gates (web production)",
@@ -27,14 +31,22 @@ EXPECTED_CONTEXTS = {
 }
 
 EXPECTED_STEPS = {
-    # The required test gate runs as a parallel body (pytest-xdist) plus a short
-    # serial tail; both together run every test exactly once.
+    # Four fixed shards run the core partition while exactly one matrix member
+    # owns each non-parallel partition. The manifest gate proves the nodeid
+    # union is non-empty and exactly-once before Final can pass.
     "quality-gates": {
-        "Pytest + coverage (parallel)",
+        "Build exactly-once test manifest",
+        "Pytest core shard",
         "Pytest (serial tail)",
         "Real-browser E2E",
+        "Publish exact test manifest",
     },
-    "impact-fast-check": {"Select impacted tests", "Run impacted tests (parallel)"},
+    "manifest-gate": {"Verify four identical non-empty manifests"},
+    "coverage-gate": {"PR and merge-group coverage policy"},
+    "impact-fast-check": {
+        "Select impacted tests",
+        "Run impacted tests (parallel body + serial tail)",
+    },
     "windows-quality-gates": {"Desktop pytest-qt suite", "Real-browser E2E"},
     "security-gates": {
         "Release gate policy",
@@ -139,6 +151,111 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
         assert required_steps <= step_names
 
 
+def test_impact_fast_check_uses_the_mandatory_two_phase_serial_split() -> None:
+    impact = _workflow(CI_WORKFLOW)["jobs"]["impact-fast-check"]
+    (step,) = [
+        step
+        for step in impact["steps"]
+        if step.get("name") == "Run impacted tests (parallel body + serial tail)"
+    ]
+    command = step["run"]
+
+    assert 'run_phase -q -m "not serial" -n auto --dist loadscope' in command
+    assert "run_phase -q -m serial -p no:xdist" in command
+    assert 'if [ "$rc" -eq 5 ]' in command
+    assert 'if [ "${#selected[@]}" -eq 0 ]' in command
+    assert 'read -r path || [ -n "$path" ]' in command
+    assert '[ -n "$path" ] && selected+=("$path")' in command
+    assert "xargs" not in "\n".join(
+        line for line in command.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def _impact_script() -> str:
+    impact = _workflow(CI_WORKFLOW)["jobs"]["impact-fast-check"]
+    (step,) = [
+        step
+        for step in impact["steps"]
+        if step.get("name") == "Run impacted tests (parallel body + serial tail)"
+    ]
+    return step["run"]
+
+
+def _run_impact_script(
+    tmp_path: Path, selection: str, *, parallel_rc: int = 0, serial_rc: int = 0
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "pytest-calls.txt"
+    fake_pytest = bin_dir / "pytest"
+    fake_pytest.write_text(
+        """#!/usr/bin/env bash
+printf 'CALL\\n' >> "$PYTEST_CALLS"
+printf '<%s>\\n' "$@" >> "$PYTEST_CALLS"
+if [[ " $* " == *' -m not serial '* ]]; then
+  exit "$PARALLEL_RC"
+fi
+exit "$SERIAL_RC"
+""",
+        encoding="utf-8",
+    )
+    fake_pytest.chmod(0o755)
+    (tmp_path / "selected-tests.txt").write_text(selection, encoding="utf-8")
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "PYTEST_CALLS": str(calls),
+        "PARALLEL_RC": str(parallel_rc),
+        "SERIAL_RC": str(serial_rc),
+    }
+    result = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", _impact_script()],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+def test_impact_script_keeps_unterminated_last_path_and_skips_blank_lines(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_impact_script(
+        tmp_path, "tests/first.py\n\ntests/last.py"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.count("CALL\n") == 2
+    assert calls.count("<tests/first.py>\n") == 2
+    assert calls.count("<tests/last.py>\n") == 2
+    assert "<>" not in calls
+
+
+def test_impact_script_neutralizes_only_no_tests_collected(tmp_path: Path) -> None:
+    no_tests, calls = _run_impact_script(
+        tmp_path, "tests/only.py\n", parallel_rc=5, serial_rc=5
+    )
+    assert no_tests.returncode == 0
+    assert calls.count("CALL\n") == 2
+
+    failed_dir = tmp_path / "failed"
+    failed_dir.mkdir()
+    failed, failed_calls = _run_impact_script(
+        failed_dir, "tests/only.py\n", parallel_rc=1
+    )
+    assert failed.returncode == 1
+    assert failed_calls.count("CALL\n") == 1
+
+
+def test_impact_script_refuses_an_empty_selection(tmp_path: Path) -> None:
+    result, calls = _run_impact_script(tmp_path, "\n\n")
+
+    assert result.returncode == 1
+    assert calls == ""
+
+
 SECRET_REFERENCE = re.compile(r"\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)[^}]*\}\}")
 
 # `GITHUB_TOKEN` is minted per run and already scoped by `permissions:`; it is
@@ -234,7 +351,9 @@ def test_every_step_holding_a_repository_secret_first_proves_its_code_is_ours() 
             offenders.append((path.name, job_id, step.get("name"), first))
             continue
         if "GITHUB_TOKEN" not in _secret_names(step.get("env", {})):
-            offenders.append((path.name, job_id, step.get("name"), "guard has no GITHUB_TOKEN"))
+            offenders.append(
+                (path.name, job_id, step.get("name"), "guard has no GITHUB_TOKEN")
+            )
     assert not offenders, (
         "steps receive a repository secret without first proving the checked-out "
         f"code was authored here: {offenders}"
@@ -258,7 +377,9 @@ def test_a_refused_guard_actually_stops_the_step() -> None:
         if shell in ABORTING_SHELLS:
             continue
         inherited = ((job.get("defaults") or {}).get("run") or {}).get("shell")
-        offenders.append((path.name, job_id, step.get("name"), shell or f"inherited:{inherited}"))
+        offenders.append(
+            (path.name, job_id, step.get("name"), shell or f"inherited:{inherited}")
+        )
     assert not offenders, (
         "steps hand over a repository secret under a shell that does not abort on the "
         f"guard's refusal; declare `shell: bash`: {offenders}"
@@ -284,7 +405,10 @@ def test_repository_secrets_are_never_scoped_wider_than_a_single_step() -> None:
             if job.get("uses"):
                 passed = job.get("secrets")
                 assert passed != "inherit", (path.name, job_id, "secrets: inherit")
-                assert not _secret_names(passed or {}) - EPHEMERAL_SECRETS, (path.name, job_id)
+                assert not _secret_names(passed or {}) - EPHEMERAL_SECRETS, (
+                    path.name,
+                    job_id,
+                )
 
 
 def test_the_trust_guard_exists_where_the_workflows_expect_it() -> None:
@@ -297,14 +421,20 @@ def test_the_secret_invariants_see_every_workflow_in_the_directory() -> None:
         CI_WORKFLOW.name,
         BOUNDARY_WORKFLOW.name,
     }
-    assert len(_workflow_paths()) == len(list((ROOT / ".github/workflows").glob("*.y*ml")))
+    assert len(_workflow_paths()) == len(
+        list((ROOT / ".github/workflows").glob("*.y*ml"))
+    )
 
 
 def test_every_required_context_has_a_deliberate_failure_canary() -> None:
     jobs = _all_jobs()
     for job_id in CANARY_LABELS:
         job = jobs[job_id]
-        (canary,) = [step for step in job["steps"] if step.get("name") == "Deliberate failure canary"]
+        (canary,) = [
+            step
+            for step in job["steps"]
+            if step.get("name") == "Deliberate failure canary"
+        ]
         assert CANARY_LABELS[job_id] in canary["if"]
         assert canary["run"].strip() == "exit 1"
 
@@ -320,6 +450,8 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
     final_gate = _workflow(CI_WORKFLOW)["jobs"]["final-gate"]
     required = {
         "quality-gates",
+        "manifest-gate",
+        "coverage-gate",
         "windows-quality-gates",
         "security-gates",
         "build-gates",
@@ -329,7 +461,9 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
     assert set(final_gate["needs"]) == required
 
     (assertion_step,) = [
-        step for step in final_gate["steps"] if step.get("name") == "Assert required checks"
+        step
+        for step in final_gate["steps"]
+        if step.get("name") == "Assert required checks"
     ]
     script = assertion_step["run"]
     for job_id in required:
