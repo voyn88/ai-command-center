@@ -2,11 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-<key>CFBundleDisplayName</key>
-<string>AICC</string>
-<key>AICCServerURL</key>
-<string>$(AICC_SERVER_URL)</string>
-<key>AICCGatewayPinB64</key>
-<string>$(AICC_GATEWAY_PIN_B64)</string>
+	<key>AICCGatewayPinB64</key>
+	<string>$(AICC_GATEWAY_PIN_B64)</string>
+	<key>AICCServerURL</key>
+	<string>$(AICC_SERVER_URL)</string>
+	<key>CFBundleDisplayName</key>
+	<string>AICC</string>
 </dict>
 </plist>
