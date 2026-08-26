@@ -302,7 +302,18 @@ def _static_quality_gate(repo_path: Path, head_sha: str) -> PublishResult | None
     # verdict to the authoritative CI suite, never widens anything.
     if not (repo_path / "scripts" / "ci" / "prepush").is_dir():
         return None
-    argv = [sys.executable, "-m", "ruff", "check", "--no-cache", "."]
+    # Never `python -m ruff` with the candidate tree as cwd: `-m` prepends
+    # the cwd to sys.path, so a committed `ruff/__main__.py` package would
+    # SHADOW the installed tool and execute candidate code right here
+    # (verification finding on f232c81). The ruff binary next to the
+    # worker's interpreter is a native executable -- no Python path
+    # resolution at all; the `-m` fallback (older layouts) runs the
+    # interpreter with -P (safe path: cwd never enters sys.path).
+    ruff_binary = Path(sys.executable).with_name("ruff")
+    if ruff_binary.is_file() and os.access(ruff_binary, os.X_OK):
+        argv = [str(ruff_binary), "check", "--no-cache", "."]
+    else:
+        argv = [sys.executable, "-P", "-m", "ruff", "check", "--no-cache", "."]
     env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),

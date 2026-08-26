@@ -606,3 +606,30 @@ def test_real_band_script_defers_without_venv_and_honours_bypass(tmp_path):
     )
     assert bypass.returncode == 0
     assert "bypassed" in bypass.stdout
+
+
+def test_committed_ruff_package_cannot_shadow_the_tool(repo, monkeypatch):
+    """Verification finding on f232c81: `python -m ruff` with the candidate
+    tree as cwd lets a committed `ruff/__main__.py` shadow the installed
+    tool and execute candidate code in the publisher context. The gate now
+    resolves the real ruff (binary next to the interpreter, or -m under -P)
+    so the planted package must never run — and the verdict must come from
+    the real tool (clean tree passes)."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    marker = work.parent / "shadow-ruff.ran"
+    shadow = work / "ruff" / "__main__.py"
+    shadow.parent.mkdir()
+    (work / "ruff" / "__init__.py").write_text("")
+    shadow.write_text(
+        f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+    )
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "shadow attempt")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not marker.exists(), "candidate ruff package executed in publisher"
+    assert r.ok, r.reason
