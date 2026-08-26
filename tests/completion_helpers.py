@@ -129,4 +129,13 @@ def seed_completed_run(
             db_path, run["id"], expected_version=version, new_state=state,
             fields={"completed_at": "2026-07-22T12:00:00"},
         )
+        if state in runtime_db.TERMINAL_STATES:
+            # This helper stands in for the whole Supervisor lifecycle, whose
+            # own finalization (report, auto-commit, `process_exited` event)
+            # is what `runtime.run_finalizer` marks with `finalized_at` —
+            # required by `task_sync` before it will project terminal fields
+            # or seed a completion row (VOYN-W0-AICC-SRV-09-FINALIZED-AT).
+            # Callers exercising the pre-finalization window itself construct
+            # that state directly rather than through this helper.
+            runtime_db.mark_run_finalized(db_path, run["id"])
     return runtime_db.get_run(db_path, run["id"])

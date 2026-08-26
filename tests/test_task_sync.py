@@ -41,6 +41,16 @@ def _make_run(db_path, *, state: str, task_id: str = "task-1", provider_id: str 
         run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="RUNNING")
     if state not in ("PREPARED", "QUEUED", "RUNNING"):
         run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state=state, fields=fields)
+    if state in db.TERMINAL_STATES:
+        # Every terminal fixture here is meant to represent a run whose
+        # finalization (report write, auto-commit, `process_exited` event —
+        # see `runtime.run_finalizer`) has already landed, matching what
+        # `sync_task_from_run`/`_seed_and_project_completion` now require
+        # before publishing terminal fields or seeding a completion. The
+        # pre-finalization window itself is exercised by dedicated tests
+        # below, not by every fixture that just wants a "done" run.
+        db.mark_run_finalized(db_path, run["id"])
+        run = db.get_run(db_path, run["id"])
     return run
 
 
@@ -331,6 +341,8 @@ def test_sync_task_from_run_failed_executors_accumulate_across_providers(tmp_pat
         db_path, run2["id"], expected_version=run2["version"], new_state="FAILED",
         fields={"failure_reason": "provider_api_error", "completed_at": "2026-01-01T00:02:00"},
     )
+    db.mark_run_finalized(db_path, run2["id"])
+    run2 = db.get_run(db_path, run2["id"])
     task_sync.sync_task_from_run(task, run2, db_path=db_path)
 
     assert task.get("failed_executors") == ["claude_code", "copilot_cli"]
@@ -667,6 +679,7 @@ def test_reconcile_and_sync_recovers_stale_current_run_id_pointer(tmp_path):
         db_path, new_run["id"], expected_version=new_run["version"],
         fields={"first_output_at": "2026-01-01T00:01:30"},
     )
+    db.mark_run_finalized(db_path, new_run["id"])
     api = runtime_api.ExecutionCenterAPI(db_path=db_path)
     # Task pointer is frozen on the OLD run — the orphaned state.
     task = _make_task(current_run_id=old_run["id"], executor="claude_code")

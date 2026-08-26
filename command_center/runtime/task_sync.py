@@ -213,6 +213,23 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         task["current_run_id"] = run["id"]
         mutated = True
 
+    # A run's `state` (hence `status`) turns terminal before its finalization
+    # — the `process_exited` event, the post-COMPLETED auto-commit, the report
+    # write (`runtime.run_finalizer`, VOYN-W0-AICC-SRV-09-FINALIZED-AT) — is
+    # durable: `Supervisor._supervise` commits the terminal row and finishes
+    # that work afterwards, on a daemon thread this sync never waits on
+    # (measured up to ~150ms wide on a run that left a dirty tree). Projecting
+    # terminal fields from inside that window would read a still-missing
+    # report/PR url, and the idempotency guard above (`terminal_projection_
+    # run_id`) would then mark this run "already handled" forever — the real
+    # data landing a moment later would never be picked up. So a terminal run
+    # without `finalized_at` yet is left exactly as this tick found it: the
+    # `current_run_id` bookkeeping above still applies, but no terminal field
+    # or launch status is published until a later tick observes `finalized_at`
+    # set.
+    if status in session_view.TERMINAL_DISPLAY_STATUSES and not run.get("finalized_at"):
+        return mutated
+
     # Advance progress for in-progress runs. While a run is RUNNING, the only
     # observable milestone is `first_output_at` — the agent has started
     # producing output. Move the task from the pre-launch "Workspace Verified"
@@ -482,7 +499,14 @@ def _seed_and_project_completion(
 
     completion = db.get_completion(api.db_path, run["id"])
     if completion is None:
-        if run.get("state") != "COMPLETED":
+        # Not just terminal, but *finalized* (see the matching guard and its
+        # rationale in `sync_task_from_run`): `begin_completion` below reads
+        # the repository's current HEAD as the completion's `head_commit`.
+        # Seeding inside the pre-finalization window would capture the SHA
+        # from *before* the post-COMPLETED auto-commit lands, seeding a
+        # completion — and, from it, a pull request — that is missing the
+        # agent's own work.
+        if run.get("state") != "COMPLETED" or not run.get("finalized_at"):
             return False
         cfg = project_config.get_project_config(run["project"])
         completion = CompletionOrchestrator(api.db_path).begin_completion(
