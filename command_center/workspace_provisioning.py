@@ -75,6 +75,11 @@ from command_center.workspace_authority import decode_workspace_authority_key
 
 _GIT_OPERATION_ERRORS = (OSError, subprocess.SubprocessError)
 _MARKER_READ_ERRORS = (OSError, ValueError, TypeError)
+# Named, not inline `except (OSError, UnicodeDecodeError):` -- ruff-format
+# under this project's py314 target rewrites a parenthesized except-tuple to
+# PEP 758's bare `except OSError, UnicodeDecodeError:`, which is a
+# SyntaxError on the Python 3.12/3.13 runtimes this code actually ships on.
+_HEAD_READ_ERRORS = (OSError, UnicodeDecodeError)
 
 # Branch names that denote a repository's main line rather than isolated
 # feature/audit work. A task whose expected branch is one of these (or equals
@@ -452,6 +457,20 @@ def _source_remote_url(repo: Path, spec: WorkspaceSpec) -> str:
     remote = git_info.run_git_command(repo, ["remote", "get-url", "origin"])
     if remote is not None and remote.returncode == 0 and remote.stdout.strip():
         value = remote.stdout.strip()
+        # Every use of this value is a positional argument to `git clone`/
+        # `git ls-remote`. A value starting with `-` would be parsed as an
+        # option instead of a repository (e.g. `--upload-pack=<command>`
+        # achieves execution during trusted provisioning) — refuse it outright
+        # rather than relying on callers to insert an option terminator that
+        # `git ls-remote` does not even support (review finding on 5f2f1dd).
+        if value.startswith("-"):
+            raise WorkspaceVerificationError(
+                failed_step="canonical_remote_not_option_like",
+                remediation="Replace origin with a repository URL that does not begin with '-'.",
+                expected_workspace=spec.workspace_path,
+                expected_branch=spec.expected_branch,
+                detail="origin URL begins with '-' and could be parsed as a git option",
+            )
         # Never persist or hand an agent an HTTPS URL containing user-info.
         # Canonical GitHub HTTPS and SSH URLs remain allowed.
         if (
@@ -473,6 +492,14 @@ def _source_remote_url(repo: Path, spec: WorkspaceSpec) -> str:
             if not candidate.is_absolute():
                 candidate = repo / candidate
             value = str(candidate.resolve())
+            if value.startswith("-"):
+                raise WorkspaceVerificationError(
+                    failed_step="canonical_remote_not_option_like",
+                    remediation="Relocate the repository outside a '-'-prefixed path.",
+                    expected_workspace=spec.workspace_path,
+                    expected_branch=spec.expected_branch,
+                    detail="resolved local origin path begins with '-'",
+                )
         return value
     # Local repositories used by offline/test deployments may have no origin.
     # ``--no-local`` below still creates independent objects and metadata.
@@ -1387,20 +1414,67 @@ def provision_and_verify(spec: WorkspaceSpec) -> VerificationEvidence:
     return evidence
 
 
+def _open_relative_regular(
+    base_fd: int, parts: tuple[str, ...], open_flags: int, nofollow: int
+) -> tuple[int, os.stat_result] | None:
+    """Open a regular file at `parts`, relative to `base_fd`, one component at
+    a time with `O_NOFOLLOW` on every hop. Walking component-by-component
+    (rather than joining a pathname and opening it once) means an
+    intermediate directory being swapped for a symlink mid-walk cannot
+    redirect the final open — the same protection `_read_agent_head` already
+    applies to `HEAD` itself, extended to cover its multi-component `refs/
+    heads/<branch>` path (review finding on 5f2f1dd: "branch refs have
+    similar pathname races because parent components are not
+    descriptor-pinned"). Returns `None` if any component is simply absent;
+    raises `OSError` for any other failure. Caller closes the returned fd.
+    """
+    current_fd = os.dup(base_fd)
+    try:
+        for index, part in enumerate(parts):
+            is_last = index == len(parts) - 1
+            flags = open_flags | nofollow | (0 if is_last else os.O_DIRECTORY)
+            try:
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                return None
+            os.close(current_fd)
+            current_fd = next_fd
+        info = os.fstat(current_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"{'/'.join(parts)} is not a regular unlinked file")
+        return current_fd, info
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+_MAX_REF_BYTES = 4096
+_MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024
+
+
 def _read_agent_head(workspace: Path, expected_branch: str) -> str:
     """Resolve HEAD without invoking Git against agent-controlled config."""
     git_dir = workspace / ".git"
     # The workspace .git tree is agent-writable and this runs inside the
-    # credential-owning publisher clone, so HEAD must never be read by
-    # pathname: an lstat-then-read let the agent win a rename race, redirect
-    # .git/HEAD at a root-owned secret via a symlink, and leak its bytes
-    # through the "unexpected HEAD contents" detail below. Pin .git to a
-    # directory fd, open HEAD *relative to that fd* with O_NOFOLLOW, and
-    # validate each fd's own fstat before reading -- the fd-pinned discipline
-    # aicc_install_transaction._read_regular already uses -- so neither a
-    # swapped parent, a HEAD symlink, nor a hardlink can redirect the read.
+    # credential-owning publisher clone, so nothing under it may ever be read
+    # by pathname: an lstat-then-read let the agent win a rename race,
+    # redirect a path at a root-owned secret via a symlink, and leak its
+    # bytes through an error detail. Pin .git to a directory fd and open
+    # everything beneath it *relative to that fd* with O_NOFOLLOW, validating
+    # each fd's own fstat before reading, so neither a swapped parent, a
+    # symlink, nor a hardlink can redirect any read.
     open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if any(part in {"", ".", ".."} for part in expected_branch.split("/")):
+        raise WorkspaceVerificationError(
+            failed_step="agent_head_branch",
+            remediation="Use a branch name without empty or dot path components.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="branch name would escape .git/refs/heads",
+        )
+    expected_ref = f"refs/heads/{expected_branch}"
     dir_fd: int | None = None
     head_fd: int | None = None
     try:
@@ -1432,7 +1506,7 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
             )
         try:
             head_text = os.read(head_fd, 4096).decode("ascii", "strict").strip()
-        except (OSError, UnicodeDecodeError):
+        except _HEAD_READ_ERRORS:
             # Never echo the bytes: a non-ASCII HEAD is refused without
             # surfacing its content in the error (or a chained exception).
             raise WorkspaceVerificationError(
@@ -1442,56 +1516,68 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
                 actual_workspace=str(workspace),
                 detail="task-local HEAD is not ASCII text",
             ) from None
+        if head_text != f"ref: {expected_ref}":
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_branch",
+                remediation="Keep the task on its exact expected branch.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"unexpected HEAD contents: {head_text!r}",
+            )
+
+        candidate: str | None = None
+        try:
+            opened = _open_relative_regular(
+                dir_fd, tuple(expected_ref.split("/")), open_flags, nofollow
+            )
+            if opened is not None:
+                ref_fd, ref_stat = opened
+                try:
+                    if ref_stat.st_size > _MAX_REF_BYTES:
+                        raise OSError("branch ref is implausibly large")
+                    candidate = (
+                        os.read(ref_fd, _MAX_REF_BYTES)
+                        .decode("ascii", "strict")
+                        .strip()
+                    )
+                finally:
+                    os.close(ref_fd)
+            else:
+                packed = _open_relative_regular(
+                    dir_fd, ("packed-refs",), open_flags, nofollow
+                )
+                if packed is not None:
+                    packed_fd, packed_stat = packed
+                    try:
+                        if packed_stat.st_size > _MAX_PACKED_REFS_BYTES:
+                            raise OSError("packed-refs is implausibly large")
+                        packed_text = os.read(packed_fd, _MAX_PACKED_REFS_BYTES).decode(
+                            "ascii", "strict"
+                        )
+                    finally:
+                        os.close(packed_fd)
+                    for line in packed_text.splitlines():
+                        if not line or line.startswith(("#", "^")):
+                            continue
+                        sha, _, ref = line.partition(" ")
+                        if ref == expected_ref:
+                            candidate = sha
+                            break
+        except _HEAD_READ_ERRORS as exc:
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_ref",
+                remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"cannot read branch ref safely: {exc}",
+            ) from exc
     finally:
         if head_fd is not None:
             os.close(head_fd)
         if dir_fd is not None:
             os.close(dir_fd)
-    expected_ref = f"refs/heads/{expected_branch}"
-    if any(part in {"", ".", ".."} for part in expected_branch.split("/")):
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_branch",
-            remediation="Use a branch name without empty or dot path components.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail="branch name would escape .git/refs/heads",
-        )
-    if head_text != f"ref: {expected_ref}":
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_branch",
-            remediation="Keep the task on its exact expected branch.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail=f"unexpected HEAD contents: {head_text!r}",
-        )
-    ref_path = git_dir.joinpath(*expected_ref.split("/"))
-    candidate: str | None = None
-    try:
-        if ref_path.exists():
-            if not stat.S_ISREG(ref_path.lstat().st_mode):
-                raise OSError("branch ref is not a regular file")
-            candidate = ref_path.read_text(encoding="ascii").strip()
-        else:
-            packed_path = git_dir / "packed-refs"
-            if packed_path.exists() and stat.S_ISREG(packed_path.lstat().st_mode):
-                for line in packed_path.read_text(encoding="ascii").splitlines():
-                    if not line or line.startswith(("#", "^")):
-                        continue
-                    sha, _, ref = line.partition(" ")
-                    if ref == expected_ref:
-                        candidate = sha
-                        break
-    except OSError as exc:
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_ref",
-            remediation="Preserve the workspace for inspection and retry on a clean clone.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail=f"cannot read branch ref safely: {exc}",
-        ) from exc
     if (
         candidate is None
         or len(candidate) != 40
@@ -2041,9 +2127,7 @@ def remove_workspace(
         # refuses a symlink at open time; the fstat validates the very
         # object the dst_dir_fd rename below will use.
         directory_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
         )
         if hasattr(os, "O_NOFOLLOW"):
             directory_flags |= os.O_NOFOLLOW

@@ -489,24 +489,65 @@ def test_recover_finishes_an_interrupted_commit_instead_of_reverting_it(
     assert json.loads(transaction.current.read_text())["manifest"]
 
 
-def test_recover_restores_release_selector_before_any_service_snapshot(tmp_path):
+def test_recover_restores_release_selector_before_any_service_snapshot(
+    monkeypatch, tmp_path
+):
+    """A prior test of this name created no `pending.json` and never
+    instrumented `restore_service_snapshot`, so `recover()`'s early
+    no-pending-install branch (which never touches a service snapshot at
+    all) satisfied it trivially -- an implementation that restored services
+    *before* the release selector inside the real interrupted-install branch
+    would still have passed (review finding on 5f2f1dd). Exercise that
+    branch for real: a pending APPLIED generation plus a pending release
+    selector plus an actual service snapshot, and record the call order of
+    both restorations."""
     module = _module()
     root = tmp_path / "root"
     state = tmp_path / "state"
     current = root / "opt/aicc/current"
     current.parent.mkdir(parents=True)
     current.symlink_to(f"releases/{'b' * 40}")
-    state.mkdir()
     (current.parent / "releases" / ("a" * 40)).mkdir(parents=True)
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/new"),))
+    transaction.apply()
+    assert json.loads(transaction.pending.read_text())["phase"] == "APPLIED"
+
     pending_release = state / "pending-release"
     pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
     pending_release.chmod(0o600)
+    (state / "attempt-units.json").write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
 
-    transaction = module.FileTransaction(root, state)
+    order: list[str] = []
+    original_selector_restore = module.FileTransaction._restore_release_selector
+
+    def recording_selector_restore(self):
+        order.append("selector")
+        return original_selector_restore(self)
+
+    def recording_service_restore(path):
+        assert path == state / "attempt-units.json"
+        order.append("services")
+
+    monkeypatch.setattr(
+        module.FileTransaction,
+        "_restore_release_selector",
+        recording_selector_restore,
+    )
+    monkeypatch.setattr(module, "restore_service_snapshot", recording_service_restore)
+
     transaction.recover()
 
+    assert order == ["selector", "services"], order
     assert current.readlink() == Path(f"releases/{'a' * 40}")
     assert not pending_release.exists()
+    assert not (root / "etc/new").exists()
+    assert not transaction.pending.exists()
 
 
 def test_recover_refuses_a_selector_to_a_missing_release(tmp_path):

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import stat
 from pathlib import Path
 
 AUTHORITY_ENV = "AICC_WORKSPACE_AUTHORITY_KEY"
 _AUTHORITY_DECODE_ERRORS = (ValueError, binascii.Error)
+_AUTHORITY_MAX_BYTES = 1 << 16
 
 
 def decode_workspace_authority_key(value: str | None) -> bytes | None:
@@ -30,17 +32,37 @@ def decode_workspace_authority_key(value: str | None) -> bytes | None:
 def load_workspace_authority_environment(
     path: Path, *, require_root_owned: bool = True
 ) -> bytes:
-    """Load a dedicated EnvironmentFile without ever evaluating it as shell."""
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("workspace authority environment must be a regular file")
-    if require_root_owned and (info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o640):
-        raise ValueError(
-            "workspace authority environment must be root-owned with mode 0640"
-        )
+    """Load a dedicated EnvironmentFile without ever evaluating it as shell.
+
+    Opens the path exactly once with ``O_NOFOLLOW`` and validates/reads from
+    that same file descriptor. Validating via ``lstat(path)`` and then
+    reopening the pathname for ``read_text()`` would leave a check/use race: a
+    replaceable parent directory lets an adversary swap the validated
+    root-owned file for an attacker-controlled one between the two syscalls
+    (review finding on 5f2f1dd).
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(file_descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("workspace authority environment must be a regular file")
+        if require_root_owned and (
+            info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o640
+        ):
+            raise ValueError(
+                "workspace authority environment must be root-owned with mode 0640"
+            )
+        if info.st_size > _AUTHORITY_MAX_BYTES:
+            raise ValueError("workspace authority environment is implausibly large")
+        raw_bytes = os.read(file_descriptor, _AUTHORITY_MAX_BYTES + 1)
+    finally:
+        os.close(file_descriptor)
+    if len(raw_bytes) > _AUTHORITY_MAX_BYTES:
+        raise ValueError("workspace authority environment is implausibly large")
 
     assignments: list[tuple[str, str]] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for raw in raw_bytes.decode("utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue

@@ -84,28 +84,76 @@ def _fsync_dir(path: Path) -> None:
         os.close(descriptor)
 
 
-def _atomic_bytes(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".{path.name}.aicc-{secrets.token_hex(8)}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(temporary, flags, mode)
+_DIR_OPEN_FLAGS = (
+    os.O_RDONLY
+    | os.O_DIRECTORY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+
+
+def _open_directory_chain(path: Path, *, create: bool) -> int:
+    """Open `path` by walking every component from `/` with O_NOFOLLOW.
+
+    `prepare()` validates each target's parent chain once via `lstat`, but a
+    write executed later (a separate `apply` invocation, in production a
+    separate process started by the installer) never revisited that check
+    before calling through to the rename below. A writable ancestor —
+    especially beneath a deployment-owned directory such as
+    `/var/lib/aicc-agent` — could be swapped for a symlink in between,
+    letting the root-run installer escape `--root` and write attacker-chosen
+    content, ownership or mode wherever the symlink points (review finding on
+    5f2f1dd). Pinning every component as a directory fd, all the way from the
+    filesystem root, immediately before use closes that window: once opened
+    here nothing can redirect the descriptors this function returns.
+    """
+    if not path.is_absolute():
+        raise ValueError(f"directory chain must be absolute: {path}")
+    current_fd = os.open("/", _DIR_OPEN_FLAGS)
     try:
-        os.fchmod(descriptor, mode)
-        os.fchown(descriptor, uid, gid)
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        _fsync_dir(path.parent)
-    finally:
-        os.close(descriptor)
+        for part in path.parts[1:]:
+            try:
+                next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=current_fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o755, dir_fd=current_fd)
+                next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _atomic_bytes(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> None:
+    directory_fd = _open_directory_chain(path.parent, create=True)
+    try:
+        temporary = f".{path.name}.aicc-{secrets.token_hex(8)}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, mode, dir_fd=directory_fd)
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            os.fchmod(descriptor, mode)
+            os.fchown(descriptor, uid, gid)
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(
+                temporary, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd
+            )
+            os.fsync(directory_fd)
+        finally:
+            os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(directory_fd)
 
 
 def _read_regular(path: Path, *, max_bytes: int = 128 * 1024 * 1024) -> FileState:
