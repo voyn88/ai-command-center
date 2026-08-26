@@ -1118,3 +1118,139 @@ def test_review_once_enqueues_a_full_context_adjudication_for_multichunk(rig, _t
     assert ("VOYN-W0-ADJ-D", pr_url) in report.reviewed
     adj = [k for k in enq if k.startswith("adjudicate:")]
     assert len(adj) == 1, enq
+
+
+# --- VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR: keep behind PRs from gridlocking --
+
+def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
+    """A PR only BEHIND main (base advanced after it branched) is brought
+    current with `gh pr update-branch` so it re-enters the merge path instead
+    of gridlocking; nothing is merged this tick."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MT1", "https://github.com/x/y/pull/41")
+    head = "a" * 40
+    calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        calls.append(argv[:2])
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "update-branch"]:
+            return subprocess.CompletedProcess(argv, 0, "updated", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ["pr", "update-branch"] in calls
+    assert ("VOYN-W0-MT1", "branch_updated_behind_main") in report.skipped
+    assert not report.merged
+
+
+def test_merge_train_does_not_update_an_unaccepted_behind_pr(rig, monkeypatch):  # noqa: F811
+    """A BEHIND PR with no ACCEPT marker is NOT branch-updated: the review tick
+    reviews it from its own diff regardless of base distance, so the merge tick
+    must not spend CI + the update quota on a PR that is not yet merge-ready
+    (which would starve accepted-but-behind PRs). (MERGE-TRAIN-COORDINATOR)"""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MT3", "https://github.com/x/y/pull/43")
+    head = "d" * 40
+    calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        calls.append(argv[:2])
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"},
+                "reviews": [], "statusCheckRollup": [],  # not accepted
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ["pr", "update-branch"] not in calls
+    assert ("VOYN-W0-MT3", "no_accept_marker_on_head") in report.skipped
+    assert not report.merged
+
+
+def test_merge_state_treats_malformed_gh_output_as_a_failed_lookup(monkeypatch):
+    """A zero-exit-but-unparseable `gh pr view` must return "" (a failed
+    lookup), never raise and abort the merge tick.
+    (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)"""
+    import subprocess
+
+    def fake_gh(argv, repo):
+        return subprocess.CompletedProcess(argv, 0, "not json <html>", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._merge_state("/tmp", "https://github.com/x/y/pull/9") == ""
+
+
+def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F811
+    """A DIRTY (conflicting) PR is flagged for a rebase and never auto-updated
+    -- update-branch cannot resolve a real conflict."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MT2", "https://github.com/x/y/pull/42")
+    head = "b" * 40
+    calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        calls.append(argv[:2])
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "DIRTY",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ["pr", "update-branch"] not in calls
+    assert ("VOYN-W0-MT2", "branch_dirty_needs_rebase") in report.skipped
+
+
+def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
+    """The per-tick branch-update count is bounded so a moving base cannot make
+    one tick spend everything re-updating branches that will fall behind again."""
+    app_factory, store, _ = rig
+    for i in range(4):
+        _ready(store, app_factory, f"VOYN-W0-MTC{i}", f"https://github.com/x/y/pull/5{i}")
+    head = "c" * 40
+    updates = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "update-branch"]:
+            updates.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "updated", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp", review_merge.ReviewConfig(max_branch_updates_per_tick=2))
+    assert len(updates) == 2
+    assert sum(1 for _, r in report.skipped if r == "branch_updated_behind_main") == 2
+    assert sum(1 for _, r in report.skipped if r == "branch_behind_update_capped") == 2

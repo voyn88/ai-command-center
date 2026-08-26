@@ -89,6 +89,10 @@ class ReviewConfig:
     queue: str = "execution"
     review_timeout: int = 900
     max_per_tick: int = 8
+    #: Per-tick cap on merge-train branch updates (BEHIND PRs brought current
+    #: with main). Bounded so a moving base cannot make the merge tick spend
+    #: the whole tick re-updating branches that will just fall behind again.
+    max_branch_updates_per_tick: int = 3
 
 
 @dataclass
@@ -1253,6 +1257,29 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return True, head
 
 
+def _merge_state(repo_path: str, pr_url: str) -> str:
+    """The PR's GitHub mergeStateStatus for the merge-train coordinator.
+
+    Returns one of BEHIND/DIRTY/BLOCKED/CLEAN/UNKNOWN, or "" for a non-open PR
+    or a failed lookup. BEHIND means the base advanced after the PR branched
+    and its branch must be updated before it can ever merge; DIRTY means a real
+    conflict that only a rebase can resolve.
+    """
+    view = _gh(["pr", "view", pr_url, "--json", "mergeStateStatus,state"], repo_path)
+    if view.returncode != 0:
+        return ""
+    # A zero exit with malformed/empty output (a transient gh hiccup) is a
+    # failed lookup, not a reason to abort the whole merge tick: treat any
+    # unparseable response as "" exactly as the docstring promises.
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict) or data.get("state") != "OPEN":
+        return ""
+    return str(data.get("mergeStateStatus") or "")
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE with the merged sha as evidence."""
@@ -1265,10 +1292,43 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at LIMIT %s",
         (cfg.max_per_tick,),
     )
+    branch_updates = 0
     for task_id, pr_url in tasks:
+        # Readiness FIRST: only a PR that already carries an independent ACCEPT
+        # marker on its head with green required checks is the merge tick's
+        # business. An un-accepted or failing PR is reviewed by the review tick
+        # straight from its own diff -- regardless of how far behind main it is
+        # -- so it needs nothing here; it returns as a ready-but-behind PR once
+        # accepted. Updating an un-accepted PR now would spend CI and the update
+        # quota on a PR that may never be accepted and starve the accepted-
+        # but-behind PRs that are one base-merge from landing.
+        # (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)
         ready, detail = _pr_is_mergeable(repo_path, pr_url)
         if not ready:
             report.skipped.append((task_id, detail))
+            continue
+        # Merge-ready. If it has merely fallen BEHIND main since it was accepted,
+        # bring its branch current with a GitHub-side base merge (no local
+        # writer lease) so it can land; the new head re-runs CI and review
+        # head-keyed. The cap counts ATTEMPTS -- incremented before the call --
+        # so repeated failures cannot exceed the per-tick mutation budget. DIRTY
+        # here would be a real conflict, left for a rebase.
+        state = _merge_state(repo_path, pr_url)
+        if state == "DIRTY":
+            report.skipped.append((task_id, "branch_dirty_needs_rebase"))
+            continue
+        if state == "BEHIND":
+            if branch_updates >= cfg.max_branch_updates_per_tick:
+                report.skipped.append((task_id, "branch_behind_update_capped"))
+                continue
+            branch_updates += 1
+            updated = _gh(["pr", "update-branch", pr_url], repo_path)
+            if updated.returncode == 0:
+                report.skipped.append((task_id, "branch_updated_behind_main"))
+            else:
+                report.skipped.append(
+                    (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
+                )
             continue
         merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
         if merged.returncode != 0:
