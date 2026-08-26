@@ -35,7 +35,9 @@ not an error — a review/analysis task legitimately changes no files.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -91,8 +93,6 @@ class PublishResult:
 def _run(
     argv: list[str], cwd: Path, env_extra: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    import os
-
     env = dict(os.environ)
     if env_extra:
         env.update(env_extra)
@@ -280,6 +280,81 @@ def _verified_pr_result(
     return PublishResult(ok=True, branch=branch, head_sha=head_sha, pr_url=pr_url)
 
 
+def _static_quality_gate(repo_path: Path, head_sha: str) -> PublishResult | None:
+    """Non-executing pre-push checks over the candidate tree as data
+    (VOYN-W0-AICC-PREPUSH-FAST-GATE v2). See the call site in
+    ``publish_run`` for the trust rationale. Returns a refusal
+    ``PublishResult`` on a red check, ``None`` to proceed.
+
+    Fail-open ONLY on missing tooling (a worker venv without ruff): the
+    gate is an economy device and the required CI suite stays
+    authoritative, so absent tooling defers to CI rather than blocking
+    every publish on that host. A finding in the candidate tree itself
+    always refuses. ``VOYN_QUALITY_BAND=off`` skips (operator escape
+    hatch, same contract as the interactive band; the skip is visible as
+    the publish succeeding without a gate refusal it would otherwise
+    hit)."""
+    if os.environ.get("VOYN_QUALITY_BAND") == "off":
+        return None
+    # Repo opt-in mirrors v1: repositories that vendored scripts/ci/prepush/
+    # get the gate; others publish as before. The marker is candidate data,
+    # so a candidate can only opt OUT -- which merely defers its own red
+    # verdict to the authoritative CI suite, never widens anything.
+    if not (repo_path / "scripts" / "ci" / "prepush").is_dir():
+        return None
+    # Never `python -m ruff` with the candidate tree as cwd: `-m` prepends
+    # the cwd to sys.path, so a committed `ruff/__main__.py` package would
+    # SHADOW the installed tool and execute candidate code right here
+    # (verification finding on f232c81). The ruff binary next to the
+    # worker's interpreter is a native executable -- no Python path
+    # resolution at all; the `-m` fallback (older layouts) runs the
+    # interpreter with -P (safe path: cwd never enters sys.path).
+    ruff_binary = Path(sys.executable).with_name("ruff")
+    if ruff_binary.is_file() and os.access(ruff_binary, os.X_OK):
+        argv = [str(ruff_binary), "check", "--no-cache", "."]
+    else:
+        argv = [sys.executable, "-P", "-m", "ruff", "check", "--no-cache", "."]
+    # --isolated: candidate configuration is never read -- a committed
+    # `[tool.ruff] exclude = ["**"]` silently neuters the gate otherwise
+    # (verification finding on 9e02e55; reproduced live: rc 0 with the
+    # exclusion, rc 1 under --isolated). The tree under check contributes
+    # only code, never policy; the gate lints by ruff's defaults, which
+    # this repository's own committed config matches (default selection,
+    # line-length 88). `--isolated --config <trusted>` is not an option:
+    # ruff rejects the combination.
+    argv.append("--isolated")
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+    }
+    try:
+        run = subprocess.run(
+            argv,
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return PublishResult(
+            ok=False, head_sha=head_sha, reason="quality_band_timeout"
+        )
+    if run.returncode == 0:
+        return None
+    stderr = run.stderr or ""
+    if "No module named ruff" in stderr:
+        return None  # tooling absent on this host: defer to CI
+    tail = (run.stdout + stderr).strip().splitlines()
+    detail = " | ".join(tail[-3:]) if tail else "no output"
+    return PublishResult(
+        ok=False,
+        head_sha=head_sha,
+        reason=f"quality_band_failed: {detail[:160]}",
+    )
+
+
 def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     """Acquire the lease, push a branch, open a PR. Idempotent on the branch
     name (``backlog/<task>``): a re-run force-updates the same branch and
@@ -329,6 +404,34 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
             return PublishResult(
                 ok=False, reason="head_not_descendant_of_pinned_base", head_sha=head_sha
             )
+
+    # Pre-push static quality gate (VOYN-W0-AICC-PREPUSH-FAST-GATE, v2 after
+    # the verification REJECT on 254154a): red PR CI runs cost an agent a
+    # full diagnose->fix->SHA->CI->review round-trip, so the cheap part of
+    # that verdict is taken here, before the push. v2 is deliberately
+    # NON-EXECUTING. The v1 ran `scripts/ci/prepush/quality_band.sh` FROM
+    # THE CANDIDATE WORKTREE inside this credentialed worker context --
+    # candidate-controlled host command execution (verification finding 1),
+    # and its env `setdefault` let an inherited variable override the
+    # validated selection base (finding 2). Candidate code only ever
+    # executes inside the agent's isolated principal, so the publish side
+    # keeps exactly the checks that treat the tree as DATA (ruff: parse +
+    # lint, which also catches syntax errors), run by the worker's own
+    # trusted interpreter with explicit argv and a minimal explicit env --
+    # nothing inherited or worktree-resident can redirect them. NOTHING on
+    # this publish path runs the impacted-TEST phase: enforcing it for
+    # agents requires an allowlisted profile in the privileged
+    # principal-isolation launcher (candidate code may only execute under
+    # the isolated principal), which is VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS
+    # -- a separate security-designed task. Until it lands, tests pre-push
+    # exist only in interactive `make prepush`, and the authoritative
+    # enforcement remains the required CI suite. `already_durable`
+    # redeliveries skip the gate: that head's verdict was taken before the
+    # original push.
+    if not already_durable:
+        gate_failure = _static_quality_gate(repo_path, head_sha)
+        if gate_failure is not None:
+            return gate_failure
 
     branch = f"backlog/{cfg.task}"
     if already_durable:
