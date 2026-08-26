@@ -1346,3 +1346,199 @@ def test_no_configured_authority_leaves_the_writer_lease_inert_too(
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert outcome.ok, outcome.reason
     assert len(runs) == 1
+
+
+# -- VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: head-pinned verification checkout ------
+
+
+def test_review_head_payload_fields_parse_and_validate() -> None:
+    request = parse_agent_run(
+        _payload(review_head={"pr_number": "42", "head_sha": "a" * 40})
+    )
+    assert request.review_head_pr_number == "42"
+    assert request.review_head_sha == "a" * 40
+
+    absent = parse_agent_run(_payload())
+    assert absent.review_head_sha is None and absent.review_head_pr_number is None
+
+    for bad in (
+        "not-a-dict",
+        {"pr_number": "42"},
+        {"pr_number": "42", "head_sha": "short"},
+        {"pr_number": "x", "head_sha": "a" * 40},
+        {"pr_number": 42, "head_sha": "a" * 40},
+    ):
+        error = parse_agent_run(_payload(review_head=bad))
+        assert isinstance(error, PayloadError) and not error.retryable, bad
+
+
+def test_review_head_runs_in_the_pinned_checkout_and_cleans_up(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The verification agent must execute in the detached checkout at the
+    PR's exact head -- not the shared repository -- and the checkout must be
+    removed on every exit path (the ExitStack owns the removal)."""
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    pin = tmp_path / "verify-42-pin"
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda repository, pr_number, head_sha: (pin, None),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_remove_review_head_checkout",
+        lambda repository, target: removed.append((repository, target)),
+    )
+    outcome = run_agent(
+        _payload(
+            task_type="verification_review",
+            untrusted=True,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
+        _event(),
+    )
+    assert outcome.ok, outcome.reason
+    assert runs[0]["repository_path"] == pin
+    assert removed == [(tmp_path, pin)]
+
+
+def test_review_head_checkout_is_removed_on_failure_paths_too(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Cleanup is owned by the handler's ExitStack, so it must run when the
+    agent run FAILS and when the runner RAISES -- not only after a success
+    (independent review of this change, chunk 1 at 32bf893: a success-only
+    test would pass an implementation that leaks the worktree on failure)."""
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, _runs = handler
+    pin = tmp_path / "verify-42-pin"
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda repository, pr_number, head_sha: (pin, None),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_remove_review_head_checkout",
+        lambda repository, target: removed.append((repository, target)),
+    )
+    payload = _payload(
+        task_type="verification_review",
+        untrusted=True,
+        review_head={"pr_number": "42", "head_sha": "b" * 40},
+    )
+
+    def failed_run(**kwargs):
+        return agent_runner.RunResult(
+            status="failed", exit_code=1, stdout="", stderr="agent died",
+            duration_seconds=0.1,
+            started_at="2026-08-26T12:00:00+00:00",
+            completed_at="2026-08-26T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_run)
+    run_agent(payload, _event())
+    assert removed == [(tmp_path, pin)]
+
+    def raising_run(**kwargs):
+        raise RuntimeError("runner blew up")
+
+    removed.clear()
+    monkeypatch.setattr(agent_runner, "run_claude_code", raising_run)
+    with pytest.raises(RuntimeError):
+        run_agent(payload, _event())
+    assert removed == [(tmp_path, pin)]
+
+
+def test_review_head_pin_is_refused_for_a_mutating_task(handler) -> None:
+    """A mutating run pinned to a detached head has no branch to publish --
+    the combination is a payload defect, never silently ignored."""
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(
+            task_type="implementation",
+            untrusted=False,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
+        _event(),
+    )
+    assert not outcome.ok and not outcome.retryable
+    assert "review_head" in outcome.reason
+    assert runs == []
+
+
+def test_review_head_checkout_failure_is_retryable(handler, monkeypatch) -> None:
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda repository, pr_number, head_sha: (None, "fetch failed"),
+    )
+    outcome = run_agent(
+        _payload(
+            task_type="verification_review",
+            untrusted=True,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
+        _event(),
+    )
+    assert not outcome.ok and outcome.retryable
+    assert "fetch failed" in outcome.reason
+    assert runs == []
+
+
+def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
+    tmp_path,
+) -> None:
+    """Real git end to end: fetch refs/pull/<n>/head from origin, add the
+    detached worktree at the exact sha, verify, and remove -- the seam the
+    faked tests above stand on."""
+    import subprocess
+
+    from command_center.worker.handlers import (
+        _remove_review_head_checkout,
+        _review_head_checkout,
+    )
+
+    def git(cwd, *args):
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git(tmp_path, "init", "-q", str(origin))
+    git(origin, "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "--allow-empty", "-q", "-m", "base")
+    git(origin, "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "--allow-empty", "-q", "-m", "pr head")
+    head_sha = git(origin, "rev-parse", "HEAD")
+    git(origin, "update-ref", "refs/pull/7/head", head_sha)
+    git(origin, "reset", "-q", "--hard", "HEAD~1")
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)],
+        capture_output=True, text=True, check=True,
+    )
+    assert git(clone, "rev-parse", "HEAD") != head_sha
+
+    checkout, failure = _review_head_checkout(clone, "7", head_sha)
+    assert failure is None
+    assert checkout is not None and checkout.is_dir()
+    assert git(checkout, "rev-parse", "HEAD") == head_sha
+
+    _remove_review_head_checkout(clone, checkout)
+    assert not checkout.exists()
+
+    missing, failure = _review_head_checkout(clone, "7", "f" * 40)
+    assert missing is None and "unreachable" in failure

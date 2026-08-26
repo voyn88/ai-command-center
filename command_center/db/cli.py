@@ -295,7 +295,14 @@ def main(argv: list[str] | None = None) -> int:
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 marker_report = publish_review_verdicts(
-                    lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                    lambda: _nc(conn), args.repo_path, task_id=args.task_id,
+                    # The same queue writer review_once uses: a REJECT
+                    # enqueues one finding-verification run before it may
+                    # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
+                    enqueue=lambda q, k, pl, tid, attempts: store.enqueue(
+                        q, idempotency_key=k, payload=pl, task_id=tid,
+                        max_attempts=attempts,
+                    ),
                 )
                 for task_id, pr in marker_report.reviewed:
                     print(f"MARKER    {task_id} -> {pr}")

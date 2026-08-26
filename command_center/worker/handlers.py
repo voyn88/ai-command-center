@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import threading
 from contextlib import ExitStack
 from pathlib import Path
@@ -93,6 +94,72 @@ def _isolated_workspace_path(repository: Path, branch: str) -> Path:
             clone_root=agent_runner.principal_workspace_root(),
         )
     return workspace_provisioning.task_workspace_path(repository, branch)
+
+
+def _review_head_checkout(
+    repository: Path, pr_number: str, head_sha: str
+) -> tuple[Path | None, str | None]:
+    """Detached worktree at exactly ``head_sha`` for a finding-verification
+    run (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT): the verifier's whole contract is
+    "reproduce each finding against the tree that would merge", and the
+    shared checkout is at whatever state the host last left it -- never
+    reliably the PR head. Fetches ``refs/pull/<n>/head`` (the advertised ref
+    that makes the head object reachable; a bare sha fetch is the fallback
+    for servers that allow it), verifies the exact object is present, adds a
+    detached worktree, and verifies the worktree's HEAD is the exact sha --
+    fail closed on any mismatch. Read-only-ness is enforced by the runner's
+    capability profile, not by this checkout. Returns ``(path, None)`` or
+    ``(None, retryable_reason)``."""
+    fetch = agent_runner._run_git(
+        ["fetch", "origin", f"refs/pull/{pr_number}/head"], repository, timeout=120
+    )
+    present = agent_runner._run_git(
+        ["cat-file", "-e", f"{head_sha}^{{commit}}"], repository
+    )
+    if present is None or present.returncode != 0:
+        agent_runner._run_git(["fetch", "origin", head_sha], repository, timeout=120)
+        present = agent_runner._run_git(
+            ["cat-file", "-e", f"{head_sha}^{{commit}}"], repository
+        )
+    if present is None or present.returncode != 0:
+        detail = fetch.stderr.strip() if fetch is not None else "git unavailable"
+        return None, (
+            f"review_head {head_sha} unreachable after fetching "
+            f"refs/pull/{pr_number}/head: {detail}"
+        )
+    target = Path(f"{repository}-worktrees") / f"verify-{pr_number}-{head_sha[:12]}"
+    with _provision_lock(str(target)):
+        if target.exists():
+            # A crashed earlier attempt's leftover: same key, same sha --
+            # rebuild rather than trust a directory whose state is unknown.
+            _remove_review_head_checkout(repository, target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        added = agent_runner._run_git(
+            ["worktree", "add", "--detach", str(target), head_sha],
+            repository,
+            timeout=60,
+        )
+    if added is None or added.returncode != 0:
+        detail = added.stderr.strip() if added is not None else "git unavailable"
+        return None, f"review_head worktree add failed: {detail}"
+    at = agent_runner._run_git(["rev-parse", "HEAD"], target)
+    if at is None or at.stdout.strip() != head_sha:
+        _remove_review_head_checkout(repository, target)
+        observed = at.stdout.strip() if at is not None else "unknown"
+        return None, (
+            f"review_head checkout verification failed: HEAD is {observed}, "
+            f"expected {head_sha}"
+        )
+    return target, None
+
+
+def _remove_review_head_checkout(repository: Path, target: Path) -> None:
+    removed = agent_runner._run_git(
+        ["worktree", "remove", "--force", str(target)], repository, timeout=60
+    )
+    if removed is None or removed.returncode != 0:
+        shutil.rmtree(target, ignore_errors=True)
+        agent_runner._run_git(["worktree", "prune"], repository)
 
 
 def _task_lease_scope(request: Any) -> str:
@@ -333,6 +400,32 @@ def _run_agent(
     # nothing is ever entered, so `stack.close()` is a no-op.
     stack = ExitStack()
     try:
+        if request.review_head_sha is not None:
+            # VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: run this agent in a detached
+            # checkout at the PR's exact head. Only meaningful for read-only
+            # verification -- a mutating run pinned to a detached head has no
+            # branch to publish and would silently discard its work, so the
+            # combination is a payload defect, refused rather than ignored.
+            if task_type in agent_runner.MUTATING_TASK_TYPES:
+                return HandlerOutcome(
+                    ok=False,
+                    reason=(
+                        f"review_head pin is not valid for mutating task_type "
+                        f"{task_type!r}"
+                    ),
+                    retryable=False,
+                )
+            checkout, failure = _review_head_checkout(
+                repository,
+                request.review_head_pr_number or "",
+                request.review_head_sha,
+            )
+            if checkout is None:
+                # Fetch/worktree trouble is repository or network state a
+                # later delivery (or another host) can genuinely cure.
+                return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
+            stack.callback(_remove_review_head_checkout, repository, checkout)
+            run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
             expected_branch = f"backlog/{backlog_task}"
             try:

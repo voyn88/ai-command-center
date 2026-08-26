@@ -212,7 +212,17 @@ def disable_codex_workspace_write(detail: str = "") -> None:
 PROFILE_READ_ONLY = "read_only"
 PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
 
-READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
+READ_ONLY_TASK_TYPES = {
+    "review",
+    "final_gate",
+    "architecture_review",
+    # Finding verification (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT): must READ the
+    # tree at the PR head to reproduce or refute review findings, so it is
+    # read-only -- deliberately NOT in MODEL_ONLY_TASK_TYPES, whose zero-tool
+    # profile is exactly what made the retired full-context adjudication
+    # unable to gather any evidence at all.
+    "verification_review",
+}
 MODEL_ONLY_TASK_TYPES = {"independent_review"}
 MUTATING_TASK_TYPES = {"implementation", "remediation"}
 
