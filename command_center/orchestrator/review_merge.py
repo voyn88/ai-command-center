@@ -711,7 +711,9 @@ def _aggregate_chunk_verdict(
     expected_manifest: str | None = None
     for key, state, payload_value, result_value in rows:
         payload = _json_object(payload_value)
-        metadata = payload.get("review_chunk") if payload else None
+        if payload is None:
+            return "WAIT", "review_chunk_manifest_invalid"
+        metadata = payload.get("review_chunk")
         if not isinstance(metadata, dict) or metadata.get("version") != 3:
             return "WAIT", "review_chunk_manifest_invalid"
         index = metadata.get("index")
