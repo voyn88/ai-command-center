@@ -89,6 +89,10 @@ class ReviewConfig:
     queue: str = "execution"
     review_timeout: int = 900
     max_per_tick: int = 8
+    #: Per-tick cap on merge-train branch updates (BEHIND PRs brought current
+    #: with main). Bounded so a moving base cannot make the merge tick spend
+    #: the whole tick re-updating branches that will just fall behind again.
+    max_branch_updates_per_tick: int = 3
 
 
 @dataclass
@@ -1253,6 +1257,23 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return True, head
 
 
+def _merge_state(repo_path: str, pr_url: str) -> str:
+    """The PR's GitHub mergeStateStatus for the merge-train coordinator.
+
+    Returns one of BEHIND/DIRTY/BLOCKED/CLEAN/UNKNOWN, or "" for a non-open PR
+    or a failed lookup. BEHIND means the base advanced after the PR branched
+    and its branch must be updated before it can ever merge; DIRTY means a real
+    conflict that only a rebase can resolve.
+    """
+    view = _gh(["pr", "view", pr_url, "--json", "mergeStateStatus,state"], repo_path)
+    if view.returncode != 0:
+        return ""
+    data = json.loads(view.stdout or "{}")
+    if data.get("state") != "OPEN":
+        return ""
+    return str(data.get("mergeStateStatus") or "")
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE with the merged sha as evidence."""
@@ -1265,9 +1286,32 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at LIMIT %s",
         (cfg.max_per_tick,),
     )
+    branch_updates = 0
     for task_id, pr_url in tasks:
         ready, detail = _pr_is_mergeable(repo_path, pr_url)
         if not ready:
+            # Merge-train coordinator: a PR merely BEHIND main (its base moved
+            # after it branched) can never merge until its branch is updated --
+            # the queue only accepts up-to-date PRs. Bring a bounded number
+            # current with `gh pr update-branch`, a GitHub-side base merge that
+            # takes no local writer lease. The new head re-runs CI and review
+            # head-keyed, so the normal path takes over next tick. DIRTY PRs
+            # have a real conflict and are left for a rebase, never
+            # auto-resolved. (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)
+            state = _merge_state(repo_path, pr_url)
+            if state == "BEHIND" and branch_updates < cfg.max_branch_updates_per_tick:
+                updated = _gh(["pr", "update-branch", pr_url], repo_path)
+                if updated.returncode == 0:
+                    branch_updates += 1
+                    report.skipped.append((task_id, "branch_updated_behind_main"))
+                else:
+                    report.skipped.append(
+                        (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
+                    )
+                continue
+            if state == "DIRTY":
+                report.skipped.append((task_id, "branch_dirty_needs_rebase"))
+                continue
             report.skipped.append((task_id, detail))
             continue
         merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
