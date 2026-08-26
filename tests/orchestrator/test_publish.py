@@ -633,3 +633,22 @@ def test_committed_ruff_package_cannot_shadow_the_tool(repo, monkeypatch):
 
     assert not marker.exists(), "candidate ruff package executed in publisher"
     assert r.ok, r.reason
+
+
+def test_committed_ruff_config_cannot_neuter_the_gate(repo, monkeypatch):
+    """Verification finding on 9e02e55, reproduced live: a committed
+    `[tool.ruff] exclude = ["**"]` made the gate pass over a syntax-invalid
+    file. Under --isolated the candidate tree contributes only code, never
+    policy — the broken file is refused regardless of committed config."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "pyproject.toml").write_text('[tool.ruff]\nexclude = ["**"]\n')
+    (work / "bad.py").write_text("def broken(:\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "neuter attempt")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_failed:")

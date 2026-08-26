@@ -314,6 +314,15 @@ def _static_quality_gate(repo_path: Path, head_sha: str) -> PublishResult | None
         argv = [str(ruff_binary), "check", "--no-cache", "."]
     else:
         argv = [sys.executable, "-P", "-m", "ruff", "check", "--no-cache", "."]
+    # --isolated: candidate configuration is never read -- a committed
+    # `[tool.ruff] exclude = ["**"]` silently neuters the gate otherwise
+    # (verification finding on 9e02e55; reproduced live: rc 0 with the
+    # exclusion, rc 1 under --isolated). The tree under check contributes
+    # only code, never policy; the gate lints by ruff's defaults, which
+    # this repository's own committed config matches (default selection,
+    # line-length 88). `--isolated --config <trusted>` is not an option:
+    # ruff rejects the combination.
+    argv.append("--isolated")
     env = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": os.environ.get("HOME", ""),
