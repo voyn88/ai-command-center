@@ -546,6 +546,57 @@ def test_migration_0009_is_reversible_without_residue(pg_connection_factory) -> 
             assert "v_task_status" in cur.fetchone()[0]
 
 
+def test_backlog_eligible_breaks_created_at_ties_by_insert_seq(pg_connection_factory) -> None:
+    """VOYN-W0-AICC-INSERT-SEQ: two rows landing on the SAME `created_at` (a
+    bulk import, two dispatches in one clock tick) must still come out of
+    `backlog_eligible` in insertion order -- not whatever order PostgreSQL
+    happens to return equal-timestamp rows in. Inserted in one statement so
+    both rows share one `now()`, reproducing the tie deterministically
+    rather than racing the wall clock."""
+    with pg_connection_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO backlog_task "
+                "(task_id, wave, priority, status, title, body, repo, created_at) "
+                "VALUES ('VOYN-W0-TIE-A', '0', 'P0', 'OPEN', 'a', 'x', 'repo-tie', now()), "
+                "       ('VOYN-W0-TIE-B', '0', 'P0', 'OPEN', 'b', 'x', 'repo-tie', now())"
+            )
+            cur.execute("SELECT task_id FROM backlog_eligible WHERE repo = 'repo-tie'")
+            assert [r[0] for r in cur.fetchall()] == ["VOYN-W0-TIE-A", "VOYN-W0-TIE-B"]
+
+
+def test_migration_0015_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up pins the insert_seq tiebreaker to migration 0015.
+    Downgrading to 0014 must drop the column and restore the created_at-only
+    ORDER BY; the second upgrade must reapply both."""
+    from command_center.db import migrations
+
+    def _has_insert_seq(cur) -> bool:
+        cur.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'backlog_task' AND column_name = 'insert_seq'"
+        )
+        return cur.fetchone() is not None
+
+    def _view_mentions_insert_seq(cur) -> bool:
+        cur.execute("SELECT pg_get_viewdef('backlog_eligible')")
+        return "insert_seq" in cur.fetchone()[0]
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            assert _has_insert_seq(cur)
+            assert _view_mentions_insert_seq(cur)
+        migrations.downgrade(conn, target=14)
+        with conn.cursor() as cur:
+            assert not _has_insert_seq(cur)
+            assert not _view_mentions_insert_seq(cur)
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        with conn.cursor() as cur:
+            assert _has_insert_seq(cur)
+            assert _view_mentions_insert_seq(cur)
+
+
 def test_second_cascade_exhaustion_parks_for_the_owner(rig) -> None:
     """First exhaustion: a finding — back to OPEN, fresh epoch. Second:
     DEFER_TO_USER — two full budgets failing is a human's decision point,
