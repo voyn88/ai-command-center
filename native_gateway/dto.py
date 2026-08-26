@@ -53,6 +53,9 @@ class TaskDTO(_Frozen):
     id: str
     title: str
     blocker: str | None = None
+    # Additive in DTO 1.0: the backlog's execution state, when known —
+    # backlog | next | in_progress | review | done | deferred.
+    state: str | None = None
     evidence: DeliveryEvidence
 
 

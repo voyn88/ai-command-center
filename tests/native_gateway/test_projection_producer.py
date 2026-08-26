@@ -143,3 +143,30 @@ def test_dialogs_project_summaries_never_content(tmp_path, monkeypatch):
     assert dialogs[1]["last_summary"] is None
     # Raw message content must never appear anywhere in the projection.
     assert "секретный" not in json.dumps(projection, ensure_ascii=False)
+
+
+def test_rich_execution_status_wins_and_maps_to_state(tmp_path, monkeypatch):
+    root = _seed_root(tmp_path, monkeypatch)
+    backlog = tmp_path / "backlog.md"
+    backlog.write_text(
+        "- VOYN_RECOMMENDATION | ts=2026-08-26T00:00:00Z | status=PO-Approved | "
+        "issue_id=VOYN-W0-RICH-A | current_wave=W0 | proposed_wave=W0 | priority=P1 | "
+        "owner=x | effect=high | effort=S | acceptance=accept:a | "
+        "task=do_thing | evidence=none | file_scope=NONE | parallel_domain=ops\n"
+        "- **VOYN-W0-RICH-A** | Wave 0 | IN_PROGRESS | P1 | X | `do-thing` | t\n"
+        "- **VOYN-W0-RICH-B** | Wave 0 | DONE | P1 | X | `finished-thing` | t\n"
+        "- **VOYN-W0-RICH-C** | Wave 0 | DEFER_TO_USER | P1 | X | `needs-owner` | t\n",
+        encoding="utf-8",
+    )
+    projection = build_projection(root, backlog_path=backlog)
+    tasks = {t["id"]: t for t in projection["tasks"]}
+    # Execution status from the rich line overrides the planning status.
+    assert tasks["VOYN-W0-RICH-A"]["state"] == "in_progress"
+    assert tasks["VOYN-W0-RICH-B"]["state"] == "done"
+    assert tasks["VOYN-W0-RICH-C"]["state"] == "deferred"
+    assert tasks["VOYN-W0-RICH-C"]["blocker"] == "Ждёт вашего решения"
+    # read_model lane placement follows: done leaves active, deferred needs attention.
+    backlog_project = next(p for p in projection["projects"] if p["id"] == "backlog")
+    assert backlog_project["needs_attention"] >= 1
+    ops_project = next(p for p in projection["projects"] if p["id"] == "ops")
+    assert ops_project["active_tasks"] >= 1

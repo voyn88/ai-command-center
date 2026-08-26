@@ -224,3 +224,39 @@ def test_page_explains_when_backlog_not_connected(monkeypatch, tmp_path):
     assert any(bc.MASTER_BACKLOG_ENV in str(w.value) for w in at.warning)
     # An unconnected page must not have rendered the records table metrics.
     assert "Всего записей" not in [m.label for m in at.metric]
+
+
+def test_rich_records_parse_exact_statuses_and_slug():
+    from command_center.backlog_client import parse_rich_records
+
+    text = (
+        "- **VOYN-W0-EXAMPLE** | Wave 0 | OPEN (сверено 2026-08-20) | **P0** | "
+        "Security | `example-slug` | Текст.\n"
+        "  - **VOYN-W4-DONE-ONE** | Wave 4 | DONE | P1 | Team | `done_thing` | x\n"
+        "- **VOYN-W1-WEIRD** | Wave 1 | TRIAGE_LATER | P2 | Team | `weird` | x\n"
+        "- не запись | OPEN | мимо\n"
+    )
+    records = {r.record_id: r for r in parse_rich_records(text)}
+    assert records["VOYN-W0-EXAMPLE"].status == "OPEN"
+    assert records["VOYN-W0-EXAMPLE"].priority == "P0"
+    assert records["VOYN-W0-EXAMPLE"].slug == "example-slug"
+    assert records["VOYN-W0-EXAMPLE"].title == "Example slug"
+    # Indented sub-list records are body lines too — the regex is anchored to
+    # line starts; the nested DONE line above is deliberately NOT matched
+    # (it belongs to a parent record's evidence trail).
+    assert "VOYN-W4-DONE-ONE" not in records
+    # Outside the exact vocabulary -> UNKNOWN, surfaced, never guessed.
+    assert records["VOYN-W1-WEIRD"].status == "UNKNOWN"
+
+
+def test_rich_records_on_the_real_master_shape(tmp_path):
+    from command_center.backlog_client import load_rich_records
+
+    master = tmp_path / "master.md"
+    master.write_text(
+        "- **VOYN-W0-A** | Wave 0 | IN_PROGRESS | P1 | X | `a` | t\n"
+        "- **VOYN-W0-B** | Wave 0 | READY_TO_REVIEW | P1 | X | `b` | t\n",
+        encoding="utf-8",
+    )
+    statuses = {r.record_id: r.status for r in load_rich_records(master)}
+    assert statuses == {"VOYN-W0-A": "IN_PROGRESS", "VOYN-W0-B": "READY_TO_REVIEW"}

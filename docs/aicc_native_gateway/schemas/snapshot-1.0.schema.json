@@ -191,6 +191,18 @@
           "title": "Id",
           "type": "string"
         },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        },
         "title": {
           "title": "Title",
           "type": "string"
