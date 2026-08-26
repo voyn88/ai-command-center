@@ -788,7 +788,12 @@ def _scan_window(
     total = int(rows[0][0]) if rows else 0
     if total <= 0:
         return 0, 0
-    offset = (int(time.time() // 300) * max(1, step)) % total
+    # The stride must never exceed the window width, or the sliding leaves
+    # permanent holes (review of cadc595: N=12, step=4, cap=3 skipped
+    # positions 3, 7, 11 forever). Clamped, coverage is contiguous for
+    # every configuration.
+    stride = max(1, min(step, scan_cap))
+    offset = (int(time.time() // 300) * stride) % total
     return offset, total
 
 
@@ -1409,17 +1414,18 @@ def _verified_rejection_outcome(
     )
     if existing:
         state = str(existing[0][0])
-        if state == "dead":
-            # Retries exhausted with no verdict, and the unique
-            # (queue, idempotency_key) makes re-enqueue impossible: waiting
-            # is a permanent silent stall (review of 5443b6e, CONFIRMED).
-            # The verification INFRASTRUCTURE failed, so fall back to the
-            # pre-AUTO-ACCEPT behavior -- remediate on the original
-            # findings, loudly.
-            return "REMEDIATE", findings
-        # ready / claimed (in flight), or succeeded whose result lookup
-        # above raced its own commit: wait, costing the tick nothing.
-        return "WAIT", "verification_pending"
+        if state in ("ready", "claimed"):
+            # Genuinely in flight: wait, costing the tick nothing.
+            return "WAIT", "verification_pending"
+        # dead (retries exhausted -- review of 5443b6e) or a TERMINAL
+        # succeeded/failed item whose result the lookup above could not
+        # consume (missing or malformed output -- review of cadc595: a
+        # commit race resolves by the next tick, but a truly resultless
+        # terminal item repeats WAIT forever). Either way the unique
+        # (queue, idempotency_key) makes re-enqueue impossible: fall back
+        # to the pre-AUTO-ACCEPT behavior -- remediate on the original
+        # findings, loudly.
+        return "REMEDIATE", findings
     if enqueue is None:
         # A legacy caller that cannot enqueue can still consume an existing
         # verdict (above) but cannot start a verification -- pre-AUTO-ACCEPT
@@ -1665,6 +1671,10 @@ def publish_review_verdicts(
             # than a silently-ineffective marker.
             report.skipped.append((task_id, "acceptance_bot_not_configured"))
             continue
+        # The external write ATTEMPT is the action (review of cadc595:
+        # counting only successes let a failing poster spend up to scan_cap
+        # write attempts in one tick despite the advertised cap).
+        actions += 1
         if override_audit is not None and not _post_auto_accept_audit(
             repo_path, pr_url, task_id, sha,
             override_audit[0], override_audit[1], override_audit[2],
@@ -1687,7 +1697,6 @@ def publish_review_verdicts(
         # pre-marker run. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
         _rerun_failing_acceptance_gate(repo_path, pr_url, sha)
         report.reviewed.append((task_id, pr_url))
-        actions += 1
     return report
 
 

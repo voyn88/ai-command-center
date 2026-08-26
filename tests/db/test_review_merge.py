@@ -2238,3 +2238,103 @@ def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch)
         if merged_tasks:
             break
     assert merged_tasks == ["VOYN-W0-ZVICTIM"]
+
+
+def test_stride_clamped_to_window_width_covers_every_position(rig, monkeypatch):  # noqa: F811, E501
+    """Review of cadc595 (CONFIRMED): step > scan_cap left permanent holes
+    (N=12, step=4, cap=3 skipped positions 3/7/11 forever). The stride is
+    clamped to the window width, so the pathological configuration now
+    covers everything within one lap."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    ids = [f"VOYN-W0-SC{i:02d}" for i in range(12)]
+    for i, tid in enumerate(ids):
+        _ready(store, app_factory, tid, f"https://github.com/x/y/pull/{400 + i}")
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        lambda argv, repo: sp.CompletedProcess(argv, 1, "", "fails -> pure skip"),
+    )
+    seen: set[str] = set()
+    for tick in range(4):  # ceil(12 / min(4,3)=3) = 4 ticks
+        monkeypatch.setattr(review_merge.time, "time", lambda t=tick: t * 300)
+        report = publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=4, scan_cap=3)
+        )
+        seen |= {task_id for task_id, _ in report.skipped}
+    assert seen == set(ids)
+
+
+def test_a_resultless_terminal_verification_remediates(rig, monkeypatch):  # noqa: F811
+    """Review of cadc595 (CONFIRMED): a succeeded verification item whose
+    result cannot be consumed (missing output) must not WAIT forever --
+    same fall-back as dead: remediation on the original findings."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    head = "8b" * 20
+    pr_url = "https://github.com/x/y/pull/84"
+    findings = f"a claim.\nVERDICT: REJECT\nHEAD_SHA: {head}\n"
+    _ready(store, app_factory, "VOYN-W0-TR", pr_url)
+    _complete_review(app_factory, worker, "VOYN-W0-TR", pr_url, head, findings)
+    vkey = review_merge._verification_key(
+        "VOYN-W0-TR", pr_url, _snapshot(head), findings
+    )
+    vstore = WorkQueueStore(app_factory)
+    vstore.enqueue("execution", idempotency_key=vkey,
+                   payload={"kind": "agent_run"}, task_id="VOYN-W0-TR")
+    claimed = worker.claim("execution", visibility_seconds=60)
+    # Succeeded, but with NO result_text anywhere in the payload.
+    assert worker.complete(claimed, {"status": "completed"})
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(app_factory, "/tmp", enqueue=lambda *a: None)
+    assert ("VOYN-W0-TR", "VOYN-W0-TR-REM") in report.remediated
+
+
+def test_a_failed_marker_post_attempt_still_consumes_the_cap(rig, monkeypatch):  # noqa: F811, E501
+    """Review of cadc595 (CONFIRMED): counting only successful posts let a
+    failing poster spend up to scan_cap write attempts per tick. The
+    ATTEMPT is the action: with cap 1 and a failing poster, exactly one
+    attempt happens per tick."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    heads = {}
+    for i, n in enumerate((90, 91)):
+        head = f"{i}f" * 10 + "e" * 20
+        pr_url = f"https://github.com/x/y/pull/{n}"
+        heads[pr_url] = head
+        _ready(store, app_factory, f"VOYN-W0-FM{i}", pr_url)
+        _complete_review(
+            app_factory, worker, f"VOYN-W0-FM{i}", pr_url, head,
+            f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        )
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge.time, "time", lambda: 0)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    attempts = []
+    monkeypatch.setattr(
+        review_merge, "_post_marker_as_bot",
+        lambda creds, pr, decision, sha: (attempts.append(pr) or (False, "marker_post_failed: down")),
+    )
+    publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert len(attempts) == 1  # the failed attempt consumed the only action
