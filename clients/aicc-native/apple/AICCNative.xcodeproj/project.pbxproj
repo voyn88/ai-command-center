@@ -1,0 +1,64 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+
+		AA0000010000000000000001 /* AICCNativeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000002 /* AICCNativeApp.swift */; };
+		AA0000010000000000000020 /* AICCAppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000019 /* AICCAppModel.swift */; };
+		AA0000010000000000000003 /* AICCNativeCore in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000010000000000000004 /* AICCNativeCore */; };
+
+		AA0000010000000000000005 /* AICC.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AICC.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA0000010000000000000002 /* AICCNativeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/AICCNativeApp.swift; sourceTree = SOURCE_ROOT; };
+		AA0000010000000000000019 /* AICCAppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/AICCAppModel.swift; sourceTree = SOURCE_ROOT; };
+
+		AA0000010000000000000006 /* Products */ = {isa = PBXGroup; children = (AA0000010000000000000005 /* AICC.app */,); name = Products; sourceTree = "<group>"; };
+		AA0000010000000000000007 = {isa = PBXGroup; children = (AA0000010000000000000002 /* AICCNativeApp.swift */, AA0000010000000000000019 /* AICCAppModel.swift */, AA0000010000000000000006 /* Products */,); sourceTree = "<group>"; };
+
+		AA0000010000000000000008 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (AA0000010000000000000003 /* AICCNativeCore in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		AA0000010000000000000009 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (AA0000010000000000000001 /* AICCNativeApp.swift in Sources */, AA0000010000000000000020 /* AICCAppModel.swift in Sources */,); runOnlyForDeploymentPostprocessing = 0; };
+
+		AA0000010000000000000010 /* AICC */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA0000010000000000000011 /* Build configuration list for PBXNativeTarget "AICC" */;
+			buildPhases = (AA0000010000000000000009 /* Sources */, AA0000010000000000000008 /* Frameworks */);
+			buildRules = ();
+			dependencies = ();
+			name = AICC;
+			packageProductDependencies = (AA0000010000000000000004 /* AICCNativeCore */,);
+			productName = AICC;
+			productReference = AA0000010000000000000005 /* AICC.app */;
+			productType = "com.apple.product-type.application";
+		};
+
+		AA0000010000000000000012 /* Project object */ = {
+			isa = PBXProject;
+			attributes = { BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2700; LastUpgradeCheck = 2700; TargetAttributes = { AA0000010000000000000010 = { CreatedOnToolsVersion = 27.0; }; }; };
+			buildConfigurationList = AA0000010000000000000013 /* Build configuration list for PBXProject "AICCNative" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base, ru);
+			mainGroup = AA0000010000000000000007;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (AA0000010000000000000014 /* XCLocalSwiftPackageReference "." */,);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = AA0000010000000000000006 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (AA0000010000000000000010 /* AICC */,);
+		};
+
+		AA0000010000000000000015 /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SWIFT_VERSION = 6.0; }; name = Debug; };
+		AA0000010000000000000016 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_VERSION = 6.0; }; name = Release; };
+		AA0000010000000000000013 /* Build configuration list for PBXProject "AICCNative" */ = { isa = XCConfigurationList; buildConfigurations = (AA0000010000000000000015 /* Debug */, AA0000010000000000000016 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+
+		AA0000010000000000000017 /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { AICC_SERVER_URL = ""; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AppInfo.plist; IPHONEOS_DEPLOYMENT_TARGET = 18.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MACOSX_DEPLOYMENT_TARGET = 15.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.dimastovlab.aicc.native; PRODUCT_NAME = AICC; SDKROOT = auto; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx"; SWIFT_STRICT_CONCURRENCY = complete; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		AA0000010000000000000018 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { AICC_SERVER_URL = ""; CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AppInfo.plist; IPHONEOS_DEPLOYMENT_TARGET = 18.0; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MACOSX_DEPLOYMENT_TARGET = 15.0; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.dimastovlab.aicc.native; PRODUCT_NAME = AICC; SDKROOT = auto; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx"; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_STRICT_CONCURRENCY = complete; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		AA0000010000000000000011 /* Build configuration list for PBXNativeTarget "AICC" */ = { isa = XCConfigurationList; buildConfigurations = (AA0000010000000000000017 /* Debug */, AA0000010000000000000018 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+
+		AA0000010000000000000014 /* XCLocalSwiftPackageReference "." */ = { isa = XCLocalSwiftPackageReference; relativePath = .; };
+		AA0000010000000000000004 /* AICCNativeCore */ = { isa = XCSwiftPackageProductDependency; package = AA0000010000000000000014 /* XCLocalSwiftPackageReference "." */; productName = AICCNativeCore; };
+	};
+	rootObject = AA0000010000000000000012 /* Project object */;
+}
