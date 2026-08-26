@@ -2023,7 +2023,9 @@ def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):  # noqa: F811
     publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
     assert len(posted) == 1
     publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
-    assert len(posted) == 2
+    # Two DISTINCT markers -- a repost of the first PR would also reach
+    # len == 2 (review of a423194).
+    assert set(posted) == set(heads) and len(posted) == 2
 
 
 def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa: F811
@@ -2164,13 +2166,15 @@ def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa:
         return sp.CompletedProcess(argv, 1, "", "always fails -> pure skip")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    seen: set[str] = set()
+    examined: list[str] = []
     for _tick in range(3):  # cursor advances per invocation: 3 calls cover 12
         report = publish_review_verdicts(
             app_factory, "/tmp", ReviewConfig(max_per_tick=5, scan_cap=5)
         )
-        seen |= {task_id for task_id, _ in report.skipped}
-    assert seen == set(ids)  # every task examined within one full cycle
+        examined += [task_id for task_id, _ in report.skipped]
+    # Every task exactly ONCE per full cycle -- set coverage alone would
+    # hide duplicate examinations (review of a423194).
+    assert sorted(examined) == sorted(ids)
 
 
 def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch):  # noqa: F811, E501
