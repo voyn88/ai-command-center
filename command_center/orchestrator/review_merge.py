@@ -1039,6 +1039,46 @@ def _remediate_rejection(
             conn.autocommit = True
 
 
+def _rerun_failing_acceptance_gate(repo_path: str, sha: str) -> None:
+    """After posting the marker, re-run the Acceptance-gate run that failed on
+    this exact head before the marker existed.
+
+    The gate subscribes to pull_request_review and that event does fire a fresh
+    run -- but a separate one. GitHub branch protection keeps evaluating the
+    original pull_request-triggered run, which stays red, so the PR is still
+    BLOCKED on a failing required check even though a later run passed
+    (live-confirmed on #383/#392/#393: the merge queue refused with "Required
+    status check Acceptance gate is failing" until this run was re-run).
+    Re-running that failing pull_request run makes it re-evaluate on the
+    now-present marker and go green. Best-effort and idempotent -- any failure
+    just leaves the event-driven or a manual re-run to cover it.
+    (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
+    """
+    listing = _gh(
+        ["run", "list", "--workflow", "acceptance-gate.yml", "--limit", "20",
+         "--json", "databaseId,headSha,event,conclusion,status"],
+        repo_path,
+    )
+    if listing.returncode != 0:
+        return
+    try:
+        runs = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError:
+        return
+    if not isinstance(runs, list):
+        return
+    for run in runs:
+        if (
+            isinstance(run, dict)
+            and run.get("headSha") == sha
+            and run.get("event") == "pull_request"
+            and run.get("status") == "completed"
+            and run.get("conclusion") != "success"
+        ):
+            _gh(["run", "rerun", str(run.get("databaseId"))], repo_path)
+            return
+
+
 def publish_review_verdicts(
     factory: Any,
     repo_path: str,
@@ -1160,6 +1200,10 @@ def publish_review_verdicts(
         if not ok:
             report.skipped.append((task_id, reason))
             continue
+        # Drive the required Acceptance-gate check green now that the marker
+        # stands, so branch protection stops blocking merge on the stale
+        # pre-marker run. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
+        _rerun_failing_acceptance_gate(repo_path, sha)
         report.reviewed.append((task_id, pr_url))
     return report
 

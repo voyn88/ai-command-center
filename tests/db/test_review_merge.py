@@ -1254,3 +1254,33 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
     assert len(updates) == 2
     assert sum(1 for _, r in report.skipped if r == "branch_updated_behind_main") == 2
     assert sum(1 for _, r in report.skipped if r == "branch_behind_update_capped") == 2
+
+
+def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch):
+    """After the marker is posted, the failing pull_request-triggered
+    Acceptance-gate run for the exact head is re-run so branch protection stops
+    seeing a red required check. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)"""
+    import subprocess
+
+    sha = "a" * 40
+    reran = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["run", "list"]:
+            body = json.dumps([
+                {"databaseId": 111, "headSha": sha, "event": "pull_request",
+                 "status": "completed", "conclusion": "failure"},
+                {"databaseId": 222, "headSha": sha, "event": "pull_request_review",
+                 "status": "completed", "conclusion": "success"},
+                {"databaseId": 333, "headSha": "b" * 40, "event": "pull_request",
+                 "status": "completed", "conclusion": "failure"},
+            ])
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "rerun"]:
+            reran.append(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    review_merge._rerun_failing_acceptance_gate("/tmp", sha)
+    assert reran == ["111"]  # only the failing pull_request run for THIS head
