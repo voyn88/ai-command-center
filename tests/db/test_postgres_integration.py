@@ -588,6 +588,106 @@ def test_backup_restore_drill_round_trips_data(
                 )
 
 
+@pytest.mark.skipif(
+    not (shutil.which("pg_dump") and shutil.which("pg_restore") and shutil.which("psql")),
+    reason="PostgreSQL client binaries are not installed",
+)
+def test_restore_onto_a_clean_host_reasserts_grants(
+    admin_conn, psycopg, test_dsn, role_passwords, pg_database, tmp_path
+):
+    """`--reassert-grants` is the "restore on a clean control [host] is
+    proven" acceptance bar (VOYN-W0-AICC-SRV-08): a plain restore lands the
+    data but, per `--no-owner --no-privileges`, leaves the product roles with
+    no access at all -- provably so, since `aicc_app` connecting to a
+    plain restore gets nothing but permission-denied. A recovery that stops
+    there has not restored control, only data.
+    """
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    client, server = _client_major(), _server_major(admin_conn)
+    if client is not None and client < server:
+        pytest.skip(f"pg_dump {client} cannot dump a PostgreSQL {server} server")
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    run_id = _seed_run(admin_conn)
+
+    params = conninfo_to_dict(test_dsn)
+    env = {
+        **os.environ,
+        "AICC_PG_HOST": params.get("host", "127.0.0.1"),
+        "AICC_PG_PORT": str(params.get("port", 5432)),
+        "AICC_PG_DB": pg_database,
+        "AICC_PG_USER": params["user"],
+        "AICC_PG_PASSWORD": params["password"],
+        # `admin_conn`/`test_dsn` are built from `AICC_TEST_PG_ADMIN_DSN`,
+        # documented (conftest.py) as a superuser connection -- the same
+        # identity doubles as AICC_PG_SUPERUSER here, matching a deployment
+        # where the operator running the drill already has superuser rights.
+        "AICC_PG_SUPERUSER": params["user"],
+        "AICC_PG_SUPERUSER_PASSWORD": params["password"],
+    }
+    repo_root = _repo_root()
+    backup_dir = tmp_path / "backups"
+
+    subprocess.run(
+        [
+            str(repo_root / "scripts" / "aicc_pg_backup.sh"),
+            "--out-dir", str(backup_dir),
+            "--verify",
+        ],
+        check=True,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    from pathlib import Path
+
+    archives = sorted(backup_dir.glob("*.dump"))
+    assert len(archives) == 1
+
+    restored_db = f"{pg_database}_clean_host"
+    try:
+        result = subprocess.run(
+            [
+                str(repo_root / "scripts" / "aicc_pg_restore.sh"),
+                "--archive", str(archives[0]),
+                "--target-db", restored_db,
+                "--reassert-grants",
+            ],
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert "privileges reasserted" in result.stdout
+
+        app_conninfo = make_conninfo(
+            **dict(
+                params,
+                dbname=restored_db,
+                user="aicc_app",
+                password=role_passwords["aicc_app"],
+            )
+        )
+        with psycopg.connect(app_conninfo) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT state, project FROM run WHERE id = %s", (run_id,))
+                assert cur.fetchone() == ("running", "p")
+    finally:
+        from psycopg import sql
+
+        with psycopg.connect(
+            make_conninfo(**dict(params, dbname="postgres")), autocommit=True
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
+                        sql.Identifier(restored_db)
+                    )
+                )
+
+
 def test_restore_refuses_to_overwrite_the_live_database(tmp_path):
     """Guard rail, checked without touching a server."""
     archive = tmp_path / "fake.dump"

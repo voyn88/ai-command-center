@@ -191,6 +191,13 @@ scripts/aicc_pg_backup.sh --out-dir /var/backups/aicc --verify --keep 14
 scripts/aicc_pg_restore.sh \
   --archive /var/backups/aicc/aicc-aicc-20260813T020000Z.dump \
   --target-db aicc_restore_check
+
+# Recovery onto a clean control host: same restore, plus reasserting the
+# privilege matrix `--no-owner --no-privileges` strips out of the archive.
+AICC_PG_SUPERUSER=postgres AICC_PG_SUPERUSER_PASSWORD=... \
+scripts/aicc_pg_restore.sh \
+  --archive /var/backups/aicc/aicc-aicc-20260813T020000Z.dump \
+  --target-db aicc --allow-overwrite --reassert-grants
 ```
 
 `pg_dump` custom format, written to a `.partial` name and renamed only on
@@ -203,6 +210,19 @@ rehearses.
 `test_backup_restore_drill_round_trips_data` runs both scripts end to end
 against a real server and reads the restored rows back, so what is verified is
 the scripts an operator actually runs, not just that `pg_dump` exists.
+
+A restored database is not yet a *recovered* one: `--no-owner --no-privileges`
+(what makes the archive portable between clusters at all) also strips every
+grant, so `aicc_app`/`aicc_migrator` can reach nothing on it until the
+privilege matrix is reapplied — the exact gap a clean control host's recovery
+would otherwise fall into, having no pre-existing grants to fall back on
+(`VOYN-W0-AICC-SRV-08`'s acceptance: recovery onto a clean control host is
+proven, not merely that data landed). `--reassert-grants` closes it by running
+`bootstrap` (as `AICC_PG_SUPERUSER`) and `upgrade` (as the restoring user, who
+now owns every table) immediately after the restore, and
+`test_restore_onto_a_clean_host_reasserts_grants` proves the result by
+connecting as `aicc_app` — the role the drill above never even attempts to
+use — and reading the restored data back through it.
 
 The client must be at least as new as the server; `pg_dump` refuses to dump a
 newer server outright. CI installs `postgresql-client-17` to match the pinned

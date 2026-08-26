@@ -11,9 +11,25 @@
 # The checksum written by aicc_pg_backup.sh is verified before any writes, so a
 # corrupted archive fails while the target database is still empty.
 #
+# `--no-owner --no-privileges` (below) makes the archive portable between
+# clusters, but it also means a raw restore lands on a database nobody but the
+# restoring role can use -- the exact shape of a "clean control" host recovery
+# (VOYN-W0-AICC-SRV-08): a brand-new host has no pre-existing grants to fall
+# back on, so a restore that stops at "the data is there" has not actually
+# proven recovery. `--reassert-grants` closes that gap by running the two
+# commands this script used to only print for the operator to type by hand
+# (`bootstrap` as `AICC_PG_SUPERUSER`, then `upgrade` as the restoring user,
+# which owns every table `--no-owner` just handed it) -- turning a two-step,
+# easy-to-skip manual dance into the one command an operator actually runs at
+# 3am.
+#
 # Usage:
 #   scripts/aicc_pg_restore.sh --archive /var/backups/aicc/aicc-...dump \
-#       --target-db aicc_restore_check [--allow-overwrite] [--jobs 4]
+#       --target-db aicc_restore_check [--allow-overwrite] [--jobs 4] \
+#       [--reassert-grants]
+#
+# `--reassert-grants` additionally requires AICC_PG_SUPERUSER and
+# AICC_PG_SUPERUSER_PASSWORD in the environment.
 
 set -euo pipefail
 
@@ -21,9 +37,10 @@ ARCHIVE=""
 TARGET_DB=""
 JOBS="1"
 ALLOW_OVERWRITE=0
+REASSERT_GRANTS=0
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -33,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --target-db)       TARGET_DB="${2:?--target-db needs a name}"; shift 2 ;;
         --jobs)            JOBS="${2:?--jobs needs a count}"; shift 2 ;;
         --allow-overwrite) ALLOW_OVERWRITE=1; shift ;;
+        --reassert-grants) REASSERT_GRANTS=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 1 ;;
     esac
@@ -47,6 +65,13 @@ done
 : "${AICC_PG_USER:?AICC_PG_USER is required}"
 : "${AICC_PG_PASSWORD:?AICC_PG_PASSWORD is required}"
 PGPORT_VALUE="${AICC_PG_PORT:-5432}"
+
+if [[ "$REASSERT_GRANTS" == "1" ]]; then
+    : "${AICC_PG_SUPERUSER:?AICC_PG_SUPERUSER is required with --reassert-grants}"
+    : "${AICC_PG_SUPERUSER_PASSWORD:?AICC_PG_SUPERUSER_PASSWORD is required with --reassert-grants}"
+    PYTHON_BIN="$(command -v python || command -v python3 || true)"
+    [[ -n "$PYTHON_BIN" ]] || { echo "python (or python3) not found in PATH" >&2; exit 127; }
+fi
 
 if [[ "$TARGET_DB" == "$AICC_PG_DB" && "$ALLOW_OVERWRITE" != "1" ]]; then
     echo "refusing to restore over the live database ${AICC_PG_DB}." >&2
@@ -115,9 +140,23 @@ fi
 # script and carry no grants at all. Without the two commands below, aicc_app
 # and aicc_worker have no access to the restored database, and re-running them
 # is the only way to put ownership back where apply_table_grants expects it.
-# Printed rather than run: this script's credentials are a restore role, not
-# necessarily the superuser that bootstrap requires.
-cat <<NOTICE
+if [[ "$REASSERT_GRANTS" == "1" ]]; then
+    echo "reasserting privileges: bootstrap as \$AICC_PG_SUPERUSER, upgrade as \$AICC_PG_USER"
+    AICC_PG_HOST="$AICC_PG_HOST" AICC_PG_PORT="$PGPORT_VALUE" AICC_PG_DB="$TARGET_DB" \
+        AICC_PG_USER="$AICC_PG_SUPERUSER" AICC_PG_PASSWORD="$AICC_PG_SUPERUSER_PASSWORD" \
+        "$PYTHON_BIN" -m command_center.db bootstrap
+    # As the owner of the restored tables (`--no-owner` above handed them to
+    # the restoring role), not aicc_migrator: ownership, not role name, is
+    # what `upgrade`'s grants need.
+    AICC_PG_HOST="$AICC_PG_HOST" AICC_PG_PORT="$PGPORT_VALUE" AICC_PG_DB="$TARGET_DB" \
+        AICC_PG_USER="$AICC_PG_USER" AICC_PG_PASSWORD="$AICC_PG_PASSWORD" \
+        "$PYTHON_BIN" -m command_center.db upgrade
+    echo "privileges reasserted: aicc_app and aicc_migrator can reach ${TARGET_DB}"
+else
+    # Printed rather than run: this script's credentials are a restore role, not
+    # necessarily the superuser that bootstrap requires, and --reassert-grants
+    # was not passed.
+    cat <<NOTICE
 
 NOTE: the restored database has no roles or grants — pg_restore was run with
 --no-owner --no-privileges, so every table is owned by '${AICC_PG_USER}'.
@@ -129,5 +168,7 @@ Before serving traffic from '${TARGET_DB}', re-assert the privilege matrix:
   AICC_PG_DB=${TARGET_DB} AICC_PG_USER=${AICC_PG_USER} ... \\
       python -m command_center.db upgrade
 
+Or re-run this script with --reassert-grants to do both automatically.
 For a drill this does not matter; for a real recovery it does.
 NOTICE
+fi
