@@ -1436,8 +1436,12 @@ def _verified_rejection_outcome(
     # fd46584, CONFIRMED).
     existing = _rows(
         factory,
-        "SELECT state FROM work_item WHERE task_id = %s AND idempotency_key = %s",
-        (task_id, key),
+        # Idempotency is scoped by (queue, idempotency_key) -- review of
+        # 653963d: without the queue predicate, a same-key item in another
+        # queue read as pending here and blocked this queue's enqueue.
+        "SELECT state FROM work_item "
+        "WHERE queue = %s AND task_id = %s AND idempotency_key = %s",
+        (cfg.queue, task_id, key),
     )
     if existing:
         state = str(existing[0][0])

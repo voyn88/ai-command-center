@@ -2545,3 +2545,46 @@ def test_cursor_advances_only_to_the_processed_boundary(rig, monkeypatch):  # no
             app_factory, "/tmp", ReviewConfig(max_per_tick=1, scan_cap=3)
         )
     assert sorted(posted) == sorted(heads)  # all three, none skipped
+
+
+def test_a_same_key_item_in_another_queue_is_not_pending_here(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 653963d (CONFIRMED): idempotency is scoped by
+    (queue, idempotency_key) -- an item with the same key parked in a
+    DIFFERENT queue must not read as verification_pending and block this
+    queue's enqueue."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    head = "6f" * 20
+    pr_url = "https://github.com/x/y/pull/98"
+    findings = f"claim.\nVERDICT: REJECT\nHEAD_SHA: {head}\n"
+    _ready(store, app_factory, "VOYN-W0-QX", pr_url)
+    _complete_review(app_factory, worker, "VOYN-W0-QX", pr_url, head, findings)
+    vkey = review_merge._verification_key(
+        "VOYN-W0-QX", pr_url, _snapshot(head), findings
+    )
+    WorkQueueStore(app_factory).enqueue(
+        "another-queue", idempotency_key=vkey,
+        payload={"kind": "agent_run"}, task_id="VOYN-W0-QX",
+    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    from command_center.orchestrator import planner
+    monkeypatch.setattr(planner, "repo_route", lambda _r: ("AICC", "/srv/repo"))
+    monkeypatch.setattr(review_merge, "cascade_for", lambda _k: [{"executor": "codex"}])
+    enq = []
+    report = publish_review_verdicts(
+        app_factory, "/tmp",
+        enqueue=lambda q, k, pl, tid, mx: enq.append((q, k)),
+    )
+    # The execution-queue verification WAS enqueued despite the same-key
+    # item sitting in another-queue.
+    assert ("VOYN-W0-QX", "verification_enqueued") in report.skipped
+    assert enq and enq[0][0] == "execution" and enq[0][1] == vkey
