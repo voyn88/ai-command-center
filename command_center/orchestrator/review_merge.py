@@ -99,6 +99,12 @@ class ReviewConfig:
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
     max_branch_updates_per_tick: int = 3
+    #: Per-tick cap on tasks EXAMINED (each examination costs gh API calls).
+    #: Fairness across ticks comes from the rotating deterministic scan order
+    #: below, not from unbounded scanning -- see the window-starvation note
+    #: in the tick functions (review of ce948c0: an unbounded scan meant
+    #: unbounded API traffic and runtime regardless of the action cap).
+    scan_cap: int = 40
 
 
 @dataclass
@@ -797,22 +803,25 @@ def review_once(
     report = LoopReport()
     where_task = " AND t.task_id = %s" if task_id is not None else ""
     params: tuple[Any, ...] = (task_id,) if task_id is not None else ()
-    # The tick's bound is on ACTIONS, not on VISIBILITY (VOYN-OPS-AICC-
-    # PUBLISH-WINDOW-STARVATION, live 2026-08-26): the old `LIMIT
-    # max_per_tick` bounded the rows SCANNED, and because permanently-
-    # skipping tasks (dead PR links, tasks waiting on another tick's stage)
-    # do not bump updated_at, the same 8 rows filled the window every tick
-    # forever -- 0 tasks completed in 4 hours while 90+ waited unseen
-    # behind them. Scanning every READY_TO_REVIEW row is cheap (one indexed
-    # SELECT over ~100 rows); what must stay bounded is the number of
-    # MUTATIONS a tick performs, counted below and capped by max_per_tick.
+    # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
+    # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
+    # permanently filled by eternal skips (skips never bump updated_at --
+    # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
+    # UNBOUNDED scan costs one gh API round-trip per task per tick
+    # (review of ce948c0) -- also wrong. So: examinations are bounded by
+    # scan_cap, MUTATIONS by max_per_tick, and fairness across ticks comes
+    # from a deterministic per-tick rotation -- ordering by
+    # md5(task_id || tick-minute), so each tick examines a different
+    # scan_cap-sized slice and every task is reached within a few ticks,
+    # with no state to maintain and no permanently-starved tail.
     tasks = _rows(
         factory,
-        "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task + " "
-        "ORDER BY t.task_id",
-        params,
+        "SELECT task_id, value FROM ("
+        "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
+        "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
+        "  WHERE t.status = 'READY_TO_REVIEW'" + where_task + ") pairs "
+        "ORDER BY md5(task_id || to_char(now(), 'YYYYMMDDHH24MI')) LIMIT %s",
+        params + (cfg.scan_cap,),
     )
     cascade = _model_only_review_cascade()
     actions = 0
@@ -1492,22 +1501,24 @@ def publish_review_verdicts(
     report = LoopReport()
     where_task = " AND t.task_id = %s" if task_id is not None else ""
     params: tuple[Any, ...] = (task_id,) if task_id is not None else ()
-    # The tick's bound is on ACTIONS, not on VISIBILITY (VOYN-OPS-AICC-
-    # PUBLISH-WINDOW-STARVATION, live 2026-08-26): the old `LIMIT
-    # max_per_tick` bounded the rows SCANNED, and because permanently-
-    # skipping tasks (dead PR links, tasks waiting on another tick's stage)
-    # do not bump updated_at, the same 8 rows filled the window every tick
-    # forever -- 0 tasks completed in 4 hours while 90+ waited unseen
-    # behind them. Scanning every READY_TO_REVIEW row is cheap (one indexed
-    # SELECT over ~100 rows); what must stay bounded is the number of
-    # MUTATIONS a tick performs, counted below and capped by max_per_tick.
+    # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
+    # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
+    # permanently filled by eternal skips (skips never bump updated_at --
+    # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
+    # UNBOUNDED scan costs one gh API round-trip per task per tick
+    # (review of ce948c0) -- also wrong. So: examinations are bounded by
+    # scan_cap, MUTATIONS by max_per_tick, and fairness across ticks comes
+    # from a deterministic per-tick rotation -- ordering by
+    # md5(task_id || tick-minute), so each tick examines a different
+    # scan_cap-sized slice and every task is reached within a few ticks,
+    # with no state to maintain and no permanently-starved tail.
     tasks = _rows(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'" + where_task
-        + " ORDER BY t.updated_at",
-        params,
+        + " ORDER BY md5(t.task_id || to_char(now(), 'YYYYMMDDHH24MI')) LIMIT %s",
+        params + (cfg.scan_cap,),
     )
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
@@ -1856,21 +1867,23 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     `_merged_target_sha`; a queued merge is a wait, not a completion)."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    # The tick's bound is on ACTIONS, not on VISIBILITY (VOYN-OPS-AICC-
-    # PUBLISH-WINDOW-STARVATION, live 2026-08-26): the old `LIMIT
-    # max_per_tick` bounded the rows SCANNED, and because permanently-
-    # skipping tasks (dead PR links, tasks waiting on another tick's stage)
-    # do not bump updated_at, the same 8 rows filled the window every tick
-    # forever -- 0 tasks completed in 4 hours while 90+ waited unseen
-    # behind them. Scanning every READY_TO_REVIEW row is cheap (one indexed
-    # SELECT over ~100 rows); what must stay bounded is the number of
-    # MUTATIONS a tick performs, counted below and capped by max_per_tick.
+    # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
+    # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
+    # permanently filled by eternal skips (skips never bump updated_at --
+    # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
+    # UNBOUNDED scan costs one gh API round-trip per task per tick
+    # (review of ce948c0) -- also wrong. So: examinations are bounded by
+    # scan_cap, MUTATIONS by max_per_tick, and fairness across ticks comes
+    # from a deterministic per-tick rotation -- ordering by
+    # md5(task_id || tick-minute), so each tick examines a different
+    # scan_cap-sized slice and every task is reached within a few ticks,
+    # with no state to maintain and no permanently-starved tail.
     tasks = _rows(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at",
-        (),
+        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY md5(t.task_id || to_char(now(), 'YYYYMMDDHH24MI')) LIMIT %s",
+        (cfg.scan_cap,),
     )
     branch_updates = 0
     actions = 0

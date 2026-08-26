@@ -2084,6 +2084,17 @@ def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa:
     posted = []
     monkeypatch.setattr(review_merge, "_post_marker_as_bot",
                         lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    # Pin the scan order (pendings first, accepted last) so the cap-1 tick
+    # proves pendings cost nothing REGARDLESS of the per-minute rotation.
+    real_rows = review_merge._rows
+
+    def ordered_rows(factory, sql, params=()):
+        rows = real_rows(factory, sql, params)
+        if "READY_TO_REVIEW" in sql and "backlog_task t" in sql:
+            return sorted(rows, key=lambda r: r[0] == "VOYN-W0-PNOK")
+        return rows
+
+    monkeypatch.setattr(review_merge, "_rows", ordered_rows)
     enq = []
     report = publish_review_verdicts(
         app_factory, "/tmp", ReviewConfig(max_per_tick=1),
