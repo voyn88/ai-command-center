@@ -56,6 +56,13 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         {"executor": "copilot", "task_type": "implementation"},
     ],
     "review": [
+        # codex first: it is the only review pool currently reachable on the
+        # fleet (copilot is org-blocked, the Claude subscription window is
+        # exhausted), and it bills a separate account. `independent_review`
+        # resolves to the read-only profile, so codex reviews under
+        # `--sandbox read-only` -- a model-only reviewer that never writes.
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "copilot", "task_type": "review"},
         {"executor": "claude", "task_type": "review"},
     ],
 }

@@ -9,8 +9,9 @@ import os
 import socket
 import sys
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,7 +19,7 @@ import pytest
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
-from command_center.worker.payloads import parse_agent_run, PayloadError
+from command_center.worker.payloads import PayloadError, parse_agent_run
 
 
 def _payload(**overrides):
@@ -45,12 +46,22 @@ def isolated_path(repository: Path, backlog_task: str = "proj") -> Path:
     `handlers._isolated_workspace_path` (`<repo>-worktrees/backlog-<task>`)
     so a test can predict where the lease gate and provisioning will look
     without importing the private helper itself."""
-    return repository.parent / f"{repository.name}-worktrees" / f"backlog-{backlog_task}"
+    return workspace_provisioning.task_workspace_path(
+        repository, f"backlog/{backlog_task}"
+    )
 
 
 @dataclass(frozen=True)
 class _FakeEvidence:
     workspace_path: str
+    expected_branch: str
+    remote_url: str
+    start_sha: str
+    base_sha: str
+    remote_task_sha: str | None
+    workspace_device: int
+    workspace_inode: int
+    provision_outcome: str
 
 
 @pytest.fixture
@@ -71,7 +82,9 @@ def handler(monkeypatch, tmp_path):
     monkeypatch.setattr(
         agent_runner, "validate_repository", lambda project_id, path: tmp_path
     )
-    monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda: (True, "ok"))
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (True, "ok")
+    )
     runs: list[dict] = []
 
     def fake_run(**kwargs):
@@ -90,7 +103,35 @@ def handler(monkeypatch, tmp_path):
     monkeypatch.setattr(
         workspace_provisioning,
         "provision_and_verify",
-        lambda spec: _FakeEvidence(workspace_path=spec.workspace_path),
+        lambda spec: _FakeEvidence(
+            workspace_path=spec.workspace_path,
+            expected_branch=spec.expected_branch or "",
+            remote_url=str(tmp_path),
+            start_sha="0" * 40,
+            base_sha="0" * 40,
+            remote_task_sha=None,
+            workspace_device=1,
+            workspace_inode=1,
+            provision_outcome="cloned",
+        ),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "trusted_publish_clone",
+        lambda workspace, **kwargs: nullcontext(Path(workspace)),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        lambda workspace, **kwargs: "0" * 40,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda workspace, **kwargs: kwargs["previous_start_sha"],
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "task_workspace_is_unchanged", lambda *a, **kw: True
     )
     monkeypatch.setattr(
         workspace_provisioning, "remove_workspace", lambda *a, **kw: "removed"
@@ -114,9 +155,7 @@ def lease_tool(monkeypatch, tmp_path):
     def install(stdout: str = "[]", exit_code: int = 0):
         binary = tmp_path / "fake-voyn-lease"
         binary.write_text(
-            "#!/bin/sh\n"
-            f"cat <<'JSON'\n{stdout}\nJSON\n"
-            f"exit {exit_code}\n"
+            f"#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\nexit {exit_code}\n"
         )
         binary.chmod(0o755)
         monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
@@ -134,9 +173,7 @@ def _lease_row(worktree, **overrides) -> str:
         "session_id": "sess-1",
         "worktree": str(worktree),
         "process_pid": 4242,
-        "expires_at": (
-            datetime.now(timezone.utc) + timedelta(minutes=5)
-        ).isoformat(),
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
     }
     row.update(overrides)
     return json.dumps([row])
@@ -222,7 +259,46 @@ def test_runner_never_started_is_retryable(handler, monkeypatch) -> None:
     assert not outcome.ok and outcome.retryable
 
 
-def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch) -> None:
+def test_principal_isolation_failure_is_retryable_not_a_task_result(
+    handler, monkeypatch, tmp_path
+) -> None:
+    run_agent, _ = handler
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "remove_workspace",
+        lambda *args, **kwargs: removed.append(args),
+    )
+
+    def launcher_refused(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr="AICC_AGENT_LAUNCH_INFRA_FAILURE: launcher socket unavailable",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", launcher_refused)
+    outcome = run_agent(
+        _payload(
+            task_type="implementation",
+            repository_path=str(tmp_path / "repo"),
+        ),
+        _event(),
+        1,
+    )
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "agent principal isolation" in outcome.reason
+    assert not removed, "ambiguous launcher failure must preserve task-local work"
+
+
+def test_api_error_in_cli_output_is_retryable_not_a_success(
+    handler, monkeypatch
+) -> None:
     """Incident 2026-08-21 16:09 UTC (control-01/worker-01): a shared
     Claude-CLI account hit its session/rate limit mid-fleet. The process
     still started and exited non-zero *with* stdout, so the pre-existing
@@ -276,7 +352,168 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch
     assert "session limit" in outcome.reason
 
 
-def test_genuine_task_failure_with_error_flavoured_text_still_ok(handler, monkeypatch) -> None:
+def test_bwrap_loopback_result_is_retryable_infrastructure_failure(
+    handler, monkeypatch
+):
+    run_agent, _runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "codex"
+    payload["cascade"][0]["task_type"] = "implementation"
+    monkeypatch.setattr(
+        agent_runner, "_codex_workspace_write_preflight_result", (True, "")
+    )
+
+    seen = []
+
+    def bwrap_then_fallback(**kwargs):
+        seen.append(kwargs["executor"])
+        if kwargs["executor"] == "codex":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=0,
+                stdout="",
+                stderr="bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+                duration_seconds=0.01,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "fallback done"}',
+            stderr="",
+            duration_seconds=0.01,
+            started_at="2026-08-23T12:00:02+00:00",
+            completed_at="2026-08-23T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", bwrap_then_fallback)
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert seen == ["codex", payload["cascade"][1]["executor"]]
+    assert agent_runner.codex_workspace_write_preflight()[0] is False
+
+
+def test_codex_workspace_preflight_skips_to_fallback_without_spending_attempt(
+    handler, monkeypatch
+):
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "codex"
+    payload["cascade"][0]["task_type"] = "implementation"
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap")
+    )
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert runs[0]["executor"] == payload["cascade"][1]["executor"]
+
+
+def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
+    run_agent, runs = handler
+    checked = []
+
+    def preflight(binary=None):
+        checked.append(binary)
+        return False, "not logged in"
+
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", preflight)
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    # The unavailable copilot no longer dead-ends the attempt: the cascade
+    # falls through to the remaining links (review finding on b311666), so
+    # the copilot binary is probed FIRST and the terminal reason belongs to
+    # the last exhausted candidate.
+    # Pin the WHOLE probe sequence, not just the first link: copilot is tried
+    # first, then the one remaining claude candidate (default binary), and the
+    # cascade neither stops early nor probes anything extra.
+    assert checked == [agent_runner.COPILOT_BINARY, None]
+    # The terminal reason must belong to the LAST exhausted candidate (claude),
+    # not the copilot link that merely started the cascade.
+    assert "claude cli unavailable" in outcome.reason
+    assert runs == []
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "AI credit usage limit reached",
+        "not logged in; authentication required",
+        "service unavailable",
+        "network error: connection refused",
+    ],
+)
+def test_copilot_provider_failure_retries_into_the_next_cascade_link(
+    handler, monkeypatch, diagnostic
+):
+    run_agent, runs = handler
+
+    def failed_copilot(**kwargs):
+        if kwargs["executor"] == "copilot":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=4,
+                stdout="",
+                stderr=diagnostic,
+                duration_seconds=0.1,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:01+00:00",
+            completed_at="2026-08-23T12:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "copilot", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    first = run_agent(payload, _event(), 1)
+    assert not first.ok and first.retryable
+    assert "executor infrastructure failure" in first.reason
+    second = run_agent(payload, _event(), 2)
+    assert second.ok and runs[-1]["executor"] == "claude"
+
+
+def test_unknown_copilot_failure_is_fail_closed_for_read_only_review(
+    handler, monkeypatch
+):
+    run_agent, _runs = handler
+
+    def failed_copilot(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=9,
+            stdout="",
+            stderr="unexpected provider-side failure",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "unexpected provider-side failure" in outcome.reason
+
+
+def test_genuine_task_failure_with_error_flavoured_text_still_ok(
+    handler, monkeypatch
+) -> None:
     """Regression guard for the fix above: a run that genuinely executed and
     the agent's own report happens to mention "error"/"rate limit" in free
     text -- but the CLI's structured payload carries neither `is_error` nor
@@ -736,7 +973,7 @@ def test_expired_other_host_and_other_path_leases_do_not_block(
 ) -> None:
     """Three ways a row can name this path without holding it."""
     run_agent, runs = handler
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    stale = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
     worktree = isolated_path(tmp_path)
     for row in (
         _lease_row(worktree, expires_at=stale),
@@ -813,7 +1050,11 @@ def test_a_lease_held_by_our_own_supervisor_does_not_block(
     """
     run_agent, runs = handler
     pid = os.getpid()
-    lease_tool(_lease_row(isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)))
+    lease_tool(
+        _lease_row(
+            isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)
+        )
+    )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert outcome.ok, outcome.reason
     assert len(runs) == 1, "the dispatch was refused by its own supervisor's lease"
@@ -830,7 +1071,11 @@ def test_a_recycled_pid_matching_an_ancestor_still_blocks(
     """
     run_agent, runs = handler
     lease_tool(
-        _lease_row(isolated_path(tmp_path), process_pid=os.getpid(), process_start="not-our-start")
+        _lease_row(
+            isolated_path(tmp_path),
+            process_pid=os.getpid(),
+            process_start="not-our-start",
+        )
     )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
@@ -842,7 +1087,7 @@ def test_a_lease_with_no_identity_token_still_blocks(
 ) -> None:
     """An unverifiable match is not a match: the row names our pid, but with
     no ``process_start`` on either side to confirm it, the gate fails closed."""
-    run_agent, runs = handler
+    run_agent, _runs = handler
     row = json.loads(_lease_row(isolated_path(tmp_path), process_pid=os.getpid()))
     row[0].pop("process_start", None)
     lease_tool(json.dumps(row))
@@ -872,12 +1117,7 @@ def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
     # `--repo <path> <verb> --repository ... --owner ...` shape instead. One
     # script answers both: it always emits `[]` (the only thing `list`
     # reads) and exits 0.
-    binary.write_text(
-        "#!/bin/sh\n"
-        f'echo "$*" >> {calls}\n'
-        "echo '[]'\n"
-        "exit 0\n"
-    )
+    binary.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho '[]'\nexit 0\n")
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
@@ -907,8 +1147,7 @@ def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
     # only `publish_run` does, immediately before its push. See
     # `test_hold_never_touches_the_clone_wide_hook_identity_file`.
     assert not any(line.split()[2:3] == ["install-hooks"] for line in lines), (
-        "the full-lifecycle lease must not provision the clone-wide hook "
-        "identity file"
+        "the full-lifecycle lease must not provision the clone-wide hook identity file"
     )
 
 
@@ -923,7 +1162,7 @@ def test_the_full_lifecycle_lease_is_scoped_to_the_task_not_the_repository(
     run_agent, _runs = handler
     calls = tmp_path / "lease-calls.log"
     binary = tmp_path / "fake-voyn-lease"
-    binary.write_text(f'#!/bin/sh\necho "$*" >> {calls}\necho \'[]\'\nexit 0\n')
+    binary.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho '[]'\nexit 0\n")
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
@@ -961,7 +1200,7 @@ def test_publish_does_not_release_a_lease_the_caller_still_holds(
     run_agent, _runs = handler
     monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
     binary = tmp_path / "fake-voyn-lease"
-    binary.write_text("#!/bin/sh\nif [ \"$1\" = \"list\" ]; then echo '[]'; fi\nexit 0\n")
+    binary.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo \'[]\'; fi\nexit 0\n')
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
@@ -1004,7 +1243,7 @@ def test_publish_releases_its_own_lease_when_the_scopes_differ(
     run_agent, _runs = handler
     monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
     binary = tmp_path / "fake-voyn-lease"
-    binary.write_text("#!/bin/sh\nif [ \"$1\" = \"list\" ]; then echo '[]'; fi\nexit 0\n")
+    binary.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo \'[]\'; fi\nexit 0\n')
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
