@@ -796,19 +796,29 @@ def review_once(
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     where_task = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (
-        (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
-    )
+    params: tuple[Any, ...] = (task_id,) if task_id is not None else ()
+    # The tick's bound is on ACTIONS, not on VISIBILITY (VOYN-OPS-AICC-
+    # PUBLISH-WINDOW-STARVATION, live 2026-08-26): the old `LIMIT
+    # max_per_tick` bounded the rows SCANNED, and because permanently-
+    # skipping tasks (dead PR links, tasks waiting on another tick's stage)
+    # do not bump updated_at, the same 8 rows filled the window every tick
+    # forever -- 0 tasks completed in 4 hours while 90+ waited unseen
+    # behind them. Scanning every READY_TO_REVIEW row is cheap (one indexed
+    # SELECT over ~100 rows); what must stay bounded is the number of
+    # MUTATIONS a tick performs, counted below and capped by max_per_tick.
     tasks = _rows(
         factory,
         "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'" + where_task + " "
-        "ORDER BY t.task_id LIMIT %s",
+        "ORDER BY t.task_id",
         params,
     )
     cascade = _model_only_review_cascade()
+    actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
+        if actions >= cfg.max_per_tick:
+            break
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
@@ -878,6 +888,7 @@ def review_once(
         for review_key, payload in prepared:
             enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
+        actions += 1
     return report
 
 
@@ -1456,18 +1467,28 @@ def publish_review_verdicts(
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     where_task = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (
-        (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
-    )
+    params: tuple[Any, ...] = (task_id,) if task_id is not None else ()
+    # The tick's bound is on ACTIONS, not on VISIBILITY (VOYN-OPS-AICC-
+    # PUBLISH-WINDOW-STARVATION, live 2026-08-26): the old `LIMIT
+    # max_per_tick` bounded the rows SCANNED, and because permanently-
+    # skipping tasks (dead PR links, tasks waiting on another tick's stage)
+    # do not bump updated_at, the same 8 rows filled the window every tick
+    # forever -- 0 tasks completed in 4 hours while 90+ waited unseen
+    # behind them. Scanning every READY_TO_REVIEW row is cheap (one indexed
+    # SELECT over ~100 rows); what must stay bounded is the number of
+    # MUTATIONS a tick performs, counted below and capped by max_per_tick.
     tasks = _rows(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'" + where_task
-        + " ORDER BY t.updated_at LIMIT %s",
+        + " ORDER BY t.updated_at",
         params,
     )
+    actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
+        if actions >= cfg.max_per_tick:
+            break
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
@@ -1526,6 +1547,9 @@ def publish_review_verdicts(
                 factory, enqueue, task_id, pr_url, snapshot, text, cfg
             )
             if outcome == "WAIT":
+                if detail == "verification_pending":
+                    # An enqueue may have just happened -- a queue mutation.
+                    actions += 1
                 report.skipped.append((task_id, detail))
                 continue
             if outcome != "ACCEPT":
@@ -1534,6 +1558,7 @@ def publish_review_verdicts(
                 )
                 if new_task_id:
                     report.remediated.append((task_id, new_task_id))
+                    actions += 1
                 else:
                     report.skipped.append((task_id, "review_verdict_reject_remediation_already_dispatched"))
                 continue
@@ -1579,6 +1604,7 @@ def publish_review_verdicts(
         # pre-marker run. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
         _rerun_failing_acceptance_gate(repo_path, pr_url, sha)
         report.reviewed.append((task_id, pr_url))
+        actions += 1
     return report
 
 
@@ -1805,15 +1831,27 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     `_merged_target_sha`; a queued merge is a wait, not a completion)."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    # The tick's bound is on ACTIONS, not on VISIBILITY (VOYN-OPS-AICC-
+    # PUBLISH-WINDOW-STARVATION, live 2026-08-26): the old `LIMIT
+    # max_per_tick` bounded the rows SCANNED, and because permanently-
+    # skipping tasks (dead PR links, tasks waiting on another tick's stage)
+    # do not bump updated_at, the same 8 rows filled the window every tick
+    # forever -- 0 tasks completed in 4 hours while 90+ waited unseen
+    # behind them. Scanning every READY_TO_REVIEW row is cheap (one indexed
+    # SELECT over ~100 rows); what must stay bounded is the number of
+    # MUTATIONS a tick performs, counted below and capped by max_per_tick.
     tasks = _rows(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at LIMIT %s",
-        (cfg.max_per_tick,),
+        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at",
+        (),
     )
     branch_updates = 0
+    actions = 0
     for task_id, pr_url in tasks:
+        if actions >= cfg.max_per_tick:
+            break
         # Readiness FIRST: only a PR that already carries an independent ACCEPT
         # marker on its head with green required checks is the merge tick's
         # business. An un-accepted or failing PR is reviewed by the review tick
@@ -1864,6 +1902,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     report.skipped.append((task_id, "branch_behind_update_capped"))
                     continue
                 branch_updates += 1
+                actions += 1
                 updated = _gh(["pr", "update-branch", pr_url], repo_path)
                 if updated.returncode == 0:
                     report.skipped.append((task_id, "branch_updated_behind_main"))
@@ -1872,6 +1911,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                         (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
                     )
                 continue
+            actions += 1
             merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
             # On a merge-queue-protected repo a zero exit only ENQUEUED the
             # PR; on a plain repo it merged synchronously. Either way the

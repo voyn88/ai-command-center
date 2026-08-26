@@ -11,6 +11,7 @@ import pytest
 
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import (
+    ReviewConfig,
     merge_once,
     publish_review_verdicts,
     reconcile_merge_evidence,
@@ -1940,3 +1941,86 @@ def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-MY", "merged_without_acceptance_evidence") in report.skipped
     assert not report.merged
+
+
+def test_permanent_skips_do_not_starve_the_publish_window(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (live 2026-08-26): with
+    max_per_tick=N old code selected the N oldest-updated rows -- which were
+    exactly the permanently-skipping ones (skips never bump updated_at), so
+    fresh work behind them was never even seen: 0 completions in 4 hours.
+    The bound is now on ACTIONS: skips cost nothing, and a task standing
+    behind any number of eternal skips still gets its marker this tick."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    # Ten tasks whose PR lookups permanently fail -- the eternal skips.
+    for i in range(10):
+        _ready(store, app_factory, f"VOYN-W0-ST{i}", f"https://github.com/x/y/pull/{100 + i}")
+    # And one real, accepted task, LAST by updated_at.
+    head = "ab" * 20
+    pr_url = "https://github.com/x/y/pull/99"
+    _ready(store, app_factory, "VOYN-W0-STREAL", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-STREAL", pr_url, head,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        if "/pull/99" not in url:
+            return sp.CompletedProcess(argv, 1, "", "no such pr")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append((pr, sha)) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=2))
+    # All ten eternal skips were scanned AND the real task still acted.
+    assert posted == [(pr_url, head)]
+    assert len(report.skipped) == 10
+
+
+def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):  # noqa: F811
+    """The other half of the same change: mutations per tick stay bounded --
+    with max_per_tick=1 and two acceptable tasks, exactly one marker posts
+    this tick; the second lands next tick."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    heads = {}
+    for i, n in enumerate((70, 71)):
+        head = f"{i}c" * 10 + "d" * 20
+        pr_url = f"https://github.com/x/y/pull/{n}"
+        heads[f"https://github.com/x/y/pull/{n}"] = head
+        _ready(store, app_factory, f"VOYN-W0-CAP{i}", pr_url)
+        _complete_review(
+            app_factory, worker, f"VOYN-W0-CAP{i}", pr_url, head,
+            f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        )
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        head = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and head:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert len(posted) == 1
+    publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert len(posted) == 2
