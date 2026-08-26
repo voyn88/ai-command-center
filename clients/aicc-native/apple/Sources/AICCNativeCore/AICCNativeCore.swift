@@ -82,6 +82,20 @@ public struct Project: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+public struct WaveGoal: Codable, Equatable, Sendable {
+    public let title: String
+    public let done: Int
+    public let total: Int
+    public let inProgress: Int
+    public let review: Int
+
+    public init(title: String, done: Int, total: Int, inProgress: Int, review: Int) {
+        self.title = title; self.done = done; self.total = total; self.inProgress = inProgress; self.review = review
+    }
+
+    public var progress: Double { total > 0 ? Double(done) / Double(total) : 0 }
+}
+
 public struct Snapshot: Codable, Equatable, Sendable {
     public let schemaVersion: String
     public let revision: String
@@ -93,8 +107,9 @@ public struct Snapshot: Codable, Equatable, Sendable {
     // DTO 1.0 additive keys: absent in old fixtures, so they decode with
     // defaults instead of failing (the server always sends them).
     public let projects: [Project]
+    public let goal: WaveGoal?
 
-    public init(schemaVersion: String, revision: String, generatedAt: Date, freshness: Freshness, tasks: [Task], lanes: [AgentLane], events: [TimelineEvent], projects: [Project] = []) {
+    public init(schemaVersion: String, revision: String, generatedAt: Date, freshness: Freshness, tasks: [Task], lanes: [AgentLane], events: [TimelineEvent], projects: [Project] = [], goal: WaveGoal? = nil) {
         self.schemaVersion = schemaVersion
         self.revision = revision
         self.generatedAt = generatedAt
@@ -103,6 +118,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
         self.lanes = lanes
         self.events = events
         self.projects = projects
+        self.goal = goal
     }
 
     public init(from decoder: Decoder) throws {
@@ -115,6 +131,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
         lanes = try container.decode([AgentLane].self, forKey: .lanes)
         events = try container.decode([TimelineEvent].self, forKey: .events)
         projects = try container.decodeIfPresent([Project].self, forKey: .projects) ?? []
+        goal = try? container.decodeIfPresent(WaveGoal.self, forKey: .goal)
     }
 
     public var overview: OverviewModel {
