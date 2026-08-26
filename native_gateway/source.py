@@ -36,6 +36,7 @@ from .dto import (
     DialogDTO,
     EvidenceState,
     Freshness,
+    GoalDTO,
     ProjectDTO,
     SnapshotDTO,
     TaskDTO,
@@ -178,8 +179,30 @@ def _map_projection(raw: dict, now: datetime, settings: GatewaySettings) -> Proj
         events=events,
         projects=projects,
         connection=ConnectionDTO(state=freshness, projectionAgeSeconds=age),
+        goal=_map_goal(raw.get("goal")),
     )
     return Projection(snapshot=snapshot, dialogs=dialogs, decisions=decisions)
+
+
+def _map_goal(raw: object) -> GoalDTO | None:
+    if not isinstance(raw, dict):
+        return None
+    title = _clean(raw.get("title"))
+    total = raw.get("total")
+    if title is None or not isinstance(total, int) or total <= 0:
+        return None
+
+    def _count(key: str) -> int:
+        value = raw.get(key)
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    return GoalDTO(
+        title=title,
+        done=min(_count("done"), total),
+        total=total,
+        inProgress=_count("in_progress"),
+        review=_count("review"),
+    )
 
 
 def _items(value: object) -> list[dict]:
