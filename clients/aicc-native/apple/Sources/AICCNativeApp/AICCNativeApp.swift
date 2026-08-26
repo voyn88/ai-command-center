@@ -134,7 +134,7 @@ private struct OverviewView: View {
                     Text("Я собрала главное и оставила вам только то, что действительно заслуживает внимания.")
                         .font(.title3).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     CalmStatus(freshness: snapshot.freshness, needsAttention: snapshot.overview.needsAttention, connection: connection)
-                    ProgressCard()
+                    ProgressCard(goal: snapshot.goal)
                     Text("Ваши проекты").font(.title2.weight(.semibold))
                     if snapshot.projects.isEmpty {
                         ProjectRow(name: "Ваш портфель", detail: "Проекты появятся вместе с данными сервера", color: .gray)
@@ -174,13 +174,28 @@ private struct CalmStatus: View {
 }
 
 private struct ProgressCard: View {
+    let goal: WaveGoal?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
             Text("БЛИЖАЙШАЯ ЦЕЛЬ").font(.caption2.weight(.bold)).tracking(1.1).foregroundStyle(.secondary)
-            Text("Новая версия AICC\nпочти готова").font(.system(.title2, design: .serif, weight: .medium))
-            Text("Осталась финальная проверка. Мы сообщим, только если понадобится ваше участие.").foregroundStyle(.secondary)
-            ProgressView(value: 0.72).tint(AICCTheme.plum).accessibilityLabel("Ближайшая цель почти готова")
-        }.padding(22).background(AICCTheme.lilac, in: RoundedRectangle(cornerRadius: 24))
+            if let goal {
+                Text(goal.title).font(.system(.title2, design: .serif, weight: .medium))
+                Text(detail(goal)).foregroundStyle(.secondary)
+                ProgressView(value: goal.progress).tint(AICCTheme.plum)
+                    .accessibilityLabel("\(goal.title): завершено \(goal.done) из \(goal.total)")
+            } else {
+                Text("Цель появится\nвместе с данными").font(.system(.title2, design: .serif, weight: .medium))
+                Text("Сервер ещё не передал картину программы.").foregroundStyle(.secondary)
+            }
+        }.padding(22).frame(maxWidth: .infinity, alignment: .leading).background(AICCTheme.lilac, in: RoundedRectangle(cornerRadius: 24))
+    }
+
+    private func detail(_ goal: WaveGoal) -> String {
+        var parts = ["Завершено \(goal.done) из \(goal.total)"]
+        if goal.inProgress > 0 { parts.append("в работе: \(goal.inProgress)") }
+        if goal.review > 0 { parts.append("на проверке: \(goal.review)") }
+        return parts.joined(separator: " · ")
     }
 }
 

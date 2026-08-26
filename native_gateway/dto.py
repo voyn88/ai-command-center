@@ -82,6 +82,16 @@ class ProjectDTO(_Frozen):
     needsAttention: int
 
 
+class GoalDTO(_Frozen):
+    """Additive in DTO 1.0 — the earliest unfinished wave's real progress."""
+
+    title: str
+    done: int
+    total: int
+    inProgress: int
+    review: int
+
+
 class ConnectionDTO(_Frozen):
     """Additive in DTO 1.0 — how live the projection behind this response is."""
 
@@ -99,6 +109,7 @@ class SnapshotDTO(_Frozen):
     events: list[TimelineEventDTO]
     projects: list[ProjectDTO]
     connection: ConnectionDTO
+    goal: GoalDTO | None = None
 
 
 class DialogDTO(_Frozen):
