@@ -126,6 +126,52 @@ def test_oversized_diff_splits_on_file_and_hunk_boundaries_without_gaps(monkeypa
         assert chunk.text.startswith("diff --git ") or chunk.text.startswith("@@ ")
 
 
+def test_oversized_single_file_splits_mid_hunk_without_gaps(monkeypatch):
+    """A single file whose one hunk alone exceeds the byte budget cannot be
+    bounded by ``_diff_units`` alone (it is already the smallest file/hunk
+    unit) -- ``_split_unit_to_fit``'s binary search must cut it mid-hunk, on
+    a line boundary, into as many pieces as the budget demands. This is
+    distinct from the file/hunk-boundary split above: here at least one
+    chunk boundary necessarily falls *inside* a hunk, not on a ``diff --git``
+    or ``@@`` line start, and the byte-for-byte reassembly invariant must
+    still hold."""
+    hunk_header = "@@ -1,3000 +1,3000 @@\n"
+    content_lines = "".join(f"+line{i}\n" for i in range(3000))
+    diff = "diff --git a/big b/big\n" + hunk_header + content_lines
+    snapshot = snap(diff)
+
+    def prompt_bytes_for(text):
+        base = review_merge._make_diff_chunks([text])[0]
+        multi = dataclasses.replace(
+            base, index=999_999_999, count=1_000_000_000, manifest_hash="f" * 64
+        )
+        return review_merge._prompt_size_bytes(
+            review_merge._render_review_prompt(TASK, PR, snapshot, multi)
+        )
+
+    half_hunk = (hunk_header + content_lines)[: len(hunk_header + content_lines) // 2]
+    budget = prompt_bytes_for(half_hunk)
+    assert budget < prompt_bytes_for(hunk_header + content_lines)
+    monkeypatch.setattr(review_merge, "_MAX_REVIEW_PROMPT_BYTES", budget)
+
+    chunks = review_merge._review_chunks(snapshot, TASK, PR)
+    assert len(chunks) > 2
+    assert [chunk.index for chunk in chunks] == list(range(len(chunks)))
+    assert all(chunk.count == len(chunks) for chunk in chunks)
+    assert "".join(chunk.text for chunk in chunks) == diff
+    assert all(
+        review_merge._prompt_size_bytes(
+            review_merge._render_review_prompt(TASK, PR, snapshot, chunk)
+        )
+        <= budget
+        for chunk in chunks
+    )
+    assert any(
+        not (chunk.text.startswith("diff --git ") or chunk.text.startswith("@@ "))
+        for chunk in chunks
+    )
+
+
 def test_missing_middle_chunk_blocks_with_the_precise_index(monkeypatch):
     snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
     complete = rows(snapshot)
