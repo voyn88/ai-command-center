@@ -50,6 +50,18 @@ public struct TimelineEvent: Codable, Identifiable, Equatable, Sendable {
     public let correlationID: String
 }
 
+public struct Project: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let state: String
+    public let activeTasks: Int
+    public let needsAttention: Int
+
+    public init(id: String, name: String, state: String, activeTasks: Int, needsAttention: Int) {
+        self.id = id; self.name = name; self.state = state; self.activeTasks = activeTasks; self.needsAttention = needsAttention
+    }
+}
+
 public struct Snapshot: Codable, Equatable, Sendable {
     public let schemaVersion: String
     public let revision: String
@@ -58,8 +70,11 @@ public struct Snapshot: Codable, Equatable, Sendable {
     public let tasks: [Task]
     public let lanes: [AgentLane]
     public let events: [TimelineEvent]
+    // DTO 1.0 additive keys: absent in old fixtures, so they decode with
+    // defaults instead of failing (the server always sends them).
+    public let projects: [Project]
 
-    public init(schemaVersion: String, revision: String, generatedAt: Date, freshness: Freshness, tasks: [Task], lanes: [AgentLane], events: [TimelineEvent]) {
+    public init(schemaVersion: String, revision: String, generatedAt: Date, freshness: Freshness, tasks: [Task], lanes: [AgentLane], events: [TimelineEvent], projects: [Project] = []) {
         self.schemaVersion = schemaVersion
         self.revision = revision
         self.generatedAt = generatedAt
@@ -67,6 +82,19 @@ public struct Snapshot: Codable, Equatable, Sendable {
         self.tasks = tasks
         self.lanes = lanes
         self.events = events
+        self.projects = projects
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(String.self, forKey: .schemaVersion)
+        revision = try container.decode(String.self, forKey: .revision)
+        generatedAt = try container.decode(Date.self, forKey: .generatedAt)
+        freshness = try container.decode(Freshness.self, forKey: .freshness)
+        tasks = try container.decode([Task].self, forKey: .tasks)
+        lanes = try container.decode([AgentLane].self, forKey: .lanes)
+        events = try container.decode([TimelineEvent].self, forKey: .events)
+        projects = try container.decodeIfPresent([Project].self, forKey: .projects) ?? []
     }
 
     public var overview: OverviewModel {

@@ -58,6 +58,25 @@ private struct OverviewView: View {
     let snapshot: Snapshot
     let connection: AICCAppModel.ConnectionState
 
+    // Attention first, then the busiest — a calm reader sees what matters.
+    private var topProjects: [Project] {
+        Array(
+            snapshot.projects
+                .sorted { ($0.needsAttention, $0.activeTasks) > ($1.needsAttention, $1.activeTasks) }
+                .prefix(6)
+        )
+    }
+
+    private func projectDetail(_ project: Project) -> String {
+        if project.needsAttention > 0 {
+            return "Требует внимания: \(project.needsAttention) · в работе: \(project.activeTasks)"
+        }
+        if project.activeTasks > 0 {
+            return "В работе: \(project.activeTasks), всё идёт по плану"
+        }
+        return "Сейчас ничего не требует участия"
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -69,9 +88,16 @@ private struct OverviewView: View {
                     CalmStatus(freshness: snapshot.freshness, needsAttention: snapshot.overview.needsAttention, connection: connection)
                     ProgressCard()
                     Text("Ваши проекты").font(.title2.weight(.semibold))
-                    ProjectRow(name: "AIOS", detail: "Главная работа идёт по плану", color: AICCTheme.forest)
-                    ProjectRow(name: "AICC Native", detail: "Собираем новый опыт для Mac и iPhone", color: AICCTheme.plum)
-                    ProjectRow(name: "Ваш портфель", detail: "Ничего не требует срочного участия", color: .gray)
+                    if snapshot.projects.isEmpty {
+                        ProjectRow(name: "Ваш портфель", detail: "Проекты появятся вместе с данными сервера", color: .gray)
+                    }
+                    ForEach(topProjects) { project in
+                        ProjectRow(
+                            name: project.name,
+                            detail: projectDetail(project),
+                            color: project.needsAttention > 0 ? .orange : (project.activeTasks > 0 ? AICCTheme.forest : .gray)
+                        )
+                    }
                 }.padding()
             }
             .navigationTitle("AICC")
