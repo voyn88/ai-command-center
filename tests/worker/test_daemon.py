@@ -10,6 +10,10 @@ for exactly one reason.
 
 from __future__ import annotations
 
+import os
+import signal
+import time
+from pathlib import Path
 
 from command_center.db.work_queue_store import ClaimedWork, QueueRefusal
 from command_center.worker.daemon import (
@@ -164,6 +168,236 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
     assert ("complete", "wat-1", {}) in store.calls
 
 
+def test_credential_hot_reload_does_not_wait_for_or_signal_the_running_job() -> None:
+    """Pool generations change beside a 3600-second handler. The handler is
+    neither stopped nor duplicated, while its heartbeat can move to the new
+    pool on its next checkout."""
+
+    import threading
+
+    store = ScriptedStore([_work({"kind": "slow"})])
+    events: list[str] = []
+    pings: list[str] = []
+    daemon: WorkerDaemon
+    handler_started = threading.Event()
+    handler_release = threading.Event()
+    reload_done = threading.Event()
+
+    def handler(payload, lease_lost, attempt_no=1):
+        events.append("handler")
+        handler_started.set()
+        assert handler_release.wait(timeout=5)
+        events.append("handler-finished")
+        return HandlerOutcome(ok=True, result={})
+
+    def reload_credentials() -> None:
+        assert not handler_release.is_set(), "test must reload while job is active"
+        events.append("reload")
+        reload_done.set()
+
+    def sleep(_seconds: float) -> None:
+        daemon.request_stop()
+
+    daemon = WorkerDaemon(
+        store,
+        {"slow": handler},
+        WorkerConfig(visibility_seconds=3),
+        sleep=sleep,
+        notify=pings.append,
+        reload_credentials=reload_credentials,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    assert handler_started.wait(timeout=5)
+    daemon.request_drain()
+    deadline = time.monotonic() + 5
+    while "STATUS=aicc-drained" not in pings and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "STATUS=aicc-drained" in pings
+    daemon.request_reload()
+    assert reload_done.wait(timeout=5)
+    handler_release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert events == ["handler", "reload", "handler-finished"]
+    assert pings.count("READY=1") == 2
+    assert "STATUS=aicc-drained" in pings
+    assert ("complete", "wat-1", {}) in store.calls
+
+
+def test_drain_ack_is_after_atomic_claim_gate_close() -> None:
+    """A SIGUSR1-equivalent racing a blocking claim cannot ACK early."""
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls = [0]
+    notices: list[str] = []
+
+    class BlockingStore(ScriptedStore):
+        def claim(self, queue, *, visibility_seconds):
+            calls[0] += 1
+            entered.set()
+            assert release.wait(timeout=5)
+            return QueueRefusal(reason="no_work")
+
+    store = BlockingStore([])
+    daemon = WorkerDaemon(
+        store,
+        {},
+        WorkerConfig(visibility_seconds=3, idle_min_seconds=0.01),
+        notify=notices.append,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    assert entered.wait(timeout=5)
+
+    daemon.request_drain()
+    time.sleep(0.05)
+    assert "STATUS=aicc-drained" not in notices
+    release.set()
+    deadline = time.monotonic() + 5
+    while "STATUS=aicc-drained" not in notices and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "STATUS=aicc-drained" in notices
+    time.sleep(0.05)
+    assert calls[0] == 1, "no claim may begin after the drain ACK"
+    daemon.request_stop()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+
+class _FileLeaseStore:
+    """Minimal cross-process lease used by the SIGTERM/SIGKILL regression."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def claim(self, queue, *, visibility_seconds):
+        if (self.root / "done").exists():
+            return QueueRefusal(reason="no_work")
+        lease = self.root / "lease"
+        now = time.monotonic()
+        if lease.exists() and float(lease.read_text()) > now:
+            return QueueRefusal(reason="no_work")
+        attempts = self.root / "attempts"
+        attempt_no = int(attempts.read_text()) + 1 if attempts.exists() else 1
+        self._publish(attempts, str(attempt_no))
+        attempt_id = f"attempt-{attempt_no}"
+        self._publish(lease, str(now + float(visibility_seconds)))
+        self._publish(self.root / "claimed", attempt_id)
+        return ClaimedWork(
+            work_item_id="job-3600",
+            attempt_id=attempt_id,
+            attempt_no=attempt_no,
+            visible_until="bounded-by-test-clock",
+            payload={"kind": "long"},
+            claim_token=f"token-{attempt_no}",
+        )
+
+    def heartbeat(self, work):
+        self._publish(self.root / "lease", str(time.monotonic() + 1.0))
+        return True
+
+    def _publish(self, path, text):
+        # Atomic rename: a SIGKILL landing mid-write must never leave an
+        # empty/half file for the parent process's cross-process read
+        # (review finding on c4001c4).
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(text)
+        os.replace(temporary, path)
+
+    def complete(self, work, result):
+        self._publish(self.root / "done", work.attempt_id)
+        return True
+
+    def fail(self, work, *, reason, retryable):
+        return False
+
+
+def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
+    tmp_path: Path,
+) -> None:
+    """Scaled systemd lifecycle: 3600s job survives TERM, then lease retries."""
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - assertions are in the supervising parent
+        # Any exception escaping this block would let the CHILD continue the
+        # pytest session -- duplicated run, interleaved capture, misleading
+        # parent failure (independent-review finding on f7515b5). The child
+        # only ever exits through os._exit.
+        try:
+            daemon = WorkerDaemon(
+                _FileLeaseStore(tmp_path),
+                {
+                    "long": lambda payload, lost, attempt=1: (
+                        (tmp_path / "handler-entered").write_text("1"),
+                        time.sleep(3600),
+                        HandlerOutcome(ok=True),
+                    )[-1]
+                },
+                WorkerConfig(visibility_seconds=1, idle_min_seconds=0.01),
+                notify=lambda _state: None,
+            )
+            daemon.install_signal_handlers()
+            daemon.run_forever()
+        except BaseException:
+            os._exit(1)
+        os._exit(0)
+
+    reaped = False
+    try:
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "claimed").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (tmp_path / "claimed").read_text() == "attempt-1"
+        while not (tmp_path / "handler-entered").exists() and (
+            time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert (tmp_path / "handler-entered").exists(), "job never started"
+
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.2)
+        waited, _status = os.waitpid(pid, os.WNOHANG)
+        # If the child died here it was ALSO reaped -- the finally must not
+        # SIGKILL a recycled PID on this failure path (review on f7515b5).
+        reaped = waited == pid
+        assert waited == 0, "SIGTERM must let the in-hand 3600s job continue"
+
+        kill_started = time.monotonic()
+        os.kill(pid, signal.SIGKILL)
+        waited, status = os.waitpid(pid, 0)
+        reaped = True
+        assert waited == pid and os.WIFSIGNALED(status)
+        assert os.WTERMSIG(status) == signal.SIGKILL
+        assert time.monotonic() - kill_started < 1.0
+
+        # The killed owner cannot report. Once its bounded visibility lease
+        # expires, the same item is safely delivered as attempt 2.
+        # The child publishes the lease via atomic rename (write to a temp
+        # name, os.replace) so a SIGKILL can never leave a half-written file
+        # for this read (review finding on c4001c4).
+        expiry = float((tmp_path / "lease").read_text())
+        time.sleep(max(0.0, expiry - time.monotonic()) + 0.05)
+        redelivered = _FileLeaseStore(tmp_path).claim("execution", visibility_seconds=1)
+        assert isinstance(redelivered, ClaimedWork)
+        assert redelivered.work_item_id == "job-3600"
+        assert redelivered.attempt_no == 2
+    finally:
+        try:
+            # Signalling an already-reaped PID is a PID-reuse hazard against
+            # an unrelated process (review finding on c4001c4).
+            if not reaped:
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
 def test_idle_backoff_grows_and_resets_on_work(monkeypatch) -> None:
     store = ScriptedStore(
         [QueueRefusal("no_work"), QueueRefusal("no_work"), _work({"kind": "echo"})]
@@ -268,7 +502,7 @@ def test_the_claim_loop_feeds_the_watchdog_between_claims() -> None:
 
     assert pings[0] == "READY=1", "readiness must precede the first claim"
     assert pings[-1] == "STOPPING=1", "a clean exit must announce itself"
-    watchdog = [p for p in pings if p == "WATCHDOG=1"]
+    watchdog = [p for p in pings if p == "WATCHDOG=1" or p.startswith("WATCHDOG=1\n")]
     claims = [c for c in store.calls if c[0] == "claim"]
     assert len(watchdog) == len(claims), "one ping per loop iteration"
 
@@ -442,4 +676,6 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
 
     assert frames[0] == b"READY=1"
     assert frames[-1] == b"STOPPING=1"
-    assert b"WATCHDOG=1" in frames
+    assert any(
+        frame == b"WATCHDOG=1" or frame.startswith(b"WATCHDOG=1\n") for frame in frames
+    )
