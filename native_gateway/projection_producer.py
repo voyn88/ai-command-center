@@ -33,8 +33,10 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from command_center import read_model, storage, tasks_repository
+from command_center import backlog_client, read_model, storage, tasks_repository
 from command_center.runtime import runs_read
+
+from .task_titles import load_cache, title_for
 
 PROJECTION_VERSION = "1"
 _EVENT_LIMIT = 50
@@ -151,12 +153,48 @@ def _map_lanes(runs: list[dict], now: datetime) -> list[dict]:
     return lanes
 
 
-def build_projection(root: Path, *, db_path: Path | None = None) -> dict:
+def _backlog_tasks(
+    backlog_path: Path | None, titles_path: Path | None = None
+) -> list[dict]:
+    """Read-only projection of the VOYN master backlog into task records.
+
+    Reuses `backlog_client` (the sanctioned read side of the Backlog Engine —
+    it has no write surface, so this cannot create a second task store).
+    Only machine `VOYN_RECOMMENDATION` records are visible to that client;
+    an unconfigured or missing file yields an empty list, never an error.
+    """
+    projection = backlog_client.load_projection(backlog_path)
+    # Russian executive titles, produced offline by `localize_titles` on a
+    # local model; a record absent from the cache keeps its humanized slug.
+    titles = load_cache(titles_path)
+    tasks = []
+    for rec in projection.records:
+        tasks.append(
+            {
+                "id": rec.issue_id,
+                "project": rec.parallel_domain or rec.owner or "backlog",
+                "title": title_for(rec.issue_id, rec.title, titles),
+                "status": "Next" if rec.is_approved else "Backlog",
+                "type": "backlog",
+            }
+        )
+    return tasks
+
+
+def build_projection(
+    root: Path,
+    *,
+    db_path: Path | None = None,
+    backlog_path: Path | None = None,
+    titles_path: Path | None = None,
+) -> dict:
     """Assemble the projection dict from the repository's read surfaces."""
     now = datetime.now(UTC)
     degraded = False
 
-    tasks = tasks_repository.load_tasks(root)
+    tasks = tasks_repository.load_tasks(root) + _backlog_tasks(
+        backlog_path, titles_path
+    )
 
     runs: list[dict] = []
     resolved_db = db_path or (storage.resolve_data_dir(root) / "runtime.db")
@@ -186,9 +224,16 @@ def build_projection(root: Path, *, db_path: Path | None = None) -> dict:
 
 
 def write_projection(
-    root: Path, out_path: Path, *, db_path: Path | None = None
+    root: Path,
+    out_path: Path,
+    *,
+    db_path: Path | None = None,
+    backlog_path: Path | None = None,
+    titles_path: Path | None = None,
 ) -> dict:
-    projection = build_projection(root, db_path=db_path)
+    projection = build_projection(
+        root, db_path=db_path, backlog_path=backlog_path, titles_path=titles_path
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     storage.atomic_write_json(out_path, projection)
     return projection
@@ -202,6 +247,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--db", type=Path, default=None)
     parser.add_argument(
+        "--backlog",
+        type=Path,
+        default=None,
+        help="VOYN master backlog path (else AICC_MASTER_BACKLOG env, else none)",
+    )
+    parser.add_argument(
+        "--titles",
+        type=Path,
+        default=None,
+        help="Russian title cache from native_gateway.localize_titles",
+    )
+    parser.add_argument(
         "--interval",
         type=int,
         default=0,
@@ -210,7 +267,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     while True:
-        projection = write_projection(args.root, args.out, db_path=args.db)
+        projection = write_projection(
+            args.root,
+            args.out,
+            db_path=args.db,
+            backlog_path=args.backlog,
+            titles_path=args.titles,
+        )
         print(
             f"projection {projection['revision']} → {args.out} "
             f"(tasks={len(projection['tasks'])}, degraded={projection['degraded']})"
