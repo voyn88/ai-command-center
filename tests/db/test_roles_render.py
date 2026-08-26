@@ -174,7 +174,8 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "queue_complete",
         "queue_fail",
     }
-    # And the enrolment layer (0003): prove its own identity, rotate its own
+    # And the enrolment layer: prove its own identity, read only the
+    # server-authoritative expiry of that proved credential, rotate its own
     # secret, and nothing else — a worker cannot mint or redeem an enrolment.
     assert granted == {
         "queue_claim",
@@ -182,6 +183,7 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "queue_complete",
         "queue_fail",
         "identity_assert",
+        "identity_current_credential",
         "enroll_rotate_self",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}

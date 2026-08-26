@@ -497,6 +497,7 @@ _APP_BACKLOG_FUNCTIONS = (
 # enrolments), or revoke anything.
 _WORKER_ENROLMENT_FUNCTIONS = (
     "identity_assert(text)",
+    "identity_current_credential(text)",
     "enroll_rotate_self(text, text, text)",
 )
 

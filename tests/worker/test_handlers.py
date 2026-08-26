@@ -7,9 +7,11 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,7 +19,7 @@ import pytest
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
-from command_center.worker.payloads import parse_agent_run, PayloadError
+from command_center.worker.payloads import PayloadError, parse_agent_run
 
 
 def _payload(**overrides):
@@ -44,12 +46,22 @@ def isolated_path(repository: Path, backlog_task: str = "proj") -> Path:
     `handlers._isolated_workspace_path` (`<repo>-worktrees/backlog-<task>`)
     so a test can predict where the lease gate and provisioning will look
     without importing the private helper itself."""
-    return repository.parent / f"{repository.name}-worktrees" / f"backlog-{backlog_task}"
+    return workspace_provisioning.task_workspace_path(
+        repository, f"backlog/{backlog_task}"
+    )
 
 
 @dataclass(frozen=True)
 class _FakeEvidence:
     workspace_path: str
+    expected_branch: str
+    remote_url: str
+    start_sha: str
+    base_sha: str
+    remote_task_sha: str | None
+    workspace_device: int
+    workspace_inode: int
+    provision_outcome: str
 
 
 @pytest.fixture
@@ -70,7 +82,9 @@ def handler(monkeypatch, tmp_path):
     monkeypatch.setattr(
         agent_runner, "validate_repository", lambda project_id, path: tmp_path
     )
-    monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda: (True, "ok"))
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (True, "ok")
+    )
     runs: list[dict] = []
 
     def fake_run(**kwargs):
@@ -89,7 +103,35 @@ def handler(monkeypatch, tmp_path):
     monkeypatch.setattr(
         workspace_provisioning,
         "provision_and_verify",
-        lambda spec: _FakeEvidence(workspace_path=spec.workspace_path),
+        lambda spec: _FakeEvidence(
+            workspace_path=spec.workspace_path,
+            expected_branch=spec.expected_branch or "",
+            remote_url=str(tmp_path),
+            start_sha="0" * 40,
+            base_sha="0" * 40,
+            remote_task_sha=None,
+            workspace_device=1,
+            workspace_inode=1,
+            provision_outcome="cloned",
+        ),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "trusted_publish_clone",
+        lambda workspace, **kwargs: nullcontext(Path(workspace)),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        lambda workspace, **kwargs: "0" * 40,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda workspace, **kwargs: kwargs["previous_start_sha"],
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "task_workspace_is_unchanged", lambda *a, **kw: True
     )
     monkeypatch.setattr(
         workspace_provisioning, "remove_workspace", lambda *a, **kw: "removed"
@@ -113,9 +155,7 @@ def lease_tool(monkeypatch, tmp_path):
     def install(stdout: str = "[]", exit_code: int = 0):
         binary = tmp_path / "fake-voyn-lease"
         binary.write_text(
-            "#!/bin/sh\n"
-            f"cat <<'JSON'\n{stdout}\nJSON\n"
-            f"exit {exit_code}\n"
+            f"#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\nexit {exit_code}\n"
         )
         binary.chmod(0o755)
         monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
@@ -133,9 +173,7 @@ def _lease_row(worktree, **overrides) -> str:
         "session_id": "sess-1",
         "worktree": str(worktree),
         "process_pid": 4242,
-        "expires_at": (
-            datetime.now(timezone.utc) + timedelta(minutes=5)
-        ).isoformat(),
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
     }
     row.update(overrides)
     return json.dumps([row])
@@ -221,7 +259,46 @@ def test_runner_never_started_is_retryable(handler, monkeypatch) -> None:
     assert not outcome.ok and outcome.retryable
 
 
-def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch) -> None:
+def test_principal_isolation_failure_is_retryable_not_a_task_result(
+    handler, monkeypatch, tmp_path
+) -> None:
+    run_agent, _ = handler
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "remove_workspace",
+        lambda *args, **kwargs: removed.append(args),
+    )
+
+    def launcher_refused(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr="AICC_AGENT_LAUNCH_INFRA_FAILURE: launcher socket unavailable",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", launcher_refused)
+    outcome = run_agent(
+        _payload(
+            task_type="implementation",
+            repository_path=str(tmp_path / "repo"),
+        ),
+        _event(),
+        1,
+    )
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "agent principal isolation" in outcome.reason
+    assert not removed, "ambiguous launcher failure must preserve task-local work"
+
+
+def test_api_error_in_cli_output_is_retryable_not_a_success(
+    handler, monkeypatch
+) -> None:
     """Incident 2026-08-21 16:09 UTC (control-01/worker-01): a shared
     Claude-CLI account hit its session/rate limit mid-fleet. The process
     still started and exited non-zero *with* stdout, so the pre-existing
@@ -275,7 +352,168 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(handler, monkeypatch
     assert "session limit" in outcome.reason
 
 
-def test_genuine_task_failure_with_error_flavoured_text_still_ok(handler, monkeypatch) -> None:
+def test_bwrap_loopback_result_is_retryable_infrastructure_failure(
+    handler, monkeypatch
+):
+    run_agent, _runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "codex"
+    payload["cascade"][0]["task_type"] = "implementation"
+    monkeypatch.setattr(
+        agent_runner, "_codex_workspace_write_preflight_result", (True, "")
+    )
+
+    seen = []
+
+    def bwrap_then_fallback(**kwargs):
+        seen.append(kwargs["executor"])
+        if kwargs["executor"] == "codex":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=0,
+                stdout="",
+                stderr="bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+                duration_seconds=0.01,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "fallback done"}',
+            stderr="",
+            duration_seconds=0.01,
+            started_at="2026-08-23T12:00:02+00:00",
+            completed_at="2026-08-23T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", bwrap_then_fallback)
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert seen == ["codex", payload["cascade"][1]["executor"]]
+    assert agent_runner.codex_workspace_write_preflight()[0] is False
+
+
+def test_codex_workspace_preflight_skips_to_fallback_without_spending_attempt(
+    handler, monkeypatch
+):
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "codex"
+    payload["cascade"][0]["task_type"] = "implementation"
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap")
+    )
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert runs[0]["executor"] == payload["cascade"][1]["executor"]
+
+
+def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
+    run_agent, runs = handler
+    checked = []
+
+    def preflight(binary=None):
+        checked.append(binary)
+        return False, "not logged in"
+
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", preflight)
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    # The unavailable copilot no longer dead-ends the attempt: the cascade
+    # falls through to the remaining links (review finding on b311666), so
+    # the copilot binary is probed FIRST and the terminal reason belongs to
+    # the last exhausted candidate.
+    # Pin the WHOLE probe sequence, not just the first link: copilot is tried
+    # first, then the one remaining claude candidate (default binary), and the
+    # cascade neither stops early nor probes anything extra.
+    assert checked == [agent_runner.COPILOT_BINARY, None]
+    # The terminal reason must belong to the LAST exhausted candidate (claude),
+    # not the copilot link that merely started the cascade.
+    assert "claude cli unavailable" in outcome.reason
+    assert runs == []
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "AI credit usage limit reached",
+        "not logged in; authentication required",
+        "service unavailable",
+        "network error: connection refused",
+    ],
+)
+def test_copilot_provider_failure_retries_into_the_next_cascade_link(
+    handler, monkeypatch, diagnostic
+):
+    run_agent, runs = handler
+
+    def failed_copilot(**kwargs):
+        if kwargs["executor"] == "copilot":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=4,
+                stdout="",
+                stderr=diagnostic,
+                duration_seconds=0.1,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:01+00:00",
+            completed_at="2026-08-23T12:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "copilot", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    first = run_agent(payload, _event(), 1)
+    assert not first.ok and first.retryable
+    assert "executor infrastructure failure" in first.reason
+    second = run_agent(payload, _event(), 2)
+    assert second.ok and runs[-1]["executor"] == "claude"
+
+
+def test_unknown_copilot_failure_is_fail_closed_for_read_only_review(
+    handler, monkeypatch
+):
+    run_agent, _runs = handler
+
+    def failed_copilot(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=9,
+            stdout="",
+            stderr="unexpected provider-side failure",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "unexpected provider-side failure" in outcome.reason
+
+
+def test_genuine_task_failure_with_error_flavoured_text_still_ok(
+    handler, monkeypatch
+) -> None:
     """Regression guard for the fix above: a run that genuinely executed and
     the agent's own report happens to mention "error"/"rate limit" in free
     text -- but the CLI's structured payload carries neither `is_error` nor
@@ -544,16 +782,42 @@ def test_cascade_clamps_at_the_tail(handler) -> None:
 def test_unavailable_executor_is_a_routing_signal_not_a_task_error(handler) -> None:
     """BO-S2a decision: a link naming an executor this host cannot run is a
     RETRYABLE refusal — the attempt returns to the pool and the next delivery
-    selects the next link. Nothing may have executed."""
+    selects the next link. Nothing may have executed.
+
+    Uses a deliberately never-real name: `codex` used to stand in for
+    "unavailable" here, but it became a genuinely wired executor
+    (VOYN-W0-AICC-EXECUTOR-CODEX), so reusing it would silently invert what
+    this test asserts -- the very kind of stale-example rot that makes a
+    green test meaningless."""
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "no-such-executor"
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert "executor_unavailable" in outcome.reason
+    assert "no-such-executor" in outcome.reason
+    assert runs == [], "an unavailable executor must not execute anything"
+    # The same payload on attempt 2 runs the second (available) link.
+    assert run_agent(payload, _event(), 2).ok
+
+
+def test_a_wired_executor_is_dispatched_under_its_own_name(handler) -> None:
+    """VOYN-W0-AICC-EXECUTOR-CODEX: an executor present in
+    `agent_runner.COMMAND_BUILDERS` must actually RUN (and be recorded as
+    itself in the result), not be refused as unavailable. Without this the
+    escalation link is inert and every task still funnels into the one
+    account whose quota exhaustion this route exists to escape."""
     run_agent, runs = handler
     payload = _cascade_payload()
     payload["cascade"][0]["executor"] = "codex"
     outcome = run_agent(payload, _event(), 1)
-    assert not outcome.ok and outcome.retryable is True
-    assert "executor_unavailable" in outcome.reason and "codex" in outcome.reason
-    assert runs == [], "an unavailable executor must not execute anything"
-    # The same payload on attempt 2 runs the second (available) link.
-    assert run_agent(payload, _event(), 2).ok
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1, "the wired executor must actually execute"
+    assert runs[0]["executor"] == "codex", (
+        "the executor must be passed through to the runner, not silently "
+        "defaulted to claude"
+    )
+    assert outcome.result["executor"] == "codex"
 
 
 def test_malformed_cascade_is_a_non_retryable_payload_defect(handler) -> None:
@@ -709,7 +973,7 @@ def test_expired_other_host_and_other_path_leases_do_not_block(
 ) -> None:
     """Three ways a row can name this path without holding it."""
     run_agent, runs = handler
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    stale = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
     worktree = isolated_path(tmp_path)
     for row in (
         _lease_row(worktree, expires_at=stale),
@@ -765,6 +1029,15 @@ def _own_start(pid: int) -> str:
     return stat[stat.rindex(")") + 2 :].split()[19]
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="reads /proc/<pid>/stat directly, the same seamless-fallback shape "
+    "worktree_lease._process_start itself uses in production (fails soft to "
+    "None off Linux, never crashes there) -- but this test's own fixture "
+    "helper, _own_start, has no such fallback, so it must skip rather than "
+    "fail where /proc does not exist. Linux CI (the real deployment target) "
+    "keeps full coverage; see VOYN-W0-AICC-LEASE-TEST-PROC-MACOS-SKIP.",
+)
 def test_a_lease_held_by_our_own_supervisor_does_not_block(
     handler, lease_tool, tmp_path
 ) -> None:
@@ -777,7 +1050,11 @@ def test_a_lease_held_by_our_own_supervisor_does_not_block(
     """
     run_agent, runs = handler
     pid = os.getpid()
-    lease_tool(_lease_row(isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)))
+    lease_tool(
+        _lease_row(
+            isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)
+        )
+    )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert outcome.ok, outcome.reason
     assert len(runs) == 1, "the dispatch was refused by its own supervisor's lease"
@@ -794,7 +1071,11 @@ def test_a_recycled_pid_matching_an_ancestor_still_blocks(
     """
     run_agent, runs = handler
     lease_tool(
-        _lease_row(isolated_path(tmp_path), process_pid=os.getpid(), process_start="not-our-start")
+        _lease_row(
+            isolated_path(tmp_path),
+            process_pid=os.getpid(),
+            process_start="not-our-start",
+        )
     )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
@@ -806,10 +1087,262 @@ def test_a_lease_with_no_identity_token_still_blocks(
 ) -> None:
     """An unverifiable match is not a match: the row names our pid, but with
     no ``process_start`` on either side to confirm it, the gate fails closed."""
-    run_agent, runs = handler
+    run_agent, _runs = handler
     row = json.loads(_lease_row(isolated_path(tmp_path), process_pid=os.getpid()))
     row[0].pop("process_start", None)
     lease_tool(json.dumps(row))
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
-    assert runs == []
+
+
+# -- full-lifecycle writer lease (VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE) ----
+
+
+def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The writer lease must be acquired (and the pre-push hook's identity
+    provisioned) BEFORE the workspace is provisioned and the agent runs --
+    not only around `publish_run`'s own push -- and released only once the
+    whole dispatch is done. `blocking_lease`'s own `list` preflight must run
+    first (it is the read-only check for a lease held by someone ELSE);
+    `acquire`/`install-hooks` (this task's lease, held by us) follow it."""
+    run_agent, runs = handler
+    calls = tmp_path / "lease-calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    # `blocking_lease` calls plain `[tool, "list"]` (no `--repo`/identity
+    # flags -- it is a read-only preflight over every lease, not one this
+    # process's own identity); the writer lease's `acquire`/`install-hooks`/
+    # `release` go through `lease_client.lease_argv`'s
+    # `--repo <path> <verb> --repository ... --owner ...` shape instead. One
+    # script answers both: it always emits `[]` (the only thing `list`
+    # reads) and exits 0.
+    binary.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho '[]'\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+
+    lines = calls.read_text().splitlines()
+    assert lines and lines[0] == "list", "blocking_lease's preflight runs first"
+
+    def _first(verb: str) -> int:
+        # `--repo <path> <verb> ...` -- the verb is the third token.
+        return next(i for i, line in enumerate(lines) if line.split()[2:3] == [verb])
+
+    def _last(verb: str) -> int:
+        return max(i for i, line in enumerate(lines) if line.split()[2:3] == [verb])
+
+    assert _first("acquire") >= 1
+    assert _first("release") >= 1
+    assert 0 < _first("acquire") < _first("release"), (
+        "the writer lease is acquired before provisioning/running the agent "
+        "and released only once the dispatch is fully done"
+    )
+    # VOYN-W0-AICC-LEASE-SCOPE-PER-TASK: the hook identity file lives in the
+    # clone's COMMON git dir, so a task-scoped lease must not write it --
+    # only `publish_run` does, immediately before its push. See
+    # `test_hold_never_touches_the_clone_wide_hook_identity_file`.
+    assert not any(line.split()[2:3] == ["install-hooks"] for line in lines), (
+        "the full-lifecycle lease must not provision the clone-wide hook identity file"
+    )
+
+
+def test_the_full_lifecycle_lease_is_scoped_to_the_task_not_the_repository(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK. Measured 2026-08-23: 96 of 115
+    returns-to-pool in three hours were `VOYN_LEASE_REFUSED active` -- tasks
+    refusing each other because the lease keyed on the repository, even
+    though #346 gave each task its own worktree and they share no mutable
+    state during the agent run. The scope must carry the task id."""
+    run_agent, _runs = handler
+    calls = tmp_path / "lease-calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho '[]'\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED"),
+        _event(),
+    )
+    assert outcome.ok, outcome.reason
+
+    scopes = {
+        line.split("--repository ", 1)[1].split()[0]
+        for line in calls.read_text().splitlines()
+        if "--repository " in line
+    }
+    assert scopes, "no identity-bearing lease call was made"
+    assert all("VOYN-W0-SCOPED" in scope for scope in scopes), (
+        f"the lease scope must name the task, got {scopes}"
+    )
+
+
+def test_publish_does_not_release_a_lease_the_caller_still_holds(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Independent-review finding on VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE:
+    the first revision let `publish_run` release the writer lease
+    unconditionally in its own `finally`, dropping it mid-dispatch -- before
+    this function's own post-publish work and `remove_workspace`'s worktree
+    cleanup, both still inside the caller's `stack`. When the full-lifecycle
+    lease was actually acquired (`VOYN_LEASE_DSN` configured), `publish_run`
+    must be called with `release_lease=False` so the one real release stays
+    with the caller's own `stack.close()`."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo \'[]\'; fi\nexit 0\n')
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    # No `backlog_task_id`, so `_task_lease_scope` falls back to the bare
+    # project and the two leases ARE the same row -- the case where the
+    # caller's own release is the only correct one.
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert captured and captured[0].release_lease is False
+
+
+def test_publish_releases_its_own_lease_when_the_scopes_differ(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK, caught in independent review before
+    merge: once the full-lifecycle lease became task-scoped
+    (`<project>:<task>`) while `publish_run` stayed repository-scoped
+    (`<project>`), they are two DIFFERENT lease rows. `release_lease=False`
+    -- correct while both keys were the repository -- would then leave
+    `<project>` held by nobody's `finally`: `writer_lease._release` only ever
+    releases its own `<project>:<task>`. The row would leak on the first
+    mutating task and refuse every later push with `VOYN_LEASE_REFUSED
+    active` for the worker process's whole lifetime, un-reapable because
+    `--auto-takeover` and `ops/lease_reap.sh` both require a DEAD recorded
+    holder and this one is alive.
+
+    So the flag must follow whether the two scopes name the same row, not
+    whether an outer lease merely exists."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo \'[]\'; fi\nexit 0\n')
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED"),
+        _event(),
+        1,
+    )
+    assert outcome.ok, outcome.reason
+    assert captured, "publish_run was never called"
+    assert captured[0].release_lease is True, (
+        "publish holds a different lease row than the caller, so it must "
+        "release its own or the repository-scoped row leaks"
+    )
+    # And the two really are different rows -- otherwise this test would pass
+    # for the wrong reason.
+    assert captured[0].repository != handlers_module._task_lease_scope(
+        parse_agent_run(
+            _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED")
+        )
+    )
+
+
+def test_publish_releases_its_own_lease_when_no_full_lifecycle_lease_is_held(
+    handler, monkeypatch
+) -> None:
+    """Symmetric case: no `VOYN_LEASE_DSN` means no full-lifecycle lease was
+    ever acquired (the `handler` fixture already unsets it), so
+    `publish_run` must keep its own default `release_lease=True` -- nothing
+    else will ever release that lease if it doesn't."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert captured and captured[0].release_lease is True
+
+
+def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Another writer already holding the repository-level lease (or the
+    authority refusing/unreachable for the acquire specifically, as opposed
+    to `list`) must refuse the dispatch retryably before any workspace is
+    touched or the agent is launched -- the same fail-closed shape
+    `blocking_lease` already has for its own preflight."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        # `blocking_lease` calls plain `[tool, "list"]` ($1=list, no
+        # `--repo`); the writer lease's calls go through `--repo <path>
+        # <verb> ...` ($3=verb). Distinguish on whichever positional
+        # argument actually carries the verb for that call shape.
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'lease already held by another writer' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "writer lease unavailable" in outcome.reason
+    assert runs == [], "the agent must not run without the writer lease held"
+
+
+def test_no_configured_authority_leaves_the_writer_lease_inert_too(
+    handler, tmp_path
+) -> None:
+    """Symmetric with `test_no_configured_authority_leaves_the_gate_inert`
+    for `blocking_lease`: a host with no `VOYN_LEASE_DSN` has no lease
+    authority to acquire a lease from either, so the full-lifecycle lease
+    must not block it (it already inherits the ambient absence of
+    `VOYN_LEASE_TOOL`/`VOYN_LEASE_DSN` from the `handler` fixture)."""
+    run_agent, runs = handler
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
