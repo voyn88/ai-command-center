@@ -1059,7 +1059,7 @@ def test_chunk_reject_overridden_by_verification_accept_with_audit(rig, monkeypa
     pr_url = "https://github.com/x/y/pull/21"
     _ready(store, app_factory, "VOYN-W0-ADJ-A", pr_url)
     SNAPSHOTS[pr_url] = _snapshot(head)
-    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- tree contradicts the claim.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- tree contradicts the claim.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
     fake_gh = _fake_pr_view(head)
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     monkeypatch.setattr(
@@ -1090,7 +1090,7 @@ def test_auto_accept_is_conditioned_on_the_audit_comment(rig, monkeypatch):  # n
     pr_url = "https://github.com/x/y/pull/24"
     _ready(store, app_factory, "VOYN-W0-ADJ-E", pr_url)
     SNAPSHOTS[pr_url] = _snapshot(head)
-    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
 
     def failing_gh(argv, repo):
         if argv[:2] == ["pr", "view"]:
@@ -1249,7 +1249,7 @@ def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_
     claimed = worker.claim("execution", visibility_seconds=60)
     assert worker.complete(claimed, {
         "status": "completed",
-        "result_text": f"FINDING 1: ARTIFACT.\nVERDICT: ACCEPT\nHEAD_SHA: {head}",
+        "result_text": f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}",
     })
     second = publish_review_verdicts(app_factory, "/tmp", enqueue=lambda *a: None)
     assert posted == [("ACCEPT", head)]
@@ -1291,12 +1291,13 @@ def test_malformed_verifier_output_never_auto_accepts(rig, monkeypatch):  # noqa
     assert not posted
 
 
-def test_a_classification_free_accept_never_auto_accepts(rig, monkeypatch):  # noqa: F811
-    """Independent review of this very change (chunk 0 at 32bf893): a
-    degenerate verifier transcript -- bare VERDICT/HEAD_SHA trailer lines
-    with no per-finding classification work -- must be treated as malformed
-    output, not an override. Fail closed to remediation on the original
-    findings."""
+def test_a_malformed_accept_never_auto_accepts(rig, monkeypatch):  # noqa: F811
+    """Independent review of this change (32bf893, then 6eb71aa): an ACCEPT
+    that violates the verifier's machine-parsed output contract -- bare
+    trailer, a classification token merely QUOTED mid-line from the
+    untrusted findings, a CONFIRMED_BLOCKING disposition contradicting the
+    ACCEPT trailer, or a missing SECURITY_CLAIMS attestation -- is malformed
+    output, not an override. Fail closed to remediation."""
     app_factory, store, _ = rig
     head = "5" * 40
     pr_url = "https://github.com/x/y/pull/29"
@@ -1310,6 +1311,25 @@ def test_a_classification_free_accept_never_auto_accepts(rig, monkeypatch):  # n
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-ADJ-J", "VOYN-W0-ADJ-J-REM") in report.remediated
     assert not posted
+
+    # The full contract, unit-level: every malformed shape is refused, the
+    # exact well-formed shape passes.
+    ok = review_merge._verification_accept_is_well_formed
+    assert not ok("VERDICT: ACCEPT")  # bare trailer
+    assert not ok("the findings mention ARTIFACT and UNVERIFIABLE tokens")  # quoted mid-line
+    assert not ok("FINDING 1: ARTIFACT -- cited.")  # no security attestation
+    assert not ok(  # disposition contradicts the ACCEPT trailer
+        "FINDING 1: CONFIRMED_BLOCKING -- reproduced.\nSECURITY_CLAIMS: NONE"
+    )
+    assert not ok("SECURITY_CLAIMS: NONE")  # attestation with no dispositions
+    assert not ok(  # attestation value outside the vocabulary
+        "FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: UNVERIFIABLE"
+    )
+    assert ok(
+        "FINDING 1: ARTIFACT -- src/x.py:10 already validates.\n"
+        "FINDING 2: CONFIRMED_MINOR -- naming only.\n"
+        "SECURITY_CLAIMS: DISPROVEN"
+    )
 
 
 def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
