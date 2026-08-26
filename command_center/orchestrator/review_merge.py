@@ -1712,7 +1712,12 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     ):
         return None, "merged_without_acceptance_evidence"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
-    if any(not _check_is_green(check) for check in rollup):
+    # An EMPTY rollup is inconclusive, not green (review of eabe0d3: `any()`
+    # over an empty list is False, which silently waved through a merged PR
+    # whose check data was unavailable or omitted) -- the repositories this
+    # loop merges always carry required checks, so "no checks recorded" is
+    # missing evidence and fails closed like everything else here.
+    if not rollup or any(not _check_is_green(check) for check in rollup):
         return None, "merged_without_acceptance_evidence"
     return oid, ""
 

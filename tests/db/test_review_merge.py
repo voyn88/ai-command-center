@@ -1831,3 +1831,31 @@ def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeyp
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MX",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):  # noqa: F811, E501
+    """Review of eabe0d3: `any()` over an empty rollup is False -- a merged
+    PR whose check data is unavailable must fail closed as missing
+    acceptance evidence, never be blessed DONE."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "d3" * 20, "e4" * 20
+    pr_url = "https://github.com/x/y/pull/34"
+    _ready(store, app_factory, "VOYN-W0-MY", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MY", "merged_without_acceptance_evidence") in report.skipped
+    assert not report.merged
