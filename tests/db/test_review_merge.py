@@ -250,7 +250,12 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
         import subprocess
         if argv[:2] == ["pr", "view"]:
             if merged_state["merged"]:
-                body = json.dumps({"state": "MERGED", "mergeCommit": {"oid": merge_oid}})
+                body = json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                    "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
@@ -317,7 +322,16 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
         import subprocess
         if argv[:2] == ["pr", "view"]:
             if merged_state["merged"]:
-                body = json.dumps({"state": "MERGED", "mergeCommit": {"oid": merge_oid}})
+                body = json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                    "headRefOid": head,
+                    "author": {"login": "dimastov-lab"},
+                    "reviews": [{
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    }],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
@@ -1583,7 +1597,12 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
     def fake_gh(argv, repo):
         if argv[:2] == ["pr", "view"]:
             if queue_state["merged"]:
-                body = json.dumps({"state": "MERGED", "mergeCommit": {"oid": merge_oid}})
+                body = json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                    "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
@@ -1782,3 +1801,33 @@ def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeyp
     report = reconcile_merge_evidence(app_factory, "/tmp")
     assert ("VOYN-W0-RC4", "default_branch_lookup_failed") in report.skipped
     assert report.suspect == []
+
+
+def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeypatch):  # noqa: F811, E501
+    """Verification of 53c7b52 (CONFIRMED): a PR merged around the queue --
+    admin bypass, hand merge -- with no acceptance marker on its merged head
+    must not be silently blessed DONE. It skips loudly for the operator."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "a1" * 20, "b2" * 20
+    pr_url = "https://github.com/x/y/pull/33"
+    _ready(store, app_factory, "VOYN-W0-MX", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                "headRefOid": head, "reviews": [],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MX", "merged_without_acceptance_evidence") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MX",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"

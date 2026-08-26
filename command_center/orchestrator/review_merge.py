@@ -1670,7 +1670,7 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     return str(data.get("mergeStateStatus") or "")
 
 
-def _merged_target_sha(repo_path: str, pr_url: str) -> str | None:
+def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     """The PR's actual merge commit on the target branch, or None until
     GitHub reports the PR MERGED.
 
@@ -1680,18 +1680,41 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> str | None:
     was the PR HEAD, which never appears on the target branch after a squash
     merge at all. DONE is a claim about the target branch, so it waits for
     state MERGED and records ``mergeCommit.oid`` -- the commit that IS on
-    the target branch (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY)."""
-    view = _gh(["pr", "view", pr_url, "--json", "state,mergeCommit"], repo_path)
+    the target branch (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY).
+
+    Completion additionally re-validates WHAT merged (verification of
+    53c7b52, CONFIRMED): the merged head must carry the independent ACCEPT
+    marker (same author-independence rule as the live path) and its final
+    check rollup must be green -- an externally merged PR (an admin bypass,
+    a hand merge around the queue) must never be silently blessed DONE; it
+    skips loudly (``merged_without_acceptance_evidence``) for the operator
+    instead. Returns ``(merge_sha, "")`` or ``(None, reason)``."""
+    view = _gh(
+        ["pr", "view", pr_url, "--json",
+         "state,mergeCommit,reviews,headRefOid,author,statusCheckRollup"],
+        repo_path,
+    )
     if view.returncode != 0:
-        return None
+        return None, "pr_view_failed"
     try:
         data = json.loads(view.stdout or "{}")
     except json.JSONDecodeError:
-        return None
+        return None, "pr_view_failed"
     if not isinstance(data, dict) or data.get("state") != "MERGED":
-        return None
+        return None, "not_merged"
     oid = str((data.get("mergeCommit") or {}).get("oid") or "")
-    return oid if re.fullmatch(r"[0-9a-f]{40}", oid) else None
+    if not re.fullmatch(r"[0-9a-f]{40}", oid):
+        return None, "merge_commit_missing"
+    head = data.get("headRefOid", "")
+    author_login = (data.get("author") or {}).get("login")
+    if not _accept_marker_on_latest_review(
+        data.get("reviews", []), head, author_login
+    ):
+        return None, "merged_without_acceptance_evidence"
+    rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
+    if any(not _check_is_green(check) for check in rollup):
+        return None, "merged_without_acceptance_evidence"
+    return oid, ""
 
 
 def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
@@ -1771,8 +1794,13 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         # still READY_TO_REVIEW completes here idempotently -- evidence +
         # DONE with the true target-branch sha -- BEFORE the readiness check,
         # which reports a merged PR as not-ready (`pr_merged`) and would
-        # otherwise strand the task in READY_TO_REVIEW forever.
-        merge_sha = _merged_target_sha(repo_path, pr_url)
+        # otherwise strand the task in READY_TO_REVIEW forever. A merged PR
+        # WITHOUT acceptance evidence (external/bypass merge) is an incident
+        # for the operator, never a silent DONE.
+        merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
+        if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
+            report.skipped.append((task_id, merge_reason))
+            continue
         if merge_sha is None:
             ready, detail = _pr_is_mergeable(repo_path, pr_url)
             if not ready:
@@ -1815,14 +1843,17 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             # On a merge-queue-protected repo a zero exit only ENQUEUED the
             # PR; on a plain repo it merged synchronously. Either way the
             # target branch, not the exit code, is the authority: DONE only
-            # once the PR reports MERGED with its merge commit.
-            merge_sha = _merged_target_sha(repo_path, pr_url)
+            # once the PR reports MERGED with its merge commit AND the
+            # acceptance evidence re-validates on the merged head.
+            merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
             if merge_sha is None:
-                report.skipped.append(
-                    (task_id, "merge_queued_awaiting_target")
-                    if merged.returncode == 0
-                    else (task_id, f"merge_failed: {merged.stderr.strip()[:100]}")
-                )
+                if merge_reason == "merged_without_acceptance_evidence":
+                    reason = merge_reason
+                elif merged.returncode == 0:
+                    reason = "merge_queued_awaiting_target"
+                else:
+                    reason = f"merge_failed: {merged.stderr.strip()[:100]}"
+                report.skipped.append((task_id, reason))
                 continue
         head = merge_sha  # the TARGET-BRANCH merge commit, never the PR head
         # Evidence and the DONE transition are one act: the sha row and the
