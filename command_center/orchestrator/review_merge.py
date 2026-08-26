@@ -1648,9 +1648,83 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     return str(data.get("mergeStateStatus") or "")
 
 
+def _merged_target_sha(repo_path: str, pr_url: str) -> str | None:
+    """The PR's actual merge commit on the target branch, or None until
+    GitHub reports the PR MERGED.
+
+    `gh pr merge --squash` on a merge-queue-protected repository only
+    ENQUEUES the PR (exit 0) -- live 2026-08-26, PR #399: the task went DONE
+    while the PR was still OPEN at queue position 1, and the recorded sha
+    was the PR HEAD, which never appears on the target branch after a squash
+    merge at all. DONE is a claim about the target branch, so it waits for
+    state MERGED and records ``mergeCommit.oid`` -- the commit that IS on
+    the target branch (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY)."""
+    view = _gh(["pr", "view", pr_url, "--json", "state,mergeCommit"], repo_path)
+    if view.returncode != 0:
+        return None
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict) or data.get("state") != "MERGED":
+        return None
+    oid = str((data.get("mergeCommit") or {}).get("oid") or "")
+    return oid if re.fullmatch(r"[0-9a-f]{40}", oid) else None
+
+
+def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
+    """Bounded flake retry (VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN): rerun the
+    FAILED jobs of completed-and-failed workflow runs on the PR's current
+    head, at most once per run -- GitHub's own run ``attempt`` counter is
+    the bound (a run already at attempt >= 2 is never touched again), so a
+    genuinely red change costs exactly one extra bounded rerun and can
+    never loop. Live 2026-08-26: both P1 PRs sat BLOCKED on one known-flaky
+    serial test until a human reran the shard -- the merge tick can do that
+    itself. Best-effort: any lookup failure returns '' and the ordinary
+    skip reason stands."""
+    view = _gh(["pr", "view", pr_url, "--json", "headRefName,headRefOid"], repo_path)
+    if view.returncode != 0:
+        return ""
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return ""
+    branch, head = data.get("headRefName"), data.get("headRefOid")
+    if not branch or not head:
+        return ""
+    listing = _gh(
+        ["run", "list", "--branch", str(branch), "--limit", "20",
+         "--json", "databaseId,headSha,status,conclusion,attempt"],
+        repo_path,
+    )
+    if listing.returncode != 0:
+        return ""
+    try:
+        runs = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError:
+        return ""
+    dispatched = 0
+    for run in runs if isinstance(runs, list) else []:
+        if (
+            isinstance(run, dict)
+            and run.get("headSha") == head
+            and run.get("status") == "completed"
+            and run.get("conclusion") == "failure"
+            and run.get("attempt") == 1
+        ):
+            rerun = _gh(
+                ["run", "rerun", str(run.get("databaseId")), "--failed"], repo_path
+            )
+            if rerun.returncode == 0:
+                dispatched += 1
+    return f"flaky_rerun_dispatched:{dispatched}" if dispatched else ""
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
-    green checks, then close it DONE with the merged sha as evidence."""
+    green checks, then close it DONE -- with the TARGET-BRANCH merge commit
+    as evidence, only once GitHub reports the PR actually MERGED (see
+    `_merged_target_sha`; a queued merge is a wait, not a completion)."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     tasks = _rows(
@@ -1671,38 +1745,64 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         # quota on a PR that may never be accepted and starve the accepted-
         # but-behind PRs that are one base-merge from landing.
         # (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)
-        ready, detail = _pr_is_mergeable(repo_path, pr_url)
-        if not ready:
-            report.skipped.append((task_id, detail))
-            continue
-        # Merge-ready. If it has merely fallen BEHIND main since it was accepted,
-        # bring its branch current with a GitHub-side base merge (no local
-        # writer lease) so it can land; the new head re-runs CI and review
-        # head-keyed. The cap counts ATTEMPTS -- incremented before the call --
-        # so repeated failures cannot exceed the per-tick mutation budget. DIRTY
-        # here would be a real conflict, left for a rebase.
-        state = _merge_state(repo_path, pr_url)
-        if state == "DIRTY":
-            report.skipped.append((task_id, "branch_dirty_needs_rebase"))
-            continue
-        if state == "BEHIND":
-            if branch_updates >= cfg.max_branch_updates_per_tick:
-                report.skipped.append((task_id, "branch_behind_update_capped"))
+        # A PR the merge queue (or anyone) already landed while the task is
+        # still READY_TO_REVIEW completes here idempotently -- evidence +
+        # DONE with the true target-branch sha -- BEFORE the readiness check,
+        # which reports a merged PR as not-ready (`pr_merged`) and would
+        # otherwise strand the task in READY_TO_REVIEW forever.
+        merge_sha = _merged_target_sha(repo_path, pr_url)
+        if merge_sha is None:
+            ready, detail = _pr_is_mergeable(repo_path, pr_url)
+            if not ready:
+                if detail.startswith("checks_not_green"):
+                    # A failed required check on an ACCEPTED head is the flake
+                    # window: retry the failed jobs once (attempt-bounded)
+                    # instead of waiting for a human (VOYN-W0-AICC-CI-FLAKE-
+                    # AUTO-RERUN). Only reached with the marker standing, so
+                    # unaccepted PRs never spend reruns.
+                    rerun = _rerun_failed_ci_once(repo_path, pr_url)
+                    if rerun:
+                        detail = f"{detail}; {rerun}"
+                report.skipped.append((task_id, detail))
                 continue
-            branch_updates += 1
-            updated = _gh(["pr", "update-branch", pr_url], repo_path)
-            if updated.returncode == 0:
-                report.skipped.append((task_id, "branch_updated_behind_main"))
-            else:
+            # Merge-ready. If it has merely fallen BEHIND main since it was
+            # accepted, bring its branch current with a GitHub-side base merge
+            # (no local writer lease) so it can land; the new head re-runs CI
+            # and review head-keyed. The cap counts ATTEMPTS -- incremented
+            # before the call -- so repeated failures cannot exceed the
+            # per-tick mutation budget. DIRTY here would be a real conflict,
+            # left for a rebase.
+            state = _merge_state(repo_path, pr_url)
+            if state == "DIRTY":
+                report.skipped.append((task_id, "branch_dirty_needs_rebase"))
+                continue
+            if state == "BEHIND":
+                if branch_updates >= cfg.max_branch_updates_per_tick:
+                    report.skipped.append((task_id, "branch_behind_update_capped"))
+                    continue
+                branch_updates += 1
+                updated = _gh(["pr", "update-branch", pr_url], repo_path)
+                if updated.returncode == 0:
+                    report.skipped.append((task_id, "branch_updated_behind_main"))
+                else:
+                    report.skipped.append(
+                        (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
+                    )
+                continue
+            merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
+            # On a merge-queue-protected repo a zero exit only ENQUEUED the
+            # PR; on a plain repo it merged synchronously. Either way the
+            # target branch, not the exit code, is the authority: DONE only
+            # once the PR reports MERGED with its merge commit.
+            merge_sha = _merged_target_sha(repo_path, pr_url)
+            if merge_sha is None:
                 report.skipped.append(
-                    (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
+                    (task_id, "merge_queued_awaiting_target")
+                    if merged.returncode == 0
+                    else (task_id, f"merge_failed: {merged.stderr.strip()[:100]}")
                 )
-            continue
-        merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
-        if merged.returncode != 0:
-            report.skipped.append((task_id, f"merge_failed: {merged.stderr.strip()[:100]}"))
-            continue
-        head = detail  # _pr_is_mergeable returned the head sha
+                continue
+        head = merge_sha  # the TARGET-BRANCH merge commit, never the PR head
         # Evidence and the DONE transition are one act: the sha row and the
         # status move commit together or not at all (an explicit transaction,
         # since the app factory is autocommit). backlog_transition's third

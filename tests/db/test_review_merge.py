@@ -227,25 +227,36 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
     _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
     head = "a" * 40
 
+    merge_oid = "b" * 40
+    merged_state = {"merged": False}
+
     def fake_gh(argv, repo):
         import subprocess
         if argv[:2] == ["pr", "view"]:
-            body = json.dumps({
-                "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-            })
+            if merged_state["merged"]:
+                body = json.dumps({"state": "MERGED", "mergeCommit": {"oid": merge_oid}})
+            else:
+                body = json.dumps({
+                    "state": "OPEN", "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
+            merged_state["merged"] = True
             return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M1", head) in report.merged
+    # Evidence is the TARGET-BRANCH merge commit, never the PR head
+    # (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY).
+    assert ("VOYN-W0-M1", merge_oid) in report.merged
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1",))
         assert cur.fetchone()[0] == "DONE"
+        cur.execute("SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='sha'", ("VOYN-W0-M1",))
+        assert cur.fetchone()[0] == merge_oid
 
 
 def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):  # noqa: F811
@@ -283,26 +294,33 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
     _ready(store, app_factory, "VOYN-W0-M1C", "https://github.com/x/y/pull/22")
     head = "1" * 40
 
+    merge_oid = "2" * 40
+    merged_state = {"merged": False}
+
     def fake_gh(argv, repo):
         import subprocess
         if argv[:2] == ["pr", "view"]:
-            body = json.dumps({
-                "state": "OPEN", "headRefOid": head,
-                "author": {"login": "dimastov-lab"},
-                "reviews": [{
-                    "body": f"ACCEPTANCE: ACCEPT {head}",
-                    "author": {"login": "voyn88-acceptance-gate[bot]"},
-                }],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-            })
+            if merged_state["merged"]:
+                body = json.dumps({"state": "MERGED", "mergeCommit": {"oid": merge_oid}})
+            else:
+                body = json.dumps({
+                    "state": "OPEN", "headRefOid": head,
+                    "author": {"login": "dimastov-lab"},
+                    "reviews": [{
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    }],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
+            merged_state["merged"] = True
             return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M1C", head) in report.merged
+    assert ("VOYN-W0-M1C", merge_oid) in report.merged
 
 
 def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):  # noqa: F811
@@ -1525,3 +1543,139 @@ def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch
     review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/1", sha)
     assert reran == ["111"]  # only the failing pull_request run for THIS head
     assert branches and "--branch" in branches[0] and "feature/x" in branches[0]
+
+
+# --- VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY + CI-FLAKE-AUTO-RERUN -----
+
+
+def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
+    """Live 2026-08-26 (PR #399): on a merge-queue-protected repo,
+    `gh pr merge` exits 0 having only ENQUEUED the PR. The task must stay
+    READY_TO_REVIEW (`merge_queued_awaiting_target`) until GitHub reports
+    MERGED -- and then complete idempotently on a later tick with the true
+    merge commit, even though `_pr_is_mergeable` reports a merged PR as
+    not-ready."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "3" * 40, "4" * 40
+    pr_url = "https://github.com/x/y/pull/30"
+    _ready(store, app_factory, "VOYN-W0-MQ", pr_url)
+    queue_state = {"merged": False}
+    merge_calls = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            if queue_state["merged"]:
+                body = json.dumps({"state": "MERGED", "mergeCommit": {"oid": merge_oid}})
+            else:
+                body = json.dumps({
+                    "state": "OPEN", "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "merge"]:
+            merge_calls.append(argv)
+            return sp.CompletedProcess(argv, 0, "queued", "")  # enqueued, NOT merged
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MQ", "merge_queued_awaiting_target") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MQ",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+    # The queue lands the PR between ticks; the next tick completes DONE
+    # without calling `gh pr merge` again.
+    queue_state["merged"] = True
+    calls_before = len(merge_calls)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MQ", merge_oid) in report.merged
+    assert len(merge_calls) == calls_before
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MQ",))
+        assert cur.fetchone()[0] == "DONE"
+        cur.execute("SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='sha'", ("VOYN-W0-MQ",))
+        assert cur.fetchone()[0] == merge_oid
+
+
+def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN: a red required check on a PR that
+    already carries the ACCEPT marker triggers `gh run rerun --failed` for
+    completed-failed runs at attempt 1 on the current head -- and never for
+    a run already at attempt 2 (GitHub's own attempt counter is the bound),
+    never for other heads, never while checks are merely pending."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "6" * 40
+    pr_url = "https://github.com/x/y/pull/31"
+    _ready(store, app_factory, "VOYN-W0-MF", pr_url)
+    reruns = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"] and "headRefName" in argv[-1]:
+            return sp.CompletedProcess(argv, 0, json.dumps(
+                {"headRefName": "backlog/x", "headRefOid": head}), "")
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "list"]:
+            return sp.CompletedProcess(argv, 0, json.dumps([
+                {"databaseId": 11, "headSha": head, "status": "completed",
+                 "conclusion": "failure", "attempt": 1},
+                {"databaseId": 12, "headSha": head, "status": "completed",
+                 "conclusion": "failure", "attempt": 2},
+                {"databaseId": 13, "headSha": "7" * 40, "status": "completed",
+                 "conclusion": "failure", "attempt": 1},
+                {"databaseId": 14, "headSha": head, "status": "in_progress",
+                 "conclusion": None, "attempt": 1},
+            ]), "")
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv)
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    skip = dict(report.skipped)["VOYN-W0-MF"]
+    assert skip.startswith("checks_not_green") and "flaky_rerun_dispatched:1" in skip
+    assert reruns == [["run", "rerun", "11", "--failed"]]
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MF",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_no_rerun_without_an_accept_marker(rig, monkeypatch):  # noqa: F811
+    """An unaccepted PR's failures are the review path's business -- the
+    flake retry must not spend reruns on a PR that may never be accepted."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "8" * 40
+    pr_url = "https://github.com/x/y/pull/32"
+    _ready(store, app_factory, "VOYN-W0-MG", pr_url)
+    reruns = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "reviews": [],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv)
+        return sp.CompletedProcess(argv, 0, "[]", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MG", "no_accept_marker_on_head") in report.skipped
+    assert reruns == []
