@@ -251,6 +251,7 @@ def self_deploy_once(
         )
     report.steps.append("import_smoke_passed")
 
+    migrations_applied = False
     if cfg.migrate:
         migrated = _run_migrations(repo_path, timeout)
         if migrated.returncode != 0:
@@ -264,6 +265,7 @@ def self_deploy_once(
                 services_touched=False,
             )
         report.steps.append("migrations_applied")
+        migrations_applied = True
 
     # Applied migrations are deliberately NOT rolled back on a later restart
     # failure: this codebase's migration policy is expand-contract (each
@@ -276,7 +278,16 @@ def self_deploy_once(
     failure = _restart_services(cfg, report)
     if failure is not None:
         # Half old, half new is the state rollback exists to prevent -- so
-        # the restored services are re-verified inside rollback() too.
-        return rollback(failure, services_touched=True)
+        # the restored services are re-verified inside rollback() too. But
+        # the rollback itself only ever spans the checkout: when migrations
+        # already committed this attempt, the outcome is still `rolled_back`
+        # while the database sits on the NEW schema against the OLD code --
+        # say so in provenance (same disclosure the migration-failure branch
+        # above already makes) instead of letting `rolled_back` imply a
+        # database that came back with the checkout.
+        reason = failure
+        if migrations_applied:
+            reason = f"{failure}; database_migrations_applied_not_rolled_back"
+        return rollback(reason, services_touched=True)
 
     return finish("deployed", report.target_sha)

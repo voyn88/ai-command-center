@@ -191,6 +191,40 @@ def test_failed_migrations_roll_back_before_services_restart(
     assert ["restart", "voyn-aicc-worker.service"] not in calls["systemctl"]
 
 
+def test_restart_failure_after_migrations_names_the_unrolled_database(
+    pair, calls, tmp_path, monkeypatch
+):
+    """Asymmetric rollback: when migrations already committed this attempt
+    and a LATER restart fails, the checkout and services roll back but the
+    database does not (expand-contract policy -- see the comment in
+    self_deploy_once). The outcome is still `rolled_back`, so provenance
+    must say the database did not span the rollback -- the same disclosure
+    the sibling migration-failure path already makes -- instead of letting
+    `rolled_back` imply every store came back with the checkout."""
+    origin, clone, first = pair
+    _commit(origin, "advance with migration")
+    fails = {"left": 1}
+
+    def one_shot_systemctl(args, timeout):
+        calls["systemctl"].append(args)
+        if args[0] == "restart" and fails["left"] > 0:
+            fails["left"] -= 1
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        out = "active" if args[0] == "is-active" else ""
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(self_deploy, "_systemctl", one_shot_systemctl)
+    cfg = _cfg(
+        tmp_path, services=("voyn-aicc-worker.service",), migrate=True
+    )
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "rolled_back"
+    assert "restart_failed" in report.detail
+    assert "database_migrations_applied_not_rolled_back" in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first
+    assert calls["migrate"] == 1
+
+
 def test_a_timeout_after_reset_still_rolls_back(pair, calls, tmp_path, monkeypatch):
     """Review of f794b3e: subprocess timeouts must become ordinary failures,
     not raises -- a raise after `reset --hard` would bypass rollback and
