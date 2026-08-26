@@ -42,6 +42,17 @@ will stop the gate closed until the resolver and its tests are updated.
 Everything it cannot establish is a refusal: no review, no marker, a marker for
 a different commit, an unparseable sha, a missing token, an API error, or an
 ambiguous synthetic history. A gate that guesses accepts nothing in particular.
+
+``evaluate``'s optional ``merger`` parameter closes the same gap for a second,
+distinct caller: this workflow never merges anything itself, so it only ever
+asks for independence from the author. ``command_center.orchestrator.
+review_merge._pr_is_mergeable`` does perform the merge (``gh pr merge``), and
+calls the same ``evaluate`` with the authenticated identity that is about to
+run it -- a verdict that identity published itself is refused the same way a
+self-issued one is, closing VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE-REM: an
+account that can publish a verdict and then act on it is a single identity
+closing the loop on itself, independent of whether it also happens to be the
+pull request's author.
 """
 
 from __future__ import annotations
@@ -65,6 +76,14 @@ MARKER = re.compile(r"ACCEPTANCE: (ACCEPT|REJECT) ([0-9a-fA-F]{40})[ \t]*")
 DISMISSED = "DISMISSED"
 # Not yet submitted; it is a draft visible only to its author.
 PENDING = "PENDING"
+
+# The states in which a review currently represents its author's live
+# position. An allowlist rather than excluding the two known non-live states
+# (PENDING, DISMISSED) individually: a state this gate has never seen --
+# something GitHub adds later, or a malformed API response -- fails closed
+# here instead of silently falling through whatever bare `!=` checks happened
+# to exclude.
+SUBMITTED = frozenset({"APPROVED", "CHANGES_REQUESTED", "COMMENTED"})
 
 _PER_PAGE = 100
 _MAX_PAGES = 50
@@ -131,8 +150,23 @@ def verdicts_from(reviews: object) -> list[Verdict]:
     return found
 
 
-def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> str:
-    """Return the accepting reviewer's login, or raise with cause and remedy."""
+def evaluate(
+    reviews: object,
+    head_sha: object,
+    pull_request_author: object,
+    merger: object | None = None,
+) -> str:
+    """Return the accepting reviewer's login, or raise with cause and remedy.
+
+    `merger`, when not `None`, is the identity that would execute the merge;
+    a verdict it published is refused on the same footing as a self-issued
+    one -- an account that can publish a verdict and then act on it is a
+    single identity closing the loop on itself. `None` means the caller
+    itself never merges and independence from the author alone is what is
+    being asked for; any other non-string or empty value means the caller
+    *does* merge but cannot say as whom, which is refused rather than
+    silently skipping the check.
+    """
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
         raise AcceptanceError(f"head sha is not a 40-character commit id: {head_sha!r}")
     head = head_sha.lower()
@@ -141,12 +175,17 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
             "the pull request has no resolvable author, so independence is unprovable"
         )
     author = pull_request_author.casefold()
+    if merger is not None and (not isinstance(merger, str) or not merger):
+        raise AcceptanceError(
+            "the merger has no resolvable identity, so independence is unprovable"
+        )
+    merger_login = merger.casefold() if isinstance(merger, str) else None
 
     verdicts = verdicts_from(reviews)
     on_head = [
         verdict
         for verdict in verdicts
-        if verdict.sha == head and verdict.state != PENDING
+        if verdict.sha == head and verdict.state in SUBMITTED
     ]
 
     rejections = [verdict for verdict in on_head if verdict.decision == "REJECT"]
@@ -166,19 +205,23 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
         verdict
         for verdict in on_head
         if verdict.decision == "ACCEPT"
-        and verdict.state != DISMISSED
         and verdict.author
         and verdict.author.casefold() != author
+        and (merger_login is None or verdict.author.casefold() != merger_login)
     ]
     if accepting:
         return accepting[0].author
 
     # Nothing accepted this commit. Say which of the ways it failed, because a
     # gate whose refusal is unreadable gets routed around instead of fixed.
+    # Every branch below guards `verdict.author` before calling `.casefold()`
+    # on it -- an ACCEPT whose review carries no attributable author must
+    # fail closed into the generic "no acceptance verdict" refusal at the
+    # bottom, never crash the gate outright.
     self_issued = [
         verdict
         for verdict in on_head
-        if verdict.decision == "ACCEPT" and verdict.author.casefold() == author
+        if verdict.decision == "ACCEPT" and verdict.author and verdict.author.casefold() == author
     ]
     if self_issued:
         raise AcceptanceError(
@@ -186,10 +229,29 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
             "pull request. Acceptance must come from an identity that is not the author; have the "
             "acceptance reviewer publish the verdict"
         )
-    dismissed = [
+    merger_issued = [
         verdict
         for verdict in on_head
-        if verdict.decision == "ACCEPT" and verdict.state == DISMISSED
+        if verdict.decision == "ACCEPT"
+        and merger_login is not None
+        and verdict.author
+        and verdict.author.casefold() == merger_login
+    ]
+    if merger_issued:
+        raise AcceptanceError(
+            f"the only ACCEPT for {head} was published by {merger_issued[0].author}, who would "
+            "merge this pull request. Acceptance must come from an identity that is neither the "
+            "author nor the merger"
+        )
+    # DISMISSED is excluded from `on_head` by the SUBMITTED allowlist above,
+    # so this scans `verdicts` directly rather than `on_head` -- otherwise a
+    # dismissed ACCEPT could never be reported as dismissed, only as "no
+    # acceptance verdict", which is true but hides the remedy (obtain a
+    # fresh verdict, not merely publish any verdict).
+    dismissed = [
+        verdict
+        for verdict in verdicts
+        if verdict.sha == head and verdict.decision == "ACCEPT" and verdict.state == DISMISSED
     ]
     if dismissed:
         raise AcceptanceError(

@@ -25,6 +25,32 @@ DIFF = "diff --git a/x b/x\n+hi\n"
 SNAPSHOTS = {}
 ORIGINAL_PR_SNAPSHOT = review_merge._pr_diff_and_head
 
+# A distinct login for each of the three identities `_pr_is_mergeable` must
+# tell apart: the PR's own author, the independent reviewer who published the
+# marker, and the authenticated `gh` identity that would execute the merge
+# (VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE-REM). Reused by every
+# `_pr_is_mergeable`/`merge_once` test below that needs the merge-readiness
+# gate to actually reach its checks-green logic rather than refuse earlier on
+# an unresolvable author or merger.
+_PR_AUTHOR = "pr-author"
+_REVIEWER = "reviewer-bot"
+_MERGER = "merger-bot"
+
+
+def _fake_gh_with_login(view_body_for):
+    """Wrap a `gh pr view` fake so it also answers `gh api user` with
+    `_MERGER` -- the merger-identity lookup every `_pr_is_mergeable` call now
+    makes before it reaches the checks-green scan these tests exist to
+    exercise."""
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["api", "user"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
+        return sp.CompletedProcess(argv, 0, view_body_for(argv), "")
+
+    return fake_gh
+
 
 def _snapshot(head, diff=DIFF):
     return review_merge._PRSnapshot.create(diff, BASE, head)
@@ -231,11 +257,16 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
         import subprocess
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
-                "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "state": "OPEN", "headRefOid": head, "author": {"login": _PR_AUTHOR},
+                "reviews": [{
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "author": {"login": _REVIEWER}, "state": "COMMENTED",
+                }],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
         if argv[:2] == ["pr", "merge"]:
             return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
@@ -292,10 +323,13 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                 "reviews": [{
                     "body": f"ACCEPTANCE: ACCEPT {head}",
                     "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    "state": "COMMENTED",
                 }],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
         if argv[:2] == ["pr", "merge"]:
             return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
@@ -303,6 +337,44 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1C", head) in report.merged
+
+
+def test_merge_skips_a_marker_issued_by_the_merger(rig, monkeypatch):  # noqa: F811
+    """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE-REM: a marker whose reviewer
+    login is the SAME as the identity that would execute `gh pr merge` must
+    not authorize it, even though that login differs from the PR's own
+    author -- an account that can publish the accepting verdict and then
+    merge on its own word is a single identity closing the loop on itself."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1E", "https://github.com/x/y/pull/24")
+    head = "3" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "author": {"login": _PR_AUTHOR},
+                "reviews": [{
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "author": {"login": _MERGER}, "state": "COMMENTED",
+                }],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert any(
+        task_id == "VOYN-W0-M1E" and reason.startswith("acceptance_refused")
+        for task_id, reason in report.skipped
+    )
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1E",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
 def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):  # noqa: F811
@@ -316,12 +388,15 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
 
     def fake_gh(argv, repo):
         import subprocess
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
             "author": {"login": "dimastov-lab"},
             "reviews": [{
                 "body": f"ACCEPTANCE: ACCEPT {head}",
                 "author": {"login": "voyn88-acceptance-gate[bot]"},
+                "state": "COMMENTED",
             }],
             "statusCheckRollup": [
                 {"name": "CI", "conclusion": "SUCCESS"},
@@ -371,9 +446,14 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, mon
 
     def fake_gh(argv, repo):
         import subprocess
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
         body = json.dumps({
-            "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"}],
+            "state": "OPEN", "headRefOid": head, "author": {"login": _PR_AUTHOR},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z",
+                "author": {"login": _REVIEWER}, "state": "COMMENTED",
+            }],
             "statusCheckRollup": [
                 {"name": "CI", "status": "IN_PROGRESS", "conclusion": None},
             ],
@@ -398,9 +478,14 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # n
 
     def fake_gh(argv, repo):
         import subprocess
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
         body = json.dumps({
-            "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"}],
+            "state": "OPEN", "headRefOid": head, "author": {"login": _PR_AUTHOR},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z",
+                "author": {"login": _REVIEWER}, "state": "COMMENTED",
+            }],
             "statusCheckRollup": [{"name": "legacy-ci", "state": "PENDING"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -818,9 +903,14 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
 
     def fake_gh(argv, repo):
         import subprocess
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
         body = json.dumps({
-            "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "state": "OPEN", "headRefOid": head, "author": {"login": _PR_AUTHOR},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": _REVIEWER}, "state": "COMMENTED",
+            }],
             "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -831,43 +921,39 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
 
 
 def test_mergeability_uses_latest_check_rerun(monkeypatch):
-    import subprocess
-
     head = "d" * 40
+    body = json.dumps({
+        "state": "OPEN", "headRefOid": head, "author": {"login": _PR_AUTHOR},
+        "reviews": [{
+            "body": f"ACCEPTANCE: ACCEPT {head}",
+            "author": {"login": _REVIEWER}, "state": "COMMENTED",
+        }],
+        "statusCheckRollup": [
+            {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T04:29:29Z"},
+            {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T05:25:43Z"},
+            {"name": "CI", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:27Z"},
+        ],
+    })
 
-    def fake_gh(argv, repo):
-        body = json.dumps({
-            "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-            "statusCheckRollup": [
-                {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T04:29:29Z"},
-                {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T05:25:43Z"},
-                {"name": "CI", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:27Z"},
-            ],
-        })
-        return subprocess.CompletedProcess(argv, 0, body, "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_with_login(lambda _argv: body))
     assert review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10") == (True, head)
 
 
 def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
-    import subprocess
-
     head = "e" * 40
+    body = json.dumps({
+        "state": "OPEN", "headRefOid": head, "author": {"login": _PR_AUTHOR},
+        "reviews": [{
+            "body": f"ACCEPTANCE: ACCEPT {head}",
+            "author": {"login": _REVIEWER}, "state": "COMMENTED",
+        }],
+        "statusCheckRollup": [
+            {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:29Z"},
+            {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T05:25:43Z"},
+        ],
+    })
 
-    def fake_gh(argv, repo):
-        body = json.dumps({
-            "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-            "statusCheckRollup": [
-                {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:29Z"},
-                {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T05:25:43Z"},
-            ],
-        })
-        return subprocess.CompletedProcess(argv, 0, body, "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_with_login(lambda _argv: body))
     ready, reason = review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10")
     assert not ready
     assert reason == "checks_not_green: ['Acceptance gate']"
@@ -882,32 +968,31 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
 ):
     """GitHub does not promise chronological rollup order.  Put the newer
     run first so taking the last array element would produce the wrong result."""
-    import subprocess
-
     head = "1" * 40
     older_conclusion = "FAILURE" if newer_conclusion == "SUCCESS" else "SUCCESS"
+    body = json.dumps({
+        "state": "OPEN",
+        "headRefOid": head,
+        "author": {"login": _PR_AUTHOR},
+        "reviews": [{
+            "body": f"ACCEPTANCE: ACCEPT {head}",
+            "author": {"login": _REVIEWER}, "state": "COMMENTED",
+        }],
+        "statusCheckRollup": [
+            {
+                "name": "Acceptance gate",
+                "conclusion": newer_conclusion,
+                "startedAt": "2026-08-23T05:25:43Z",
+            },
+            {
+                "name": "Acceptance gate",
+                "conclusion": older_conclusion,
+                "startedAt": "2026-08-23T04:29:29Z",
+            },
+        ],
+    })
 
-    def fake_gh(argv, repo):
-        body = json.dumps({
-            "state": "OPEN",
-            "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-            "statusCheckRollup": [
-                {
-                    "name": "Acceptance gate",
-                    "conclusion": newer_conclusion,
-                    "startedAt": "2026-08-23T05:25:43Z",
-                },
-                {
-                    "name": "Acceptance gate",
-                    "conclusion": older_conclusion,
-                    "startedAt": "2026-08-23T04:29:29Z",
-                },
-            ],
-        })
-        return subprocess.CompletedProcess(argv, 0, body, "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_with_login(lambda _argv: body))
     ready, _ = review_merge._pr_is_mergeable(
         "/tmp", "https://github.com/x/y/pull/10"
     )
@@ -928,20 +1013,19 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
     ],
 )
 def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, checks):
-    import subprocess
-
     head = "f" * 40
+    body = json.dumps({
+        "state": "OPEN",
+        "headRefOid": head,
+        "author": {"login": _PR_AUTHOR},
+        "reviews": [{
+            "body": f"ACCEPTANCE: ACCEPT {head}",
+            "author": {"login": _REVIEWER}, "state": "COMMENTED",
+        }],
+        "statusCheckRollup": checks,
+    })
 
-    def fake_gh(argv, repo):
-        body = json.dumps({
-            "state": "OPEN",
-            "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-            "statusCheckRollup": checks,
-        })
-        return subprocess.CompletedProcess(argv, 0, body, "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_with_login(lambda _argv: body))
     ready, reason = review_merge._pr_is_mergeable(
         "/tmp", "https://github.com/x/y/pull/10"
     )
@@ -1373,10 +1457,13 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
                 "author": {"login": "writer-bot"},
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
-                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                             "author": {"login": "voyn88-acceptance-gate[bot]"},
+                             "state": "COMMENTED"}],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
         if argv[:2] == ["pr", "update-branch"]:
             return subprocess.CompletedProcess(argv, 0, "updated", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
@@ -1446,10 +1533,13 @@ def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F8
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "DIRTY",
                 "author": {"login": "writer-bot"},
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
-                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                             "author": {"login": "voyn88-acceptance-gate[bot]"},
+                             "state": "COMMENTED"}],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": _MERGER}), "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)

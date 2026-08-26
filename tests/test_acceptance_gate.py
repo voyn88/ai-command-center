@@ -159,6 +159,20 @@ def test_an_unattributable_verdict_cannot_establish_independence() -> None:
         )
 
 
+def test_an_unattributable_verdict_cannot_prove_independence() -> None:
+    """A review whose ACCEPT cannot be pinned to any login must fail closed
+    the same way once a `merger` identity is also being checked for
+    independence -- not crash. `merger_issued`'s filter used to call
+    `verdict.author.casefold()` before confirming `verdict.author` is a
+    string, so an unattributable ACCEPT raised `AttributeError` instead of
+    the intended `AcceptanceError` refusal once a merger was supplied."""
+    with pytest.raises(AcceptanceError, match="no acceptance verdict"):
+        evaluate(
+            [{"body": f"ACCEPTANCE: ACCEPT {HEAD}", "state": "COMMENTED"}],
+            HEAD, AUTHOR, merger="merger-bot",
+        )
+
+
 @pytest.mark.parametrize("head", [None, "", "not-a-sha", HEAD[:39], 12345])
 def test_an_unusable_head_sha_is_refused(head: object) -> None:
     with pytest.raises(AcceptanceError, match="head sha is not"):

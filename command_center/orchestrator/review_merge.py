@@ -73,6 +73,7 @@ from typing import Any
 
 from command_center.orchestrator import github_app_auth
 from command_center.orchestrator.routing import cascade_for
+from scripts import assert_independent_acceptance
 
 __all__ = [
     "LoopReport",
@@ -1586,6 +1587,25 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
     return list(latest.values())
 
 
+def _gh_current_login(repo_path: str) -> str | None:
+    """The GitHub login `gh pr merge` in `merge_once` below would act as on
+    this host -- the `merger` identity `_pr_is_mergeable` passes to the
+    shared acceptance gateway (`scripts.assert_independent_acceptance.
+    evaluate`). None on any failure to resolve it; the caller must treat
+    that as "cannot say as whom" (a refusal), never as "not merging" (which
+    would skip the merger-independence check entirely) -- see `evaluate`'s
+    own docstring for why those are different refusals."""
+    result = _gh(["api", "user"], repo_path)
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    login = data.get("login") if isinstance(data, dict) else None
+    return login if isinstance(login, str) and login else None
+
+
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
     marker -- from a reviewer login that is NOT the PR's own author -- stands
@@ -1602,7 +1622,21 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     live-verified) and `publish_review_verdicts` posts under its identity,
     so that check reflects reality again and is required like any other --
     removing the exclusion is not a relaxation, it is retiring a workaround
-    whose reason to exist is gone."""
+    whose reason to exist is gone.
+
+    The marker check above is a cheap fast path (see its own docstring for
+    why it is deliberately loose) -- it decides nothing on its own. Once it
+    passes, the decision goes through the same gateway the CI acceptance
+    gate runs (`scripts.assert_independent_acceptance.evaluate`): the exact
+    first-line marker parse, the same submitted/undismissed review-state
+    handling, and -- the one thing the CI check cannot itself express --
+    independence from the identity that is about to execute `gh pr merge`
+    below, not merely from the PR's own author (VOYN-W0-AICC-MARKER-
+    REVIEWER-INDEPENDENCE-REM: an account that can publish the accepting
+    verdict and then merge on its own word is a single identity closing the
+    loop on itself, whether or not it is also the PR's author). A merger
+    whose own identity cannot be resolved is a refusal, never a silent
+    pass-through."""
     view = _gh(
         ["pr", "view", pr_url, "--json",
          "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author"],
@@ -1615,9 +1649,30 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
+    reviews = data.get("reviews") or []
+    accept = _accept_marker_on_latest_review(reviews, head, author_login)
     if not accept:
         return False, "no_accept_marker_on_head"
+    # `gh pr view --json reviews` returns GraphQL-shaped entries
+    # (`author.login`); the shared gateway is written against the GitHub
+    # REST review shape (`user.login`) it shares with the CI check that
+    # calls it directly -- reshape rather than fork the gateway's contract.
+    rest_shaped_reviews = [
+        {
+            "user": {"login": (r.get("author") or {}).get("login")},
+            "body": r.get("body"),
+            "state": r.get("state"),
+        }
+        for r in reviews
+        if isinstance(r, dict)
+    ]
+    merger_login = _gh_current_login(repo_path)
+    try:
+        assert_independent_acceptance.evaluate(
+            rest_shaped_reviews, head, author_login, merger_login or ""
+        )
+    except assert_independent_acceptance.AcceptanceError as exc:
+        return False, f"acceptance_refused: {exc}"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
