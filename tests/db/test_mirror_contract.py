@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import importlib
 import json
 import re
 from pathlib import Path
@@ -87,6 +88,96 @@ def _discover() -> list[tuple[str, type[PostgresTableMirror]]]:
 
 MIRRORS = _discover()
 IDS = [table for table, _ in MIRRORS]
+
+
+#: `CREATE TABLE <name> (` as the accepted schema writes it — one per table,
+#: anchored at line start for the same reason `_ADD_COLUMN` is: these files are
+#: mostly comment, and prose about a table is not a declaration of one.
+_CREATE_TABLE = re.compile(r"^CREATE TABLE (\w+) \(", re.MULTILINE)
+
+
+def _declared_tables() -> set[str]:
+    return set(_CREATE_TABLE.findall(DDL))
+
+
+#: Tables whose mirror exists but is not a `PostgresTableMirror` subclass, so
+#: `_discover` — which walks `PostgresTableMirror.__subclasses__()` — cannot
+#: find it. `queue_entry` is the one table this is currently true for:
+#: `PostgresQueueMirror` replaces the whole list on every write instead of
+#: upserting a row, because queue order is data the row-oriented contract has
+#: no column for. Adding a table here is how a slice opts a legitimately
+#: different mirror shape out of `test_every_table_has_a_mirror` without
+#: opting it out of having a mirror at all — `test_every_bespoke_mirror_is_real`
+#: checks the entry itself stays honest.
+BESPOKE_MIRRORS: dict[str, str] = {
+    "queue_entry": "command_center.db.queue_store.PostgresQueueMirror",
+}
+
+
+def test_the_ddl_scan_finds_every_declared_table() -> None:
+    """The positive control for `_declared_tables`.
+
+    Without it, a regex matching nothing would silently pass every table as
+    covered — the same failure mode `test_the_migration_scan_finds_a_column
+    _added_after_0001` guards against for columns, here for tables.
+    """
+    declared = _declared_tables()
+    assert {"task", "run", "queue_entry"} <= declared
+    assert len(declared) == 33
+
+
+def test_every_table_has_a_mirror() -> None:
+    """The check `_discover` cannot do, because it only ever looks forward.
+
+    Every other check in this file starts from a mirror and asks whether it is
+    *correct*. None of them starts from a table and asks whether a mirror
+    exists at all — `_discover` walks `PostgresTableMirror.__subclasses__()`,
+    so a table nobody wrote a mirror for is invisible to it in exactly the way
+    an unwritten line is invisible to a spell-checker. `queue_entry` proves the
+    gap is real rather than theoretical: its mirror does not subclass
+    `PostgresTableMirror` at all, and would have passed every check in this
+    file — including this one, via `BESPOKE_MIRRORS` — while passing none of
+    them if the entry were simply missing.
+    """
+    covered = set(dict(MIRRORS)) | set(BESPOKE_MIRRORS)
+    missing = _declared_tables() - covered
+    assert not missing, (
+        f"{sorted(missing)}: declared in the accepted schema with no mirror at all — "
+        "not a PostgresTableMirror subclass and not in BESPOKE_MIRRORS. This table will "
+        "silently never reach PostgreSQL."
+    )
+
+
+def test_bespoke_mirrors_are_not_double_counted() -> None:
+    """`BESPOKE_MIRRORS` names what `_discover` cannot find — nothing it can.
+
+    A table listed in both would still pass `test_every_table_has_a_mirror`,
+    so that check alone cannot tell a genuine exception from a stale one left
+    behind after a mirror was rewritten as a `PostgresTableMirror` subclass.
+    """
+    overlap = set(dict(MIRRORS)) & set(BESPOKE_MIRRORS)
+    assert not overlap, (
+        f"{sorted(overlap)}: declared in BESPOKE_MIRRORS and also discovered automatically "
+        "— remove the entry, `_discover` already finds this mirror."
+    )
+
+
+def test_every_bespoke_mirror_is_real() -> None:
+    """`BESPOKE_MIRRORS` is a claim, not a fact, until something checks it.
+
+    A stale or typo'd entry would satisfy `test_every_table_has_a_mirror`
+    while naming a class that does not exist — the same silent gap this whole
+    file exists to close, one level up.
+    """
+    for table, dotted in BESPOKE_MIRRORS.items():
+        module_name, _, class_name = dotted.rpartition(".")
+        module = importlib.import_module(module_name)
+        mirror = getattr(module, class_name, None)
+        assert mirror is not None, f"{table}: {dotted} does not exist"
+        assert not issubclass(mirror, PostgresTableMirror), (
+            f"{table}: {dotted} is now a PostgresTableMirror subclass — `_discover` finds it "
+            "automatically, so it belongs in the enrolled contract, not BESPOKE_MIRRORS."
+        )
 
 
 @functools.cache
