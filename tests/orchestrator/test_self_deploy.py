@@ -150,10 +150,22 @@ def test_failed_smoke_rolls_back_before_anything_else_ran(pair, calls, tmp_path)
     assert rows[-1]["outcome"] == "rolled_back"
 
 
-def test_failed_restart_rolls_back(pair, calls, tmp_path):
+def test_failed_restart_rolls_back(pair, calls, tmp_path, monkeypatch):
+    """First restart (onto the new code) fails; the restore restart succeeds
+    -- a VERIFIED rollback reports rolled_back."""
     origin, clone, first = pair
     _commit(origin, "advance")
-    calls["systemctl_rc"][("restart",)] = 1
+    fails = {"left": 1}
+
+    def one_shot_systemctl(args, timeout):
+        calls["systemctl"].append(args)
+        if args[0] == "restart" and fails["left"] > 0:
+            fails["left"] -= 1
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        out = "active" if args[0] == "is-active" else ""
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(self_deploy, "_systemctl", one_shot_systemctl)
     cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",))
     report = self_deploy_once(str(clone), cfg)
     assert report.outcome == "rolled_back"
@@ -216,3 +228,63 @@ def test_branch_is_configurable(pair, calls, tmp_path):
     )
     assert (report.outcome, report.detail) == ("deployed", new)
     assert _git(clone, "rev-parse", "HEAD") == new
+
+
+def test_a_failed_rollback_is_reported_failed_not_rolled_back(
+    pair, calls, tmp_path, monkeypatch
+):
+    """Review of 8d1f967 (High): the rollback's own `reset --hard` result
+    was ignored -- a host left on NEW code must never carry provenance
+    claiming a successful rollback. A rollback that cannot restore the
+    checkout is `failed`/`rollback_incomplete`, an operator incident."""
+    origin, clone, first = pair
+    _commit(origin, "advance")
+    calls["smoke_rc"] = 1
+
+    real_git = self_deploy._git
+
+    def sabotaged_git(repo_path, args, timeout):
+        if args[:2] == ["reset", "--hard"] and args[2] == first:
+            return subprocess.CompletedProcess(args, 1, "", "disk full")
+        return real_git(repo_path, args, timeout)
+
+    monkeypatch.setattr(self_deploy, "_git", sabotaged_git)
+    report = self_deploy_once(str(clone), _cfg(tmp_path))
+    assert report.outcome == "failed"
+    assert report.detail.startswith("rollback_incomplete_checkout")
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
+    ]
+    assert rows[-1]["outcome"] == "failed"
+
+
+def test_a_failed_service_restore_is_reported_failed(pair, calls, tmp_path):
+    """The restore restart after a restart failure is verified too: dead
+    services on the old code are `failed`, not `rolled_back`."""
+    origin, clone, first = pair
+    _commit(origin, "advance")
+    calls["systemctl_rc"][("restart",)] = 1  # every restart fails
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",))
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "failed"
+    assert "rollback_incomplete_services" in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first  # checkout DID restore
+
+
+def test_migration_failure_provenance_names_the_partial_database(
+    pair, calls, tmp_path, monkeypatch
+):
+    """Review of 8d1f967 (Medium): earlier pending migrations may have
+    committed before the failing one -- provenance must say so instead of
+    implying a pristine database."""
+    origin, clone, first = pair
+    _commit(origin, "advance with migration")
+    monkeypatch.setattr(
+        self_deploy, "_run_migrations",
+        lambda repo_path, timeout: subprocess.CompletedProcess([], 1, "", "DDL boom"),
+    )
+    report = self_deploy_once(str(clone), _cfg(tmp_path, migrate=True))
+    assert report.outcome == "rolled_back"
+    assert "database_may_hold_partial_migrations" in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first

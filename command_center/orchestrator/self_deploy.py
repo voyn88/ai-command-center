@@ -219,24 +219,49 @@ def self_deploy_once(
         return finish("failed", f"reset_failed: {moved.stderr.strip()[:100]}")
     report.steps.append(f"checkout_moved:{report.target_sha}")
 
+    def rollback(reason: str, *, services_touched: bool) -> SelfDeployReport:
+        """VERIFIED restoration (review of 8d1f967: an unchecked
+        `reset --hard` could itself fail or time out, leaving the host on
+        new code while provenance claimed a successful rollback). The
+        outcome is `rolled_back` only when the checkout provably sits at
+        the previous sha again and the touched services are active on it;
+        anything less is `failed` with `rollback_incomplete` -- an
+        operator incident, never a false all-clear."""
+        _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
+        at = _git(repo_path, ["rev-parse", "HEAD"], timeout)
+        if at.returncode != 0 or at.stdout.strip() != report.previous_sha:
+            return finish("failed", f"rollback_incomplete_checkout: after {reason}")
+        if services_touched:
+            restore_failure = _restart_services(cfg, report)
+            if restore_failure is not None:
+                return finish(
+                    "failed",
+                    f"rollback_incomplete_services: {restore_failure}; after {reason}",
+                )
+        return finish("rolled_back", reason)
+
     # Smoke BEFORE migrations (review of cff672a): a broken tree must be
     # discovered while the database is still untouched -- the cheapest
     # failure order is the one with nothing to unwind.
     smoke = _import_smoke(repo_path, timeout)
     if smoke.returncode != 0:
-        _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
-        return finish(
-            "rolled_back", f"import_smoke_failed: {smoke.stderr.strip()[:150]}"
+        return rollback(
+            f"import_smoke_failed: {smoke.stderr.strip()[:150]}",
+            services_touched=False,
         )
     report.steps.append("import_smoke_passed")
 
     if cfg.migrate:
         migrated = _run_migrations(repo_path, timeout)
         if migrated.returncode != 0:
-            _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
-            return finish(
-                "rolled_back",
-                f"migrations_failed: {(migrated.stderr or migrated.stdout).strip()[:150]}",
+            # The checkout is restored, but earlier PENDING migrations may
+            # have committed before the failing one (each migration is its
+            # own transaction) -- provenance says so explicitly rather than
+            # implying a pristine database (review of 8d1f967, medium).
+            return rollback(
+                "migrations_failed_database_may_hold_partial_migrations: "
+                f"{(migrated.stderr or migrated.stdout).strip()[:130]}",
+                services_touched=False,
             )
         report.steps.append("migrations_applied")
 
@@ -250,10 +275,8 @@ def self_deploy_once(
     # the CLI gates it behind --yes-i-understand-this-drops-data.
     failure = _restart_services(cfg, report)
     if failure is not None:
-        _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
-        # Best effort: put the services back on the previous code too --
-        # half old, half new is the state this rollback exists to prevent.
-        _restart_services(cfg, report)
-        return finish("rolled_back", failure)
+        # Half old, half new is the state rollback exists to prevent -- so
+        # the restored services are re-verified inside rollback() too.
+        return rollback(failure, services_touched=True)
 
     return finish("deployed", report.target_sha)
