@@ -1,0 +1,299 @@
+{
+  "$defs": {
+    "AgentLaneDTO": {
+      "additionalProperties": false,
+      "properties": {
+        "heartbeatAgeSeconds": {
+          "title": "Heartbeatageseconds",
+          "type": "integer"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "state",
+        "heartbeatAgeSeconds"
+      ],
+      "title": "AgentLaneDTO",
+      "type": "object"
+    },
+    "ConnectionDTO": {
+      "additionalProperties": false,
+      "description": "Additive in DTO 1.0 \u2014 how live the projection behind this response is.",
+      "properties": {
+        "projectionAgeSeconds": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Projectionageseconds"
+        },
+        "state": {
+          "$ref": "#/$defs/Freshness"
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "title": "ConnectionDTO",
+      "type": "object"
+    },
+    "DeliveryEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "acceptance": {
+          "$ref": "#/$defs/EvidenceState",
+          "default": "unknown"
+        },
+        "ci": {
+          "$ref": "#/$defs/EvidenceState",
+          "default": "unknown"
+        },
+        "deployedSHA": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Deployedsha"
+        },
+        "headSHA": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Headsha"
+        },
+        "mergedSHA": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mergedsha"
+        },
+        "pullRequest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pullrequest"
+        }
+      },
+      "title": "DeliveryEvidence",
+      "type": "object"
+    },
+    "EvidenceState": {
+      "enum": [
+        "unknown",
+        "observed",
+        "verified",
+        "rejected",
+        "pending"
+      ],
+      "title": "EvidenceState",
+      "type": "string"
+    },
+    "Freshness": {
+      "enum": [
+        "fresh",
+        "stale",
+        "offline",
+        "degraded"
+      ],
+      "title": "Freshness",
+      "type": "string"
+    },
+    "ProjectDTO": {
+      "additionalProperties": false,
+      "description": "Additive in DTO 1.0 \u2014 calm per-project rollup for the overview.",
+      "properties": {
+        "activeTasks": {
+          "title": "Activetasks",
+          "type": "integer"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "needsAttention": {
+          "title": "Needsattention",
+          "type": "integer"
+        },
+        "state": {
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "state",
+        "activeTasks",
+        "needsAttention"
+      ],
+      "title": "ProjectDTO",
+      "type": "object"
+    },
+    "TaskDTO": {
+      "additionalProperties": false,
+      "properties": {
+        "blocker": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Blocker"
+        },
+        "evidence": {
+          "$ref": "#/$defs/DeliveryEvidence"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "evidence"
+      ],
+      "title": "TaskDTO",
+      "type": "object"
+    },
+    "TimelineEventDTO": {
+      "additionalProperties": false,
+      "properties": {
+        "correlationID": {
+          "title": "Correlationid",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "occurredAt": {
+          "title": "Occurredat",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "occurredAt",
+        "summary",
+        "correlationID"
+      ],
+      "title": "TimelineEventDTO",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "connection": {
+      "$ref": "#/$defs/ConnectionDTO"
+    },
+    "events": {
+      "items": {
+        "$ref": "#/$defs/TimelineEventDTO"
+      },
+      "title": "Events",
+      "type": "array"
+    },
+    "freshness": {
+      "$ref": "#/$defs/Freshness"
+    },
+    "generatedAt": {
+      "title": "Generatedat",
+      "type": "string"
+    },
+    "lanes": {
+      "items": {
+        "$ref": "#/$defs/AgentLaneDTO"
+      },
+      "title": "Lanes",
+      "type": "array"
+    },
+    "projects": {
+      "items": {
+        "$ref": "#/$defs/ProjectDTO"
+      },
+      "title": "Projects",
+      "type": "array"
+    },
+    "revision": {
+      "title": "Revision",
+      "type": "string"
+    },
+    "schemaVersion": {
+      "title": "Schemaversion",
+      "type": "string"
+    },
+    "tasks": {
+      "items": {
+        "$ref": "#/$defs/TaskDTO"
+      },
+      "title": "Tasks",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "revision",
+    "generatedAt",
+    "freshness",
+    "tasks",
+    "lanes",
+    "events",
+    "projects",
+    "connection"
+  ],
+  "title": "SnapshotDTO",
+  "type": "object"
+}

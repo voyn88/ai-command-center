@@ -354,6 +354,9 @@
     "command_center/worktree_launcher.py": [
       "orchestration"
     ],
+    "native_gateway/auth.py": [
+      "authz"
+    ],
     "ops/aicc_agent_launcher.py": [
       "orchestration"
     ],
