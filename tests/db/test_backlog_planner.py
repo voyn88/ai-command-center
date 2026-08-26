@@ -349,7 +349,18 @@ def test_ingest_succeeded_records_evidence_and_moves_to_review(rig) -> None:
     assert ok, reason
 
 
-def test_ingest_without_machine_outcome_still_reviews_but_done_holds(rig) -> None:
+def test_ingest_a_clean_run_with_no_pr_returns_to_pool_not_review(rig) -> None:
+    """VOYN-W0-AICC-INGEST-REQUIRES-REAL-PR-NOT-JUST-COMPLETED. Proven live
+    2026-08-21: the agent process exited cleanly (`status: completed`) but
+    `publish_run`'s own `git push` failed underneath it (a stale writer
+    lease), so `pr_url` never arrived. `status='completed'` alone used to be
+    enough to reach READY_TO_REVIEW -- but review_once/publish_review_
+    verdicts/merge_once all `JOIN backlog_evidence ON kind = 'pr'`, so a
+    task with no `pr` evidence reaches READY_TO_REVIEW and then sits there
+    invisibly forever, never even reviewed, let alone blocked at a later
+    DONE gate. A clean run that never got published is exactly as exhausted
+    an attempt as a failed one and belongs on the same cascade-exhaustion
+    path."""
     app_factory, store, worker = rig
     assert store.upsert_task(_task("VOYN-W0-NM", repo="repo-nm"))[0]
     assert _dispatch(app_factory, "VOYN-W0-NM")[0]
@@ -357,11 +368,62 @@ def test_ingest_without_machine_outcome_still_reviews_but_done_holds(rig) -> Non
     with app_factory() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
-            cur.fetchall()
+            rows = cur.fetchall()
+    assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-NM", "returned_to_pool")]
     task = store.get_task("VOYN-W0-NM")
-    assert task["status"] == "READY_TO_REVIEW"
-    ok, reason, _ = store.transition("VOYN-W0-NM", "DONE", task["revision"])
-    assert not ok and reason.startswith("missing_evidence")
+    assert task["status"] == "OPEN"
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_evidence WHERE task_id = %s",
+                ("VOYN-W0-NM",),
+            )
+            assert cur.fetchone()[0] == 0
+
+
+def test_repeated_no_pr_publish_failure_stays_operational(rig) -> None:
+    """A second technical publish failure is still an operations retry, not
+    an owner decision.  Migration 0012 deliberately exempts no_pr_published
+    from the two-epoch DEFER_TO_USER circuit breaker."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-N2", repo="repo-nm"))[0]
+
+    for round_no in (1, 2):
+        assert _dispatch(app_factory, "VOYN-W0-N2")[0], f"round {round_no}"
+        _complete_latest(
+            app_factory,
+            worker,
+            "VOYN-W0-N2",
+            {"status": "completed"},
+        )
+        with app_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+                rows = cur.fetchall()
+        assert [(r[0], r[2]) for r in rows] == [
+            ("VOYN-W0-N2", "returned_to_pool")
+        ]
+        assert store.get_task("VOYN-W0-N2")["status"] == "OPEN", rows
+
+
+def test_ingest_a_clean_run_with_sha_but_no_pr_still_returns_to_pool(rig) -> None:
+    """The exact live shape of the 2026-08-21 incident: status='completed'
+    AND a real head_sha (the agent reported its own HEAD_SHA trailer), but
+    publish still failed so pr_url is null. sha alone is not evidence a
+    review can act on -- return_to_pool, same as no evidence at all."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SO", repo="repo-so"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-SO")[0]
+    _complete_latest(
+        app_factory, worker, "VOYN-W0-SO", {"status": "completed", "head_sha": "cafef00d"}
+    )
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            rows = cur.fetchall()
+    assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-SO", "returned_to_pool")]
+    task = store.get_task("VOYN-W0-SO")
+    assert task["status"] == "OPEN"
 
 
 def test_ingest_queue_succeeded_but_task_failed_returns_to_pool_not_review(rig) -> None:
@@ -398,6 +460,62 @@ def test_ingest_queue_succeeded_but_task_failed_returns_to_pool_not_review(rig) 
                 ("VOYN-W0-QF",),
             )
             assert cur.fetchone()[0] == 0
+
+
+def test_migration_0012_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up pins the technical-failure policy to migration
+    0012.  Downgrading to 0011 must restore the owner-defer definition, and
+    the second upgrade must reapply the operational retry classification."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "v_technical" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=11)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "v_technical" not in cur.fetchone()[0]
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "v_technical" in cur.fetchone()[0]
+
+
+def test_migration_0011_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up on the exact function body, same pin as 0009's own
+    test: down restores 0009's (pr-not-required) definition, up reapplies
+    0011's fix -- so a future no-op down (CREATE FUNCTION, not OR REPLACE)
+    breaks the second up loudly instead of leaving stale behaviour
+    undetected."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_ingest_results'"
+            )
+            assert "no_pr_published" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=10)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_ingest_results'"
+            )
+            assert "no_pr_published" not in cur.fetchone()[0]
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_ingest_results'"
+            )
+            assert "no_pr_published" in cur.fetchone()[0]
 
 
 def test_migration_0009_is_reversible_without_residue(pg_connection_factory) -> None:
