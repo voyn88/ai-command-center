@@ -2094,3 +2094,44 @@ def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa:
     assert enq == []  # nothing re-enqueued for the pending two
     pending = [r for r in report.skipped if r[1] == "verification_pending"]
     assert len(pending) == 2
+
+
+def test_a_dead_verification_falls_back_to_remediation(rig, monkeypatch):  # noqa: F811
+    """Review of 5443b6e (CONFIRMED): a dead-lettered verification item
+    (retries exhausted, unique key blocks re-enqueue) must not read as
+    pending forever -- that is a permanent silent stall. It falls back to
+    remediation on the original findings, loudly."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    head = "7a" * 20
+    pr_url = "https://github.com/x/y/pull/83"
+    findings = f"a claim.\nVERDICT: REJECT\nHEAD_SHA: {head}\n"
+    _ready(store, app_factory, "VOYN-W0-DV", pr_url)
+    _complete_review(app_factory, worker, "VOYN-W0-DV", pr_url, head, findings)
+    # Dead-letter the verification item: claim it and fail it out of budget.
+    vkey = review_merge._verification_key(
+        "VOYN-W0-DV", pr_url, _snapshot(head), findings
+    )
+    vstore = WorkQueueStore(app_factory)
+    vstore.enqueue("execution", idempotency_key=vkey,
+                   payload={"kind": "agent_run"}, task_id="VOYN-W0-DV",
+                   max_attempts=1)
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert worker.fail(claimed, reason="executor exploded", retryable=False)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT state FROM work_item WHERE idempotency_key=%s", (vkey,))
+        assert cur.fetchone()[0] == "dead"
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(
+        app_factory, "/tmp", enqueue=lambda *a: None,
+    )
+    assert ("VOYN-W0-DV", "VOYN-W0-DV-REM") in report.remediated

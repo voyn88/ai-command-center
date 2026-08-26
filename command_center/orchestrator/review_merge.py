@@ -1356,12 +1356,23 @@ def _verified_rejection_outcome(
     # action -- an already-pending WAIT must cost nothing, or pending tasks
     # recreate exactly the window starvation this change removes (review of
     # fd46584, CONFIRMED).
-    pending = _rows(
+    existing = _rows(
         factory,
-        "SELECT 1 FROM work_item WHERE task_id = %s AND idempotency_key = %s",
+        "SELECT state FROM work_item WHERE task_id = %s AND idempotency_key = %s",
         (task_id, key),
     )
-    if pending:
+    if existing:
+        state = str(existing[0][0])
+        if state == "dead":
+            # Retries exhausted with no verdict, and the unique
+            # (queue, idempotency_key) makes re-enqueue impossible: waiting
+            # is a permanent silent stall (review of 5443b6e, CONFIRMED).
+            # The verification INFRASTRUCTURE failed, so fall back to the
+            # pre-AUTO-ACCEPT behavior -- remediate on the original
+            # findings, loudly.
+            return "REMEDIATE", findings
+        # ready / claimed (in flight), or succeeded whose result lookup
+        # above raced its own commit: wait, costing the tick nothing.
         return "WAIT", "verification_pending"
     if enqueue is None:
         # A legacy caller that cannot enqueue can still consume an existing
