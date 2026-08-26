@@ -1151,6 +1151,19 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
     assert not report.merged
 
 
+def test_merge_state_treats_malformed_gh_output_as_a_failed_lookup(monkeypatch):
+    """A zero-exit-but-unparseable `gh pr view` must return "" (a failed
+    lookup), never raise and abort the merge tick.
+    (VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR)"""
+    import subprocess
+
+    def fake_gh(argv, repo):
+        return subprocess.CompletedProcess(argv, 0, "not json <html>", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._merge_state("/tmp", "https://github.com/x/y/pull/9") == ""
+
+
 def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F811
     """A DIRTY (conflicting) PR is flagged for a rebase and never auto-updated
     -- update-branch cannot resolve a real conflict."""

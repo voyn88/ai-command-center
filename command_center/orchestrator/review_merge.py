@@ -1268,8 +1268,14 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     view = _gh(["pr", "view", pr_url, "--json", "mergeStateStatus,state"], repo_path)
     if view.returncode != 0:
         return ""
-    data = json.loads(view.stdout or "{}")
-    if data.get("state") != "OPEN":
+    # A zero exit with malformed/empty output (a transient gh hiccup) is a
+    # failed lookup, not a reason to abort the whole merge tick: treat any
+    # unparseable response as "" exactly as the docstring promises.
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict) or data.get("state") != "OPEN":
         return ""
     return str(data.get("mergeStateStatus") or "")
 
