@@ -2158,7 +2158,10 @@ def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa:
     import subprocess as sp
 
     app_factory, store, _ = rig
-    ids = [f"VOYN-W0-PG{i:02d}" for i in range(12)]
+    # 15 ids at scan_cap 5: three windows tile the id space with no wrap,
+    # so exactly-once is well-defined (12 ids left 3 pigeonhole duplicates
+    # on the wrapping third window).
+    ids = [f"VOYN-W0-PG{i:02d}" for i in range(15)]
     for i, tid in enumerate(ids):
         _ready(store, app_factory, tid, f"https://github.com/x/y/pull/{200 + i}")
 
@@ -2167,7 +2170,7 @@ def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa:
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     examined: list[str] = []
-    for _tick in range(3):  # cursor advances per invocation: 3 calls cover 12
+    for _tick in range(3):  # cursor advances per invocation: 3 calls cover 15
         report = publish_review_verdicts(
             app_factory, "/tmp", ReviewConfig(max_per_tick=5, scan_cap=5)
         )
