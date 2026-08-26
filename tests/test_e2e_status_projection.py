@@ -27,6 +27,8 @@ from axe_playwright_python.sync_playwright import Axe
 
 sync_api = pytest.importorskip("playwright.sync_api")
 
+pytestmark = pytest.mark.e2e
+
 APP = Path(__file__).resolve().parents[1] / "app.py"
 
 
@@ -40,20 +42,50 @@ def _chromium_installed() -> bool:
         return False
 
 
-# Skip the whole module *before* the fixture spawns Streamlit when the browser is
-# absent (e.g. the required CI gate, which does not install browsers). A dedicated
-# informational CI step runs `python -m playwright install chromium` first, so the
-# E2E actually executes there without being able to destabilise the merge gate.
-if not _chromium_installed():
-    pytest.skip("Playwright Chromium browser is not installed", allow_module_level=True)
+@pytest.fixture(scope="module", autouse=True)
+def _require_chromium():
+    """Keep E2E nodeids collectable while skipping execution without Chromium."""
+    if not _chromium_installed():
+        pytest.skip("Playwright Chromium browser is not installed")
+
 
 # A known, tiny store whose statuses include the previously-invisible `Blocked`.
 FIXTURE_TASKS = [
-    {"id": "t1", "project": "AICC", "title": "Backlog one", "goal": "g", "status": "Backlog"},
-    {"id": "t2", "project": "AICC", "title": "Backlog two", "goal": "g", "status": "Backlog"},
-    {"id": "t3", "project": "AICC", "title": "Blocked one", "goal": "g", "status": "Blocked"},
-    {"id": "t4", "project": "AICC", "title": "Blocked two", "goal": "g", "status": "Blocked"},
-    {"id": "t5", "project": "AICC", "title": "Blocked three", "goal": "g", "status": "Blocked"},
+    {
+        "id": "t1",
+        "project": "AICC",
+        "title": "Backlog one",
+        "goal": "g",
+        "status": "Backlog",
+    },
+    {
+        "id": "t2",
+        "project": "AICC",
+        "title": "Backlog two",
+        "goal": "g",
+        "status": "Backlog",
+    },
+    {
+        "id": "t3",
+        "project": "AICC",
+        "title": "Blocked one",
+        "goal": "g",
+        "status": "Blocked",
+    },
+    {
+        "id": "t4",
+        "project": "AICC",
+        "title": "Blocked two",
+        "goal": "g",
+        "status": "Blocked",
+    },
+    {
+        "id": "t5",
+        "project": "AICC",
+        "title": "Blocked three",
+        "goal": "g",
+        "status": "Blocked",
+    },
     {"id": "t6", "project": "AICC", "title": "Done one", "goal": "g", "status": "Done"},
 ]
 BLOCKED_COUNT = sum(1 for t in FIXTURE_TASKS if t["status"] == "Blocked")
@@ -80,14 +112,24 @@ def live_app(tmp_path_factory):
     }
     proc = subprocess.Popen(
         [
-            sys.executable, "-m", "streamlit", "run", str(APP),
-            "--server.port", str(port),
-            "--server.address", "127.0.0.1",
-            "--server.headless", "true",
-            "--browser.gatherUsageStats", "false",
+            sys.executable,
+            "-m",
+            "streamlit",
+            "run",
+            str(APP),
+            "--server.port",
+            str(port),
+            "--server.address",
+            "127.0.0.1",
+            "--server.headless",
+            "true",
+            "--browser.gatherUsageStats",
+            "false",
         ],
-        env=env, cwd=str(APP.parent),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=env,
+        cwd=str(APP.parent),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
     url = f"http://127.0.0.1:{port}"
     try:
@@ -157,7 +199,12 @@ def _dashboard_action_names(surface, *, timeout: int = 90000) -> list[str]:
         for name in action_names
         if any(
             marker in name
-            for marker in ("Быстро:", "arrow_forward", "Открыть Execution Center", "Открыть задачу")
+            for marker in (
+                "Быстро:",
+                "arrow_forward",
+                "Открыть Execution Center",
+                "Открыть задачу",
+            )
         )
     ]
 
@@ -166,7 +213,9 @@ def test_dashboard_action_probe_waits_for_incremental_streamlit_render():
     with sync_api.sync_playwright() as pw:
         browser = pw.chromium.launch()
         page = browser.new_page(viewport={"width": 320, "height": 800})
-        page.set_content("<main data-testid='stMain'><h2>Очередь выполнения</h2></main>")
+        page.set_content(
+            "<main data-testid='stMain'><h2>Очередь выполнения</h2></main>"
+        )
         page.evaluate(
             "setTimeout(() => {"
             "const status = document.createElement('div');"
@@ -180,7 +229,9 @@ def test_dashboard_action_probe_waits_for_incremental_streamlit_render():
         )
 
         surface = page.locator("[data-testid='stMain']")
-        assert _dashboard_action_names(surface, timeout=5000) == ["Быстро: новая задача"]
+        assert _dashboard_action_names(surface, timeout=5000) == [
+            "Быстро: новая задача"
+        ]
         assert surface.locator("[role='status']").count() == 1
         browser.close()
 
@@ -199,7 +250,9 @@ def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
         assert surface.locator("[role='status']").count() >= 1
         assert surface.locator("[role='progressbar']").count() >= 1
         assert surface.locator("svg[role='img'][aria-label]").count() >= 1
-        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
 
         assert dashboard_action_names
         assert len(dashboard_action_names) == len(set(dashboard_action_names))
@@ -216,7 +269,9 @@ def test_dashboard_keyboard_semantics_and_320px_reflow(live_app):
 
         page.set_viewport_size({"width": 640, "height": 800})
         page.evaluate("document.documentElement.style.fontSize = '200%'")
-        assert page.evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        assert page.evaluate(
+            "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+        )
         browser.close()
 
 
@@ -231,7 +286,9 @@ def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
         # Streamlit keeps the parent document across Python reruns. Reinstalling
         # the shell repair must disconnect the previous observer instead of
         # accumulating one callback per rerun.
-        initial_installs = page.evaluate("window.__aiccAccessibilityRepair.installCount")
+        initial_installs = page.evaluate(
+            "window.__aiccAccessibilityRepair.installCount"
+        )
         page.get_by_role("button", name="Проекты", exact=True).click()
         page.get_by_text("Обзор всех проектов", exact=False).first.wait_for()
         page.get_by_role("button", name="Обзор", exact=True).click()
@@ -244,7 +301,10 @@ def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
             "window.__aiccInstallAccessibilityRepair();"
             "window.__aiccInstallAccessibilityRepair();"
         )
-        assert page.evaluate("window.__aiccAccessibilityRepair.installCount") == initial_installs + 2
+        assert (
+            page.evaluate("window.__aiccAccessibilityRepair.installCount")
+            == initial_installs + 2
+        )
         assert page.evaluate("window.__aiccAccessibilityRepair.activeObservers") == 1
         page.evaluate("window.__aiccAccessibilityRepair.callbackCount = 0")
         page.evaluate(
@@ -261,13 +321,18 @@ def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
             "link.textContent = 'Руководство оператора';"
             "document.querySelector('h2').appendChild(link);"
         )
-        meaningful_link = page.get_by_role("link", name="Руководство оператора", exact=True)
+        meaningful_link = page.get_by_role(
+            "link", name="Руководство оператора", exact=True
+        )
         meaningful_link.wait_for()
         assert meaningful_link.get_attribute("aria-hidden") is None
-        assert page.get_by_role(
-            "button",
-            name=re.compile(r"^(Скрыть|Показать|Открыть) навигацию$"),
-        ).count() == 1
+        assert (
+            page.get_by_role(
+                "button",
+                name=re.compile(r"^(Скрыть|Показать|Открыть) навигацию$"),
+            ).count()
+            == 1
+        )
 
         results = Axe().run(
             page,
@@ -286,15 +351,21 @@ def test_dashboard_has_no_serious_live_accessibility_defects(live_app):
         ]
         residuals = {
             "axe_serious": [violation["id"] for violation in serious],
-            "empty_checkbox_names": page.get_by_role("checkbox", name="", exact=True).count(),
-            "focusable_sections": page.locator("section[tabindex]:not([tabindex='-1'])").count(),
+            "empty_checkbox_names": page.get_by_role(
+                "checkbox", name="", exact=True
+            ).count(),
+            "focusable_sections": page.locator(
+                "section[tabindex]:not([tabindex='-1'])"
+            ).count(),
             "decorative_heading_links": page.locator(
                 "[data-testid='stHeaderActionElements'] a:not([aria-hidden='true']), "
                 "a[data-testid='stHeaderActionElements']:not([aria-hidden='true'])"
             ).count(),
             "icon_names_in_buttons": page.get_by_role(
                 "button",
-                name=re.compile(r"(arrow_forward|task_alt|refresh|settings|delete|close)"),
+                name=re.compile(
+                    r"(arrow_forward|task_alt|refresh|settings|delete|close)"
+                ),
             ).count(),
         }
         assert residuals == {
