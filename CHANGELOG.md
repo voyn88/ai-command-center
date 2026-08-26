@@ -8,6 +8,17 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Decided — the Streamlit console's remote-identity gate (`VOYN-W0-AICC-CONSOLE-NO-AUTH`)
+
+[ADR-0011](docs/adr/0011-streamlit-console-identity-boundary.md) records the decision the
+localhost-bind compensating control (`VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH`, #314) left open: no
+external Streamlit deployment is planned today, and none is authorized by a bind flag alone. If
+remote reachability is ever proposed, it must ship with an identity-aware reverse proxy in front of
+Streamlit authenticated through the same AIOS-identity boundary already accepted for the mutating
+HTTP surface (`command_center/http_auth/`, `VOYN-W0-AICC-AUTH-HTTP-01`) — not a new mechanism built
+for Streamlit, and not deferred to an uncommitted web-client rewrite. No code changes ship with this
+decision; it is the standing justification for rejecting a future bind-only widening in review.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
