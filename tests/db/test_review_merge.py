@@ -2438,3 +2438,34 @@ def test_rerun_budget_is_per_head_across_duplicate_tasks(rig, monkeypatch):  # n
                 app_factory, "/tmp", task, pr, head, 3
             )
     assert len(reruns) == 3  # cap holds across BOTH tasks
+
+
+def test_persistent_dispatch_failures_stop_writing_at_the_hard_ceiling(rig, monkeypatch):  # noqa: F811, E501
+    """Verification finding on 8ea1251: clean dispatch failures refunded
+    every reservation, so ledger rows and audit events grew one pair per
+    tick, forever. Total reservations per head are hard-capped at cap*5:
+    after that the reconcile writes nothing and reports exhausted."""
+    app_factory, store, _ = rig
+    pr = "https://github.com/x/y/pull/34"
+    _ready(store, app_factory, "VOYN-W0-M1P", pr)
+    head = "f" * 40
+    monkeypatch.setattr(
+        review_merge,
+        "_rerun_failing_acceptance_gate",
+        lambda repo, prq, sha: "not_dispatched",
+    )
+    results = [
+        review_merge._reconcile_stale_acceptance_gate(
+            app_factory, "/tmp", "VOYN-W0-M1P", pr, head, 3
+        )
+        for _ in range(20)
+    ]
+    assert results.count("acceptance_gate_rerun_dispatch_failed") == 15  # 3*5
+    assert results.count("acceptance_gate_rerun_exhausted") == 5
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance'",
+            ("VOYN-W0-M1P",),
+        )
+        assert cur.fetchone()[0] == 30  # 15 reservations + 15 refunds, then flat

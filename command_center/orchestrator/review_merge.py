@@ -1893,6 +1893,15 @@ def _reconcile_stale_acceptance_gate(
     on 6b74c6a). The reservation row still lives under the reconciling
     task for auditability; the LIKE scan spans every task's rows because
     the head sha inside the value is the true identity.
+
+    TOTAL reservations per head are hard-capped at ``cap * 5`` regardless
+    of refunds (verification finding on 8ea1251: a persistent clean
+    dispatch failure refunded every reservation, so the try/fail pairs --
+    and their audit events -- grew without bound, one pair per tick,
+    forever). Once the ceiling is hit the reconcile stops writing anything
+    and reports ``acceptance_gate_rerun_exhausted``: at that point the
+    dispatch path has failed cleanly many times over and a human should
+    look, not the ledger.
     """
     prefix_try = f"gate_rerun:{head}:"
     prefix_fail = f"gate_rerun_fail:{head}:"
@@ -1920,6 +1929,9 @@ def _reconcile_stale_acceptance_gate(
                     (f"gate_rerun:{head}",),
                 )
                 tries, refunds = _counts(cur)
+                if tries >= cap * 5:
+                    conn.rollback()
+                    return "acceptance_gate_rerun_exhausted"
                 if tries - refunds >= cap:
                     conn.rollback()
                     return "acceptance_gate_rerun_capped"
