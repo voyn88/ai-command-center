@@ -179,7 +179,11 @@ section below for why it exists at all):
   read-only query of the `voyn_coordination.writer_lease` authority that
   refuses a mutating dispatch into a worktree another writer holds; it owns no
   lease state and never acquires) — clients of the PL/pgSQL queue authority
-  accepted via VOYN-W0-AICC-SRV-03/04b. The bridge executes through the
+  accepted via VOYN-W0-AICC-SRV-03/04b. The writer lease (SRV-04a) and the
+  queue claim (SRV-04b) are two separately-reasoned authorities that compose
+  rather than nest; see
+  [ADR-0011](adr/0011-writer-lease-vs-queue-claim-scope.md) for the split.
+  The bridge executes through the
   frozen runner (`agent_runner.run_claude_code`) unchanged — sandbox
   profiles, credential scrubbing and timeouts stay the legacy engine's
   decisions; the bridge owns only payload validation and outcome folding.
