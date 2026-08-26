@@ -525,6 +525,7 @@ _OPERATOR_FUNCTIONS = (
     "enroll_mint_ticket(text, text, text, inet, interval, text)",
     "enroll_revoke_ticket(text, text)",
     "enroll_sweep_expired()",
+    "identity_backfill_worker_role(text, text)",
     "identity_revoke_principal(text, text)",
     "identity_sweep_expired()",
 )
@@ -855,9 +856,21 @@ def render_worker_host_role(role: str) -> list[str]:
     password makes `work_attempt.claimed_by_role` uninformative and turns the
     compromise of any execution host into the compromise of all of them.
 
-    No new identity machinery is needed for this — role membership already
-    carries the grants, and revoking a host is `ALTER ROLE ... NOLOGIN`. No
-    password is rendered here, for the reason `render_role_creation()` gives.
+    Role membership already carries the grants, and revoking a host is
+    `ALTER ROLE ... NOLOGIN`. No password is rendered here, for the reason
+    `render_role_creation()` gives.
+
+    VOYN-W0-AICC-SRV-02-MIGRATION: this is the "hand-provisioned host" path
+    0003's `identity_create_worker_role()` comment names as the thing it
+    mirrors — and until this change it was the one way to produce an
+    `aicc_worker` role with no matching `principal` row, invisible to
+    `identity_revoke_principal()`, `identity_sweep_expired()`, and the
+    `work_attempt.claimed_by_role` join 0002's header anticipates. The second
+    statement below closes that at the source, via the same
+    `identity_backfill_worker_role()` an operator would otherwise have to call
+    by hand (`0015_principal_worker_role_backfill.up.sql`). Guarded by
+    `to_regclass`, not assumed present, so this still renders correctly against
+    a database that has not been migrated past 0002 yet.
     """
     _require_identifier(role)
     return [
@@ -867,7 +880,16 @@ def render_worker_host_role(role: str) -> list[str]:
         f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
         "    END IF;\n"
         "END\n"
-        "$$;"
+        "$$;",
+        "DO $$\n"
+        "BEGIN\n"
+        "    IF to_regclass('public.principal') IS NOT NULL\n"
+        "       AND to_regprocedure('public.identity_backfill_worker_role(text, text)')"
+        " IS NOT NULL THEN\n"
+        f"        PERFORM identity_backfill_worker_role('{role}');\n"
+        "    END IF;\n"
+        "END\n"
+        "$$;",
     ]
 
 
