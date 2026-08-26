@@ -72,6 +72,7 @@ import urllib.error
 import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,11 @@ class ReviewConfig:
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
     max_branch_updates_per_tick: int = 3
+    #: Per-head cap on Acceptance-gate reruns issued by the merge tick's
+    #: reconcile step (VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY). A gate that is
+    #: still red after this many reruns is genuinely refusing, not stale --
+    #: hammering it further would only mask a real refusal as latency.
+    max_gate_reruns_per_head: int = 3
 
 
 @dataclass
@@ -1236,7 +1242,7 @@ def _remediate_rejection(
             conn.autocommit = True
 
 
-def _rerun_failing_acceptance_gate(repo_path: str, pr_url: str, sha: str) -> None:
+def _rerun_failing_acceptance_gate(repo_path: str, pr_url: str, sha: str) -> str:
     """After posting the marker, re-run the Acceptance-gate run that failed on
     this PR's exact head before the marker existed.
 
@@ -1250,32 +1256,38 @@ def _rerun_failing_acceptance_gate(repo_path: str, pr_url: str, sha: str) -> Non
     now-present marker and go green. The lookup is scoped to the PR's own head
     branch, so a different PR that happens to share the head sha (a different
     base branch) is never touched and the run-list window cannot be exhausted
-    by unrelated PRs' runs on an active repo. Best-effort and idempotent -- any
-    failure just leaves the event-driven or a manual re-run to cover it.
-    (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
+    by unrelated PRs' runs on an active repo. Idempotent. Three-valued
+    outcome for budget-metering callers (verification findings on 862ad82
+    and 439347c): "dispatched" -- a matching stale run was found and `gh
+    run rerun` accepted; "not_dispatched" -- the failure provably happened
+    BEFORE any dispatch could reach GitHub (view/list/parse failure, or no
+    matching run), safe to refund; "ambiguous" -- `gh run rerun` itself
+    returned nonzero, which may follow a server-side accept, so a metering
+    caller must keep its reservation spent. Callers without a budget treat
+    anything but "dispatched" as a best-effort no-op. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
     """
     view = _gh(["pr", "view", pr_url, "--json", "headRefName"], repo_path)
     if view.returncode != 0:
-        return
+        return "not_dispatched"
     try:
         branch = (json.loads(view.stdout or "{}")).get("headRefName")
     except json.JSONDecodeError:
-        return
+        return "not_dispatched"
     if not branch:
-        return
+        return "not_dispatched"
     listing = _gh(
         ["run", "list", "--workflow", "acceptance-gate.yml", "--branch", branch,
          "--limit", "30", "--json", "databaseId,headSha,event,conclusion,status"],
         repo_path,
     )
     if listing.returncode != 0:
-        return
+        return "not_dispatched"
     try:
         runs = json.loads(listing.stdout or "[]")
     except json.JSONDecodeError:
-        return
+        return "not_dispatched"
     if not isinstance(runs, list):
-        return
+        return "not_dispatched"
     for run in runs:
         if (
             isinstance(run, dict)
@@ -1284,8 +1296,9 @@ def _rerun_failing_acceptance_gate(repo_path: str, pr_url: str, sha: str) -> Non
             and run.get("status") == "completed"
             and run.get("conclusion") != "success"
         ):
-            _gh(["run", "rerun", str(run.get("databaseId"))], repo_path)
-            return
+            rerun = _gh(["run", "rerun", str(run.get("databaseId"))], repo_path)
+            return "dispatched" if rerun.returncode == 0 else "ambiguous"
+    return "not_dispatched"
 
 
 def _verified_rejection_outcome(
@@ -1585,6 +1598,19 @@ def publish_review_verdicts(
 # -- Part 3: merge ------------------------------------------------------------
 
 
+#: The exact check name acceptance-gate.yml's job reports. A repository
+#: contract, like the squash-subject `(#N)` suffix in
+#: `assert_independent_acceptance.py`: renaming the workflow job without
+#: updating this constant makes the stale-red classifier stop matching --
+#: the fail-SAFE direction (passive checks_not_green skip), never a rerun
+#: of the wrong workflow. Exact equality, not substring (verification
+#: finding on 282c11f: a hypothetical sibling check like "Acceptance gate
+#: integration" would classify as stale-red yet the reconciler can only
+#: rerun acceptance-gate.yml -- burning budget while the actual blocking
+#: check stays untouched).
+_ACCEPTANCE_GATE_CHECK_NAME = "Acceptance gate (independent verdict on exact SHA)"
+
+
 def _check_is_green(check: dict[str, Any]) -> bool:
     """A single `statusCheckRollup` entry is green iff it is DEFINITIVELY
     successful -- never on absence of information. GitHub's rollup mixes two
@@ -1671,6 +1697,34 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
+        # VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY: an independent ACCEPT marker
+        # stands on this exact head, yet the ONLY non-green check(s) are the
+        # Acceptance gate itself -- the signature of a stale pull_request-
+        # triggered gate run from before the marker existed (measured live on
+        # #382: marker 03:00Z, gate re-run only at 09:15Z, merged 09:21Z --
+        # a 6.3h tail whose verdict had been ready in 36 minutes). Surface it
+        # as its own reason so merge_once can re-drive the gate instead of
+        # skipping passively for hours. The name is matched EXACTLY against
+        # `_ACCEPTANCE_GATE_CHECK_NAME` -- see that constant for why
+        # substring matching was retired here too. "Definitively red" means a COMPLETED
+        # run with a real failing conclusion, nothing less (verification
+        # finding 1 on 8208ede: a PENDING CheckRun has conclusion None, which
+        # the first cut treated as definitive -- it burned a rerun attempt on
+        # a run `_rerun_failing_acceptance_gate` cannot even rerun, since the
+        # helper requires status completed). Excluded and left to the plain
+        # passive fail-closed skip: conclusion None (still queued/running, or
+        # a legacy StatusContext shape) and AMBIGUOUS (the synthetic
+        # conclusion `_latest_checks_by_name` mints for un-orderable
+        # duplicate runs -- "the red run is stale" is not a fact we hold).
+        gate_definitively_red = [
+            c
+            for c in rollup
+            if not _check_is_green(c)
+            and str(c.get("name") or "") == _ACCEPTANCE_GATE_CHECK_NAME
+            and c.get("conclusion") not in (None, "AMBIGUOUS")
+        ]
+        if len(gate_definitively_red) == len(bad):
+            return False, f"acceptance_gate_stale_red:{head}"
         return False, f"checks_not_green: {bad[:3]}"
     return True, head
 
@@ -1798,6 +1852,143 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     return f"flaky_rerun_dispatched:{dispatched}" if dispatched else ""
 
 
+def _reconcile_stale_acceptance_gate(
+    factory: Any, repo_path: str, task_id: str, pr_url: str, head: str, cap: int
+) -> str:
+    """Re-drive a stale-red Acceptance gate the merge tick found blocking an
+    already-accepted head (VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY).
+
+    `publish_review_verdicts` already issues one best-effort re-run right
+    after posting the marker -- but exactly once, and when that single
+    `gh run rerun` fails or races, nothing ever retries: the required check
+    stays red and the PR sits accepted-and-green-but-unmerged for hours
+    (p95 4.87h vs a 0.3h median over the 40 merged PRs measured 2026-08-26).
+    The merge tick runs every 5 minutes anyway, so it is the natural retry
+    point. Bounded per head through `backlog_evidence` rows (kind
+    'acceptance', value ``gate_rerun:<head>:<n>``) -- persistent across
+    ticks and process restarts, so a genuinely refusing gate is retried at
+    most `cap` times, then left to a human.
+
+    The budget is an append-only reserve/refund ledger under a per-(task,
+    head) advisory xact lock, because a dispatch to GitHub cannot join the
+    database transaction and BOTH orderings of a naive two-phase flow were
+    (correctly) rejected by verification: record-then-dispatch burned the
+    budget on transient gh failures (finding on 8208ede), and
+    dispatch-then-record could exceed the cap when a crash landed between
+    the dispatch and the row (finding on 746d8e4). So: a ``gate_rerun``
+    reservation row commits BEFORE the dispatch -- a crash after dispatch
+    leaves it counted, the cap can never be exceeded -- and a CLEAN
+    dispatch failure appends a matching ``gate_rerun_fail`` refund row, so
+    transient gh failures spend nothing. Spent budget = reservations minus
+    refunds. The only path that burns an attempt without a rerun is a
+    crash between the committed reservation and the dispatch -- the
+    fail-closed direction, bounded at one per crash. Rows are only ever
+    appended through ``backlog_record_evidence`` (idempotent by UNIQUE);
+    the advisory lock serialises concurrent reconcilers so indices never
+    collide (finding 2 on 8208ede stays closed). Both the lock and the
+    ledger scan are keyed by HEAD ALONE, not (task, head): duplicate
+    READY_TO_REVIEW tasks legitimately share one PR (this repository's own
+    remediation chains do), and a per-task budget would let each of them
+    independently spend `cap` reruns on the same head (verification finding
+    on 6b74c6a). The reservation row still lives under the reconciling
+    task for auditability; the LIKE scan spans every task's rows because
+    the head sha inside the value is the true identity.
+    """
+    prefix_try = f"gate_rerun:{head}:"
+    prefix_fail = f"gate_rerun_fail:{head}:"
+
+    def _counts(cur: Any) -> tuple[int, int]:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE kind = 'acceptance' AND value LIKE %s",
+            (prefix_try + "%",),
+        )
+        tries = int(cur.fetchone()[0])
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE kind = 'acceptance' AND value LIKE %s",
+            (prefix_fail + "%",),
+        )
+        return tries, int(cur.fetchone()[0])
+
+    with factory() as conn:
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (f"gate_rerun:{head}",),
+                )
+                tries, refunds = _counts(cur)
+                if tries - refunds >= cap:
+                    conn.rollback()
+                    return "acceptance_gate_rerun_capped"
+                reservation = tries + 1
+                cur.execute(
+                    "SELECT backlog_record_evidence(%s, 'acceptance', %s)",
+                    (task_id, f"{prefix_try}{reservation}"),
+                )
+            conn.commit()
+        finally:
+            conn.autocommit = True
+    outcome = _rerun_failing_acceptance_gate(repo_path, pr_url, head)
+    if outcome == "dispatched":
+        return "acceptance_gate_rerun_requeued"
+    if outcome == "ambiguous":
+        # `gh run rerun` returned nonzero AFTER the request may have reached
+        # GitHub (verification finding on 439347c): refunding here could let
+        # later ticks exceed the cap. The reservation stays spent -- the
+        # fail-closed direction: a rerun that did land turns the gate green
+        # and moots the budget; one that did not costs one attempt.
+        return "acceptance_gate_rerun_ambiguous"
+    if outcome == "not_dispatched":
+        with factory() as conn:
+            conn.autocommit = False
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"gate_rerun:{head}",),
+                    )
+                    cur.execute(
+                        "SELECT backlog_record_evidence(%s, 'acceptance', %s)",
+                        (task_id, f"{prefix_fail}{reservation}"),
+                    )
+                conn.commit()
+            finally:
+                conn.autocommit = True
+        return "acceptance_gate_rerun_dispatch_failed"
+    return "acceptance_gate_rerun_dispatch_failed"
+
+
+def _accept_marker_submitted_at(repo_path: str, pr_url: str) -> str:
+    """When the standing ACCEPT marker (same rule as `_pr_is_mergeable`:
+    latest review, marker on the PR's own head, independent login) exists,
+    its `submittedAt` -- the acceptance-tail telemetry's start-of-stage
+    timestamp. The head is read from the same view because by the time the
+    telemetry runs, the caller's sha is the TARGET-BRANCH merge commit, not
+    the reviewed head. Empty string when unavailable; telemetry is
+    best-effort and must never block a merge."""
+    view = _gh(
+        ["pr", "view", pr_url, "--json", "reviews,author,headRefOid"], repo_path
+    )
+    if view.returncode != 0:
+        return ""
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    reviews = data.get("reviews") or []
+    head = str(data.get("headRefOid") or "")
+    author_login = (data.get("author") or {}).get("login")
+    if not _accept_marker_on_latest_review(reviews, head, author_login):
+        return ""
+    latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
+    return str(latest.get("submittedAt") or "")
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
@@ -1837,6 +2028,27 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         if merge_sha is None:
             ready, detail = _pr_is_mergeable(repo_path, pr_url)
             if not ready:
+                # An accepted head blocked ONLY by a stale-red Acceptance
+                # gate is the merge tick's business after all: re-drive the
+                # gate (bounded by the reserve/refund ledger) instead of
+                # skipping passively for hours.
+                # (VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY)
+                if detail.startswith("acceptance_gate_stale_red:"):
+                    stale_head = detail.split(":", 1)[1]
+                    report.skipped.append(
+                        (
+                            task_id,
+                            _reconcile_stale_acceptance_gate(
+                                factory,
+                                repo_path,
+                                task_id,
+                                pr_url,
+                                stale_head,
+                                cfg.max_gate_reruns_per_head,
+                            ),
+                        )
+                    )
+                    continue
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake
                     # window: retry the failed jobs once (attempt-bounded)
@@ -1889,6 +2101,33 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                 report.skipped.append((task_id, reason))
                 continue
         head = merge_sha  # the TARGET-BRANCH merge commit, never the PR head
+        # Acceptance-tail telemetry (VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY):
+        # verdict-marker time -> merge time, persisted with the DONE
+        # evidence so the tail is measurable from the store. The merge is
+        # already IRREVERSIBLE here: nothing between it and the DONE
+        # transition below may be able to raise. The blanket net is the
+        # invariant, not sloppiness -- two verification rounds proved
+        # narrow nets keep leaking (692ba90: aware-minus-naive TypeError;
+        # cee3a19: a null review entry raising inside the marker lookup),
+        # and every leak strands a merged PR without evidence or DONE.
+        # Telemetry that cannot be computed is simply not recorded.
+        merged_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        latency_value = ""
+        try:
+            marker_at = _accept_marker_submitted_at(repo_path, pr_url)
+        except Exception:  # noqa: BLE001 -- see invariant note above
+            marker_at = ""
+        if marker_at:
+            try:
+                marker_dt = datetime.fromisoformat(marker_at.replace("Z", "+00:00"))
+                if marker_dt.tzinfo is None:
+                    marker_dt = marker_dt.replace(tzinfo=timezone.utc)
+                seconds = int(
+                    (datetime.fromisoformat(merged_at) - marker_dt).total_seconds()
+                )
+                latency_value = f"latency:{head}:{marker_at}:{merged_at}:{seconds}"
+            except (ValueError, TypeError):
+                latency_value = ""
         # Evidence and the DONE transition are one act: the sha row and the
         # status move commit together or not at all (an explicit transaction,
         # since the app factory is autocommit). backlog_transition's third
@@ -1913,6 +2152,11 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     cur.execute(
                         "SELECT backlog_record_evidence(%s, 'sha', %s)", (task_id, head)
                     )
+                    if latency_value:
+                        cur.execute(
+                            "SELECT backlog_record_evidence(%s, 'acceptance', %s)",
+                            (task_id, latency_value),
+                        )
                     cur.execute(
                         "SELECT ok, reason FROM backlog_transition(%s, 'DONE', %s)",
                         (task_id, revision),

@@ -357,13 +357,28 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
     """The `"cceptance" not in name` exclusion is gone: a red Acceptance
     gate check blocks merge like any other required check, now that the
     bot behind it is reconnected and the check can genuinely reflect an
-    independent verdict rather than being permanently, structurally red."""
+    independent verdict rather than being permanently, structurally red.
+
+    Since VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY the block is active rather
+    than passive: with a standing independent marker and the gate as the
+    only red check, the merge tick re-drives the stale gate run instead of
+    skipping for hours -- but it still NEVER merges around the red check."""
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M1D", "https://github.com/x/y/pull/23")
     head = "2" * 40
 
     def fake_gh(argv, repo):
         import subprocess
+        if argv[:2] == ["pr", "view"] and "headRefName" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"headRefName": "backlog/task-d"}), ""
+            )
+        if argv[:2] == ["run", "list"]:
+            runs = [{"databaseId": 55, "headSha": head, "event": "pull_request",
+                     "status": "completed", "conclusion": "failure"}]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(runs), "")
+        if argv[:2] == ["run", "rerun"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
             "author": {"login": "dimastov-lab"},
@@ -380,10 +395,14 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
+    assert not report.merged
     assert any(
-        task_id == "VOYN-W0-M1D" and reason.startswith("checks_not_green")
+        task_id == "VOYN-W0-M1D" and reason == "acceptance_gate_rerun_requeued"
         for task_id, reason in report.skipped
     )
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1D",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
 def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
@@ -909,8 +928,8 @@ def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
             "state": "OPEN", "headRefOid": head,
             "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
             "statusCheckRollup": [
-                {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:29Z"},
-                {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T05:25:43Z"},
+                {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:29Z"},
+                {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "FAILURE", "startedAt": "2026-08-23T05:25:43Z"},
             ],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -918,7 +937,10 @@ def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     ready, reason = review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10")
     assert not ready
-    assert reason == "checks_not_green: ['Acceptance gate']"
+    # Since VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY a definitively-red latest
+    # gate run under a standing marker surfaces as the reconcile reason (the
+    # merge tick re-drives it, bounded) -- but it still never merges.
+    assert reason == f"acceptance_gate_stale_red:{head}"
 
 
 @pytest.mark.parametrize(
@@ -1940,3 +1962,479 @@ def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-MY", "merged_without_acceptance_evidence") in report.skipped
     assert not report.merged
+
+
+# --- acceptance-tail reconcile + telemetry (VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY)
+
+
+def test_stale_red_acceptance_gate_is_rerun_and_capped(rig, monkeypatch):  # noqa: F811
+    """An accepted head whose ONLY red check is the Acceptance gate gets the
+    gate re-driven by the merge tick — bounded at max_gate_reruns_per_head
+    across ticks via persistent evidence rows, and never merged around."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1E", "https://github.com/x/y/pull/24")
+    head = "3" * 40
+    reruns = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"] and "headRefName" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"headRefName": "backlog/task-x"}), ""
+            )
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "author": {"login": "dimastov-lab"},
+                "reviews": [{
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "author": {"login": "voyn88-acceptance-gate[bot]"},
+                }],
+                "statusCheckRollup": [
+                    {"name": "CI", "conclusion": "SUCCESS"},
+                    {"name": "Acceptance gate (independent verdict on exact SHA)",
+                     "conclusion": "FAILURE"},
+                ],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "list"]:
+            runs = [{"databaseId": 77, "headSha": head, "event": "pull_request",
+                     "status": "completed", "conclusion": "failure"}]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(runs), "")
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    for expected_attempts in (1, 2, 3):
+        report = merge_once(app_factory, "/tmp")
+        assert not report.merged
+        assert ("VOYN-W0-M1E", "acceptance_gate_rerun_requeued") in report.skipped
+        assert len(reruns) == expected_attempts
+    # Fourth tick: the persistent per-head budget is spent — no more reruns,
+    # the genuinely refusing gate is left for a human.
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1E", "acceptance_gate_rerun_capped") in report.skipped
+    assert len(reruns) == 3
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' AND value LIKE %s",
+            ("VOYN-W0-M1E", f"gate_rerun:{head}:%"),
+        )
+        assert cur.fetchone()[0] == 3
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1E",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_stale_gate_reconcile_needs_the_gate_to_be_the_only_red_check(rig, monkeypatch):  # noqa: F811, E501
+    """CI red alongside the gate: re-driving the gate could not make the PR
+    mergeable, so the tick keeps the plain passive skip and spends nothing."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1F", "https://github.com/x/y/pull/25")
+    head = "5" * 40
+    reruns = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            }],
+            "statusCheckRollup": [
+                {"name": "CI", "conclusion": "FAILURE"},
+                {"name": "Acceptance gate (independent verdict on exact SHA)",
+                 "conclusion": "FAILURE"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert any(
+        task_id == "VOYN-W0-M1F" and reason.startswith("checks_not_green")
+        for task_id, reason in report.skipped
+    )
+    assert reruns == []
+
+
+def test_merge_records_acceptance_latency_evidence(rig, monkeypatch):  # noqa: F811
+    """A successful merge persists the verdict-marker -> merge latency with
+    the DONE evidence, so the acceptance tail is measurable from the store.
+    Queue-aware: the fake reports MERGED with its merge commit after the
+    merge call, per MERGE-DONE-BEFORE-TARGET-VERIFY."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1G", "https://github.com/x/y/pull/26")
+    head, merge_oid = "6" * 40, "a1" * 20
+    marker_at = "2026-08-26T03:00:09Z"
+    state = {"merged": False}
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED" if state["merged"] else "OPEN",
+                "mergeCommit": {"oid": merge_oid} if state["merged"] else None,
+                "headRefOid": head,
+                "author": {"login": "dimastov-lab"},
+                "reviews": [{
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    "submittedAt": marker_at,
+                }],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "merge"]:
+            state["merged"] = True
+            return subprocess.CompletedProcess(argv, 0, "merged", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1G", merge_oid) in report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT value FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' AND value LIKE 'latency:%%'",
+            ("VOYN-W0-M1G",),
+        )
+        rows = cur.fetchall()
+        assert len(rows) == 1
+        parts = rows[0][0].split(":")
+        assert parts[0] == "latency" and parts[1] == merge_oid
+        assert marker_at.replace("Z", "") in rows[0][0]
+        assert int(rows[0][0].rsplit(":", 1)[1]) >= 0
+
+def test_pending_acceptance_gate_is_not_stale_red_and_burns_no_attempt(rig, monkeypatch):  # noqa: F811, E501
+    """Verification finding 1 on 8208ede: a still-running gate run has
+    conclusion None — not a completed red run. It must take the plain
+    passive skip, never the reconcile path (whose rerun helper requires a
+    completed run anyway), and must not burn a rerun attempt."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1H", "https://github.com/x/y/pull/27")
+    head = "7" * 40
+    reruns = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            }],
+            "statusCheckRollup": [
+                {"name": "CI", "conclusion": "SUCCESS"},
+                {"name": "Acceptance gate (independent verdict on exact SHA)",
+                 "status": "IN_PROGRESS"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert not report.merged
+    assert any(
+        task_id == "VOYN-W0-M1H" and reason.startswith("checks_not_green")
+        for task_id, reason in report.skipped
+    )
+    assert reruns == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance'",
+            ("VOYN-W0-M1H",),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_gate_rerun_cap_holds_under_concurrent_reconcilers(rig, monkeypatch):  # noqa: F811, E501
+    """Verification finding 2 on 8208ede: concurrent reconcilers used to
+    read the same pre-transaction count, collide on the (idempotent-by-
+    UNIQUE) evidence value, and BOTH issue a rerun — exceeding the cap.
+    Under the advisory-lock claim, N concurrent calls with cap=3 yield
+    exactly 3 distinct attempt rows and exactly 3 reruns."""
+    import threading
+
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1I", "https://github.com/x/y/pull/28")
+    head = "8" * 40
+    reruns = []
+    monkeypatch.setattr(
+        review_merge,
+        "_rerun_failing_acceptance_gate",
+        lambda repo, pr, sha: (reruns.append(sha), "dispatched")[1],
+    )
+    results = []
+
+    def call():
+        results.append(
+            review_merge._reconcile_stale_acceptance_gate(
+                app_factory, "/tmp", "VOYN-W0-M1I",
+                "https://github.com/x/y/pull/28", head, 3,
+            )
+        )
+
+    threads = [threading.Thread(target=call) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(results) == [
+        "acceptance_gate_rerun_capped",
+        "acceptance_gate_rerun_capped",
+        "acceptance_gate_rerun_requeued",
+        "acceptance_gate_rerun_requeued",
+        "acceptance_gate_rerun_requeued",
+    ]
+    assert len(reruns) == 3
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT value FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' ORDER BY value",
+            ("VOYN-W0-M1I",),
+        )
+        values = [r[0] for r in cur.fetchall()]
+        assert values == [f"gate_rerun:{head}:1", f"gate_rerun:{head}:2", f"gate_rerun:{head}:3"]
+
+
+def test_failed_rerun_dispatch_does_not_consume_the_budget(rig, monkeypatch):  # noqa: F811, E501
+    """Verification finding on 862ad82: a transient gh failure used to burn
+    a persistent attempt without any rerun dispatched — three hiccups could
+    permanently cap an accepted PR. A failed dispatch now rolls the claim
+    back, reports its own reason, and the budget stays intact for the next
+    tick."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1J", "https://github.com/x/y/pull/29")
+    head = "9" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"] and "headRefName" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"headRefName": "backlog/task-j"}), ""
+            )
+        if argv[:2] == ["run", "list"]:
+            return subprocess.CompletedProcess(argv, 1, "", "transient")
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            }],
+            "statusCheckRollup": [
+                {"name": "CI", "conclusion": "SUCCESS"},
+                {"name": "Acceptance gate (independent verdict on exact SHA)",
+                 "conclusion": "FAILURE"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    for _ in range(4):  # more rounds than the cap: none may consume budget
+        report = merge_once(app_factory, "/tmp")
+        assert ("VOYN-W0-M1J", "acceptance_gate_rerun_dispatch_failed") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        # Every failed dispatch leaves a reservation AND its refund: spent
+        # budget stays zero, the audit trail of the attempts stays real.
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' AND value LIKE %s",
+            ("VOYN-W0-M1J", f"gate_rerun:{head}:%"),
+        )
+        assert cur.fetchone()[0] == 4
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' AND value LIKE %s",
+            ("VOYN-W0-M1J", f"gate_rerun_fail:{head}:%"),
+        )
+        assert cur.fetchone()[0] == 4
+
+
+def test_naive_marker_timestamp_never_aborts_post_merge_bookkeeping(rig, monkeypatch):  # noqa: F811, E501
+    """Verification finding on 692ba90: a timezone-naive submittedAt made
+    the latency subtraction raise TypeError AFTER the merge, so the DONE
+    transition never ran on an already-merged PR. Naive is treated as UTC:
+    the merge completes, the task goes DONE, the latency row still lands."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1K", "https://github.com/x/y/pull/30")
+    head, merge_oid = "b" * 40, "b2" * 20
+    state = {"merged": False}
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED" if state["merged"] else "OPEN",
+                "mergeCommit": {"oid": merge_oid} if state["merged"] else None,
+                "headRefOid": head,
+                "author": {"login": "dimastov-lab"},
+                "reviews": [{
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    "submittedAt": "2026-08-26T03:00:09",  # naive, no zone
+                }],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "merge"]:
+            state["merged"] = True
+            return subprocess.CompletedProcess(argv, 0, "merged", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1K", merge_oid) in report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1K",))
+        assert cur.fetchone()[0] == "DONE"
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' AND value LIKE 'latency:%%'",
+            ("VOYN-W0-M1K",),
+        )
+        assert cur.fetchone()[0] == 1
+
+def test_malformed_review_data_never_aborts_post_merge_bookkeeping(rig, monkeypatch):  # noqa: F811, E501
+    """Verification finding on cee3a19: a null entry in `reviews` raised
+    inside the telemetry marker lookup AFTER the irreversible merge, before
+    evidence and DONE. Telemetry that cannot be computed records nothing;
+    the merge still completes its bookkeeping."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1L", "https://github.com/x/y/pull/31")
+    head, merge_oid = "c" * 40, "c3" * 20
+    state = {"merged": False}
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"] and "reviews,author,headRefOid" in argv:
+            # telemetry's own lookup: malformed — a null review entry
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"reviews": [None], "author": {}}), ""
+            )
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED" if state["merged"] else "OPEN",
+                "mergeCommit": {"oid": merge_oid} if state["merged"] else None,
+                "headRefOid": head,
+                "author": {"login": "dimastov-lab"},
+                "reviews": [{
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    "submittedAt": "2026-08-26T03:00:09Z",
+                }],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "merge"]:
+            state["merged"] = True
+            return subprocess.CompletedProcess(argv, 0, "merged", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1L", merge_oid) in report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1L",))
+        assert cur.fetchone()[0] == "DONE"
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' AND value LIKE 'latency:%%'",
+            ("VOYN-W0-M1L",),
+        )
+        assert cur.fetchone()[0] == 0  # telemetry skipped, never fatal
+
+def test_ambiguous_rerun_dispatch_keeps_the_reservation_spent(rig, monkeypatch):  # noqa: F811, E501
+    """Verification finding on 439347c: nonzero from `gh run rerun` itself
+    may follow a server-side accept — refunding there could let later ticks
+    exceed the cap. Ambiguity keeps the reservation spent: three ambiguous
+    rounds exhaust the budget, no refunds appear, and the cap holds."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1M", "https://github.com/x/y/pull/32")
+    head = "d" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"] and "headRefName" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"headRefName": "backlog/task-m"}), ""
+            )
+        if argv[:2] == ["run", "list"]:
+            runs = [{"databaseId": 99, "headSha": head, "event": "pull_request",
+                     "status": "completed", "conclusion": "failure"}]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(runs), "")
+        if argv[:2] == ["run", "rerun"]:
+            return subprocess.CompletedProcess(argv, 1, "", "http 502")
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            }],
+            "statusCheckRollup": [
+                {"name": "CI", "conclusion": "SUCCESS"},
+                {"name": "Acceptance gate (independent verdict on exact SHA)",
+                 "conclusion": "FAILURE"},
+            ],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    for _ in range(3):
+        report = merge_once(app_factory, "/tmp")
+        assert ("VOYN-W0-M1M", "acceptance_gate_rerun_ambiguous") in report.skipped
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1M", "acceptance_gate_rerun_capped") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' AND value LIKE %s",
+            ("VOYN-W0-M1M", f"gate_rerun:{head}:%"),
+        )
+        assert cur.fetchone()[0] == 3
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence "
+            "WHERE task_id=%s AND kind='acceptance' AND value LIKE %s",
+            ("VOYN-W0-M1M", f"gate_rerun_fail:{head}:%"),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_rerun_budget_is_per_head_across_duplicate_tasks(rig, monkeypatch):  # noqa: F811, E501
+    """Verification finding on 6b74c6a: the cap was effectively
+    per-(task, head), so duplicate READY_TO_REVIEW tasks sharing one PR
+    (remediation chains do) could each spend `cap` reruns on the same
+    head. The ledger is keyed by head alone: two tasks together still
+    dispatch at most `cap` reruns."""
+    app_factory, store, _ = rig
+    pr = "https://github.com/x/y/pull/33"
+    _ready(store, app_factory, "VOYN-W0-M1N", pr)
+    _ready(store, app_factory, "VOYN-W0-M1O", pr)
+    head = "e" * 40
+    reruns = []
+    monkeypatch.setattr(
+        review_merge,
+        "_rerun_failing_acceptance_gate",
+        lambda repo, prq, sha: (reruns.append(sha), "dispatched")[1],
+    )
+    for task in ("VOYN-W0-M1N", "VOYN-W0-M1O"):
+        for _ in range(3):
+            review_merge._reconcile_stale_acceptance_gate(
+                app_factory, "/tmp", task, pr, head, 3
+            )
+    assert len(reruns) == 3  # cap holds across BOTH tasks
