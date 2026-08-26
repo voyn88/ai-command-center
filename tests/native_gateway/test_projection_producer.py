@@ -109,3 +109,37 @@ def test_artifact_survives_gateway_redaction_cleanly(tmp_path, monkeypatch):
     settings = GatewaySettings(projection_path=out, token_file=tmp_path / "unused")
     snapshot = FileProjectionSource(settings).load().snapshot
     assert snapshot.tasks[0].title == "Ship the thing"  # not [REDACTED]
+
+
+def test_dialogs_project_summaries_never_content(tmp_path, monkeypatch):
+    root = _seed_root(tmp_path, monkeypatch)
+    (root / "data/chats.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "c-1",
+                    "title": "Обсуждение дизайна",
+                    "updated_at": "2026-08-26T01:00:00",
+                    "messages": [
+                        {"role": "user", "content": "секретный вопрос про password"},
+                        {"role": "assistant", "content": "ответ"},
+                    ],
+                },
+                {
+                    "id": "c-2",
+                    "title": "Недельный бриф",
+                    "updated_at": "2026-08-26T02:00:00",
+                    "messages": [],
+                },
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    projection = build_projection(root)
+    dialogs = projection["dialogs"]
+    assert [d["id"] for d in dialogs] == ["c-2", "c-1"]  # newest first
+    assert dialogs[1]["message_count"] == 2
+    assert dialogs[1]["last_summary"] is None
+    # Raw message content must never appear anywhere in the projection.
+    assert "секретный" not in json.dumps(projection, ensure_ascii=False)
