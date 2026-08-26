@@ -819,3 +819,38 @@ def test_plan_once_reconciles_technical_parks_without_audit_spam(rig) -> None:
     report = plan_once(app_factory, PlanLimits(wip_limit=4, max_resumes_per_tick=0))
     assert report.resumed == []
     assert store.get_task("VOYN-W0-RZ")["status"] == "DEFER_TO_USER"
+
+
+def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
+    """Independent review of PR #401 at 2bc73ac: a task technically parked,
+    later resumed, and then hand-upserted BACK into DEFER_TO_USER (an owner
+    decision with no return_to_pool event) still carries its old technical
+    park event -- which must NOT reopen it. Any granted mutating event after
+    the park event supersedes the evidence: fail closed."""
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-RSS")
+
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-RSS")
+    assert ok and reason == "OPEN"
+
+    # The owner hand-parks it again -- via upsert, the only path that sets
+    # DEFER_TO_USER without a return_to_pool event.
+    assert store.upsert_task(_task("VOYN-W0-RSS", status="DEFER_TO_USER"))[0]
+
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-RSS")
+    assert (ok, reason) == (False, "superseded_park_evidence")
+    assert store.get_task("VOYN-W0-RSS")["status"] == "DEFER_TO_USER"
+
+    # And the planner filter mirrors the gate: the task is never attempted,
+    # so the refusal above stays the ONLY superseded audit row.
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+    assert "VOYN-W0-RSS" not in [task_id for task_id, _ in report.resumed]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_event WHERE task_id = %s "
+                "AND event = 'resume_deferred' AND outcome = 'rejected' "
+                "AND reason = 'superseded_park_evidence'",
+                ("VOYN-W0-RSS",),
+            )
+            assert cur.fetchone()[0] == 1

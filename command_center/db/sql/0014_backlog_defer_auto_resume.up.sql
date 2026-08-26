@@ -79,6 +79,28 @@ BEGIN
         RETURN v;
     END IF;
 
+    -- The park event must still be the mutation that PRODUCED the current
+    -- DEFER_TO_USER state, not merely the newest technical park on record
+    -- (independent review of PR #401 at 2bc73ac: a task technically parked,
+    -- later resumed, and then hand-upserted back into DEFER_TO_USER for an
+    -- owner decision still carries its old cascade_exhausted event -- which
+    -- must not reopen it). Any granted mutating event after the park event
+    -- means some other act may have set the current state: fail closed.
+    IF EXISTS (
+        SELECT 1 FROM backlog_event e
+         WHERE e.task_id = p_task_id
+           AND e.outcome = 'granted'
+           AND e.event IN ('upsert', 'transition', 'triage',
+                           'dispatch', 'return_to_pool', 'resume_deferred')
+           AND e.event_id > v_park_event_id
+    ) THEN
+        PERFORM _backlog_audit(p_task_id, 'resume_deferred', 'rejected',
+                               'superseded_park_evidence',
+                               jsonb_build_object('park_event_id', v_park_event_id));
+        v.reason := 'superseded_park_evidence'; v.revision := t.revision;
+        RETURN v;
+    END IF;
+
     SELECT count(*) INTO v_resumes FROM backlog_event e
      WHERE e.task_id = p_task_id
        AND e.event = 'resume_deferred'
