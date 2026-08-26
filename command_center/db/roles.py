@@ -491,7 +491,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_resume_deferred(text)",
     # The persisted scan cursor for the tick windows (0015): returns this
     # tick's offset and advances atomically per invocation.
-    "backlog_scan_advance(text, integer, integer)",
+    "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
 )

@@ -234,7 +234,7 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_resume_deferred",
         # VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (0015): the persisted
         # scan cursor for the tick windows.
-        "backlog_scan_advance",
+        "backlog_scan_claim",
         "backlog_triage",
     }
 

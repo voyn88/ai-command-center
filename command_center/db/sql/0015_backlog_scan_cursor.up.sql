@@ -1,42 +1,45 @@
--- VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION: the persisted scan cursor.
+-- VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION: the persisted KEYSET scan cursor.
 --
--- Every stateless schedule tried for the tick scan windows fell to a
--- reviewed counterexample: a fixed page starved its own tail behind
--- action-consuming rows; wall-clock-derived offsets alias against the
--- actual tick cadence (bucket*stride mod N can resonate to a constant --
--- e.g. 15-minute ticks over 12 rows with stride 4 select offset 0
--- forever) and are not restart-safe. Fairness that survives arbitrary
--- scheduling requires one small piece of state: a named cursor advanced
--- atomically PER ACTUAL INVOCATION, not per wall-clock bucket.
+-- Five reviewed counterexamples killed every lighter scheme for the tick
+-- scan windows: pseudo-random sampling, fixed pages starved by
+-- action-consuming heads, strides wider than the window, wall-clock
+-- aliasing against the real tick cadence, and finally a persisted NUMERIC
+-- offset whose ordinal meaning shifts under membership churn (insertions
+-- before a waiting task move it out from under the cursor indefinitely).
+-- A keyset cursor has none of these failure modes: it stores the LAST
+-- EXAMINED task_id, which is immovable relative to every other persisting
+-- id, so the cursor provably passes every waiter within one lap of the id
+-- space regardless of churn, cadence, restarts, or which rows consume the
+-- action budget.
 --
--- backlog_scan_advance returns the offset the CALLING tick should use and
--- advances the cursor by p_step modulo p_modulo under a row lock, so
--- concurrent ticks get disjoint windows and a restart resumes exactly
--- where the last tick stopped.
+-- Writes go only through backlog_scan_claim -- an insert-if-missing
+-- compare-and-set under the row lock. A failed CAS means a concurrent
+-- same-name tick advanced first; the caller proceeds with its
+-- already-fetched window (a bounded duplicate examination, never a skip).
 
 CREATE TABLE backlog_scan_cursor (
     name       text PRIMARY KEY,
-    position   bigint NOT NULL DEFAULT 0,
+    position   text NOT NULL DEFAULT '',
     updated_at timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT backlog_scan_cursor_name_present CHECK (length(name) > 0),
-    CONSTRAINT backlog_scan_cursor_position_nonnegative CHECK (position >= 0)
+    CONSTRAINT backlog_scan_cursor_name_present CHECK (length(name) > 0)
 );
 
-CREATE FUNCTION backlog_scan_advance(
-    p_name text, p_step integer, p_modulo integer
-) RETURNS integer
+CREATE FUNCTION backlog_scan_claim(
+    p_name text, p_expected text, p_new text
+) RETURNS boolean
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-DECLARE v_modulo integer; v_old bigint;
+DECLARE v_position text;
 BEGIN
-    v_modulo := greatest(coalesce(p_modulo, 1), 1);
     INSERT INTO backlog_scan_cursor (name) VALUES (p_name)
         ON CONFLICT (name) DO NOTHING;
-    SELECT position INTO v_old FROM backlog_scan_cursor
+    SELECT position INTO v_position FROM backlog_scan_cursor
      WHERE name = p_name FOR UPDATE;
+    IF v_position IS DISTINCT FROM p_expected THEN
+        RETURN false;
+    END IF;
     UPDATE backlog_scan_cursor
-       SET position = (v_old + greatest(coalesce(p_step, 1), 1)) % v_modulo,
-           updated_at = now()
+       SET position = coalesce(p_new, ''), updated_at = now()
      WHERE name = p_name;
-    RETURN (v_old % v_modulo)::integer;
+    RETURN true;
 END
 $$;

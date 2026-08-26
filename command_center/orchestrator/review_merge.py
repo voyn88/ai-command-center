@@ -766,38 +766,64 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
 
 
-def _scan_window(
-    factory: Any, cursor_name: str, count_sql: str, params: tuple,
-    scan_cap: int, step: int
-) -> tuple[int, int]:
-    """The sliding-window schedule for a tick's scan, driven by the
-    PERSISTED cursor of migration 0015. Four reviewed counterexamples
-    killed every stateless variant: per-minute md5 sampling was
-    pseudo-random (24c124b); a fixed page starved its own tail behind
-    rows consuming the action cap on every visit (2199a56); a stride
-    above the window width left permanent holes (cadc595); and
-    wall-clock-derived offsets alias against the actual tick cadence --
-    15-minute ticks over 12 rows with stride 4 resonate to offset 0
-    forever -- and are not restart-safe (2f7ac9c). `backlog_scan_advance`
-    returns this tick's offset and atomically advances the cursor by the
-    stride PER ACTUAL INVOCATION, so the guarantee holds under any
-    cadence, delays, restarts, or concurrent ticks: every task lands at
-    the FRONT of the window -- examined before anything can spend the
-    action cap -- within ceil(N / stride) invocations; membership churn
-    delays a task by at most one lap. The stride is clamped to the window
-    width (no holes), and the window stays scan_cap wide, bounding
-    per-tick gh API cost. Returns (offset, total)."""
-    rows = _rows(factory, count_sql, params)
-    total = int(rows[0][0]) if rows else 0
-    if total <= 0:
-        return 0, 0
-    stride = max(1, min(step, scan_cap))
-    advanced = _rows(
+def _scan_tasks(
+    factory: Any,
+    cursor_name: str,
+    select_sql: str,
+    params: tuple,
+    scan_cap: int,
+    step: int,
+) -> list[tuple[Any, ...]]:
+    """The tick's scan window, driven by the persisted KEYSET cursor of
+    migration 0015. Five reviewed counterexamples killed every lighter
+    schedule (pseudo-random sampling 24c124b; fixed pages starved by
+    action-consuming heads 2199a56; strides wider than the window cadc595;
+    wall-clock aliasing 2f7ac9c; a numeric offset whose ordinal meaning
+    shifts under membership churn c725613). The cursor stores the LAST
+    EXAMINED task_id -- immovable relative to every other persisting id --
+    so it provably passes every waiter within one lap of the id space
+    under any churn, cadence, restarts, or action-hogging rows.
+
+    ``select_sql`` must expose ``task_id`` ordering and accept a trailing
+    ``(after, limit)`` parameter pair (``WHERE ... AND task_id > %s ORDER
+    BY task_id LIMIT %s``). The window is the first ``scan_cap`` rows
+    after the cursor, wrapping to the start when short; the cursor then
+    advances to the ``min(step, scan_cap)``-th examined id via an atomic
+    compare-and-set -- so every waiter periodically sits at the FRONT of
+    the window, examined before anything can spend the action cap. A lost
+    CAS (a concurrent same-name tick advanced first) keeps the fetched
+    window: a bounded duplicate examination, never a skip."""
+    cursor_rows = _rows(
         factory,
-        "SELECT backlog_scan_advance(%s, %s, %s)",
-        (cursor_name, stride, total),
+        "SELECT position FROM backlog_scan_cursor WHERE name = %s",
+        (cursor_name,),
     )
-    return int(advanced[0][0]), total
+    after = str(cursor_rows[0][0]) if cursor_rows else ""
+    tasks = _rows(factory, select_sql, params + (after, scan_cap))
+    wrapped = False
+    if len(tasks) < scan_cap:
+        wrapped = True
+        seen_keys = {row[0] for row in tasks}
+        tasks += [
+            row
+            for row in _rows(
+                factory, select_sql, params + ("", scan_cap - len(tasks))
+            )
+            if row[0] not in seen_keys
+        ]
+    if not tasks:
+        return []
+    stride = max(1, min(step, scan_cap))
+    marker_row = tasks[min(stride, len(tasks)) - 1]
+    # After a wrap the lap restarts: pointing the cursor at an id from the
+    # window's wrapped head keeps monotone progress through the id space.
+    new_position = str(marker_row[0]) if not wrapped or stride <= len(tasks) else ""
+    _rows(
+        factory,
+        "SELECT backlog_scan_claim(%s, %s, %s)",
+        (cursor_name, after, new_position),
+    )
+    return tasks
 
 
 def review_once(
@@ -849,26 +875,16 @@ def review_once(
     # periodically sits at the FRONT of the window, examined before
     # anything else can spend the action cap -- immune even to rows that
     # consume actions on every visit (reviews of 24c124b and 2199a56).
-    base_sql = (
+    tasks = _scan_tasks(
+        factory,
+        "scan:review_once",
         "SELECT task_id, value FROM ("
         "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
         "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
         "  WHERE t.status = 'READY_TO_REVIEW'" + where_task + ") pairs "
-        "ORDER BY task_id OFFSET %s LIMIT %s"
-    )
-    offset, total = _scan_window(
-        factory,
-        "scan:review_once",
-        "SELECT count(*) FROM ("
-        "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
-        "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
-        "  WHERE t.status = 'READY_TO_REVIEW'" + where_task + ") pairs",
+        "WHERE task_id > %s ORDER BY task_id LIMIT %s",
         params, cfg.scan_cap, cfg.max_per_tick,
     )
-    tasks = _rows(factory, base_sql, params + (offset, cfg.scan_cap))
-    short = cfg.scan_cap - len(tasks)
-    if short > 0 and offset > 0 and total > len(tasks):
-        tasks += _rows(factory, base_sql, params + (0, min(short, offset)))
     cascade = _model_only_review_cascade()
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
@@ -1567,24 +1583,15 @@ def publish_review_verdicts(
     # periodically sits at the FRONT of the window, examined before
     # anything else can spend the action cap -- immune even to rows that
     # consume actions on every visit (reviews of 24c124b and 2199a56).
-    base_sql = (
+    tasks = _scan_tasks(
+        factory,
+        "scan:publish_review_verdicts",
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'" + where_task
-        + " ORDER BY t.task_id OFFSET %s LIMIT %s"
-    )
-    offset, total = _scan_window(
-        factory,
-        "scan:publish_review_verdicts",
-        "SELECT count(*) FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task,
+        + " AND t.task_id > %s ORDER BY t.task_id LIMIT %s",
         params, cfg.scan_cap, cfg.max_per_tick,
     )
-    tasks = _rows(factory, base_sql, params + (offset, cfg.scan_cap))
-    short = cfg.scan_cap - len(tasks)
-    if short > 0 and offset > 0 and total > len(tasks):
-        tasks += _rows(factory, base_sql, params + (0, min(short, offset)))
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
         if actions >= cfg.max_per_tick:
@@ -1959,23 +1966,15 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     # periodically sits at the FRONT of the window, examined before
     # anything else can spend the action cap -- immune even to rows that
     # consume actions on every visit (reviews of 24c124b and 2199a56).
-    base_sql = (
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.task_id OFFSET %s LIMIT %s"
-    )
-    offset, total = _scan_window(
+    tasks = _scan_tasks(
         factory,
         "scan:merge_once",
-        "SELECT count(*) FROM backlog_task t "
+        "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'",
+        "WHERE t.status = 'READY_TO_REVIEW' "
+        "AND t.task_id > %s ORDER BY t.task_id LIMIT %s",
         (), cfg.scan_cap, cfg.max_per_tick,
     )
-    tasks = _rows(factory, base_sql, (offset, cfg.scan_cap))
-    short = cfg.scan_cap - len(tasks)
-    if short > 0 and offset > 0 and total > len(tasks):
-        tasks += _rows(factory, base_sql, (0, min(short, offset)))
     branch_updates = 0
     actions = 0
     for task_id, pr_url in tasks:

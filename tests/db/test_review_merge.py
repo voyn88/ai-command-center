@@ -2378,3 +2378,33 @@ def test_override_audit_and_marker_are_separate_write_budget_units(rig, monkeypa
     # Tick two: the audit already stands (idempotent), the marker is the
     # tick's single write.
     assert [k for k, _ in writes] == ["audit", "marker"]
+
+
+def test_churn_before_a_waiter_cannot_starve_it(rig, monkeypatch):  # noqa: F811
+    """Review of c725613 (CONFIRMED): a numeric offset's ordinal meaning
+    shifts under membership churn -- tasks inserted BEFORE a waiter kept
+    pushing it out from under the cursor. The keyset cursor stores the last
+    examined task_id, immovable relative to persisting ids: the waiter is
+    reached within one lap regardless of insertions ahead of it."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-ZWAITER", "https://github.com/x/y/pull/500")
+    for i in range(3):
+        _ready(store, app_factory, f"VOYN-W0-A{i:02d}", f"https://github.com/x/y/pull/{510 + i}")
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        lambda argv, repo: sp.CompletedProcess(argv, 1, "", "fails -> pure skip"),
+    )
+    seen: set[str] = set()
+    for tick in range(4):
+        # Adversarial churn: every tick inserts fresh tasks that sort BEFORE
+        # the waiter (ids "VOYN-W0-B..." < "VOYN-W0-Z...").
+        _ready(store, app_factory, f"VOYN-W0-B{tick:02d}", f"https://github.com/x/y/pull/{520 + tick}")
+        report = publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=2, scan_cap=2)
+        )
+        seen |= {task_id for task_id, _ in report.skipped}
+        if "VOYN-W0-ZWAITER" in seen:
+            break
+    assert "VOYN-W0-ZWAITER" in seen
