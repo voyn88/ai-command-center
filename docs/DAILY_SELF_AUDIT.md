@@ -66,12 +66,35 @@ python scripts/daily_audit_daemon.py --reset-circuit
 ```
 
 `deploy/com.ai-command-center.daily-audit.plist` is a launchd template. Replace
-`__ROOT__`, `__PYTHON__`, `__PATH__` and `__DATA_DIR__` with absolute paths
-before installing it. `AICC_DATA_DIR` must be the same directory used by the
-Streamlit application; otherwise campaigns run correctly but cannot appear in
-the application UI. The
-process is kept alive, while the SQLite due time and lease ensure that only one
-campaign is dispatched per day and that another host cannot duplicate it.
+`__ROOT__`, `__PYTHON__`, `__PATH__`, `__DATA_DIR__` and `__RUN_AS_USER__` with
+absolute paths (and the account that owns the repository and its Git
+credentials) before installing it. `AICC_DATA_DIR` must be the same directory
+used by the Streamlit application; otherwise campaigns run correctly but
+cannot appear in the application UI. The process is kept alive, while the
+SQLite due time and lease ensure that only one campaign is dispatched per day
+and that another host cannot duplicate it.
+
+The plist must be installed as a **LaunchDaemon in the `system` domain**, not
+as a LaunchAgent in the per-user `gui/<uid>` domain. A `gui/<uid>` agent only
+runs while that user has an active, logged-in Aqua session — i.e. autonomy
+would literally require the laptop to be open and unlocked, contradicting
+`scripts/daily_audit_daemon.py`'s own "long-lived headless host" design.
+Bootstrapping into `system` instead runs the service at boot regardless of
+any GUI login, while `UserName` keeps it executing as the repository owner
+so file and Git-credential permissions still line up:
+
+```text
+sudo cp deploy/com.ai-command-center.daily-audit.plist \
+    /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl bootstrap system \
+    /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl enable system/com.ai-command-center.daily-audit
+```
+
+Status can be inspected without `sudo` via `launchctl print
+system/com.ai-command-center.daily-audit`, which is what
+`daily_audit_panel.launch_agent_status()` shells out to for the UI's service
+indicator.
 
 ## Safety and recovery contract
 

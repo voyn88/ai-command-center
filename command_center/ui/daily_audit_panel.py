@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -25,13 +24,19 @@ def _local_time(value: str | None) -> str:
 
 
 def launch_agent_status(label: str = LAUNCH_AGENT_LABEL) -> tuple[bool, str]:
-    """Read launchd state without changing or restarting the service."""
+    """Read launchd state without changing or restarting the service.
+
+    The service is bootstrapped into the ``system`` domain (a LaunchDaemon),
+    not the per-user ``gui/<uid>`` domain: a GUI-domain agent only runs while
+    that user has an active, logged-in Aqua session, which would make
+    autonomous operation depend on the laptop being open and unlocked.
+    """
     launchctl = shutil.which("launchctl")
     if launchctl is None:
         return False, "launchd недоступен"
     try:
         result = subprocess.run(
-            [launchctl, "print", f"gui/{os.getuid()}/{label}"],
+            [launchctl, "print", f"system/{label}"],
             capture_output=True,
             text=True,
             check=False,

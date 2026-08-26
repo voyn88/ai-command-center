@@ -21,3 +21,26 @@ def test_daily_audit_deep_link_renders_but_is_not_duplicated_in_navigation():
 def test_launch_agent_status_is_portable_when_launchctl_is_absent(monkeypatch):
     monkeypatch.setattr(daily_audit_panel.shutil, "which", lambda _: None)
     assert daily_audit_panel.launch_agent_status() == (False, "launchd недоступен")
+
+
+def test_launch_agent_status_queries_system_domain_not_gui_domain(monkeypatch):
+    """The daemon must run without a logged-in GUI session (headless host),
+    so status must be read from the `system` domain, never `gui/<uid>`."""
+    monkeypatch.setattr(daily_audit_panel.shutil, "which", lambda _: "/usr/bin/launchctl")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+
+        class Result:
+            returncode = 0
+            stdout = "\n\tstate = running\n"
+
+        return Result()
+
+    monkeypatch.setattr(daily_audit_panel.subprocess, "run", fake_run)
+    running, label = daily_audit_panel.launch_agent_status()
+    assert running is True
+    assert label == "работает"
+    assert captured["cmd"][-1] == f"system/{daily_audit_panel.LAUNCH_AGENT_LABEL}"
+    assert not any(arg.startswith("gui/") for arg in captured["cmd"])
