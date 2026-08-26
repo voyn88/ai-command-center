@@ -55,7 +55,7 @@ struct AICCNativeShell: View {
                 .tabItem { Label(AppTab.overview.title, systemImage: AppTab.overview.icon) }.tag(AppTab.overview)
             WorkView(tasks: model.snapshot.tasks)
                 .tabItem { Label(AppTab.work.title, systemImage: AppTab.work.icon) }.tag(AppTab.work)
-            DialoguesView()
+            DialoguesView(dialogs: model.dialogs)
                 .tabItem { Label(AppTab.dialogues.title, systemImage: AppTab.dialogues.icon) }.tag(AppTab.dialogues)
             DecisionsView()
                 .tabItem { Label(AppTab.decisions.title, systemImage: AppTab.decisions.icon) }.tag(AppTab.decisions)
@@ -227,11 +227,32 @@ private struct WorkView: View {
 }
 
 private struct DialoguesView: View {
+    let dialogs: [DialogSummary]
+
     var body: some View {
         CompanionPage(title: "Диалоги", subtitle: "Разговоры всегда связаны с конкретным делом.") {
-            CompanionCard(title: "Обсуждение дизайна AICC", detail: "Есть короткое резюме и следующий вопрос для вас.", tint: .orange, badge: "Новый")
-            CompanionCard(title: "Ваш недельный бриф", detail: "Три главные темы, которые стоит знать.", tint: AICCTheme.plum)
+            if dialogs.isEmpty {
+                CompanionCard(title: "Пока тихо", detail: "Разговоры появятся здесь, как только начнутся.", tint: .gray)
+            }
+            ForEach(dialogs.prefix(20)) { dialog in
+                CompanionCard(
+                    title: dialog.title,
+                    detail: detailLine(dialog),
+                    tint: AICCTheme.plum
+                )
+            }
         }
+    }
+
+    private func detailLine(_ dialog: DialogSummary) -> String {
+        var parts: [String] = ["Сообщений: \(dialog.messageCount)"]
+        if let last = dialog.lastActivityAt {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.locale = Locale(identifier: "ru_RU")
+            formatter.unitsStyle = .full
+            parts.append("обновлён " + formatter.localizedString(for: last, relativeTo: .now))
+        }
+        return parts.joined(separator: " · ")
     }
 }
 

@@ -279,3 +279,46 @@ private extension Optional where Wrapped == URL {
         return self
     }
 }
+
+// MARK: - Read-only collections (DTO 1.0 envelope)
+
+public struct DialogSummary: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let title: String
+    public let state: String
+    public let lastActivityAt: Date?
+    public let messageCount: Int
+    public let lastSummary: String?
+}
+
+/// The gateway's collection envelope: schema-versioned page of items.
+public struct CollectionPage<Item: Codable & Equatable & Sendable>: Codable, Equatable, Sendable {
+    public struct Cursor: Codable, Equatable, Sendable { public let nextCursor: String? }
+    public let schemaVersion: String
+    public let revision: String
+    public let freshness: Freshness
+    public let items: [Item]
+    public let page: Cursor
+}
+
+extension SnapshotRemoteStore {
+    /// Fetch a read-only collection route (e.g. "v1/dialogs") as a typed page.
+    public func fetchPage<Item>(
+        _ path: String, as type: Item.Type
+    ) async throws -> CollectionPage<Item> {
+        var request = Self.request(configuration: configuration)
+        request.url = configuration.baseURL.appending(path: path)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw GatewayError.invalidResponse }
+        if http.statusCode == 401 { throw GatewayError.unauthorized }
+        guard (200...299).contains(http.statusCode) else { throw GatewayError.unexpectedStatus(http.statusCode) }
+        let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
+        let page = try decoder.decode(CollectionPage<Item>.self, from: data)
+        guard page.schemaVersion == configuration.expectedSchemaVersion else { throw GatewayError.schemaMismatch }
+        return page
+    }
+
+    public func fetchDialogs() async throws -> [DialogSummary] {
+        try await fetchPage("v1/dialogs", as: DialogSummary.self).items
+    }
+}

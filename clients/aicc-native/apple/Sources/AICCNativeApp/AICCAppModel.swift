@@ -23,6 +23,7 @@ final class AICCAppModel: ObservableObject {
     }
 
     @Published private(set) var snapshot: Snapshot
+    @Published private(set) var dialogs: [DialogSummary] = []
     @Published private(set) var connection: ConnectionState = .fixture
 
     init() {
@@ -69,8 +70,9 @@ final class AICCAppModel: ObservableObject {
         else { return }
 
         connection = .connecting
+        let store = SnapshotRemoteStore(configuration: configuration)
         do {
-            snapshot = try await SnapshotRemoteStore(configuration: configuration).fetchSnapshot(revision: snapshot.revision)
+            snapshot = try await store.fetchSnapshot(revision: snapshot.revision)
             connection = .live
         } catch GatewayError.notModified {
             connection = .live
@@ -78,6 +80,11 @@ final class AICCAppModel: ObservableObject {
             connection = .unauthorized
         } catch {
             connection = .offline
+        }
+        // Secondary, best-effort: dialog summaries. Their absence must never
+        // degrade the primary snapshot state.
+        if connection == .live {
+            dialogs = (try? await store.fetchDialogs()) ?? dialogs
         }
     }
 }
