@@ -35,8 +35,21 @@ private enum AppTab: String, CaseIterable, Identifiable {
 struct AICCNativeShell: View {
     @ObservedObject var model: AICCAppModel
     @State private var tab: AppTab = .overview
+    @State private var showPairing = false
 
     var body: some View {
+        content
+            .onChange(of: model.connection) { _, newValue in
+                if newValue == .unauthorized { showPairing = true }
+                if newValue == .live { showPairing = false }
+            }
+            .task { if !model.hasCredential { showPairing = true } }
+            .sheet(isPresented: $showPairing) {
+                PairingView { token in await model.pair(token: token) }
+            }
+    }
+
+    private var content: some View {
         TabView(selection: $tab) {
             OverviewView(snapshot: model.snapshot, connection: model.connection)
                 .tabItem { Label(AppTab.overview.title, systemImage: AppTab.overview.icon) }.tag(AppTab.overview)
@@ -51,6 +64,41 @@ struct AICCNativeShell: View {
         }
         .tint(AICCTheme.plum)
         .task { await model.refresh() }
+    }
+}
+
+private struct PairingView: View {
+    let onPair: (String) async -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var token = ""
+    @State private var busy = false
+
+    init(onPair: @escaping (String) async -> Void) { self.onPair = onPair }
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Подключение к AICC")
+                    .font(.system(.largeTitle, design: .serif, weight: .medium))
+                Text("Вставьте токен устройства — его выдаёт ваш сервер AICC один раз при добавлении устройства. Токен хранится только в связке ключей этого устройства.")
+                    .foregroundStyle(.secondary)
+                SecureField("Токен устройства", text: $token)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                Button {
+                    busy = true
+                    _Concurrency.Task { await onPair(token); busy = false }
+                } label: {
+                    if busy { ProgressView() } else { Text("Сохранить и подключиться") }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(AICCTheme.plum)
+                .disabled(token.trimmingCharacters(in: .whitespaces).isEmpty || busy)
+                Spacer()
+            }
+            .padding(24)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Позже") { dismiss() } } }
+        }
     }
 }
 

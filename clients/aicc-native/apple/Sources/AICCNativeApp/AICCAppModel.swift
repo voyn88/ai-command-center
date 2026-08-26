@@ -29,6 +29,21 @@ final class AICCAppModel: ObservableObject {
         snapshot = (try? Fixture.healthySnapshot()) ?? .preview
     }
 
+    /// Whether any device credential is available (env override or Keychain).
+    var hasCredential: Bool {
+        ProcessInfo.processInfo.environment["AICC_DEVICE_TOKEN"] != nil
+            || DeviceTokenStore.load() != nil
+    }
+
+    /// Store the operator-issued device token in the Keychain and reconnect.
+    /// The token text itself never touches UserDefaults, files or logs.
+    func pair(token: String) async {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        DeviceTokenStore.save(trimmed)
+        await refresh()
+    }
+
     func refresh() async {
         // Server URL is injected at release time (AICC_SERVER_URL). The device
         // token is provisioned by the operator and lives in the Keychain; the
