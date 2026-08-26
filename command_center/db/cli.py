@@ -263,6 +263,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
                     print(f"INGESTED  {task_id}: {action}")
+                for task_id, park_reason in report.resumed:
+                    print(f"RESUMED   {task_id}: {park_reason}")
                 for task_id, reason in report.skipped_by_wave_gate:
                     print(f"WAVE-GATE {task_id}: {reason}")
                 for task_id, reason in report.refused:

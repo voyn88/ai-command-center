@@ -483,6 +483,9 @@ _APP_BACKLOG_FUNCTIONS = (
     # BO-S3, result ingest (0007; replaced 0006's backlog_release_terminal).
     "backlog_ingest_results(text)",
     "backlog_return_to_pool(text, text)",
+    # DEFER_TO_USER -> OPEN for technical parks only (0014); the function is
+    # the classification gate, so granting it does not grant a generic unpark.
+    "backlog_resume_deferred(text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
 )
