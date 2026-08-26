@@ -12,13 +12,17 @@
 // login route to build or protect.
 
 import { useCallback, useEffect, useState } from 'react'
+import type { FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import BackgroundSwitcher from '../components/BackgroundSwitcher'
 import GlassPanel from '../components/GlassPanel'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
 import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
+import { fetchHome } from '../lib/api'
+import type { Project } from '../lib/api'
 import {
+  enqueueAudit,
   fetchQueueItem,
   fetchQueueItems,
   QueueAuthError,
@@ -128,6 +132,77 @@ function TaskRow({ item, language, fallback }: { item: QueueItem; language: stri
   )
 }
 
+/** The one-button audit trigger (APP-CONTROL-S4): pick a project, confirm
+ * (or edit) the review prompt, and enqueue an `agent_run` — the server
+ * pins the safe profile (task_type=review, untrusted=false) and resolves
+ * `repository_path` from the project's own config, so the caller here only
+ * ever needs a project id. */
+function AuditLauncher({ projects, onQueued }: { projects: Project[]; onQueued: () => void }) {
+  const { t } = useTranslation()
+  const [projectId, setProjectId] = useState(projects[0]?.id ?? '')
+  const [prompt, setPrompt] = useState(() => t('auditPromptDefault'))
+  const [status, setStatus] = useState<'idle' | 'sending' | 'error' | 'locked'>('idle')
+  const [lastQueued, setLastQueued] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!projectId && projects.length > 0) setProjectId(projects[0].id)
+  }, [projects, projectId])
+
+  if (projects.length === 0) return null
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!projectId || !prompt.trim() || status === 'sending') return
+    setStatus('sending')
+    setLastQueued(null)
+    try {
+      const ack = await enqueueAudit({ project_id: projectId, prompt: prompt.trim() })
+      setStatus('idle')
+      setLastQueued(ack.work_item_id)
+      onQueued()
+    } catch (error) {
+      setStatus(error instanceof QueueAuthError ? 'locked' : 'error')
+    }
+  }
+
+  return (
+    <GlassPanel title={t('auditTitle')}>
+      <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: '.6rem' }}>
+        <div style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}>
+          <select
+            className="task-token-input"
+            value={projectId}
+            onChange={(event) => setProjectId(event.target.value)}
+            aria-label={t('auditProjectLabel')}
+          >
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+          <button type="submit" className="execution-back" disabled={status === 'sending'}>
+            {status === 'sending' ? t('auditSubmitting') : t('auditSubmit')}
+          </button>
+        </div>
+        <textarea
+          className="task-token-input"
+          value={prompt}
+          onChange={(event) => setPrompt(event.target.value)}
+          aria-label={t('auditPromptLabel')}
+          rows={2}
+          style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+        />
+        {status === 'error' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('auditError')}</p>}
+        {status === 'locked' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('auditLocked')}</p>}
+        {lastQueued && status === 'idle' && (
+          <p style={{ color: 'var(--ok)', margin: 0 }}>{t('auditQueued')}</p>
+        )}
+      </form>
+    </GlassPanel>
+  )
+}
+
 function TokenGate({ onUnlocked }: { onUnlocked: () => void }) {
   const { t } = useTranslation()
   const [value, setValue] = useState('')
@@ -163,6 +238,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
   const [locked, setLocked] = useState(false)
   const [error, setError] = useState(false)
   const [filter, setFilter] = useState<string>('ALL')
+  const [projects, setProjects] = useState<Project[]>([])
 
   const load = useCallback(() => {
     setError(false)
@@ -175,6 +251,13 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
       })
   }, [filter])
   useEffect(load, [load])
+  // The audit launcher's project picker: GET /api/home is unauthenticated
+  // (same source Home.tsx uses), independent of the owner-token gate above.
+  useEffect(() => {
+    fetchHome()
+      .then((data) => setProjects(data.projects))
+      .catch(() => setProjects([]))
+  }, [])
 
   const visible = items || []
 
@@ -203,6 +286,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
               <button className="execution-back" onClick={load}>{t('retry')}</button>
             </GlassPanel>
           )}
+          {!locked && items && <AuditLauncher projects={projects} onQueued={load} />}
           {!locked && items && (
             <GlassPanel title={t('tasks')}>
               <div className="execution-filters" aria-label={t('allStates')}>
