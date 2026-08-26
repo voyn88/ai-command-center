@@ -1,0 +1,18 @@
+[Unit]
+Description=Recover interrupted AICC principal-isolation file transaction
+DefaultDependencies=no
+After=local-fs.target
+Before=aicc-agent-launcher.socket
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/aicc-install-transaction recover
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/aicc /etc/systemd/system /usr/lib/systemd/system-generators /usr/lib/sysusers.d /usr/lib/tmpfiles.d /usr/libexec /var/lib/aicc-agent /var/lib/aicc-principal-isolation
+
+[Install]
+WantedBy=multi-user.target

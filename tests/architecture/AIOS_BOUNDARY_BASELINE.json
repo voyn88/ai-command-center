@@ -18,6 +18,52 @@
     "command_center/aml_store.py": [
       "memory"
     ],
+    "command_center/api/audit_routes.py": [
+      "audit"
+    ],
+    "command_center/api/audit_schemas.py": [
+      "audit"
+    ],
+    "command_center/api/audit_service.py": [
+      "audit"
+    ],
+    "command_center/audit/__init__.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/__init__.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/_ruff.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/base.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/code_quality.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/coverage.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/deps.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/lint.py": [
+      "audit"
+    ],
+    "command_center/audit/checks/security.py": [
+      "audit"
+    ],
+    "command_center/audit/registry.py": [
+      "audit"
+    ],
+    "command_center/audit/runner.py": [
+      "audit",
+      "orchestration"
+    ],
+    "command_center/audit/types.py": [
+      "audit"
+    ],
     "command_center/case_store.py": [
       "memory"
     ],
@@ -38,6 +84,33 @@
       "audit",
       "orchestration"
     ],
+    "command_center/db/audit_store.py": [
+      "audit"
+    ],
+    "command_center/db/provenance_store.py": [
+      "audit"
+    ],
+    "command_center/db/work_queue_store.py": [
+      "queue"
+    ],
+    "command_center/dispatch/__init__.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/api.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/models.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/policy.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/policy_config.py": [
+      "orchestration"
+    ],
+    "command_center/dispatch/service.py": [
+      "orchestration"
+    ],
     "command_center/evidence_store.py": [
       "memory"
     ],
@@ -45,6 +118,40 @@
       "queue"
     ],
     "command_center/executors.py": [
+      "orchestration"
+    ],
+    "command_center/http_auth/__init__.py": [
+      "authz"
+    ],
+    "command_center/http_auth/authz.py": [
+      "authz"
+    ],
+    "command_center/http_auth/identity.py": [
+      "authz"
+    ],
+    "command_center/http_auth/routing.py": [
+      "authz"
+    ],
+    "command_center/ops/credential_rotation.py": [
+      "memory"
+    ],
+    "command_center/orchestrator/__init__.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/github_app_auth.py": [
+      "authz",
+      "orchestration"
+    ],
+    "command_center/orchestrator/planner.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/publish.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/review_merge.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/routing.py": [
       "orchestration"
     ],
     "command_center/pipeline_settings.py": [
@@ -80,7 +187,55 @@
     "command_center/runtime/context_service.py": [
       "runtime_package"
     ],
-    "command_center/runtime/db.py": [
+    "command_center/runtime/db/__init__.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/db/audit.py": [
+      "audit",
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/completion.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/db/conflict.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/core.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/council.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/execution.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/db/marketplace.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/db/model_registry.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/networking.py": [
+      "runtime_package"
+    ],
+    "command_center/runtime/db/proposal.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/provenance.py": [
+      "audit",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/schema.py": [
+      "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/db/wave1.py": [
       "memory",
       "runtime_package"
     ],
@@ -118,6 +273,9 @@
     "command_center/runtime/reports.py": [
       "runtime_package"
     ],
+    "command_center/runtime/run_finalizer.py": [
+      "runtime_package"
+    ],
     "command_center/runtime/runs_read.py": [
       "runtime_package"
     ],
@@ -131,8 +289,11 @@
     "command_center/runtime/stream_parser.py": [
       "runtime_package"
     ],
-    "command_center/runtime/supervisor.py": [
+    "command_center/runtime/stream_reader.py": [
       "memory",
+      "runtime_package"
+    ],
+    "command_center/runtime/supervisor.py": [
       "orchestration",
       "runtime_package"
     ],
@@ -157,11 +318,50 @@
     "command_center/tasks_repository.py": [
       "memory"
     ],
+    "command_center/webapi/queue_routes.py": [
+      "queue"
+    ],
+    "command_center/worker/__init__.py": [
+      "orchestration"
+    ],
+    "command_center/worker/__main__.py": [
+      "orchestration"
+    ],
+    "command_center/worker/credential_file.py": [
+      "orchestration"
+    ],
+    "command_center/worker/daemon.py": [
+      "orchestration"
+    ],
+    "command_center/worker/handlers.py": [
+      "orchestration"
+    ],
+    "command_center/worker/lease_client.py": [
+      "orchestration"
+    ],
+    "command_center/worker/payloads.py": [
+      "orchestration"
+    ],
+    "command_center/worker/sdnotify.py": [
+      "orchestration"
+    ],
+    "command_center/worker/worktree_lease.py": [
+      "orchestration"
+    ],
+    "command_center/worker/writer_lease.py": [
+      "orchestration"
+    ],
     "command_center/worktree_launcher.py": [
       "orchestration"
     ],
     "native_gateway/auth.py": [
       "authz"
+    ],
+    "ops/aicc_agent_launcher.py": [
+      "orchestration"
+    ],
+    "ops/aicc_staged_worker_rollout.py": [
+      "orchestration"
     ],
     "scripts/daily_audit_daemon.py": [
       "audit",

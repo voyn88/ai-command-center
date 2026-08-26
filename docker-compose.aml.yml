@@ -7,7 +7,15 @@ services:
     container_name: aml-service
     restart: unless-stopped
     ports:
-      - "${AML_PORT:-8501}:8501"
+      # The host interface is named explicitly and defaults to loopback. An
+      # unqualified "8501:8501" publishes on EVERY host interface, and Docker
+      # writes that rule below a host firewall, so the exposure would not show
+      # up in the firewall's own configuration. This service has no
+      # authentication and performs privileged git/gh and subprocess
+      # operations, so reaching it off-host must be a deliberate act:
+      # set AML_BIND_HOST to widen it, in front of a reviewed authenticating
+      # proxy.
+      - "${AML_BIND_HOST:-127.0.0.1}:${AML_PORT:-8501}:8501"
     volumes:
       - aml-data:/data
     environment:
@@ -16,6 +24,11 @@ services:
       STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
       # Опционально: переопределить порт внутри контейнера
       STREAMLIT_SERVER_PORT: "8501"
+      # Адрес прослушивания ВНУТРИ сетевого namespace контейнера. Здесь 0.0.0.0
+      # корректен и обязателен: namespace приватный, а опубликованный выше порт
+      # не смог бы достучаться до сервиса, слушающего только 127.0.0.1 внутри
+      # контейнера. Реальная граница экспозиции — адрес публикации в `ports`.
+      # Entrypoint не имеет значения по умолчанию и без этой строки не стартует.
       STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]

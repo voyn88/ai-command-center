@@ -1,0 +1,40 @@
+# The queue reaper (VOYN-W0-AICC-SRV-06): the production caller of
+# queue_reap(), which until this unit existed ran only in tests.
+#
+# Install (control-plane host, beside the app credential):
+#   cp deploy/systemd/aicc-queue-reaper.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-queue-reaper.timer
+#
+# Identity: queue_reap() and queue_redrive() are aicc_app privileges —
+# deliberately NOT worker privileges, so a compromised worker host cannot
+# expire the fleet's leases. /etc/aicc/app.env therefore carries the control
+# plane's AICC_PG_* credential, not a worker's.
+#
+# Why a timer and not a loop inside some daemon: queue_reap() is idempotent
+# and row-locked against racing completions, so a missed tick delays recovery
+# and never corrupts it — exactly the contract a oneshot timer needs. It also
+# survives every failure mode this task must cover: host reboot (OnBootSec),
+# control-plane restart (the timer persists), worker loss (the reap itself).
+
+[Unit]
+Description=AI Command Center queue reaper (lease recovery + dead-lettering)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aicc-app
+Group=aicc-app
+EnvironmentFile=/etc/aicc/app.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db queue-reap
+# A reap against an unreachable database is a failed tick, not an incident:
+# the next tick retries, and systemd's journal keeps the evidence.
+TimeoutStartSec=60s
+
+# Containment mirrors the worker unit: this process talks to PostgreSQL and
+# needs nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

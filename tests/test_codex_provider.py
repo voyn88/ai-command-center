@@ -206,6 +206,7 @@ def test_cancellation_refuses_unverifiable_reused_pid(fake_codex, git_repo, tmp_
     assert final["cancel_requested"] == 1
 
 
+@pytest.mark.serial  # SIGTERM-grace timing: the 0.1s escalation window misses under xdist CPU load
 def test_codex_ignored_termination_escalates(fake_codex, git_repo, tmp_path, monkeypatch):
     worktree = _add_worktree(git_repo, tmp_path / "worktree")
     monkeypatch.setenv("FAKE_CODEX_EXTRA_SLEEP", "5")

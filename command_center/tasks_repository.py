@@ -90,6 +90,12 @@ def normalize_task(task: dict) -> dict:
     task.setdefault("owner", "")
     task.setdefault("estimate_hours", 0.0)
     task.setdefault("depends_on", [])
+    # Explicit priority-ordering rank (VOYN-W2-TASKS). Absent on historical rows
+    # and on freshly created tasks; `task_ordering.default_order` treats a
+    # missing rank as "unranked, sinks to the end", so the field only needs to
+    # exist once an operator has reordered. `None` (not 0) is the unranked
+    # sentinel — 0 is a legitimate top-of-list rank.
+    task.setdefault("priority_rank", None)
     task.setdefault("updated_at", task.get("created_at", ""))
     models.normalize_task_workflow(task)
     models.normalize_task_execution(task)

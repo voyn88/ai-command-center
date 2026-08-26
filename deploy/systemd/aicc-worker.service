@@ -1,0 +1,90 @@
+# The headless worker under systemd (VOYN-W0-AICC-SRV-05).
+#
+# Install:
+#   cp deploy/systemd/aicc-worker.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-worker
+#
+# The unit assumes the host is already enrolled: /etc/aicc/worker.env carries
+# AICC_PG_USER=<its aicc_w_* role> and the SCRAM secret produced at ticket
+# redemption. Enrolment is an operator act — a worker cannot redeem its own
+# ticket by design.
+
+[Unit]
+Description=AI Command Center headless worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# The daemon sends READY=1 when its claim loop starts and feeds the watchdog
+# from BOTH its threads (claim loop between claims, heartbeat thread during a
+# run), so every healthy state pings within one heartbeat interval
+# (visibility/3 = 100s by default). Two consecutive missed pings mean the
+# process is wedged, and restart is safe by the same construction as SIGKILL:
+# lease expiry plus the reaper timer (aicc-queue-reaper.timer) resume the item
+# elsewhere. 240s = two heartbeat intervals plus slack.
+WatchdogSec=240s
+User=aicc-worker
+Group=aicc-worker
+SupplementaryGroups=aicc-workspace
+EnvironmentFile=/etc/aicc/worker.env
+Environment=HOME=/var/lib/aicc-worker
+Environment=XDG_CONFIG_HOME=/var/lib/aicc-worker/config
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
+
+# Exit codes are the daemon's interface: 2 = config refused (an operator's
+# problem — restarting cannot cure a bad env file, so it is excluded from
+# restart), 3 = DB unreachable (cured by time).
+Restart=always
+RestartSec=10s
+RestartPreventExitStatus=2
+# SIGTERM stops claiming and finishes the item in hand. The stop timeout
+# outlives ONE visibility window — a handler that finishes within its first
+# lease survives shutdown intact. A longer-running handler (heartbeats exist
+# so they may) is abandoned at the timeout; that abandonment is safe by
+# construction (reaper + stale-owner fence), it is just not free: the item
+# re-runs elsewhere.
+TimeoutStopSec=330s
+
+# Containment: the worker executes claimed payloads and talks to PostgreSQL —
+# nothing here needs privileges, a home, or a writable system.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The preprod clone source lives under /home/voynadmin; ProtectHome
+# presents an empty /home, so the ONE directory the worker must read
+# is bind-mounted back read-only -- secrets in the rest of the home
+# stay invisible (review finding on 63cb072).
+BindReadOnlyPaths=/home/voynadmin/Projects/ai-command-center
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+StateDirectory=aicc-worker
+StateDirectoryMode=0700
+ReadWritePaths=/srv/aicc-workspaces
+# Resource envelope (SRV-05): declared limits, enforced by cgroups — which,
+# unlike the mount/network sandbox directives, apply for user units too.
+# Acceptance of the *sandbox* directives is measurement-from-inside per
+# SRV-05-B and deliberately not claimed here.
+MemoryMax=6G
+MemoryHigh=5G
+CPUQuota=300%
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

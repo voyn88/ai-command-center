@@ -14,6 +14,7 @@ _KEY_WINDOW_STATE = "window/state"
 _KEY_THEME = "appearance/theme"
 _KEY_DENSITY = "appearance/density"
 _KEY_SELECTED_PROJECT = "workspace/selected_project"
+_KEY_WORKSPACE_ROOT = "workspace/root"
 
 
 class ThemeMode(str, Enum):
@@ -93,6 +94,18 @@ class SettingsStore:
             self._settings.setValue(_KEY_SELECTED_PROJECT, normalized)
         else:
             self._settings.remove(_KEY_SELECTED_PROJECT)
+
+    def workspace_root(self) -> str | None:
+        """Workspace root chosen in the first-run wizard (D-1), if any."""
+        value = self._settings.value(_KEY_WORKSPACE_ROOT)
+        return str(value) if value not in (None, "") else None
+
+    def set_workspace_root(self, path: str | None) -> None:
+        normalized = path.strip() if path else ""
+        if normalized:
+            self._settings.setValue(_KEY_WORKSPACE_ROOT, normalized)
+        else:
+            self._settings.remove(_KEY_WORKSPACE_ROOT)
 
     def sync(self) -> None:
         self._settings.sync()

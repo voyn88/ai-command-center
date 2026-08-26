@@ -1,9 +1,14 @@
+/* Dark-first glass theme. Colours mirror the platform-canonical dark palette in
+   command_center/design/tokens.json (accent, accent-2, cyan, ok, warn, crit,
+   text, text-2, text-3, hairline) so this shell shares one source of truth with
+   the desktop and Streamlit shells. System-first fonts only — no web-font CDN,
+   no Inter. tests/test_theme_canon.py guards these invariants. */
 :root{
-  --accent-1:#7c5cff; --accent-2:#4d9fff; --teal:#33e0c0;
-  --run:#4d9fff; --ok:#3ddc84; --warn:#f5b23a; --bad:#ff5d6f;
-  --glass:rgba(17,22,38,.55); --gline:rgba(255,255,255,.09);
-  --tx:#eef2fb; --tx2:#aab3c9; --tx3:#7c85a0;
-  --font-sans:-apple-system,"SF Pro Text","Inter",system-ui,sans-serif;
+  --accent-1:#6C8CFF; --accent-2:#536DFE; --teal:#55D6E3;
+  --run:#6C8CFF; --ok:#3DDC97; --warn:#F5B14C; --bad:#FF6B7A;
+  --glass:rgba(17,22,38,.55); --gline:rgba(255,255,255,.08);
+  --tx:#E8ECF4; --tx2:#A6B0C3; --tx3:#6B7488;
+  --font-sans:-apple-system,"SF Pro Text",system-ui,sans-serif;
   --font-mono:"SF Mono","JetBrains Mono",ui-monospace,monospace;
 }
 .glass{background:var(--glass);backdrop-filter:blur(22px) saturate(140%);

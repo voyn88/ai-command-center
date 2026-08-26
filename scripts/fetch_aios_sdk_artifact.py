@@ -1,5 +1,12 @@
-"""Fetch and verify the exact accepted AIOS SDK wheel from a permanent
-GitHub Release asset (no mutable fallback).
+"""Fetch and verify an exact accepted AIOS wheel from a permanent GitHub
+Release asset (no mutable fallback).
+
+Two distributions are consumed this way and both go through this one script,
+selected by ``--lock``: ``aios-sdk`` (the HTTP client, ``aios-sdk.lock.json``)
+and ``aios-db`` (the universal PostgreSQL primitives, ``aios-db.lock.json``).
+The verification is identical for both — the same release-identity, tag-binding
+and checksum proofs — so it is written once rather than copied and left to
+drift.
 
 Earlier revisions pinned a CI Actions artifact; those expire (the pinned
 artifact 9042593332 did), turning the fail-closed gate into a permanent
@@ -25,6 +32,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = REPO_ROOT / "aios-sdk.lock.json"
+DB_LOCK_PATH = REPO_ROOT / "aios-db.lock.json"
 MAX_ARTIFACT_BYTES = 100 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 CHECKSUM_MANIFEST_NAME = "SHA256SUMS"
@@ -55,7 +63,10 @@ class ArtifactLock:
     wheel_filename: str
     wheel_sha256: str
     version: str
-    api_major: int
+    # SDK-only: the major of the HTTP API contract the client speaks. `aios-db`
+    # is an in-process library with no wire contract, so it declares none —
+    # optional rather than a meaningless `1` that would read as a real claim.
+    api_major: int | None = None
 
     def as_dict(self) -> dict[str, object]:
         return dict(vars(self))
@@ -74,7 +85,7 @@ def load_lock(path: Path = LOCK_PATH) -> ArtifactLock:
         len(lock.source_sha) != 40
         or len(lock.accepted_main_sha) != 40
         or len(lock.wheel_sha256) != 64
-        or lock.api_major <= 0
+        or (lock.api_major is not None and lock.api_major <= 0)
         or not _RELEASE_TAG_PATTERN.fullmatch(lock.release_tag)
     ):
         raise ArtifactError("invalid AIOS SDK lock identity")
@@ -244,8 +255,14 @@ def resolve_artifact_token(env: dict[str, str] | None = None) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--lock",
+        type=Path,
+        default=LOCK_PATH,
+        help="artifact lock to fetch (default: aios-sdk.lock.json)",
+    )
     args = parser.parse_args()
-    lock = load_lock()
+    lock = load_lock(args.lock)
     wheel, manifest = fetch_release_wheel(lock, resolve_artifact_token())
     path = persist_verified_wheel(wheel, manifest, args.output, lock)
     print(path)

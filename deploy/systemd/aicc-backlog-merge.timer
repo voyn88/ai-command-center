@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the backlog merge tick periodically (BO-S3b)
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

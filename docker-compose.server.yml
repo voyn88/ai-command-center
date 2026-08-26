@@ -1,0 +1,68 @@
+# PostgreSQL for a single-host AICC server install (VOYN-W0-AICC-SRV-01a).
+#
+# Three deliberate choices:
+#
+#   * The port is published on 127.0.0.1 only. `ports: ["5432:5432"]` binds
+#     0.0.0.0, and on a cloud host Docker's forwarding rules sit in front of the
+#     firewall — the database would be reachable from the internet while `ufw
+#     status` still showed it closed. Remote access is an SSH tunnel or the
+#     private network, never a published port.
+#   * Passwords come from the environment with no default. `${VAR:?message}`
+#     makes compose refuse to start when a variable is unset, so there is no
+#     path to a running database with a known credential.
+#   * `POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256` forces SCRAM for host
+#     connections; the image's default (`md5`) is a broken password hash.
+#
+# Usage: put the variables in an untracked `.env` beside this file, then
+#   docker compose -f docker-compose.server.yml up -d
+#   AICC_PG_USER=<superuser>   ... python -m command_center.db bootstrap
+#   AICC_PG_USER=aicc_migrator ... python -m command_center.db upgrade
+
+services:
+  postgres:
+    # Pinned by digest, not by tag: tags are mutable, and the deploy must be
+    # reproducible from a commit SHA. Resolved with
+    # `docker buildx imagetools inspect postgres:17.6-alpine`.
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    container_name: aicc-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AICC_PG_DB:?set AICC_PG_DB}
+      POSTGRES_USER: ${AICC_PG_SUPERUSER:?set AICC_PG_SUPERUSER}
+      POSTGRES_PASSWORD: ${AICC_PG_SUPERUSER_PASSWORD:?set AICC_PG_SUPERUSER_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      # Log every connection and DDL statement: on a server that dispatches
+      # autonomous agents, "who changed the schema" must be answerable after
+      # the fact.
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - log_statement=ddl
+      - -c
+      - log_min_duration_statement=1000
+    ports:
+      - "127.0.0.1:${AICC_PG_PORT:-5432}:5432"
+    volumes:
+      - aicc-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # Hardening that costs nothing here: the database needs no new privileges
+    # and writes only to its data volume.
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 1m
+
+volumes:
+  aicc-pgdata:
+    name: aicc-pgdata

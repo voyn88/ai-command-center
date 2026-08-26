@@ -133,3 +133,58 @@ def test_home_load_error_journey_shows_russian_error_state(
 
     texts = [label.text() for label in home.findChildren(QLabel)]
     assert i18n.HOME_LOAD_ERROR in texts
+
+
+def test_first_run_wizard_journey_configures_workspace_then_lands_home(
+    qtbot, qapp, settings_store, tmp_path, monkeypatch
+):
+    """D-1 wizard path: unconfigured machine → wizard → configured → Home.
+
+    POSIX-gated like the other filesystem-sensitive journeys.
+    """
+    import os
+
+    if os.name != "posix":
+        import pytest
+
+        pytest.skip("first-run wizard journey is POSIX-gated (D-1)")
+
+    from command_center.application.first_run import (
+        HealthCheckItem,
+        HealthStatus,
+        initialize_workspace,
+    )
+    from command_center.desktop.pages.first_run_wizard import FirstRunWizard
+
+    # Unconfigured: no persisted root, no wizard has run yet.
+    assert settings_store.workspace_root() is None
+
+    env: dict[str, str] = {}
+    wizard = FirstRunWizard(
+        settings_store,
+        health_checks=lambda: (
+            HealthCheckItem("git", "Git", HealthStatus.OK, "/usr/bin/git"),
+        ),
+        initialize=lambda raw: initialize_workspace(raw, environ=env),
+    )
+    qtbot.addWidget(wizard)
+    wizard.workspace_edit.setText(str(tmp_path / "workspace"))
+    wizard.continue_button.click()
+    assert wizard.result() == int(wizard.DialogCode.Accepted)
+
+    # The wizard wrote the config the app expects: persisted root + layout.
+    root = settings_store.workspace_root()
+    assert root is not None
+    for child in ("data", "generated", "reports"):
+        assert (tmp_path / "workspace" / child).is_dir()
+    assert env["AICC_WORKSPACE_ROOT"] == root
+
+    # Next launch over the same settings skips the wizard and lands on Home.
+    from command_center.application.first_run import workspace_is_configured
+
+    assert workspace_is_configured(env)
+    shell, _theme = build_shell(qapp, settings_store)
+    qtbot.addWidget(shell)
+    assert shell.current_section_key == "home"
+    _walk_every_section(shell, qapp)
+    assert shell.shutdown()

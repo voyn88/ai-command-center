@@ -1,0 +1,31 @@
+# The backlog planner tick (VOYN-W0-BACKLOG-ORCHESTRATOR BO-S2): the
+# production caller of the plan cycle — release finished lanes, dispatch
+# eligible tasks into the execution queue via the atomic backlog_dispatch.
+#
+# Install (control-plane host, beside the reaper):
+#   cp deploy/systemd/aicc-backlog-planner.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-backlog-planner.timer
+#
+# Oneshot, the reaper's pattern: a tick is idempotent (planner:global lease
+# makes two control hosts one planner; dispatch is atomic per task; the
+# idempotency key pins re-ticks to the same work item), so a missed tick
+# delays planning and never corrupts it.
+
+[Unit]
+Description=AI Command Center backlog planner (dispatch tick)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aicc-app
+Group=aicc-app
+EnvironmentFile=/etc/aicc/app.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db backlog-plan
+TimeoutStartSec=120s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

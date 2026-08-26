@@ -88,9 +88,16 @@ def _clear_execution_center_singleton_cache() -> None:
     at a `runtime.db` path this fixture just deleted and recreated fresh
     (unmigrated), surfacing as `sqlite3.OperationalError: no such table:
     run`. Streamlit is imported lazily here so modules that never touch
-    Streamlit at all aren't forced to import it just for this cleanup."""
-    import streamlit as st
-
+    Streamlit at all aren't forced to import it just for this cleanup —
+    and guarded, because a headless worker host installs no desktop extras
+    at all: the SRV-05 daemon tests run on machines where streamlit is
+    deliberately absent, and an autouse fixture that hard-imports it turns
+    every such run red at setup for a dependency the tests under test
+    never touch."""
+    try:
+        import streamlit as st
+    except ImportError:
+        return
     st.cache_resource.clear()
 
 
@@ -187,8 +194,18 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
     calling code (including a freshly re-exec'd `app.py`) imported it — the same
     technique `fake_claude` already uses for `supervisor_module.subprocess.Popen`.
     Everything that isn't a `start-task.sh` call is forwarded to the real
-    `subprocess.run` unchanged (e.g. `git_repo`'s real `git init`)."""
-    import app
+    `subprocess.run` unchanged (e.g. `git_repo`'s real `git init`).
+
+    Guarded like the streamlit cleanup above, and for the same host: `app.py`
+    hard-imports streamlit at line 10, so on a headless worker machine this
+    autouse fixture would fail setup for every test in the tree — including
+    the worker-daemon tests whose whole point is running where the desktop
+    does not. No streamlit means no `app`, means nothing here to isolate."""
+    try:
+        import app
+    except ImportError:
+        yield
+        return
     from command_center import workspace_home
 
     generated_dir = isolated_data_dir / "generated"
@@ -217,7 +234,7 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
         return original_run(command, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", guarded_run)
-    return generated_dir
+    yield generated_dir
 
 
 @pytest.fixture(autouse=True)

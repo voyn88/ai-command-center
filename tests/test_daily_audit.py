@@ -220,7 +220,11 @@ def test_lease_heartbeat_prevents_a_second_campaign_after_original_expiry(tmp_pa
 
         def run(self, request):
             self.started.set()
-            assert self.release.wait(timeout=2)
+            # Longer than the lease under test, because this thread must stay
+            # blocked for the whole window the test measures. At two seconds it
+            # was shorter than the widened lease and timed out first — the
+            # fixture's own bound silently becoming the thing under test.
+            assert self.release.wait(timeout=10)
             return CampaignResult("completed", "ok", target_verified=True)
 
     backend = BlockingBackend()
@@ -228,8 +232,21 @@ def test_lease_heartbeat_prevents_a_second_campaign_after_original_expiry(tmp_pa
     service = DailyAuditService(
         config(
             tmp_path,
-            lease_duration=timedelta(milliseconds=300),
-            lease_heartbeat_seconds=0.05,
+            # A second and a tenth, not 300ms and 50ms. The property under
+            # test is "a live heartbeat refreshes the lease past its original
+            # deadline" — but at 300ms the assertion also required the
+            # heartbeat thread to be scheduled within 50ms of its turn, and on
+            # a loaded parallel runner it is not. The lease then expires
+            # *honestly*, a contender takes it, and the test fails for a reason
+            # that is not the property. Measured on CI: one failure in a
+            # 4153-test run, `acquire_due` returning a campaign id.
+            #
+            # Widening the budget is the fix here rather than an evasion,
+            # because the number was never the subject: nothing about the
+            # heartbeat is exercised more strongly by making its window smaller
+            # than the operating system's scheduling noise.
+            lease_duration=timedelta(seconds=1),
+            lease_heartbeat_seconds=0.1,
         ),
         backend,
         db_path=db_path,
@@ -239,25 +256,64 @@ def test_lease_heartbeat_prevents_a_second_campaign_after_original_expiry(tmp_pa
     result = []
     worker = threading.Thread(target=lambda: result.append(service.tick()))
     worker.start()
-    assert backend.started.wait(timeout=1)
-    original_until = datetime.fromisoformat(service.store.status()["lease_until"])
-    deadline = time.monotonic() + 1
-    while datetime.fromisoformat(service.store.status()["lease_until"]) <= original_until:
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
+    # Released on every exit path. `worker` is not a daemon thread, so an
+    # assertion below used to leave the process blocked at exit for the whole
+    # of the backend's wait — review measured 10.6s on a failing run against
+    # 2.6s before, per xdist worker.
+    try:
+        assert backend.started.wait(timeout=1)
+        original_until = datetime.fromisoformat(service.store.status()["lease_until"])
+        deadline = time.monotonic() + 1
+        while datetime.fromisoformat(service.store.status()["lease_until"]) <= original_until:
+            assert time.monotonic() < deadline, (
+                "the lease was never refreshed at all within 1s — the heartbeat "
+                "thread never ran, or it ran and wrote nothing"
+            )
+            time.sleep(0.01)
 
-    # Wait past the *original* lease deadline so a missing heartbeat would hand
-    # ownership to a second contender, while still expecting the refreshed lease
-    # to remain valid.
-    time.sleep(0.35)
-    contender = DailyAuditStore(db_path)
-    assert contender.acquire_due(
-        now=utc_now(), owner="two", lease_duration=timedelta(seconds=1)
-    ) is None
-    backend.release.set()
-    worker.join(timeout=2)
-    assert not worker.is_alive()
-    assert result[0].target_verified
+        # The deadline the *first* beat installed. Waiting past `original_until`
+        # alone proves only that one refresh happened, and review demonstrated the
+        # cost: a heartbeat mutated to beat exactly once and return passed five
+        # times out of five, while the unwidened test caught it. Waiting past the
+        # first refreshed deadline instead means only *continued* beating can keep
+        # the lease alive, which is the property this test is named for.
+        first_refreshed_until = datetime.fromisoformat(service.store.status()["lease_until"])
+
+        # Wait past the *original* lease deadline so a missing heartbeat would hand
+        # ownership to a second contender, while still expecting the refreshed lease
+        # to remain valid.
+        # Wait for the *condition* the test is about — being past the original
+        # deadline — rather than for a duration guessed to exceed it. A fixed sleep
+        # is a bet on the scheduler, and this file has already paid out on that bet
+        # once.
+        deadline = time.monotonic() + 5
+        while utc_now() <= first_refreshed_until:
+            assert time.monotonic() < deadline, "never passed the first refreshed deadline"
+            time.sleep(0.01)
+
+        # And state the precondition instead of assuming it: if the refreshed lease
+        # has itself expired, the contender below would succeed for a reason that
+        # is not the one under test, and the failure should say so.
+        refreshed_until = datetime.fromisoformat(service.store.status()["lease_until"])
+        assert refreshed_until > utc_now(), (
+            "the lease is expired at the moment of the contender check, so the "
+            "assertion below would pass or fail for a reason other than the one "
+            "under test. Either the heartbeat thread was starved, or it stopped "
+            "extending — this test cannot tell those apart, and says so rather "
+            "than reporting whichever happened as the other"
+        )
+
+        contender = DailyAuditStore(db_path)
+        assert contender.acquire_due(
+            now=utc_now(), owner="two", lease_duration=timedelta(seconds=1)
+        ) is None
+        backend.release.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert result[0].target_verified
+    finally:
+        backend.release.set()
+        worker.join(timeout=2)
 
 
 def test_service_shutdown_cancels_active_agent_and_persists_interruption(tmp_path):

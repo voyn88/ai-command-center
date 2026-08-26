@@ -1,0 +1,54 @@
+-- 0004_run_finalized_at (VOYN-W0-AICC-SRV-09-FINALIZED-AT)
+--
+-- A durable marker for "this run's finalization is complete", which the schema
+-- did not have.
+--
+-- `run.state` going terminal and `run` being *finished with* are two different
+-- facts, and until now only the first was stored. `supervisor._supervise`
+-- commits the terminal row, and only afterwards appends `process_exited`,
+-- auto-commits the agent's work and saves the report — on a daemon thread that
+-- interpreter shutdown does not join. Between those two points the run reads
+-- COMPLETED to every observer while its report does not exist yet and the
+-- agent's commit has not been made.
+--
+-- Measured over 20 runs on this branch, and worth stating precisely because the
+-- number this work started from was the small one:
+--
+--   clean working tree   median   6.1 ms, max   8.1 ms
+--   changed working tree median 139.0 ms, max 152.1 ms
+--
+-- The second is the case that matters. A run that changed the tree is a run
+-- with work to lose, and the auto-commit it pays for — a real `git commit`,
+-- 133 ms of the 139 — is what widens the window by a factor of twenty. So the
+-- window is at its widest exactly when a death inside it is most expensive, and
+-- against the 200 ms poll the CLI actually uses it is not a rare race at all.
+--
+-- The consequence that matters here is not the flake but the *absence of a
+-- predicate*. A second process — the cutover operator, the backward mirror's
+-- transport, a readiness probe — has no way to ask "is anything still being
+-- finalized?", because the only answer lives in `Supervisor.wait_for_run`,
+-- which reads an in-memory registry belonging to one process. Anything built on
+-- the terminal state alone is built on a fact that is true too early.
+--
+-- So: `finalized_at` is written as the *last* step of finalization, after the
+-- report and the auto-commit are durable — never in the same UPDATE as the
+-- state change. The marker is a consequence of the durable write, not its
+-- announcement. A process killed anywhere inside the window therefore leaves
+-- the run visibly unfinalized, which is a recoverable truth, rather than
+-- "terminal, and silently missing its report", which is not distinguishable
+-- from a finished run.
+--
+-- Nullable and write-once. Existing rows get NULL, which is honest: those runs
+-- finalized under a supervisor that recorded nothing, and backfilling `now()`
+-- would manufacture evidence that the report and the commit were durable when
+-- nothing checked.
+
+ALTER TABLE run ADD COLUMN finalized_at timestamptz;
+
+-- The predicate the cutover reads is "terminal rows whose marker is still
+-- empty", so the index is partial on exactly that emptiness. It stays small by
+-- construction: an entry exists only while a run is unfinalized, and every
+-- successful finalization removes its own row from the index. A full index on
+-- `(state)` would instead grow with the whole run history to answer a question
+-- that is only ever asked about a handful of rows.
+CREATE INDEX idx_run_unfinalized ON run (state) WHERE finalized_at IS NULL;

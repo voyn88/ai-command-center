@@ -21,6 +21,19 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  # The merge queue tests the *prospective* merged result — this branch's
+  # commits on top of whatever else the queue is about to land — rather than
+  # the branch in isolation. Without this trigger the queue's checks never
+  # start and every entry times out, so the trigger has to exist before the
+  # queue is switched on, not with it.
+  #
+  # Note for whoever enables the queue: this is a base-repository event, so
+  # secrets ARE available here, while the `pull_request` path withholds them
+  # from forks. Since the queue ref carries the pull request's own commits,
+  # enabling the queue makes repository secrets reachable from fork-authored
+  # code. See `tests/test_release_gate_policy.py` and
+  # `VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY`.
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:

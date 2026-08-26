@@ -114,3 +114,19 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Tasks screen (VOYN-W0-APP-CONTROL-S1): human list over the server queue.
+   Reuses the execution-* layout primitives; rows follow the same hairline
+   discipline. Status colour goes to the label only, never the row. */
+.task-row { border: 1px solid var(--gline); border-radius: 12px; padding: .8rem .9rem; background: rgba(255,255,255,.025); display: grid; gap: .4rem; }
+.task-row-head { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr) auto auto; gap: .8rem; align-items: center; }
+.task-row-head strong { color: var(--tx); font-size: .84rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-status { font-size: .68rem; font-weight: 600; letter-spacing: .04em; }
+.task-date { color: var(--tx3); font-size: .7rem; white-space: nowrap; }
+.task-toggle { border: none; background: transparent; color: var(--accent-1); cursor: pointer; font-size: .72rem; padding: .2rem .3rem; }
+.task-details { color: var(--tx2); font-size: .76rem; margin: 0; display: grid; gap: .25rem; border-top: 1px solid var(--gline); padding-top: .55rem; }
+.task-details p { margin: 0; }
+.task-details-label { color: var(--tx3); }
+.task-details-tech { font-family: var(--font-mono); color: var(--tx3); font-size: .66rem; }
+.task-token-input { border: 1px solid var(--gline); border-radius: 10px; background: rgba(255,255,255,.04); color: var(--tx); padding: .55rem .7rem; min-width: 16rem; }
+@media (max-width: 760px) { .task-row-head { grid-template-columns: 1fr auto; } .task-date { display: none; } }

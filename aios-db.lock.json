@@ -1,0 +1,9 @@
+{
+  "accepted_main_sha": "64cc517430d91668e4294dd58291c36bce66e049",
+  "release_tag": "v0.2.2rc5",
+  "repository": "dimastov-lab/aios",
+  "source_sha": "64cc517430d91668e4294dd58291c36bce66e049",
+  "version": "0.1.0",
+  "wheel_filename": "aios_db-0.1.0-py3-none-any.whl",
+  "wheel_sha256": "ab48132218946dfa07ce7b8c2290385d539c3d2a359b474883e766154aa08922"
+}

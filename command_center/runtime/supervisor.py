@@ -44,9 +44,7 @@ from __future__ import annotations
 
 import logging
 import os
-import json
 import signal
-import sqlite3
 import subprocess
 import threading
 import time
@@ -65,12 +63,14 @@ from command_center import run_lineage as provenance
 from command_center.runtime import (
     context_service,
     db,
-    git_ops,
+    git_ops,  # noqa: F401 - re-exported: tests patch `supervisor.git_ops.commit_all`
     identity,
     outcome,
     providers,
     reports,
+    run_finalizer,
     stream_parser,
+    stream_reader,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,8 @@ _CANCEL_CAS_MAX_ATTEMPTS = 5
 # reclassify so the persisted cancel request wins instead of leaving an exited
 # child stuck in RUNNING. The retry is bounded for the same reason as the
 # cancel-side CAS above.
-_TERMINAL_CAS_MAX_ATTEMPTS = 5
+# Canonical value lives in `run_finalizer` since the NIGHT-W9 extraction.
+_TERMINAL_CAS_MAX_ATTEMPTS = run_finalizer.TERMINAL_CAS_MAX_ATTEMPTS
 
 # How long a run must keep *looking* gone (pid still None, or its pid no longer
 # resolves) before reconcile() from a NON-owning process terminalizes it to
@@ -445,6 +446,11 @@ class Supervisor:
     def __init__(self, db_path: Path | None = None) -> None:
         self.db_path = db_path or db.resolve_db_path()
         db.migrate(self.db_path)
+        # Extracted sides of the supervisor (NIGHT-W9): stream consumption and
+        # finalize/outcome persistence live behind small interfaces; this class
+        # keeps orchestration (process lifecycle, `_active` registry, locks).
+        self._streams = stream_reader.StreamReader(self.db_path)
+        self._finalizer = run_finalizer.RunFinalizer(self.db_path)
         self._active: dict[str, _ActiveRun] = {}
         # Run ids this instance has committed to launching (persisted as
         # PREPARED/QUEUED) but has not yet `Popen`'d — the gap `self._active`
@@ -1414,73 +1420,12 @@ class Supervisor:
             return self._signal_process_group_locked(active, sig)
 
     def _append_lifecycle_event_best_effort(self, lifecycle: str, run_id: str, **payload: object) -> None:
-        """Persist audit telemetry without making lifecycle safety depend on it."""
-        try:
-            db.append_run_event(
-                self.db_path,
-                run_id,
-                "lifecycle",
-                stream_parser.lifecycle_event(lifecycle, **payload)["payload"],
-            )
-        except Exception:
-            logger.exception("Could not persist %s lifecycle event for run %s", lifecycle, run_id)
+        """Delegates to `run_finalizer.RunFinalizer` (extracted side)."""
+        self._finalizer.append_lifecycle_event_best_effort(lifecycle, run_id, **payload)
 
     def _auto_commit_completed_work(self, run_id: str, repo_path: Path) -> str | None:
-        """Commit whatever a `COMPLETED` run left uncommitted, so an agent's
-        work is never lost to a forgotten commit.
-
-        Best-effort *by construction*: the run's terminal state is already
-        persisted when this runs, and every failure path here is swallowed into
-        a lifecycle event. A commit that cannot be made must never demote a
-        genuine `COMPLETED` — the changes then simply stay in the working tree
-        exactly as the agent left them, which is where they were before this
-        hook existed.
-
-        Note this never rewrites the run row: `post_run_git_status` /
-        `working_tree_changed` deliberately keep recording what the *agent*
-        left behind, not what the supervisor did afterwards, because those are
-        the inputs `outcome.classify_process_result` already ruled on.
-
-        Returns the new HEAD sha on success, `None` when the tree was already
-        clean (an idempotent no-op — the agent committed its own work, or the
-        run was read-only) or the commit could not be made.
-        """
-        message = (
-            f"chore(agent): auto-commit work from run {run_id}\n"
-            "\n"
-            "Committed automatically by the AI Command Center supervisor: the "
-            "run finished COMPLETED with a dirty working tree.\n"
-            "\n"
-            f"Run-Id: {run_id}"
-        )
-        try:
-            proc = git_ops.commit_all(repo_path, message=message)
-        except Exception as exc:
-            logger.exception("Auto-commit failed for run %s", run_id)
-            self._append_lifecycle_event_best_effort(
-                "auto_commit_failed", run_id, error=str(exc)
-            )
-            return None
-
-        if proc is None:
-            self._append_lifecycle_event_best_effort("auto_commit_skipped_clean_tree", run_id)
-            return None
-        if proc.returncode != 0:
-            self._append_lifecycle_event_best_effort(
-                "auto_commit_failed",
-                run_id,
-                returncode=proc.returncode,
-                error=(proc.stderr or "").strip()[:400],
-            )
-            return None
-
-        head = None
-        try:
-            head = agent_runner.git_snapshot(repo_path).get("head")
-        except Exception:  # pragma: no cover - snapshot is telemetry only
-            logger.exception("Could not read HEAD after auto-commit for run %s", run_id)
-        self._append_lifecycle_event_best_effort("auto_committed", run_id, head=head)
-        return head
+        """Delegates to `run_finalizer.RunFinalizer` (extracted side)."""
+        return self._finalizer.auto_commit_completed_work(run_id, repo_path)
 
     def _persist_run_failure(
         self,
@@ -1490,77 +1435,17 @@ class Supervisor:
         failure_reason: str,
         lifecycle: str,
     ) -> bool:
-        """Bounded CAS fallback after a locally owned child is confirmed gone.
-
-        Return true only when the run is gone or a terminal state is confirmed.
-        All exception classes are retried: a transient SQLite failure must not
-        permanently strand an exited run in an active state.
-        """
-        def finish_started_attempt(current: dict) -> None:
-            attempts = db.list_provider_attempts(self.db_path, run_id)
-            if not attempts or attempts[-1]["outcome"] != "started":
-                return
-            reason = current.get("failure_reason") or failure_reason
-            db.finish_provider_attempt(
-                self.db_path,
-                run_id=run_id,
-                attempt_number=attempts[-1]["attempt_number"],
-                outcome="failed",
-                classification=provider_route.classify_failure(reason),
-                disposition=provider_route.TERMINAL,
-                error_code=reason,
-                completed_at=current.get("completed_at") or iso_now(),
-            )
-
-        for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
-            try:
-                current = db.get_run(self.db_path, run_id)
-                if current is None:
-                    return True
-                if current["state"] in db.TERMINAL_STATES:
-                    if current["state"] == "FAILED":
-                        finish_started_attempt(current)
-                    return True
-                if current["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
-                    return False
-                current = db.update_run_state(
-                    self.db_path,
-                    run_id,
-                    expected_version=current["version"],
-                    new_state="FAILED",
-                    fields={
-                        "exit_code": exit_code,
-                        "completed_at": iso_now(),
-                        "failure_reason": failure_reason,
-                    },
-                )
-                finish_started_attempt(current)
-                self._append_lifecycle_event_best_effort(
-                    lifecycle,
-                    run_id,
-                    exit_code=exit_code,
-                )
-                return True
-            except (db.LostUpdateError, db.InvalidTransitionError):
-                continue
-            except Exception:
-                logger.exception("Could not persist %s for run %s", failure_reason, run_id)
-                continue
-        logger.error(
-            "Run %s remained active after %s %s persistence attempts",
-            run_id,
-            _TERMINAL_CAS_MAX_ATTEMPTS,
-            failure_reason,
+        """Delegates to `run_finalizer.RunFinalizer` (extracted side)."""
+        return self._finalizer.persist_run_failure(
+            run_id, exit_code=exit_code, failure_reason=failure_reason, lifecycle=lifecycle
         )
-        return False
 
     def _persist_supervision_failure(self, run_id: str, *, exit_code: int | None) -> bool:
-        return self._persist_run_failure(
-            run_id,
-            exit_code=exit_code,
-            failure_reason="supervision_failed",
-            lifecycle="supervision_failed",
-        )
+        return self._finalizer.persist_supervision_failure(run_id, exit_code=exit_code)
+
+    def _mark_finalized(self, run_id: str) -> None:
+        """Delegates to `run_finalizer.RunFinalizer` (extracted side)."""
+        self._finalizer.mark_finalized(run_id)
 
     def _release_active(self, run_id: str, active: _ActiveRun) -> None:
         active.terminal_persisted_event.set()
@@ -1832,159 +1717,35 @@ class Supervisor:
                 pass
 
     def _write_stdin(self, run_id: str, active: _ActiveRun, prompt: str) -> None:
-        try:
-            active.process.stdin.write(prompt)
-            active.process.stdin.close()
-            db.append_run_event(
-                self.db_path,
-                run_id,
-                "lifecycle",
-                stream_parser.lifecycle_event("prompt_delivered", transport="stdin")["payload"],
-            )
-        except (BrokenPipeError, OSError, ValueError) as exc:
-            db.append_run_event(
-                self.db_path,
-                run_id,
-                "lifecycle",
-                stream_parser.lifecycle_event("prompt_delivery_failed", error=type(exc).__name__)["payload"],
-            )
+        self._streams.write_stdin(run_id, active, prompt)
 
     # ------------------------------------------------------------------
     # Streaming consumption (runs in background reader threads)
     # ------------------------------------------------------------------
 
     def _record_handshake(self, run_id: str, active: _ActiveRun) -> None:
-        """Record the provider startup/handshake milestone exactly once.
-
-        This is deliberately separate from `process_started`: a valid PID
-        proves the process was created; provider-approved readiness evidence
-        proves it reached its protocol startup milestone. For Claude the
-        historical any-output rule remains; for Codex only recognized
-        lifecycle JSON qualifies. The gap
-        between the two is exactly the window in which a run is "started but
-        early output not yet received" — surfaced to the UI as
-        `session_view.STATUS_STARTING`, never as a failure.
-
-        Best-effort and non-fatal by construction:
-
-        - Guarded by an in-memory `threading.Event` so it runs once even
-          though both reader threads (stdout and stderr) call it, and without
-          re-reading the run row for every subsequent line.
-        - Any database error (a lost compare-and-set race against a
-          concurrent `cancel()`/watchdog write, the run already gone, ...) is
-          swallowed. Handshake timing is observability, not correctness — it
-          must never crash a reader thread or fail a run, and the run's
-          terminal state is decided entirely from process-exit facts
-          regardless of whether this ever succeeded.
-
-        The append-only `handshake_received` lifecycle event is written first
-        (it touches only `run_event`, never `run.version`, so it never races
-        anything), then the `first_output_at` column is set best-effort so the
-        live projection layer (`session_view.derive_status`), which reads only
-        the run row, can tell STARTING from RUNNING.
-        """
-        with active.handshake_lock:
-            if active.handshake_recorded.is_set():
-                return
-            # Claim the milestone first, atomically: even if the DB writes
-            # below fail or race, we must never spin re-attempting on every
-            # line, nor let the other reader thread also claim it.
-            active.handshake_recorded.set()
-        now = iso_now()
-        try:
-            db.append_run_event(
-                self.db_path, run_id, "lifecycle", stream_parser.lifecycle_event("handshake_received", at=now)["payload"]
-            )
-        except Exception:
-            logger.debug("handshake event persist failed for run %s", run_id, exc_info=True)
-        try:
-            run = db.get_run(self.db_path, run_id)
-            if run is None or run.get("first_output_at"):
-                return
-            db.update_run_fields(
-                self.db_path, run_id, expected_version=run["version"], fields={"first_output_at": now}
-            )
-        except Exception:
-            # LostUpdateError (a concurrent cancel/terminal write landed
-            # first), KeyError (run gone), or any other db hiccup — the
-            # milestone is best-effort; the append-only event above already
-            # captured the timing for the audit log.
-            logger.debug("first_output_at milestone failed for run %s", run_id, exc_info=True)
+        """Delegates to `stream_reader.StreamReader` (extracted side)."""
+        self._streams.record_handshake(run_id, active)
 
     def _drain_stdout(self, run_id: str, active: _ActiveRun) -> None:
-        process = active.process
-        try:
-            for chunk in process.stdout:
-                for line in active.provider_runtime.feed_stdout(chunk):
-                    self._persist_stdout_event(run_id, active, line)
-        finally:
-            for line in active.provider_runtime.flush_stdout():
-                self._persist_stdout_event(run_id, active, line)
-            try:
-                process.stdout.close()
-            except Exception:
-                logger.debug("stdout close failed for run %s", run_id, exc_info=True)
+        self._streams.drain_stdout(run_id, active)
 
     def _persist_stdout_event(self, run_id: str, active: _ActiveRun, line: str) -> None:
-        event = active.provider_runtime.parse_stdout_line(line)
-        if active.provider_runtime.stdout_event_is_readiness(line, event):
-            self._record_handshake(run_id, active)
-        if event is None:
-            return
-        if active.provider_runtime.event_is_valid_result(event):
-            active.valid_result_recorded.set()
-        if active.provider_runtime.event_is_provider_error(event):
-            active.add_diagnostic(json.dumps(event["payload"], ensure_ascii=False, sort_keys=True))
-        self._append_stream_event(run_id, event["event_type"], event["payload"])
+        self._streams.persist_stdout_event(run_id, active, line)
 
     def _drain_stderr(self, run_id: str, active: _ActiveRun) -> None:
-        process = active.process
-        try:
-            for chunk in process.stderr:
-                for line in active.provider_runtime.feed_stderr(chunk):
-                    self._persist_stderr_event(run_id, active, line)
-        finally:
-            for line in active.provider_runtime.flush_stderr():
-                self._persist_stderr_event(run_id, active, line)
-            try:
-                process.stderr.close()
-            except Exception:
-                logger.debug("stderr close failed for run %s", run_id, exc_info=True)
+        self._streams.drain_stderr(run_id, active)
 
     def _persist_stderr_event(self, run_id: str, active: _ActiveRun, line: str) -> None:
-        if active.provider_runtime.stderr_line_is_readiness(line):
-            self._record_handshake(run_id, active)
-        event = stream_parser.stderr_event(line[:providers.MAX_PERSISTED_EVENT_CHARS])
-        active.add_diagnostic(event["payload"]["line"])
-        self._append_stream_event(run_id, event["event_type"], event["payload"])
+        self._streams.persist_stderr_event(run_id, active, line)
 
     def _append_stream_event(self, run_id: str, event_type: str, payload: dict) -> None:
-        """Persist one stream event, tolerating a concurrently deleted run.
-
-        Stdout/stderr reader threads outlive the foreground launcher. If the
-        run (or its task/session parent) is deleted while output is still
-        draining, the append hits a FOREIGN KEY violation. That is a benign
-        race — there is nothing left to persist for a run that no longer
-        exists — so the reader thread stops recording quietly instead of
-        dying with an unhandled exception. This mirrors how the codebase
-        already treats a vanished run elsewhere (see `_record_handshake`).
-        """
-        try:
-            db.append_run_event(self.db_path, run_id, event_type, payload)
-        except sqlite3.IntegrityError:
-            pass
+        """Delegates to `stream_reader.StreamReader` (extracted side)."""
+        self._streams.append_stream_event(run_id, event_type, payload)
 
     def _final_result_payload(self, run_id: str) -> dict | None:
-        """The payload of the run's own `result`-type event (the last line of
-        `claude -p --output-format stream-json`'s output — carries `result`
-        text and, when applicable, a `permission_denials` array), or `None`
-        if no such event was persisted. Called only after both stdout/stderr
-        reader threads have joined (see `_supervise`), so every event this
-        run will ever produce is already committed to `run_event`."""
-        result_events = db.list_run_events(self.db_path, run_id, after_seq=0, limit=1_000_000, event_type="result")
-        if not result_events:
-            return None
-        return result_events[-1]["payload"]
+        """Delegates to `run_finalizer.RunFinalizer` (extracted side)."""
+        return self._finalizer.final_result_payload(run_id)
 
     def _supervise(
         self,
@@ -2233,6 +1994,25 @@ class Supervisor:
                         run_id,
                         error=str(exc),
                     )
+
+            # The last write of the run, and the reason `finalized_at` exists.
+            # Everything above — the `process_exited` event, the auto-commit of
+            # the agent's work, the report — happens *after* the terminal state
+            # is already visible to every reader, on a daemon thread that
+            # interpreter shutdown does not join. For the width of that window
+            # — measured over 20 runs at a 6.1 ms median with a clean tree and a
+            # 139 ms median (152 ms max) once the auto-commit has a real `git
+            # commit` to make — the run looks finished and is not, and a death
+            # inside it used to be indistinguishable from a clean completion.
+            # Note which way round that is: the window is twenty times wider on
+            # exactly the runs that produced work worth losing.
+            #
+            # Placing the marker here, rather than in the `fields` of the
+            # `update_run_state` call above, is the entire point: it makes
+            # "finalized" a consequence of the durable writes instead of a
+            # promise made before them. Move it up and the column still exists
+            # while the guarantee is gone.
+            self._mark_finalized(run_id)
         except Exception:
             logger.exception("Unexpected supervision failure for run %s", run_id)
             exited = active.process_exited_event.is_set()
@@ -2420,9 +2200,17 @@ class Supervisor:
         RUNNING for a later reconcile to reclassify)."""
         if pid is None:
             return True  # nothing to signal; safe to terminalize
-        current = identity.capture_identity(pid)
-        if current is None:
+        process_query = identity.query_identity(pid)
+        if process_query.status in {
+            identity.ProcessQueryStatus.ABSENT,
+            identity.ProcessQueryStatus.ZOMBIE,
+        }:
             return True  # already gone; terminalize
+        if process_query.status is identity.ProcessQueryStatus.UNKNOWN:
+            return False  # unreadable is not safe to signal or terminalize
+        current = process_query.identity
+        if current is None:  # defensive: LIVE always carries an identity
+            return False
         if recorded_identity and current.as_string() != recorded_identity:
             return False  # pid reused since classification — must not signal it
         try:
@@ -2499,7 +2287,7 @@ class Supervisor:
             if classification == "RUNNING" and current["state"] == "RUNNING":
                 return current
             try:
-                return db.update_run_state(
+                reconciled = db.update_run_state(
                     self.db_path,
                     run_id,
                     expected_version=current["version"],
@@ -2508,6 +2296,16 @@ class Supervisor:
                 )
             except (db.LostUpdateError, db.InvalidTransitionError):
                 continue
+            if classification in db.TERMINAL_STATES:
+                # Reconciliation *is* the finalization for these runs: the
+                # supervisor that owned them is gone, so no report and no
+                # auto-commit are coming, and this decision is the last word on
+                # them. Without the marker they would stay unfinalized forever
+                # and the cutover predicate could never reach zero on any
+                # install that has ever restarted with a run in flight — a
+                # drain gate that never drains.
+                self._mark_finalized(run_id)
+            return reconciled
         raise SupervisorError(
             f"Run {run_id!r} could not persist reconciliation state "
             f"{classification!r} after {_TERMINAL_CAS_MAX_ATTEMPTS} attempts."
@@ -2670,14 +2468,23 @@ class Supervisor:
                     looks_gone = True
                     detail = "no pid recorded for this run"
                 else:
-                    current_identity = identity.capture_identity(pid)
-                    if current_identity is None:
+                    process_query = identity.query_identity(pid)
+                    if process_query.status in {
+                        identity.ProcessQueryStatus.ABSENT,
+                        identity.ProcessQueryStatus.ZOMBIE,
+                    }:
                         looks_gone = True
-                        detail = "pid no longer exists"
+                        detail = "pid no longer executes"
+                    elif process_query.status is identity.ProcessQueryStatus.UNKNOWN:
+                        classification = "UNKNOWN"
+                        detail = "pid identity could not be queried safely"
+                    elif process_query.identity is None:
+                        classification = "UNKNOWN"
+                        detail = "live pid query returned no identity"
                     elif not recorded_identity:
                         classification = "UNKNOWN"
                         detail = "pid exists but no identity was recorded at launch time"
-                    elif current_identity.as_string() == recorded_identity:
+                    elif process_query.identity.as_string() == recorded_identity:
                         classification = "RUNNING"
                         detail = "pid exists and identity matches; orphaned from this supervisor instance"
                     else:

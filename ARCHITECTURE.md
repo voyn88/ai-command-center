@@ -41,10 +41,20 @@ flowchart LR
     Streamlit -. "D1 shell shipped; wiring & packaging planned" .-> Desktop["Native PySide6 client"]
 ```
 
-Streamlit itself serves HTTP and WebSocket traffic. The repository does not configure
-`server.address`, and `scripts/start-ui.sh` does not add a bind address. Operators must explicitly
-bind Streamlit to localhost when network exposure is not intended. The application has no
-authentication layer.
+Streamlit itself serves HTTP and WebSocket traffic. **The application has no authentication layer**
+yet performs privileged git/gh and subprocess operations, so every launch path is constrained to
+keep it off-host unless the operator deliberately opts out:
+
+| Launch path | Control |
+|---|---|
+| `streamlit run app.py` | `.streamlit/config.toml` pins `[server] address = "localhost"` |
+| `scripts/start-ui.sh` | injects `--server.address localhost` unless one is passed |
+| container entrypoint | `scripts/aml-entrypoint.sh` has **no default** and exits `78` unless `STREAMLIT_SERVER_ADDRESS` is set |
+| `docker compose` | the port is published on `${AML_BIND_HOST:-127.0.0.1}` |
+
+`tests/test_deployment_exposure.py` is the gate for all four. Not being exposed is not the same as
+being authenticated: HTTP authentication is a separate, still-open piece of work, so widening any of
+these controls means putting an unauthenticated privileged console on the network.
 
 ## 2. UI and service boundaries
 

@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: DimastovLab.AICommandCenter
+PackageVersion: 0.1.0
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: AI Command Center\AI Command Center.exe
+    PortableCommandAlias: aicc
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/dimastov-lab/ai-command-center/releases/download/desktop-v0.1.0/AI-Command-Center-windows-x64.zip
+    InstallerSha256: 3E47BACCA6001CC9CFB566839133920E58C38E11D2D76AB29DC3611D6A85F415
+ManifestType: installer
+ManifestVersion: 1.6.0

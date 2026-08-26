@@ -1,0 +1,139 @@
+/* AUTO-GENERATED from tokens.json by build_tokens.py — do not edit by hand. */
+/* control-plane-design-tokens v1.0.0 — dark-first; explicit data-theme overrides the OS media query. */
+
+:root {
+  /* font */
+  --font-sans: -apple-system, "SF Pro Text", system-ui, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+  /* size */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-base: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 28px;
+  --fs-3xl: 36px;
+  /* weight */
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+  /* tracking */
+  --tracking-tight: -0.01em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.02em;
+  --tracking-caps: 0.06em;
+  /* space */
+  --space-px: 2px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  /* radius */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+  /* duration */
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 320ms;
+  /* easing */
+  --ease-standard: cubic-bezier(0.2, 0.7, 0.2, 1);
+  /* --- theme: dark (default) --- */
+  /* color */
+  --bg: #0B0E14;
+  --surface: #121724;
+  --raise: #1A2130;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --line: #2A3441;
+  --text: #E8ECF4;
+  --text-2: #A6B0C3;
+  --text-3: #6B7488;
+  --accent: #6C8CFF;
+  --accent-2: #536DFE;
+  --ok: #3DDC97;
+  --warn: #F5B14C;
+  --crit: #FF6B7A;
+  --violet: #B08CFF;
+  --cyan: #55D6E3;
+  /* shadow */
+  --sh: 0 1px 2px rgba(0, 0, 0, 0.40), 0 4px 16px rgba(0, 0, 0, 0.35);
+  --sh-hi: 0 8px 30px rgba(0, 0, 0, 0.50);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    /* color */
+    --bg: #F4F6FB;
+    --surface: #FFFFFF;
+    --raise: #FBFCFF;
+    --hairline: rgba(16, 22, 40, 0.10);
+    --line: #D7DEE9;
+    --text: #10151F;
+    --text-2: #515A6B;
+    --text-3: #8A93A6;
+    --accent: #4C6EF0;
+    --accent-2: #3B54D6;
+    --ok: #1FA971;
+    --warn: #C8811A;
+    --crit: #E23D4E;
+    --violet: #7A4DE0;
+    --cyan: #1699A8;
+    /* shadow */
+    --sh: 0 1px 2px rgba(16, 22, 40, 0.06), 0 4px 16px rgba(16, 22, 40, 0.08);
+    --sh-hi: 0 12px 34px rgba(16, 22, 40, 0.14);
+  }
+}
+
+:root[data-theme="dark"] {
+  /* color */
+  --bg: #0B0E14;
+  --surface: #121724;
+  --raise: #1A2130;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --line: #2A3441;
+  --text: #E8ECF4;
+  --text-2: #A6B0C3;
+  --text-3: #6B7488;
+  --accent: #6C8CFF;
+  --accent-2: #536DFE;
+  --ok: #3DDC97;
+  --warn: #F5B14C;
+  --crit: #FF6B7A;
+  --violet: #B08CFF;
+  --cyan: #55D6E3;
+  /* shadow */
+  --sh: 0 1px 2px rgba(0, 0, 0, 0.40), 0 4px 16px rgba(0, 0, 0, 0.35);
+  --sh-hi: 0 8px 30px rgba(0, 0, 0, 0.50);
+}
+
+:root[data-theme="light"] {
+  /* color */
+  --bg: #F4F6FB;
+  --surface: #FFFFFF;
+  --raise: #FBFCFF;
+  --hairline: rgba(16, 22, 40, 0.10);
+  --line: #D7DEE9;
+  --text: #10151F;
+  --text-2: #515A6B;
+  --text-3: #8A93A6;
+  --accent: #4C6EF0;
+  --accent-2: #3B54D6;
+  --ok: #1FA971;
+  --warn: #C8811A;
+  --crit: #E23D4E;
+  --violet: #7A4DE0;
+  --cyan: #1699A8;
+  /* shadow */
+  --sh: 0 1px 2px rgba(16, 22, 40, 0.06), 0 4px 16px rgba(16, 22, 40, 0.08);
+  --sh-hi: 0 12px 34px rgba(16, 22, 40, 0.14);
+}

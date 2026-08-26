@@ -261,6 +261,37 @@ SETTINGS_SELECTED_PROJECT_PLACEHOLDER = "Например, проект-1"
 SETTINGS_SAVE_WORKSPACE = "Сохранить параметры рабочего пространства"
 SETTINGS_SAVED = "Параметры сохранены"
 
+# --- First-run wizard (D-1) -----------------------------------------------
+FIRST_RUN_TITLE = "Первый запуск"
+FIRST_RUN_SUBTITLE = (
+    "Проверим окружение и настроим рабочее пространство — это займёт минуту."
+)
+FIRST_RUN_CHECKS_GROUP = "Проверка окружения"
+FIRST_RUN_CHECKS_ACCESSIBLE = "Список проверок окружения"
+FIRST_RUN_STATUS_LABELS = {
+    "ok": "Готово",
+    "warning": "Внимание",
+    "error": "Ошибка",
+}
+FIRST_RUN_RECHECK = "Перепроверить"
+FIRST_RUN_WORKSPACE_GROUP = "Рабочее пространство"
+FIRST_RUN_WORKSPACE_LABEL = "Каталог рабочего пространства"
+FIRST_RUN_WORKSPACE_DESCRIPTION = (
+    "Здесь приложение будет хранить данные, артефакты и отчёты. "
+    "Каталог будет создан, если его ещё нет."
+)
+FIRST_RUN_BROWSE = "Выбрать…"
+FIRST_RUN_CONTINUE = "Продолжить"
+FIRST_RUN_QUIT = "Выйти"
+FIRST_RUN_ERRORS_NOTE = (
+    "Часть обязательных зависимостей не найдена — приложение запустится, "
+    "но соответствующие функции будут недоступны до их установки."
+)
+
+# --- Startup error boundary (D-1) -----------------------------------------
+STARTUP_ERROR_WINDOW_TITLE = "AI Command Center — ошибка запуска"
+STARTUP_ERROR_DETAILS_HINT = "Техническая информация — в разделе «Показать детали»."
+
 
 # --- Status badges / project cards (D2C) ----------------------------------
 BADGE_SENSITIVE = "Конфиденциально"

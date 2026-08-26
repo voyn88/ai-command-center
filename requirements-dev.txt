@@ -15,6 +15,11 @@ pytest-cov>=5.0,<7.0
 mypy>=1.13,<2.0
 # Qt test bindings for the optional desktop app (PySide6).
 pytest-qt>=4.4,<5.0
+# Parallel test execution for the CI quality gate (`pytest -n auto`). The suite
+# isolates every worker via per-process temp data dirs (tests/conftest.py), so
+# the ~3k-test gate can fan out across runner cores instead of running serially.
+# Held to the validated 3.x line; pulls in `execnet` transitively.
+pytest-xdist>=3.6,<4.0
 # FastAPI/Starlette's TestClient dependency. The production API does not need
 # this package, but clean CI environments need it to collect endpoint tests.
 # NOTE (audit SEC-3): the TestClient dependency is `httpx` (0.x line); `httpx2`
@@ -29,3 +34,13 @@ httpx>=0.27,<1.0
 playwright>=1.55,<2.0
 # Local axe-core bundle for real-browser WCAG checks (no CDN/network at test time).
 axe-playwright-python==0.1.8
+# Coverage-derived test<->source dependency cache for the local dev loop
+# (`make test-impacted`). Complements, does not replace, `scripts/ci/
+# test_impact/select_tests.py`'s static-AST selector: testmon's map is built
+# from *actual* coverage data (catches dynamic imports and runtime-only
+# dependencies the static walker cannot see), at the cost of needing a prior
+# full run to seed `.testmondata`. Local-only, like `test-fast` above --
+# CI's required gate is untouched and keeps running the full suite every
+# time; testmon only ever narrows a LOCAL iteration loop, never a merge
+# decision.
+pytest-testmon>=2.1,<3.0

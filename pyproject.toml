@@ -41,4 +41,16 @@ exclude_lines = [
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-xdist>=3.6",
+]
+
+[tool.pytest.ini_options]
+# `serial` tests are timing-sensitive subprocess tests that miss their
+# deadlines when pytest-xdist saturates the CPU. Both locally and in CI the
+# suite runs as a parallel body plus a short serial tail:
+#   pytest -q -n auto --dist loadscope -m "not serial" && pytest -q -m serial
+# (see .github/workflows/ci.yml "Pytest + coverage (parallel)" / "serial tail").
+markers = [
+    "serial: must not run concurrently with other tests (excluded from pytest-xdist runs; see README Validation)",
+    "e2e: requires the real Playwright browser and runs in the dedicated E2E partition",
 ]

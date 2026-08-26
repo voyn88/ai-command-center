@@ -1,18 +1,29 @@
 import { useState } from 'react'
 import Home from './screens/Home'
 import Execution from './screens/Execution'
+import Tasks from './screens/Tasks'
 import BackgroundLayer from './components/BackgroundLayer'
 
+type Screen = 'home' | 'execution' | 'tasks'
+
+function fromHash(): Screen {
+  if (window.location.hash === '#execution') return 'execution'
+  if (window.location.hash === '#tasks') return 'tasks'
+  return 'home'
+}
+
 function App() {
-  const [screen, setScreen] = useState<'home' | 'execution'>(() => window.location.hash === '#execution' ? 'execution' : 'home')
-  const navigate = (next: 'home' | 'execution') => {
-    window.location.hash = next === 'execution' ? 'execution' : ''
+  const [screen, setScreen] = useState<Screen>(fromHash)
+  const navigate = (next: Screen) => {
+    window.location.hash = next === 'home' ? '' : next
     setScreen(next)
   }
   return (
     <>
       <BackgroundLayer />
-      {screen === 'home' ? <Home onNavigate={navigate} /> : <Execution onNavigate={navigate} />}
+      {screen === 'home' && <Home onNavigate={navigate} />}
+      {screen === 'execution' && <Execution onNavigate={navigate} />}
+      {screen === 'tasks' && <Tasks onNavigate={navigate} />}
     </>
   )
 }

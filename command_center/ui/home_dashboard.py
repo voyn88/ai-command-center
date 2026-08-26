@@ -155,6 +155,21 @@ button:focus-visible, a:focus-visible, [tabindex]:focus-visible {{
   outline: 3px solid var(--hx-blue) !important;
   outline-offset: 3px !important;
 }}
+[data-testid="stCaptionContainer"],
+kbd[aria-label^="Shortcut"] {{
+  opacity: 1 !important;
+}}
+[data-testid="stCaptionContainer"] p,
+kbd[aria-label^="Shortcut"] {{
+  color: var(--hx-muted) !important;
+}}
+a[aria-label="Link to heading"] {{
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  min-height: 24px;
+}}
 @media (max-width: 420px) {{
   .hx-kpis, .hx-kanban {{ grid-template-columns: minmax(0, 1fr); }}
   .hx-row, .hx-foot {{ flex-wrap: wrap; }}

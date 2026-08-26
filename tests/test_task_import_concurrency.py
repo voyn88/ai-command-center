@@ -96,6 +96,7 @@ def test_unsafe_read_modify_write_pattern_loses_tasks(tmp_path):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.serial  # threaded lock-deadline (join timeout=15); flaky when xdist saturates all cores
 def test_two_different_packages_imported_concurrently_both_survive_threaded(tmp_path):
     start = threading.Barrier(2)
     errors: list[Exception] = []
@@ -168,6 +169,7 @@ def test_import_lock_times_out_with_a_clear_error_instead_of_hanging(tmp_path):
     assert result.imported_ids == ["TIMEOUT-1"]
 
 
+@pytest.mark.serial  # many concurrent registry writers on a lock deadline; flaky when xdist saturates all cores
 def test_registry_stays_valid_json_after_many_concurrent_imports(tmp_path):
     task_id_batches = [[f"BULK-{i}-1", f"BULK-{i}-2"] for i in range(8)]
     start = threading.Barrier(len(task_id_batches))

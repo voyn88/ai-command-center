@@ -92,11 +92,26 @@ def main() -> int:
     if commit_msg:
         import subprocess
 
-        subprocess.run(["git", "add", "-A"], check=True)
+        # Identity supplied on the command line, not read from the
+        # environment. A CI runner has no global `user.email`, and this fake
+        # runs in a linked worktree whose config it does not own — so a commit
+        # that relies on ambient identity fails there and passes here, which is
+        # precisely the shape of flake this fixture is supposed to avoid
+        # creating. `-c` is scoped to the single invocation and needs no
+        # cleanup.
+        identity = [
+            "-c",
+            "user.name=fake-claude",
+            "-c",
+            "user.email=fake-claude@example.invalid",
+        ]
+        subprocess.run(["git", *identity, "add", "-A"], check=True)
         # --allow-empty so HEAD advances even when the run made no file changes
         # (e.g. an agent that amended an earlier interrupted run by committing
         # staged state, or simply produced an empty commit to record progress).
-        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", commit_msg], check=True)
+        subprocess.run(
+            ["git", *identity, "commit", "-q", "--allow-empty", "-m", commit_msg], check=True
+        )
 
     hold_file = os.environ.get("FAKE_CLAUDE_HOLD_FILE")
     if hold_file:

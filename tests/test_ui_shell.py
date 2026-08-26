@@ -39,6 +39,12 @@ def test_shell_renders_title_and_sidebar_navigation():
     assert "nav_btn_dashboard" in keys
     assert "nav_btn_runs" in keys
     assert "nav_btn_focus" not in keys
+    body = "".join(item.value for item in at.markdown)
+    compact = body.replace(" ", "")
+    assert '[data-testid="stCaptionContainer"]' in body
+    assert 'a[aria-label="Link to heading"]' in body
+    assert "min-width:24px" in compact
+    assert "opacity:1!important" in compact
 
 
 def test_sidebar_still_has_command_palette_trigger():

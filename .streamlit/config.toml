@@ -1,8 +1,14 @@
-# UX-1 theme engine: native Streamlit theming (no custom CSS), values kept
-# in line with command_center/ui/tokens.py's semantic status tones. Both
-# [theme.light] and [theme.dark] are defined so the built-in app-settings
-# menu can switch between them; there is no separate Python "engine" beyond
-# this file plus command_center/ui/theme.py's st.context.theme helper.
+# UX-1 theme engine: native Streamlit theming (no custom CSS). The colour values
+# below are the platform-canonical design tokens from
+# command_center/design/tokens.json — the same source command_center/ui/board_style.py
+# derives its board palette from — so the app, the board and the web/desktop
+# shells all share one palette. tests/test_theme_canon.py asserts these
+# stay in sync with tokens.json (mapping: primaryColor/blueColor->accent,
+# backgroundColor->bg, secondaryBackgroundColor->surface, textColor->text,
+# borderColor->line, greenColor->ok, orangeColor->warn, redColor->crit,
+# grayColor->text-2). Both [theme.light] and [theme.dark] are defined so the
+# built-in app-settings menu can switch between them; there is no separate Python
+# "engine" beyond this file plus command_center/ui/theme.py's st.context.theme helper.
 
 [server]
 # The application has NO authentication layer yet performs privileged git/gh and
@@ -29,25 +35,25 @@ baseRadius = "medium"
 buttonRadius = "medium"
 
 [theme.light]
-primaryColor = "#0969da"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f6f8fa"
-textColor = "#1f2328"
-borderColor = "#d0d7de"
-greenColor = "#1a7f37"
-orangeColor = "#bf8700"
-redColor = "#cf222e"
-blueColor = "#0969da"
-grayColor = "#57606a"
+primaryColor = "#4C6EF0"
+backgroundColor = "#F4F6FB"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#10151F"
+borderColor = "#D7DEE9"
+greenColor = "#1FA971"
+orangeColor = "#C8811A"
+redColor = "#E23D4E"
+blueColor = "#4C6EF0"
+grayColor = "#515A6B"
 
 [theme.dark]
-primaryColor = "#58a6ff"
-backgroundColor = "#0d1117"
-secondaryBackgroundColor = "#161b22"
-textColor = "#e6edf3"
-borderColor = "#30363d"
-greenColor = "#3fb950"
-orangeColor = "#d29922"
-redColor = "#f85149"
-blueColor = "#58a6ff"
-grayColor = "#8b949e"
+primaryColor = "#6C8CFF"
+backgroundColor = "#0B0E14"
+secondaryBackgroundColor = "#121724"
+textColor = "#E8ECF4"
+borderColor = "#2A3441"
+greenColor = "#3DDC97"
+orangeColor = "#F5B14C"
+redColor = "#FF6B7A"
+blueColor = "#6C8CFF"
+grayColor = "#A6B0C3"

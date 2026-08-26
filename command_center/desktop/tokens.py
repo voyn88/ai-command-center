@@ -1,18 +1,29 @@
 """Design tokens for the desktop shell.
 
-Single source of truth for spacing, typography, radii, control heights, and the
-light/dark colour palettes, implementing `docs/desktop/DESIGN_SYSTEM.md` §1–§2.
-Every value is defined once here and referenced by :mod:`command_center.desktop.theme`
-and the widgets, never hardcoded per-widget.
+Single source of truth for spacing, typography, radii and control heights, and
+the binding of the light/dark colour palettes, implementing
+`docs/desktop/DESIGN_SYSTEM.md` §1–§2. Every value is defined once and referenced
+by :mod:`command_center.desktop.theme` and the widgets, never hardcoded
+per-widget.
 
-This module is pure data (dataclasses + constants). It imports nothing from Qt or
-from ``command_center`` core, so it is trivially unit-testable and carries no
-side effects at import time.
+The **colours** are not defined here: they are derived from the platform-canonical
+``command_center/design/tokens.json`` (see :mod:`command_center.design`), so the
+Qt shell shares one palette with the web shell, the Streamlit board and the mobile
+theme. A few Qt-only surface tints (sidebar, selection, hover) have no dedicated
+canonical token and are computed as deterministic blends of canonical tokens via
+:func:`command_center.design.mix`, so they, too, trace back to ``tokens.json``.
+
+This module is pure data (dataclasses + constants) and imports only the equally
+pure :mod:`command_center.design` loader — nothing from Qt or from
+``command_center`` core — so it stays trivially unit-testable with no Qt side
+effects at import time.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from command_center.design import Theme, color, mix
 
 # --- §1.1 Spacing (px @ 1.0 scale) -----------------------------------------
 SPACE_XS = 4
@@ -84,52 +95,51 @@ class Palette:
     status_sensitive: str
 
 
-LIGHT = Palette(
-    name="light",
-    bg_base="#f4f5f8",
-    surface="#ffffff",
-    surface_raised="#ffffff",
-    sidebar_bg="#fbfbfd",
-    topbar_bg="#ffffff",
-    border="#e1e4ea",
-    text_primary="#1a2340",
-    text_secondary="#5b6478",
-    text_disabled="#9aa1b0",
-    accent="#3b5bdb",
-    accent_emphasis="#2f4bc0",
-    selected_bg="#eaeffd",
-    hover_bg="#eef1f6",
-    status_neutral="#6b7280",
-    status_info="#2563eb",
-    status_active="#7c3aed",
-    status_success="#15803d",
-    status_warning="#b45309",
-    status_danger="#b91c1c",
-    status_cancelled="#57534e",
-    status_sensitive="#9d174d",
-)
+def _palette(theme: Theme) -> Palette:
+    """Build a :class:`Palette` for ``theme`` from the canonical design tokens.
 
-DARK = Palette(
-    name="dark",
-    bg_base="#14161c",
-    surface="#1b1e26",
-    surface_raised="#22262f",
-    sidebar_bg="#17191f",
-    topbar_bg="#1b1e26",
-    border="#2a2e39",
-    text_primary="#e8eaf0",
-    text_secondary="#a2a9ba",
-    text_disabled="#626878",
-    accent="#5b7cff",
-    accent_emphasis="#7089ff",
-    selected_bg="#232a44",
-    hover_bg="#21242e",
-    status_neutral="#9aa1b0",
-    status_info="#60a5fa",
-    status_active="#a78bfa",
-    status_success="#4ade80",
-    status_warning="#fbbf24",
-    status_danger="#f87171",
-    status_cancelled="#a8a29e",
-    status_sensitive="#f472b6",
-)
+    Every surface, text, accent and status colour maps to a token in
+    ``command_center/design/tokens.json``. The status ramp reuses the canonical
+    semantic hues (``info``→accent, ``active``→violet, ``success``→ok,
+    ``warning``→warn, ``danger``/``sensitive``→crit, ``neutral``/``cancelled``→
+    muted text); the canon carries no distinct "sensitive" tone, so it shares the
+    danger hue. Sidebar, selection and hover are subtle blends of canonical
+    tokens (see module docstring), not new hand-picked colours.
+    """
+    def c(name: str) -> str:
+        return color(name, theme)
+
+    return Palette(
+        name=theme,
+        # Surfaces
+        bg_base=c("bg"),
+        surface=c("surface"),
+        surface_raised=c("raise"),
+        sidebar_bg=mix(c("bg"), c("surface"), 0.5),
+        topbar_bg=c("surface"),
+        # Lines
+        border=c("line"),
+        # Text
+        text_primary=c("text"),
+        text_secondary=c("text-2"),
+        text_disabled=c("text-3"),
+        # Accent / selection
+        accent=c("accent"),
+        accent_emphasis=c("accent-2"),
+        selected_bg=mix(c("bg"), c("accent"), 0.14),
+        hover_bg=mix(c("surface"), c("text"), 0.05),
+        # §1.10 Semantic status colours
+        status_neutral=c("text-2"),
+        status_info=c("accent"),
+        status_active=c("violet"),
+        status_success=c("ok"),
+        status_warning=c("warn"),
+        status_danger=c("crit"),
+        status_cancelled=c("text-3"),
+        status_sensitive=c("crit"),
+    )
+
+
+LIGHT = _palette("light")
+
+DARK = _palette("dark")

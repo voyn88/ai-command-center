@@ -126,7 +126,33 @@ def _supervise(api: runtime_api.ExecutionCenterAPI, run_id: str) -> int:
                 last_stage = stage
 
             if state in run_db.TERMINAL_STATES:
+                # A terminal row is necessary but not sufficient: the
+                # supervisor commits it *before* appending `process_exited`,
+                # auto-committing the agent's work and writing the run report,
+                # all on a daemon thread that this process's exit would kill
+                # without joining. Wait for the supervisor's own finalization
+                # signal, then re-sync the task from the settled row.
+                waited_from = time.monotonic()
+                finalized = api.supervisor.wait_for_run(run_id, timeout=60.0)
+                wedged = time.monotonic() - waited_from >= 60.0
+                run = finalized or run
+                state = run.get("state", state)
+                if task_sync.sync_task_from_run(task, run, db_path=RUN_DB):
+                    tasks_repository.upsert_tasks(ROOT, tasks)
                 print(f"\nПрогон завершён: state={state}  stage={stage}  progress={progress}%")
+                if wedged:
+                    # Same rule as the debug CLI: a terminal state whose
+                    # finalization never completed is not a clean finish, and
+                    # returning 0 here would tell the caller it was. The
+                    # `process_exited` event, the auto-commit and the report may
+                    # all be missing.
+                    print(
+                        "ВНИМАНИЕ: состояние терминальное, но супервизор не завершил "
+                        "финализацию за 60 с — событие process_exited, автокоммит "
+                        "работы агента и отчёт могут отсутствовать.",
+                        file=sys.stderr,
+                    )
+                    return 5
                 return 0 if state == "COMPLETED" else 1
         elif run is None:
             print(f"\nПрогон {run_id[:12]} не найден в БД — возможно, был удалён.")

@@ -152,6 +152,14 @@ def import_legacy_runs(db_path: Path, *, legacy_runs: list[dict] | None = None) 
         if report_path:
             db.create_report(db_path, run["id"], report_path)
 
+        # Last, after the events and the report, exactly as a live run's
+        # finalization does it. An imported row has no finalization pending —
+        # the import is the whole of it — so leaving the marker empty would
+        # park every historical run in the "still finalizing" set permanently
+        # and make the cutover predicate unusable on any install that imported
+        # its v1 history.
+        db.mark_run_finalized(db_path, run["id"])
+
         created_run_ids.append(run["id"])
 
     return created_run_ids

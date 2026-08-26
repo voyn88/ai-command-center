@@ -73,22 +73,37 @@ def test_migrate_is_idempotent(tmp_path):
     assert db.current_schema_version(path) == db.SCHEMA_VERSION
 
 
-@pytest.mark.parametrize("historical_version", range(1, db.SCHEMA_VERSION))
+# Parametrized over the *actual* recorded migration versions below the current
+# head — not a contiguous ``range`` — because the migration sequence may carry
+# reserved-version gaps: a version can be pre-assigned to a sibling engine that
+# lands on its own branch (e.g. council took v22 while models/market hold v20/v21
+# on theirs), so those numbers are not reachable heads on this branch. A historical
+# database only ever recorded a real migration version, so those are exactly the
+# ones that must upgrade cleanly; the gap fills in on merge without changing this
+# test.
+@pytest.mark.parametrize(
+    "historical_version",
+    [version for version, _ in db.MIGRATIONS if version < db.SCHEMA_VERSION],
+)
 def test_upgrade_from_every_supported_historical_schema(
     tmp_path, monkeypatch, historical_version
 ):
     path = tmp_path / f"runtime-v{historical_version}.db"
     current_migrations = list(db.MIGRATIONS)
     current_version = db.SCHEMA_VERSION
+    historical_migrations = [
+        migration for migration in current_migrations if migration[0] <= historical_version
+    ]
+    # Version numbers may be *reserved* with a gap (a sibling wave pre-assigns a
+    # number that lands only on merge — e.g. v20 is reserved while v21 ships), so
+    # the recorded schema version at a historical point is the highest migration
+    # actually present up to that point, not the parametrised number itself.
+    expected_recorded = max((m[0] for m in historical_migrations), default=0)
     with monkeypatch.context() as historical:
-        historical.setattr(
-            db,
-            "MIGRATIONS",
-            [migration for migration in current_migrations if migration[0] <= historical_version],
-        )
+        historical.setattr(db, "MIGRATIONS", historical_migrations)
         historical.setattr(db, "SCHEMA_VERSION", historical_version)
         db.migrate(path)
-        assert db.current_schema_version(path) == historical_version
+        assert db.current_schema_version(path) == expected_recorded
 
     # Pinned to the module constant, not a literal: hard-coding the number here
     # made this test fail on every schema addition for a reason unrelated to

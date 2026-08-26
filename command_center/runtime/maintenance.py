@@ -27,10 +27,15 @@ import gzip
 import hashlib
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
-from command_center.runtime.db import TERMINAL_STATES, connect, transaction
+from command_center.runtime.db import (
+    TERMINAL_STATES,
+    connect,
+    retention_cutoff,
+    transaction,
+)
 
 _ARCHIVE_SELECT = """
     SELECT run_event.* FROM run_event
@@ -91,8 +96,14 @@ def archive_and_prune(
     backup_path = archive_dir / f"runtime-backup-{stamp}.db"
     _backup_database(db_path, backup_path)
 
-    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat(
-        timespec="seconds"
+    # Rendered in the zone the database says its naive timestamps are on, not
+    # in this process's zone — otherwise the same database at the same instant
+    # yields a different set of deleted rows depending on how the prune was
+    # started (VOYN-W0-AICC-RETENTION-TZ). The zone and where it came from go
+    # into the report: an irreversible delete has to be able to say which clock
+    # it judged the rows against.
+    cutoff, cutoff_zone, cutoff_zone_source = retention_cutoff(
+        db_path, retention_days=retention_days
     )
     placeholders = ",".join("?" for _ in TERMINAL_STATES)
     archive_path = archive_dir / f"run-events-{stamp}.jsonl.gz"
@@ -135,6 +146,8 @@ def archive_and_prune(
         "archive_sha256": digest.hexdigest(),
         "retention_days": retention_days,
         "cutoff": cutoff,
+        "cutoff_timezone": cutoff_zone,
+        "cutoff_timezone_source": cutoff_zone_source,
         "archived_events": archived,
         "pruned_events": archived,
         "integrity_check": "ok",

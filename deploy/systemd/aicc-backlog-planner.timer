@@ -1,0 +1,14 @@
+# Schedule for aicc-backlog-planner.service (BO-S2). Cadence bounds dispatch
+# latency, not correctness — the tick is idempotent and lease-guarded.
+
+[Unit]
+Description=Run the AICC backlog planner every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

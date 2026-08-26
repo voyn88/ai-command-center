@@ -680,7 +680,7 @@ def build_session_view(
 # `run`/`session` row carries a "last alive at" column. What this section
 # provides instead is honestly a different thing wearing the same word the
 # mission's mock uses: the wall-clock time the UI itself last *confirmed*
-# (via a cheap, read-only `identity.capture_identity(pid) is not None`
+# (via a cheap, read-only `identity.query_identity(pid).status == LIVE`
 # check — the exact primitive `Supervisor.reconcile()` already uses, just
 # not mutating anything) that a Running session's PID still exists. It is
 # intentionally kept in `st.session_state` by the caller, not in

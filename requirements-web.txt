@@ -1,2 +1,13 @@
 fastapi>=0.110,<1.0
 uvicorn>=0.27,<1.0
+# PostgreSQL driver and pool for the server deployment (VOYN-W0-AICC-SRV-01a).
+# No AICC module imports these any more — `aios-db` does, through
+# `command_center/db/adapter.py`. They stay declared here because the lock is
+# installed with `--no-deps`: a transitive dependency of the pinned aios-db
+# wheel is not resolved for us, so the environment has to provide it, and an
+# undeclared one would surface as an ImportError at first probe rather than at
+# install time. `[binary]` ships the libpq build, so no system libpq/pg_config
+# is needed on CI runners or in the deploy image. Major-band caps match the
+# house style.
+psycopg[binary]>=3.2,<4.0
+psycopg-pool>=3.2,<4.0

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 from command_center import models, tasks_repository
@@ -232,6 +233,13 @@ def test_dashboard_css_has_visible_focus_reflow_and_theme_specific_contrast_toke
     assert "outline:3pxsolid" in body.replace(" ", "")
     assert "@media (max-width: 420px)" in body
     assert "--hx-green: #15803d" in body
+    assert '[data-testid="stCaptionContainer"] p' in body
+    assert 'kbd[aria-label^="Shortcut"]' in body
+    assert 'a[aria-label="Link to heading"]' in body
+    compact = body.replace(" ", "")
+    assert "opacity:1!important" in compact
+    assert "min-width:24px" in compact
+    assert "min-height:24px" in compact
 
 
 def _relative_luminance(hex_color: str) -> float:
@@ -432,6 +440,7 @@ def _wait_for_report(db_path, run_id: str, *, timeout: float = 10.0) -> None:
     raise AssertionError(f"run {run_id!r} did not finish in the background within {timeout}s")
 
 
+@pytest.mark.serial  # real subprocess + DB running-then-completed timing; flaky when xdist saturates all cores
 def test_dashboard_queue_and_footer_reflect_a_genuinely_running_then_completed_session(
     git_repo, configure_project_repo, fake_claude
 ):

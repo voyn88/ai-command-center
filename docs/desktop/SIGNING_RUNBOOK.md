@@ -1,5 +1,11 @@
 # Runbook: подпись и notarization desktop-инсталляторов (#197)
 
+> **Принятая стратегия (2026-08-11): unsigned-first.** Дистрибуция стартует
+> без сертификатов — через GitHub Releases + Homebrew cask + winget с
+> проверкой SHA-256; см. `INSTALL_UNSIGNED.md` и workflow
+> `release-desktop.yml`. Всё ниже — отложенный owner-шаг: когда владелец
+> получит сертификаты, подпись встраивается в тот же релизный конвейер.
+
 Статус на 2026-08-11: на сборочной машине (Apple Silicon) `security find-identity
 -v -p codesigning` → **0 valid identities**, профиль `notarytool` отсутствует.
 Всё в §1 может выполнить **только владелец** (платный аккаунт, секреты).

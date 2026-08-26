@@ -1,0 +1,279 @@
+/* Design primitives — styled purely from tokens.css custom properties.
+ * Rule: NO hardcoded colors. Every color is var(--token) or a color-mix over
+ * one. Import tokens.css before this file so the properties resolve.
+ *
+ *   @import "./tokens.css";
+ *   @import "./primitives.css";
+ *
+ * Tinted fills use color-mix(in srgb, var(--token) N%, transparent) so a single
+ * hue token drives fill, border, and text for each state — and both themes stay
+ * correct because the token itself is theme-aware.
+ */
+
+/* --- Card: depth over borders --- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--sh);
+  padding: var(--space-5);
+  color: var(--text);
+  transition: box-shadow var(--dur-base) var(--ease-standard),
+              transform var(--dur-base) var(--ease-standard);
+}
+.card--raised {
+  background: var(--raise);
+  box-shadow: var(--sh-hi);
+}
+.card--hover:hover {
+  box-shadow: var(--sh-hi);
+  transform: translateY(-2px);
+}
+
+/* --- Chip: small status token --- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 22px;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  letter-spacing: var(--tracking-wide);
+  line-height: 1;
+  color: var(--text-2);
+  background: color-mix(in srgb, var(--text-3) 16%, transparent);
+  border: 1px solid transparent;
+}
+.chip::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: currentColor;
+}
+.chip--ok {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 30%, transparent);
+}
+.chip--crit {
+  color: var(--crit);
+  background: color-mix(in srgb, var(--crit) 14%, transparent);
+  border-color: color-mix(in srgb, var(--crit) 30%, transparent);
+}
+.chip--info {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.chip--warn {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  border-color: color-mix(in srgb, var(--warn) 30%, transparent);
+}
+.chip--violet {
+  color: var(--violet);
+  background: color-mix(in srgb, var(--violet) 14%, transparent);
+  border-color: color-mix(in srgb, var(--violet) 30%, transparent);
+}
+.chip--cyan {
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 14%, transparent);
+  border-color: color-mix(in srgb, var(--cyan) 30%, transparent);
+}
+
+/* --- Nav item --- */
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-medium);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-standard),
+              color var(--dur-fast) var(--ease-standard);
+}
+.nav-item:hover {
+  background: color-mix(in srgb, var(--text-3) 12%, transparent);
+  color: var(--text);
+}
+.nav-item--active {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+/* --- KPI: big number over a caption --- */
+.kpi {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.kpi__value {
+  font-family: var(--font-sans);
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text);
+  line-height: 1;
+}
+.kpi__label {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.kpi__delta--up { color: var(--ok); }
+.kpi__delta--down { color: var(--crit); }
+
+/* --- Row: list line with a hairline separator --- */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-2);
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+}
+.row:last-child { border-bottom: 0; }
+.row:hover { background: color-mix(in srgb, var(--text-3) 8%, transparent); }
+.row__meta {
+  margin-left: auto;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+}
+
+/* --- Bar: track + fill for progress / mini charts --- */
+.bar {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--text-3) 20%, transparent);
+  overflow: hidden;
+}
+.bar__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  height: 100%;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+}
+.bar__fill--ok { background: var(--ok); }
+.bar__fill--warn { background: var(--warn); }
+.bar__fill--crit { background: var(--crit); }
+
+/* --- Badge: count / numeric marker --- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--bg);
+  background: var(--accent);
+}
+.badge--crit { background: var(--crit); }
+.badge--muted {
+  color: var(--text-2);
+  background: color-mix(in srgb, var(--text-3) 22%, transparent);
+}
+
+/* --- Button --- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 34px;
+  padding: 0 var(--space-4);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--text);
+  background: transparent;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-standard),
+              border-color var(--dur-fast) var(--ease-standard),
+              transform var(--dur-fast) var(--ease-standard);
+}
+.btn:active { transform: translateY(1px); }
+.btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 2px;
+}
+.btn--primary {
+  color: var(--bg);
+  background: var(--accent);
+}
+.btn--primary:hover {
+  background: color-mix(in srgb, var(--accent) 88%, var(--text));
+}
+.btn--ghost {
+  color: var(--text-2);
+  border-color: var(--hairline);
+  background: color-mix(in srgb, var(--text-3) 8%, transparent);
+}
+.btn--ghost:hover {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text-3) 16%, transparent);
+}
+.btn--small {
+  height: 26px;
+  padding: 0 var(--space-3);
+  font-size: var(--fs-sm);
+}
+
+/* --- Input --- */
+.input {
+  width: 100%;
+  height: 34px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--fs-md);
+  color: var(--text);
+  background: var(--raise);
+  transition: border-color var(--dur-fast) var(--ease-standard),
+              box-shadow var(--dur-fast) var(--ease-standard);
+}
+.input::placeholder { color: var(--text-3); }
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+/* --- Avatar --- */
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-pill);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--bg);
+  background: linear-gradient(135deg, var(--accent), var(--violet));
+}
+.avatar--sm { width: 24px; height: 24px; font-size: var(--fs-xs); }

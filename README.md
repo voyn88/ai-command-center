@@ -431,6 +431,37 @@ python -m compileall -q command_center scripts tests app.py
 pytest -q
 ```
 
+`./scripts/preflight.sh` (or `make preflight`) runs the first three — the fast, deterministic part
+of the CI Quality gates — in one command; run it before pushing.
+
+For a faster local pytest loop, `pytest-xdist` is in the dev dependency group. A few
+timing-sensitive subprocess tests (SIGTERM-grace escalation, process-tree teardown, concurrent
+registry writers) miss their deadlines when 8 workers saturate the CPU, so they carry a `serial`
+marker and run in a second, single-process phase:
+
+```bash
+pytest -q -n 8 -m "not serial" && pytest -q -m serial   # or: make test-fast
+```
+
+This is a local-only speedup; CI intentionally keeps its serial `pytest -q` run.
+
+For an even faster inner loop while iterating on one change, `pytest-testmon` (also in the dev
+dependency group) caches a coverage-derived test↔source dependency map and re-runs only the tests
+whose covered code actually changed since the last run — at test-function granularity, not just
+file granularity:
+
+```bash
+pytest -q --testmon          # first run seeds the cache (make test-impacted-seed)
+pytest -q --testmon          # subsequent runs: only affected tests re-execute (make test-impacted)
+```
+
+Also local-only and complementary to (not a replacement for) `scripts/ci/test_impact/
+select_tests.py`'s static-AST selector that drives CI's advisory `Impact fast pre-check` job:
+testmon's map comes from real coverage data, so it also catches dynamic-import and runtime-only
+dependencies the static walker can't see, at the cost of needing a seed run and going stale across
+a large rebase (re-seed with `make test-impacted-seed` if selections look suspiciously narrow).
+CI's required gate is unaffected either way — it always runs the full suite.
+
 `.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
 compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
 Python 3.14, plus a `windows-latest` job covering the automated half of the desktop leg. The workflow

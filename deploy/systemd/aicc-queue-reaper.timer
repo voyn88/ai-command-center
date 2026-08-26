@@ -1,0 +1,21 @@
+# Schedule for aicc-queue-reaper.service (VOYN-W0-AICC-SRV-06).
+#
+# The cadence bounds recovery latency, not correctness: a lapsed lease is
+# invisible to claims either way, and the reap requeues it whenever it runs.
+# One minute keeps worst-case resume-after-worker-loss near the visibility
+# window itself (lease expiry dominates), while costing one row-scan query
+# per minute on an indexed predicate.
+
+[Unit]
+Description=Run the AICC queue reaper every minute
+
+[Timer]
+# OnBootSec is the reboot half of recovery acceptance: a control host that
+# power-cycled reaps within two minutes of coming back, no human involved.
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,77 @@
+name: verify-winget
+
+# End-to-end check of the unsigned-first Windows channel (#197): install the
+# released desktop build via winget local manifests (packaging/winget) on a
+# clean runner, verify hash validation, portable alias, and that the exe
+# starts. Runs on demand and whenever the manifests change.
+
+on:
+  pull_request:
+    paths:
+      - "packaging/winget/**"
+      - ".github/workflows/verify-winget.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  winget-install:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure winget is available
+        shell: pwsh
+        run: |
+          if (Get-Command winget -ErrorAction SilentlyContinue) {
+            winget --version
+          } else {
+            Write-Host "winget not found - bootstrapping via Microsoft.WinGet.Client"
+            Install-PackageProvider -Name NuGet -Force | Out-Null
+            Install-Module Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser
+            Repair-WinGetPackageManager -AllUsers -Force -Latest
+            winget --version
+          }
+      - name: Enable local manifests
+        shell: pwsh
+        run: winget settings --enable LocalManifestFiles
+      - name: Install from local manifest
+        shell: pwsh
+        run: |
+          winget install --manifest packaging\winget `
+            --accept-source-agreements --accept-package-agreements `
+            --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw "winget install failed: $LASTEXITCODE" }
+      - name: Verify installed payload
+        shell: pwsh
+        run: |
+          $pkgRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+          $exe = Get-ChildItem -Path $pkgRoot -Recurse -Filter "AI Command Center.exe" | Select-Object -First 1
+          if (-not $exe) { throw "installed exe not found under $pkgRoot" }
+          Write-Host "exe: $($exe.FullName) ($([math]::Round($exe.Length/1MB,1)) MB)"
+          $alias = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\aicc.exe"
+          if (-not (Test-Path $alias)) { throw "portable alias aicc.exe not found in WinGet\Links" }
+          Write-Host "alias: $alias"
+      - name: Smoke-start exe (headless)
+        shell: pwsh
+        run: |
+          $pkgRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+          $exe = (Get-ChildItem -Path $pkgRoot -Recurse -Filter "AI Command Center.exe" | Select-Object -First 1).FullName
+          # Unsigned build: SmartScreen blocks Start-Process on files carrying
+          # Mark-of-the-Web ("operation was canceled by the user"). A real user
+          # clicks "Run anyway" once; headless equivalent is Unblock-File.
+          Get-ChildItem -Path (Split-Path $exe) -Recurse -File | Unblock-File
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 10
+          if ($p.HasExited) { throw "exe exited early with code $($p.ExitCode)" }
+          Write-Host "process alive after 10s (pid $($p.Id)) - OK"
+          Stop-Process -Id $p.Id -Force
+      - name: Uninstall
+        shell: pwsh
+        run: |
+          winget list --accept-source-agreements | Select-String -Pattern "Command Center|AICommandCenter" | ForEach-Object { $_.Line }
+          winget uninstall --manifest packaging\winget `
+            --accept-source-agreements --disable-interactivity
+          if ($LASTEXITCODE -ne 0) { throw "winget uninstall failed: $LASTEXITCODE" }

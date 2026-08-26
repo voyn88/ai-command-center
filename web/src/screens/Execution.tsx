@@ -7,7 +7,7 @@ import GlassPanel from '../components/GlassPanel'
 import KpiCard from '../components/KpiCard'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
-import { ExecutionIcon, HomeIcon } from '../components/NavIcons'
+import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
 
 function formatDate(value: string | null, language: string, fallback: string) {
   if (!value) return fallback
@@ -48,7 +48,7 @@ function RunRow({ run, fallback, language, resultLabel, exitLabel }: { run: Exec
   )
 }
 
-export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' | 'execution') => void }) {
+export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' | 'execution' | 'tasks') => void }) {
   const { t, i18n } = useTranslation()
   const [data, setData] = useState<ExecutionDTO | null>(null)
   const [error, setError] = useState(false)
@@ -77,6 +77,7 @@ export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' 
         <aside className="glass execution-nav">
           <NavItem label={t('home')} icon={<HomeIcon />} onClick={() => onNavigate('home')} />
           <NavItem label={t('execution')} icon={<ExecutionIcon />} active onClick={() => onNavigate('execution')} />
+          <NavItem label={t('tasks')} icon={<TasksIcon />} onClick={() => onNavigate('tasks')} />
         </aside>
         <main className="execution-main">
           {!data && !error && <GlassPanel>{t('loading')}</GlassPanel>}

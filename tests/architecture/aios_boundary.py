@@ -44,6 +44,30 @@ Engine signatures (deliberately structural, never a grep over comments):
   engines don't count as engines; presentation layers still fall under the
   import/call signatures, so an engine can't hide there.
 
+  The ``memory`` name tokens (``db``, ``database``, ``store``, ``storage``,
+  ``repository``, ``persistence``, ``memory``) are **corroborated**: they
+  classify only when the same file also *behaves* like a store -- see
+  :func:`_persists_data`. Those tokens name what a file is about as readily as
+  what it is; a package directory called ``db/`` says where code lives, not
+  whether the code inside owns an engine. Under a name-only rule a
+  docstring-only ``__init__.py`` and a module that renders SQL text were
+  violations, which made it impossible for the control plane to keep any
+  database-adjacent module at all -- a gate policing names rather than
+  behaviour. Every other category still classifies on the name alone: nothing
+  loosened for queue, orchestration, authz or audit.
+
+  Strictness is not reduced for a real engine. A file that owns persistence
+  imports a driver (statically, aliased, or via ``importlib`` with a literal
+  name), calls into a driver it bound itself, or writes durably to disk -- and a
+  JSON/JSONL store with no driver at all is still caught by that last clause.
+  What no longer counts is executing SQL on a connection someone else opened:
+  that is delegation, and the engine is wherever the driver is.
+
+  Acknowledged limit, stated rather than papered over: a driver reached through
+  a *non-literal* dynamic import (``__import__(name_from_config)``) is beyond
+  static analysis and is not detected. Literal ``importlib``/``__import__`` and
+  aliases are.
+
 Baseline maintenance (a reviewed change, never a casual one — see
 ``docs/AIOS_BOUNDARY.md``):
 
@@ -57,6 +81,7 @@ import ast
 import json
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -66,6 +91,18 @@ BASELINE_FILE = Path(__file__).resolve().parent / "AIOS_BOUNDARY_BASELINE.json"
 SDK_ALLOWED_TOP_LEVEL = "aios_sdk"
 #: The one production adapter allowed to import that public top-level package.
 SDK_ADAPTER_PATH = "command_center/application/aios_tasks.py"
+
+#: The second public AIOS distribution: universal PostgreSQL primitives
+#: (`aios-db`). Allowed for the same reason `aios_sdk` is — it is a published,
+#: independently versioned contract, not Core internals — and confined the same
+#: way, to one reviewed adapter module.
+DB_ALLOWED_TOP_LEVEL = "aios_db"
+DB_ADAPTER_PATH = "command_center/db/adapter.py"
+
+PUBLIC_AIOS_TOP_LEVELS: dict[str, str] = {
+    SDK_ALLOWED_TOP_LEVEL: SDK_ADAPTER_PATH,
+    DB_ALLOWED_TOP_LEVEL: DB_ADAPTER_PATH,
+}
 #: The banned core namespace.
 CORE_TOP_LEVEL = "aios"
 
@@ -99,6 +136,10 @@ DB_DRIVER_MODULES = frozenset(
         "sqlite3",
         "sqlalchemy",
         "psycopg",
+        # The pool package is a separate distribution from `psycopg` and was not
+        # listed, so a file could open a PostgreSQL connection pool without the
+        # gate seeing a driver at all.
+        "psycopg_pool",
         "psycopg2",
         "asyncpg",
         "aiosqlite",
@@ -154,6 +195,7 @@ NAME_TOKEN_SIGNATURES: dict[str, frozenset[str]] = {
             "supervisor",
             "orchestrator",
             "orchestration",
+            "dispatch",
             "dispatcher",
             "autopilot",
             "autonomy",
@@ -192,6 +234,110 @@ NAME_TOKEN_SIGNATURES: dict[str, frozenset[str]] = {
 NAME_SUBSTRING_SIGNATURES: dict[str, tuple[str, ...]] = {
     "audit": ("activity_log", "audit_log", "event_log"),
 }
+
+#: Name categories that a path name alone cannot establish: they must be
+#: corroborated by behaviour in the same file (see `_CORROBORATION`).
+#:
+#: `memory` and `queue` qualify because their tokens (`db`, `store`,
+#: `repository`, `queue`, ...) name what a file is *about* as readily as what
+#: it *is* — a directory called `db/` says nothing about whether the code
+#: inside owns an engine — *and* because each has a behavioural substitute that
+#: keeps a home-grown engine detected. `orchestration`, `authz` and `audit` are
+#: deliberately absent: no equivalent substitute has been demonstrated for
+#: them, and corroborating a name without one is a straight loss of coverage.
+CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue"})
+
+# --- queue-engine behaviour (corroboration for the `queue` name signature) ---
+
+#: Operations that make something a queue *engine* rather than a table of queue
+#: rows. Storing and listing entries is what a repository does; handing work out
+#: exactly once — claiming, leasing, acking, retrying — is the engine.
+#: Two vocabularies, because there are two jobs with very different blast
+#: radii. Using one frozenset for both was a real defect: it forced the wide
+#: signal's precision requirement onto the narrow signal's coverage
+#: requirement, and the coverage lost was the whole point of the name rule.
+#:
+#: **Corroboration** — applied only to files that already carry a `queue` name
+#: token, of which this repository has three. A wide vocabulary is affordable
+#: here: a false positive can only land on a file someone already named after a
+#: queue, and the cost of a false negative is an undetected engine.
+QUEUE_CORROBORATION_TOKENS = frozenset(
+    {
+        "claim",
+        "claims",
+        "lease",
+        "leases",
+        "heartbeat",
+        "ack",
+        "nack",
+        "enqueue",
+        "dequeue",
+        "requeue",
+        "reserve",
+        "release",
+        "retry",
+        "redeliver",
+        "pop",
+        "push",
+        "next",
+        "backoff",
+        "inflight",
+        # The mainstream queue verbs, added after review demonstrated three
+        # engines that escaped without them: `poll`/`finish`, `take`/`settle`,
+        # `checkout`/`give_back`. These are what `java.util.concurrent`, the Go
+        # channel idiom and any worker pool call their operations, so a queue
+        # author reaches for them without thinking about this detector at all —
+        # missing them was a coverage gap, not an adversary outwitting us.
+        # Measured before adding: closes all three, and changes the
+        # classification of none of the three queue-named files in this
+        # repository.
+        "poll",
+        "peek",
+        "take",
+        "offer",
+        "drain",
+        "checkout",
+        "settle",
+        "complete",
+        "fail",
+        "fetch",
+    }
+)
+
+#: **Unconditional** — applied to every file regardless of name, so precision
+#: is the binding constraint. Measured, not guessed: a draft that used the wide
+#: vocabulary here flagged twelve modules across the tree — auth *claims*, a
+#: FastAPI *dispatch*, UI panels — because those are ordinary English words
+#: that queues do not own. What survives is specific enough to mean the
+#: mechanism rather than the word.
+QUEUE_ENGINE_TOKENS = frozenset({"dequeue", "requeue", "nack", "redeliver"})
+
+#: SQL markers, split the same way. `SKIP LOCKED` exists for exactly one
+#: purpose — letting concurrent consumers take different rows — so it is safe
+#: unconditionally. `FOR UPDATE` is plain row locking and only means "queue"
+#: alongside a queue name, so it corroborates but never classifies on its own.
+QUEUE_ENGINE_SQL_MARKERS = ("skip locked",)
+QUEUE_CORROBORATION_SQL_MARKERS = ("skip locked", "for update")
+
+# --- persistence behaviour (corroboration for the `memory` name signature) ---
+
+#: ``<module>.<attr>`` calls that put bytes somewhere durable.
+DURABLE_WRITE_CALLS: dict[str, frozenset[str]] = {
+    "os": frozenset({"replace", "rename", "fdopen", "write", "link", "symlink"}),
+    "shutil": frozenset({"copyfile", "copy", "copy2", "copyfileobj", "move", "copytree"}),
+    "json": frozenset({"dump"}),
+    "pickle": frozenset({"dump"}),
+    "csv": frozenset({"writer", "DictWriter"}),
+    "tempfile": frozenset({"mkstemp", "NamedTemporaryFile", "TemporaryFile"}),
+}
+
+#: ``pathlib.Path`` write methods. Matched on the attribute name alone: the name
+#: is distinctive enough that a false positive would have to be a deliberate
+#: imitation, and requiring the receiver to resolve to a `Path` would miss
+#: every `self._file.write_text(...)`.
+PATH_WRITE_ATTRS = frozenset({"write_text", "write_bytes"})
+
+_WRITE_MODE_CHARS = frozenset("wax+")
 
 _TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
 
@@ -246,11 +392,12 @@ def _is_forbidden_aios_module(name: str, rel_path: str) -> bool:
     top = _top_level(name)
     if top == CORE_TOP_LEVEL:
         return True
-    if top != SDK_ALLOWED_TOP_LEVEL:
+    adapter_path = PUBLIC_AIOS_TOP_LEVELS.get(top)
+    if adapter_path is None:
         return False
-    # Even the adapter cannot couple to generated/private SDK modules: every
-    # consumed symbol must be a documented top-level export.
-    return rel_path != SDK_ADAPTER_PATH or name != SDK_ALLOWED_TOP_LEVEL
+    # Even the adapter cannot couple to generated/private submodules of a public
+    # distribution: every consumed symbol must be a documented top-level export.
+    return rel_path != adapter_path or name != top
 
 
 def _literal_string(node: ast.AST) -> str | None:
@@ -327,6 +474,43 @@ def find_forbidden_aios_imports(
 # ---------------------------------------------------------------------------
 
 
+def _dynamic_import_target(node: ast.AST) -> str | None:
+    """The literal module name of an ``import_module``/``__import__`` call.
+
+    A driver reached through ``importlib`` is the same driver; only a
+    non-literal argument is genuinely beyond static analysis.
+    """
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+    func = node.func
+    is_dynamic = (isinstance(func, ast.Name) and func.id == "__import__") or (
+        isinstance(func, ast.Attribute) and func.attr == "import_module"
+    )
+    return _literal_string(node.args[0]) if is_dynamic else None
+
+
+def _module_bindings(tree: ast.AST) -> dict[str, str]:
+    """Local name -> top-level module it is bound to.
+
+    Covers ``import x``, ``import x as y`` and ``y = importlib.import_module("x")``,
+    so a call site can be attributed to the module it actually reaches rather
+    than to whatever the variable happens to be called.
+    """
+    bindings: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bindings[alias.asname or _top_level(alias.name)] = _top_level(alias.name)
+        elif isinstance(node, ast.Assign):
+            target = _dynamic_import_target(node.value)
+            if target is None:
+                continue
+            for assigned in node.targets:
+                if isinstance(assigned, ast.Name):
+                    bindings[assigned.id] = _top_level(target)
+    return bindings
+
+
 def _import_categories(tree: ast.AST) -> tuple[set[str], set[str]]:
     """(categories, local aliases of ``subprocess``/``os``) from import nodes."""
     categories: set[str] = set()
@@ -340,6 +524,11 @@ def _import_categories(tree: ast.AST) -> tuple[set[str], set[str]]:
                         categories.add(category)
                 if top in {"subprocess", "os"}:
                     spawn_capable_aliases.add(alias.asname or _top_level(alias.name))
+        elif (dynamic := _dynamic_import_target(node)) is not None:
+            top = _top_level(dynamic)
+            for category, modules in IMPORT_SIGNATURES.items():
+                if top in modules:
+                    categories.add(category)
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             top = _top_level(node.module)
             for category, modules in IMPORT_SIGNATURES.items():
@@ -375,6 +564,129 @@ def _call_categories(tree: ast.AST, spawn_capable_aliases: set[str]) -> set[str]
     return categories
 
 
+def _persists_data(tree: ast.AST) -> bool:
+    """Whether this file actually keeps state somewhere durable.
+
+    This is the corroboration the ``memory`` *name* signature needs (see the
+    module docstring). Three shapes count, and they are the three ways a file
+    can own persistence rather than merely be handed a connection:
+
+    * it imports a database driver -- statically, under an alias, or through
+      ``importlib`` with a literal name (checked in :func:`_import_categories`);
+    * it calls into a driver it bound itself -- ``pg.connect(...)``,
+      ``sqlite3.connect(...)``, ``importlib.import_module("psycopg").connect()``;
+    * it writes durably to the filesystem -- an atomic temp-file swap, an
+      append, a copy. A JSON/JSONL store is a persistence engine even though it
+      never imports a driver, and treating "driver" as the whole definition
+      would let one out of the gate entirely.
+
+    What deliberately does *not* count is executing SQL on a connection someone
+    else opened. That is delegation, not ownership: the engine is where the
+    driver is. Counting it would flag the SQL-rendering and grant modules that
+    the boundary ruling requires to stay in the control plane, while catching no
+    engine that the driver rule misses.
+    """
+    bindings = _module_bindings(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            # `open(path, "w")` and friends; a read-only open is not persistence.
+            if func.id == "open" and _opens_for_writing(node):
+                return True
+            continue
+        if not isinstance(func, ast.Attribute):
+            continue
+        if func.attr in PATH_WRITE_ATTRS:
+            return True
+        # `Path.open` reached as an attribute -- `self._path.open("a")`,
+        # `Path(x).open("w")`. Checked before the receiver is resolved, because
+        # a store that owns its file typically holds it on `self` and never
+        # names a module at the call site. Missing this let an append-only
+        # JSONL store in a directory called `db/` classify as no engine at all,
+        # which is the exact loosening the corroboration rule must not cause.
+        # Still mode-gated: a read-only `.open()` is not persistence.
+        # `Path.open` takes the mode as its *first* positional argument, unlike
+        # the builtin, where it is the second.
+        if func.attr == "open" and _opens_for_writing(node, mode_index=0):
+            return True
+        base = func.value
+        if not isinstance(base, ast.Name):
+            continue
+        module = bindings.get(base.id)
+        if module is None:
+            continue
+        if module in DB_DRIVER_MODULES:
+            return True
+        if func.attr in DURABLE_WRITE_CALLS.get(module, frozenset()):
+            return True
+    return False
+
+
+def _opens_for_writing(node: ast.Call, *, mode_index: int = 1) -> bool:
+    """Whether an `open` call asks for a writable mode.
+
+    `mode_index` differs by call form: the builtin `open(file, mode)` carries it
+    second, `Path.open(mode)` first. Getting that wrong silently answers "not a
+    write" for every attribute-form open, which is how an append-only store
+    escaped this check once already.
+    """
+    mode_nodes = list(node.args[mode_index : mode_index + 1])
+    mode_nodes += [kw.value for kw in node.keywords if kw.arg == "mode"]
+    for mode in mode_nodes:
+        literal = _literal_string(mode)
+        if literal and set(literal) & _WRITE_MODE_CHARS:
+            return True
+    return False
+
+
+def _runs_queue_operations(
+    tree: ast.AST,
+    tokens: frozenset[str] = QUEUE_ENGINE_TOKENS,
+    sql_markers: tuple[str, ...] = QUEUE_ENGINE_SQL_MARKERS,
+) -> bool:
+    """Whether this file hands work out, rather than merely storing it.
+
+    Two signals, both structural: a **defined** function whose name carries a
+    work-handout verb, and SQL that only a handout path writes.
+
+    Deliberately *not* signals: `INSERT`, `SELECT ... ORDER BY`, `DELETE`. That
+    is a repository over queue rows, which a control plane is allowed to own;
+    the engine is whatever decides who gets the next one.
+
+    Acknowledged limits, stated because a reader auditing coverage will
+    otherwise assume they are covered: a *called* but not defined operation
+    (`engine.dequeue()`) and an operation bound by assignment
+    (`dequeue = lambda ...`) are not detected. Both were true of the previous
+    rule as well; neither is a regression, and closing them needs
+    cross-module resolution this single-file scanner does not have.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if set(_TOKEN_SPLIT.split(node.name.lower())) & tokens:
+                return True
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            lowered = node.value.lower()
+            if any(marker in lowered for marker in sql_markers):
+                return True
+    return False
+
+
+def _corroborates_queue_name(tree: ast.AST) -> bool:
+    """The wide vocabulary, affordable because the name already narrowed the set."""
+    return _runs_queue_operations(
+        tree, QUEUE_CORROBORATION_TOKENS, QUEUE_CORROBORATION_SQL_MARKERS
+    )
+
+
+#: Category -> the behaviour that has to corroborate its name signature.
+_CORROBORATION: dict[str, Callable[[ast.AST], bool]] = {
+    "memory": _persists_data,
+    "queue": _corroborates_queue_name,
+}
+
+
 def _name_categories(rel_path: str) -> set[str]:
     """Engine-named path segments (skipped for pure presentation layers)."""
     if _is_presentation(rel_path):
@@ -406,7 +718,24 @@ def classify_engine_categories(rel_path: str, tree: ast.AST) -> set[str]:
     import_cats, spawn_aliases = _import_categories(tree)
     categories |= import_cats
     categories |= _call_categories(tree, spawn_aliases)
-    categories |= _name_categories(rel_path)
+
+    name_cats = _name_categories(rel_path)
+    categories |= name_cats - CORROBORATED_NAME_CATEGORIES
+    # A `memory` or `queue` name is a question, not a verdict. It becomes one
+    # only if the file also *behaves* like the thing it is named after: a path
+    # segment says where something lives, not what it does, and a file whose
+    # name is its only engine signal is a file the gate would freeze for being
+    # called `db` or `queue`.
+    for category in name_cats & CORROBORATED_NAME_CATEGORIES:
+        if _CORROBORATION[category](tree):
+            categories.add(category)
+    # Queue-engine behaviour classifies regardless of the filename. This is the
+    # half the old name-only rule missed entirely: it flagged an adapter called
+    # `queue_store.py` while a hand-rolled claim/lease loop in a file named
+    # anything else went unseen. Corroborating the name without adding this
+    # would have been a straight reduction in control.
+    if _runs_queue_operations(tree):
+        categories.add("queue")
     return categories
 
 

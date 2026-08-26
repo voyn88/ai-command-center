@@ -276,6 +276,30 @@ def test_dispatcher_restart_mid_run_yields_no_duplicates(tmp_path, api, fake_cla
     hold.write_text("")
     fake_claude["FAKE_CLAUDE_HOLD_FILE"] = str(hold)
 
+    # No working-tree change from the fake, and this is the fix for a real
+    # flake rather than a convenience. The fixture's default makes every fake
+    # run write an *untracked* file, between emitting its output and waiting on
+    # the hold file — so whether it lands before the SIGKILL below is a
+    # scheduling question. When it lands, the restarted dispatcher correctly
+    # refuses to relaunch into a dirty worktree ("0 changed, 1 untracked") and
+    # this test fails; when it does not, the test passes. It failed exactly
+    # that way twice today, both times only under `-n auto`, and each failure
+    # cost a full CI rerun.
+    #
+    # The refusal is right and is covered by its own tests. What is wrong is
+    # this test arranging for a refusal while asking for a relaunch. So the
+    # fake commits its work instead of leaving it loose: HEAD advances, the
+    # worktree stays clean, and the restarted dispatcher's cleanliness check
+    # has nothing to object to whichever side of the SIGKILL the write lands.
+    #
+    # Simply dropping the change was the first attempt and was wrong — the
+    # suite said so immediately: an implementation run that changes nothing is
+    # classified `FAILED` rather than `COMPLETED`
+    # (`runtime.outcome.REQUIRES_CHANGES_TASK_TYPES`), so the test needs the
+    # work to happen *and* the tree to be clean, which is what committing is.
+    fake_claude["FAKE_CLAUDE_COMMIT"] = "agent work committed by the fake"
+
+
     first = task_pipeline.tick(tmp_path, api, configs, github=github, advance_wait_seconds=60)
     launched = first.launched()
     assert [d.task_id for d in launched] == ["r"]

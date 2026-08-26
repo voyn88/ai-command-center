@@ -242,6 +242,7 @@ def test_sensitive_launch_accepted_with_confirmation(monkeypatch, git_repo, conf
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.serial  # real subprocess + DB running-state timing; flaky when xdist saturates all cores
 def test_launch_is_nonblocking_and_running_status_is_displayed(git_repo, configure_project_repo, fake_claude):
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
     configure_project_repo("AIOS", git_repo)
@@ -334,6 +335,7 @@ def test_cancel_action_hidden_for_non_running_states(state):
     assert not any(b.key == f"exec_card_cancel_btn_{run['id']}" for b in at.button)
 
 
+@pytest.mark.serial  # real subprocess + DB running-state timing; flaky when xdist saturates all cores
 def test_cancel_action_visible_while_running(git_repo, configure_project_repo, fake_claude):
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
     configure_project_repo("AIOS", git_repo)

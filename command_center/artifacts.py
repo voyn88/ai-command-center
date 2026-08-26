@@ -11,7 +11,21 @@ from here; the reverse must never happen.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+
+
+def format_mtime(path: Path) -> str:
+    """Human mtime for artifact listings; '—' when the file cannot be stat'd.
+
+    Moved here from `app.py` (NIGHT-W9 slice 5) beside `read_text`/
+    `list_markdown_files` — same Streamlit-free file-helper family (see
+    WORKSPACE_HOME_ARCHITECTURE.md §9)."""
+    try:
+        timestamp = path.stat().st_mtime
+    except OSError:
+        return "—"
+    return datetime.fromtimestamp(timestamp).strftime("%d.%m.%Y %H:%M")
 
 
 def read_text(path: Path) -> str:

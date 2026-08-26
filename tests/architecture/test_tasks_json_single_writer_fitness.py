@@ -27,6 +27,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GUARDED_FILES = (
     REPO_ROOT / "app.py",
     REPO_ROOT / "command_center" / "ui" / "legacy_task_helpers.py",
+    # API surface: the read service never touches tasks.json as a store, and the
+    # Wave-1 write service reaches the board only through
+    # ``tasks_repository.create_task`` (the single writer), never directly.
+    REPO_ROOT / "command_center" / "api" / "service.py",
+    REPO_ROOT / "command_center" / "api" / "wave1_service.py",
 )
 
 # Method names that write, replace or delete a file when invoked on a path to

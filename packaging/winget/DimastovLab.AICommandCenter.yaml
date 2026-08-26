@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+# Version manifest (unsigned-first channel, #197). On each desktop-v* release
+# replace PackageVersion here and in the sibling manifests, plus the
+# InstallerSha256, then install locally:
+#   winget settings --enable LocalManifestFiles   (once, admin)
+#   winget install --manifest packaging/winget
+# Submission to microsoft/winget-pkgs is a later step (needs a stable version
+# cadence; unsigned zip+portable is accepted, validated by hash).
+PackageIdentifier: DimastovLab.AICommandCenter
+PackageVersion: 0.1.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0

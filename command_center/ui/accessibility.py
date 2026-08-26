@@ -72,6 +72,15 @@ _SHELL_REPAIR = """
     state.observer.observe(document.body, {
       childList: true,
       subtree: true,
+      // Streamlit's resizable sidebar re-applies aria-expanded as an *attribute*
+      // mutation (not a node insertion) on resize/rerun, which a childList-only
+      // observer never sees — so the invalid attribute silently reappears after
+      // the initial repair (axe: aria-allowed-attr, critical). Watching just
+      // that one attribute closes the gap without a feedback loop: removing an
+      // absent attribute emits no mutation, and the other repairs set
+      // attributes outside this filter.
+      attributes: true,
+      attributeFilter: ["aria-expanded"],
     });
     state.activeObservers += 1;
     state.installCount += 1;

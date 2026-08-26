@@ -8,6 +8,63 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added (SRV-05 slice 2)
+- `command_center/worker/payloads.py` — versioned `agent_run` payload contract
+  (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
+  provenance defaults to untrusted.
+- `command_center/worker/handlers.py` — the payload→execution bridge through
+  the existing `agent_runner.run_claude_code` (sandbox profiles, credential
+  scrubbing and timeouts stay the runner's decisions); untrusted mutating
+  payloads are refused, not silently downgraded; results travel as bounded
+  tails.
+- `deploy/systemd/aicc-worker.service` — declared cgroup resource envelope
+  (MemoryMax/MemoryHigh/CPUQuota/TasksMax); sandbox-directive acceptance
+  stays measurement-from-inside per SRV-05-B.
+
+### Added — the headless worker service (`VOYN-W0-AICC-SRV-05`, slice 1)
+
+- `command_center/db/work_queue_store.py`: the first Python surface over the
+  `0002_queue_claim` protocol — until now `queue_claim`/`queue_heartbeat`/
+  `queue_complete`/`queue_fail` had no caller outside tests. Token generated
+  locally, only its SHA-256 travels on claim; refusals are data, not
+  exceptions.
+- `command_center/worker/`: the claim-execute-report daemon. Heartbeat runs
+  beside the handler and stops the work when the lease is lost; SIGTERM
+  finishes the item in hand and claims no more; an unknown payload kind is a
+  non-retryable failure; auth loss exits non-zero and leaves restart pacing to
+  systemd. Handlers are a registry — the bridge from a claimed payload to a
+  real agent run is deliberately a follow-up slice, because the `execution`
+  payload schema and its producer do not exist yet.
+- `deploy/systemd/aicc-worker.service`: the first systemd unit in the repo.
+  `TimeoutStopSec` outlives the visibility window so a healthy handler is
+  never killed mid-item; hardened (`NoNewPrivileges`, `ProtectSystem=strict`).
+- Test conftest guards: two autouse fixtures hard-imported streamlit (directly
+  and via `app.py`), turning every test on a headless host red at setup — the
+  exact host the worker ships to. Both are now guarded, with the reason
+  recorded at the guard.
+
+### Security — container deployment no longer exposes the console (`VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH`)
+
+An earlier audit (`9761459`, BLOCKER-1) pinned the Streamlit console to localhost for the bare
+`streamlit run` and `scripts/start-ui.sh` paths, but no test guarded that decision and the container
+deployment path reintroduced the same exposure: `scripts/aml-entrypoint.sh` defaulted
+`--server.address` to `0.0.0.0` and `docker-compose.aml.yml` published the port unqualified, so a
+routine `docker compose up` put an unauthenticated console that performs privileged git/gh and
+subprocess operations on every host interface — below any host firewall rule, since Docker installs
+its own.
+
+- `scripts/aml-entrypoint.sh` no longer has a default bind address. It exits `78` (`EX_CONFIG`) with
+  an explanatory message unless `STREAMLIT_SERVER_ADDRESS` is set, so the choice cannot be inherited
+  unseen.
+- `docker-compose.aml.yml` publishes on `${AML_BIND_HOST:-127.0.0.1}` instead of every interface, and
+  states the container-internal `0.0.0.0` explicitly with the reason it is correct there.
+- `tests/test_deployment_exposure.py` gates all four launch paths, executing the entrypoint rather
+  than pattern-matching it.
+
+This closes the *exposure*, not the underlying absence of authentication: the console still has no
+auth layer, which is tracked separately as `AUTH-HTTP-01`. Widening `AML_BIND_HOST` therefore still
+means publishing an unauthenticated privileged surface.
+
 ### H1 sprint history
 
 **H1** is the committed-next horizon defined by
@@ -108,6 +165,58 @@ merged between 2026-07-29 and 2026-07-31. `docs/desktop/README.md` and `CURRENT_
 still describe the desktop client as a pure shell with no data wiring, or as documentation and design
 work only. The code, its tests, and this changelog are the current authority; those three documents
 need reconciliation.
+
+### HTTP authentication for the mutating API surfaces (VOYN-W0-AICC-AUTH-HTTP-01) — 2026-08-15
+
+Both FastAPI applications served no authentication at all. Every mutating route
+now requires a verified platform principal and an explicit AICC-local grant.
+
+#### Added
+- **`command_center/http_auth/`** — `identity.py` (forwards the caller's platform
+  bearer credential to `GET /api/v1/whoami`; stores no credential, hashes
+  nothing, holds no key; fails closed with `503` when the authority is
+  unreachable, which is deliberately distinct from the `401` for a rejected
+  credential; no cache, so a revoked principal is refused on its next request),
+  `authz.py` (a closed, deny-by-default operation inventory and a
+  configuration-driven grant map — a 200 from `whoami` is authentication, never
+  permission), and `routing.py` (the table of all 29 mutating routes, the
+  dependency, and `validate_routing`).
+- **A boot check.** `validate_routing` runs in both app factories: a mutating
+  route with no routing entry, no mounted dependency, or an operation outside
+  the inventory stops the process from starting, as does an unparseable grant
+  file. It also refuses a zero-route inventory, because a route walker that
+  inspects nothing must not report success.
+- **`tests/http_auth/`** — 84 checks, including an unauthenticated sweep of all
+  29 routes, and `tests/http_auth/negative_control.py`, which removes each
+  control in turn on a throwaway copy of the tree and requires the suite to go
+  red (15 mutants, 15 killed, 0 survived).
+
+#### Changed
+- **The mutating surface is 29 routes across two apps, not two.**
+  `command_center/api/app.py` mounts 27 of them while its package docstring
+  still called the application read-only; the docstrings are corrected
+  (`VOYN-W0-AICC-AUTH-HTTP-01a`).
+- **`actor` is gone from the dispatch write bodies.** Not validated — made
+  impossible, following `queue_claim()`: the field is deleted, the request
+  models set `extra="forbid"` so a forged actor is a `422` rather than a silent
+  ignore, and `dispatch.service.assign` / `dispatch.policy_config.update_policy`
+  take a `Principal` and have no `actor` parameter to pass.
+  `PUT /api/v1/dispatch/policy` no longer accepts an unwrapped body as
+  `changes`: that form was indistinguishable from a body carrying an
+  unexpected top-level key.
+
+#### Known limitations
+- **Read paths remain unauthenticated** — out of scope by acceptance criteria,
+  not by cost (measured: 47–76 ms median per verification, a ceiling of roughly
+  105–169 authentications/second). Filed as `VOYN-W0-AICC-AUTH-HTTP-02`.
+- **Seven routes still accept a client-supplied identity field** (`voter_id`,
+  `owner` ×2, `actor` ×4). They are authenticated and authorized like every
+  other route; removing the fields needs per-endpoint product decisions, so each
+  is a signed carve-out in `routing.CLIENT_IDENTITY_CARVE_OUTS` with a reason
+  and a task (`VOYN-W0-AICC-AUTH-HTTP-01b`), and a test refuses any *unsigned*
+  one.
+- **The Streamlit console is untouched** and remains the most exposed surface
+  (`VOYN-W0-AICC-STREAMLIT-EXPOSURE-01`).
 
 ### AIOS Tasks backend (Sprint 4) — 2026-08-06
 
