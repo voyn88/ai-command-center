@@ -34,11 +34,14 @@ not an error — a review/analysis task legitimately changes no files.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from command_center.worker import lease_client
+
+_PR_VIEW_DECODE_ERRORS = (TypeError, ValueError)
 
 __all__ = ["PublishConfig", "PublishResult", "publish_run"]
 
@@ -66,6 +69,14 @@ class PublishConfig:
     # "acquired through... never bypassed" contract) for any caller that
     # does not hold an outer lease.
     release_lease: bool = True
+    # Exact base captured by standalone workspace provisioning. Appended to
+    # preserve the positional constructor contract of the older fields.
+    base_sha: str | None = None
+    # Exact remote task-branch tip captured before the agent ran. None means
+    # the branch was absent. It is the force-lease authority; a fresh read may
+    # detect drift but must never authorize overwriting it.
+    remote_sha: str | None = None
+    remote_sha_known: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +88,9 @@ class PublishResult:
     reason: str = ""
 
 
-def _run(argv: list[str], cwd: Path, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    argv: list[str], cwd: Path, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     import os
 
     env = dict(os.environ)
@@ -94,8 +107,11 @@ def _lease_argv(cfg: PublishConfig, verb: str, repo_path: Path) -> list[str]:
     # lease held across the whole provision->agent->tests->publish
     # lifecycle, not just this push) can never drift apart.
     identity = lease_client.LeaseIdentity(
-        lease_tool=cfg.lease_tool, repository=cfg.repository,
-        owner=cfg.owner, session=cfg.session, task=cfg.task,
+        lease_tool=cfg.lease_tool,
+        repository=cfg.repository,
+        owner=cfg.owner,
+        session=cfg.session,
+        task=cfg.task,
         ttl=cfg.ttl,
     )
     return lease_client.lease_argv(identity, verb, repo_path)
@@ -119,13 +135,18 @@ def _https_push_target(repo_path: Path) -> str | None:
     url = remote.stdout.strip()
     prefix = "git@github.com:"
     if url.startswith(prefix):
-        return "https://github.com/" + url[len(prefix):]
+        return "https://github.com/" + url[len(prefix) :]
     if url.startswith("https://github.com/"):
         return url
     return None
 
 
-def _remote_branch_sha(repo_path: Path, target: str, branch: str) -> tuple[bool, str]:
+def _remote_branch_sha(
+    repo_path: Path,
+    target: str,
+    branch: str,
+    env_extra: dict[str, str] | None = None,
+) -> tuple[bool, str]:
     """Read the exact remote branch tip used by an explicit force lease.
 
     An empty SHA is a valid observation: it means the branch did not exist,
@@ -133,7 +154,7 @@ def _remote_branch_sha(repo_path: Path, target: str, branch: str) -> tuple[bool,
     writer racing us.  Any malformed or ambiguous answer fails closed.
     """
     ref = f"refs/heads/{branch}"
-    remote = _run(["git", "ls-remote", "--heads", target, ref], repo_path)
+    remote = _run(["git", "ls-remote", "--heads", target, ref], repo_path, env_extra)
     if remote.returncode != 0:
         return False, ""
     lines = [line.split() for line in remote.stdout.splitlines() if line.strip()]
@@ -147,6 +168,118 @@ def _remote_branch_sha(repo_path: Path, target: str, branch: str) -> tuple[bool,
     return True, sha.lower()
 
 
+def _pr_snapshot(repo_path: Path, reference: str) -> tuple[int, dict[str, str] | None]:
+    result = _run(
+        [
+            "gh",
+            "pr",
+            "view",
+            reference,
+            "--json",
+            "url,headRefOid,baseRefName,state",
+        ],
+        repo_path,
+    )
+    if result.returncode != 0:
+        return result.returncode, None
+    try:
+        value = json.loads(result.stdout)
+    except _PR_VIEW_DECODE_ERRORS:
+        return 0, None
+    return 0, value if isinstance(value, dict) else None
+
+
+def _verified_pr_result(
+    repo_path: Path,
+    cfg: PublishConfig,
+    branch: str,
+    head_sha: str,
+    durable_target: str,
+    durable_env: dict[str, str] | None,
+) -> PublishResult:
+    """Resolve/create the PR while the repository writer lease is held.
+
+    A URL is not evidence that the PR still points at the commit we pushed.
+    Validate head, base and open state, then make one final remote read before
+    returning success so the lease fences the entire push -> PR handoff.
+    """
+    view_status, snapshot = _pr_snapshot(repo_path, branch)
+    if view_status != 0:
+        body = f"Autonomous delivery of {cfg.task}.\n\nHEAD_SHA: {head_sha}\n"
+        created = _run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--base",
+                cfg.base,
+                "--head",
+                branch,
+                "--title",
+                f"{cfg.task}: autonomous delivery",
+                "--body",
+                body,
+            ],
+            repo_path,
+        )
+        if created.returncode != 0:
+            return PublishResult(
+                ok=False,
+                branch=branch,
+                head_sha=head_sha,
+                reason=f"pr_create_failed: {created.stderr.strip()[:160]}",
+            )
+        pr_reference = created.stdout.strip()
+        if not pr_reference:
+            return PublishResult(
+                ok=False,
+                branch=branch,
+                head_sha=head_sha,
+                reason="pr_create_missing_url",
+            )
+        view_status, snapshot = _pr_snapshot(repo_path, pr_reference)
+        if view_status != 0:
+            return PublishResult(
+                ok=False,
+                branch=branch,
+                head_sha=head_sha,
+                reason="pr_unreadable_after_create",
+            )
+
+    if snapshot is None:
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_snapshot_malformed"
+        )
+    pr_url = snapshot.get("url", "")
+    if snapshot.get("headRefOid", "").lower() != head_sha.lower():
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_head_sha_mismatch"
+        )
+    if snapshot.get("baseRefName") != cfg.base:
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_base_mismatch"
+        )
+    if snapshot.get("state") != "OPEN":
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_not_open"
+        )
+    if not pr_url:
+        return PublishResult(
+            ok=False, branch=branch, head_sha=head_sha, reason="pr_snapshot_missing_url"
+        )
+    durable, durable_sha = _remote_branch_sha(
+        repo_path, durable_target, branch, durable_env
+    )
+    if not durable or durable_sha != head_sha.lower():
+        return PublishResult(
+            ok=False,
+            branch=branch,
+            head_sha=head_sha,
+            reason="remote_branch_changed_during_pr_handoff",
+        )
+    return PublishResult(ok=True, branch=branch, head_sha=head_sha, pr_url=pr_url)
+
+
 def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     """Acquire the lease, push a branch, open a PR. Idempotent on the branch
     name (``backlog/<task>``): a re-run force-updates the same branch and
@@ -156,16 +289,70 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         return PublishResult(ok=False, reason="cannot read HEAD")
     head_sha = head.stdout.strip()
 
-    base_sha = _run(["git", "rev-parse", f"origin/{cfg.base}"], repo_path)
-    if base_sha.returncode == 0 and base_sha.stdout.strip() == head_sha:
+    status = _run(["git", "status", "--porcelain"], repo_path)
+    if status.returncode != 0:
+        return PublishResult(
+            ok=False, reason="cannot_read_worktree_status", head_sha=head_sha
+        )
+    if status.stdout.strip():
+        return PublishResult(ok=False, reason="uncommitted_changes", head_sha=head_sha)
+
+    if cfg.base_sha is not None:
+        base_sha_value = cfg.base_sha
+        base_present = _run(
+            ["git", "cat-file", "-e", f"{base_sha_value}^{{commit}}"], repo_path
+        )
+        if base_present.returncode != 0:
+            return PublishResult(
+                ok=False, reason="pinned_base_sha_missing", head_sha=head_sha
+            )
+    else:
+        base_sha = _run(["git", "rev-parse", f"origin/{cfg.base}"], repo_path)
+        if base_sha.returncode != 0:
+            return PublishResult(
+                ok=False, reason="cannot_read_base_sha", head_sha=head_sha
+            )
+        base_sha_value = base_sha.stdout.strip()
+
+    already_durable = (
+        cfg.remote_sha_known
+        and cfg.remote_sha is not None
+        and cfg.remote_sha == head_sha.lower()
+    )
+    if base_sha_value == head_sha and not already_durable:
         return PublishResult(ok=False, reason="nothing_to_publish", head_sha=head_sha)
+    if base_sha_value != head_sha:
+        ancestry = _run(
+            ["git", "merge-base", "--is-ancestor", base_sha_value, head_sha], repo_path
+        )
+        if ancestry.returncode != 0:
+            return PublishResult(
+                ok=False, reason="head_not_descendant_of_pinned_base", head_sha=head_sha
+            )
 
     branch = f"backlog/{cfg.task}"
+    if already_durable:
+        durable_target = _https_push_target(repo_path)
+        durable_env = None
+        if durable_target is None:
+            durable_target = "origin"
+            durable_env = {
+                "GIT_SSH_COMMAND": (f"ssh -i {cfg.deploy_key} -o IdentitiesOnly=yes")
+            }
+        durable, durable_sha = _remote_branch_sha(
+            repo_path, durable_target, branch, durable_env
+        )
+        if not durable or durable_sha != head_sha.lower():
+            return PublishResult(
+                ok=False, reason="remote_branch_changed_before_pr", head_sha=head_sha
+            )
     lease = _run(_lease_argv(cfg, "acquire", repo_path), repo_path)
     if lease.returncode != 0:
         # The lease is held by another writer: a data refusal, the attempt
         # returns to the pool and a later tick retries — never a forced push.
-        return PublishResult(ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}")
+        return PublishResult(
+            ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}"
+        )
     # Live-reproduced 2026-08-21: `install-hooks` is what writes the
     # pre-push hook's `voyn-lease.env` (repository/owner/session/task/pid/
     # process-start) -- and it had only ever been run once, at whatever
@@ -190,50 +377,94 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
             ok=False, reason=f"install_hooks_failed: {hooks.stderr.strip()[:120]}"
         )
     try:
-        https_target = _https_push_target(repo_path)
-        if https_target is not None:
-            observed, remote_sha = _remote_branch_sha(repo_path, https_target, branch)
-            if not observed:
-                return PublishResult(
-                    ok=False, reason="cannot_read_remote_branch_for_force_lease"
-                )
-            branch_ref = f"refs/heads/{branch}"
-            push = _run(
-                ["git", "push", f"--force-with-lease={branch_ref}:{remote_sha}",
-                 https_target, f"HEAD:{branch_ref}"],
-                repo_path,
-            )
+        if already_durable:
+            push = None
         else:
-            # origin isn't a github.com remote this host knows how to
-            # rewrite to HTTPS -- fall back to the configured deploy key.
-            git_ssh = f"ssh -i {cfg.deploy_key} -o IdentitiesOnly=yes"
-            push = _run(
-                ["git", "push", "--force-with-lease", "origin", f"HEAD:refs/heads/{branch}"],
-                repo_path, {"GIT_SSH_COMMAND": git_ssh},
+            pinned_remote_sha = cfg.remote_sha or ""
+            https_target = _https_push_target(repo_path)
+            if https_target is not None:
+                observed, observed_sha = _remote_branch_sha(
+                    repo_path, https_target, branch
+                )
+                if not observed:
+                    return PublishResult(
+                        ok=False, reason="cannot_read_remote_branch_for_force_lease"
+                    )
+                if cfg.remote_sha_known and observed_sha != pinned_remote_sha:
+                    return PublishResult(
+                        ok=False, reason="remote_branch_changed_before_push"
+                    )
+                branch_ref = f"refs/heads/{branch}"
+                expected_remote_sha = (
+                    pinned_remote_sha if cfg.remote_sha_known else observed_sha
+                )
+                push = _run(
+                    [
+                        "git",
+                        "push",
+                        f"--force-with-lease={branch_ref}:{expected_remote_sha}",
+                        https_target,
+                        f"HEAD:{branch_ref}",
+                    ],
+                    repo_path,
+                )
+                durable_target = https_target
+                durable_env = None
+            else:
+                # origin isn't a github.com remote this host knows how to
+                # rewrite to HTTPS -- fall back to the configured deploy key.
+                git_ssh = f"ssh -i {cfg.deploy_key} -o IdentitiesOnly=yes"
+                ssh_env = {"GIT_SSH_COMMAND": git_ssh}
+                observed, observed_sha = _remote_branch_sha(
+                    repo_path, "origin", branch, ssh_env
+                )
+                if not observed:
+                    return PublishResult(
+                        ok=False, reason="cannot_read_remote_branch_for_force_lease"
+                    )
+                if cfg.remote_sha_known and observed_sha != pinned_remote_sha:
+                    return PublishResult(
+                        ok=False, reason="remote_branch_changed_before_push"
+                    )
+                branch_ref = f"refs/heads/{branch}"
+                expected_remote_sha = (
+                    pinned_remote_sha if cfg.remote_sha_known else observed_sha
+                )
+                push = _run(
+                    [
+                        "git",
+                        "push",
+                        f"--force-with-lease={branch_ref}:{expected_remote_sha}",
+                        "origin",
+                        f"HEAD:{branch_ref}",
+                    ],
+                    repo_path,
+                    ssh_env,
+                )
+                durable_target = "origin"
+                durable_env = ssh_env
+        if push is not None and push.returncode != 0:
+            return PublishResult(
+                ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}"
             )
-        if push.returncode != 0:
-            return PublishResult(ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}")
+        if push is not None:
+            durable, durable_sha = _remote_branch_sha(
+                repo_path, durable_target, branch, durable_env
+            )
+            if not durable or durable_sha != head_sha.lower():
+                return PublishResult(
+                    ok=False,
+                    reason="remote_branch_head_not_durable_after_push",
+                    head_sha=head_sha,
+                )
+        return _verified_pr_result(
+            repo_path,
+            cfg,
+            branch,
+            head_sha,
+            durable_target,
+            durable_env,
+        )
     finally:
         if cfg.release_lease:
             _run(_lease_argv(cfg, "release", repo_path), repo_path)
-
-    body = (
-        f"Autonomous delivery of {cfg.task}.\n\n"
-        f"HEAD_SHA: {head_sha}\n"
-    )
-    existing = _run(
-        ["gh", "pr", "view", branch, "--json", "url", "-q", ".url"], repo_path
-    )
-    if existing.returncode == 0 and existing.stdout.strip():
-        return PublishResult(ok=True, branch=branch, head_sha=head_sha, pr_url=existing.stdout.strip())
-    created = _run(
-        ["gh", "pr", "create", "--base", cfg.base, "--head", branch,
-         "--title", f"{cfg.task}: autonomous delivery", "--body", body],
-        repo_path,
-    )
-    if created.returncode != 0:
-        return PublishResult(
-            ok=False, branch=branch, head_sha=head_sha,
-            reason=f"pr_create_failed: {created.stderr.strip()[:160]}",
-        )
-    return PublishResult(ok=True, branch=branch, head_sha=head_sha, pr_url=created.stdout.strip())

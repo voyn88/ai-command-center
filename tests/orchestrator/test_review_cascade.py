@@ -34,8 +34,9 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     ]
     _queue, key, payload, task_id, max_attempts = calls[0]
     assert task_id == "VOYN-W0-X"
-    assert ":v5:base:" in key and ":diff:" in key
+    assert ":v6:base:" in key and ":diff:" in key
     assert [link["executor"] for link in payload["cascade"]] == [
+        "codex",
         "copilot",
         "claude",
     ]
@@ -54,9 +55,11 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
         assert "--allow-tool" not in argv
         if link["executor"] == "copilot":
             assert "--available-tools=" in argv
+        elif link["executor"] == "codex":
+            assert argv[argv.index("--sandbox") + 1] == "read-only"
         else:
             assert argv[argv.index("--tools") + 1] == ""
-    assert max_attempts == len(payload["cascade"]) == 2
+    assert max_attempts == len(payload["cascade"]) == 3
 
 
 def test_exact_task_target_is_parameterized_for_enqueue_and_marker(monkeypatch):

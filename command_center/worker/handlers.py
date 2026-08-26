@@ -43,11 +43,11 @@ from pathlib import Path
 from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
+from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
-from command_center.orchestrator.publish import PublishConfig, publish_run
 
 __all__ = ["build_handlers"]
 
@@ -66,8 +66,6 @@ _TAIL_CHARS = 4000
 # the identical path, so `blocking_lease` still detects a collision between
 # the two launch paths. If a third caller needs this convention, extract it
 # into `workspace_provisioning` then — not before.
-_WORKTREE_PARENT_SUFFIX = "-worktrees"
-
 # VOYN-W0-AICC-ISOLATED-WORKTREE-PER-ATTEMPT naming decision: keyed by
 # BRANCH (`backlog/<task>`), not by attempt. The payload contract
 # (`worker.payloads.AgentRunRequest`) carries no `attempt_id`/`head_sha` --
@@ -88,8 +86,13 @@ _provision_locks_guard = threading.Lock()
 
 
 def _isolated_workspace_path(repository: Path, branch: str) -> Path:
-    slug = branch.strip().strip("/").replace("/", "-") or "work"
-    return repository.parent / f"{repository.name}{_WORKTREE_PARENT_SUFFIX}" / slug
+    if agent_runner.principal_isolation_required():
+        return workspace_provisioning.task_workspace_path(
+            repository,
+            branch,
+            clone_root=agent_runner.principal_workspace_root(),
+        )
+    return workspace_provisioning.task_workspace_path(repository, branch)
 
 
 def _task_lease_scope(request: Any) -> str:
@@ -137,6 +140,7 @@ def _provision_lock(key: str) -> threading.Lock:
             _provision_locks[key] = lock
         return lock
 
+
 #: BO-S3 result enrichment: the delivery contract for machine-readable
 #: outcomes. A PR reference is extracted by its exact URL shape — nothing
 #: else on GitHub looks like it — and the head SHA ONLY from an explicit
@@ -172,6 +176,25 @@ def _cascade_link(request, attempt_no: int) -> dict[str, Any] | None:
     return request.cascade[min(attempt_no, len(request.cascade)) - 1]
 
 
+def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
+    if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
+        available, detail = agent_runner.codex_workspace_write_preflight()
+        return available, detail, "codex workspace-write sandbox unavailable"
+    if agent_runner.principal_isolation_required():
+        available, detail = agent_runner.principal_executor_preflight(executor)
+        return available, detail, f"isolated {executor} cli unavailable"
+    if executor == "codex":
+        available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
+        return available, detail, "codex cli unavailable"
+    if executor == "copilot":
+        available, detail = agent_runner.claude_cli_preflight(
+            agent_runner.COPILOT_BINARY
+        )
+        return available, detail, "copilot cli unavailable"
+    available, detail = agent_runner.claude_cli_preflight()
+    return available, detail, "claude cli unavailable"
+
+
 def _run_agent(
     payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1
 ) -> HandlerOutcome:
@@ -182,6 +205,7 @@ def _run_agent(
         )
 
     link = _cascade_link(request, attempt_no)
+    cascade_step = attempt_no if link is not None else None
     task_type = request.task_type
     model = request.model
     # A payload with no cascade at all (pre-BO-S2a shape, or a direct
@@ -215,20 +239,38 @@ def _run_agent(
         # item's own max_attempts.
         return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
 
-    if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
-        available, detail = agent_runner.codex_workspace_write_preflight()
-        unavailable_reason = "codex workspace-write sandbox unavailable"
-    elif executor == "codex":
-        available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
-        unavailable_reason = "codex cli unavailable"
-    elif executor == "copilot":
-        available, detail = agent_runner.claude_cli_preflight(
-            agent_runner.COPILOT_BINARY
-        )
-        unavailable_reason = "copilot cli unavailable"
-    else:
-        available, detail = agent_runner.claude_cli_preflight()
-        unavailable_reason = "claude cli unavailable"
+    available, detail, unavailable_reason = _executor_preflight(executor, task_type)
+    if not available and link is not None:
+        # An open Codex circuit is a routing fact, not a consumed model
+        # attempt. Select the next healthy cascade link inside this already
+        # claimed delivery instead of returning it just to increment the
+        # queue attempt counter.
+        for candidate_step in range(attempt_no + 1, len(request.cascade) + 1):
+            candidate = request.cascade[candidate_step - 1]
+            candidate_executor = str(candidate.get("executor"))
+            if candidate_executor not in agent_runner.COMMAND_BUILDERS:
+                continue
+            candidate_task_type = str(candidate.get("task_type", request.task_type))
+            candidate_available, candidate_detail, candidate_reason = (
+                _executor_preflight(candidate_executor, candidate_task_type)
+            )
+            if not candidate_available:
+                detail, unavailable_reason = candidate_detail, candidate_reason
+                continue
+            link = candidate
+            cascade_step = candidate_step
+            executor = candidate_executor
+            task_type = candidate_task_type
+            model = request.model
+            model_override = candidate.get("model")
+            if isinstance(model_override, str) and model_override.strip():
+                model = model_override
+            available, detail, unavailable_reason = (
+                candidate_available,
+                candidate_detail,
+                candidate_reason,
+            )
+            break
     if not available:
         return HandlerOutcome(
             ok=False, reason=f"{unavailable_reason}: {detail}", retryable=True
@@ -293,7 +335,16 @@ def _run_agent(
     try:
         if task_type in agent_runner.MUTATING_TASK_TYPES:
             expected_branch = f"backlog/{backlog_task}"
-            isolated_workspace = _isolated_workspace_path(repository, expected_branch)
+            try:
+                isolated_workspace = _isolated_workspace_path(
+                    repository, expected_branch
+                )
+            except (OSError, agent_runner.RunnerError) as exc:
+                return HandlerOutcome(
+                    ok=False,
+                    reason=f"isolated workspace root unavailable: {exc}",
+                    retryable=True,
+                )
 
             # Single-writer gate at the dispatch boundary (part B of
             # VOYN-OPS-WORKER-DISPATCH-INTO-LEASED-WORKTREE), now checked
@@ -389,7 +440,9 @@ def _run_agent(
                     )
 
             base_branch = (
-                project_config.get_project_config(request.project_id).get("default_branch")
+                project_config.get_project_config(request.project_id).get(
+                    "default_branch"
+                )
                 or "main"
             )
             spec = workspace_provisioning.WorkspaceSpec(
@@ -398,6 +451,12 @@ def _run_agent(
                 base_branch=base_branch,
                 repository_path=str(repository),
                 task_type=task_type,
+                task_local_git_metadata=True,
+                task_clone_root=(
+                    str(agent_runner.principal_workspace_root())
+                    if agent_runner.principal_isolation_required()
+                    else None
+                ),
             )
             try:
                 # Locked per-path: `provision_workspace` is check-then-act
@@ -440,15 +499,59 @@ def _run_agent(
         # visibility-window expiry / supersession in `work_queue_store`,
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
-        run = agent_runner.run_claude_code(
-            repository_path=run_repository,
-            prompt=request.prompt,
-            task_type=task_type,
-            timeout_seconds=request.timeout_seconds,
-            model=model,
-            cancel_event=lease_lost,
-            executor=executor,
-        )
+        while True:
+            run = agent_runner.run_claude_code(
+                repository_path=run_repository,
+                prompt=request.prompt,
+                task_type=task_type,
+                timeout_seconds=request.timeout_seconds,
+                model=model,
+                cancel_event=lease_lost,
+                executor=executor,
+            )
+            if not (
+                executor == "codex"
+                and run.is_executor_sandbox_error
+                and isolated_workspace is not None
+                and not lease_lost.is_set()
+            ):
+                break
+            agent_runner.disable_codex_workspace_write(_tail(run.stderr or run.stdout))
+            unchanged = workspace_provisioning.task_workspace_is_unchanged(
+                run_repository,
+                expected_branch=evidence.expected_branch,
+                remote_url=evidence.remote_url,
+                start_sha=evidence.start_sha,
+                trusted_base_sha=evidence.base_sha,
+                expected_remote_sha=evidence.remote_task_sha,
+                expected_inode=(evidence.workspace_device, evidence.workspace_inode),
+            )
+            if not unchanged or cascade_step is None:
+                break
+            fallback_selected = False
+            for candidate_step in range(cascade_step + 1, len(request.cascade) + 1):
+                candidate = request.cascade[candidate_step - 1]
+                candidate_executor = str(candidate.get("executor"))
+                if candidate_executor not in agent_runner.COMMAND_BUILDERS:
+                    continue
+                candidate_task_type = str(candidate.get("task_type", request.task_type))
+                candidate_available, _, _ = _executor_preflight(
+                    candidate_executor, candidate_task_type
+                )
+                if not candidate_available:
+                    continue
+                executor = candidate_executor
+                task_type = candidate_task_type
+                model = request.model
+                model_override = candidate.get("model")
+                if isinstance(model_override, str) and model_override.strip():
+                    model = model_override
+                link = candidate
+                cascade_step = candidate_step
+                fallback_selected = True
+                break
+            if not fallback_selected:
+                break
 
         if lease_lost.is_set():
             # Cancellation confirmed: `run_claude_code` did not return until
@@ -480,7 +583,7 @@ def _run_agent(
 
         result_text = agent_runner.extract_result_text(run.stdout)
         result = {
-            "cascade_step": attempt_no if link is not None else None,
+            "cascade_step": cascade_step,
             "executor": (link or {}).get("executor", "claude"),
             **_machine_outcome(result_text),
             "status": run.status,
@@ -492,17 +595,113 @@ def _run_agent(
             "stderr_tail": _tail(run.stderr),
             "result_text": _tail(result_text),
         }
+
+        def checkpoint_preserved_candidate() -> HandlerOutcome | None:
+            """Authenticate the committed prefix before an infrastructure retry."""
+            if isolated_workspace is None:
+                return None
+            try:
+                candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
+                    run_repository,
+                    expected_branch=evidence.expected_branch,
+                    expected_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
+                )
+                if candidate_sha == evidence.start_sha:
+                    return None
+                with workspace_provisioning.trusted_publish_clone(
+                    run_repository,
+                    expected_branch=evidence.expected_branch,
+                    remote_url=evidence.remote_url,
+                    start_sha=evidence.start_sha,
+                    trusted_base_sha=evidence.base_sha,
+                    expected_remote_sha=evidence.remote_task_sha,
+                    expected_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
+                    expected_candidate_sha=candidate_sha,
+                    # An infrastructure failure can happen after a valid
+                    # commit but before the agent finishes its remaining
+                    # edits.  Only the exact committed SHA is checkpointed;
+                    # dirty files stay outside that authority and the next
+                    # allow-dirty retry can finish and commit them.
+                    require_clean=False,
+                ):
+                    workspace_provisioning.checkpoint_task_workspace(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        previous_start_sha=evidence.start_sha,
+                        expected_candidate_sha=candidate_sha,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                    )
+            except workspace_provisioning.WorkspaceVerificationError as exc:
+                return HandlerOutcome(
+                    ok=False,
+                    reason=(
+                        "infrastructure retry checkpoint failed at "
+                        f"{exc.failed_step}: {exc.detail}"
+                    ),
+                    retryable=True,
+                    result=result,
+                )
+            return None
+
         if run.status == "failed" and run.exit_code is None and not run.stdout:
             # The process never started (OSError path in the runner):
             # nothing executed, so redelivery is safe and may land on a
             # healthier host. The worktree (if any) holds no run output
             # either -- safe to remove immediately rather than leave an
-            # empty one behind for every failed launch attempt.
-            if isolated_workspace is not None:
-                workspace_provisioning.remove_workspace(isolated_workspace, repository)
+            # empty one behind for every failed launch attempt. "Safe" is
+            # keyed to freshness, not to the provisioning mode: a workspace
+            # this attempt just created ("cloned"/"created"/"attached")
+            # holds nothing ("attached" included: provision_workspace's
+            # contract defines it as `git worktree add` of a NEW directory
+            # for an existing branch -- the directory itself is created by
+            # this attempt), while a "reused" one may carry a preserved
+            # unpublished commit from an earlier attempt and must survive
+            # for the retry to publish (review finding on 363e91d: the old
+            # `== "cloned"` gate leaked every legacy fresh worktree).
+            if isolated_workspace is not None and evidence.provision_outcome in {
+                "cloned",
+                "created",
+                "attached",
+            }:
+                workspace_provisioning.remove_workspace(
+                    isolated_workspace,
+                    repository,
+                    verified_clean=True,
+                    verified_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
+                )
             return HandlerOutcome(
                 ok=False,
                 reason=_tail(run.stderr) or "runner failed to start",
+                retryable=True,
+            )
+        if run.is_principal_isolation_error:
+            # The separate-UID launcher failed before it could return a
+            # trustworthy provider outcome. It may have failed either before
+            # starting the agent or after the agent changed the tree but
+            # before the broker returned the outcome. Preserve the task-local
+            # workspace for reconciliation: deleting it in the latter case
+            # would destroy the only copy of a local commit. Never consume the
+            # task as completed and never fall back to direct same-UID
+            # execution. A later delivery may land after socket/systemd
+            # recovery and safely inspect/reuse the workspace.
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    "executor infrastructure failure (agent principal "
+                    f"isolation): {_tail(run.stderr or result_text)}"
+                ),
                 retryable=True,
             )
         read_only_copilot_failure = (
@@ -517,13 +716,12 @@ def _run_agent(
             # CLI reports through its own structured
             # `is_error`+`api_error_status`/`terminal_reason` fields (see
             # `RunResult.is_executor_api_error`), never by executing any
-            # task work. That is indistinguishable from the "process never
-            # started" case above in every way that matters here: nothing
-            # ran, so redelivery is safe and may land on a healthier
-            # host/account, and the worktree (if any) holds no run output
-            # worth preserving.
-            if isolated_workspace is not None:
-                workspace_provisioning.remove_workspace(isolated_workspace, repository)
+            # task work. Redelivery is safe and may land on a healthier
+            # host/account. The clone is nevertheless preserved: a late or
+            # spoofed classification must never delete the only local commit.
+            checkpoint_failure = checkpoint_preserved_candidate()
+            if checkpoint_failure is not None:
+                return checkpoint_failure
             return HandlerOutcome(
                 ok=False,
                 reason=(
@@ -534,8 +732,13 @@ def _run_agent(
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.
-            if isolated_workspace is not None:
-                workspace_provisioning.remove_workspace(isolated_workspace, repository)
+            if executor == "codex":
+                agent_runner.disable_codex_workspace_write(
+                    _tail(run.stderr or result_text)
+                )
+            checkpoint_failure = checkpoint_preserved_candidate()
+            if checkpoint_failure is not None:
+                return checkpoint_failure
             return HandlerOutcome(
                 ok=False,
                 reason=(
@@ -579,18 +782,78 @@ def _run_agent(
                 full_lifecycle_lease_held
                 and _task_lease_scope(request) == publish_repository
             )
-            pub = publish_run(
-                run_repository,
-                PublishConfig(
-                    lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
-                    repository=publish_repository,
-                    owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
-                    session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
-                    task=backlog_task,
-                    deploy_key=deploy_key,
-                    release_lease=not caller_holds_this_row,
-                ),
-            )
+            if not (
+                evidence.expected_branch and evidence.remote_url and evidence.start_sha
+            ):
+                return HandlerOutcome(
+                    ok=False,
+                    reason="guarded publish authority is incomplete",
+                    retryable=True,
+                )
+            try:
+                candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
+                    run_repository,
+                    expected_branch=evidence.expected_branch,
+                    expected_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
+                )
+                with workspace_provisioning.trusted_publish_clone(
+                    run_repository,
+                    expected_branch=evidence.expected_branch,
+                    remote_url=evidence.remote_url,
+                    start_sha=evidence.start_sha,
+                    trusted_base_sha=evidence.base_sha,
+                    expected_remote_sha=evidence.remote_task_sha,
+                    expected_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
+                    expected_candidate_sha=candidate_sha,
+                ) as publish_clone:
+                    # The fresh publisher clone above has now proved that the
+                    # candidate is a clean descendant of the signed base
+                    # without executing any agent-controlled Git config or
+                    # hooks.  Advance retry authority before attempting the
+                    # fallible lease/push/PR sequence.  If publication fails,
+                    # the preserved task clone can therefore be verified and
+                    # retried instead of being stranded behind the old signed
+                    # start SHA.
+                    workspace_provisioning.checkpoint_task_workspace(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        previous_start_sha=evidence.start_sha,
+                        expected_candidate_sha=candidate_sha,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                    )
+                    pub = publish_run(
+                        publish_clone,
+                        PublishConfig(
+                            lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
+                            repository=publish_repository,
+                            owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
+                            session=os.environ.get(
+                                "VOYN_LEASE_SESSION", "server-worker"
+                            ),
+                            task=backlog_task,
+                            deploy_key=deploy_key,
+                            base=base_branch,
+                            release_lease=not caller_holds_this_row,
+                            base_sha=evidence.base_sha,
+                            remote_sha=evidence.remote_task_sha,
+                            remote_sha_known=True,
+                        ),
+                    )
+            except workspace_provisioning.WorkspaceVerificationError as exc:
+                return HandlerOutcome(
+                    ok=False,
+                    reason=f"guarded publish preparation failed at {exc.failed_step}: {exc.detail}",
+                    retryable=True,
+                )
             result["publish"] = {
                 "ok": pub.ok,
                 "branch": pub.branch,
@@ -616,7 +879,26 @@ def _run_agent(
             # reuses ("reused") the still-present worktree.
             publish_left_nothing_local = pub.ok or pub.reason == "nothing_to_publish"
             if isolated_workspace is not None and publish_left_nothing_local:
-                workspace_provisioning.remove_workspace(isolated_workspace, repository)
+                workspace_provisioning.remove_workspace(
+                    isolated_workspace,
+                    repository,
+                    verified_clean=True,
+                    verified_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
+                )
+            if pub.reason in {
+                "uncommitted_changes",
+                "pinned_base_sha_missing",
+                "head_not_descendant_of_pinned_base",
+            }:
+                return HandlerOutcome(
+                    ok=False,
+                    reason=f"publish precondition failed: {pub.reason}",
+                    retryable=True,
+                    result=result,
+                )
         elif isolated_workspace is not None:
             # Publishing is disabled for this deployment (no
             # AICC_PUBLISH_DEPLOY_KEY): the worktree's local commits are the
@@ -626,7 +908,52 @@ def _run_agent(
             # local-only mode never cleans up -- the worktree accumulates
             # the same way the shared checkout used to, and an operator
             # enabling publishing later can still recover it.
-            pass
+            try:
+                # Local-only mode still needs a trusted checkpoint.  The
+                # saved commit is the only durable task result here, and a
+                # later retry (or enabling the guarded publisher) must be
+                # able to authenticate and reuse it.
+                candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
+                    run_repository,
+                    expected_branch=evidence.expected_branch,
+                    expected_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
+                )
+                with workspace_provisioning.trusted_publish_clone(
+                    run_repository,
+                    expected_branch=evidence.expected_branch,
+                    remote_url=evidence.remote_url,
+                    start_sha=evidence.start_sha,
+                    trusted_base_sha=evidence.base_sha,
+                    expected_remote_sha=evidence.remote_task_sha,
+                    expected_inode=(
+                        evidence.workspace_device,
+                        evidence.workspace_inode,
+                    ),
+                    expected_candidate_sha=candidate_sha,
+                ):
+                    workspace_provisioning.checkpoint_task_workspace(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        previous_start_sha=evidence.start_sha,
+                        expected_candidate_sha=candidate_sha,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                    )
+            except workspace_provisioning.WorkspaceVerificationError as exc:
+                return HandlerOutcome(
+                    ok=False,
+                    reason=(
+                        "local task checkpoint failed at "
+                        f"{exc.failed_step}: {exc.detail}"
+                    ),
+                    retryable=True,
+                    result=result,
+                )
         return HandlerOutcome(ok=True, result=result)
     finally:
         stack.close()
