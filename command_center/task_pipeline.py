@@ -2427,9 +2427,9 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     for row in rows:
         try:
             payload = _json.loads(row["payload"])
-        except (TypeError, ValueError):
+            cost = payload.get("total_cost_usd")
+        except (TypeError, ValueError, AttributeError):
             continue
-        cost = payload.get("total_cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             total += float(cost)
     return total

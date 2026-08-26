@@ -513,3 +513,34 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     )
     ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert [d.task_id for d in ungated.launched()] == ["s"]
+
+
+def test_daily_spend_usd_ignores_non_dict_json_payload(tmp_path, api):
+    """A `run_event` row can hold any valid JSON, not just an object — a
+    provider or replay bug could log `total_cost_usd` inside a JSON array or
+    string. `daily_spend_usd` must skip such rows instead of raising
+    `AttributeError` from calling `.get()` on a non-dict."""
+    task = runtime_db.create_task(
+        api.db_path, project="AIOS", title="odd-payload", task_type="implementation"
+    )
+    session = runtime_db.create_session(
+        api.db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    run = runtime_db.create_run(
+        api.db_path, session_id=session["id"], task_id=task["id"],
+        project="AIOS", task_type="implementation", repository_path="/tmp/x",
+        prompt="odd", is_resume=False,
+    )
+    # Malformed but valid JSON: a list, not an object.
+    runtime_db.append_run_event(
+        api.db_path, run["id"], "stream_event",
+        [{"type": "result", "total_cost_usd": 9.0}],
+    )
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (models.iso_now(), run["id"]),
+            )
+
+    assert task_pipeline.daily_spend_usd(api.db_path) == pytest.approx(0.0)
