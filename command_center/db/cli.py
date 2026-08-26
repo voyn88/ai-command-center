@@ -35,6 +35,31 @@ def build_parser() -> argparse.ArgumentParser:
         "upgrade",
         help="Apply pending migrations and re-assert table grants (as the migrator).",
     )
+    snapshot = sub.add_parser(
+        "legacy-snapshot",
+        help="Create a checksummed, read-only legacy rollback snapshot.",
+    )
+    snapshot.add_argument("--data-dir", default="data")
+    snapshot.add_argument("--output", required=True)
+    legacy_import = sub.add_parser(
+        "legacy-import",
+        help="Deterministically import a verified snapshot and reconcile it.",
+    )
+    legacy_import.add_argument("--snapshot", required=True)
+    legacy_import.add_argument("--report", required=True)
+    freeze = sub.add_parser(
+        "legacy-freeze",
+        help="Retire legacy writable authority once PostgreSQL itself, "
+        "queried fresh right now, reconciles clean against the snapshot.",
+    )
+    freeze.add_argument("--data-dir", default="data")
+    freeze.add_argument("--snapshot", required=True)
+    freeze.add_argument("--report", required=True)
+    verify = sub.add_parser(
+        "legacy-verify",
+        help="Re-check that no retired legacy store became writable again.",
+    )
+    verify.add_argument("--data-dir", default="data")
 
     # The queue's recovery surface (SRV-06). These run as `aicc_app` — the
     # role the SQL protocol granted queue_reap/queue_redrive/work_dlq to —
@@ -192,6 +217,39 @@ def main(argv: list[str] | None = None) -> int:
         # failed tick to the operator; noop/deployed is success.
         return 0 if deploy_report.outcome in ("noop", "deployed") else 1
 
+    # These two touch only the filesystem: taking a snapshot and re-checking a
+    # past retirement need no PostgreSQL connection, so they must not require
+    # one. `legacy-freeze` is *not* here — it independently reconciles the
+    # snapshot against the live target, so it needs the same connection
+    # `legacy-import` does (see `retire_legacy_authority`'s docstring for why
+    # it refuses to trust a reconciliation report file instead).
+    if args.command in {"legacy-snapshot", "legacy-verify"}:
+        from pathlib import Path
+
+        from command_center.db.legacy_migration import (
+            MigrationRefused,
+            create_snapshot,
+            verify_retirement,
+        )
+
+        # A refusal is the expected answer to an unsafe cutover, not a crash;
+        # an operator reads the reason, not a traceback.
+        try:
+            if args.command == "legacy-snapshot":
+                snap = create_snapshot(Path(args.data_dir), Path(args.output))
+                print(f"snapshot: {snap.directory}")
+                print(f"files: {len(snap.manifest['files'])}")
+            else:
+                state = verify_retirement(Path(args.data_dir))
+                for entry in state["retired"]:
+                    print(f"retired: {entry['file']} ({entry['how']})")
+                for name in state["retained_writable"]:
+                    print(f"retained (no PostgreSQL mapping): {name}")
+        except MigrationRefused as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
     try:
         config = load_config()
     except ConfigError as exc:
@@ -221,6 +279,30 @@ def main(argv: list[str] | None = None) -> int:
                 # app" the same state.
                 count = roles.apply_table_grants(conn)
                 print(f"re-asserted {count} table grants")
+                return 0
+
+            if args.command in {"legacy-import", "legacy-freeze"}:
+                from pathlib import Path
+
+                from command_center.db.legacy_migration import (
+                    MigrationRefused,
+                    migrate,
+                    retire_legacy_authority,
+                )
+
+                try:
+                    if args.command == "legacy-import":
+                        report = migrate(Path(args.snapshot), conn, Path(args.report))
+                        print(f"reconciliation: clean ({len(report['tables'])} tables)")
+                        print(f"report: {args.report}")
+                    else:
+                        marker = retire_legacy_authority(
+                            Path(args.data_dir), Path(args.snapshot), conn, Path(args.report)
+                        )
+                        print(f"legacy authority retired: {marker}")
+                except MigrationRefused as exc:
+                    print(f"refused: {exc}", file=sys.stderr)
+                    return 2
                 return 0
 
             if args.command == "queue-reap":
