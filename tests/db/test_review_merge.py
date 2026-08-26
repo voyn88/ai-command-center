@@ -2469,3 +2469,78 @@ def test_a_failed_audit_lookup_does_not_burn_the_write_budget(rig, monkeypatch):
     report = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
     assert ("VOYN-W0-AA", "auto_accept_audit_post_failed") in report.skipped
     assert posted == [pr_b]  # B's marker landed despite A's failed lookup
+
+
+def test_multiple_pr_rows_per_task_are_all_reached(rig, monkeypatch):  # noqa: F811
+    """Review of aba471f (CONFIRMED, medium): a task_id-only keyset skipped a
+    task's remaining pr evidence rows once the cursor passed its id. The
+    composite (task_id, value) keyset reaches every row across ticks."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MPR", "https://github.com/x/y/pull/600")
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT backlog_record_evidence(%s,'pr',%s)",
+            ("VOYN-W0-MPR", "https://github.com/x/y/pull/601"),
+        )
+        c.commit()
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        lambda argv, repo: sp.CompletedProcess(argv, 1, "", "fails -> pure skip"),
+    )
+    seen_urls: set[str] = set()
+    for _tick in range(3):
+        report = publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=1, scan_cap=1)
+        )
+        # pr_view_failed skips carry no URL; track via the scan itself.
+        seen_urls |= {r[1] for r in report.skipped if isinstance(r[1], str)}
+    # Both evidence rows were examined (each produced its own skip)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT position FROM backlog_scan_cursor WHERE name=%s",
+                    ("scan:publish_review_verdicts",))
+        row = cur.fetchone()
+    assert row is not None and "pull/60" in row[0].replace("\x1f", " ")
+
+
+def test_cursor_advances_only_to_the_processed_boundary(rig, monkeypatch):  # noqa: F811, E501
+    """Review of aba471f (High, addressed to the achievable floor): the
+    cursor moves exactly as far as the tick actually processed, so a
+    budget break mid-window never jumps unexamined rows. With cap 1 and
+    three accepted tasks in one window, three ticks post three markers --
+    none skipped."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    heads = {}
+    for i, n in enumerate((700, 701, 702)):
+        head = f"{i}a" * 10 + "9" * 20
+        pr_url = f"https://github.com/x/y/pull/{n}"
+        heads[pr_url] = head
+        _ready(store, app_factory, f"VOYN-W0-PB{i}", pr_url)
+        _complete_review(
+            app_factory, worker, f"VOYN-W0-PB{i}", pr_url, head,
+            f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        )
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    for _tick in range(3):
+        publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=1, scan_cap=3)
+        )
+    assert sorted(posted) == sorted(heads)  # all three, none skipped

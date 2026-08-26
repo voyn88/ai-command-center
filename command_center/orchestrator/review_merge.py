@@ -766,64 +766,68 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
 
 
+_SCAN_KEY_SEP = "\x1f"
+
+
 def _scan_tasks(
     factory: Any,
     cursor_name: str,
     select_sql: str,
     params: tuple,
     scan_cap: int,
-    step: int,
-) -> list[tuple[Any, ...]]:
-    """The tick's scan window, driven by the persisted KEYSET cursor of
-    migration 0015. Five reviewed counterexamples killed every lighter
-    schedule (pseudo-random sampling 24c124b; fixed pages starved by
-    action-consuming heads 2199a56; strides wider than the window cadc595;
-    wall-clock aliasing 2f7ac9c; a numeric offset whose ordinal meaning
-    shifts under membership churn c725613). The cursor stores the LAST
-    EXAMINED task_id -- immovable relative to every other persisting id --
-    so it provably passes every waiter within one lap of the id space
-    under any churn, cadence, restarts, or action-hogging rows.
-
-    ``select_sql`` must expose ``task_id`` ordering and accept a trailing
-    ``(after, limit)`` parameter pair (``WHERE ... AND task_id > %s ORDER
-    BY task_id LIMIT %s``). The window is the first ``scan_cap`` rows
-    after the cursor, wrapping to the start when short; the cursor then
-    advances to the ``min(step, scan_cap)``-th examined id via an atomic
-    compare-and-set -- so every waiter periodically sits at the FRONT of
-    the window, examined before anything can spend the action cap. A lost
-    CAS (a concurrent same-name tick advanced first) keeps the fetched
-    window: a bounded duplicate examination, never a skip."""
+) -> tuple[list[tuple[Any, ...]], str]:
+    """The tick's scan window over the COMPOSITE keyset (task_id, value)
+    with the persisted cursor of migration 0015 (reviews aba471f and five
+    predecessors: the composite key is unique even when one task carries
+    several pr evidence rows, so no row can be jumped past; ordinal
+    offsets, wall clocks, and fixed pages all fell to counterexamples).
+    ``select_sql`` must accept a trailing ``(after_task, after_value,
+    limit)`` triple (``WHERE (task_id, value) > (%s, %s) ORDER BY task_id,
+    value LIMIT %s``). Returns ``(rows, cursor_token)`` -- the caller MUST
+    call `_scan_commit` with the last row it actually PROCESSED, so the
+    cursor advances exactly as far as real progress: no row is ever
+    skipped, and progress is at least one row per tick. That is the
+    strongest fairness a bounded-work tick can offer: sustained starvation
+    of a waiter then requires an adversarial insertion rate of at least
+    the tick's processing rate (typically scan_cap per tick, since skips
+    are cheap) sourced from the trusted planner itself -- the theoretical
+    floor for any finite scheduler under unbounded arrivals, documented
+    here deliberately rather than claimed away."""
     cursor_rows = _rows(
         factory,
         "SELECT position FROM backlog_scan_cursor WHERE name = %s",
         (cursor_name,),
     )
-    after = str(cursor_rows[0][0]) if cursor_rows else ""
-    tasks = _rows(factory, select_sql, params + (after, scan_cap))
-    wrapped = False
+    token = str(cursor_rows[0][0]) if cursor_rows else ""
+    after_task, _, after_value = token.partition(_SCAN_KEY_SEP)
+    tasks = _rows(factory, select_sql, params + (after_task, after_value, scan_cap))
     if len(tasks) < scan_cap:
-        wrapped = True
-        seen_keys = {row[0] for row in tasks}
+        seen = {(row[0], row[1]) for row in tasks}
         tasks += [
             row
             for row in _rows(
-                factory, select_sql, params + ("", scan_cap - len(tasks))
+                factory, select_sql, params + ("", "", scan_cap - len(tasks))
             )
-            if row[0] not in seen_keys
+            if (row[0], row[1]) not in seen
         ]
-    if not tasks:
-        return []
-    stride = max(1, min(step, scan_cap))
-    marker_row = tasks[min(stride, len(tasks)) - 1]
-    # After a wrap the lap restarts: pointing the cursor at an id from the
-    # window's wrapped head keeps monotone progress through the id space.
-    new_position = str(marker_row[0]) if not wrapped or stride <= len(tasks) else ""
+    return tasks, token
+
+
+def _scan_commit(
+    factory: Any, cursor_name: str, token: str, last_row: tuple[Any, ...] | None
+) -> None:
+    """Advance the cursor to the last row the tick actually processed --
+    an atomic compare-and-set; a lost race to a concurrent same-name tick
+    keeps that tick's advance (a bounded duplicate examination on the next
+    lap, never a skip)."""
+    if last_row is None:
+        return
+    new_token = f"{last_row[0]}{_SCAN_KEY_SEP}{last_row[1]}"
     _rows(
         factory,
         "SELECT backlog_scan_claim(%s, %s, %s)",
-        (cursor_name, after, new_position),
+        (cursor_name, token, new_token),
     )
-    return tasks
 
 
 def review_once(
@@ -875,21 +879,23 @@ def review_once(
     # periodically sits at the FRONT of the window, examined before
     # anything else can spend the action cap -- immune even to rows that
     # consume actions on every visit (reviews of 24c124b and 2199a56).
-    tasks = _scan_tasks(
+    tasks, scan_token = _scan_tasks(
         factory,
         "scan:review_once",
         "SELECT task_id, value FROM ("
         "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
         "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
         "  WHERE t.status = 'READY_TO_REVIEW'" + where_task + ") pairs "
-        "WHERE task_id > %s ORDER BY task_id LIMIT %s",
-        params, cfg.scan_cap, cfg.max_per_tick,
+        "WHERE (task_id, value) > (%s, %s) ORDER BY task_id, value LIMIT %s",
+        params, cfg.scan_cap,
     )
+    last_processed = None
     cascade = _model_only_review_cascade()
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
         if actions >= cfg.max_per_tick:
             break
+        last_processed = (task_id, pr_url)
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
@@ -960,6 +966,7 @@ def review_once(
             enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
         actions += 1
+    _scan_commit(factory, "scan:review_once", scan_token, last_processed)
     return report
 
 
@@ -1586,19 +1593,22 @@ def publish_review_verdicts(
     # periodically sits at the FRONT of the window, examined before
     # anything else can spend the action cap -- immune even to rows that
     # consume actions on every visit (reviews of 24c124b and 2199a56).
-    tasks = _scan_tasks(
+    tasks, scan_token = _scan_tasks(
         factory,
         "scan:publish_review_verdicts",
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'" + where_task
-        + " AND t.task_id > %s ORDER BY t.task_id LIMIT %s",
-        params, cfg.scan_cap, cfg.max_per_tick,
+        + " AND (t.task_id, e.value) > (%s, %s) "
+        "ORDER BY t.task_id, e.value LIMIT %s",
+        params, cfg.scan_cap,
     )
+    last_processed = None
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
         if actions >= cfg.max_per_tick:
             break
+        last_processed = (task_id, pr_url)
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
@@ -1731,6 +1741,9 @@ def publish_review_verdicts(
         # pre-marker run. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
         _rerun_failing_acceptance_gate(repo_path, pr_url, sha)
         report.reviewed.append((task_id, pr_url))
+    _scan_commit(
+        factory, "scan:publish_review_verdicts", scan_token, last_processed
+    )
     return report
 
 
@@ -1969,20 +1982,23 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     # periodically sits at the FRONT of the window, examined before
     # anything else can spend the action cap -- immune even to rows that
     # consume actions on every visit (reviews of 24c124b and 2199a56).
-    tasks = _scan_tasks(
+    tasks, scan_token = _scan_tasks(
         factory,
         "scan:merge_once",
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW' "
-        "AND t.task_id > %s ORDER BY t.task_id LIMIT %s",
-        (), cfg.scan_cap, cfg.max_per_tick,
+        "AND (t.task_id, e.value) > (%s, %s) "
+        "ORDER BY t.task_id, e.value LIMIT %s",
+        (), cfg.scan_cap,
     )
+    last_processed = None
     branch_updates = 0
     actions = 0
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
+        last_processed = (task_id, pr_url)
         # Readiness FIRST: only a PR that already carries an independent ACCEPT
         # marker on its head with green required checks is the merge tick's
         # business. An un-accepted or failing PR is reviewed by the review tick
@@ -2097,6 +2113,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     report.skipped.append((task_id, f"transition:{reason}"))
             finally:
                 conn.autocommit = True
+    _scan_commit(factory, "scan:merge_once", scan_token, last_processed)
     return report
 
 
