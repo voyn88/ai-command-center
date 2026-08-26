@@ -50,3 +50,13 @@ def test_queue_redrive_requires_the_item_id() -> None:
     assert build_parser().parse_args(["queue-redrive", "wki_1"]).extra_attempts == 1
     with pytest.raises(SystemExit):
         build_parser().parse_args(["queue-redrive"])
+
+
+def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
+    args = build_parser().parse_args(["backlog-merge-reconcile"])
+    assert args.command == "backlog-merge-reconcile"
+    assert args.repo_path == "."
+    scoped = build_parser().parse_args(
+        ["backlog-merge-reconcile", "--repo-path", "/srv/aicc"]
+    )
+    assert scoped.repo_path == "/srv/aicc"
