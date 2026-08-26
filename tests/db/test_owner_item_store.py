@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from command_center import record_mirror
+from command_center.db import owner_item_store
 from command_center.db.owner_item_store import (
     MIRROR_UNAVAILABLE,
     OWNER_ITEM_COLUMNS,
@@ -22,6 +23,8 @@ from command_center.db.owner_item_store import (
     divergence,
 )
 from command_center.runtime.db import wave1
+
+from tests.db.mirror_probe import each_lost_write_is_noticed
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -287,3 +290,50 @@ def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
             cur.execute("SELECT created_at FROM owner_item WHERE id = 'tz'")
             stored = cur.fetchone()[0]
     assert stored == expected
+
+
+def test_every_lost_mirror_write_is_visible_to_reconciliation(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """The check the other tests above cannot substitute for.
+
+    Every test elsewhere in this module drives `_mirror_owner_item` and then
+    reads the mirror it actually wrote — none of them ever fails that write and
+    asks whether the *absence* is noticed. That is exactly the gap slice 14's
+    perturbation sweep found in three other families: a table can carry a full
+    round-trip suite and still have a dropped `upsert` sail through green,
+    because nothing ever drops one. `each_lost_write_is_noticed` does, failing
+    one of the two calls `_mirror_owner_item` makes — `create_owner_item`'s and
+    `set_owner_item_done`'s — in turn, and checks reconciliation after each.
+    """
+    real_mirror = PostgresOwnerItemMirror(connection_factory=pg_connection_factory)
+    state: dict[str, object] = {}
+
+    def scenario() -> None:
+        with pg_connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM owner_item")
+        db_path = tmp_path / f"runtime-{len(state)}.db"
+        wave1.db.migrate(db_path)
+        state["db"] = db_path
+        created = wave1.create_owner_item(db_path, title="scenario")
+        wave1.set_owner_item_done(
+            db_path, created["id"], expected_version=created["version"], done=True
+        )
+
+    def noticed() -> bool:
+        db_path = state["db"]
+        return bool(divergence(wave1.list_owner_items(db_path, limit=1000), real_mirror))
+
+    results = each_lost_write_is_noticed(
+        monkeypatch,
+        targets=(
+            (owner_item_store, ("PostgresOwnerItemMirror",), lambda: real_mirror),
+        ),
+        scenario=scenario,
+        noticed=noticed,
+    )
+
+    assert len(results) == 2, [result.target for result in results]
+    missed = [result for result in results if not result.noticed]
+    assert not missed, f"lost writes nothing noticed: {missed}"
