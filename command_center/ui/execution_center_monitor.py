@@ -122,7 +122,7 @@ def _execution_center_record_heartbeat(run_id: str, pid: int | None, now: dateti
     never adds a row to `runtime.db` on every refresh tick."""
     if not pid:
         return
-    if runtime_identity.capture_identity(pid) is not None:
+    if runtime_identity.query_identity(pid).status is runtime_identity.ProcessQueryStatus.LIVE:
         st.session_state.setdefault("exec_center_heartbeats", {})[run_id] = now
 
 

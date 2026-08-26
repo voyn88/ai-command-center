@@ -1,0 +1,16 @@
+[Unit]
+Description=AICC separate-principal agent launcher socket
+Requires=aicc-principal-recovery.service
+After=aicc-principal-recovery.service
+
+[Socket]
+ListenStream=/run/aicc-agent-launcher/control.sock
+SocketUser=root
+SocketGroup=aicc-publisher
+SocketMode=0660
+DirectoryMode=0750
+Accept=yes
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
