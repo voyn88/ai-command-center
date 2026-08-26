@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import json
+import os
 import stat
 
 import pytest
