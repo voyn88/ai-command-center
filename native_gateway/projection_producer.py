@@ -248,6 +248,36 @@ def _map_dialogs(root: Path) -> list[dict]:
     return dialogs
 
 
+def _wave_goal(rich: list) -> dict | None:
+    """The calm 'nearest goal': the earliest unfinished wave's real progress.
+
+    Waves are the backlog's own ordering (protocol: earliest unfinished wave
+    first), so the goal card states exactly what the programme states —
+    nothing invented. Records whose wave is not 'Wave <n>' (e.g. section
+    codes) are out of scope for the card.
+    """
+    import re as _re
+
+    by_wave: dict[int, list] = {}
+    for record in rich:
+        match = _re.fullmatch(r"Wave (\d+)", record.wave.strip())
+        if match:
+            by_wave.setdefault(int(match.group(1)), []).append(record)
+    for number in sorted(by_wave):
+        records = by_wave[number]
+        done = sum(1 for r in records if r.status == "DONE")
+        if done >= len(records):
+            continue
+        return {
+            "title": f"Волна {number}",
+            "done": done,
+            "total": len(records),
+            "in_progress": sum(1 for r in records if r.status == "IN_PROGRESS"),
+            "review": sum(1 for r in records if r.status == "READY_TO_REVIEW"),
+        }
+    return None
+
+
 def build_projection(
     root: Path,
     *,
@@ -259,6 +289,7 @@ def build_projection(
     now = datetime.now(UTC)
     degraded = False
 
+    rich_records = backlog_client.load_rich_records(backlog_path)
     tasks = tasks_repository.load_tasks(root) + _backlog_tasks(
         backlog_path, titles_path
     )
@@ -280,6 +311,7 @@ def build_projection(
         "lanes": _map_lanes(runs, now),
         "events": _map_events(runs),
         "dialogs": _map_dialogs(root),
+        "goal": _wave_goal(rich_records),
         "decisions": [],
     }
     digest = hashlib.sha256(
