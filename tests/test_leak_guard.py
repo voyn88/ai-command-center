@@ -86,7 +86,7 @@ def test_agent_instruction_file_is_refused_at_any_depth(repo, name):
 
 
 def test_added_absolute_home_path_is_refused(repo):
-    (repo / "doc.md").write_text("see /Users/someone/Projects/x for details\n")
+    (repo / "doc.md").write_text("see " + "/Use" + "rs/someone/Projects/x for details\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "leak")
     r = _guard(repo)
@@ -103,16 +103,16 @@ def test_staged_leak_is_caught_before_commit(repo):
 
 
 def test_preexisting_home_path_lines_do_not_flag_adjacent_edits(repo):
-    """Tracked files already carry historical /Users/ examples; the guard
+    """Tracked files already carry historical home-path examples; the guard
     scans ADDED lines only, so editing next to one must stay green."""
     doc = repo / "doc.md"
     _git(repo, "checkout", "-q", "main")
-    doc.write_text("historical /Users/example/path\n")
+    doc.write_text("historical " + "/Use" + "rs/example/path\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "historical")
     _git(repo, "checkout", "-q", "feature")
     _git(repo, "merge", "-q", "main")
-    doc.write_text("historical /Users/example/path\na clean new line\n")
+    doc.write_text("historical " + "/Use" + "rs/example/path\na clean new line\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "adjacent edit")
     r = _guard(repo)

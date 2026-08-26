@@ -19,9 +19,11 @@
 #      VOYN itself appears legitimately in thousands of task ids in this
 #      repository, so a global name scan cannot work -- the instruction FILE
 #      is the reproducible leak vector, and it is blocked by name.)
-#   2. No ADDED line containing an absolute home path (/Users/... or
-#      /home/voynadmin). Added lines only: tracked files already contain
-#      historical, legitimate /Users/ examples (ROADMAP_STATE.md, UI panel
+#   2. No ADDED line containing an absolute macOS or worker home path.
+#      (The literals are never written out in this file -- see HOME_PAT --
+#      so the guard can scan itself.) Added lines only: tracked files
+#      already contain historical, legitimate home-path examples (
+#      ROADMAP_STATE.md, UI panel
 #      docstrings), and flagging context lines would make every adjacent
 #      edit a false positive. This guard's own file is excluded -- it must
 #      name the patterns it hunts.
@@ -42,10 +44,16 @@ if [ "${VOYN_LEAK_GUARD:-on}" = "off" ]; then
 fi
 
 BASE="${VOYN_LEAK_GUARD_BASE:-origin/main}"
-# The guard and its test must name the very patterns they hunt; nothing else
-# is exempt.
-SELF="scripts/ci/prepush/leak_guard.sh"
-SELF_TEST="tests/test_leak_guard.py"
+# NOTHING is exempt from the added-line scan (verification finding on
+# f4616fd: whole-file exclusions for the guard and its test let a private
+# home path ride in through exactly those files). This file and the test
+# therefore never contain the hunted literals -- the pattern is assembled
+# from halves at runtime, so the guard can scan its own diffs too.
+HOME_PAT="/Use""rs/|/home/voyn""admin"
+if [ -z "$HOME_PAT" ]; then
+    say "refused: internal error (empty scan pattern)"
+    exit 1
+fi
 
 # Fail CLOSED on an unresolvable base (verification finding 1 on f24d081:
 # an empty merge_base silently skipped both committed-range scans and a
@@ -79,14 +87,12 @@ while IFS= read -r path; do
 done < <(range_files | sort -u)
 
 added_lines() {
-    git diff --unified=0 "$merge_base"...HEAD -- . \
-        ":(exclude)$SELF" ":(exclude)$SELF_TEST"
-    git diff --cached --unified=0 -- . \
-        ":(exclude)$SELF" ":(exclude)$SELF_TEST"
+    git diff --unified=0 "$merge_base"...HEAD -- .
+    git diff --cached --unified=0 -- .
 }
 
 hits="$(added_lines | grep -nE '^\+' | grep -vE '^\+\+\+' \
-    | grep -E '/Users/|/home/voynadmin' | head -5 || true)"
+    | grep -E "$HOME_PAT" | head -5 || true)"
 if [ -n "$hits" ]; then
     say "refused: added line(s) carry absolute home paths:"
     printf '%s\n' "$hits"
