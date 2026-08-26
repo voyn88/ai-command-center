@@ -1,4 +1,12 @@
 # Versioned two-lane worker template for VOYN pre-production.
+#
+# Installed only to /etc/systemd/system (see deploy/install-agent-principal-
+# isolation.sh) and run by the system manager. Same rationale as
+# aicc-worker.service's header: a user unit shares the invoking account's UID
+# and grants no privilege transition, so it cannot carry the sandbox
+# directives below as a real boundary. `WantedBy=multi-user.target` is the
+# mechanical proof this is a system unit, pinned by
+# tests/ops/test_worker_unit_is_a_system_unit.py.
 [Unit]
 Description=AICC preprod worker lane %i
 After=network-online.target voyn-aicc-pgtunnel.service

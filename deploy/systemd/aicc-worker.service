@@ -4,6 +4,17 @@
 #   cp deploy/systemd/aicc-worker.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now aicc-worker
 #
+# This MUST land under /etc/systemd/system and run under the system manager
+# (`systemctl`, never `systemctl --user`). A user unit is not this boundary:
+# it runs under the invoking account's own systemd instance at that same
+# UID, so NoNewPrivileges/ProtectSystem/ProtectHome/PrivateDevices etc. below
+# cross no privilege transition -- the operator who could edit or bypass the
+# unit already owns everything those directives would otherwise withhold.
+# `WantedBy=multi-user.target` in the Install stanza below (a target that
+# exists only in the system manager -- the user manager's own boot target
+# has a different name) is the mechanical proof this is a system unit;
+# pinned by tests/ops/test_worker_unit_is_a_system_unit.py.
+#
 # The unit assumes the host is already enrolled: /etc/aicc/worker.env carries
 # AICC_PG_USER=<its aicc_w_* role> and the SCRAM secret produced at ticket
 # redemption. Enrolment is an operator act — a worker cannot redeem its own
