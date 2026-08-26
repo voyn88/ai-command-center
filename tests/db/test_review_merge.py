@@ -2485,23 +2485,24 @@ def test_multiple_pr_rows_per_task_are_all_reached(rig, monkeypatch):  # noqa: F
             ("VOYN-W0-MPR", "https://github.com/x/y/pull/601"),
         )
         c.commit()
-    monkeypatch.setattr(
-        review_merge, "_gh",
-        lambda argv, repo: sp.CompletedProcess(argv, 1, "", "fails -> pure skip"),
-    )
-    seen_urls: set[str] = set()
+    examined: list[str] = []
+
+    def failing_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        if url:
+            examined.append(url)
+        return sp.CompletedProcess(argv, 1, "", "fails -> pure skip")
+
+    monkeypatch.setattr(review_merge, "_gh", failing_gh)
     for _tick in range(3):
-        report = publish_review_verdicts(
+        publish_review_verdicts(
             app_factory, "/tmp", ReviewConfig(max_per_tick=1, scan_cap=1)
         )
-        # pr_view_failed skips carry no URL; track via the scan itself.
-        seen_urls |= {r[1] for r in report.skipped if isinstance(r[1], str)}
-    # Both evidence rows were examined (each produced its own skip)
-    with app_factory() as c, c.cursor() as cur:
-        cur.execute("SELECT position FROM backlog_scan_cursor WHERE name=%s",
-                    ("scan:publish_review_verdicts",))
-        row = cur.fetchone()
-    assert row is not None and "pull/60" in row[0].replace("\x1f", " ")
+    # BOTH evidence rows were examined -- exact URLs, not just the shared
+    # task (review of a5b2a0d: the earlier assertion could not tell /600
+    # from /601 and a task-id-only cursor would have passed).
+    assert {"https://github.com/x/y/pull/600",
+            "https://github.com/x/y/pull/601"} <= set(examined)
 
 
 def test_cursor_advances_only_to_the_processed_boundary(rig, monkeypatch):  # noqa: F811, E501

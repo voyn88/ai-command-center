@@ -43,3 +43,9 @@ BEGIN
     RETURN true;
 END
 $$;
+
+-- PostgreSQL grants PUBLIC execute on new functions by default; the
+-- bootstrap's blanket revoke predates this migration, so revoke here and
+-- let roles.py grant the app role explicitly (review of a5b2a0d).
+REVOKE ALL ON FUNCTION backlog_scan_claim(text, text, text) FROM PUBLIC;
+REVOKE ALL ON backlog_scan_cursor FROM PUBLIC;
