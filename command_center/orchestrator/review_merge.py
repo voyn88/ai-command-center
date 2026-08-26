@@ -1350,6 +1350,19 @@ def _verified_rejection_outcome(
             f"{findings}\n\n--- Verification confirmed a blocking finding "
             f"(key {key}) ---\n{verification_text}"
         )
+    # Distinguish a FRESH enqueue from an already-pending verification: the
+    # queue's idempotent enqueue returns the same id either way, so ask the
+    # store directly. The caller counts only the fresh enqueue as a tick
+    # action -- an already-pending WAIT must cost nothing, or pending tasks
+    # recreate exactly the window starvation this change removes (review of
+    # fd46584, CONFIRMED).
+    pending = _rows(
+        factory,
+        "SELECT 1 FROM work_item WHERE task_id = %s AND idempotency_key = %s",
+        (task_id, key),
+    )
+    if pending:
+        return "WAIT", "verification_pending"
     if enqueue is None:
         # A legacy caller that cannot enqueue can still consume an existing
         # verdict (above) but cannot start a verification -- pre-AUTO-ACCEPT
@@ -1381,7 +1394,7 @@ def _verified_rejection_outcome(
         },
     }
     enqueue(cfg.queue, key, payload, task_id, len(cascade))
-    return "WAIT", "verification_pending"
+    return "WAIT", "verification_enqueued"
 
 
 _AUDIT_SECTION_LIMIT = 28_000  # chars per section; GitHub comment cap is 65536
@@ -1547,8 +1560,9 @@ def publish_review_verdicts(
                 factory, enqueue, task_id, pr_url, snapshot, text, cfg
             )
             if outcome == "WAIT":
-                if detail == "verification_pending":
-                    # An enqueue may have just happened -- a queue mutation.
+                if detail == "verification_enqueued":
+                    # A fresh queue mutation; an already-pending verification
+                    # deliberately costs nothing (review of fd46584).
                     actions += 1
                 report.skipped.append((task_id, detail))
                 continue

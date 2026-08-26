@@ -1206,7 +1206,7 @@ def test_chunk_reject_enqueues_verification_and_waits(rig, monkeypatch):  # noqa
         app_factory, "/tmp",
         enqueue=lambda q, k, pl, tid, mx: enq.append((q, k, pl, tid, mx)),
     )
-    assert ("VOYN-W0-ADJ-C", "verification_pending") in report.skipped
+    assert ("VOYN-W0-ADJ-C", "verification_enqueued") in report.skipped
     assert not report.remediated
     assert not posted
     assert len(enq) == 1
@@ -1282,7 +1282,7 @@ def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_
         app_factory, "/tmp",
         enqueue=lambda q, k, pl, tid, mx: enq.append((q, k, pl, tid, mx)),
     )
-    assert ("VOYN-W0-ADJ-H", "verification_pending") in report.skipped
+    assert ("VOYN-W0-ADJ-H", "verification_enqueued") in report.skipped
     assert not report.remediated and not posted
     assert len(enq) == 1
     _q, vkey, payload, _tid, _mx = enq[0]
@@ -2024,3 +2024,73 @@ def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):  # noqa: F811
     assert len(posted) == 1
     publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
     assert len(posted) == 2
+
+
+def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa: F811
+    """Review of fd46584 (CONFIRMED): an already-pending verification WAIT
+    must not consume the action cap -- otherwise pending tasks recreate the
+    starvation. Two tasks with verifications already IN the queue, cap 1: a
+    later accepted task still gets its marker in the same tick."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    vstore = WorkQueueStore(app_factory)
+    heads = {}
+    # Two tasks headed for pending verifications, one accepted task last by
+    # updated_at. ALL reviews complete first -- `_complete_review` claims the
+    # oldest ready queue item, so the verification rows must enter the queue
+    # only after every review item has been claimed and completed.
+    for i, n in enumerate((80, 81)):
+        head = f"{i}e" * 10 + "f" * 20
+        pr_url = f"https://github.com/x/y/pull/{n}"
+        heads[pr_url] = head
+        _ready(store, app_factory, f"VOYN-W0-PN{i}", pr_url)
+        _complete_review(
+            app_factory, worker, f"VOYN-W0-PN{i}", pr_url, head,
+            f"a claim.\nVERDICT: REJECT\nHEAD_SHA: {head}\n",
+        )
+    head = "9d" * 20
+    pr_url = "https://github.com/x/y/pull/82"
+    heads[pr_url] = head
+    _ready(store, app_factory, "VOYN-W0-PNOK", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-PNOK", pr_url, head,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+    for i, n in enumerate((80, 81)):
+        h = f"{i}e" * 10 + "f" * 20
+        u = f"https://github.com/x/y/pull/{n}"
+        vkey = review_merge._verification_key(
+            f"VOYN-W0-PN{i}", u, _snapshot(h),
+            f"a claim.\nVERDICT: REJECT\nHEAD_SHA: {h}\n",
+        )
+        vstore.enqueue("execution", idempotency_key=vkey,
+                       payload={"kind": "agent_run"}, task_id=f"VOYN-W0-PN{i}")
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    enq = []
+    report = publish_review_verdicts(
+        app_factory, "/tmp", ReviewConfig(max_per_tick=1),
+        enqueue=lambda q, k, pl, tid, mx: enq.append(k),
+    )
+    assert posted == [pr_url], (report.skipped, report.remediated)
+    assert report.remediated == []
+    assert enq == []  # nothing re-enqueued for the pending two
+    pending = [r for r in report.skipped if r[1] == "verification_pending"]
+    assert len(pending) == 2
