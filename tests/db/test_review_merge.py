@@ -1011,7 +1011,7 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
 
 # --- VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: finding-verification adjudication -----
 
-def _force_chunk_reject(monkeypatch, verification):
+def _force_chunk_reject(monkeypatch, verification, findings="isolated-chunk finding text"):
     """Drive publish_review_verdicts down the multi-chunk REJECT path and make
     the finding-verification lookup return `verification` (a result text) or
     None (no verification run has completed yet)."""
@@ -1021,7 +1021,7 @@ def _force_chunk_reject(monkeypatch, verification):
     )
     monkeypatch.setattr(
         review_merge, "_aggregate_chunk_verdict",
-        lambda rows, snapshot, prefix: ("REJECT", "isolated-chunk finding text"),
+        lambda rows, snapshot, prefix: ("REJECT", findings),
     )
 
     def fake_latest(factory, task_id, key):
@@ -1330,6 +1330,87 @@ def test_a_malformed_accept_never_auto_accepts(rig, monkeypatch):  # noqa: F811
         "FINDING 2: CONFIRMED_MINOR -- naming only.\n"
         "SECURITY_CLAIMS: DISPROVEN"
     )
+
+
+# --- VOYN-OPS-AICC-VERIFY-DISPOSITION-FLOOR: disposition-count floor and ---
+# --- sequential FINDING numbering ------------------------------------------
+
+def test_disposition_floor_requires_one_per_rejecting_chunk_section():
+    """`_aggregate_chunk_verdict` builds the findings text handed to
+    verification as one `Chunk i/N:` section per REJECTing chunk --
+    orchestrator-known, not the verifier's self-report. A verifier that only
+    classifies chunk 1 of a 2-chunk rejection has silently dropped chunk 2's
+    findings and must not be honored as a well-formed ACCEPT."""
+    ok = review_merge._verification_accept_is_well_formed
+    two_chunk_findings = "Chunk 1/2:\nfoo bug\n\nChunk 2/2:\nbar bug"
+    one_disposition = "FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE"
+    two_dispositions = (
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "FINDING 2: ARTIFACT -- cited.\n"
+        "SECURITY_CLAIMS: NONE"
+    )
+    assert not ok(one_disposition, two_chunk_findings)
+    assert ok(two_dispositions, two_chunk_findings)
+    # A single-chunk (or non-aggregated) REJECT has no `Chunk i/N:` section
+    # at all and still floors at 1 -- unchanged from verify-v2.
+    assert ok(one_disposition, "free-text findings, no chunk headers here")
+    assert ok(one_disposition)  # default findings="" also floors at 1
+
+
+def test_disposition_numbering_must_be_sequential_without_gaps():
+    """FINDING numbers must cover exactly 1..K -- a gap or a duplicate means
+    the verifier skipped or double-counted a finding rather than classifying
+    each one, which the count-floor check alone would not catch."""
+    ok = review_merge._verification_accept_is_well_formed
+    assert not ok(  # gap: no FINDING 2
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "FINDING 3: ARTIFACT -- cited.\n"
+        "SECURITY_CLAIMS: NONE"
+    )
+    assert not ok(  # duplicate numbering, no FINDING 2
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "SECURITY_CLAIMS: NONE"
+    )
+    assert ok(
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "FINDING 2: CONFIRMED_MINOR -- naming only.\n"
+        "SECURITY_CLAIMS: DISPROVEN"
+    )
+
+
+def test_partial_chunk_verification_coverage_remediates(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-OPS-AICC-VERIFY-DISPOSITION-FLOOR's core acceptance: two chunks
+    REJECT, but the verifier's ACCEPT only classifies one of them -- one
+    disposition against a two-section floor -- so the override is refused
+    and the task remediates on the original (both-chunk) findings, exactly
+    the malformed-output fail-closed leg."""
+    app_factory, store, _ = rig
+    head = "6" * 40
+    pr_url = "https://github.com/x/y/pull/30"
+    _ready(store, app_factory, "VOYN-W0-ADJ-K", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    two_chunk_findings = "Chunk 1/2:\nfoo bug\n\nChunk 2/2:\nbar bug"
+    _force_chunk_reject(
+        monkeypatch,
+        f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        findings=two_chunk_findings,
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (posted.append(a) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-ADJ-K", "VOYN-W0-ADJ-K-REM") in report.remediated
+    assert not posted
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT body FROM backlog_task WHERE task_id=%s", ("VOYN-W0-ADJ-K-REM",))
+        body = cur.fetchone()[0]
+    assert "Chunk 1/2" in body and "Chunk 2/2" in body  # both chunks, not just the verified one
 
 
 def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
