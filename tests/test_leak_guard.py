@@ -126,3 +126,70 @@ def test_bypass_is_printed_never_silent(repo):
     r = _guard(repo, {"VOYN_LEAK_GUARD": "off"})
     assert r.returncode == 0
     assert "bypassed" in r.stdout
+
+
+def test_unresolvable_base_fails_closed(repo):
+    """Verification finding 1 on f24d081: an unresolvable base used to skip
+    the committed-range scans silently — a committed leak reached 'pass'.
+    A guard that cannot see the range must refuse."""
+    (repo / "CLAUDE.md").write_text("instructions\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "leak")
+    r = _guard(repo, {"VOYN_LEAK_GUARD_BASE": "no-such-ref"})
+    assert r.returncode == 1
+    assert "cannot resolve base" in r.stdout
+
+
+def test_deleting_a_leaked_instruction_file_is_allowed(repo):
+    """Verification finding 2 on f24d081: deletion (the remediation this
+    guard exists to force) must not be refused by the by-name check."""
+    _git(repo, "checkout", "-q", "main")
+    (repo / "CLAUDE.md").write_text("previously leaked\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "historical leak")
+    _git(repo, "checkout", "-q", "feature")
+    _git(repo, "merge", "-q", "main")
+    _git(repo, "rm", "-q", "CLAUDE.md")
+    _git(repo, "commit", "-m", "remediate: remove leaked file")
+    r = _guard(repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_renaming_to_an_instruction_file_is_refused(repo):
+    (repo / "notes.md").write_text("instructions\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "notes")
+    _git(repo, "mv", "notes.md", "CLAUDE.md")
+    _git(repo, "commit", "-m", "rename to instruction file")
+    r = _guard(repo)
+    assert r.returncode == 1
+    assert "agent-instruction file" in r.stdout
+
+
+def test_trusted_copy_scans_a_target_repo_passed_as_argument(repo, tmp_path):
+    """Finding 3 on f24d081 (publish-side wiring): the trusted script copy
+    accepts the repository to scan as $1 — the publish gate executes the
+    WORKER's copy against the candidate tree, never the candidate's copy."""
+    import subprocess
+
+    target = tmp_path / "candidate"
+    subprocess.run(["git", "init", "-b", "main", str(target)],
+                   check=True, capture_output=True)
+    _git(target, "config", "user.email", "t@t")
+    _git(target, "config", "user.name", "t")
+    (target / "base.txt").write_text("x\n")
+    _git(target, "add", ".")
+    _git(target, "commit", "-m", "base")
+    _git(target, "checkout", "-q", "-b", "feature")
+    (target / "CLAUDE.md").write_text("leak\n")
+    _git(target, "add", ".")
+    _git(target, "commit", "-m", "leak")
+
+    import os
+    env = dict(os.environ, VOYN_LEAK_GUARD_BASE="main")
+    r = subprocess.run(
+        ["bash", str(SCRIPT), str(target)],
+        capture_output=True, text=True, check=False, env=env,
+    )
+    assert r.returncode == 1
+    assert "agent-instruction file 'CLAUDE.md'" in r.stdout

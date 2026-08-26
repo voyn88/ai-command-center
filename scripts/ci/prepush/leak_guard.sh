@@ -29,7 +29,10 @@
 # VOYN_LEAK_GUARD=off bypasses (printed, never silent), mirroring
 # quality_band.sh. VOYN_LEAK_GUARD_BASE overrides the diff base.
 set -uo pipefail
-cd "$(dirname "$0")/../../.."
+# $1 (optional): the repository to scan. Defaults to this script's own repo
+# for interactive/preflight use; publish_run passes the candidate worktree
+# while executing THIS trusted copy, never the candidate's.
+cd "${1:-$(dirname "$0")/../../..}"
 
 say() { echo "LEAK_GUARD: $*"; }
 
@@ -44,12 +47,23 @@ BASE="${VOYN_LEAK_GUARD_BASE:-origin/main}"
 SELF="scripts/ci/prepush/leak_guard.sh"
 SELF_TEST="tests/test_leak_guard.py"
 
+# Fail CLOSED on an unresolvable base (verification finding 1 on f24d081:
+# an empty merge_base silently skipped both committed-range scans and a
+# committed leak reached "pass"). A guard that cannot see the range must
+# refuse; VOYN_LEAK_GUARD=off stays the printed escape hatch.
 merge_base="$(git merge-base "$BASE" HEAD 2>/dev/null)" || merge_base=""
+if [ -z "$merge_base" ]; then
+    say "refused: cannot resolve base '$BASE' (set VOYN_LEAK_GUARD_BASE, or VOYN_LEAK_GUARD=off to bypass)"
+    exit 1
+fi
+
+# --diff-filter=d everywhere: deletions (and the rename-FROM side) must not
+# be refused -- deleting a leaked CLAUDE.md is exactly the remediation this
+# guard exists to force (verification finding 2 on f24d081). A rename-TO
+# still shows under the new name and is refused.
 range_files() {
-    if [ -n "$merge_base" ]; then
-        git diff --name-only "$merge_base"...HEAD -- .
-    fi
-    git diff --cached --name-only -- .
+    git diff --name-only --diff-filter=d "$merge_base"...HEAD -- .
+    git diff --cached --name-only --diff-filter=d -- .
 }
 
 fail=0
@@ -65,10 +79,8 @@ while IFS= read -r path; do
 done < <(range_files | sort -u)
 
 added_lines() {
-    if [ -n "$merge_base" ]; then
-        git diff --unified=0 "$merge_base"...HEAD -- . \
-            ":(exclude)$SELF" ":(exclude)$SELF_TEST"
-    fi
+    git diff --unified=0 "$merge_base"...HEAD -- . \
+        ":(exclude)$SELF" ":(exclude)$SELF_TEST"
     git diff --cached --unified=0 -- . \
         ":(exclude)$SELF" ":(exclude)$SELF_TEST"
 }
