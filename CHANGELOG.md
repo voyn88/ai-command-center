@@ -8,6 +8,19 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — WAL archiving and point-in-time recovery (`VOYN-W0-AICC-SRV-08`)
+- `docker-compose.server.yml`: continuous WAL archiving to a second named
+  volume (`aicc-wal-archive`), with a one-shot init container to fix its
+  ownership since Docker creates named volumes owned by root.
+- `scripts/aicc_pg_base_backup.sh`: physical base backup via `pg_basebackup`,
+  the base half of PITR (paired with the existing nightly `pg_dump`, which
+  stays the fast path back to "last night").
+- `scripts/aicc_pg_pitr_restore.sh`: replays archived WAL on top of a base
+  backup, up to a chosen `--target-time` or the end of the archive, into a
+  side-by-side `--target-dir` — never the live database.
+- `tests/db/test_pitr_script_guards.py`: guard-rail coverage for both scripts,
+  no server required.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

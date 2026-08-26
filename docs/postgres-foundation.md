@@ -208,6 +208,43 @@ The client must be at least as new as the server; `pg_dump` refuses to dump a
 newer server outright. CI installs `postgresql-client-17` to match the pinned
 server image.
 
+## WAL archiving and point-in-time recovery
+
+The nightly `pg_dump` above only ever gets you back to the moment it ran. WAL
+archiving (`docker-compose.server.yml`) closes that gap: `archive_command`
+continuously copies completed WAL segments into a second named volume
+(`aicc-wal-archive`), and `archive_timeout=300` guarantees a segment ships at
+least every 5 minutes even if the database is idle. Replaying that archive on
+top of a physical base backup can recover to any point in time after the
+backup, not just to a nightly boundary.
+
+```bash
+# The base half — a byte-for-byte copy of the cluster, taken with
+# pg_basebackup. Needs AICC_PG_SUPERUSER (or another REPLICATION role); none
+# of aicc_migrator/aicc_app/aicc_worker qualify.
+AICC_PG_HOST=... AICC_PG_USER=postgres AICC_PG_PASSWORD=... \
+  scripts/aicc_pg_base_backup.sh --out-dir /var/backups/aicc-basebackups --verify --keep 4
+
+# The drill. Restores side by side into --target-dir, replays the archive, and
+# promotes — it never touches the live database.
+scripts/aicc_pg_pitr_restore.sh \
+  --base-backup /var/backups/aicc-basebackups/aicc-basebackup-aicc-20260826T020000Z \
+  --wal-archive /var/lib/postgresql/wal-archive \
+  --target-dir /var/tmp/aicc-pitr-drill \
+  --port 55432 \
+  --target-time "2026-08-26T14:32:07Z"
+```
+
+Do not prune a base backup out of `--keep` while WAL older than it is still
+needed to restore it — the archive has no retention of its own, and pruning it
+is an operator decision, not something either script does automatically.
+
+`tests/db/test_pitr_script_guards.py` covers both scripts' guard rails
+(non-numeric `--keep`/`--port`, a target that is not actually a base backup, an
+empty or missing WAL archive, refusing to restore into a non-empty directory)
+without a server, the same way `test_backup_script_guards.py` does for the
+logical backup path above.
+
 ## Running the tests
 
 `tests/db` skips itself unless a server is provided:

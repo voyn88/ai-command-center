@@ -17,8 +17,27 @@
 #   docker compose -f docker-compose.server.yml up -d
 #   AICC_PG_USER=<superuser>   ... python -m command_center.db bootstrap
 #   AICC_PG_USER=aicc_migrator ... python -m command_center.db upgrade
+#
+# WAL archiving (VOYN-W0-AICC-SRV-08) is on by default so that
+# `scripts/aicc_pg_pitr_restore.sh` can recover to any point after a base
+# backup, not just to the moment of the last nightly `pg_dump`. See
+# docs/postgres-foundation.md.
 
 services:
+  # A named volume Docker creates is owned by root, and the postgres image's
+  # entrypoint only chowns $PGDATA — not a second volume mounted alongside it.
+  # Without this, `archive_command` fails on every WAL segment because the
+  # `postgres` process inside the container cannot write into
+  # /var/lib/postgresql/wal-archive. One-shot, same pinned image (no extra
+  # pull), and `postgres` only starts once this exits successfully.
+  wal-archive-init:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    container_name: aicc-wal-archive-init
+    user: root
+    command: ["sh", "-c", "mkdir -p /var/lib/postgresql/wal-archive && chown -R postgres:postgres /var/lib/postgresql/wal-archive"]
+    volumes:
+      - aicc-wal-archive:/var/lib/postgresql/wal-archive
+
   postgres:
     # Pinned by digest, not by tag: tags are mutable, and the deploy must be
     # reproducible from a commit SHA. Resolved with
@@ -26,6 +45,9 @@ services:
     image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
     container_name: aicc-postgres
     restart: unless-stopped
+    depends_on:
+      wal-archive-init:
+        condition: service_completed_successfully
     environment:
       POSTGRES_DB: ${AICC_PG_DB:?set AICC_PG_DB}
       POSTGRES_USER: ${AICC_PG_SUPERUSER:?set AICC_PG_SUPERUSER}
@@ -46,10 +68,26 @@ services:
       - log_statement=ddl
       - -c
       - log_min_duration_statement=1000
+      - -c
+      - archive_mode=on
+      # Alpine's default shell is busybox `sh`, not bash, so this has to be a
+      # POSIX-sh one-liner rather than the bash idiom used elsewhere in this
+      # repo. `test ! -f` refuses to clobber a segment archived by a previous
+      # attempt (postgres retries a failed archive_command indefinitely);
+      # writing to `.tmp` then `mv`-ing keeps a crash mid-copy from leaving a
+      # truncated file that looks like a complete, restorable segment — `mv`
+      # within the same volume is a rename, not a copy, so it is atomic.
+      - -c
+      - "archive_command=test ! -f /var/lib/postgresql/wal-archive/%f && cp %p /var/lib/postgresql/wal-archive/%f.tmp && mv /var/lib/postgresql/wal-archive/%f.tmp /var/lib/postgresql/wal-archive/%f"
+      # Bounds the RPO of continuous archiving even during a quiet period: with
+      # no writes, a segment does not fill and would otherwise never ship.
+      - -c
+      - archive_timeout=300
     ports:
       - "127.0.0.1:${AICC_PG_PORT:-5432}:5432"
     volumes:
       - aicc-pgdata:/var/lib/postgresql/data
+      - aicc-wal-archive:/var/lib/postgresql/wal-archive
     healthcheck:
       test:
         ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q"]
@@ -66,3 +104,5 @@ services:
 volumes:
   aicc-pgdata:
     name: aicc-pgdata
+  aicc-wal-archive:
+    name: aicc-wal-archive
