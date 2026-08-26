@@ -57,11 +57,30 @@ permissions:
 
 jobs:
   quality-gates:
-    name: Quality gates (whitespace · Ruff · compile · pytest)
+    name: Linux quality shard ${{ matrix.shard }} of 4
     runs-on: ubuntu-latest
-    # A single coverage-enabled pass can take more than 18 minutes on a cold
-    # runner; keep headroom for runner variance while bounding genuine hangs.
-    timeout-minutes: 30
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - shard: 1
+            run_serial: true
+            run_e2e: false
+            run_typecheck: false
+          - shard: 2
+            run_serial: false
+            run_e2e: true
+            run_typecheck: false
+          - shard: 3
+            run_serial: false
+            run_e2e: false
+            run_typecheck: false
+          - shard: 4
+            run_serial: false
+            run_e2e: false
+            run_typecheck: true
     env:
       AICC_AIOS_SDK_WHEEL: ${{ github.workspace }}/.artifacts/aios_sdk-0.2.0-py3-none-any.whl
       # The second accepted AIOS distribution: universal PostgreSQL primitives
@@ -73,6 +92,7 @@ jobs:
       AICC_TEST_PG_ADMIN_DSN: >-
         host=127.0.0.1 port=5432 dbname=postgres user=postgres
         password=ci-only-throwaway-Kq7vRt2wXz
+      COVERAGE_FILE: .coverage.shard-${{ matrix.shard }}
     services:
       # Same image and digest as docker-compose.server.yml: the migration,
       # privilege and restore behaviour under test is version-dependent, so CI
@@ -99,36 +119,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect docs-only change scope
-        id: change-scope
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          CHANGED_FILES="$(git diff --name-only "$BASE_SHA...HEAD")"
-          if [[ -z "$CHANGED_FILES" ]]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if echo "$CHANGED_FILES" | grep -Eqv '(^README\.md$|^CHANGELOG\.md$|^docs/|\.md$)'; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Deliberate failure canary
-        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-linux')
+        if: github.event_name == 'pull_request' && matrix.shard == 1 && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-linux')
         run: exit 1
 
       - name: Set up Python
-        if: steps.change-scope.outputs.docs_only != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
@@ -142,7 +137,6 @@ jobs:
       # (even non-desktop ones) can run. Cheap (apt), only needed when the
       # desktop deps are installed.
       - name: Install Qt system libraries (for optional desktop shell)
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
@@ -152,7 +146,6 @@ jobs:
       # postgresql-client, and pg_dump refuses to dump a newer server outright,
       # so the matching major is installed from PGDG.
       - name: Install PostgreSQL 17 client (for the backup/restore drill)
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
@@ -164,13 +157,11 @@ jobs:
           sudo apt-get install -y postgresql-client-17
 
       - name: Install dependencies
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-linux.lock
 
       - name: Install exact accepted AIOS SDK and DB artifacts
-        if: steps.change-scope.outputs.docs_only != 'true'
         # `bash` is not cosmetic here and is pinned by
         # `test_a_refused_guard_actually_stops_the_step`: GitHub runs it as
         # `bash --noprofile --norc -eo pipefail`, so the guard's non-zero exit
@@ -189,49 +180,15 @@ jobs:
           python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
           pip install "$AICC_AIOS_DB_WHEEL"
 
-      # Narrows the REQUIRED pytest steps below to the impact-selected subset
-      # on pull_request only -- merge_group/push/workflow_dispatch always run
-      # the unabridged suite regardless of this step's output, unconditionally
-      # (the actual safety net: the exact set that lands on main is always
-      # fully verified there, whatever ran narrower on the PR that got it
-      # there). `scripts/ci/test_impact/select_tests.py` already backs the
-      # advisory `impact-fast-check` job below; this reuses the identical
-      # selector, not a second implementation, so the two can never disagree.
-      #
-      # Fail-open by construction, never fail-narrow: any outcome other than
-      # a clean `mode=subset` -- the selector erroring, a global/ambiguous
-      # file (conftest, lockfile, pyproject, CI config, or anything the
-      # selector cannot map) reporting `ALL`, or genuinely no first-party
-      # file changed -- runs the full suite. "Ambiguity widens the
-      # selection, never narrows it" (the selector's own module docstring)
-      # is the same rule this step defers to, not a second policy.
-      - name: Select impacted tests (pull_request only)
-        id: select
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      # Every shard independently collects the exact same nodeid universe.
+      # The signed manifest partitions it into mutually-exclusive core,
+      # serial and real-browser sets; a missing or empty partition fails before
+      # pytest can accidentally turn an empty argv into a full-suite run.
+      - name: Build exactly-once test manifest
         run: |
-          if [[ "$EVENT_NAME" != "pull_request" ]]; then
-            echo "mode=all" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if ! python scripts/ci/test_impact/select_tests.py \
-              --base "$BASE_SHA" --format pytest --output selected-tests.txt; then
-            echo "::warning::test-impact selector failed; running the full suite"
-            echo "mode=all" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if grep -qx "tests" selected-tests.txt; then
-            mode=all   # trigger-all: a global/unmapped file changed
-          elif [ -s selected-tests.txt ]; then
-            mode=subset
-          else
-            mode=all   # no first-party file changed -- widen, never skip
-          fi
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          echo "----- test-impact selection: mode=$mode -----"
-          cat selected-tests.txt || true
+          python scripts/ci/test_shards.py build \
+            --shards 4 \
+            --output test-manifest.json
 
       - name: Whitespace errors
         shell: bash
@@ -246,118 +203,54 @@ jobs:
           fi
 
       - name: Ruff
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: ruff check .
 
       - name: Compile validation
-        if: steps.change-scope.outputs.docs_only != 'true'
         run: python -m compileall -q command_center scripts tests app.py
 
-      # Required test gate, parallelised with pytest-xdist. `-n auto` fans the
-      # ~3k-test suite across every runner core (the suite isolates each worker
-      # via per-process temp data dirs in tests/conftest.py); `--dist loadscope`
-      # keeps all tests from one module on the same worker so module-scoped
-      # fixtures are built once, not per worker. This is the change that brings
-      # the gate from ~18 min down under 8 min.
-      #
-      # `-m "not serial"` excludes the handful of tests that must not run
-      # concurrently; those run in the "Pytest (serial tail)" step below, so the
-      # set of tests that run is unchanged — coverage is not reduced.
-      #
-      # Coverage is collected here (pytest-cov combines the xdist workers'
-      # data automatically). No fail-under threshold is configured, so test
-      # failures still gate the job while coverage stays informational.
-      # Durations keep future runtime regressions visible in the CI log.
-      # Coverage measurement is the single largest wall-time multiplier of
-      # this job (VOYN-W0-AICC-CI-FAST-01). On pull requests it decides
-      # nothing — failures gate, coverage informs — so PRs run bare and the
-      # full instrumented pass stays on main pushes and merge queues, where
-      # the number is actually consumed. The SET of tests is identical.
-      - name: Pytest + coverage (parallel)
-        if: steps.change-scope.outputs.docs_only != 'true'
+      - name: Pytest core shard
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            COV_ARGS=""
-          else
-            COV_ARGS="--cov=command_center --cov-report=term --cov-report=xml"
+          args=(
+            --pytest-arg=-q
+            --pytest-arg=-n
+            --pytest-arg=auto
+            --pytest-arg=--dist
+            --pytest-arg=loadscope
+            --pytest-arg=--durations=50
+          )
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            args+=(--pytest-arg=--cov=command_center --pytest-arg=--cov-report=)
           fi
-          # See the serial-tail step below for why this is not piped through
-          # `xargs`: it converts pytest's own exit codes into its 123, which
-          # hides the "no tests collected" 5 that a narrow subset can
-          # legitimately produce. Tolerated ONLY in subset mode -- in a full
-          # run, collecting nothing means collection itself is broken and
-          # must fail.
-          set +e
-          if [ "${{ steps.select.outputs.mode }}" = "subset" ]; then
-            echo "Impact-selected subset ($(wc -l < selected-tests.txt) file(s)):"
-            cat selected-tests.txt
-            set --
-            while IFS= read -r selected_test; do
-              [ -n "$selected_test" ] && set -- "$@" "$selected_test"
-            done < selected-tests.txt
-            pytest -q -m "not serial" -n auto --dist loadscope \
-              --durations=50 $COV_ARGS "$@"
-            rc=$?
-            if [ "$rc" -eq 5 ]; then
-              echo "Subset contains only serial-marked tests; the tail step runs them."
-              exit 0
-            fi
-            exit $rc
-          fi
-          pytest -q -m "not serial" -n auto --dist loadscope \
-            --durations=50 \
-            $COV_ARGS
-          exit $?
+          python scripts/ci/test_shards.py run \
+            --manifest test-manifest.json \
+            --partition core \
+            --shard "${{ matrix.shard }}" \
+            "${args[@]}"
 
-      # Small non-parallel tail: the `serial`-marked tests that rely on
-      # process-global or cross-process shared state. Runs in a single worker
-      # and appends to the coverage data from the parallel step. Tolerates
-      # pytest's exit code 5 ("no tests collected") so the step stays green
-      # while the serial set is empty.
       - name: Pytest (serial tail)
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: matrix.run_serial
+        shell: bash
         run: |
-          set +e
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            COV_ARGS=""
-          else
-            COV_ARGS="--cov=command_center --cov-append --cov-report=term"
+          args=(--pytest-arg=-q --pytest-arg=-p --pytest-arg=no:xdist)
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            args+=(
+              --pytest-arg=--cov=command_center
+              --pytest-arg=--cov-append
+              --pytest-arg=--cov-report=
+            )
           fi
-          # NOT piped through `xargs` (VOYN-W0-AICC-CI-SERIAL-TAIL-EXIT-5):
-          # this step's whole contract is that pytest's exit code 5 ("no
-          # tests collected") is a PASS -- an impact-selected subset very
-          # often contains no `serial`-marked test at all. `xargs` reports
-          # its own 123 for "the command exited non-zero", swallowing the 5
-          # before the check below could see it, so every such PR failed the
-          # required gate. Introduced by the impact-selection change (#363)
-          # and caught by the very next PR (#365).
-          #
-          # Reading the file into "$@" keeps each path a separate argv
-          # element without a shell-word-splitting hazard, and the `set --`
-          # form means an empty file yields no arguments at all, which the
-          # `mode == subset` guard already makes unreachable.
-          if [ "${{ steps.select.outputs.mode }}" = "subset" ]; then
-            set --
-            while IFS= read -r selected_test; do
-              [ -n "$selected_test" ] && set -- "$@" "$selected_test"
-            done < selected-tests.txt
-            pytest -q -m serial -p no:xdist $COV_ARGS "$@"
-          else
-            pytest -q -m serial -p no:xdist $COV_ARGS
-          fi
-          rc=$?
-          if [ "$rc" -eq 5 ]; then
-            echo "No serial-marked tests collected; nothing to run."
-            exit 0
-          fi
-          exit $rc
+          python scripts/ci/test_shards.py run \
+            --manifest test-manifest.json \
+            --partition serial \
+            "${args[@]}"
 
       # Informational, non-blocking signal. It never fails the job so the merge
       # gate stays focused on the deterministic checks above while surfacing
       # type-check progress for a codebase that is not yet fully typed.
 
       - name: Type check (informational)
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: matrix.run_typecheck
         continue-on-error: true
         run: mypy command_center || true
 
@@ -365,7 +258,7 @@ jobs:
       # does not re-download the browser on every run. Keyed on the pinned
       # playwright version in the lock so a driver bump invalidates the cache.
       - name: Cache Playwright browsers
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: matrix.run_e2e
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/ms-playwright
@@ -374,10 +267,108 @@ jobs:
       # Real-browser lifecycle projection is a release invariant, not an
       # informational signal: a failing user journey must fail this check.
       - name: Real-browser E2E
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: matrix.run_e2e
         run: |
           python -m playwright install chromium
-          pytest -q tests/test_e2e_status_projection.py
+          python scripts/ci/test_shards.py run \
+            --manifest test-manifest.json \
+            --partition e2e \
+            --pytest-arg=-q
+
+      - name: Publish exact test manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-manifest-${{ matrix.shard }}
+          path: test-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish main coverage shard
+        if: always() && github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: .coverage.shard-${{ matrix.shard }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
+  manifest-gate:
+    name: Linux manifest gate (exactly once)
+    if: always()
+    needs: [quality-gates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Download shard manifests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: test-manifest-*
+          path: manifests
+
+      - name: Verify four identical non-empty manifests
+        shell: bash
+        run: |
+          shopt -s nullglob
+          manifests=(manifests/*/test-manifest.json)
+          if [[ "${#manifests[@]}" -ne 4 ]]; then
+            echo "expected 4 manifests, found ${#manifests[@]}"
+            exit 1
+          fi
+          python scripts/ci/test_shards.py verify "${manifests[@]}"
+
+  coverage-gate:
+    name: Main coverage aggregation
+    if: always()
+    needs: [quality-gates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: PR and merge-group coverage policy
+        if: github.event_name != 'push'
+        run: echo "Coverage instrumentation runs only on the post-merge main push."
+
+      - name: Check out repository
+        if: github.event_name == 'push'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Python
+        if: github.event_name == 'push'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-ci-linux.lock
+
+      - name: Install locked coverage tooling
+        if: github.event_name == 'push'
+        run: pip install --require-hashes --no-deps -r requirements-ci-linux.lock
+
+      - name: Download coverage shards
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: coverage-shard-*
+          path: coverage
+
+      - name: Combine four coverage shards
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          shards=(coverage/*/.coverage.shard-*)
+          if [[ "${#shards[@]}" -ne 4 ]]; then
+            echo "expected 4 coverage shards, found ${#shards[@]}"
+            exit 1
+          fi
+          cp "${shards[@]}" .
+          coverage combine .coverage.shard-*
+          coverage report
+          coverage xml
 
   # Windows 11 x64 leg of the D1 desktop acceptance gate. Mirrors `quality-gates`
   # but on `windows-latest`, so the `pytest-qt` desktop suite and full repository
@@ -728,19 +719,41 @@ jobs:
           python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
           pip install "$AICC_AIOS_DB_WHEEL"
 
-      - name: Run impacted tests (parallel)
+      - name: Run impacted tests (parallel body + serial tail)
         if: steps.select.outputs.mode == 'subset'
         run: |
           echo "Running $(wc -l < selected-tests.txt) impacted test file(s):"
           cat selected-tests.txt
-          # NUL-delimit the paths and let xargs build the argv; `-r` guarantees
-          # pytest is never invoked with an empty argv (which would run the
-          # whole suite). `mode == subset` already implies a non-empty file.
-          tr '\n' '\0' < selected-tests.txt \
-            | xargs -0 -r pytest -q -m "not serial" -n auto --dist loadscope
+          # Mirror the mandatory quality gate's two phases. The selected set
+          # can contain only serial or only non-serial tests, so pytest's
+          # no-tests-collected exit code (5) is neutral for either phase; every
+          # other non-zero result remains a real failure. A bash array preserves
+          # paths and exit codes, unlike xargs (which maps child failures to 123).
+          selected=()
+          while IFS= read -r path || [ -n "$path" ]; do
+            [ -n "$path" ] && selected+=("$path")
+          done < selected-tests.txt
+          if [ "${#selected[@]}" -eq 0 ]; then
+            echo "selected-tests.txt is empty despite mode=subset; refusing the whole suite" >&2
+            exit 1
+          fi
+          run_phase() {
+            local rc
+            set +e
+            pytest "$@" "${selected[@]}"
+            rc=$?
+            set -e
+            if [ "$rc" -eq 5 ]; then
+              echo "No tests collected for this phase; nothing to run."
+              return 0
+            fi
+            return "$rc"
+          }
+          run_phase -q -m "not serial" -n auto --dist loadscope
+          run_phase -q -m serial -p no:xdist
 
   # Stable protected context. `always()` guarantees that the aggregator runs
-  # even when an upstream job fails, is cancelled, or is skipped; only four
+  # even when an upstream job fails, is cancelled, or is skipped; only every
   # explicit success results can pass it.
   final-gate:
     name: Final merge gate
@@ -749,6 +762,8 @@ jobs:
     timeout-minutes: 5
     needs:
       - quality-gates
+      - manifest-gate
+      - coverage-gate
       - windows-quality-gates
       - security-gates
       - build-gates
@@ -758,6 +773,14 @@ jobs:
         run: |
           if [[ "${{ needs.quality-gates.result }}" != "success" ]]; then
             echo "quality-gates did not succeed"
+            exit 1
+          fi
+          if [[ "${{ needs.manifest-gate.result }}" != "success" ]]; then
+            echo "manifest-gate did not succeed"
+            exit 1
+          fi
+          if [[ "${{ needs.coverage-gate.result }}" != "success" ]]; then
+            echo "coverage-gate did not succeed"
             exit 1
           fi
           if [[ "${{ needs.windows-quality-gates.result }}" != "success" ]]; then

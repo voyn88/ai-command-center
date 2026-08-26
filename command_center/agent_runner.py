@@ -95,11 +95,20 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from command_center import models, project_config, storage
+
+# Ruff targets the product's Python 3.14 desktop runtime and would otherwise
+# apply PEP 758's optional-parentheses rewrite.  Worker/control hosts and CI
+# still execute this module on Python 3.13, so named exception tuples keep the
+# source valid on every supported delivery runtime after ``ruff format``.
+_OS_SUBPROCESS_ERRORS = (OSError, subprocess.SubprocessError)
+_JSON_ERRORS = (json.JSONDecodeError, ValueError)
+_OS_VALUE_ERRORS = (OSError, ValueError)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = storage.resolve_data_dir(ROOT)
@@ -112,6 +121,74 @@ CLAUDE_BINARY = "claude"
 # the service already runs as that user), which systemd does not add for it.
 CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
 COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
+
+# The worker never elevates and keeps NoNewPrivileges=yes.  A root-owned,
+# socket-activated launcher is the sole bridge to the separate aicc-agent UID.
+# This path is deliberately not environment-overridable: worker.env contains
+# publisher authority and must not be able to replace the executable that
+# enforces the boundary around it.
+PRINCIPAL_ISOLATION_LAUNCHER = "/usr/libexec/aicc-agent-launcher"
+PRINCIPAL_ISOLATION_REQUIRED_ENV = "AICC_AGENT_PRINCIPAL_ISOLATION"
+PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
+PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
+    "claude": "/usr/local/bin/claude",
+    "codex": "/usr/local/bin/codex",
+    # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
+    # principal isolation because its login credential carries GitHub /
+    # repository authority -- staging it would hand untrusted model code the
+    # exact capability this boundary exists to withhold (review finding on
+    # b311666). The retry-loop hazard that once motivated listing it is
+    # closed in handlers instead: an unavailable executor falls through the
+    # cascade to the next link rather than respinning forever.
+}
+_PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
+
+# Codex 0.149.0 on worker-01 can exit zero after its vendor bwrap fails to
+# create loopback inside the network namespace. This exact, two-part signature
+# is an executor-host failure, not a task result.
+_CODEX_BWRAP_LOOPBACK_SIGNATURE = (
+    "bwrap: loopback:",
+    "failed rtm_newaddr: operation not permitted",
+)
+_COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
+    "ai credit usage limit",
+    "rate limit",
+    "not logged in",
+    "authentication required",
+    "authentication failed",
+    "unauthorized",
+    "forbidden",
+    "failed during startup",
+    "service unavailable",
+    "temporarily unavailable",
+    "network error",
+    "connection refused",
+    "too many requests",
+    "could not authenticate",
+    "getaddrinfo",
+    "econnreset",
+)
+_CODEX_PREFLIGHT_PROMPT = (
+    "This is a disposable sandbox capability probe. In the current repository, "
+    "create a file named aicc-codex-commit-probe.txt containing exactly "
+    "AICC_CODEX_COMMIT_OK followed by a newline. Run git add for that file and "
+    "git commit -m 'aicc codex commit probe'. Do not inspect any other path or "
+    "use a remote. After the commit succeeds, reply exactly: "
+    "AICC_CODEX_WORKSPACE_WRITE_OK"
+)
+_codex_workspace_write_preflight_lock = threading.Lock()
+_codex_workspace_write_preflight_result: tuple[bool, str] | None = None
+
+
+def disable_codex_workspace_write(detail: str = "") -> None:
+    """Open the worker-local Codex circuit after a runtime bwrap failure."""
+    global _codex_workspace_write_preflight_result
+    reason = "Codex workspace-write sandbox unavailable"
+    if detail:
+        reason = f"{reason}: {detail[-400:]}"
+    with _codex_workspace_write_preflight_lock:
+        _codex_workspace_write_preflight_result = (False, reason)
+
 
 # --------------------------------------------------------------------------
 # Execution profiles — named, testable single source of truth for "what can
@@ -136,6 +213,7 @@ PROFILE_READ_ONLY = "read_only"
 PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
 
 READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
+MODEL_ONLY_TASK_TYPES = {"independent_review"}
 MUTATING_TASK_TYPES = {"implementation", "remediation"}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
@@ -168,7 +246,11 @@ def profile_for_task_type(task_type: str) -> str:
     Only reviewed implementation/remediation types receive development
     capabilities. Unknown and future task types fail closed as read-only.
     """
-    return PROFILE_TRUSTED_DEVELOPMENT if task_type in MUTATING_TASK_TYPES else PROFILE_READ_ONLY
+    return (
+        PROFILE_TRUSTED_DEVELOPMENT
+        if task_type in MUTATING_TASK_TYPES
+        else PROFILE_READ_ONLY
+    )
 
 
 def is_untrusted_source(source: str | None) -> bool:
@@ -191,7 +273,9 @@ def is_untrusted_task(task: dict) -> bool:
     return bool(task.get("untrusted_import")) or is_untrusted_source(task.get("source"))
 
 
-def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevated: bool = False) -> str:
+def profile_for_task(
+    task_type: str, *, untrusted: bool = False, operator_elevated: bool = False
+) -> str:
     """Provenance-aware execution profile (audit D7).
 
     Read-only task types are always `PROFILE_READ_ONLY` (they have no dangerous
@@ -205,6 +289,7 @@ def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevat
     if untrusted and not operator_elevated:
         return PROFILE_READ_ONLY
     return PROFILE_TRUSTED_DEVELOPMENT
+
 
 # The *complete* available tool set for read-only task types, passed via `--tools`
 # (not `--allowedTools`/`--disallowedTools`). Per `claude --help`, `--tools` replaces
@@ -267,7 +352,19 @@ _VCS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "GITHUB_API_TOKEN",
         "GITHUB_ACCESS_TOKEN",
         "GIT_ASKPASS",
+        "GIT_SSH_COMMAND",
+        "SSH_AUTH_SOCK",
         "SSH_ASKPASS",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "AICC_WORKSPACE_AUTHORITY_KEY",
+        "AICC_PUBLISH_DEPLOY_KEY",
+        "AICC_PUBLISH_OWNER",
+        "PGPASSFILE",
+        "VOYN_LEASE_DSN",
+        "VOYN_LEASE_TOOL",
+        "VOYN_LEASE_SESSION",
+        "VOYN_LEASE_REPOSITORY",
     }
 )
 
@@ -276,7 +373,111 @@ def scrub_vcs_credentials(environment: dict[str, str]) -> dict[str, str]:
     """Return a copy of `environment` with Git/GitHub credential variables
     (`_VCS_CREDENTIAL_ENV_VARS`) removed, so a spawned agent cannot inherit
     ambient push/merge credentials. Never removes the agent's own model auth."""
-    return {key: value for key, value in environment.items() if key not in _VCS_CREDENTIAL_ENV_VARS}
+    scrubbed = {
+        key: value
+        for key, value in environment.items()
+        if key not in _VCS_CREDENTIAL_ENV_VARS
+        and not key.startswith(
+            ("GIT_CONFIG_", "AICC_PG_", "AICC_PUBLISH_", "VOYN_LEASE_")
+        )
+        and not key.endswith("_DSN")
+    }
+    # Ignore machine/user Git config and the host gh credential store for the
+    # model process.  The task clone carries only the local identity needed to
+    # commit; it has no remote until the guarded publisher restores one after
+    # the process exits.
+    scrubbed.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GH_CONFIG_DIR": "/nonexistent/aicc-agent-gh",
+            "SSH_ASKPASS_REQUIRE": "never",
+        }
+    )
+    return scrubbed
+
+
+def build_principal_isolation_manifest(
+    *,
+    repository_path: Path,
+    prompt: str,
+    task_type: str,
+    timeout_seconds: int,
+    executor: str,
+    model: str | None,
+) -> dict[str, object]:
+    """Build the only payload accepted by the privileged launcher.
+
+    No environment value crosses this interface.  In particular, publisher,
+    lease, workspace-HMAC and GitHub credentials remain in the aicc-worker
+    process.  The launcher loads only provider-specific model authentication
+    from root-owned allowlisted files after it has selected ``aicc-agent``.
+    """
+    if executor not in COMMAND_BUILDERS:
+        raise RunnerError(f"unknown executor {executor!r}")
+    return {
+        "version": 1,
+        "run_id": uuid.uuid4().hex,
+        "workspace": str(repository_path.resolve(strict=True)),
+        "executor": executor,
+        "profile": profile_for_task_type(task_type),
+        "prompt": prompt,
+        "model": model,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def principal_isolation_required() -> bool:
+    return os.environ.get(PRINCIPAL_ISOLATION_REQUIRED_ENV) == "required"
+
+
+def principal_workspace_root(
+    config_path: Path | None = None, *, require_root_owned: bool = True
+) -> Path:
+    """Read the one canonical task root shared with the privileged broker."""
+    path = config_path or PRINCIPAL_WORKSPACE_ROOTS_FILE
+    info = path.stat()
+    if require_root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
+        raise RunnerError("principal workspace-root config is not immutable root-owned")
+    roots = [
+        Path(line.strip())
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if len(roots) != 1 or not roots[0].is_absolute():
+        raise RunnerError(
+            "principal workspace-root config must contain one absolute root"
+        )
+    return roots[0].resolve(strict=True)
+
+
+def principal_executor_preflight(executor: str) -> tuple[bool, str]:
+    """Cheap worker-side check for the fixed root-owned provider path.
+
+    The privileged broker repeats ownership/mode validation.  This check only
+    avoids spending a queue attempt when deployment is visibly incomplete.
+    """
+    binary = PRINCIPAL_EXECUTOR_BINARIES.get(executor)
+    if binary is None:
+        return False, f"executor {executor!r} is not allowlisted"
+    if Path(binary).is_file() and os.access(binary, os.X_OK):
+        return True, ""
+    return False, f"isolated executor binary is unavailable: {binary}"
+
+
+def _principal_launcher_environment() -> dict[str, str]:
+    """Minimal environment for the unprivileged socket client.
+
+    The client needs no model or repository credential.  Keeping HOME, XDG,
+    SSH and Git variables out also prevents a future client regression from
+    turning the bridge into an ambient-secret transport.
+    """
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+    }
 
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -318,6 +519,178 @@ def claude_cli_preflight(binary: str | None = None) -> tuple[bool, str]:
     )
 
 
+def codex_workspace_write_preflight() -> tuple[bool, str]:
+    """Probe the exact workspace-write launch path once per worker.
+
+    Version/help probes cannot discover the worker's AppArmor/user-namespace
+    refusal: it happens only when Codex starts bwrap. The probe uses a
+    disposable git workspace, never a task repository. A negative result is
+    cached, so later tasks skip Codex instead of consuming another attempt.
+    """
+    global _codex_workspace_write_preflight_result
+    with _codex_workspace_write_preflight_lock:
+        if _codex_workspace_write_preflight_result is not None:
+            return _codex_workspace_write_preflight_result
+        if principal_isolation_required():
+            binary_available, binary_detail = principal_executor_preflight("codex")
+        else:
+            binary_available = shutil.which(CODEX_BINARY) is not None
+            binary_detail = f"Codex CLI {CODEX_BINARY!r} is not available on PATH"
+        if not binary_available:
+            _codex_workspace_write_preflight_result = (
+                False,
+                binary_detail,
+            )
+            return _codex_workspace_write_preflight_result
+
+        import tempfile
+
+        try:
+            probe_parent = (
+                str(principal_workspace_root())
+                if principal_isolation_required()
+                else None
+            )
+        except (OSError, RunnerError) as exc:
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"isolated workspace root is unavailable: {exc}",
+            )
+            return _codex_workspace_write_preflight_result
+        try:
+            temporary = tempfile.TemporaryDirectory(
+                prefix="aicc-codex-preflight-", dir=probe_parent
+            )
+        except OSError as exc:
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"cannot create isolated Codex probe workspace: {exc}",
+            )
+            return _codex_workspace_write_preflight_result
+        with temporary as raw_probe:
+            probe = Path(raw_probe)
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(probe)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if initialized.returncode != 0:
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"cannot create disposable Codex probe workspace: {initialized.stderr.strip()}",
+                )
+                return _codex_workspace_write_preflight_result
+            for key, value in (
+                ("user.name", "AICC Codex Preflight"),
+                ("user.email", "aicc-codex-preflight@localhost"),
+            ):
+                configured = subprocess.run(
+                    ["git", "config", "--local", key, value],
+                    cwd=probe,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if configured.returncode != 0:
+                    _codex_workspace_write_preflight_result = (
+                        False,
+                        f"cannot configure disposable Codex probe: {configured.stderr.strip()}",
+                    )
+                    return _codex_workspace_write_preflight_result
+            seed = probe / ".aicc-codex-preflight-seed"
+            seed.write_text("seed\n", encoding="utf-8")
+            seeded = subprocess.run(
+                ["git", "add", seed.name],
+                cwd=probe,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if seeded.returncode == 0:
+                seeded = subprocess.run(
+                    ["git", "commit", "--quiet", "-m", "aicc codex preflight seed"],
+                    cwd=probe,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            if seeded.returncode != 0:
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"cannot seed disposable Codex probe: {seeded.stderr.strip()}",
+                )
+                return _codex_workspace_write_preflight_result
+            before = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=probe,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            run = run_claude_code(
+                repository_path=probe,
+                prompt=_CODEX_PREFLIGHT_PROMPT,
+                task_type="implementation",
+                timeout_seconds=MIN_TIMEOUT_SECONDS,
+                executor="codex",
+            )
+            diagnostic = "\n".join(part for part in (run.stdout, run.stderr) if part)
+            if run.is_executor_sandbox_error:
+                detail = (
+                    diagnostic[-400:] or "bwrap loopback namespace setup was denied"
+                )
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"Codex workspace-write sandbox unavailable: {detail}",
+                )
+            elif run.status != "completed":
+                detail = diagnostic[-400:] or f"exit_code={run.exit_code!r}"
+                # Provider/auth/network failures are transient. Do not pin a
+                # worker-wide negative forever; only the proven bwrap/capability
+                # failures above/below open the persistent local circuit.
+                return (
+                    False,
+                    f"Codex workspace-write preflight failed: {detail}",
+                )
+            else:
+                after = _run_git(["rev-parse", "HEAD"], probe)
+                status = _run_git(["status", "--porcelain"], probe)
+                common = _run_git(
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"], probe
+                )
+                probe_file = probe / "aicc-codex-commit-probe.txt"
+                try:
+                    probe_content = probe_file.read_text(encoding="utf-8")
+                except OSError:
+                    probe_content = None
+                commit_ok = bool(
+                    after
+                    and after.returncode == 0
+                    and after.stdout.strip()
+                    and after.stdout.strip() != before
+                    and status
+                    and status.returncode == 0
+                    and not status.stdout.strip()
+                    and common
+                    and common.returncode == 0
+                    and Path(common.stdout.strip()).resolve()
+                    == (probe / ".git").resolve()
+                    and probe_content == "AICC_CODEX_COMMIT_OK\n"
+                )
+                if not commit_ok:
+                    _codex_workspace_write_preflight_result = (
+                        False,
+                        (
+                            "Codex workspace-write preflight could not create a clean local commit "
+                            "with task-local Git metadata"
+                        ),
+                    )
+                else:
+                    _codex_workspace_write_preflight_result = (True, "")
+        return _codex_workspace_write_preflight_result
+
+
 def validate_repository(project_id: str, repository_path: str) -> Path:
     """Raise RunnerError unless `repository_path` is the configured path for `project_id`."""
     if not repository_path:
@@ -337,11 +710,15 @@ def validate_repository(project_id: str, repository_path: str) -> Path:
             "Запуск отклонён."
         )
     if not resolved_configured.is_dir():
-        raise RunnerError(f"Настроенный путь репозитория не существует: {resolved_configured}")
+        raise RunnerError(
+            f"Настроенный путь репозитория не существует: {resolved_configured}"
+        )
     return resolved_configured
 
 
-def _run_git(args: list[str], cwd: Path, timeout: int = 10) -> subprocess.CompletedProcess | None:
+def _run_git(
+    args: list[str], cwd: Path, timeout: int = 10
+) -> subprocess.CompletedProcess | None:
     try:
         return subprocess.run(
             ["git", *args],
@@ -351,7 +728,7 @@ def _run_git(args: list[str], cwd: Path, timeout: int = 10) -> subprocess.Comple
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except _OS_SUBPROCESS_ERRORS:
         return None
 
 
@@ -363,17 +740,32 @@ def is_git_repository(repo_path: Path) -> bool:
 def git_snapshot(repo_path: Path) -> dict:
     """Read-only branch/HEAD/status snapshot of `repo_path`, used for pre/post-run records."""
     if not is_git_repository(repo_path):
-        return {"is_git_repo": False, "branch": None, "head": None, "status_summary": None}
+        return {
+            "is_git_repo": False,
+            "branch": None,
+            "head": None,
+            "status_summary": None,
+        }
 
     branch = _run_git(["branch", "--show-current"], cwd=repo_path)
     head = _run_git(["rev-parse", "HEAD"], cwd=repo_path)
     status = _run_git(["status", "--porcelain"], cwd=repo_path)
 
-    status_lines = [line for line in (status.stdout.splitlines() if status and status.returncode == 0 else []) if line]
+    status_lines = [
+        line
+        for line in (
+            status.stdout.splitlines() if status and status.returncode == 0 else []
+        )
+        if line
+    ]
 
     return {
         "is_git_repo": True,
-        "branch": (branch.stdout.strip() if branch and branch.stdout.strip() else "(detached HEAD)"),
+        "branch": (
+            branch.stdout.strip()
+            if branch and branch.stdout.strip()
+            else "(detached HEAD)"
+        ),
         "head": head.stdout.strip() if head and head.returncode == 0 else None,
         "status_summary": "\n".join(status_lines) if status_lines else "(чисто)",
     }
@@ -393,7 +785,11 @@ def build_command(
     capability_override: str | None = None,
 ) -> list[str]:
     if capability_override is not None:
-        profile = PROFILE_READ_ONLY if capability_override.lower() in ("read_only", "readonly") else PROFILE_TRUSTED_DEVELOPMENT
+        profile = (
+            PROFILE_READ_ONLY
+            if capability_override.lower() in ("read_only", "readonly")
+            else PROFILE_TRUSTED_DEVELOPMENT
+        )
     else:
         profile = profile_for_task_type(task_type)
     command = [
@@ -406,7 +802,12 @@ def build_command(
         PERMISSION_MODE_BY_PROFILE[profile],
     ]
 
-    if profile == PROFILE_READ_ONLY:
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        # The exact PR diff is already embedded in the prompt by the trusted
+        # control plane. Giving this reviewer Read/Grep/Glob would add ambient
+        # repository authority it neither needs nor can bind to that exact SHA.
+        command += ["--tools", ""]
+    elif profile == PROFILE_READ_ONLY:
         # Tool-set replacement, not a permission-layer denial: Bash (and every
         # shell-reachable mutation) is not in this list, so it cannot be invoked by
         # this run at all. See the module docstring and READ_ONLY_ALLOWED_TOOLS.
@@ -474,8 +875,9 @@ def build_codex_command(
     ]
     if model:
         command += ["--model", model]
-    # The prompt goes last and positionally: `codex exec [OPTIONS] [PROMPT]`.
-    command.append(prompt)
+    # Terminate option parsing before the untrusted task prompt. Without `--`,
+    # a prompt beginning with a Codex flag could replace the selected sandbox.
+    command += ["--", prompt]
     return command
 
 
@@ -510,20 +912,40 @@ def build_copilot_command(
     exactly the boundary these profiles draw.
     """
     profile = profile_for_task_type(task_type)
-    command = [COPILOT_BINARY, "-p", prompt, "--no-color"]
-    if profile == PROFILE_READ_ONLY:
+    command = [
+        COPILOT_BINARY,
+        "-p",
+        prompt,
+        "--no-color",
+        "--silent",
+        "--no-remote",
+        "--no-remote-export",
+        "--disable-builtin-mcps",
+        "--no-custom-instructions",
+        "--no-ask-user",
+    ]
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        # Empty availability is stronger than a permission prompt: no Copilot
+        # tool is exposed to the model at all, including read and shell.
+        command += ["--available-tools="]
+    elif profile == PROFILE_READ_ONLY:
         # Grant reads only. Absent `write`/`shell`, mutation is unreachable.
         command += ["--allow-tool", "read"]
     else:
         command += [
-            "--allow-tool", "read",
-            "--allow-tool", "write",
-            "--allow-tool", "shell",
+            "--allow-tool",
+            "read",
+            "--allow-tool",
+            "write",
+            "--allow-tool",
+            "shell",
             # The agent commits locally; pushing/PR-opening belongs to
             # `publish_run`, which holds the writer lease. Denying the remote-
             # mutating subcommands keeps that boundary technical, not advisory.
-            "--deny-tool", "shell(git push)",
-            "--deny-tool", "shell(git remote)",
+            "--deny-tool",
+            "shell(git push)",
+            "--deny-tool",
+            "shell(git remote)",
         ]
     if model:
         command += ["--model", model]
@@ -563,7 +985,7 @@ def extract_result_text(stdout: str) -> str:
     """
     try:
         data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
+    except _JSON_ERRORS:
         return stdout
     if isinstance(data, list):
         for item in reversed(data):
@@ -591,7 +1013,7 @@ def _parse_cli_result_payload(stdout: str) -> dict | None:
         return None
     try:
         data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
+    except _JSON_ERRORS:
         return None
     return data if isinstance(data, dict) else None
 
@@ -660,7 +1082,43 @@ class RunResult:
         positively confirm a parseable dict payload -- fail safe to today's
         behavior rather than guess.
         """
-        return (self.is_error and self.api_error_status is not None) or self.terminal_reason == "api_error"
+        return (
+            self.is_error and self.api_error_status is not None
+        ) or self.terminal_reason == "api_error"
+
+    def is_executor_provider_error(self, executor: str) -> bool:
+        """Whether the selected CLI positively reports a provider failure.
+
+        Claude exposes structured API fields; Copilot 1.0.x reports its
+        pre-task auth/quota/network failures on stderr. Copilot free-text is
+        considered only for a failed, non-zero process, so a successful
+        review that merely discusses a rate limit cannot trigger a retry.
+        """
+        if self.is_executor_api_error:
+            return True
+        if executor != "copilot" or self.status != "failed" or not self.exit_code:
+            return False
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
+        return any(
+            signature in diagnostic
+            for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
+        )
+
+    @property
+    def is_executor_sandbox_error(self) -> bool:
+        """Whether the sandbox launcher reported its known loopback failure."""
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
+        return all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
+
+    @property
+    def is_principal_isolation_error(self) -> bool:
+        """The OS launcher refused or lost the isolated execution service.
+
+        The fixed signature is emitted only by the root-owned launcher/client,
+        before a provider verdict can be trusted.  It is therefore executor
+        infrastructure and safe to retry, never a completed task result.
+        """
+        return _PRINCIPAL_ISOLATION_FAILURE in f"{self.stdout}\n{self.stderr}"
 
 
 # How often the mid-run poll loop wakes to re-check `cancel_event` and the
@@ -689,7 +1147,9 @@ def _popen_new_process_group_kwargs() -> dict:
     it, `os.killpg`/`CTRL_BREAK_EVENT` would reach this worker process too."""
     if sys.platform == "win32":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    return {"start_new_session": True}  # POSIX: equivalent to a preexec_fn calling os.setsid()
+    return {
+        "start_new_session": True
+    }  # POSIX: equivalent to a preexec_fn calling os.setsid()
 
 
 def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) -> None:
@@ -709,7 +1169,7 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
     if sys.platform == "win32":
         try:
             proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-        except (OSError, ValueError):
+        except _OS_VALUE_ERRORS:
             pass
     else:
         try:
@@ -805,20 +1265,53 @@ def run_claude_code(
             completed_at=models.iso_now(),
         )
     command = builder(prompt, task_type=task_type, model=model)
+    launcher_input: str | None = None
+    launch_environment = scrub_vcs_credentials(dict(os.environ))
+    launch_cwd = repository_path
+    if principal_isolation_required():
+        try:
+            manifest = build_principal_isolation_manifest(
+                repository_path=repository_path,
+                prompt=prompt,
+                task_type=task_type,
+                timeout_seconds=timeout_seconds,
+                executor=executor,
+                model=model,
+            )
+        except (OSError, RunnerError) as exc:
+            now = models.iso_now()
+            return RunResult(
+                status="failed",
+                exit_code=None,
+                stdout="",
+                stderr=f"{_PRINCIPAL_ISOLATION_FAILURE}: invalid manifest: {exc}",
+                duration_seconds=0.0,
+                started_at=now,
+                completed_at=now,
+            )
+        command = [PRINCIPAL_ISOLATION_LAUNCHER, "--client"]
+        launcher_input = json.dumps(manifest, separators=(",", ":")) + "\n"
+        launch_environment = _principal_launcher_environment()
+        # The client only opens the protected Unix socket.  It must not need
+        # access to the task tree; the root launcher bind-mounts the verified
+        # workspace into the aicc-agent unit as /workspace.
+        launch_cwd = Path("/")
     started_at = models.iso_now()
     started_monotonic = time.monotonic()
 
     try:
         proc = subprocess.Popen(
             command,
-            cwd=repository_path,
+            cwd=launch_cwd,
+            stdin=subprocess.PIPE if launcher_input is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             # Strip ambient Git/GitHub credentials: this agent has no reason to
             # authenticate to a remote, and the completion pipeline (not the
             # agent) owns push/merge. See scrub_vcs_credentials.
-            env=scrub_vcs_credentials(dict(os.environ)),
+            env=launch_environment,
+            close_fds=True,
             **_popen_new_process_group_kwargs(),
         )
     except OSError as exc:
@@ -845,8 +1338,8 @@ def run_claude_code(
 
     def _collect() -> None:
         try:
-            out, err = proc.communicate()
-        except (OSError, ValueError):
+            out, err = proc.communicate(input=launcher_input)
+        except _OS_VALUE_ERRORS:
             out, err = "", ""
         collected["stdout"] = out or ""
         collected["stderr"] = err or ""
@@ -901,7 +1394,14 @@ def run_claude_code(
             started_at=started_at,
             completed_at=models.iso_now(),
         )
-    status = "completed" if exit_code == 0 else "failed"
+    diagnostic = f"{stdout}\n{stderr}".lower()
+    status = (
+        "failed"
+        if all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
+        else "completed"
+        if exit_code == 0
+        else "failed"
+    )
     return RunResult(
         status=status,
         exit_code=exit_code,
@@ -962,7 +1462,9 @@ def load_runs() -> list[dict]:
     storage.ensure_seeded_jsonl(RUNS_FILE)
     records = storage.read_jsonl(RUNS_FILE)
     latest = storage.fold_latest_by_id(records)
-    return sorted(latest.values(), key=lambda run: run.get("created_at") or "", reverse=True)
+    return sorted(
+        latest.values(), key=lambda run: run.get("created_at") or "", reverse=True
+    )
 
 
 def get_run(run_id: str) -> dict | None:
@@ -979,7 +1481,11 @@ def get_run(run_id: str) -> dict | None:
 # See `command_center.runtime.reports.REPORTS_ROOT` for why this honors
 # `AICC_REPORTS_ROOT` — same subprocess-isolation gap, same fix, applied here too
 # for consistency between the v1.2 and v2 report-writing paths.
-REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REPORTS_ROOT") else ROOT / "reports"
+REPORTS_ROOT = (
+    Path(os.environ["AICC_REPORTS_ROOT"])
+    if os.environ.get("AICC_REPORTS_ROOT")
+    else ROOT / "reports"
+)
 
 
 # Path components are restricted to this conservative charset so a hand-authored
@@ -1002,7 +1508,7 @@ def report_path_for(run: dict) -> Path:
     try:
         started_dt = datetime.fromisoformat(started)
     except ValueError:
-        started_dt = datetime.now()
+        started_dt = datetime.now(UTC)
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
     task_part = _safe_path_component(run.get("task_id") or "adhoc", "adhoc")[:12]
     agent = _safe_path_component(run.get("agent") or "agent", "agent")
@@ -1032,48 +1538,48 @@ def render_report_markdown(run: dict, parsed: dict) -> str:
 
     return f"""# Отчёт агента
 
-- Run ID: `{run.get('id', '—')}`
-- Task ID: `{run.get('task_id') or '—'}`
-- Project: {run.get('project', '—')}
-- Agent: {run.get('agent', '—')}
-- Task type: {run.get('task_type', '—')}
-- Repository: `{run.get('repository_path', '—')}`
-- Branch before run: {pre.get('branch') or '—'}
-- HEAD before run: {pre.get('head') or '—'}
-- Branch after run: {post.get('branch') or '—'}
-- HEAD after run: {post.get('head') or '—'}
-- Started: {run.get('started_at') or '—'}
-- Completed: {run.get('completed_at') or '—'}
+- Run ID: `{run.get("id", "—")}`
+- Task ID: `{run.get("task_id") or "—"}`
+- Project: {run.get("project", "—")}
+- Agent: {run.get("agent", "—")}
+- Task type: {run.get("task_type", "—")}
+- Repository: `{run.get("repository_path", "—")}`
+- Branch before run: {pre.get("branch") or "—"}
+- HEAD before run: {pre.get("head") or "—"}
+- Branch after run: {post.get("branch") or "—"}
+- HEAD after run: {post.get("head") or "—"}
+- Started: {run.get("started_at") or "—"}
+- Completed: {run.get("completed_at") or "—"}
 - Duration: {duration_str}
-- Exit code: {run.get('exit_code')}
-- Status: {run.get('status', '—')}
+- Exit code: {run.get("exit_code")}
+- Status: {run.get("status", "—")}
 
 ## Prompt
 
 ```
-{run.get('prompt', '')}
+{run.get("prompt", "")}
 ```
 
 ## Stdout (полный, без сокращений)
 
 ```
-{run.get('stdout', '')}
+{run.get("stdout", "")}
 ```
 
 ## Stderr (полный, без сокращений)
 
 ```
-{run.get('stderr', '')}
+{run.get("stderr", "")}
 ```
 
 ## Извлечённые данные (парсер)
 
-- Verdict: {parsed.get('verdict') or 'не определено'}
-- Confidence: {parsed.get('confidence', 'none')}
-- Commit hash: {parsed.get('commit_hash') or '—'}
-- Branch: {parsed.get('branch') or '—'}
-- Pull Request: {parsed.get('pull_request_url') or '—'}
-- Recommended next action: {parsed.get('recommended_next_action') or '—'}
+- Verdict: {parsed.get("verdict") or "не определено"}
+- Confidence: {parsed.get("confidence", "none")}
+- Commit hash: {parsed.get("commit_hash") or "—"}
+- Branch: {parsed.get("branch") or "—"}
+- Pull Request: {parsed.get("pull_request_url") or "—"}
+- Recommended next action: {parsed.get("recommended_next_action") or "—"}
 
 ### Findings
 
@@ -1082,13 +1588,13 @@ def render_report_markdown(run: dict, parsed: dict) -> str:
 ## Git status до запуска
 
 ```
-{pre.get('status_summary') or '—'}
+{pre.get("status_summary") or "—"}
 ```
 
 ## Git status после запуска
 
 ```
-{post.get('status_summary') or '—'}
+{post.get("status_summary") or "—"}
 ```
 """
 

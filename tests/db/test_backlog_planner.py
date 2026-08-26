@@ -381,6 +381,31 @@ def test_ingest_a_clean_run_with_no_pr_returns_to_pool_not_review(rig) -> None:
             assert cur.fetchone()[0] == 0
 
 
+def test_repeated_no_pr_publish_failure_stays_operational(rig) -> None:
+    """A second technical publish failure is still an operations retry, not
+    an owner decision.  Migration 0012 deliberately exempts no_pr_published
+    from the two-epoch DEFER_TO_USER circuit breaker."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-N2", repo="repo-nm"))[0]
+
+    for round_no in (1, 2):
+        assert _dispatch(app_factory, "VOYN-W0-N2")[0], f"round {round_no}"
+        _complete_latest(
+            app_factory,
+            worker,
+            "VOYN-W0-N2",
+            {"status": "completed"},
+        )
+        with app_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+                rows = cur.fetchall()
+        assert [(r[0], r[2]) for r in rows] == [
+            ("VOYN-W0-N2", "returned_to_pool")
+        ]
+        assert store.get_task("VOYN-W0-N2")["status"] == "OPEN", rows
+
+
 def test_ingest_a_clean_run_with_sha_but_no_pr_still_returns_to_pool(rig) -> None:
     """The exact live shape of the 2026-08-21 incident: status='completed'
     AND a real head_sha (the agent reported its own HEAD_SHA trailer), but
@@ -435,6 +460,33 @@ def test_ingest_queue_succeeded_but_task_failed_returns_to_pool_not_review(rig) 
                 ("VOYN-W0-QF",),
             )
             assert cur.fetchone()[0] == 0
+
+
+def test_migration_0012_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up pins the technical-failure policy to migration
+    0012.  Downgrading to 0011 must restore the owner-defer definition, and
+    the second upgrade must reapply the operational retry classification."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "v_technical" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=11)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "v_technical" not in cur.fetchone()[0]
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "v_technical" in cur.fetchone()[0]
 
 
 def test_migration_0011_is_reversible_without_residue(pg_connection_factory) -> None:
