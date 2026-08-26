@@ -181,6 +181,37 @@ def _backlog_tasks(
     return tasks
 
 
+def _map_dialogs(root: Path) -> list[dict]:
+    """Dialog summaries from the AICC chat store (`data/chats.json`).
+
+    Summary-level strictly: id, title, message count and the last-activity
+    timestamp. Message CONTENT never enters the projection — raw dialog text
+    is exactly the class of data the gateway boundary exists to keep in.
+    """
+    conversations = storage.read_json(
+        storage.resolve_data_dir(root) / "chats.json", []
+    )
+    if not isinstance(conversations, list):
+        return []
+    dialogs = []
+    for conversation in conversations:
+        if not isinstance(conversation, dict):
+            continue
+        messages = conversation.get("messages")
+        dialogs.append(
+            {
+                "id": _clean_str(conversation.get("id")) or "unknown",
+                "title": _clean_str(conversation.get("title")) or "Разговор",
+                "state": "open",
+                "last_activity_at": _clean_str(conversation.get("updated_at")),
+                "message_count": len(messages) if isinstance(messages, list) else 0,
+                "last_summary": None,
+            }
+        )
+    dialogs.sort(key=lambda d: d["last_activity_at"] or "", reverse=True)
+    return dialogs
+
+
 def build_projection(
     root: Path,
     *,
@@ -212,7 +243,7 @@ def build_projection(
         "tasks": [_map_task(t) for t in tasks],
         "lanes": _map_lanes(runs, now),
         "events": _map_events(runs),
-        "dialogs": [],
+        "dialogs": _map_dialogs(root),
         "decisions": [],
     }
     digest = hashlib.sha256(
