@@ -13,6 +13,7 @@ from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import (
     merge_once,
     publish_review_verdicts,
+    reconcile_merge_evidence,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -74,6 +75,21 @@ def _ready(store, factory, task_id, pr):
         cur.execute("SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)", (task_id, _rev()))
         cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", (task_id, pr))
         cur.execute("SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)", (task_id, _rev()))
+        c.commit()
+
+
+def _done(store, factory, task_id, pr, sha):
+    """A DONE task carrying pr + sha evidence, as merge_once leaves it --
+    built directly against the store rather than through merge_once, so
+    reconcile tests can plant a pre-fix sha value (a PR head, never a merge
+    commit) that merge_once itself would no longer produce."""
+    _ready(store, factory, task_id, pr)
+    with factory() as c, c.cursor() as cur:
+        def _rev():
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            return cur.fetchone()[0]
+        cur.execute("SELECT backlog_record_evidence(%s,'sha',%s)", (task_id, sha))
+        cur.execute("SELECT ok FROM backlog_transition(%s,'DONE',%s)", (task_id, _rev()))
         c.commit()
 
 
@@ -1679,3 +1695,90 @@ def test_no_rerun_without_an_accept_marker(rig, monkeypatch):  # noqa: F811
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-MG", "no_accept_marker_on_head") in report.skipped
     assert reruns == []
+
+
+def _fake_reconcile_gh(default_branch, statuses):
+    """statuses: {sha: compare-status}. `--jq` mocking is by-hand since the
+    real `gh` process never runs in these tests."""
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["api", "repos/x/y"] and argv[-1] == ".default_branch":
+            return sp.CompletedProcess(argv, 0, default_branch, "")
+        if argv[0] == "api" and "/compare/" in argv[1]:
+            sha = argv[1].rsplit("...", 1)[1]
+            status = statuses.get(sha)
+            if status is None:
+                return sp.CompletedProcess(argv, 1, "", "not found")
+            return sp.CompletedProcess(argv, 0, status, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    return fake_gh
+
+
+def test_reconcile_flags_a_sha_not_on_the_default_branch(rig, monkeypatch):  # noqa: F811
+    """VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY: a DONE task whose sha
+    evidence predates the fix (a PR head that a squash merge never puts on
+    main) is surfaced as suspect -- report-only."""
+    app_factory, store, _ = rig
+    bad_sha = "9" * 40
+    _done(store, app_factory, "VOYN-W0-RC1", "https://github.com/x/y/pull/40", bad_sha)
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_reconcile_gh("main", {bad_sha: "diverged"})
+    )
+    report = reconcile_merge_evidence(app_factory, "/tmp")
+    assert report.suspect == [("VOYN-W0-RC1", bad_sha, "sha_not_on_main")]
+    assert report.verified == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-RC1",))
+        assert cur.fetchone()[0] == "DONE"  # report-only: never flipped
+
+
+def test_reconcile_verifies_a_sha_that_is_an_ancestor(rig, monkeypatch):  # noqa: F811
+    """A post-fix DONE row, whose sha IS the target-branch merge commit,
+    is verified rather than flagged."""
+    app_factory, store, _ = rig
+    good_sha = "a" * 40
+    _done(store, app_factory, "VOYN-W0-RC2", "https://github.com/x/y/pull/41", good_sha)
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_reconcile_gh("main", {good_sha: "behind"})
+    )
+    report = reconcile_merge_evidence(app_factory, "/tmp")
+    assert report.verified == [("VOYN-W0-RC2", good_sha)]
+    assert report.suspect == []
+
+
+def test_reconcile_skips_without_pr_evidence_to_identify_the_repo(rig):  # noqa: F811
+    """A DONE task carrying sha evidence but no pr evidence cannot be
+    checked -- an inconclusive skip, never a false suspect."""
+    from tests.db.test_backlog_planner import _task
+
+    app_factory, store, _ = rig
+    assert store.upsert_task(_task("VOYN-W0-RC3", repo="repo-x", status="DONE"))[0]
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT backlog_record_evidence(%s,'sha',%s)", ("VOYN-W0-RC3", "b" * 40)
+        )
+        c.commit()
+    report = reconcile_merge_evidence(app_factory, "/tmp")
+    assert ("VOYN-W0-RC3", "no_pr_evidence_to_identify_repo") in report.skipped
+    assert report.suspect == []
+    assert report.verified == []
+
+
+def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeypatch):  # noqa: F811, E501
+    """A failed default-branch lookup (gh hiccup, auth issue) is inconclusive
+    -- it must never be reported as a suspect sha, which would read as a
+    confirmed defect rather than "the check itself didn't run"."""
+    app_factory, store, _ = rig
+    sha = "c" * 40
+    _done(store, app_factory, "VOYN-W0-RC4", "https://github.com/x/y/pull/42", sha)
+
+    import subprocess as sp
+
+    monkeypatch.setattr(
+        review_merge, "_gh", lambda argv, repo: sp.CompletedProcess(argv, 1, "", "down")
+    )
+    report = reconcile_merge_evidence(app_factory, "/tmp")
+    assert ("VOYN-W0-RC4", "default_branch_lookup_failed") in report.skipped
+    assert report.suspect == []

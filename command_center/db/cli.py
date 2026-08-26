@@ -102,6 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
         "marker and checks are green, closing the task DONE "
         "(aicc-backlog-merge.timer). Needs --repo-path.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    sub.add_parser(
+        "backlog-merge-reconcile",
+        help="Report-only audit (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-"
+        "VERIFY): flag existing DONE tasks whose 'sha' evidence is not an "
+        "ancestor of the default branch (pre-fix rows recorded the PR head, "
+        "not the merge commit). Never changes a task's status.",
+    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -323,6 +330,27 @@ def main(argv: list[str] | None = None) -> int:
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 return 0
+
+            if args.command == "backlog-merge-reconcile":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.review_merge import (
+                    reconcile_merge_evidence,
+                )
+
+                report = reconcile_merge_evidence(lambda: _nc(conn), args.repo_path)
+                for task_id, sha, reason in report.suspect:
+                    print(f"SUSPECT   {task_id} sha={sha}: {reason}")
+                for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
+                print(
+                    f"verified {len(report.verified)}, "
+                    f"suspect {len(report.suspect)}, "
+                    f"skipped {len(report.skipped)}"
+                )
+                # Non-zero exit surfaces a real finding to a human/CI without
+                # ever touching the database -- report-only stays report-only.
+                return 1 if report.suspect else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
