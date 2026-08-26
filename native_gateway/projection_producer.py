@@ -79,6 +79,7 @@ def _map_task(task: dict) -> dict:
         "id": _clean_str(task.get("id")) or "unknown",
         "title": _clean_str(task.get("title")) or "Untitled",
         "blocker": blocker,
+        "state": _clean_str(task.get("state")),
         "evidence": evidence,
     }
 
@@ -153,6 +154,22 @@ def _map_lanes(runs: list[dict], now: datetime) -> list[dict]:
     return lanes
 
 
+# Exact rich-status vocabulary -> the projection's task state and the AICC
+# read-model lane it corresponds to. DEFER_TO_USER additionally carries a
+# blocker so the client's attention surface picks it up.
+_RICH_STATE = {
+    "UNTRIAGED": ("backlog", "Backlog"),
+    "OPEN": ("next", "Next"),
+    "NEEDS_REFINEMENT": ("backlog", "Backlog"),
+    "SPLIT": ("backlog", "Backlog"),
+    "IN_PROGRESS": ("in_progress", "In Progress"),
+    "READY_TO_REVIEW": ("review", "Review"),
+    "DONE": ("done", "Done"),
+    "DEFER_TO_USER": ("deferred", "Blocked"),
+    "UNKNOWN": ("backlog", "Backlog"),
+}
+
+
 def _backlog_tasks(
     backlog_path: Path | None, titles_path: Path | None = None
 ) -> list[dict]:
@@ -160,25 +177,44 @@ def _backlog_tasks(
 
     Reuses `backlog_client` (the sanctioned read side of the Backlog Engine —
     it has no write surface, so this cannot create a second task store).
-    Only machine `VOYN_RECOMMENDATION` records are visible to that client;
-    an unconfigured or missing file yields an empty list, never an error.
+    Two record surfaces merge here: machine `VOYN_RECOMMENDATION` lines
+    (planning) and the body's rich task lines (execution status, parsed by
+    the same shared module); on an id collision the rich EXECUTION status
+    wins, because that is the state the owner actually asks about.
+    An unconfigured or missing file yields an empty list, never an error.
     """
     projection = backlog_client.load_projection(backlog_path)
+    rich = backlog_client.load_rich_records(backlog_path)
     # Russian executive titles, produced offline by `localize_titles` on a
     # local model; a record absent from the cache keeps its humanized slug.
     titles = load_cache(titles_path)
-    tasks = []
+
+    tasks: dict[str, dict] = {}
     for rec in projection.records:
-        tasks.append(
+        tasks[rec.issue_id] = {
+            "id": rec.issue_id,
+            "project": rec.parallel_domain or rec.owner or "backlog",
+            "title": title_for(rec.issue_id, rec.title, titles),
+            "status": "Next" if rec.is_approved else "Backlog",
+            "state": "next" if rec.is_approved else "backlog",
+            "type": "backlog",
+        }
+    for record in rich:
+        state, lane = _RICH_STATE[record.status]
+        entry = tasks.setdefault(
+            record.record_id,
             {
-                "id": rec.issue_id,
-                "project": rec.parallel_domain or rec.owner or "backlog",
-                "title": title_for(rec.issue_id, rec.title, titles),
-                "status": "Next" if rec.is_approved else "Backlog",
+                "id": record.record_id,
+                "project": "backlog",
+                "title": title_for(record.record_id, record.title, titles),
                 "type": "backlog",
-            }
+            },
         )
-    return tasks
+        entry["status"] = lane
+        entry["state"] = state
+        if record.status == "DEFER_TO_USER":
+            entry["blocker"] = "Ждёт вашего решения"
+    return list(tasks.values())
 
 
 def _map_dialogs(root: Path) -> list[dict]:

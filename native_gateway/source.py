@@ -57,6 +57,11 @@ _EVIDENCE_STATES = {
 
 _OFFLINE_REVISION = "offline"
 
+# Allowlisted task execution states (DTO 1.0 additive field).
+_TASK_STATES = frozenset(
+    {"backlog", "next", "in_progress", "review", "done", "deferred"}
+)
+
 
 def _clean(value: object) -> str | None:
     if not isinstance(value, str) or not value.strip():
@@ -186,10 +191,12 @@ def _items(value: object) -> list[dict]:
 def _map_task(raw: dict) -> TaskDTO:
     evidence_raw = raw.get("evidence")
     evidence_raw = evidence_raw if isinstance(evidence_raw, dict) else {}
+    state = _clean(raw.get("state"))
     return TaskDTO(
         id=_clean_required(raw.get("id"), "unknown"),
         title=_clean_required(raw.get("title"), "Untitled"),
         blocker=_clean(raw.get("blocker")),
+        state=state if state in _TASK_STATES else None,
         evidence=DeliveryEvidence(
             headSHA=_clean(evidence_raw.get("head_sha")),
             pullRequest=_clean(evidence_raw.get("pr")),
