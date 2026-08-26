@@ -550,8 +550,8 @@ def list_proposal_evidence(db_path: Path, proposal_id: str) -> list[dict]:
         return events
 
 
-def list_proposal_evidence_stored(db_path: Path, proposal_id: str) -> list[dict]:
-    """Evidence rows in the shape SQLite **stores**, for reconciliation.
+def list_proposal_evidence_stored(db_path: Path) -> list[dict]:
+    """Every evidence row, for every proposal, in the shape SQLite **stores**.
 
     :func:`list_proposal_evidence` pops `data_json` and returns a parsed `data`
     key instead, which is right for its callers and wrong for reconciliation:
@@ -561,12 +561,14 @@ def list_proposal_evidence_stored(db_path: Path, proposal_id: str) -> list[dict]
     The decoding here is written inline rather than in a `_decode_*` helper,
     which is how it got past the fitness gate until that gate learned to treat
     a `.pop("<column>")` as the same act.
+
+    Unscoped by `proposal_id` (SRV-07f): a table-wide reconciliation cannot be
+    assembled from a reader that only answers for one proposal without first
+    enumerating every proposal and fanning out a call per one. Ordered by `id`,
+    the table's own key, not `seq`, which only orders one proposal's slice.
     """
     with db.connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT * FROM proposal_evidence WHERE proposal_id = ? ORDER BY seq ASC",
-            (proposal_id,),
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM proposal_evidence ORDER BY id").fetchall()
         return [dict(row) for row in rows]
 
 
@@ -597,20 +599,22 @@ def append_proposal_event(
     return event_record["seq"]
 
 
-def list_proposal_events_stored(db_path: Path, proposal_id: str) -> list[dict]:
-    """Every proposal event in the shape SQLite **stores**, for reconciliation.
+def list_proposal_events_stored(db_path: Path) -> list[dict]:
+    """Every proposal event, for every proposal, in the shape SQLite **stores**.
 
     :func:`list_proposal_events` hands out the shape callers want, which is not
     the shape the mirror holds — the same split `digest_item`, `model_event`,
     `audit_run`, `run_event`, `council_event` and `completion_event` all have.
     Six tables into that pattern, the gate that requires this reader is worth
     more than the memory that used to.
+
+    Unscoped by `proposal_id` (SRV-07f): a table-wide reconciliation cannot be
+    assembled from a reader that only answers for one proposal without first
+    enumerating every proposal and fanning out a call per one. Ordered by `id`,
+    the table's own key, not `seq`, which only orders one proposal's slice.
     """
     with db.connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT * FROM proposal_event WHERE proposal_id = ? ORDER BY seq ASC",
-            (proposal_id,),
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM proposal_event ORDER BY id").fetchall()
         return [dict(row) for row in rows]
 
 

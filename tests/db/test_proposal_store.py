@@ -81,13 +81,13 @@ def test_the_proposal_family_reconciles_after_every_write(
         assert proposal_divergence([stored] if stored else [], proposals) == [], stage
         assert (
             proposal_event_divergence(
-                proposal_db.list_proposal_events_stored(db_path, proposal_id), events
+                proposal_db.list_proposal_events_stored(db_path), events
             )
             == []
         ), stage
         assert (
             proposal_evidence_divergence(
-                proposal_db.list_proposal_evidence_stored(db_path, proposal_id), evidence
+                proposal_db.list_proposal_evidence_stored(db_path), evidence
             )
             == []
         ), stage
@@ -190,20 +190,20 @@ def test_the_atomic_path_mirrors_the_parent_before_its_children(
     assert proposal_divergence([stored], proposals) == []
     assert (
         proposal_evidence_divergence(
-            proposal_db.list_proposal_evidence_stored(db_path, stored["id"]), evidence
+            proposal_db.list_proposal_evidence_stored(db_path), evidence
         )
         == []
     )
     assert (
         proposal_event_divergence(
-            proposal_db.list_proposal_events_stored(db_path, stored["id"]), events
+            proposal_db.list_proposal_events_stored(db_path), events
         )
         == []
     )
     # Not vacuous: both children exist on the authority side, so an empty
     # mirror would have been reported above rather than silently agreeing.
-    assert len(proposal_db.list_proposal_evidence_stored(db_path, stored["id"])) == 1
-    assert len(proposal_db.list_proposal_events_stored(db_path, stored["id"])) == 1
+    assert len(proposal_db.list_proposal_evidence_stored(db_path)) == 1
+    assert len(proposal_db.list_proposal_events_stored(db_path)) == 1
 
 
 def test_a_mirror_failure_cannot_break_a_proposal_write(tmp_path, monkeypatch) -> None:

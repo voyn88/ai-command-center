@@ -114,6 +114,10 @@ completion_event_divergence = divergence_against(
     both things that hide a column: it selects an explicit list without `id`
     and pops `metadata_json` in favour of a decoded `metadata`. Fed those, this
     pairs rows on `None` and compares a column that is not there.
+
+    `list_completion_events_stored` takes no `run_id` (SRV-07f): it is a
+    whole-table reader, because reconciling the table means reconciling every
+    run's events, not one run fanned out over the caller.
     """,
 )
 completion_validation_divergence = divergence_against(COMPLETION_VALIDATION)

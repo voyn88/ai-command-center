@@ -117,6 +117,10 @@ proposal_event_divergence = divergence_against(
     **Takes rows in the shape SQLite stores** — `runtime/db/proposal.py`'s
     `list_proposal_events_stored`, not `list_proposal_events`, which hands out
     the caller-facing shape. Fed that, this reports every event divergent.
+
+    `list_proposal_events_stored` takes no `proposal_id` (SRV-07f): it is a
+    whole-table reader, because reconciling the table means reconciling every
+    proposal's events, not one proposal fanned out over the caller.
     """,
 )
 proposal_evidence_divergence = divergence_against(
@@ -126,5 +130,8 @@ proposal_evidence_divergence = divergence_against(
     "    the public reader pops `data_json` and returns a parsed `data` key, so\n"
     "    reconciliation fed its rows reports every one of them divergent while\n"
     "    agreeing about a column PostgreSQL does not have. See\n"
-    "    `mirror_support.divergence` for what each reported shape means.",
+    "    `mirror_support.divergence` for what each reported shape means.\n\n"
+    "    Takes no `proposal_id` (SRV-07f): it is a whole-table reader, because\n"
+    "    reconciling the table means reconciling every proposal's evidence, not\n"
+    "    one proposal fanned out over the caller.",
 )

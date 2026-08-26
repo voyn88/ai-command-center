@@ -884,8 +884,8 @@ def _mirror_report(record: dict) -> None:
 
 
 
-def list_run_events_stored(db_path: Path, run_id: str) -> list[dict]:
-    """Every journal row for one run in the shape SQLite **stores**.
+def list_run_events_stored(db_path: Path) -> list[dict]:
+    """Every journal row, for every run, in the shape SQLite **stores**.
 
     :func:`list_run_events` selects an explicit column list that omits `id` —
     reasonably, since callers address the journal by `(run_id, seq)`. But
@@ -896,11 +896,15 @@ def list_run_events_stored(db_path: Path, run_id: str) -> list[dict]:
     *decode* a column away, and this one *projects* it away. The fitness gate
     was extended in the same slice to catch the second variant, because the
     first one taught that memory is not a mechanism.
+
+    Unscoped by `run_id` (SRV-07f): a reconciliation run over the whole table
+    — the shape SRV-07's importer needs — cannot be built out of a reader that
+    only ever answers for one run at a time without first enumerating every
+    run and fanning out a call per one. Ordered by `id`, the table's own key,
+    not `seq`, which only orders one run's slice.
     """
     with db.connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT * FROM run_event WHERE run_id = ? ORDER BY seq ASC", (run_id,)
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM run_event ORDER BY id").fetchall()
         return [dict(row) for row in rows]
 
 

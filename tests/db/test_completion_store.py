@@ -92,7 +92,7 @@ def test_the_completion_family_reconciles_after_every_write(
         assert completion_divergence([stored] if stored else [], completions) == [], stage
         assert (
             completion_event_divergence(
-                completion_db.list_completion_events_stored(db_path, run["id"]), events
+                completion_db.list_completion_events_stored(db_path), events
             )
             == []
         ), stage

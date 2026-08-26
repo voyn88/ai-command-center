@@ -67,7 +67,7 @@ def test_the_journal_and_the_report_reconcile_after_every_write(
     run = _launch(db_path)
 
     def reconciled(stage: str) -> None:
-        assert run_event_divergence(exec_db.list_run_events_stored(db_path, run["id"]), events) == [], (
+        assert run_event_divergence(exec_db.list_run_events_stored(db_path), events) == [], (
             stage
         )
         stored_report = exec_db.get_report(db_path, run["id"])
