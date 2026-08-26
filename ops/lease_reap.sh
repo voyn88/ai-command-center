@@ -21,14 +21,42 @@
 # 0), so the "backstop" would do nothing with no signal that anything was
 # wrong; both are checked explicitly now and exit nonzero with a logged
 # reason.
+#
+# VOYN-W0-AICC-REAPER-NOT-RUNNING: found live on worker-01 -- this reaper had
+# refused with `invalid branch` on EVERY tick since 2026-08-23T23:55Z (2.5+
+# days, 271 consecutive failures, zero successful reaps in that window).
+# `voyn-lease acquire` derives its identity's `branch` field by running `git
+# branch --show-current` in `--repo` (defaulting to cwd), and refuses an empty
+# result. The shared preprod checkout this script used to `cd` into
+# (`aicc-preprod/repo`) had been left in a detached-HEAD state by an unrelated
+# operation, where `branch --show-current` prints nothing -- and stayed
+# detached indefinitely, since nothing that mutates that checkout (including
+# the self-deploy tick) re-attaches it to a branch.
+#
+# This reaper's identity is synthetic (owner=lease-reaper, task=LEASE-REAPER)
+# and has no real branch, worktree or HEAD to report in the first place -- it
+# should never depend on the live, shared, concurrently-mutated checkout
+# another process happens to be using. It now runs against its own dedicated,
+# throwaway git repo instead, created idempotently on first use and never
+# touched by anything else, so no other process's checkout state can ever
+# break it again.
 set -euo pipefail
 export PGPASSFILE=/run/voyn-aicc-worker/pgpass
 export VOYN_LEASE_DSN="host=10.20.0.2 port=5432 dbname=voyn_control user=voyn_lease_client connect_timeout=5"
-REPO=/home/voynadmin/aicc-preprod/repo
-LOG=/home/voynadmin/aicc-preprod/lease_reap.log
-cd "$REPO"
+# Overridable so a test can point both at a scratch directory without
+# touching the real production paths.
+IDENTITY_REPO="${IDENTITY_REPO:-/home/voynadmin/aicc-preprod/lease-reap-identity}"
+LOG="${LOG:-/home/voynadmin/aicc-preprod/lease_reap.log}"
 
 ts() { date -u +%FT%TZ; }
+
+if [ ! -d "$IDENTITY_REPO/.git" ]; then
+  mkdir -p "$IDENTITY_REPO"
+  git -C "$IDENTITY_REPO" init -q -b lease-reaper
+  git -c user.name=lease-reaper -c user.email=lease-reaper@localhost \
+      -C "$IDENTITY_REPO" commit -q --allow-empty -m "lease-reaper identity anchor"
+fi
+cd "$IDENTITY_REPO"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "$(ts) FATAL: jq not found on PATH -- reap cannot run" >>"$LOG"
