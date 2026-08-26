@@ -33,9 +33,10 @@ def client() -> TestClient:
 
 
 class FakeReadStore:
-    def __init__(self, items=None, item=None):
+    def __init__(self, items=None, item=None, metrics=None):
         self.items = items or []
         self.item = item
+        self.metrics = metrics or []
         self.calls = []
 
     def list_items(self, *, queue=None, state=None, limit=100):
@@ -45,6 +46,10 @@ class FakeReadStore:
     def get_item(self, work_item_id):
         self.calls.append(("get", work_item_id))
         return self.item
+
+    def queue_metrics(self, *, queue=None):
+        self.calls.append(("metrics", queue))
+        return self.metrics
 
 
 class FakeWriteStore:
@@ -59,7 +64,10 @@ class FakeWriteStore:
 # -- read authentication wiring (what routing coverage cannot see) ------------
 
 
-@pytest.mark.parametrize("path", ["/api/v1/queue/items", "/api/v1/queue/items/wki_1"])
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/queue/items", "/api/v1/queue/items/wki_1", "/api/v1/queue/metrics"],
+)
 def test_a_read_refused_by_the_platform_is_a_401_here(client, monkeypatch, path):
     """The GETs must consult `routing.authenticate` — reads are outside the
     mutating table, so their gate is this dependency and nothing else."""
@@ -72,7 +80,10 @@ def test_a_read_refused_by_the_platform_is_a_401_here(client, monkeypatch, path)
     assert client.get(path).status_code == 401
 
 
-@pytest.mark.parametrize("path", ["/api/v1/queue/items", "/api/v1/queue/items/wki_1"])
+@pytest.mark.parametrize(
+    "path",
+    ["/api/v1/queue/items", "/api/v1/queue/items/wki_1", "/api/v1/queue/metrics"],
+)
 def test_every_read_authenticates_exactly_once(client, monkeypatch, path):
     seen = []
     monkeypatch.setattr(routing, "authenticate", lambda request: seen.append(path))
@@ -107,6 +118,38 @@ def test_item_detail_and_404(client, monkeypatch):
 
     monkeypatch.setattr(qmod, "_read_store", lambda: FakeReadStore(item=None))
     assert client.get("/api/v1/queue/items/wki_nope").status_code == 404
+
+
+def test_metrics_envelope_carries_the_schema_version(client, monkeypatch):
+    rows = [
+        {
+            "queue": "execution",
+            "ready": 3,
+            "claimed": 1,
+            "succeeded": 120,
+            "dead": 2,
+            "oldest_ready_seconds": 12.5,
+            "stale_claims": 0,
+        }
+    ]
+    store = FakeReadStore(metrics=rows)
+    monkeypatch.setattr(qmod, "_read_store", lambda: store)
+    response = client.get("/api/v1/queue/metrics")
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": qmod.QUEUE_METRICS_SCHEMA_VERSION,
+        "queues": rows,
+    }
+    assert store.calls == [("metrics", None)]
+
+
+def test_metrics_passes_the_queue_filter_through(client, monkeypatch):
+    store = FakeReadStore(metrics=[])
+    monkeypatch.setattr(qmod, "_read_store", lambda: store)
+    response = client.get("/api/v1/queue/metrics?queue=execution")
+    assert response.status_code == 200
+    assert response.json()["queues"] == []
+    assert store.calls == [("metrics", "execution")]
 
 
 # -- the audit enqueue (S4 start) ---------------------------------------------

@@ -12,6 +12,12 @@ protocol function calls, so handing it to an HTTP layer cannot widen the
 mutation surface. Rows travel as plain dicts because their one consumer is a
 JSON serializer; a dataclass here would be a second copy of the view's own
 column contract.
+
+`queue_metrics()` (VOYN-W0-AICC-SRV-08, worker-telemetry-contract) is the
+same read grant aggregated instead of listed: per-queue state counts, backlog
+age and stale-claim count for a monitoring consumer, versioned via
+`QUEUE_METRICS_SCHEMA_VERSION` the same way the queue's INPUT contract is
+versioned in `command_center/worker/payloads.py`.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-__all__ = ["WorkQueueReadStore"]
+__all__ = ["QUEUE_METRICS_SCHEMA_VERSION", "WorkQueueReadStore"]
 
 _ITEM_COLUMNS = (
     "work_item_id, queue, idempotency_key, task_id, repository_id, priority, "
@@ -34,6 +40,23 @@ _ATTEMPT_COLUMNS = (
 )
 
 _STATES = frozenset({"ready", "claimed", "succeeded", "dead"})
+
+# Versioned the same way `payloads.py` versions the queue's INPUT contract
+# (`AGENT_RUN_SCHEMA_VERSION`): this is the OUTPUT contract a monitoring
+# consumer pins against. Bump on any shape change so a dashboard built
+# against v1 fails loudly on an unrecognised v2 instead of silently
+# misreading renamed or reordered fields.
+QUEUE_METRICS_SCHEMA_VERSION = 1
+
+_METRICS_COLUMNS = (
+    "queue",
+    "ready",
+    "claimed",
+    "succeeded",
+    "dead",
+    "oldest_ready_seconds",
+    "stale_claims",
+)
 
 
 def _rows_to_dicts(columns: str, rows: list[tuple]) -> list[dict[str, Any]]:
@@ -129,3 +152,52 @@ class WorkQueueReadStore:
                             json.loads(value) if isinstance(value, str) else value
                         )
         return item
+
+    def queue_metrics(self, *, queue: str | None = None) -> list[dict[str, Any]]:
+        """Per-queue operational telemetry: one row per queue, newest facts
+        computed server-side so the answer is exact under a client clock
+        skewed from the database's own ``now()``.
+
+        ``stale_claims`` counts items whose current attempt's lease has
+        already expired (``visible_until < now()``) but which the reaper
+        (SRV-06) has not yet swept back to ``ready`` or ``dead`` — the same
+        condition the lease-refusal incident this task exists to retry after
+        (VOYN-W0-AICC-LEASE-STUCK-EXPIRED-NO-RECLAIM) left invisible until an
+        operator went looking by hand. A queue with a persistently nonzero
+        count here means the reap sweep is not running, not merely that one
+        worker is momentarily busy.
+
+        ``oldest_ready_seconds`` is ``None`` when nothing is waiting — the
+        healthy steady state, not a missing measurement.
+        """
+        sql = (
+            "SELECT i.queue, "
+            "count(*) FILTER (WHERE i.state = 'ready') AS ready, "
+            "count(*) FILTER (WHERE i.state = 'claimed') AS claimed, "
+            "count(*) FILTER (WHERE i.state = 'succeeded') AS succeeded, "
+            "count(*) FILTER (WHERE i.state = 'dead') AS dead, "
+            "EXTRACT(EPOCH FROM (now() - min(i.available_at) "
+            "    FILTER (WHERE i.state = 'ready'))) AS oldest_ready_seconds, "
+            "count(*) FILTER (WHERE i.state = 'claimed' AND a.visible_until < now()) "
+            "    AS stale_claims "
+            "FROM work_item_public i "
+            "LEFT JOIN work_attempt_public a ON a.attempt_id = i.current_attempt_id"
+        )
+        params: list[Any] = []
+        if queue is not None:
+            sql += " WHERE i.queue = %s"
+            params.append(queue)
+        sql += " GROUP BY i.queue ORDER BY i.queue"
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+        out = []
+        for row in rows:
+            entry = dict(zip(_METRICS_COLUMNS, row, strict=True))
+            oldest = entry["oldest_ready_seconds"]
+            entry["oldest_ready_seconds"] = (
+                None if oldest is None else round(float(oldest), 3)
+            )
+            out.append(entry)
+        return out
