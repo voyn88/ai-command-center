@@ -2146,3 +2146,29 @@ def test_a_dead_verification_falls_back_to_remediation(rig, monkeypatch):  # noq
         app_factory, "/tmp", enqueue=lambda *a: None,
     )
     assert ("VOYN-W0-DV", "VOYN-W0-DV-REM") in report.remediated
+
+
+def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa: F811
+    """Review of 24c124b (CONFIRMED): per-minute pseudo-random sampling could
+    leave a task unsampled indefinitely. The partition schedule is a
+    GUARANTEE: with N tasks and scan_cap C, cycling through all
+    ceil(N/C) pages examines every task exactly once per cycle."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    ids = [f"VOYN-W0-PG{i:02d}" for i in range(12)]
+    for i, tid in enumerate(ids):
+        _ready(store, app_factory, tid, f"https://github.com/x/y/pull/{200 + i}")
+
+    def fake_gh(argv, repo):
+        return sp.CompletedProcess(argv, 1, "", "always fails -> pure skip")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    seen: set[str] = set()
+    for page in range(3):  # ceil(12 / 5) = 3 pages
+        monkeypatch.setattr(review_merge.time, "time", lambda p=page: p * 300)
+        report = publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=5, scan_cap=5)
+        )
+        seen |= {task_id for task_id, _ in report.skipped}
+    assert seen == set(ids)  # every task examined within one full cycle
