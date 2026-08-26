@@ -8,6 +8,16 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — a real revoke lever for native gateway device tokens (`VOYN-W0-AICC-SRV-02b`)
+- `native_gateway.provision revoke --registry <file> --device-id <id> --reason
+  <text>`: disables a device token and appends an audit entry (who, why,
+  when). Previously the only way to disable a device was hand-editing the
+  registry JSON — the check honored `disabled` immediately (no cache), but
+  there was no operator-facing lever to set it and no audit trail, despite
+  `native_gateway/auth.py` documenting "revocation with audit trail."
+  Idempotent, matching `identity_revoke_principal()`'s contract on the
+  Postgres side of this same protocol.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
