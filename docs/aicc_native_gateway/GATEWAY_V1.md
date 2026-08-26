@@ -92,6 +92,17 @@ The client lane `codex/aicc-native-phase0` owns `clients/aicc-native/**` and
    the client lane; whichever way that lands, the schema-compat tests here
    pin the served shape until a deliberate, reviewed change.
 
+## AIOS boundary note (`native_gateway/auth.py`)
+
+Device-token verification is deliberately a **placeholder**, mirroring the
+already-frozen `command_center/companion/auth.py` precedent in
+`AIOS_BOUNDARY_BASELINE.json`: no roles, no policy engine, no session store —
+one hashed-token registry lookup gating a read-only projection. Per
+ADR-0008/AC-01 the real identity capability belongs in AIOS; when AIOS
+Identity (VOYN-W0-F4) exposes a device-credential contract, this module
+converges onto it and its baseline entry shrinks away. Growing this file into
+anything more than token verification is prohibited by the boundary gate.
+
 ## Command Gateway (future, out of v1)
 
 No write route exists in v1. Requirements for the future command surface are

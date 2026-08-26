@@ -160,6 +160,9 @@
     "command_center/worktree_launcher.py": [
       "orchestration"
     ],
+    "native_gateway/auth.py": [
+      "authz"
+    ],
     "scripts/daily_audit_daemon.py": [
       "audit",
       "orchestration"
