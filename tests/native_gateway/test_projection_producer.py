@@ -40,17 +40,21 @@ _TASKS = [
 ]
 
 
-def _seed_root(tmp_path: Path) -> Path:
+def _seed_root(tmp_path: Path, monkeypatch) -> Path:
     root = tmp_path / "aicc"
     (root / "data").mkdir(parents=True)
     (root / "data/tasks.json").write_text(
         json.dumps(_TASKS, ensure_ascii=False), encoding="utf-8"
     )
+    # The repository-wide conftest redirects AICC_DATA_DIR to a shared temp
+    # directory; pin it to this seeded root so the producer reads exactly the
+    # state built here (and local hermetic runs behave identically to CI).
+    monkeypatch.setenv("AICC_DATA_DIR", str(root / "data"))
     return root
 
 
-def test_build_projection_maps_tasks_and_projects(tmp_path):
-    root = _seed_root(tmp_path)
+def test_build_projection_maps_tasks_and_projects(tmp_path, monkeypatch):
+    root = _seed_root(tmp_path, monkeypatch)
     projection = build_projection(root)
 
     assert projection["projection_version"] == "1"
@@ -73,15 +77,15 @@ def test_build_projection_maps_tasks_and_projects(tmp_path):
     assert projects["beta"]["state"] == "idle"
 
 
-def test_revision_is_stable_for_identical_state(tmp_path):
-    root = _seed_root(tmp_path)
+def test_revision_is_stable_for_identical_state(tmp_path, monkeypatch):
+    root = _seed_root(tmp_path, monkeypatch)
     first = build_projection(root)
     second = build_projection(root)
     assert first["revision"] == second["revision"]
 
 
-def test_round_trip_through_gateway_source(tmp_path):
-    root = _seed_root(tmp_path)
+def test_round_trip_through_gateway_source(tmp_path, monkeypatch):
+    root = _seed_root(tmp_path, monkeypatch)
     out = tmp_path / "artifact/projection.json"
     write_projection(root, out)
 
@@ -97,9 +101,9 @@ def test_round_trip_through_gateway_source(tmp_path):
     assert snapshot.revision == json.loads(out.read_text())["revision"]
 
 
-def test_artifact_survives_gateway_redaction_cleanly(tmp_path):
+def test_artifact_survives_gateway_redaction_cleanly(tmp_path, monkeypatch):
     """A normal producer artifact must not trip the redaction boundary."""
-    root = _seed_root(tmp_path)
+    root = _seed_root(tmp_path, monkeypatch)
     out = tmp_path / "projection.json"
     write_projection(root, out)
     settings = GatewaySettings(projection_path=out, token_file=tmp_path / "unused")
