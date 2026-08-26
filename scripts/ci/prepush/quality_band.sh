@@ -19,9 +19,16 @@
 # missing .venv therefore defer to CI instead of blocking the push - the
 # band must never be able to reduce coverage, only to fail sooner.
 #
+# TRUST BOUNDARY (v2): this script is for contexts that already execute the
+# tree's own code -- an interactive writer (`make prepush`) or the agent's
+# sandboxed run. `publish_run` deliberately does NOT execute it (it is
+# candidate content in that credentialed context -- verification finding on
+# 254154a); the publish side runs only the non-executing ruff gate from the
+# worker's trusted interpreter (`_static_quality_gate` in
+# command_center/orchestrator/publish.py).
+#
 # VOYN_QUALITY_BAND=off bypasses the band; the bypass is printed, never
-# silent. VOYN_QUALITY_BAND_BASE overrides the selection base (publish_run
-# passes its pinned base SHA so selection matches the exact publish diff).
+# silent. VOYN_QUALITY_BAND_BASE overrides the selection base.
 set -uo pipefail
 cd "$(dirname "$0")/../../.."
 

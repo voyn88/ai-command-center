@@ -481,81 +481,85 @@ def test_stale_hook_identity_fails_closed_without_pushing(repo, monkeypatch):
     assert "backlog" not in out  # never pushed
 
 
-# --- pre-push quality band (VOYN-W0-AICC-PREPUSH-FAST-GATE) ---------------
-# The band script is repo-content: absent in every fixture repo above, so all
-# earlier tests double as the "no band script -> phase skipped" case.
+# --- pre-push static quality gate (VOYN-W0-AICC-PREPUSH-FAST-GATE v2) -------
+# v1 executed scripts/ci/prepush/quality_band.sh FROM the candidate worktree
+# inside publish_run's credentialed context; independent verification on head
+# 254154a rejected that as candidate-controlled host command execution (and
+# its env `setdefault` as an inherited-env override of the validated base).
+# v2 runs only ruff — parse + lint, candidate tree strictly as data — from
+# the worker's own trusted interpreter. Opt-in is the scripts/ci/prepush/
+# directory: absent in the plain fixture repos above, so every earlier test
+# doubles as the opt-out case.
 
 
-def _install_band(work, body):
-    band = work / "scripts" / "ci" / "prepush" / "quality_band.sh"
-    band.parent.mkdir(parents=True)
-    band.write_text(body)
-    band.chmod(0o755)
+def _opt_in(work):
+    d = work / "scripts" / "ci" / "prepush"
+    d.mkdir(parents=True)
+    (d / ".keep").write_text("")
     _git(work, "add", ".")
-    _git(work, "commit", "-m", "band")
+    _git(work, "commit", "-m", "opt in")
 
 
-def test_quality_band_failure_refuses_publish_before_lease(repo, monkeypatch):
+def test_static_gate_refuses_red_tree_before_lease(repo, monkeypatch):
     work, bin_, calls = repo
     _with_path(bin_, monkeypatch)
-    marker = work.parent / "band.ran"
-    _install_band(
-        work,
-        f'#!/bin/sh\ntouch {marker}\n'
-        'echo "QUALITY_BAND: fail phase=tests"\nexit 1\n',
-    )
-    (work / "change.txt").write_text("x\n")
+    _opt_in(work)
+    (work / "bad.py").write_text("def broken(:\n")
     _git(work, "add", ".")
-    _git(work, "commit", "-m", "work")
+    _git(work, "commit", "-m", "red")
 
     r = publish_run(work, _cfg(bin_))
 
     assert not r.ok
     assert r.reason.startswith("quality_band_failed:")
-    assert "fail phase=tests" in r.reason
-    assert marker.exists()
-    # A red band must cost zero lease traffic and zero gh traffic: it runs
-    # before acquire, so the calls log was never written.
+    # A red gate must cost zero lease and zero gh traffic: it runs before
+    # acquire, so the calls log was never written.
     assert not calls.exists()
 
 
-def test_quality_band_pass_publishes_and_pins_selection_base(repo, monkeypatch):
+def test_static_gate_passes_clean_tree(repo, monkeypatch):
     work, bin_, _ = repo
     _with_path(bin_, monkeypatch)
-    envfile = work.parent / "band.base"
-    _install_band(
-        work, f'#!/bin/sh\necho "$VOYN_QUALITY_BAND_BASE" > {envfile}\nexit 0\n'
-    )
-    (work / "change.txt").write_text("x\n")
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
     _git(work, "add", ".")
-    _git(work, "commit", "-m", "work")
-    base_sha = subprocess.run(
-        ["git", "rev-parse", "origin/main"],
-        cwd=work,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    _git(work, "commit", "-m", "clean")
 
     r = publish_run(work, _cfg(bin_))
 
     assert r.ok, r.reason
-    # publish_run hands the band its own resolved base so test selection
-    # matches the exact diff being published.
-    assert envfile.read_text().strip() == base_sha
 
 
-def test_quality_band_env_bypass_reaches_the_script(repo, monkeypatch):
+def test_candidate_band_script_is_never_executed_by_publish(repo, monkeypatch):
+    """THE regression test for the verification findings on 254154a: a
+    worktree-resident band script is candidate content and must never run in
+    publish_run's credentialed context, and no inherited environment value
+    may steer the gate."""
     work, bin_, _ = repo
     _with_path(bin_, monkeypatch)
-    # Fails unless the caller's VOYN_QUALITY_BAND=off made it through: the
-    # bypass is the script's decision (it prints it), publish only inherits.
-    _install_band(
-        work, '#!/bin/sh\n[ "$VOYN_QUALITY_BAND" = "off" ] && exit 0\nexit 1\n'
-    )
-    (work / "change.txt").write_text("x\n")
+    marker = work.parent / "candidate-script.ran"
+    band = work / "scripts" / "ci" / "prepush" / "quality_band.sh"
+    band.parent.mkdir(parents=True)
+    band.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+    band.chmod(0o755)
+    (work / "ok.py").write_text("X = 1\n")
     _git(work, "add", ".")
-    _git(work, "commit", "-m", "work")
+    _git(work, "commit", "-m", "with candidate band script")
+    monkeypatch.setenv("VOYN_QUALITY_BAND_BASE", "garbage-that-must-not-matter")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+    assert not marker.exists(), "candidate script executed in publish context"
+
+
+def test_static_gate_env_off_is_an_operator_bypass(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "bad.py").write_text("def broken(:\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "red")
     monkeypatch.setenv("VOYN_QUALITY_BAND", "off")
 
     r = publish_run(work, _cfg(bin_))
@@ -564,8 +568,9 @@ def test_quality_band_env_bypass_reaches_the_script(repo, monkeypatch):
 
 
 def test_real_band_script_defers_without_venv_and_honours_bypass(tmp_path):
-    """The committed quality_band.sh itself: venv-less hosts defer to CI
-    (exit 0, printed) and VOYN_QUALITY_BAND=off is a printed bypass."""
+    """The committed quality_band.sh itself (interactive/agent-side use):
+    venv-less hosts defer to CI (exit 0, printed) and VOYN_QUALITY_BAND=off
+    is a printed bypass."""
     import pathlib
 
     script = (

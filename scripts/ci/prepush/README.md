@@ -11,13 +11,20 @@ impacted run would have caught (measured 2026-08-26: 22% of recent PR CI runs
 red, failures almost entirely in the pytest shard jobs), and every red run
 costs an agent a full diagnose → fix → new SHA → CI → review cycle.
 
-## Where it runs
+## Where it runs — and the trust boundary
 
-- `publish_run` (`command_center/orchestrator/publish.py`) invokes it in the
-  worktree before acquiring the push lease. A failing band refuses the publish
-  with `reason=quality_band_failed: …`, so agents get the verdict in about a
-  minute instead of a CI round-trip later.
-- Interactive writers: `make prepush`.
+- Interactive writers: `make prepush` (the full band, including the
+  impacted-test phases — a human running their own code).
+- The agent's own sandboxed run is the other place candidate tests execute.
+- `publish_run` (`command_center/orchestrator/publish.py`) does **not**
+  execute this script: in that credentialed worker context the worktree is
+  candidate content, and executing it would be candidate-controlled host
+  command execution (verification finding on head `254154a`). The publish
+  side instead runs `_static_quality_gate` — ruff (parse + lint, catches
+  syntax errors) from the worker's own trusted interpreter with explicit
+  argv and a minimal explicit env, treating the tree strictly as data. A red
+  gate refuses the publish with `reason=quality_band_failed: …` before the
+  lease is acquired.
 
 ## What it is not
 
