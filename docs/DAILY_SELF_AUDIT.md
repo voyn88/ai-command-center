@@ -66,12 +66,55 @@ python scripts/daily_audit_daemon.py --reset-circuit
 ```
 
 `deploy/com.ai-command-center.daily-audit.plist` is a launchd template. Replace
-`__ROOT__`, `__PYTHON__`, `__PATH__` and `__DATA_DIR__` with absolute paths
-before installing it. `AICC_DATA_DIR` must be the same directory used by the
-Streamlit application; otherwise campaigns run correctly but cannot appear in
-the application UI. The
-process is kept alive, while the SQLite due time and lease ensure that only one
-campaign is dispatched per day and that another host cannot duplicate it.
+`__ROOT__`, `__PYTHON__`, `__PATH__`, `__DATA_DIR__` and `__RUN_AS_USER__` with
+absolute paths (and the account that owns the repository and its Git
+credentials) before installing it. `AICC_DATA_DIR` must be the same directory
+used by the Streamlit application; otherwise campaigns run correctly but
+cannot appear in the application UI. The process is kept alive, while the
+SQLite due time and lease ensure that only one campaign is dispatched per day
+and that another host cannot duplicate it.
+
+The plist must be installed as a **LaunchDaemon in the `system` domain**, not
+as a LaunchAgent in the per-user `gui/<uid>` domain. A `gui/<uid>` agent only
+runs while that user has an active, logged-in Aqua session — i.e. autonomy
+would literally require the laptop to be open and unlocked, contradicting
+`scripts/daily_audit_daemon.py`'s own "long-lived headless host" design.
+Bootstrapping into `system` instead runs the service at boot regardless of
+any GUI login, while `UserName` keeps it executing as the repository owner
+so file and Git-credential permissions still line up:
+
+```text
+sudo cp deploy/com.ai-command-center.daily-audit.plist \
+    /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl bootstrap system \
+    /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl enable system/com.ai-command-center.daily-audit
+```
+
+Status can be inspected without `sudo` via `launchctl print
+system/com.ai-command-center.daily-audit`, which is what
+`daily_audit_panel.launch_agent_status()` shells out to for the UI's service
+indicator.
+
+### Migrating an existing `gui/<uid>` LaunchAgent installation
+
+Any host that installed the service before this migration has it bootstrapped
+as a per-user LaunchAgent instead. The UI now reports that installation as
+"legacy agent active, migration required" rather than "not installed" (it
+still probes `gui/<uid>` as a fallback after the `system` domain lookup
+fails), but the legacy copy must be explicitly removed — otherwise both the
+old LaunchAgent and the new LaunchDaemon can end up running the daemon at the
+same time, doubling dispatch against the same SQLite lease. To migrate:
+
+```text
+launchctl bootout gui/$(id -u)/com.ai-command-center.daily-audit
+rm -f ~/Library/LaunchAgents/com.ai-command-center.daily-audit.plist
+```
+
+Then install the LaunchDaemon as shown above. After migration, `launchctl
+print gui/$(id -u)/com.ai-command-center.daily-audit` should report no such
+service, and the UI should show "работает" (running under `system`) instead
+of the legacy-agent warning.
 
 ## Safety and recovery contract
 

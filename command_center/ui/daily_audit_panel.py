@@ -24,25 +24,52 @@ def _local_time(value: str | None) -> str:
         return value
 
 
-def launch_agent_status(label: str = LAUNCH_AGENT_LABEL) -> tuple[bool, str]:
-    """Read launchd state without changing or restarting the service."""
-    launchctl = shutil.which("launchctl")
-    if launchctl is None:
-        return False, "launchd недоступен"
+def _launchctl_print(launchctl: str, target: str) -> subprocess.CompletedProcess | None:
     try:
-        result = subprocess.run(
-            [launchctl, "print", f"gui/{os.getuid()}/{label}"],
+        return subprocess.run(
+            [launchctl, "print", target],
             capture_output=True,
             text=True,
             check=False,
             timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def launch_agent_status(label: str = LAUNCH_AGENT_LABEL) -> tuple[bool, str]:
+    """Read launchd state without changing or restarting the service.
+
+    The service is bootstrapped into the ``system`` domain (a LaunchDaemon),
+    not the per-user ``gui/<uid>`` domain: a GUI-domain agent only runs while
+    that user has an active, logged-in Aqua session, which would make
+    autonomous operation depend on the laptop being open and unlocked.
+
+    Installations from before that migration are still bootstrapped as a
+    ``gui/<uid>`` LaunchAgent. If the ``system`` domain has no entry, this
+    falls back to checking for that legacy agent so an unmigrated host reads
+    as "legacy agent active" instead of silently "not installed" (see
+    docs/DAILY_SELF_AUDIT.md for the migration steps).
+    """
+    launchctl = shutil.which("launchctl")
+    if launchctl is None:
+        return False, "launchd недоступен"
+    result = _launchctl_print(launchctl, f"system/{label}")
+    if result is None:
         return False, "статус недоступен"
-    if result.returncode != 0:
-        return False, "не установлен"
-    running = "\n\tstate = running\n" in result.stdout
-    return running, "работает" if running else "установлен, но не запущен"
+    if result.returncode == 0:
+        running = "\n\tstate = running\n" in result.stdout
+        return running, "работает" if running else "установлен, но не запущен"
+
+    legacy = _launchctl_print(launchctl, f"gui/{os.getuid()}/{label}")
+    if legacy is not None and legacy.returncode == 0:
+        running = "\n\tstate = running\n" in legacy.stdout
+        return running, (
+            "работает через устаревший gui-агент, требуется миграция"
+            if running
+            else "устаревший gui-агент установлен, но не запущен — требуется миграция"
+        )
+    return False, "не установлен"
 
 
 def _latest_daily_runs(db_path: Path) -> list[dict]:
@@ -74,7 +101,14 @@ def render_daily_audit_page(db_path: Path) -> None:
     cols[2].metric("Следующий запуск", _local_time(status.get("next_run_at")))
     cols[3].metric("Последний результат", campaigns[0]["status"] if campaigns else "—")
 
-    if not agent_running:
+    if "требуется миграция" in agent_label:
+        st.warning(
+            "Обнаружен устаревший gui-агент (launchd-сервис, установленный в "
+            "домене пользователя). Выполните миграцию на system-LaunchDaemon "
+            "по инструкции в docs/DAILY_SELF_AUDIT.md, иначе старая и новая "
+            "версии сервиса могут запуститься одновременно."
+        )
+    elif not agent_running:
         st.error(
             "Фоновый launchd-сервис не работает. Ручной запрос сохранится, "
             "но не будет обработан до запуска сервиса."
