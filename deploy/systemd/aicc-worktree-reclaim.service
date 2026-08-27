@@ -1,0 +1,45 @@
+# The one-time, auditable worktree reclaim sweep (VOYN-W0-AICC-WORKTREE-LEAK):
+# reclaims leaked worktree *directories* that `aicc-worktree-prune.timer`
+# cannot touch, because that sweep only reconciles `.git/worktrees/<name>`
+# metadata for a worktree whose directory is already gone — it never removes
+# a directory that is still sitting on disk.
+#
+# Deliberately no paired `.timer`: this is an operator-triggered, one-off
+# sweep, not unattended hygiene. Run it manually, review the audit log
+# (`/var/log/aicc-worktree-reclaim/worktree-reclaim.jsonl`, provisioned by
+# `LogsDirectory=` below), then re-run with `--apply` once satisfied — see
+# `command_center/worktree_reclaim.py` for what "reclaimable" means (clean,
+# unleased, HEAD commit older than `--min-age-days`) and why every other
+# candidate is left alone.
+#
+# Usage (dry run first, always):
+#   systemctl start aicc-worktree-reclaim.service
+#   journalctl -u aicc-worktree-reclaim.service   # or read the audit log directly
+#   # once satisfied nothing flagged should be kept:
+#   /opt/aicc/.venv/bin/python -m command_center.worktree_reclaim --apply \
+#       --audit-log /var/log/aicc-worktree-reclaim/worktree-reclaim.jsonl
+#
+# Identity/sandboxing mirrors aicc-worktree-prune.service: same user
+# (needs read/write on the configured repositories' worktrees, not a
+# database credential), same hardening.
+
+[Unit]
+Description=AI Command Center worktree reclaim sweep (dry run — see comments for --apply)
+After=network.target
+
+[Service]
+Type=oneshot
+User=aicc-worker
+Group=aicc-worker
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.worktree_reclaim \
+    --audit-log /var/log/aicc-worktree-reclaim/worktree-reclaim.jsonl
+TimeoutStartSec=300s
+
+LogsDirectory=aicc-worktree-reclaim
+LogsDirectoryMode=0700
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
