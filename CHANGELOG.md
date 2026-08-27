@@ -8,6 +8,33 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — authenticated OTLP export (`VOYN-W0-AICC-SRV-08-OTLP-AUTH`)
+
+- `command_center/otlp/` — a client for AICC's own metrics/logs/traces export
+  that admits exactly two states, export-off and export-authenticated: no
+  endpoint means no client is built, and a configured endpoint without a
+  credential refuses to start. Closes the exposure of an OTLP receiver whose
+  only protection was binding to `127.0.0.1`, which is not a boundary once a
+  worker and collector are on different hosts.
+- `command_center/otlp/credential.py` — the bearer token comes from a file
+  (`AICC_OTLP_TOKEN_FILE`), never an environment variable AICC's spawned
+  agent subprocesses would inherit; mode 0600/0400 enforced on load and every
+  re-read, re-read on change so a rotated token is picked up without a
+  restart.
+- `command_center/otlp/config.py` — `https` required except for a loopback
+  host (matching the tunnel topology `AICC_PG_SSLMODE` already exempts); no
+  `AICC_OTLP_INSECURE` escape hatch exists, pinned by
+  `tests/otlp/test_config.py::test_there_is_no_switch_that_disables_authentication`.
+- `command_center/otlp/transport.py` — no redirect or proxy handlers
+  (a token must not travel to a `Location` header's target or an inherited
+  `http_proxy`); a 401/403 forces one credential re-read before it is raised
+  as the distinct, non-transient `OtlpAuthRejected`.
+- `command_center/otlp/cli.py` (`python -m command_center.otlp check`) — posts
+  a telemetry-free empty OTLP payload and reports whether the configured
+  credential is accepted, with a distinct exit code per failure class.
+- `docs/operations/OTLP_INGEST_AUTH.md` — the deployment and verification
+  procedure.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
