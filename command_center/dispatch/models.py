@@ -20,6 +20,7 @@ ASSIGNED = "assigned"
 
 # Deferred (stays queued). Each is a *typed* reason, never force-run.
 DEFER_KILL_SWITCH = "kill_switch_engaged"
+DEFER_COST_DATA_UNAVAILABLE = "cost_data_unavailable"
 DEFER_DAILY_BUDGET = "daily_budget_exhausted"
 DEFER_AGENT_BUDGET = "agent_budget_exceeded"
 DEFER_PROJECT_BUDGET = "project_budget_exceeded"
@@ -30,6 +31,7 @@ DEFER_NO_AVAILABLE_EXECUTOR = "no_available_executor"
 DEFER_REASONS = frozenset(
     {
         DEFER_KILL_SWITCH,
+        DEFER_COST_DATA_UNAVAILABLE,
         DEFER_DAILY_BUDGET,
         DEFER_AGENT_BUDGET,
         DEFER_PROJECT_BUDGET,
@@ -45,6 +47,11 @@ REASON_EXPLANATIONS: dict[str, str] = {
     ASSIGNED: "Assigned to the cheapest eligible executor within budget.",
     DEFER_KILL_SWITCH: (
         "Kill switch engaged (master switch off): no automatic dispatch."
+    ),
+    DEFER_COST_DATA_UNAVAILABLE: (
+        "Trailing-24h spend could not be read: dispatch is refused until cost "
+        "data is available again, so budget guardrails can never be silently "
+        "bypassed by a database outage."
     ),
     DEFER_DAILY_BUDGET: (
         "Assigning any eligible executor would exceed the daily spend budget."
@@ -288,6 +295,10 @@ class DispatchPlan:
     daily_spend_usd: float
     max_daily_spend_usd: float
     projected_spend_usd: float
+    # True when the trailing-24h spend could not be read (e.g. a DB outage):
+    # dispatch is refused wholesale rather than guessing a spend figure that a
+    # zero/unset daily cap or a free executor could silently sail past.
+    budget_unknown: bool = False
 
     @property
     def assignments(self) -> tuple[DispatchDecision, ...]:
@@ -307,6 +318,7 @@ class DispatchPlan:
         remaining = self.budget_remaining_usd
         return {
             "kill_switch_engaged": self.kill_switch_engaged,
+            "budget_unknown": self.budget_unknown,
             "daily_spend_usd": self.daily_spend_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,

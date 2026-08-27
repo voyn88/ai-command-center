@@ -26,6 +26,8 @@ a property already covered directly in `test_completion_scenarios.py`.
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from command_center import (
@@ -513,3 +515,46 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     )
     ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert [d.task_id for d in ungated.launched()] == ["s"]
+
+
+def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeypatch, caplog):
+    """A `jsonb`-backed read (the PostgreSQL mirror, VOYN-W0-AICC-SRV-01B) hands
+    back a `payload` that is already a decoded `dict`, not JSON text, and
+    `json.loads(dict)` raises `TypeError`. A prior version caught `TypeError`
+    alongside `ValueError` and silently `continue`d — every row in the batch
+    was dropped with no error and no log line, so the spend cap read 0 and
+    stopped gating without ever saying so. A dict-shaped row must be summed
+    like any other, and a genuinely malformed JSON-text row must be skipped
+    *and logged*, without knocking out the well-formed rows around it."""
+
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor(self._rows)
+
+    rows = [
+        {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
+        {"payload": {"type": "result", "total_cost_usd": 3.5}},
+        {"payload": "{not valid json"},
+    ]
+
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn(rows)
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+    with caplog.at_level("WARNING"):
+        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+    assert total == pytest.approx(5.5)
+    assert "unparseable" in caplog.text
