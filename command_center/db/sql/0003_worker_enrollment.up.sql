@@ -87,7 +87,10 @@ CREATE TABLE principal (
     -- The network an operator declared this host will connect from, in
     -- advance. Enforced for worker hosts by `identity_assert()`. Spoofable at
     -- the network layer, so it is a signal that raises the cost of using a
-    -- stolen secret elsewhere and never the only control.
+    -- stolen secret elsewhere and never the only control. This is the
+    -- enforcement VOYN-W0-AICC-SRV-02d found missing against the SRV-02
+    -- design: a declared-but-unchecked column is worse than none, since it
+    -- reads as protection. Closed here, not carried forward from SRV-02.
     expected_cidr inet,
 
     -- Self-referencing: the first principals are bootstrapped with NULL, and
