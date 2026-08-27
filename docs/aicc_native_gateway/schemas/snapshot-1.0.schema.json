@@ -134,6 +134,41 @@
       "title": "Freshness",
       "type": "string"
     },
+    "GoalDTO": {
+      "additionalProperties": false,
+      "description": "Additive in DTO 1.0 \u2014 the earliest unfinished wave's real progress.",
+      "properties": {
+        "done": {
+          "title": "Done",
+          "type": "integer"
+        },
+        "inProgress": {
+          "title": "Inprogress",
+          "type": "integer"
+        },
+        "review": {
+          "title": "Review",
+          "type": "integer"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "total": {
+          "title": "Total",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "title",
+        "done",
+        "total",
+        "inProgress",
+        "review"
+      ],
+      "title": "GoalDTO",
+      "type": "object"
+    },
     "ProjectDTO": {
       "additionalProperties": false,
       "description": "Additive in DTO 1.0 \u2014 calm per-project rollup for the overview.",
@@ -264,6 +299,17 @@
     "generatedAt": {
       "title": "Generatedat",
       "type": "string"
+    },
+    "goal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GoalDTO"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "lanes": {
       "items": {
