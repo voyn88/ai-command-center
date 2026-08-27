@@ -152,6 +152,56 @@ def test_zero_ceiling_means_no_budget_limit():
 
 
 # --------------------------------------------------------------------------
+# Unknown budget (cost data unavailable) blocks everything, like the kill
+# switch — never a simulated spend figure a zero cap or free executor could
+# silently absorb.
+# --------------------------------------------------------------------------
+
+
+def test_budget_unknown_defers_everything_even_with_zero_ceiling():
+    # The exact configuration that used to fail OPEN: no cap configured (the
+    # default) and a free local executor available.
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    tasks = [_task("t1", priority="Critical"), _task("t2", priority="High")]
+    plan = _plan(tasks, executors, policy, max_daily_spend_usd=0.0, budget_unknown=True)
+
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+
+
+def test_budget_unknown_defers_everything_with_a_nonzero_ceiling_and_free_executor():
+    # The other configuration that used to fail OPEN: a real cap is
+    # configured, but the only eligible executor costs $0.0, so "assume the
+    # ceiling is hit" (projected == max) never actually exceeds it.
+    policy = DispatchPolicy(cost_matrix={"ollama": 0.0})
+    executors = [_executor("ollama", cost=0.0)]
+    plan = _plan(
+        [_task("t1")], executors, policy, max_daily_spend_usd=5.0, budget_unknown=True
+    )
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
+
+
+def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        kill_switch_engaged=True,
+        budget_unknown=True,
+    )
+
+    assert plan.kill_switch_engaged is True
+    assert plan.budget_unknown is True
+    assert plan.decisions[0].reason == models.DEFER_KILL_SWITCH
+
+
+# --------------------------------------------------------------------------
 # Kill switch is respected — nothing is assigned while engaged
 # --------------------------------------------------------------------------
 

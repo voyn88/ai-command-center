@@ -64,6 +64,7 @@ No new task store, no new queue, no second completion state machine.
 from __future__ import annotations
 
 import contextlib
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -90,6 +91,8 @@ from command_center.runtime import db as runtime_db
 from command_center.runtime import reports
 from command_center.runtime import scheduler, task_sync
 from command_center.runtime.completion import CompletionPolicy
+
+_LOG = logging.getLogger(__name__)
 
 PIPELINE_LOCK_FILE_NAME = "task_pipeline.lock"
 
@@ -2407,6 +2410,15 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     work started in it). Reads only the final `result` stream events, which are
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
+
+    `payload` may already be a `dict` rather than JSON text — a `jsonb`-backed
+    read (the PostgreSQL mirror this table has, VOYN-W0-AICC-SRV-01B) hands
+    back a decoded object, not a string, and `json.loads` on a `dict` raises
+    `TypeError`. A prior version caught `TypeError` alongside `ValueError` and
+    silently `continue`d past every row, which zeroes the whole sum with no
+    error and no log line — a spend cap that reads 0 stops gating without
+    ever saying so. Only malformed JSON *text* is tolerated (and logged); a
+    row of an unexpected shape is now visible instead of silently dropped.
     """
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
@@ -2425,9 +2437,21 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             (cutoff, cutoff),
         ).fetchall()
     for row in rows:
-        try:
-            payload = _json.loads(row["payload"])
-        except (TypeError, ValueError):
+        payload = row["payload"]
+        if isinstance(payload, (str, bytes, bytearray)):
+            try:
+                payload = _json.loads(payload)
+            except ValueError:
+                _LOG.warning(
+                    "daily_spend_usd: skipping run_event with unparseable payload_json: %r",
+                    payload[:200] if isinstance(payload, str) else payload,
+                )
+                continue
+        if not isinstance(payload, dict):
+            _LOG.warning(
+                "daily_spend_usd: skipping run_event whose payload is a %s, not an object",
+                type(payload).__name__,
+            )
             continue
         cost = payload.get("total_cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
