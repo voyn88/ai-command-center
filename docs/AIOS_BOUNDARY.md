@@ -276,6 +276,33 @@ prohibited, and convergence into AIOS Core remains this subsystem's stated
 end state once the core's dispatch contract (aios ADR-0022) is accepted and
 covers it.
 
+### SRV-02 `principal` — recorded as not placed here (2026-08-27)
+
+`VOYN-W0-AICC-SRV-02` proposed an AICC-local `principal` table as the identity
+registry backing the SRV lane. It is not placed in this repository, and this is
+the decision record, not a deferral.
+
+AIOS already runs a tenant-scoped identity registry — `principals`,
+`auth_principals`, `credentials` — as verified in
+`command_center/db/sql/0002_queue_claim.up.sql` (`grep -rn principal
+--include=*.sql command_center/` returns 0; the table exists in no AICC
+database today). A second, AICC-local `principal` table would be exactly the
+"second principal registry" the `http_auth/identity.py` section above already
+names as the one thing that would turn this repository's authentication seam
+into a genuine violation. The registry belongs where it already lives; SRV-02
+should consume it through a versioned contract when one is needed, the same
+shape `identity.py` already uses for `whoami` — not grow a duplicate here.
+
+This placement decision neither blocks nor is predetermined by
+`VOYN-W0-AICC-SRV-04b` (the queue claim protocol, accepted and merged above).
+SRV-04b's claimant identity is `session_user`, the PostgreSQL role SCRAM
+authenticated at connect time — a fact AICC can establish with no seam and no
+dependency on `principal`, `repo_lease`, or `identity_assert()`. If and when a
+`principal` registry is consumed from AIOS, it joins to
+`work_attempt.claimed_by_role`; it was never a prerequisite for SRV-04b, so
+this record changes nothing about SRV-04b's already-accepted design, and
+SRV-04b's design was never a vote on where SRV-02 belongs either.
+
 ## CI wiring
 
 - The required merge gate already runs these tests: `pytest -q` in
