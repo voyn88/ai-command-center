@@ -250,7 +250,26 @@ def create_run(
     concurrent `create_run(..., enforce_workspace_lock=True)` call for the
     same workspace the way a separate pre-flight query (e.g. `launch_service.
     find_active_run_conflict`) can — raises `WorkspaceLockedError` instead of
-    inserting."""
+    inserting.
+
+    Two scope limits worth stating explicitly, since both have surprised
+    readers before: (1) the key is `repository_path` itself — a resolved
+    filesystem path string, not a canonical repository identity — so the same
+    underlying repository checked out at two different paths (e.g. on two
+    different hosts, or two independent worktrees of one project) is two
+    different, mutually invisible locks; and (2) this row-based lock carries
+    no expiry or heartbeat, so a row this same host's Supervisor process left
+    PREPARED/QUEUED/RUNNING before crashing stays "locked" until something
+    calls `Supervisor.reconcile()` against *this* `db_path` and proves, via a
+    local pid check, that the row is dead — which by construction can only
+    ever happen on the host that created the row (`Supervisor.start_raw`
+    self-heals this by reconciling once and retrying on a same-host
+    conflict — see its docstring). Real cross-host mutual exclusion needs a
+    shared, host-aware lease authority outside this process's own SQLite file
+    (`resolve_db_path`); that capability is deliberately not built here — see
+    the `repo_lease` reference in `command_center/db/sql/0002_queue_claim.
+    up.sql` and `docs/AIOS_BOUNDARY.md` for why this module (the legacy local
+    execution engine) does not grow it itself."""
     if provider_route is not None:
         if not provider_route or any(not item for item in provider_route):
             raise ValueError("provider_route must contain non-empty provider ids")

@@ -1568,6 +1568,72 @@ def test_start_raw_raises_workspace_locked_error_when_workspace_already_active(
         sup.cancel(first["id"], confirmed=True, grace_seconds=2)
 
 
+def test_start_raw_self_heals_a_same_host_crashed_workspace_lock(
+    git_repo, configure_project_repo, fake_claude
+):
+    """A row left RUNNING with no `pid` recorded (the state a crashed
+    Supervisor leaves behind — see `db.create_run`'s `enforce_workspace_lock`
+    docstring) must not permanently occupy the workspace lock on the *same*
+    host: `start_raw` reconciles once and retries before raising
+    `WorkspaceLockedError`, so the very next launch attempt against that
+    workspace self-heals instead of requiring an operator to call
+    `reconcile()` out of band first."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+
+    stale_task = db.create_task(sup.db_path, project="AIOS", title="stale", task_type="implementation")
+    stale_session = db.create_session(
+        sup.db_path, task_id=stale_task["id"], project="AIOS", repository_path=str(git_repo)
+    )
+    stale_run = db.create_run(
+        sup.db_path, session_id=stale_session["id"], task_id=stale_task["id"], project="AIOS",
+        task_type="implementation", repository_path=str(git_repo), prompt="p0", is_resume=False,
+    )
+    stale_run = db.update_run_state(
+        sup.db_path, stale_run["id"], expected_version=stale_run["version"], new_state="QUEUED"
+    )
+    db.update_run_state(
+        sup.db_path, stale_run["id"], expected_version=stale_run["version"], new_state="RUNNING",
+        fields={"pid": None, "process_start_identity": None, "started_at": "2026-01-01T00:00:00"},
+    )
+
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p1", confirmed=True,
+    )
+    try:
+        assert run["state"] == "RUNNING"
+        assert db.get_run(sup.db_path, stale_run["id"])["state"] == "INTERRUPTED"
+    finally:
+        sup.cancel(run["id"], confirmed=True, grace_seconds=2)
+
+
+def test_start_raw_still_raises_workspace_locked_error_when_conflict_is_genuinely_alive(
+    git_repo, configure_project_repo, fake_claude
+):
+    """The self-heal reconcile-and-retry in `start_raw` must not paper over a
+    conflict that is genuinely still active: reconciling a run this same
+    Supervisor instance is actively supervising is a no-op (see
+    `Supervisor.reconcile`'s own `self._active`/`self._launching` guards), so
+    the retry must still lose and raise `WorkspaceLockedError` against the
+    same conflicting run — proving this is a bounded, single retry, not a
+    loop that eventually forces the launch through."""
+    fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    first = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p1", confirmed=True
+    )
+    try:
+        with pytest.raises(supervisor.WorkspaceLockedError) as excinfo:
+            sup.start_raw(
+                project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p2",
+                confirmed=True,
+            )
+        assert excinfo.value.conflicting_run["id"] == first["id"]
+    finally:
+        sup.cancel(first["id"], confirmed=True, grace_seconds=2)
+
+
 def test_start_raw_allows_relaunch_of_same_workspace_after_prior_run_completes(
     git_repo, configure_project_repo, fake_claude
 ):

@@ -780,7 +780,7 @@ class Supervisor:
         if executor_id == providers.CLAUDE_ID:
             _assert_no_forbidden_flags(command)
 
-        try:
+        def _attempt_create_run() -> dict:
             # Keep creation and in-memory ownership registration atomic with
             # `reconcile()`'s active-id snapshot plus active-row query. Without
             # this shared lock, a dashboard refresh can observe the committed
@@ -789,7 +789,7 @@ class Supervisor:
             # The lock covers one short SQLite transaction only; it is released
             # before git inspection or subprocess creation.
             with self._active_lock:
-                run = db.create_run(
+                created = db.create_run(
                     self.db_path,
                     session_id=session_id,
                     task_id=task_id,
@@ -832,11 +832,41 @@ class Supervisor:
                     enforce_workspace_lock=True,
                     max_global_concurrency=max_global_concurrency,
                 )
-                self._launching.add(run["id"])
-        except db.WorkspaceLockedError as exc:
-            raise WorkspaceLockedError(exc.conflicting_run) from exc
-        except db.TaskAlreadyActiveError as exc:
-            raise TaskAlreadyActiveError(exc.conflicting_run) from exc
+                self._launching.add(created["id"])
+                return created
+
+        try:
+            run = _attempt_create_run()
+        except (db.WorkspaceLockedError, db.TaskAlreadyActiveError):
+            # `enforce_workspace_lock` and the per-task lock above have no expiry
+            # or heartbeat (see `db.create_run`'s own docstring): a row left
+            # PREPARED/QUEUED/RUNNING by a Supervisor that crashed on *this* host
+            # occupies its workspace/task lock until something calls
+            # `reconcile()`, which today only runs opportunistically (once at app
+            # startup, or on an open dashboard's refresh tick — see `app.py`'s
+            # `get_execution_center_api`). Rather than requiring every caller of
+            # `start_raw` to remember to reconcile first, self-heal here:
+            # reconcile once (a no-op if the conflicting run is genuinely still
+            # alive) and retry exactly once before surfacing the conflict.
+            #
+            # This does not reach across hosts: `reconcile()` can only prove a
+            # *local* pid is gone, and `repository_path` above is this process's
+            # own resolved path inside its own local `runtime.db`
+            # (`db.resolve_db_path`) — so it cannot detect or clear a lock held
+            # by a Supervisor on a different host against the same repository
+            # checked out at a different path. That requires a shared,
+            # host-aware lease authority (see the `repo_lease` reference in
+            # `command_center/db/sql/0002_queue_claim.up.sql` and the
+            # already-accepted `command_center/worker/worktree_lease.py` pattern
+            # for the queue-dispatch path) and is out of scope for this frozen
+            # local engine (`docs/AIOS_BOUNDARY.md`).
+            self.reconcile()
+            try:
+                run = _attempt_create_run()
+            except db.WorkspaceLockedError as exc:
+                raise WorkspaceLockedError(exc.conflicting_run) from exc
+            except db.TaskAlreadyActiveError as exc:
+                raise TaskAlreadyActiveError(exc.conflicting_run) from exc
 
         # Executor capability preflight (Required fix 5). The decision itself is
         # already persisted on the run row's `capability_*`/`command_policy`
