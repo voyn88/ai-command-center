@@ -8,6 +8,27 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Linux systemd runtime platform proof (`VOYN-W0-AICC-SRV-05-LINUX-VERIFIED`)
+- `tests/ops/test_worker_systemd_runtime_platform.py`: proves, against a real
+  kernel and a real `systemd --user` session (not a mock), the mechanisms the
+  worker unit depends on — `systemd-analyze verify` on both unit files,
+  `Restart=always`/`StartLimitBurst` pacing (a clean `exit(0)` still restarts
+  and still trips the limit), the `KillMode=control-group` vs `KillMode=process`
+  cgroup-kill distinction, `PR_SET_PDEATHSIG`, `MemoryMax` OOM-kill,
+  `TasksMax` EAGAIN, `LimitAS`/`RLIMIT_AS` (a Linux-only guarantee — it does
+  not hold on macOS), seccomp (`SystemCallFilter` kills with `SIGSYS` where
+  DAC alone would return `EPERM`), journald's unforgeable trusted fields,
+  `StateDirectoryMode` landing on disk as declared, and `Type=notify` +
+  `WatchdogSec` aborting a handler that stops petting the watchdog. Each test
+  spawns and tears down its own disposable transient unit; nothing is
+  installed as a system unit or needs root. Self-skips off a live
+  `systemd --user` session.
+- `docs/operations/SRV05_LINUX_SYSTEMD_VERIFICATION.md`: the proof index —
+  11 of 13 runtime-platform properties proven on one host, and the 2 that
+  are cross-host claims (SIGKILL failover consistency, network-partition
+  arbitration) a single host cannot honestly exercise, tracked as follow-up
+  requiring a second real host.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
