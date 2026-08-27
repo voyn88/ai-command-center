@@ -11,6 +11,15 @@
 # The checksum written by aicc_pg_backup.sh is verified before any writes, so a
 # corrupted archive fails while the target database is still empty.
 #
+# This restores ONLY the database named by AICC_PG_DB. It does not and cannot
+# touch the AIOS platform's own database, where AICC's writer lease
+# (repo_lease/repo_lease_event, via the external voyn-lease tool) and task
+# state (tasks/task_events, via aios_sdk) actually live. Restoring over a live
+# cutover window leaves those platform writes in place with no automatic
+# compensating action -- see docs/operations/PLATFORM_ROLLBACK_ASYMMETRY.md
+# for what that means and the manual reconciliation procedure to run around
+# this script during such a window.
+#
 # Usage:
 #   scripts/aicc_pg_restore.sh --archive /var/backups/aicc/aicc-...dump \
 #       --target-db aicc_restore_check [--allow-overwrite] [--jobs 4]
@@ -23,7 +32,7 @@ JOBS="1"
 ALLOW_OVERWRITE=0
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 

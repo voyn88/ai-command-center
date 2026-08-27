@@ -8,6 +8,15 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — platform rollback asymmetry analysis (`VOYN-W0-AICC-SRV-09-PLATFORM-ROLLBACK-ASYMMETRY`)
+- `docs/operations/PLATFORM_ROLLBACK_ASYMMETRY.md`: enumerates exactly what
+  AICC writes into the AIOS platform's own database during a cutover window
+  (the `repo_lease`/`repo_lease_event` writer lease via `voyn-lease`, and
+  `tasks`/`task_events` via `aios_sdk`) that `scripts/aicc_pg_restore.sh`
+  cannot reach or undo, traces the gap to `SRV-02`'s lease-split decision,
+  and defines the manual reconciliation procedure to run around a restore
+  during such a window.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
