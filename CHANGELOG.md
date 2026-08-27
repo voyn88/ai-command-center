@@ -8,6 +8,17 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — SRV-04b two-host acceptance record (`VOYN-W0-AICC-CLAIM-TWO-HOST-ACCEPTED`)
+- `docs/srv04b-two-host-acceptance.md`: records a separate, two-physical-host
+  acceptance pass of the `0002_queue_claim` protocol against
+  `origin/main@f9bb889` — exclusivity under real network jitter (192 attempts
+  across 8 runs, exactly 8 winners), the stale-owner fence under a real
+  userspace network blackhole (`attempt_expired` after 27.45s), cross-host
+  token theft/`SET ROLE` laundering refused by the `session_user` claimant
+  check, and clock independence (0 of 11 protocol functions take a timestamp
+  parameter). Named limit: the database host's OS was not Linux in this pass.
+  `docs/AIOS_BOUNDARY.md` cross-references it from the SRV-04b exception note.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
