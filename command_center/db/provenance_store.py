@@ -166,12 +166,17 @@ RUN_PROVIDER_ROUTE = MirroredTable(
     references={"run_id": "run"},
 )
 
-#: The composite key this slice exists for.
+#: The composite key this slice exists for. `attempt_number` is declared
+#: `integer` (see `0001_initial.up.sql`), the one case in this schema of a key
+#: that mixes a `text` column with a numeric one — `numeric_key_columns` says
+#: so, and `test_text_key_columns_match_the_schemas_declared_types` checks it
+#: against the DDL rather than trusting the comment.
 PROVIDER_ATTEMPT = MirroredTable(
     table="provider_attempt",
     columns=PROVIDER_ATTEMPT_COLUMNS,
     codec=ColumnCodec(timestamps=frozenset({"started_at", "completed_at"})),
     key=("run_id", "attempt_number"),
+    numeric_key_columns=frozenset({"attempt_number"}),
     references={"run_id": "run"},
 )
 

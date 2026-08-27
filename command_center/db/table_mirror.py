@@ -64,10 +64,57 @@ class MirroredTable:
     #: the table simply never mirrors.
     key: str | tuple[str, ...] = "id"
 
+    #: Key columns whose PostgreSQL type is numeric rather than `text`.
+    #:
+    #: Every declared key is `text` except an identity table's own generated
+    #: `id` (`bigint`, handled by `identity` below) and `provider_attempt`'s
+    #: `attempt_number` — the one case this migration has today of a key that
+    #: mixes a text column with a numeric one. The default is empty rather
+    #: than inferred, on the same logic as `references`: a table that gets
+    #: this wrong fails loudly, because PostgreSQL refuses `COLLATE` on a
+    #: numeric type outright (`42P22`), while a *missing* entry here fails
+    #: silently — the key sorts in whatever collation the database happens to
+    #: have, which is `VOYN-W0-AICC-SRV-07e`'s reproduced defect: a
+    #: byte-identical mirror ordered under `COLLATE "und-x-icu"` disagreed
+    #: with SQLite's own `BINARY` order on text keys it never told PostgreSQL
+    #: to compare byte-wise.
+    numeric_key_columns: frozenset[str] = field(default_factory=frozenset)
+
     @property
     def key_columns(self) -> tuple[str, ...]:
         """The key as a tuple, whatever it was declared as."""
         return (self.key,) if isinstance(self.key, str) else tuple(self.key)
+
+    @property
+    def text_key_columns(self) -> tuple[str, ...]:
+        """Key columns whose comparison is collation-sensitive.
+
+        SQLite compares `TEXT` byte-for-byte (`BINARY`, its default and the
+        only collation this schema uses) regardless of the server it runs on.
+        PostgreSQL compares `text` in whatever collation the *database* was
+        created with, which is a per-deployment choice — `initdb
+        --locale-provider=icu` gives every text column ICU ordering, and nothing
+        about this schema opts out of it. Naming these columns is what lets
+        `key_expression` request `COLLATE "C"` explicitly, so the comparison
+        does not depend on that choice.
+
+        An identity table's key is its own generated `bigint`, never `text`,
+        so it is excluded outright rather than requiring every identity table
+        to also declare `numeric_key_columns={"id"}`.
+        """
+        if self.identity:
+            return ()
+        return tuple(name for name in self.key_columns if name not in self.numeric_key_columns)
+
+    def key_expression(self, name: str) -> str:
+        """One key column, `COLLATE "C"`-qualified if its comparison needs it."""
+        return f'{name} COLLATE "C"' if name in self.text_key_columns else name
+
+    @property
+    def key_order_by(self) -> str:
+        """`ORDER BY` targets for every key column, in declaration order."""
+        return ", ".join(self.key_expression(name) for name in self.key_columns)
+
     #: Tables this one references, as `{column: parent table}`.
     #:
     #: Declared rather than inferred, and it earns its place twice. It records
@@ -228,9 +275,65 @@ class PostgresTableMirror:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT {', '.join(spec.columns)} FROM {spec.table} "
-                    f"ORDER BY {', '.join(spec.key_columns)}"
+                    f"ORDER BY {spec.key_order_by}"
                 )
                 rows = cur.fetchall()
+        return self._rows(rows)
+
+    def list_records_window(self, *, after: tuple[Any, ...] | None, limit: int) -> list[dict]:
+        """Up to `limit` records with a key greater than `after`, in the
+        authority's own byte order.
+
+        The seek predicate a keyset-paginated backfill needs, so a table too
+        large for `list_records()` can still be walked in windows without
+        loading it whole. Built as the standard multi-column "seek" formula —
+        `(k1 > v1) OR (k1 = v1 AND k2 > v2) OR ...` — rather than a row
+        constructor (`(k1, k2) > (v1, v2)`), because a row constructor lets
+        PostgreSQL pick each column's comparison collation implicitly and this
+        window exists precisely so that choice is never implicit: every
+        comparison against a `text` key column names `COLLATE "C"` itself, via
+        `MirroredTable.key_expression`.
+
+        `after=None` starts at the first row. The boundary this returns —
+        the last row's own key — is what a caller passes back in to continue,
+        so windows compose into a scan with no gap and no overlap *provided*
+        the comparison PostgreSQL uses agrees with SQLite's. That agreement is
+        exactly what `COLLATE "C"` buys: SQLite's `TEXT` is always `BINARY`
+        (byte-wise), and PostgreSQL's `C` collation is byte-wise too — the one
+        collation among the choices a deployment can make that is guaranteed
+        not to depend on the choice. Without it the failure is silent and
+        specifically *not* a hole: every row still appears in some window,
+        because the two orderings are both total orders over the same set, so
+        adjacent windows stay contiguous — see the docstring on
+        `MirroredTable.numeric_key_columns` for the reproduction this closes.
+        """
+        spec = self.spec
+        keys = spec.key_columns
+        params: list[Any] = []
+        where = ""
+        if after is not None:
+            if len(after) != len(keys):
+                raise ValueError(f"{spec.table}: `after` must have {len(keys)} values, got {after!r}")
+            clauses = []
+            for index, name in enumerate(keys):
+                equals = " AND ".join(f"{spec.key_expression(k)} = %s" for k in keys[:index])
+                greater = f"{spec.key_expression(name)} > %s"
+                clauses.append(f"({equals} AND {greater})" if equals else f"({greater})")
+                params.extend(after[:index])
+                params.append(after[index])
+            where = f"WHERE {' OR '.join(clauses)} "
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {', '.join(spec.columns)} FROM {spec.table} "
+                    f"{where}ORDER BY {spec.key_order_by} LIMIT %s",
+                    (*params, limit),
+                )
+                rows = cur.fetchall()
+        return self._rows(rows)
+
+    def _rows(self, rows: Iterable[tuple[Any, ...]]) -> list[dict]:
+        spec = self.spec
         return [
             {
                 name: spec.codec.to_authority(name, value)

@@ -260,6 +260,34 @@ def test_the_declared_key_is_the_tables_primary_key(table: str, mirror) -> None:
 
 
 @pytest.mark.parametrize(("table", "mirror"), MIRRORS, ids=IDS)
+def test_text_key_columns_match_the_schemas_declared_types(table: str, mirror) -> None:
+    """`MirroredTable.numeric_key_columns` must name exactly the key columns
+    the schema does not declare `text` — checked against the DDL rather than
+    trusted, the same way `key` and `identity` are.
+
+    The two ways this can be wrong fail differently on a real PostgreSQL, and
+    neither fails here without this check. A key column that *is* `text` but
+    is missing from `numeric_key_columns`'s complement — i.e. `list_records`
+    orders it without `COLLATE "C"` — fails silently: the query is valid, it
+    just sorts in whatever collation the database happens to have, which is
+    `VOYN-W0-AICC-SRV-07e`'s reproduced defect. A column that is *not* `text`
+    but gets treated as one fails loudly (`COLLATE` on a numeric type raises
+    PostgreSQL error `42P22`) — loud but only at the first real query, which
+    for a table nothing has queried yet could be a long time after the
+    declaration that caused it.
+    """
+    declared = _declared_columns(table)
+    for name in mirror.spec.key_columns:
+        is_text = declared[name].startswith("text")
+        collated = name in mirror.spec.text_key_columns
+        assert collated == is_text, (
+            f"{table}.{name}: schema declares {declared[name]!r} (text={is_text}) "
+            f"but the mirror {'applies' if collated else 'omits'} COLLATE \"C\" for it. "
+            f"{'Add it to numeric_key_columns' if collated else 'It is missing from text_key_columns'}."
+        )
+
+
+@pytest.mark.parametrize(("table", "mirror"), MIRRORS, ids=IDS)
 def test_the_declared_identity_matches_the_schema(table: str, mirror) -> None:
     """The third declaration field, checked like the other two.
 

@@ -8,6 +8,28 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — mirror key order no longer depends on the database's collation (`VOYN-W0-AICC-SRV-07e`)
+- `command_center/db/table_mirror.py`: `list_records()` orders text-typed key
+  columns with `COLLATE "C"` (byte-wise), matching SQLite's own `BINARY`
+  ordering for `TEXT` regardless of the collation a PostgreSQL database was
+  created with (`initdb --locale-provider=icu` gives every `text` column ICU
+  ordering by default). Reproduced against a byte-identical mirror: 5 false
+  discrepancies under `COLLATE "und-x-icu"`, 0 under `COLLATE "C"`. Also adds
+  `list_records_window(after=, limit=)`, the keyset-pagination seek predicate
+  the same fix applies to, for a future backfill over a table too large for
+  `list_records()`.
+- `MirroredTable.numeric_key_columns` declares the one exception this schema
+  has — `provider_attempt.attempt_number` — so a numeric key column is never
+  wrongly `COLLATE`d (PostgreSQL error `42P22`) and every other key column's
+  text-ness is checked against the DDL by
+  `test_text_key_columns_match_the_schemas_declared_types`, offline, for all
+  32 mirrored tables.
+- `tests/db/test_window_boundary_collation.py`: the gate — inserts rows whose
+  key order disagrees between `COLLATE "C"` and `COLLATE "und-x-icu"` on the
+  same server, asserts `list_records()`/`list_records_window()` match the
+  former and the raw ICU-ordered query does not, so the fix stays proven
+  rather than assumed.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
