@@ -60,7 +60,7 @@ def publish(monkeypatch, snapshot, review_rows):
         review_merge, "_latest_review_result",
         lambda _f, _t, key: (
             {"result_text": f"VERDICT: REJECT\nHEAD_SHA: {HEAD}"}
-            if key.startswith("adjudicate:") else None
+            if key.startswith("verify:") else None
         ),
     )
     report = review_merge.publish_review_verdicts(None, "/repo")
@@ -112,8 +112,7 @@ def test_prompt_encoding_and_utf8_budget_preserve_every_byte(monkeypatch):
     for call in calls:
         prompt = call[2]["prompt"]
         assert len(prompt.encode()) <= review_merge._MAX_REVIEW_PROMPT_BYTES
-        if review_merge._REVIEW_INPUT_MARKER not in prompt:
-            continue  # the full-context adjudication item carries no envelope
+        assert review_merge._REVIEW_INPUT_MARKER in prompt  # chunks only, no eager adjudication
         envelope = json.loads(prompt.split(review_merge._REVIEW_INPUT_MARKER)[1])
         decoded.append(envelope["content"]["text"])
         assert envelope["base_sha"] == BASE

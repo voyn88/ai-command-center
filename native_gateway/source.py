@@ -36,6 +36,7 @@ from .dto import (
     DialogDTO,
     EvidenceState,
     Freshness,
+    GoalDTO,
     ProjectDTO,
     SnapshotDTO,
     TaskDTO,
@@ -56,6 +57,11 @@ _EVIDENCE_STATES = {
 }
 
 _OFFLINE_REVISION = "offline"
+
+# Allowlisted task execution states (DTO 1.0 additive field).
+_TASK_STATES = frozenset(
+    {"backlog", "next", "in_progress", "review", "done", "deferred"}
+)
 
 
 def _clean(value: object) -> str | None:
@@ -173,8 +179,30 @@ def _map_projection(raw: dict, now: datetime, settings: GatewaySettings) -> Proj
         events=events,
         projects=projects,
         connection=ConnectionDTO(state=freshness, projectionAgeSeconds=age),
+        goal=_map_goal(raw.get("goal")),
     )
     return Projection(snapshot=snapshot, dialogs=dialogs, decisions=decisions)
+
+
+def _map_goal(raw: object) -> GoalDTO | None:
+    if not isinstance(raw, dict):
+        return None
+    title = _clean(raw.get("title"))
+    total = raw.get("total")
+    if title is None or not isinstance(total, int) or total <= 0:
+        return None
+
+    def _count(key: str) -> int:
+        value = raw.get(key)
+        return value if isinstance(value, int) and value >= 0 else 0
+
+    return GoalDTO(
+        title=title,
+        done=min(_count("done"), total),
+        total=total,
+        inProgress=_count("in_progress"),
+        review=_count("review"),
+    )
 
 
 def _items(value: object) -> list[dict]:
@@ -186,10 +214,12 @@ def _items(value: object) -> list[dict]:
 def _map_task(raw: dict) -> TaskDTO:
     evidence_raw = raw.get("evidence")
     evidence_raw = evidence_raw if isinstance(evidence_raw, dict) else {}
+    state = _clean(raw.get("state"))
     return TaskDTO(
         id=_clean_required(raw.get("id"), "unknown"),
         title=_clean_required(raw.get("title"), "Untitled"),
         blocker=_clean(raw.get("blocker")),
+        state=state if state in _TASK_STATES else None,
         evidence=DeliveryEvidence(
             headSHA=_clean(evidence_raw.get("head_sha")),
             pullRequest=_clean(evidence_raw.get("pr")),

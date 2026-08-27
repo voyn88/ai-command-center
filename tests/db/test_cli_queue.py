@@ -14,7 +14,7 @@ import pytest
 # vendored `aios_db` wheel — present in CI, optional in a bare local checkout.
 pytest.importorskip("aios_db")
 
-from command_center.db.cli import build_parser  # noqa: E402
+from command_center.db.cli import _review_enqueue, build_parser  # noqa: E402
 
 
 def test_queue_reap_takes_no_arguments() -> None:
@@ -50,3 +50,48 @@ def test_queue_redrive_requires_the_item_id() -> None:
     assert build_parser().parse_args(["queue-redrive", "wki_1"]).extra_attempts == 1
     with pytest.raises(SystemExit):
         build_parser().parse_args(["queue-redrive"])
+
+
+def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
+    args = build_parser().parse_args(["backlog-merge-reconcile"])
+    assert args.command == "backlog-merge-reconcile"
+    assert args.repo_path == "."
+    scoped = build_parser().parse_args(
+        ["backlog-merge-reconcile", "--repo-path", "/srv/aicc"]
+    )
+    assert scoped.repo_path == "/srv/aicc"
+
+
+def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
+    """A review-class enqueue must outrank the priority=0 implementation
+    dispatch enqueues (`backlog_dispatch`), or it queues FIFO behind runs
+    already occupying a worker slot (VOYN-OPS-AICC-REVIEW-QUEUE-PRIORITY)."""
+
+    calls: list[dict] = []
+
+    class _FakeStore:
+        def enqueue(self, queue, *, idempotency_key, payload, task_id,
+                    max_attempts, priority):
+            calls.append({
+                "queue": queue,
+                "idempotency_key": idempotency_key,
+                "payload": payload,
+                "task_id": task_id,
+                "max_attempts": max_attempts,
+                "priority": priority,
+            })
+            return "wki_1"
+
+    enqueue = _review_enqueue(_FakeStore())
+    work_item_id = enqueue("execution", "key-1", {"kind": "review"}, "VOYN-W0-X", 1)
+
+    assert work_item_id == "wki_1"
+    assert calls == [{
+        "queue": "execution",
+        "idempotency_key": "key-1",
+        "payload": {"kind": "review"},
+        "task_id": "VOYN-W0-X",
+        "max_attempts": 1,
+        "priority": 100,
+    }]
+    assert calls[0]["priority"] > 0
