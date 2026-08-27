@@ -307,6 +307,32 @@ from `_render_live_execution_center_body` (`app.py:3339`) via `render_live_execu
 (`app.py:3484`). **Superseded** — this held only for the local branch; `b2134c4` on `origin/main`
 restores the function, as recorded at the head of this section.
 
+## Gate audit, 2026-08-27 (VOYN-W0-AICC-CLOSURE-WITHOUT-A-GATE)
+
+The rule this task enforces: **a closure without an executable gate is a pause, not a closure.**
+BLOCKER-1 (`AUDIT-W0-001`, pin Streamlit to localhost) was declared `Done` by this audit with no
+test, and that closure quietly regressed through a path this document never watched — a containerized
+launch (`scripts/aml-entrypoint.sh`, `docker-compose.aml.yml`) reintroduced the same unauthenticated
+network exposure. That regression is fixed and gated now (`tests/test_deployment_exposure.py`,
+VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH), but its lesson generalizes: every other row this document
+calls `Done`/`Resolved`/`Merged` needed the same check, not just a prose citation.
+
+Every row across both reconciliation tables (the 14 `Done` rows above, and the 7 `Merged` rows in
+"Merge verification") was re-read for an executable test that pins the specific fixed behavior —
+one that goes red if the fix is silently reverted, not merely a test that imports the touched module.
+Result:
+
+| Outcome | Rows |
+| --- | --- |
+| Already had an adequate gate | W0-001, W0-002, W0-003, W0-004, W0-005, W0-006, W1-001, W1-003, W1-004, W1-005, W1-009, W1-010, W2-003, W2-004, W2-006, W2-007, W3-001 |
+| Gate added by this task | W1-008 (`tests/test_background_sync_optin_wiring.py` — pins the `AICC_BACKGROUND_SYNC` opt-in `if`, the one line `tests/test_task_pipeline_background_sync.py` did not cover), W2-008 (`tests/test_task_cards_manual_status.py` — pins the honest-framing label/caption and that Pause/Resume/Restart only ever write the advisory `launch_status`), W2-005 (`tests/architecture/test_workspace_scaffolding_removed_fitness.py` — fails if the removed dead workspace/panel-registry cluster reappears or is imported anywhere) |
+| Stale doc note corrected | W1-007 — this document's own "coverage gap, recorded not hidden" claim was wrong: `tests/test_app_streamlit.py::test_kanban_task_delete_requires_explicit_confirmation` exercises the real two-step dialog and shipped in the same commit (`1eb942a`) as the fix |
+
+All three new/verified gates were confirmed to actually catch the regression they guard (run red
+against the reverted behavior, green against the fix) before being counted here, not just asserted
+to exist. `AUDIT-W1-006` and the five rows still `Still Open` (`W1-002`, `W2-001`, `W2-002`,
+`W4-003`, `W4-004`) are unaffected — there is no closure to gate until they close.
+
 ## Source-of-truth warning
 
 This historical audit must not be treated as the current source of truth. Its task candidates

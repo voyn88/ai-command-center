@@ -248,9 +248,12 @@ only opens a confirmation: it sets `st.session_state[f"{key_prefix}_delete_confi
 explicit "Я подтверждаю удаление этой задачи" checkbox (app.py:1450-1472). Two deliberate actions,
 no silent delete — the DoD.
 Git: `1eb942a`; PR #87 merged 2026-08-06.
-**Coverage gap, recorded not hidden:** no test under `tests/` exercises this dialog — grepping the
-suite for `delete_confirm` / "Подтвердить удаление" returns nothing. The behaviour is correct by
-inspection but is an untested UI path, so a refactor could silently restore the one-click delete.
+**Coverage gap note is stale (corrected 2026-08-27, VOYN-W0-AICC-CLOSURE-WITHOUT-A-GATE).** The gap
+recorded here no longer exists: `tests/test_app_streamlit.py::test_kanban_task_delete_requires_explicit_confirmation`
+drives the real dialog end-to-end (first click opens the dialog without deleting, the confirm button
+stays disabled until the checkbox is checked, only then does the click delete the task) and was
+in fact added in the same commit, `1eb942a`, that shipped the fix — this note's "grepping ... returns
+nothing" was already wrong at the time it was written. This row has an adequate executable gate.
 
 ### AUDIT-W1-008 — Фоновая синхронизация run→task — **Done (opt-in by design)**
 
@@ -355,6 +358,13 @@ The decision was made and executed: `command_center/workspace_context.py`,
 `workspace_service.py` and `ui/panel_registry.py` no longer exist, and their tests went with them.
 Git: `552f2d6` / `b798bf2` ("Remove the dead workspace/panel-registry cluster; fix the autonomy-UI
 docs (audit H7/H8)").
+
+**Gate added (2026-08-27, VOYN-W0-AICC-CLOSURE-WITHOUT-A-GATE).** This removal originally shipped
+with no executable gate — exactly the pattern that let BLOCKER-1 (AUDIT-W0-001) regress through the
+container launch path. `tests/architecture/test_workspace_scaffolding_removed_fitness.py` now fails
+if any of the three files reappear under their removed names, or if any file anywhere in the
+repository imports `workspace_context` / `workspace_service` / `panel_registry`. Verified red when
+`command_center/panel_registry.py` is reintroduced, green when absent.
 
 ### AUDIT-W2-006 — ahead/behind и `git fetch` в `git_info.py` — **Still Open**
 
