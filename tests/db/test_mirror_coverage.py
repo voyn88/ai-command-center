@@ -116,6 +116,15 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
     ),
+    "backlog_task_remediation": Exclusion(
+        reason=(
+            "PostgreSQL-native (migration 0010): remediation lineage rows exist "
+            "only through backlog_record_remediation, written the same "
+            "transaction as the REJECTED transition they follow up on; no "
+            "SQLite authority ever held them, so there is nothing to mirror."
+        ),
+        task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
     "queue_entry": Exclusion(
         reason=(
             "Mirrored under a contract of its own rather than the shared one: the "

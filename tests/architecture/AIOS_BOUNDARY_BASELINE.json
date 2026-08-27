@@ -132,7 +132,14 @@
     "command_center/http_auth/routing.py": [
       "authz"
     ],
+    "command_center/ops/credential_rotation.py": [
+      "memory"
+    ],
     "command_center/orchestrator/__init__.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/github_app_auth.py": [
+      "authz",
       "orchestration"
     ],
     "command_center/orchestrator/planner.py": [
@@ -320,10 +327,16 @@
     "command_center/worker/__main__.py": [
       "orchestration"
     ],
+    "command_center/worker/credential_file.py": [
+      "orchestration"
+    ],
     "command_center/worker/daemon.py": [
       "orchestration"
     ],
     "command_center/worker/handlers.py": [
+      "orchestration"
+    ],
+    "command_center/worker/lease_client.py": [
       "orchestration"
     ],
     "command_center/worker/payloads.py": [
@@ -335,7 +348,19 @@
     "command_center/worker/worktree_lease.py": [
       "orchestration"
     ],
+    "command_center/worker/writer_lease.py": [
+      "orchestration"
+    ],
     "command_center/worktree_launcher.py": [
+      "orchestration"
+    ],
+    "native_gateway/auth.py": [
+      "authz"
+    ],
+    "ops/aicc_agent_launcher.py": [
+      "orchestration"
+    ],
+    "ops/aicc_staged_worker_rollout.py": [
       "orchestration"
     ],
     "scripts/daily_audit_daemon.py": [

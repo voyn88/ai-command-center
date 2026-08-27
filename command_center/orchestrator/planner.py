@@ -43,6 +43,10 @@ class PlanLimits:
     #: Per-tick dispatch cap, distinct from WIP: one tick must stay short.
     max_dispatches_per_tick: int = 4
     timeout_seconds: int = 900
+    #: Per-tick cap on DEFER_TO_USER auto-resumes (VOYN-W0-AICC-DEFER-AUTO-
+    #: RESUME). Bounded so a large parked backlog drains gradually across
+    #: ticks instead of flooding OPEN in one; 0 disables the reconcile.
+    max_resumes_per_tick: int = 10
 
 
 @dataclass(slots=True)
@@ -52,6 +56,9 @@ class PlanReport:
     refused: list[tuple[str, str]] = field(default_factory=list)
     undispatchable: list[tuple[str, str]] = field(default_factory=list)
     ingested: list[tuple[str, str]] = field(default_factory=list)  # (task, action)
+    #: (task, original park reason) — DEFER_TO_USER technical parks the 0014
+    #: gate returned to OPEN this tick (VOYN-W0-AICC-DEFER-AUTO-RESUME).
+    resumed: list[tuple[str, str]] = field(default_factory=list)
     planner_busy: bool = False
 
 
@@ -168,6 +175,49 @@ class Planner:
                 "SELECT * FROM backlog_ingest_results(%s)", (limits.planner,)
             ):
                 report.ingested.append((task_id, action))
+
+            # Reconcile technical DEFER_TO_USER parks back to OPEN (VOYN-W0-
+            # AICC-DEFER-AUTO-RESUME) before selecting candidates, so a
+            # resumed task is eligible in this very tick. The candidate query
+            # mirrors the 0014 gate's own conditions purely as a FILTER --
+            # so ineligible parks are not attempted (and not audit-spammed)
+            # every tick; the SECURITY DEFINER function remains the only
+            # authority and revalidates everything under the row lock.
+            if limits.max_resumes_per_tick > 0:
+                resumable = self._rows(
+                    "SELECT t.task_id, park.reason FROM backlog_task t "
+                    "CROSS JOIN LATERAL ("
+                    "  SELECT e.reason, e.event_id FROM backlog_event e"
+                    "   WHERE e.task_id = t.task_id"
+                    "     AND e.event = 'return_to_pool'"
+                    "     AND e.outcome = 'granted'"
+                    "     AND e.detail->>'target' = 'DEFER_TO_USER'"
+                    "   ORDER BY e.event_id DESC LIMIT 1"
+                    ") park "
+                    "WHERE t.status = 'DEFER_TO_USER' AND t.kind = 'task' "
+                    "  AND park.reason LIKE 'cascade_exhausted:%%' "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM backlog_event e2"
+                    "     WHERE e2.task_id = t.task_id"
+                    "       AND e2.outcome = 'granted'"
+                    "       AND e2.event IN ('upsert', 'transition', 'triage',"
+                    "                        'dispatch', 'return_to_pool',"
+                    "                        'resume_deferred')"
+                    "       AND e2.event_id > park.event_id) "
+                    "  AND (SELECT count(*) FROM backlog_event e"
+                    "        WHERE e.task_id = t.task_id"
+                    "          AND e.event = 'resume_deferred'"
+                    "          AND e.outcome = 'granted') < 3 "
+                    "ORDER BY t.priority NULLS LAST, t.wave, t.task_id "
+                    "LIMIT %s",
+                    (limits.max_resumes_per_tick,),
+                )
+                for task_id, park_reason in resumable:
+                    ok, _reason, _revision = self._row(
+                        "SELECT * FROM backlog_resume_deferred(%s)", (task_id,)
+                    )
+                    if ok:
+                        report.resumed.append((task_id, park_reason))
 
             candidates = self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable "

@@ -17,6 +17,7 @@ out of this module.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +31,9 @@ AGENT_RUN_SCHEMA_VERSION = 1
 # the operator can see why, instead of timing out opaquely mid-run.
 _MAX_TIMEOUT_SECONDS = 3600
 _MIN_TIMEOUT_SECONDS = 30
+# Dot-runs are excluded by construction (separators carry exactly one
+# non-alphanumeric), so no separate ".." check is needed.
+_BACKLOG_TASK_ID = re.compile(r"^VOYN-[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +65,15 @@ class AgentRunRequest:
     #: COLLISION, found 2026-08-21: 29 backlog tasks pointed at one PR with a
     #: single 7-line diff).
     backlog_task_id: str | None = None
+    #: VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: a finding-verification run must read
+    #: the tree at the PR's exact head, not whatever state the shared
+    #: checkout happens to be in. When present, the handler fetches
+    #: ``refs/pull/<review_head_pr_number>/head``, verifies the head sha is
+    #: present, and runs the agent in a detached read-only worktree at that
+    #: sha. Only honored for non-mutating task types (fail closed in the
+    #: handler); absent keeps the historical behaviour byte-for-byte.
+    review_head_pr_number: str | None = None
+    review_head_sha: str | None = None
 
 
 def _string(payload: dict[str, Any], key: str) -> str | None:
@@ -142,6 +155,34 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         cascade.append(dict(link))
 
     backlog_task_id = _string(payload, "backlog_task_id")
+    if backlog_task_id is not None and not _BACKLOG_TASK_ID.fullmatch(backlog_task_id):
+        return PayloadError(
+            reason=("backlog_task_id must use the canonical VOYN-... identifier format")
+        )
+
+    # VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: the head-pinned checkout request.
+    # Absent is the historical behaviour; present but malformed is a payload
+    # defect (non-retryable -- redelivery re-reads the same broken pin).
+    review_head = payload.get("review_head")
+    review_head_pr_number: str | None = None
+    review_head_sha: str | None = None
+    if review_head is not None:
+        if not isinstance(review_head, dict):
+            return PayloadError(
+                reason=f"review_head must be an object, got {type(review_head).__name__}"
+            )
+        pr_number = review_head.get("pr_number")
+        head_sha = review_head.get("head_sha")
+        if not (isinstance(pr_number, str) and re.fullmatch(r"[0-9]{1,10}", pr_number)):
+            return PayloadError(
+                reason=f"review_head.pr_number must be a decimal string, got {pr_number!r}"
+            )
+        if not (isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha)):
+            return PayloadError(
+                reason=f"review_head.head_sha must be a 40-hex sha, got {head_sha!r}"
+            )
+        review_head_pr_number = pr_number
+        review_head_sha = head_sha
 
     return AgentRunRequest(
         project_id=project_id,
@@ -153,4 +194,6 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         untrusted=untrusted,
         cascade=tuple(cascade),
         backlog_task_id=backlog_task_id,
+        review_head_pr_number=review_head_pr_number,
+        review_head_sha=review_head_sha,
     )

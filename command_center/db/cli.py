@@ -17,9 +17,40 @@ import argparse
 import logging
 import sys
 from contextlib import nullcontext
+from typing import Any
 
 from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
+
+
+def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
+    """Build the ``enqueue(queue, key, payload, task_id, max_attempts)``
+    writer that ``review_once``/``publish_review_verdicts`` call.
+
+    A review run unblocks a merge in minutes; an implementation run can hold
+    a worker slot for up to 900s. The claim protocol already orders ready
+    work ``priority DESC`` (0002_queue_claim) -- review-class items must
+    carry a priority above the 0 that dispatch enqueues at, or they queue
+    FIFO behind runs that are already in flight.
+    """
+
+    def _enqueue(
+        queue: str,
+        idempotency_key: str,
+        payload: dict[str, Any],
+        task_id: str | None,
+        max_attempts: int,
+    ) -> str:
+        return store.enqueue(
+            queue,
+            idempotency_key=idempotency_key,
+            payload=payload,
+            task_id=task_id,
+            max_attempts=max_attempts,
+            priority=priority,
+        )
+
+    return _enqueue
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,10 +114,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Report the eligible set without dispatching.",
     )
-    sub.add_parser(
+    review = sub.add_parser(
         "backlog-review",
         help="One review tick (BO-S3b): enqueue an adversarial review run for "
-        "each READY_TO_REVIEW task carrying a PR (aicc-backlog-review.timer).",
+        "each READY_TO_REVIEW task carrying a PR, then publish the ACCEPT "
+        "marker for any task whose review already returned a verdict "
+        "(aicc-backlog-review.timer). Needs --repo-path.",
+    )
+    review.add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    review.add_argument(
+        "--task-id",
+        default=None,
+        help="Review and publish a verdict only for this exact backlog task id.",
     )
     sub.add_parser(
         "backlog-merge",
@@ -94,6 +133,45 @@ def build_parser() -> argparse.ArgumentParser:
         "marker and checks are green, closing the task DONE "
         "(aicc-backlog-merge.timer). Needs --repo-path.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    sub.add_parser(
+        "backlog-merge-reconcile",
+        help="Report-only audit (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-"
+        "VERIFY): flag existing DONE tasks whose 'sha' evidence is not an "
+        "ancestor of the default branch (pre-fix rows recorded the PR head, "
+        "not the merge commit). Never changes a task's status.",
+    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+
+    self_deploy = sub.add_parser(
+        "self-deploy",
+        help="One self-deploy tick (VOYN-W0-AICC-DEPLOY-AUTOMATION): fast-"
+        "forward this host's checkout to the remote default branch, run "
+        "migrations when asked, restart the named services, smoke, and roll "
+        "back on failure (voyn-aicc-self-deploy.timer). Fail-closed: refuses "
+        "diverged/dirty checkouts and dependency-manifest changes.",
+    )
+    self_deploy.add_argument(
+        "--repo-path", default=".", help="This host's runtime checkout."
+    )
+    self_deploy.add_argument(
+        "--restart",
+        action="append",
+        default=[],
+        metavar="SERVICE",
+        help="systemd service to restart after the checkout moves "
+        "(repeatable; worker hosts list their daemons, control hosts whose "
+        "ticks are oneshot need none).",
+    )
+    self_deploy.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Run `command_center.db upgrade` after moving the checkout "
+        "(the database-owning control host only).",
+    )
+    self_deploy.add_argument(
+        "--branch",
+        default="main",
+        help="Remote branch to deploy from (the repository's default branch).",
+    )
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -118,6 +196,32 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
     )
     args = build_parser().parse_args(argv)
+
+    if args.command == "self-deploy":
+        # Deliberately BEFORE any database configuration or pool: a deploy
+        # must work when the database is down or this host has no DB role
+        # at all -- restoring a broken host is exactly when it runs
+        # (VOYN-W0-AICC-DEPLOY-AUTOMATION). The --migrate subprocess opens
+        # its own pool from the environment on the host that has one.
+        from command_center.deployment.self_deploy import (
+            SelfDeployConfig,
+            self_deploy_once,
+        )
+
+        deploy_report = self_deploy_once(
+            args.repo_path,
+            SelfDeployConfig(
+                branch=args.branch,
+                services=tuple(args.restart),
+                migrate=args.migrate,
+            ),
+        )
+        print(f"{deploy_report.outcome.upper():10} {deploy_report.detail}")
+        for step in deploy_report.steps:
+            print(f"STEP      {step}")
+        # A refusal or rollback exits non-zero so systemd surfaces the
+        # failed tick to the operator; noop/deployed is success.
+        return 0 if deploy_report.outcome in ("noop", "deployed") else 1
 
     try:
         config = load_config()
@@ -255,6 +359,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
                     print(f"INGESTED  {task_id}: {action}")
+                for task_id, park_reason in report.resumed:
+                    print(f"RESUMED   {task_id}: {park_reason}")
                 for task_id, reason in report.skipped_by_wave_gate:
                     print(f"WAVE-GATE {task_id}: {reason}")
                 for task_id, reason in report.refused:
@@ -267,15 +373,36 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
-                from command_center.orchestrator.review_merge import review_once
+                from command_center.orchestrator.review_merge import (
+                    publish_review_verdicts,
+                    review_once,
+                )
 
                 store = WorkQueueStore(lambda: _nc(conn))
+                enqueue = _review_enqueue(store)
                 report = review_once(
                     lambda: _nc(conn),
-                    lambda q, k, pl: store.enqueue(q, idempotency_key=k, payload=pl),
+                    enqueue,
+                    args.repo_path,
+                    task_id=args.task_id,
                 )
                 for task_id, pr in report.reviewed:
                     print(f"REVIEW    {task_id} -> {pr}")
+                for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
+                marker_report = publish_review_verdicts(
+                    lambda: _nc(conn), args.repo_path, task_id=args.task_id,
+                    # The same queue writer review_once uses: a REJECT
+                    # enqueues one finding-verification run before it may
+                    # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
+                    enqueue=enqueue,
+                )
+                for task_id, pr in marker_report.reviewed:
+                    print(f"MARKER    {task_id} -> {pr}")
+                for task_id, new_task_id in marker_report.remediated:
+                    print(f"REMEDIATE {task_id} -> {new_task_id}")
+                for task_id, reason in marker_report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
                 return 0
 
             if args.command == "backlog-merge":
@@ -289,6 +416,27 @@ def main(argv: list[str] | None = None) -> int:
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 return 0
+
+            if args.command == "backlog-merge-reconcile":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.review_merge import (
+                    reconcile_merge_evidence,
+                )
+
+                report = reconcile_merge_evidence(lambda: _nc(conn), args.repo_path)
+                for task_id, sha, reason in report.suspect:
+                    print(f"SUSPECT   {task_id} sha={sha}: {reason}")
+                for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
+                print(
+                    f"verified {len(report.verified)}, "
+                    f"suspect {len(report.suspect)}, "
+                    f"skipped {len(report.skipped)}"
+                )
+                # Non-zero exit surfaces a real finding to a human/CI without
+                # ever touching the database -- report-only stays report-only.
+                return 1 if report.suspect else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
