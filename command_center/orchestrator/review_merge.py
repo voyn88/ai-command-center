@@ -440,7 +440,7 @@ def _render_review_prompt(
 # independently of _REVIEW_POLICY_VERSION, and is baked into the key below so
 # bumping it re-verifies under the new contract instead of reusing an old
 # verdict -- same rollout mechanism as the review policy version.
-_VERIFICATION_POLICY_VERSION = "verify-v2"
+_VERIFICATION_POLICY_VERSION = "verify-v3"
 
 # Findings larger than this are not auto-verified: the prompt wrapper plus
 # envelope must stay far under the executor argv/prompt limits the review
@@ -457,34 +457,60 @@ _VERIFICATION_INPUT_MARKER = "\nFINDINGS_ENVELOPE_JSON:\n"
 #: carries (a) at least one line-anchored disposition in the exact
 #: `FINDING <n>: <CLASS> ...` shape, (b) NO CONFIRMED_BLOCKING disposition
 #: (an ACCEPT trailer contradicting its own dispositions is malformed),
-#: and (c) an explicit `SECURITY_CLAIMS: NONE|DISPROVEN` attestation line
-#: -- the prompt forbids classifying a security allegation UNVERIFIABLE,
-#: and this line makes that rule's outcome explicit and checkable rather
-#: than implicit in prose. Line anchoring (not substring) is what stops a
-#: token merely QUOTED from the untrusted findings text from satisfying
-#: the check. This is the mechanical maximum available over free-text
+#: (c) an explicit `SECURITY_CLAIMS: NONE|DISPROVEN` attestation line --
+#: the prompt forbids classifying a security allegation UNVERIFIABLE, and
+#: this line makes that rule's outcome explicit and checkable rather than
+#: implicit in prose -- (d) as of VOYN-OPS-AICC-VERIFY-DISPOSITION-FLOOR,
+#: at least as many dispositions as `_required_disposition_floor` demands
+#: (one per rejecting `Chunk i/N:` section `_aggregate_chunk_verdict` put
+#: into the findings text, floored at 1 for a single-chunk REJECT), and
+#: (e) the FINDING numbers form exactly 1..K with no gaps or duplicates --
+#: a verifier that classified 1 of 2 rejecting chunks, or skipped FINDING
+#: 2 while numbering 1 and 3, has silently dropped findings rather than
+#: verified them. Line anchoring (not substring) is what stops a token
+#: merely QUOTED from the untrusted findings text from satisfying the
+#: check. This remains the mechanical maximum available over free-text
 #: findings: dispositions are self-reported by the verifier, exactly as
-#: the original REJECT is self-reported by the reviewer -- per-finding
-#: cross-validation requires structured review output, which is
+#: the original REJECT is self-reported by the reviewer -- the count and
+#: numbering checks catch UNDER-coverage of the orchestrator's own known
+#: chunk count, not semantic mismatch between a disposition and the
+#: finding it claims to address; that per-finding cross-validation
+#: requires structured review output, which is
 #: VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE territory. CI, the acceptance
 #: gate, and the mandatory audit comment remain the outer backstops.
 _VERIFICATION_DISPOSITION = re.compile(
-    r"(?m)^\s*FINDING\s+\d+\s*:\s*"
+    r"(?m)^\s*FINDING\s+(\d+)\s*:\s*"
     r"(CONFIRMED_BLOCKING|CONFIRMED_MINOR|ARTIFACT|UNVERIFIABLE)\b"
 )
 _VERIFICATION_SECURITY_ATTESTATION = re.compile(
     r"(?m)^\s*SECURITY_CLAIMS\s*:\s*(NONE|DISPROVEN)\b"
 )
 
+#: `_aggregate_chunk_verdict` builds the multi-chunk findings text as one
+#: `Chunk i/N:` header line per REJECTing chunk, joined by blank lines --
+#: this is orchestrator-known structure, not the verifier's self-report, so
+#: counting these headers gives a floor on how many findings a well-formed
+#: ACCEPT must have classified.
+_CHUNK_REJECT_SECTION = re.compile(r"(?m)^Chunk \d+/\d+:$")
 
-def _verification_accept_is_well_formed(verification_text: str) -> bool:
-    dispositions = [
-        match.group(1)
-        for match in _VERIFICATION_DISPOSITION.finditer(verification_text)
-    ]
+
+def _required_disposition_floor(findings: str) -> int:
+    return max(1, len(_CHUNK_REJECT_SECTION.findall(findings)))
+
+
+def _verification_accept_is_well_formed(
+    verification_text: str, findings: str = ""
+) -> bool:
+    numbers: list[int] = []
+    dispositions: list[str] = []
+    for match in _VERIFICATION_DISPOSITION.finditer(verification_text):
+        numbers.append(int(match.group(1)))
+        dispositions.append(match.group(2))
     return (
         bool(dispositions)
         and "CONFIRMED_BLOCKING" not in dispositions
+        and len(dispositions) >= _required_disposition_floor(findings)
+        and sorted(numbers) == list(range(1, len(numbers) + 1))
         and _VERIFICATION_SECURITY_ATTESTATION.search(verification_text) is not None
     )
 
@@ -1300,11 +1326,13 @@ def _verified_rejection_outcome(
         if parsed is None or parsed[1] != snapshot.head:
             return "REMEDIATE", findings
         if parsed[0] == "ACCEPT":
-            if not _verification_accept_is_well_formed(verification_text):
+            if not _verification_accept_is_well_formed(verification_text, findings):
                 # No dispositions, a disposition contradicting the verdict,
-                # or a missing security attestation: malformed output, not
-                # an override -- same fail-closed leg as an unparseable
-                # verdict. See _verification_accept_is_well_formed.
+                # fewer dispositions than rejecting chunk sections, a gap or
+                # duplicate in FINDING numbering, or a missing security
+                # attestation: malformed output, not an override -- same
+                # fail-closed leg as an unparseable verdict. See
+                # _verification_accept_is_well_formed.
                 return "REMEDIATE", findings
             return "ACCEPT", verification_text
         return "REJECT", (

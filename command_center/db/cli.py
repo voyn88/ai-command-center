@@ -17,9 +17,40 @@ import argparse
 import logging
 import sys
 from contextlib import nullcontext
+from typing import Any
 
 from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
+
+
+def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
+    """Build the ``enqueue(queue, key, payload, task_id, max_attempts)``
+    writer that ``review_once``/``publish_review_verdicts`` call.
+
+    A review run unblocks a merge in minutes; an implementation run can hold
+    a worker slot for up to 900s. The claim protocol already orders ready
+    work ``priority DESC`` (0002_queue_claim) -- review-class items must
+    carry a priority above the 0 that dispatch enqueues at, or they queue
+    FIFO behind runs that are already in flight.
+    """
+
+    def _enqueue(
+        queue: str,
+        idempotency_key: str,
+        payload: dict[str, Any],
+        task_id: str | None,
+        max_attempts: int,
+    ) -> str:
+        return store.enqueue(
+            queue,
+            idempotency_key=idempotency_key,
+            payload=payload,
+            task_id=task_id,
+            max_attempts=max_attempts,
+            priority=priority,
+        )
+
+    return _enqueue
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -348,12 +379,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
                 store = WorkQueueStore(lambda: _nc(conn))
+                enqueue = _review_enqueue(store)
                 report = review_once(
                     lambda: _nc(conn),
-                    lambda q, k, pl, tid, attempts: store.enqueue(
-                        q, idempotency_key=k, payload=pl, task_id=tid,
-                        max_attempts=attempts,
-                    ),
+                    enqueue,
                     args.repo_path,
                     task_id=args.task_id,
                 )
@@ -366,10 +395,7 @@ def main(argv: list[str] | None = None) -> int:
                     # The same queue writer review_once uses: a REJECT
                     # enqueues one finding-verification run before it may
                     # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
-                    enqueue=lambda q, k, pl, tid, attempts: store.enqueue(
-                        q, idempotency_key=k, payload=pl, task_id=tid,
-                        max_attempts=attempts,
-                    ),
+                    enqueue=enqueue,
                 )
                 for task_id, pr in marker_report.reviewed:
                     print(f"MARKER    {task_id} -> {pr}")
