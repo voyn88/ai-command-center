@@ -479,3 +479,217 @@ def test_stale_hook_identity_fails_closed_without_pushing(repo, monkeypatch):
         check=False,
     ).stdout
     assert "backlog" not in out  # never pushed
+
+
+# --- pre-push static quality gate (VOYN-W0-AICC-PREPUSH-FAST-GATE v2) -------
+# v1 executed scripts/ci/prepush/quality_band.sh FROM the candidate worktree
+# inside publish_run's credentialed context; independent verification on head
+# 254154a rejected that as candidate-controlled host command execution (and
+# its env `setdefault` as an inherited-env override of the validated base).
+# v2 runs only ruff — parse + lint, candidate tree strictly as data — from
+# the worker's own trusted interpreter. Opt-in is the scripts/ci/prepush/
+# directory: absent in the plain fixture repos above, so every earlier test
+# doubles as the opt-out case.
+
+
+def _opt_in(work):
+    d = work / "scripts" / "ci" / "prepush"
+    d.mkdir(parents=True)
+    (d / ".keep").write_text("")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "opt in")
+
+
+def test_static_gate_refuses_red_tree_before_lease(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "bad.py").write_text("def broken(:\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "red")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_failed:")
+    # A red gate must cost zero lease and zero gh traffic: it runs before
+    # acquire, so the calls log was never written.
+    assert not calls.exists()
+
+
+def test_static_gate_passes_clean_tree(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_candidate_band_script_is_never_executed_by_publish(repo, monkeypatch):
+    """THE regression test for the verification findings on 254154a: a
+    worktree-resident band script is candidate content and must never run in
+    publish_run's credentialed context, and no inherited environment value
+    may steer the gate."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    marker = work.parent / "candidate-script.ran"
+    band = work / "scripts" / "ci" / "prepush" / "quality_band.sh"
+    band.parent.mkdir(parents=True)
+    band.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+    band.chmod(0o755)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "with candidate band script")
+    monkeypatch.setenv("VOYN_QUALITY_BAND_BASE", "garbage-that-must-not-matter")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+    assert not marker.exists(), "candidate script executed in publish context"
+
+
+def test_static_gate_env_off_is_an_operator_bypass(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "bad.py").write_text("def broken(:\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "red")
+    monkeypatch.setenv("VOYN_QUALITY_BAND", "off")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_real_band_script_defers_without_venv_and_honours_bypass(tmp_path):
+    """The committed quality_band.sh itself (interactive/agent-side use):
+    venv-less hosts defer to CI (exit 0, printed) and VOYN_QUALITY_BAND=off
+    is a printed bypass."""
+    import pathlib
+
+    script = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "ci"
+        / "prepush"
+        / "quality_band.sh"
+    )
+    probe = tmp_path / "probe"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(probe)], check=True, capture_output=True
+    )
+    target = probe / "scripts" / "ci" / "prepush" / "quality_band.sh"
+    target.parent.mkdir(parents=True)
+    target.write_text(script.read_text())
+    target.chmod(0o755)
+    (probe / "scripts" / "preflight.sh").write_text("#!/bin/sh\nexit 1\n")
+
+    no_venv = subprocess.run(
+        ["bash", str(target)], cwd=probe, capture_output=True, text=True, check=False
+    )
+    assert no_venv.returncode == 0
+    assert "skipped (no .venv" in no_venv.stdout
+
+    bypass = subprocess.run(
+        ["bash", str(target)],
+        cwd=probe,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "VOYN_QUALITY_BAND": "off"},
+    )
+    assert bypass.returncode == 0
+    assert "bypassed" in bypass.stdout
+
+
+def test_committed_ruff_package_cannot_shadow_the_tool(repo, monkeypatch):
+    """Verification finding on f232c81: `python -m ruff` with the candidate
+    tree as cwd lets a committed `ruff/__main__.py` shadow the installed
+    tool and execute candidate code in the publisher context. The gate now
+    resolves the real ruff (binary next to the interpreter, or -m under -P)
+    so the planted package must never run — and the verdict must come from
+    the real tool (clean tree passes)."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    marker = work.parent / "shadow-ruff.ran"
+    shadow = work / "ruff" / "__main__.py"
+    shadow.parent.mkdir()
+    (work / "ruff" / "__init__.py").write_text("")
+    shadow.write_text(
+        f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
+    )
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "shadow attempt")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not marker.exists(), "candidate ruff package executed in publisher"
+    assert r.ok, r.reason
+
+
+def test_committed_ruff_config_cannot_neuter_the_gate(repo, monkeypatch):
+    """Verification finding on 9e02e55, reproduced live: a committed
+    `[tool.ruff] exclude = ["**"]` made the gate pass over a syntax-invalid
+    file. Under --isolated the candidate tree contributes only code, never
+    policy — the broken file is refused regardless of committed config."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "pyproject.toml").write_text('[tool.ruff]\nexclude = ["**"]\n')
+    (work / "bad.py").write_text("def broken(:\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "neuter attempt")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_failed:")
+
+
+def test_publish_refuses_a_committed_instruction_file(repo, monkeypatch):
+    """VOYN-OPS-PUBLIC-REPO-CLAUDE-MD-LEAK finding 3: the guard must run on
+    the ordinary agent publish path, not only in interactive preflight. A
+    candidate tree carrying a committed CLAUDE.md is refused before the
+    lease."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "CLAUDE.md").write_text("instructions\n")
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "leak")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("leak_guard_failed:")
+    assert "agent-instruction file" in r.reason
+    assert not calls.exists()
+
+
+def test_candidate_leak_guard_copy_is_never_executed(repo, monkeypatch):
+    """Trust rule regression: publish runs the WORKER'S trusted leak_guard
+    copy; a malicious candidate copy in the worktree must never execute."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    marker = work.parent / "candidate-guard.ran"
+    guard = work / "scripts" / "ci" / "prepush" / "leak_guard.sh"
+    guard.parent.mkdir(parents=True)
+    guard.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+    guard.chmod(0o755)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "candidate guard copy")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+    assert not marker.exists(), "candidate leak_guard executed in publisher"
