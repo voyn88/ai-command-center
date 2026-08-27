@@ -15,6 +15,18 @@ module closes that: every table in the schema is either mirrored or **signed out
 of scope**, with a reason and the task that owns it, and the same rule applies
 to tables created in the runtime database that have no PostgreSQL target at all.
 
+VOYN-W0-AICC-SRV-07h found the fix above still ambiguous in a different way:
+`queue_entry` lived in the *exclusion* registry (`UNMIRRORED_SCHEMA_TABLES`)
+next to tables with no SQLite source at all (`work_item`, `principal`, ...).
+An exclusion is supposed to mean "nothing to mirror here"; `queue_entry` means
+the opposite — it has a source and a working mirror, just not this module's
+kind. The two facts read identically to an operator counting entries, which is
+the same ambiguity by one level of indirection. `MIRRORED_UNDER_OWN_CONTRACT`
+below is the third bucket: covered, by a contract other than
+`PostgresTableMirror`. `test_the_domain_table_total_is_reported_not_left_to_a_silent_subtraction`
+turns "32 shared + 1 own contract = 33" into an assertion with the numbers in
+its failure message, rather than a fact that only holds if nobody miscounts.
+
 Both gates are proved to bite: `test_the_coverage_gate_fails_on_...` feeds each
 one a table that is neither mirrored nor declared and asserts it is reported. A
 coverage gate that has never been shown to fail is a coverage gate that
@@ -125,19 +137,6 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
     ),
-    "queue_entry": Exclusion(
-        reason=(
-            "Mirrored under a contract of its own rather than the shared one: the "
-            "queue synchronises by whole-list replacement (DELETE plus a bulk "
-            "re-INSERT) and carries a `position` column the JSON authority does not "
-            "have, so it has `replace_entries`/`list_entries` and no `upsert` at "
-            "all. Folding it into `PostgresTableMirror` would produce one class "
-            "saying something vague about both. Deliberate, pre-existing, and "
-            "recorded here because it was previously visible only as an off-by-one "
-            "in a hand-written count."
-        ),
-        task="VOYN-W0-AICC-QUEUE-ENTRY-PARITY",
-    ),
     "work_item": Exclusion(
         reason=(
             "PostgreSQL-native authority: it has no SQLite source to mirror from. "
@@ -225,6 +224,38 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
 
 
 # ---------------------------------------------------------------------------
+# Tables mirrored, but not through `PostgresTableMirror` — VOYN-W0-AICC-SRV-07h
+# ---------------------------------------------------------------------------
+#
+# `UNMIRRORED_SCHEMA_TABLES` above is one bucket for two different facts: a
+# table with no SQLite source at all (`work_item`, `principal`, ...) and a
+# table that *does* have a source and *is* mirrored, just by code this module
+# does not scan for. Before SRV-07h `queue_entry` lived in that bucket, and
+# the two facts read identically to anyone totting up the count — which is
+# exactly how "32 mirrored + queue_entry excluded" and "32 mirrored, 33rd
+# table forgotten" became indistinguishable. This registry is the missing
+# third answer: covered, by a contract of its own.
+
+MIRRORED_UNDER_OWN_CONTRACT: dict[str, Exclusion] = {
+    "queue_entry": Exclusion(
+        reason=(
+            "Mirrored under a contract of its own rather than the shared one: the "
+            "queue synchronises by whole-list replacement (DELETE plus a bulk "
+            "re-INSERT) and carries a `position` column the JSON authority does not "
+            "have, so it has `replace_entries`/`list_entries` and no `upsert` at "
+            "all (`command_center/db/queue_store.py`). Folding it into "
+            "`PostgresTableMirror` would produce one class saying something vague "
+            "about both. Deliberate, pre-existing, and recorded here — rather than "
+            "in `UNMIRRORED_SCHEMA_TABLES` — because it is covered, not excluded: "
+            "conflating the two is what let the 33rd table hide as an off-by-one "
+            "in a hand-written count."
+        ),
+        task="VOYN-W0-AICC-QUEUE-ENTRY-PARITY",
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Signed exclusions — runtime-database tables with no PostgreSQL target
 # ---------------------------------------------------------------------------
 
@@ -294,6 +325,17 @@ def _mirrored_tables() -> set[str]:
     return set(mirror_classes())
 
 
+def _covered_tables() -> set[str]:
+    """Every domain table with a working mirror, whatever contract it uses.
+
+    The shared `PostgresTableMirror` subclasses plus the small set declared in
+    `MIRRORED_UNDER_OWN_CONTRACT` — the two answers that both mean "this table
+    is not the omission Gate A exists to catch," as opposed to a signed
+    exclusion, which means "there is nothing here to mirror at all."
+    """
+    return _mirrored_tables() | set(MIRRORED_UNDER_OWN_CONTRACT)
+
+
 def _modules_creating_runtime_tables() -> dict[Path, set[str]]:
     """`{module: tables it creates in the runtime database}`.
 
@@ -337,7 +379,7 @@ def _runtime_tables() -> set[str]:
 
 def test_every_schema_table_is_mirrored_or_signed_out_of_scope() -> None:
     uncovered = _uncovered(
-        _schema_tables(), _mirrored_tables(), UNMIRRORED_SCHEMA_TABLES
+        _schema_tables(), _covered_tables(), UNMIRRORED_SCHEMA_TABLES
     )
     assert uncovered == [], (
         "tables with neither a mirror nor a signed exclusion: "
@@ -347,7 +389,7 @@ def test_every_schema_table_is_mirrored_or_signed_out_of_scope() -> None:
 
 
 def test_no_mirror_exclusion_outlives_its_reason() -> None:
-    stale = _stale(_schema_tables(), _mirrored_tables(), UNMIRRORED_SCHEMA_TABLES)
+    stale = _stale(_schema_tables(), _covered_tables(), UNMIRRORED_SCHEMA_TABLES)
     assert stale == [], f"exclusions for tables that are mirrored or gone: {stale}"
 
 
@@ -359,7 +401,7 @@ def test_the_coverage_gate_fails_on_a_table_that_is_neither() -> None:
     a table nobody declared anything about.
     """
     tables = _schema_tables() | {"a_table_nobody_declared"}
-    assert _uncovered(tables, _mirrored_tables(), UNMIRRORED_SCHEMA_TABLES) == [
+    assert _uncovered(tables, _covered_tables(), UNMIRRORED_SCHEMA_TABLES) == [
         "a_table_nobody_declared"
     ]
 
@@ -369,14 +411,78 @@ def test_the_coverage_gate_fails_on_a_table_that_is_neither() -> None:
         UNMIRRORED_SCHEMA_TABLES,
         a_table_nobody_declared=Exclusion(reason="test double", task="VOYN-TEST"),
     )
-    assert _uncovered(tables, _mirrored_tables(), signed) == []
+    assert _uncovered(tables, _covered_tables(), signed) == []
 
 
 def test_the_staleness_gate_fails_on_an_exclusion_for_a_mirrored_table() -> None:
-    covered = _mirrored_tables() | {"queue_entry"}
-    assert _stale(_schema_tables(), covered, UNMIRRORED_SCHEMA_TABLES) == [
-        "queue_entry"
+    covered = _covered_tables() | {"a_table_nobody_declared"}
+    stale_declarations = dict(
+        UNMIRRORED_SCHEMA_TABLES,
+        a_table_nobody_declared=Exclusion(reason="test double", task="VOYN-TEST"),
+    )
+    assert _stale(_schema_tables(), covered, stale_declarations) == [
+        "a_table_nobody_declared"
     ]
+
+
+def test_queue_entry_lives_in_the_own_contract_registry_not_the_exclusions() -> None:
+    """The fact this whole registry split exists to keep visible.
+
+    `queue_entry` has a real mirror (`command_center/db/queue_store.py`); it is
+    not excluded from anything. Before SRV-07h it sat in
+    `UNMIRRORED_SCHEMA_TABLES` next to tables that have no SQLite source at
+    all, which is what let a genuinely covered table read as a gap-with-a-note.
+    """
+    assert "queue_entry" not in UNMIRRORED_SCHEMA_TABLES
+    assert "queue_entry" in MIRRORED_UNDER_OWN_CONTRACT
+    assert "queue_entry" not in _mirrored_tables(), (
+        "queue_entry has no PostgresTableMirror subclass — if this now fails, "
+        "its own contract was folded into the shared one and the "
+        "MIRRORED_UNDER_OWN_CONTRACT entry is stale"
+    )
+
+
+def test_no_own_contract_exclusion_outlives_its_reason() -> None:
+    """As `test_no_mirror_exclusion_outlives_its_reason`, for the other registry.
+
+    A table stays declared here only while it is mirrored by its own contract
+    and by nothing else; once a `PostgresTableMirror` subclass also claims it,
+    or the table is dropped, the declaration is noise.
+    """
+    stale = _stale(_schema_tables(), _mirrored_tables(), MIRRORED_UNDER_OWN_CONTRACT)
+    assert stale == [], (
+        f"own-contract declarations for tables that moved or gone: {stale}"
+    )
+
+
+def test_the_domain_table_total_is_reported_not_left_to_a_silent_subtraction() -> None:
+    """The property SRV-07h exists for: 33 covered, stated, not 32-and-silence.
+
+    `_mirrored_tables()` alone answers "32" — correct for the shared contract
+    and silent about `queue_entry`. Reporting only that figure is indistinguishable
+    from a schema that grew a 33rd table nobody mirrored at all, which is exactly
+    the ambiguity `table_mirror.py`'s docstring names as the original defect.
+    This test makes the total, and its two components, an assertion with numbers
+    in the failure message rather than a fact left implicit in set arithmetic.
+    """
+    shared = _mirrored_tables()
+    own_contract = set(MIRRORED_UNDER_OWN_CONTRACT)
+    assert not shared & own_contract, (
+        "a table declared in both registries has two conflicting mirrors"
+    )
+    domain_tables = _schema_tables() - set(UNMIRRORED_SCHEMA_TABLES)
+    covered = shared | own_contract
+    assert covered == domain_tables, (
+        f"{len(covered)} covered ({len(shared)} shared contract + "
+        f"{len(own_contract)} own contract) vs {len(domain_tables)} SQLite-"
+        f"authority domain tables — difference: {sorted(domain_tables ^ covered)}"
+    )
+    assert len(domain_tables) == 33, (
+        f"the SQLite-authority domain table count moved to {len(domain_tables)}; "
+        "update docs/srv01b-schema-map.md's reconciliation and this comment "
+        "together, the same rule test_schema_correspondence.py applies to the "
+        "raw migration count"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -447,8 +553,12 @@ def test_the_runtime_gate_fails_on_an_undeclared_ad_hoc_table() -> None:
 
 @pytest.mark.parametrize(
     "registry",
-    [UNMIRRORED_SCHEMA_TABLES, RUNTIME_TABLES_WITHOUT_A_TARGET],
-    ids=["schema", "runtime"],
+    [
+        UNMIRRORED_SCHEMA_TABLES,
+        MIRRORED_UNDER_OWN_CONTRACT,
+        RUNTIME_TABLES_WITHOUT_A_TARGET,
+    ],
+    ids=["schema", "own_contract", "runtime"],
 )
 def test_every_exclusion_is_signed(registry: dict[str, Exclusion]) -> None:
     """A reason and an owning task, both non-empty and both meaning something.
