@@ -2595,3 +2595,105 @@ def test_a_same_key_item_in_another_queue_is_not_pending_here(rig, monkeypatch):
     # item sitting in another-queue.
     assert ("VOYN-W0-QX", "verification_enqueued") in report.skipped
     assert enq and enq[0][0] == "execution" and enq[0][1] == vkey
+
+
+def test_a_deferred_marker_keeps_the_cursor_before_its_task(rig, monkeypatch):  # noqa: F811, E501
+    """Verification of c4426a4 (CONFIRMED_BLOCKING 1): advancing the cursor
+    past a task whose marker was budget-deferred made the marker wait a
+    full lap. The cursor stays BEFORE the task: the next tick re-enters it
+    first and the marker is that tick's first write -- a follower task does
+    not jump the queue."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    head_a = "1e" * 20
+    pr_a = "https://github.com/x/y/pull/85"
+    _ready(store, app_factory, "VOYN-W0-DA", pr_a)
+    SNAPSHOTS[pr_a] = _snapshot(head_a)
+    # Follower: plain ACCEPT, later in task_id order.
+    head_b = "2f" * 20
+    pr_b = "https://github.com/x/y/pull/86"
+    _ready(store, app_factory, "VOYN-W0-DB", pr_b)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-DB", pr_b, head_b,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head_b}\n",
+    )
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head_a}\n")
+    # _force_chunk_reject rigs chunk rows for EVERY task; restrict to A only.
+    monkeypatch.setattr(
+        review_merge, "_chunk_review_rows",
+        lambda factory, task_id, pr_url, snapshot: (
+            ("prefix", [{"chunk": 0}]) if task_id == "VOYN-W0-DA" else (None, [])
+        ),
+    )
+    real_latest = review_merge._latest_review_result
+
+    def latest(factory, task_id, key):
+        if key.startswith("verify:") and task_id == "VOYN-W0-DA":
+            return {"result_text": f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head_a}\n"}
+        return real_latest(factory, task_id, key)
+
+    monkeypatch.setattr(review_merge, "_latest_review_result", latest)
+    heads = {pr_a: head_a, pr_b: head_b}
+    audits = []
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        if argv[:2] == ["pr", "view"] and "comments" in argv[-1]:
+            body = {"comments": [{"body": audits[0]}] if audits else []}
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        if argv[:2] == ["pr", "comment"]:
+            audits.append(argv[-1])
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    first = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert ("VOYN-W0-DA", "marker_deferred_write_budget") in first.skipped
+    assert posted == []  # tick one: only the audit write happened
+    second = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    # Tick two re-enters A FIRST: its marker is the single write; B waits.
+    assert posted == [pr_a], second.skipped
+
+
+def test_targeted_invocations_leave_the_shared_cursor_alone(rig, monkeypatch):  # noqa: F811, E501
+    """Verification of c4426a4 (CONFIRMED_BLOCKING 2): --task-id runs were
+    repositioning the global cursor and starving unrelated rows. A targeted
+    run must not create or move the cursor."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    head = "3a" * 20
+    pr_url = "https://github.com/x/y/pull/87"
+    _ready(store, app_factory, "VOYN-W0-TG", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-TG", pr_url, head,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (True, ""))
+    publish_review_verdicts(app_factory, "/tmp", task_id="VOYN-W0-TG")
+    review_once(app_factory, lambda *a: None, "/tmp", task_id="VOYN-W0-TG")
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT count(*) FROM backlog_scan_cursor")
+        assert cur.fetchone()[0] == 0  # no cursor row was even created

@@ -865,8 +865,6 @@ def review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where_task = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (task_id,) if task_id is not None else ()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
     # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
     # permanently filled by eternal skips (skips never bump updated_at --
@@ -879,16 +877,29 @@ def review_once(
     # periodically sits at the FRONT of the window, examined before
     # anything else can spend the action cap -- immune even to rows that
     # consume actions on every visit (reviews of 24c124b and 2199a56).
-    tasks, scan_token = _scan_tasks(
-        factory,
-        "scan:review_once",
-        "SELECT task_id, value FROM ("
-        "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
-        "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
-        "  WHERE t.status = 'READY_TO_REVIEW'" + where_task + ") pairs "
-        "WHERE (task_id, value) > (%s, %s) ORDER BY task_id, value LIMIT %s",
-        params, cfg.scan_cap,
-    )
+    if task_id is not None:
+        # A targeted invocation must not touch the shared scan cursor
+        # (verification of c4426a4, CONFIRMED: repeated targeted runs were
+        # resetting full-scan progress and starving unrelated rows).
+        tasks, scan_token = _rows(
+            factory,
+            "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "ORDER BY e.value LIMIT %s",
+            (task_id, cfg.scan_cap),
+        ), None
+    else:
+        tasks, scan_token = _scan_tasks(
+            factory,
+            "scan:review_once",
+            "SELECT task_id, value FROM ("
+            "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
+            "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
+            "  WHERE t.status = 'READY_TO_REVIEW') pairs "
+            "WHERE (task_id, value) > (%s, %s) ORDER BY task_id, value LIMIT %s",
+            (), cfg.scan_cap,
+        )
     last_processed = None
     cascade = _model_only_review_cascade()
     actions = 0
@@ -966,7 +977,8 @@ def review_once(
             enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
         actions += 1
-    _scan_commit(factory, "scan:review_once", scan_token, last_processed)
+    if scan_token is not None:
+        _scan_commit(factory, "scan:review_once", scan_token, last_processed)
     return report
 
 
@@ -1583,8 +1595,6 @@ def publish_review_verdicts(
     not errors."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where_task = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (task_id,) if task_id is not None else ()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
     # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
     # permanently filled by eternal skips (skips never bump updated_at --
@@ -1597,21 +1607,34 @@ def publish_review_verdicts(
     # periodically sits at the FRONT of the window, examined before
     # anything else can spend the action cap -- immune even to rows that
     # consume actions on every visit (reviews of 24c124b and 2199a56).
-    tasks, scan_token = _scan_tasks(
-        factory,
-        "scan:publish_review_verdicts",
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task
-        + " AND (t.task_id, e.value) > (%s, %s) "
-        "ORDER BY t.task_id, e.value LIMIT %s",
-        params, cfg.scan_cap,
-    )
+    if task_id is not None:
+        # Targeted invocation: never touch the shared scan cursor
+        # (verification of c4426a4, CONFIRMED).
+        tasks, scan_token = _rows(
+            factory,
+            "SELECT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "ORDER BY e.value LIMIT %s",
+            (task_id, cfg.scan_cap),
+        ), None
+    else:
+        tasks, scan_token = _scan_tasks(
+            factory,
+            "scan:publish_review_verdicts",
+            "SELECT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' "
+            "AND (t.task_id, e.value) > (%s, %s) "
+            "ORDER BY t.task_id, e.value LIMIT %s",
+            (), cfg.scan_cap,
+        )
     last_processed = None
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
         if actions >= cfg.max_per_tick:
             break
+        prev_processed = last_processed
         last_processed = (task_id, pr_url)
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
@@ -1729,6 +1752,12 @@ def publish_review_verdicts(
                 report.skipped.append((task_id, "auto_accept_audit_post_failed"))
                 continue
             if actions >= cfg.max_per_tick:
+                # Leave the cursor BEFORE this task (verification of
+                # c4426a4, CONFIRMED: advancing past a deferred marker made
+                # it wait a full cursor lap): the next tick re-enters here
+                # first, the audit's idempotent no-op costs nothing, and
+                # the marker is that tick's first write.
+                last_processed = prev_processed
                 report.skipped.append((task_id, "marker_deferred_write_budget"))
                 continue
         actions += 1
@@ -1745,9 +1774,10 @@ def publish_review_verdicts(
         # pre-marker run. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
         _rerun_failing_acceptance_gate(repo_path, pr_url, sha)
         report.reviewed.append((task_id, pr_url))
-    _scan_commit(
-        factory, "scan:publish_review_verdicts", scan_token, last_processed
-    )
+    if scan_token is not None:
+        _scan_commit(
+            factory, "scan:publish_review_verdicts", scan_token, last_processed
+        )
     return report
 
 
