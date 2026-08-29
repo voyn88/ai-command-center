@@ -64,6 +64,7 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
 
 def test_exact_task_target_is_parameterized_for_enqueue_and_marker(monkeypatch):
     captured = []
+    cfg = review_merge.ReviewConfig(max_per_tick=3, scan_cap=40)
 
     def rows(_factory, sql, params=()):
         captured.append((sql, params))
@@ -71,17 +72,17 @@ def test_exact_task_target_is_parameterized_for_enqueue_and_marker(monkeypatch):
 
     monkeypatch.setattr(review_merge, "_rows", rows)
     review_merge.review_once(
-        object(), lambda *args: None, "/srv/aicc", task_id="VOYN-W0-EXACT"
+        object(), lambda *args: None, "/srv/aicc", cfg, task_id="VOYN-W0-EXACT"
     )
     review_merge.publish_review_verdicts(
-        object(), "/srv/aicc", task_id="VOYN-W0-EXACT"
+        object(), "/srv/aicc", cfg, task_id="VOYN-W0-EXACT"
     )
 
     assert len(captured) == 2
     for sql, params in captured:
         assert "t.task_id = %s" in sql
         assert params[0] == "VOYN-W0-EXACT"
-        assert params[-1] == review_merge.ReviewConfig().max_per_tick
+        assert params[-1] == cfg.max_per_tick
 
 
 def test_empty_review_route_fails_closed_without_enqueuing(monkeypatch):

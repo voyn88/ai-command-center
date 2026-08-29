@@ -57,6 +57,13 @@ def _spend(monkeypatch, value: float):
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", lambda *_a, **_k: value)
 
 
+def _spend_unavailable(monkeypatch):
+    def _raise(*_a, **_k):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+
+
 def _enable_master_switch():
     settings = pipeline_settings.load_settings(ROOT)
     import dataclasses
@@ -176,6 +183,40 @@ def test_plan_enforces_daily_budget_from_pipeline_settings(monkeypatch, pool):
 
     assert plan.assignments == ()
     assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
+
+
+def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
+    monkeypatch, pool
+):
+    # The exact repro from the bug report: master switch on, default
+    # `pipeline_settings` (max_daily_spend_usd=0.0, i.e. no configured cap),
+    # default policy (ollama cost 0.0, prefer_local=True) — a DB outage on the
+    # spend read must still refuse dispatch, not assign 2-for-2.
+    _enable_master_switch()
+    _spend_unavailable(monkeypatch)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+
+    plan = service.plan(ROOT)
+
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+
+
+def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
+    _enable_master_switch()
+    _spend_unavailable(monkeypatch)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    task = _queued_task(title="t1")
+
+    result = service.assign(ROOT, CALLER, confirmed=True)
+
+    assert result["applied"] is False
+    assert result["reason"] == "cost_data_unavailable"
+    stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
+    assert stored.get("executor") in (None, "")
 
 
 # --------------------------------------------------------------------------
