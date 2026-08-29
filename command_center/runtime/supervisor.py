@@ -48,6 +48,7 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -80,6 +81,66 @@ logger = logging.getLogger(__name__)
 # Keeping the original constructor also prevents a failed Claude-launch setup
 # from making the recovery probe recursively launch another fake Claude.
 _SYSTEM_POPEN = subprocess.Popen
+_SYSTEM_PROCESS_PID = os.getpid()
+_SYSTEM_PROCESS_IDENTITY = identity.capture_identity(_SYSTEM_PROCESS_PID)
+# Finalization ownership is process-scoped, matching the liveness proof used
+# during recovery.  Multiple Supervisor facades in one backend process are not
+# independent crash domains and therefore must not manufacture competing
+# ownership tokens for the same OS identity.
+_SYSTEM_FINALIZATION_OWNER_TOKEN: str | None = uuid.uuid4().hex
+_PROCESS_CONTEXT_GUARD = threading.Lock()
+_FINALIZATION_LOCKS_GUARD = threading.Lock()
+_FINALIZATION_LOCKS: dict[str, threading.Lock] = {}
+_PROCESS_OWNED_RUNS_GUARD = threading.Lock()
+_PROCESS_OWNED_RUNS: set[str] = set()
+
+
+def _reset_process_finalization_context() -> None:
+    """Drop inherited authority after ``fork`` without doing fallible I/O.
+
+    ``after_in_child`` exceptions are ignored by Python.  Identity capture uses
+    ``ps`` and can fail, so the hook only publishes unmistakably child-local,
+    unauthorised state.  ``_ensure_process_finalization_context`` performs the
+    fallible capture lazily and retries on the next Supervisor construction.
+    """
+    global _SYSTEM_PROCESS_PID, _SYSTEM_PROCESS_IDENTITY
+    global _SYSTEM_FINALIZATION_OWNER_TOKEN, _PROCESS_CONTEXT_GUARD
+    global _FINALIZATION_LOCKS_GUARD
+    global _FINALIZATION_LOCKS, _PROCESS_OWNED_RUNS_GUARD, _PROCESS_OWNED_RUNS
+    _SYSTEM_PROCESS_PID = os.getpid()
+    _SYSTEM_PROCESS_IDENTITY = None
+    _SYSTEM_FINALIZATION_OWNER_TOKEN = None
+    _PROCESS_CONTEXT_GUARD = threading.Lock()
+    _FINALIZATION_LOCKS_GUARD = threading.Lock()
+    _FINALIZATION_LOCKS = {}
+    _PROCESS_OWNED_RUNS_GUARD = threading.Lock()
+    _PROCESS_OWNED_RUNS = set()
+
+
+def _ensure_process_finalization_context() -> tuple[int, identity.ProcessIdentity, str]:
+    """Return fully initialized authority for this exact OS process."""
+    global _SYSTEM_PROCESS_IDENTITY, _SYSTEM_FINALIZATION_OWNER_TOKEN
+    if os.getpid() != _SYSTEM_PROCESS_PID:
+        _reset_process_finalization_context()
+    with _PROCESS_CONTEXT_GUARD:
+        if _SYSTEM_PROCESS_IDENTITY is None:
+            captured = identity.capture_identity(_SYSTEM_PROCESS_PID)
+            if captured is None:
+                raise SupervisorError(
+                    "Could not establish the supervisor process identity."
+                )
+            _SYSTEM_PROCESS_IDENTITY = captured
+        if _SYSTEM_FINALIZATION_OWNER_TOKEN is None:
+            _SYSTEM_FINALIZATION_OWNER_TOKEN = uuid.uuid4().hex
+        return (
+            _SYSTEM_PROCESS_PID,
+            _SYSTEM_PROCESS_IDENTITY,
+            _SYSTEM_FINALIZATION_OWNER_TOKEN,
+        )
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_process_finalization_context)
 
 # `AICC_CLAUDE_BINARY` lets a test point a genuinely separate OS process
 # (e.g. `scripts/execution_center_debug.py`, invoked as a real subprocess, not
@@ -448,13 +509,22 @@ class Supervisor:
     """
 
     def __init__(self, db_path: Path | None = None) -> None:
+        self._creator_pid = os.getpid()
+        owner_pid, owner_identity, owner_token = _ensure_process_finalization_context()
+        self._finalization_owner_token = owner_token
+        self._finalization_owner_pid = owner_pid
+        self._finalization_owner_identity = owner_identity.as_string()
         self.db_path = db_path or db.resolve_db_path()
         db.migrate(self.db_path)
         # Extracted sides of the supervisor (NIGHT-W9): stream consumption and
         # finalize/outcome persistence live behind small interfaces; this class
         # keeps orchestration (process lifecycle, `_active` registry, locks).
         self._streams = stream_reader.StreamReader(self.db_path)
-        self._finalizer = run_finalizer.RunFinalizer(self.db_path)
+        self._finalizer = run_finalizer.RunFinalizer(
+            self.db_path,
+            owner_token=self._finalization_owner_token,
+            owner_pid=self._creator_pid,
+        )
         self._active: dict[str, _ActiveRun] = {}
         # Run ids this instance has committed to launching (persisted as
         # PREPARED/QUEUED) but has not yet `Popen`'d — the gap `self._active`
@@ -482,6 +552,19 @@ class Supervisor:
         if os.environ.get("AICC_COMPLETION_AUTOPILOT"):
             self.start_completion_autopilot()
 
+    def _assert_current_process(self) -> None:
+        """Reject a Supervisor facade inherited across ``fork``.
+
+        Its locks, process handles, active registry and finalizer all belong to
+        the parent crash domain.  A child must construct a fresh facade after
+        the at-fork hook has established child-local authority.
+        """
+        if os.getpid() != self._creator_pid:
+            raise SupervisorError(
+                "A Supervisor inherited across fork cannot be used; "
+                "construct a fresh Supervisor in the child process."
+            )
+
     # ------------------------------------------------------------------
     # Completion pipeline (AICC-AUTONOMY-001) — advances the post-execution
     # lifecycle *independently* of the original Claude process. Bounded (only
@@ -490,6 +573,7 @@ class Supervisor:
     # ------------------------------------------------------------------
 
     def advance_completions(self, *, now=None, limit: int = 50, github=None) -> list:
+        self._assert_current_process()
         from command_center.runtime.completion_service import CompletionOrchestrator
 
         orchestrator = CompletionOrchestrator(self.db_path, github=github)
@@ -501,6 +585,7 @@ class Supervisor:
         no-op. This is the "Supervisor advances completion workflows
         independently of the Claude process" integration, kept off the UI
         thread so completion validation/GitHub calls never block rendering."""
+        self._assert_current_process()
         if self._autopilot_thread is not None and self._autopilot_thread.is_alive():
             return
         stop = threading.Event()
@@ -518,6 +603,7 @@ class Supervisor:
         thread.start()
 
     def stop_completion_autopilot(self) -> None:
+        self._assert_current_process()
         if self._autopilot_stop is not None:
             self._autopilot_stop.set()
 
@@ -618,6 +704,7 @@ class Supervisor:
         an unconfigured/mismatched repository path, or an invalid resume
         request (no such session).
         """
+        self._assert_current_process()
         # Pre-launch gates, in the only order that is safe. Provider resolution
         # first, because every gate below is phrased in terms of it; then the
         # project-level policy on which providers may run at all; then the
@@ -833,10 +920,15 @@ class Supervisor:
                     base_branch=provenance_base_branch,
                     base_sha=provenance_base_sha,
                     head_sha=launch_snapshot.get("head"),
+                    finalization_owner_token=self._finalization_owner_token,
+                    finalization_owner_pid=self._finalization_owner_pid,
+                    finalization_owner_identity=self._finalization_owner_identity,
                     enforce_workspace_lock=True,
                     max_global_concurrency=max_global_concurrency,
                 )
                 self._launching.add(run["id"])
+                with _PROCESS_OWNED_RUNS_GUARD:
+                    _PROCESS_OWNED_RUNS.add(run["id"])
         except db.WorkspaceLockedError as exc:
             raise WorkspaceLockedError(exc.conflicting_run) from exc
         except db.TaskAlreadyActiveError as exc:
@@ -881,6 +973,16 @@ class Supervisor:
                         reason=decision.reason,
                     )["payload"],
                 )
+                if not self._complete_owned_terminal_finalization(
+                    run["id"],
+                    exit_code=None,
+                    lifecycle="capability_preflight_failed",
+                ):
+                    raise SupervisorError(
+                        f"Run {run['id']!r} capability failure was not durably finalized."
+                    )
+                with _PROCESS_OWNED_RUNS_GUARD:
+                    _PROCESS_OWNED_RUNS.discard(run["id"])
             finally:
                 with self._active_lock:
                     self._launching.discard(run["id"])
@@ -917,8 +1019,30 @@ class Supervisor:
             # every path it can reach — success or a failed `Popen`) was
             # never entered, so nothing else will clear this run out of
             # `_launching` if it's left here.
+            terminal_persisted = self._persist_run_failure(
+                run["id"],
+                exit_code=None,
+                failure_reason="launch_preparation_failed",
+                lifecycle="launch_preparation_failed",
+            )
+            if terminal_persisted:
+                try:
+                    terminal_persisted = self._complete_owned_terminal_finalization(
+                        run["id"],
+                        exit_code=None,
+                        lifecycle="launch_preparation_failed",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not finalize launch preparation failure for run %s",
+                        run["id"],
+                    )
+                    terminal_persisted = False
             with self._active_lock:
                 self._launching.discard(run["id"])
+            if terminal_persisted:
+                with _PROCESS_OWNED_RUNS_GUARD:
+                    _PROCESS_OWNED_RUNS.discard(run["id"])
             raise
 
         return self._launch_process(run, spec, repo_path, provider)
@@ -1028,6 +1152,14 @@ class Supervisor:
             self._append_lifecycle_event_best_effort(
                 "launch_failed", run_id, error=str(exc), error_type=type(exc).__name__
             )
+            if not self._complete_owned_terminal_finalization(
+                run_id, exit_code=None, lifecycle="launch_failed"
+            ):
+                raise SupervisorError(
+                    f"Run {run_id!r} launch failure was not durably finalized."
+                ) from exc
+            with _PROCESS_OWNED_RUNS_GUARD:
+                _PROCESS_OWNED_RUNS.discard(run_id)
             return run
 
         pid = process.pid
@@ -1043,12 +1175,21 @@ class Supervisor:
             # inside the post-Popen safety boundary.
             exited = self._terminate_unregistered_process(process, process_group_id=pid)
             if exited:
-                self._persist_run_failure(
+                terminal_persisted = self._persist_run_failure(
                     run_id,
                     exit_code=process.returncode,
                     failure_reason="launch_setup_failed",
                     lifecycle="launch_failed",
                 )
+                if terminal_persisted:
+                    terminal_persisted = self._complete_owned_terminal_finalization(
+                        run_id,
+                        exit_code=process.returncode,
+                        lifecycle="launch_failed",
+                    )
+                if terminal_persisted:
+                    with _PROCESS_OWNED_RUNS_GUARD:
+                        _PROCESS_OWNED_RUNS.discard(run_id)
             self._append_lifecycle_event_best_effort(
                 "launch_failed", run_id, error=str(exc), error_type=type(exc).__name__, pid=pid
             )
@@ -1451,12 +1592,167 @@ class Supervisor:
         """Delegates to `run_finalizer.RunFinalizer` (extracted side)."""
         return self._finalizer.mark_finalized(run_id)
 
+    def _owns_open_finalization_claim(self, run_id: str) -> bool:
+        claim = db.get_run_finalization_claim(self.db_path, run_id)
+        return bool(
+            claim
+            and claim["owner_token"] == self._finalization_owner_token
+            and claim.get("completed_at") is None
+        )
+
+    def _acquire_recovery_finalization_claim(self, run_id: str) -> bool:
+        """Take ownership only after proving the prior supervisor is gone."""
+        claim = db.get_run_finalization_claim(self.db_path, run_id)
+        if claim is not None:
+            if claim.get("completed_at") is not None:
+                return False
+            if claim["owner_token"] == self._finalization_owner_token:
+                return True
+            owner_query = identity.query_identity(int(claim["owner_pid"]))
+            if owner_query.status is identity.ProcessQueryStatus.UNKNOWN:
+                return False
+            if owner_query.status is identity.ProcessQueryStatus.LIVE:
+                # A live PID without a readable identity is not proof of reuse.
+                # The command portion is mutable (process-title/argv changes,
+                # locale/rendering differences), so a command-only mismatch
+                # must also fail closed.  Only a different birth timestamp can
+                # prove that this live PID is a later process.
+                if owner_query.identity is None:
+                    return False
+                if owner_query.identity.as_string() == claim["owner_identity"]:
+                    return False
+                recorded_start, separator, _recorded_command = claim[
+                    "owner_identity"
+                ].partition("|")
+                if not separator or recorded_start == owner_query.identity.start_time:
+                    return False
+            expected = claim["owner_token"]
+        else:
+            # Pre-v25 rows have no fenced owner.  Their safety cannot be
+            # inferred while an old supervisor may still be finalizing them.
+            # Deployment must prove a zero-unfinalized drain before upgrading;
+            # absent claims remain fail-closed instead of being time-stolen.
+            return False
+        acquired = db.claim_run_finalization(
+            self.db_path,
+            run_id,
+            owner_token=self._finalization_owner_token,
+            owner_pid=self._finalization_owner_pid,
+            owner_identity=self._finalization_owner_identity,
+            expected_owner_token=expected,
+        )
+        return bool(
+            acquired
+            and acquired["owner_token"] == self._finalization_owner_token
+        )
+
+    def _ensure_terminal_report(self, run: dict) -> None:
+        """Create or verify the immutable report before finalized_at.
+
+        Recovery may resume after the file rename but before the report-row
+        insert. Re-rendering that deterministic path is safe until the row is
+        registered; once registered, both the row and referenced file must be
+        present and are never rewritten.
+        """
+        existing = db.get_report(self.db_path, run["id"])
+        if existing is not None:
+            resolved = reports.resolve_report_path(existing.get("path"))
+            if resolved is None or not resolved.is_file():
+                raise SupervisorError(
+                    f"Run {run['id']!r} has a report row without a valid durable file."
+                )
+            return
+        events = db.list_run_events(
+            self.db_path, run["id"], after_seq=0, limit=1_000_000
+        )
+        path = reports.save_report(run, events)
+        try:
+            db.create_report(
+                self.db_path, run["id"], reports.stored_report_path(path)
+            )
+        except Exception:
+            # A retry can observe an insert completed by an earlier attempt
+            # whose caller failed immediately after commit. Accept only the
+            # exact durable row/file, never the exception by itself.
+            existing = db.get_report(self.db_path, run["id"])
+            if existing is None:
+                raise
+        stored = db.get_report(self.db_path, run["id"])
+        resolved = reports.resolve_report_path(stored.get("path") if stored else None)
+        if stored is None or resolved is None or not resolved.is_file():
+            raise SupervisorError(f"Run {run['id']!r} report was not durably persisted.")
+
+    def _ensure_lifecycle_event(
+        self, run_id: str, lifecycle: str, **payload: object
+    ) -> None:
+        if self._has_lifecycle_event(run_id, lifecycle):
+            return
+        self._append_lifecycle_event_best_effort(lifecycle, run_id, **payload)
+        if not self._has_lifecycle_event(run_id, lifecycle):
+            raise SupervisorError(
+                f"Run {run_id!r} lifecycle event {lifecycle!r} was not persisted."
+            )
+
+    def _complete_owned_terminal_finalization(
+        self,
+        run_id: str,
+        *,
+        exit_code: int | None,
+        lifecycle: str,
+    ) -> bool:
+        """Idempotently finish every durability write under the exact claim."""
+        with _FINALIZATION_LOCKS_GUARD:
+            finalization_lock = _FINALIZATION_LOCKS.setdefault(run_id, threading.Lock())
+        with finalization_lock:
+            current = db.get_run(self.db_path, run_id)
+            if current is None:
+                return True
+            if current.get("finalized_at"):
+                return True
+            if current["state"] not in db.TERMINAL_STATES:
+                return False
+            if not self._owns_open_finalization_claim(run_id):
+                return False
+
+            self._finalizer.finish_started_attempt(
+                current,
+                fallback_failure_reason=current.get("failure_reason") or "supervision_failed",
+            )
+            self._ensure_lifecycle_event(
+                run_id, lifecycle, exit_code=exit_code, state=current["state"]
+            )
+            if current["state"] == "COMPLETED" and not any(
+                self._has_lifecycle_event(run_id, marker)
+                for marker in (
+                    "auto_committed",
+                    "auto_commit_skipped_clean_tree",
+                    "auto_commit_failed",
+                )
+            ):
+                self._auto_commit_completed_work(
+                    run_id, Path(current["repository_path"])
+                )
+            current = db.get_run(self.db_path, run_id)
+            if current is None:
+                return True
+            try:
+                self._ensure_terminal_report(current)
+            except Exception as exc:
+                self._append_lifecycle_event_best_effort(
+                    "report_persistence_failed", run_id, error=str(exc)
+                )
+                raise
+            finalized = self._mark_finalized(run_id)
+            return finalized
+
     def _release_active(self, run_id: str, active: _ActiveRun) -> None:
         active.terminal_persisted_event.set()
         with self._active_lock:
             if self._active.get(run_id) is active:
                 self._active.pop(run_id, None)
         active.done_event.set()
+        with _PROCESS_OWNED_RUNS_GUARD:
+            _PROCESS_OWNED_RUNS.discard(run_id)
 
     def _retry_failed_finalization(self, run_id: str, active: _ActiveRun) -> bool:
         with active.finalization_retry_lock:
@@ -1467,9 +1763,18 @@ class Supervisor:
                 and active.finalization_failed_event.is_set()
             ):
                 return False
-            if not self._persist_supervision_failure(
+            current = db.get_run(self.db_path, run_id)
+            if current is None:
+                self._release_active(run_id, active)
+                return True
+            if current["state"] not in db.TERMINAL_STATES and not self._persist_supervision_failure(
+                run_id, exit_code=active.process.returncode
+            ):
+                return False
+            if not self._complete_owned_terminal_finalization(
                 run_id,
                 exit_code=active.process.returncode,
+                lifecycle="supervision_failed",
             ):
                 return False
             self._release_active(run_id, active)
@@ -1530,9 +1835,19 @@ class Supervisor:
             lifecycle="launch_setup_failed",
         )
         if terminal_persisted:
-            self._release_active(run_id, active)
-        else:
+            try:
+                terminal_persisted = self._complete_owned_terminal_finalization(
+                    run_id,
+                    exit_code=active.process.returncode,
+                    lifecycle="launch_setup_failed",
+                )
+            except Exception:
+                logger.exception("Could not finalize failed launch for run %s", run_id)
+                terminal_persisted = False
+        if not terminal_persisted:
             active.finalization_failed_event.set()
+            return
+        self._release_active(run_id, active)
 
     def _retry_failed_launch_cleanup(self, run_id: str, active: _ActiveRun) -> bool:
         with active.launch_cleanup_retry_lock:
@@ -1553,6 +1868,18 @@ class Supervisor:
                 failure_reason="launch_setup_failed",
                 lifecycle="launch_setup_failed",
             )
+            if terminal_persisted:
+                try:
+                    terminal_persisted = self._complete_owned_terminal_finalization(
+                        run_id,
+                        exit_code=active.process.returncode,
+                        lifecycle="launch_setup_failed",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not finalize recovered failed launch for run %s", run_id
+                    )
+                    terminal_persisted = False
             if terminal_persisted:
                 self._release_active(run_id, active)
                 return True
@@ -1947,7 +2274,15 @@ class Supervisor:
                         # Respect it and avoid a duplicate process-exited event
                         # or report; this instance still releases ownership in
                         # the outer finally block.
-                        terminal_persisted = True
+                        terminal_persisted = self._complete_owned_terminal_finalization(
+                            run_id,
+                            exit_code=exit_code,
+                            lifecycle="process_exited",
+                        )
+                        if not terminal_persisted:
+                            raise SupervisorError(
+                                f"Run {run_id!r} terminal decision was not durably finalized."
+                            )
                         active.terminal_persisted_event.set()
                         return
                     if current["state"] != "RUNNING":
@@ -1975,30 +2310,6 @@ class Supervisor:
                     post_run_git_status=post_status,
                 )
 
-            # Runs before the report so the commit (or its failure) is part of
-            # the run's own persisted audit trail.
-            if new_state == "COMPLETED":
-                self._auto_commit_completed_work(run_id, repo_path)
-
-            if new_state in ("COMPLETED", "FAILED", "CANCELLED"):
-                try:
-                    events = db.list_run_events(self.db_path, run_id, after_seq=0, limit=1_000_000)
-                    path = reports.save_report(run, events)
-                    # Relative to `REPORTS_ROOT`'s *parent* (not the hardcoded
-                    # repo root), so tests can redirect report persistence.
-                    db.create_report(
-                        self.db_path,
-                        run_id,
-                        reports.stored_report_path(path),
-                    )
-                except Exception as exc:
-                    logger.exception("Could not persist report for run %s", run_id)
-                    self._append_lifecycle_event_best_effort(
-                        "report_persistence_failed",
-                        run_id,
-                        error=str(exc),
-                    )
-
             # The last write of the run, and the reason `finalized_at` exists.
             # Everything above — the `process_exited` event, the auto-commit of
             # the agent's work, the report — happens *after* the terminal state
@@ -2016,7 +2327,9 @@ class Supervisor:
             # "finalized" a consequence of the durable writes instead of a
             # promise made before them. Move it up and the column still exists
             # while the guarantee is gone.
-            if not self._mark_finalized(run_id):
+            if not self._complete_owned_terminal_finalization(
+                run_id, exit_code=exit_code, lifecycle="process_exited"
+            ):
                 raise SupervisorError(f"Run {run_id!r} finalization marker was not persisted.")
         except Exception:
             logger.exception("Unexpected supervision failure for run %s", run_id)
@@ -2031,10 +2344,27 @@ class Supervisor:
             for thread in reader_threads:
                 thread.join(timeout=DEFAULT_CANCEL_GRACE_SECONDS)
             if exited:
-                terminal_persisted = self._persist_supervision_failure(
-                    run_id,
-                    exit_code=active.process.returncode,
+                current = db.get_run(self.db_path, run_id)
+                terminal_persisted = bool(
+                    current and current["state"] in db.TERMINAL_STATES
                 )
+                if not terminal_persisted:
+                    terminal_persisted = self._persist_supervision_failure(
+                        run_id,
+                        exit_code=active.process.returncode,
+                    )
+                if terminal_persisted:
+                    try:
+                        terminal_persisted = self._complete_owned_terminal_finalization(
+                            run_id,
+                            exit_code=active.process.returncode,
+                            lifecycle="supervision_failed",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not recover durable finalization for run %s", run_id
+                        )
+                        terminal_persisted = False
                 if terminal_persisted:
                     active.terminal_persisted_event.set()
                 else:
@@ -2069,6 +2399,7 @@ class Supervisor:
         pre-run snapshot (see `_supervise`'s
         `cancellation_working_tree_changed_requires_inspection` event).
         """
+        self._assert_current_process()
         context_service.require_launch_confirmation(confirmed, what="Cancelling a run")
 
         with self._active_lock:
@@ -2291,6 +2622,8 @@ class Supervisor:
         run_id: str,
         *,
         classification: str,
+        pid: int | None = None,
+        detail: str = "reconciled orphan",
     ) -> dict | None:
         """Persist one reconciliation decision with bounded CAS retries."""
         for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
@@ -2298,12 +2631,29 @@ class Supervisor:
             if current is None:
                 return current
             if current["state"] in db.TERMINAL_STATES:
-                if current.get("finalized_at") or self._mark_finalized(run_id):
-                    return db.get_run(self.db_path, run_id)
-                continue
+                # Never infer that another owner's post-terminal writes are
+                # done. A terminal-but-unfinalized row remains visibly pending
+                # until its owner completes or a later recovery proves that
+                # owner dead and takes the explicit claim.
+                if current.get("finalized_at"):
+                    return current
+                if self._owns_open_finalization_claim(run_id):
+                    if self._complete_owned_terminal_finalization(
+                        run_id,
+                        exit_code=current.get("exit_code"),
+                        lifecycle="reconciliation_classified",
+                    ):
+                        return db.get_run(self.db_path, run_id)
+                    continue
+                return current
             if current["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
                 return current
             if classification == "RUNNING" and current["state"] == "RUNNING":
+                return current
+            if (
+                classification in db.TERMINAL_STATES
+                and not self._acquire_recovery_finalization_claim(run_id)
+            ):
                 return current
             try:
                 reconciled = db.update_run_state(
@@ -2315,15 +2665,22 @@ class Supervisor:
                 )
             except (db.LostUpdateError, db.InvalidTransitionError):
                 continue
-            if classification in db.TERMINAL_STATES and not self._mark_finalized(run_id):
-                # Reconciliation *is* the finalization for these runs: the
-                # supervisor that owned them is gone, so no report and no
-                # auto-commit are coming, and this decision is the last word on
-                # them. Without the marker they would stay unfinalized forever
-                # and the cutover predicate could never reach zero on any
-                # install that has ever restarted with a run in flight — a
-                # drain gate that never drains.
-                continue
+            if classification in db.TERMINAL_STATES:
+                if not self._has_lifecycle_event(run_id, "reconciliation_classified"):
+                    self._append_lifecycle_event_best_effort(
+                        "reconciliation_classified",
+                        run_id,
+                        pid=pid,
+                        classification=classification,
+                        detail=detail,
+                    )
+                if not self._complete_owned_terminal_finalization(
+                    run_id,
+                    exit_code=reconciled.get("exit_code"),
+                    lifecycle="reconciliation_classified",
+                ):
+                    continue
+                return db.get_run(self.db_path, run_id)
             return reconciled
         raise SupervisorError(
             f"Run {run_id!r} could not persist reconciliation state "
@@ -2420,6 +2777,7 @@ class Supervisor:
           not itself `Popen`, so it cannot resume incremental persistence
           and must not attempt to signal/cancel it.
         """
+        self._assert_current_process()
         outcomes = []
         # The row query belongs to the same critical section as the in-memory
         # snapshot. `start_raw()` uses this lock around create_run()+registration,
@@ -2428,6 +2786,8 @@ class Supervisor:
         with self._active_lock:
             active_snapshot = dict(self._active)
             launching_ids = set(self._launching)
+        with _PROCESS_OWNED_RUNS_GUARD:
+            process_owned_ids = set(_PROCESS_OWNED_RUNS)
 
         # Self-heal terminal persistence failures without waiting for a
         # Supervisor restart. Slow normal finalization is not eligible because
@@ -2467,6 +2827,41 @@ class Supervisor:
             # ownership registration is not yet visible — exactly the state the
             # comment above says reconciliation must never observe.
             active_rows = db.list_runs(self.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+
+        # Recover terminal rows only through the durable ownership claim. A
+        # live prior supervisor means "still finalizing", not an orphan; an
+        # unknown process query also fails closed. If the exact owner identity
+        # is gone, one CAS winner reconstructs the report/attempt/commit and
+        # only then closes the marker.
+        for pending in db.list_unfinalized_runs(self.db_path):
+            run_id = pending["id"]
+            if run_id in actively_supervised_ids:
+                continue
+            try:
+                if not self._acquire_recovery_finalization_claim(run_id):
+                    continue
+                if not self._has_lifecycle_event(run_id, "finalization_recovered"):
+                    self._append_lifecycle_event_best_effort(
+                        "finalization_recovered",
+                        run_id,
+                        prior_state=pending["state"],
+                    )
+                if self._complete_owned_terminal_finalization(
+                    run_id,
+                    exit_code=pending.get("exit_code"),
+                    lifecycle="finalization_recovered",
+                ):
+                    with _PROCESS_OWNED_RUNS_GUARD:
+                        _PROCESS_OWNED_RUNS.discard(run_id)
+                    outcomes.append(
+                        {
+                            "run_id": run_id,
+                            "classification": pending["state"],
+                            "detail": "recovered terminal finalization after owner exit",
+                        }
+                    )
+            except Exception:
+                logger.exception("Could not recover terminal finalization for run %s", run_id)
         # Forget "gone" suspicions for any run that is no longer active — it
         # either reached a terminal state (its owner CAS'd it) or is now
         # supervised, so it must not carry a stale suspicion into a later pass.
@@ -2476,7 +2871,7 @@ class Supervisor:
                 self._suspected_gone.pop(stale, None)
         for run in active_rows:
             run_id = run["id"]
-            if run_id in actively_supervised_ids:
+            if run_id in actively_supervised_ids or run_id in process_owned_ids:
                 continue
             try:
                 pid = run.get("pid")
@@ -2555,6 +2950,8 @@ class Supervisor:
                 persisted = self._persist_reconciliation_state(
                     run_id,
                     classification=classification,
+                    pid=pid,
+                    detail=detail,
                 )
                 if persisted is not None and persisted["state"] in db.TERMINAL_STATES:
                     classification = persisted["state"]
@@ -2568,13 +2965,14 @@ class Supervisor:
                             detail=detail,
                         )
                 else:
-                    self._append_lifecycle_event_best_effort(
-                        "reconciliation_classified",
-                        run_id,
-                        pid=pid,
-                        classification=classification,
-                        detail=detail,
-                    )
+                    if not self._has_lifecycle_event(run_id, "reconciliation_classified"):
+                        self._append_lifecycle_event_best_effort(
+                            "reconciliation_classified",
+                            run_id,
+                            pid=pid,
+                            classification=classification,
+                            detail=detail,
+                        )
                 outcomes.append({"run_id": run_id, "classification": classification, "detail": detail})
             except Exception as exc:
                 # One damaged/contended row must not prevent recovery of every
@@ -2597,12 +2995,14 @@ class Supervisor:
         return db.get_run(self.db_path, run_id)
 
     def active_run_ids(self) -> list[str]:
+        self._assert_current_process()
         with self._active_lock:
             return list(self._active.keys())
 
     def wait_for_run(self, run_id: str, timeout: float | None = None) -> dict:
         """Block until `run_id` leaves this instance's active-run registry
         (i.e. reaches a terminal state) or `timeout` elapses."""
+        self._assert_current_process()
         deadline = None if timeout is None else time.monotonic() + max(timeout, 0.0)
         while True:
             with self._active_lock:

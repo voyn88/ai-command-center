@@ -24,6 +24,9 @@ def _make_running_row(db_path, *, pid, process_start_identity):
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(
@@ -159,10 +162,16 @@ def test_reconcile_only_touches_running_rows(tmp_path):
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="RUNNING")
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="COMPLETED")
+    assert db.mark_run_finalized(
+        db_path, run["id"], owner_token="dead-supervisor"
+    ) is not None
 
     sup = supervisor.Supervisor(db_path)
     outcomes = sup.reconcile()
@@ -201,6 +210,9 @@ def _make_queued_row(db_path, *, pid=None, process_start_identity=None):
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     if pid is not None:
@@ -217,6 +229,9 @@ def _make_prepared_row(db_path):
     return db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
 
 
@@ -429,6 +444,9 @@ def _make_running_row_with_timeout(db_path, *, pid, process_start_identity, star
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False, timeout_seconds=timeout_seconds,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(

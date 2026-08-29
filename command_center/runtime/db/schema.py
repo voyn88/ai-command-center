@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -239,6 +239,65 @@ def _migration_24_add_finalized_at(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_run_unfinalized "
             "ON run (state) WHERE finalized_at IS NULL"
+        )
+
+
+def _migration_25_add_finalization_claim(conn: sqlite3.Connection) -> None:
+    """Install claim fencing only after an offline, fully-finalized drain.
+
+    A pre-v25 process cannot write claims.  Creating the table while such a
+    process is active would let new code mistake a missing claim for abandoned
+    ownership.  Refuse that rolling-upgrade shape; deployment must stop intake
+    and the old supervisor, prove the drain, then migrate and restart.
+    """
+    with db.transaction(conn):
+        if conn.execute(
+            "SELECT 1 FROM schema_version WHERE version = 25"
+        ).fetchone() is not None:
+            return
+        terminal_states = tuple(sorted(db.TERMINAL_STATES))
+        terminal_placeholders = ",".join("?" for _ in terminal_states)
+        preexisting = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'run_finalization_claim'"
+        ).fetchone()
+        if preexisting is not None:
+            raise RuntimeError(
+                "runtime schema v25 found an unversioned finalization claim table"
+            )
+        # Fail closed: only a known terminal state with durable finalization
+        # evidence is safe.  There is no SQL CHECK on run.state, so testing
+        # only today's active/terminal allowlists would let a corrupt or future
+        # state silently cross the non-rolling cutover.
+        unsafe = conn.execute(
+            "SELECT id, state FROM run WHERE NOT "
+            f"(state IN ({terminal_placeholders}) AND finalized_at IS NOT NULL) LIMIT 1",
+            terminal_states,
+        ).fetchone()
+        if unsafe is not None:
+            raise RuntimeError(
+                "runtime schema v25 requires an offline zero-active, "
+                "zero-unfinalized drain before finalization claims are enabled"
+            )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS run_finalization_claim ("
+            "run_id TEXT NOT NULL PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE, "
+            "owner_token TEXT NOT NULL CHECK (owner_token <> ''), "
+            "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), "
+            "owner_identity TEXT NOT NULL CHECK (owner_identity <> ''), "
+            "claimed_at TEXT NOT NULL, completed_at TEXT, "
+            "CHECK (completed_at IS NULL OR completed_at >= claimed_at))"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_finalization_claim_open "
+            "ON run_finalization_claim(completed_at) WHERE completed_at IS NULL"
+        )
+        # The fencing table and its ledger record are one atomic fact.  The
+        # generic migration loop's following INSERT is deliberately idempotent
+        # and will observe this row as already present.
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (25, db.iso_now()),
         )
 
 
@@ -1160,4 +1219,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (22, _SCHEMA_V22),
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
+    (25, _migration_25_add_finalization_claim),
 ]

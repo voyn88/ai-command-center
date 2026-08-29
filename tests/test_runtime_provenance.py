@@ -176,6 +176,13 @@ def test_migration_preserves_run_history_and_backfills_missing_rows(tmp_path):
         db.SCHEMA_VERSION = original_version - 1
         db.migrate(db_path)
         legacy = _run(db_path)
+        with db.connect(db_path) as conn:
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE run SET state = 'COMPLETED', completed_at = ?, "
+                    "finalized_at = ? WHERE id = ?",
+                    (db.iso_now(), db.iso_now(), legacy["id"]),
+                )
     finally:
         db.MIGRATIONS = original_migrations
         db.SCHEMA_VERSION = original_version

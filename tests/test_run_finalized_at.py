@@ -34,16 +34,18 @@ that would keep the column and destroy the guarantee.
 from __future__ import annotations
 
 import os
+import multiprocessing
 import signal
 import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
 
-from command_center.runtime import db, supervisor
+from command_center.runtime import db, identity, reports, supervisor
 
 PROBE = Path(__file__).parent / "fixtures" / "finalization_kill_probe.py"
 
@@ -67,6 +69,132 @@ def _run_probe(repo: Path, *, widen: float, poll: float) -> subprocess.Completed
         capture_output=True,
         text=True,
         timeout=120,
+    )
+
+
+def _create_claimed_terminal_run(
+    sup: supervisor.Supervisor, repo: Path, *, state: str = "COMPLETED"
+) -> dict:
+    task = db.create_task(
+        sup.db_path, project="AIOS", title="claimed", task_type="implementation"
+    )
+    session = db.create_session(
+        sup.db_path,
+        task_id=task["id"],
+        project="AIOS",
+        repository_path=str(repo),
+    )
+    run = db.create_run(
+        sup.db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        repository_path=str(repo),
+        task_type="implementation",
+        prompt="claimed",
+        is_resume=False,
+        command=["claude", "--print"],
+        finalization_owner_token=sup._finalization_owner_token,
+        finalization_owner_pid=sup._finalization_owner_pid,
+        finalization_owner_identity=sup._finalization_owner_identity,
+    )
+    run = db.update_run_state(
+        sup.db_path, run["id"], expected_version=run["version"], new_state="QUEUED"
+    )
+    run = db.update_run_state(
+        sup.db_path, run["id"], expected_version=run["version"], new_state="RUNNING"
+    )
+    return db.update_run_state(
+        sup.db_path,
+        run["id"],
+        expected_version=run["version"],
+        new_state=state,
+        fields={"completed_at": db.iso_now(), "exit_code": 0},
+    )
+
+
+def _replace_claim_with_dead_owner(
+    sup: supervisor.Supervisor, run_id: str, *, token: str = "dead-owner-token"
+) -> None:
+    current = db.get_run_finalization_claim(sup.db_path, run_id)
+    replaced = db.claim_run_finalization(
+        sup.db_path,
+        run_id,
+        owner_token=token,
+        owner_pid=999_999_999,
+        owner_identity="dead-start|dead-command",
+        expected_owner_token=current["owner_token"],
+    )
+    assert replaced is not None
+
+
+def _fork_finalization_context_probe(
+    inherited,
+    db_path: str,
+    cold_db_path: str,
+    run_id: str,
+    result_queue,
+    fail_first_capture: bool,
+) -> None:
+    """Exercise both rejected inherited state and fresh child authority."""
+    from command_center.runtime import identity as child_identity
+    from command_center.runtime import supervisor as child_supervisor
+
+    rejected: list[str] = []
+    inherited_calls = (
+        ("reconcile", lambda: inherited.reconcile()),
+        ("cancel", lambda: inherited.cancel("missing", confirmed=False)),
+        ("wait", lambda: inherited.wait_for_run("missing", timeout=0)),
+        ("active", inherited.active_run_ids),
+        ("finalizer", lambda: inherited._finalizer.final_result_payload("missing")),
+    )
+    for name, call in inherited_calls:
+        try:
+            call()
+        except (child_supervisor.SupervisorError, RuntimeError):
+            rejected.append(name)
+
+    capture_error = None
+    cold_version_before = db.current_schema_version(Path(cold_db_path))
+    cold_version_after_failed_capture = cold_version_before
+    original_capture = child_supervisor.identity.capture_identity
+    if fail_first_capture:
+        child_supervisor.identity.capture_identity = lambda _pid: None
+        try:
+            child_supervisor.Supervisor(db_path=Path(db_path))
+        except child_supervisor.SupervisorError as exc:
+            capture_error = str(exc)
+        finally:
+            child_supervisor.identity.capture_identity = original_capture
+        cold_version_after_failed_capture = db.current_schema_version(
+            Path(cold_db_path)
+        )
+
+    first = child_supervisor.Supervisor(db_path=Path(db_path))
+    second = child_supervisor.Supervisor(db_path=Path(db_path))
+    child_supervisor.Supervisor(db_path=Path(cold_db_path))
+    first.reconcile()
+    observed = child_identity.query_identity(os.getpid())
+    result_queue.put(
+        {
+            "pid": os.getpid(),
+            "global_pid": child_supervisor._SYSTEM_PROCESS_PID,
+            "global_token": child_supervisor._SYSTEM_FINALIZATION_OWNER_TOKEN,
+            "first_token": first._finalization_owner_token,
+            "second_token": second._finalization_owner_token,
+            "first_owner_pid": first._finalization_owner_pid,
+            "identity_status": observed.status.value,
+            "identity_matches": bool(
+                observed.identity
+                and observed.identity.as_string() == first._finalization_owner_identity
+            ),
+            "rejected": rejected,
+            "capture_error": capture_error,
+            "cold_version_before": cold_version_before,
+            "cold_version_after_failed_capture": cold_version_after_failed_capture,
+            "cold_version_after_retry": db.current_schema_version(Path(cold_db_path)),
+            "finalized_at": db.get_run(Path(db_path), run_id)["finalized_at"],
+        }
     )
 
 
@@ -215,15 +343,428 @@ def test_the_marker_is_write_once(git_repo, configure_project_repo, fake_claude)
 
     first = db.get_run(sup.db_path, run["id"])["finalized_at"]
     assert first is not None
-    assert db.mark_run_finalized(sup.db_path, run["id"]) is None, "a second mark was accepted"
+    assert db.mark_run_finalized(
+        sup.db_path,
+        run["id"],
+        owner_token=sup._finalization_owner_token,
+    ) is None, "a second mark was accepted"
     assert db.get_run(sup.db_path, run["id"])["finalized_at"] == first
 
     # And it leaves the concurrency protocol alone: a marker is bookkeeping, and
     # bumping `version` would make an unrelated compare-and-set holder lose its
     # update because of a write that changed no domain field.
     before = db.get_run(sup.db_path, run["id"])
-    db.mark_run_finalized(sup.db_path, run["id"])
+    db.mark_run_finalized(
+        sup.db_path,
+        run["id"],
+        owner_token=sup._finalization_owner_token,
+    )
     assert db.get_run(sup.db_path, run["id"])["version"] == before["version"]
+
+
+def test_same_process_supervisors_share_finalization_ownership(
+    git_repo, configure_project_repo
+):
+    configure_project_repo("AIOS", git_repo)
+    owner = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(owner, git_repo)
+    intruder = supervisor.Supervisor(db_path=owner.db_path)
+
+    observed = intruder._persist_reconciliation_state(
+        run["id"], classification="INTERRUPTED"
+    )
+
+    assert observed["state"] == "COMPLETED"
+    assert owner._finalization_owner_token == intruder._finalization_owner_token
+    assert observed["finalized_at"] is not None
+    assert db.get_report(owner.db_path, run["id"]) is not None
+    claim = db.get_run_finalization_claim(owner.db_path, run["id"])
+    assert claim["owner_token"] == owner._finalization_owner_token
+    assert claim["completed_at"] is not None
+    assert intruder._mark_finalized(run["id"]) is True
+
+
+def test_same_process_reconcile_recovers_process_owned_terminal_failure(
+    git_repo, configure_project_repo
+):
+    configure_project_repo("AIOS", git_repo)
+    owner = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(owner, git_repo)
+    with supervisor._PROCESS_OWNED_RUNS_GUARD:
+        supervisor._PROCESS_OWNED_RUNS.add(run["id"])
+
+    recovery = supervisor.Supervisor(db_path=owner.db_path)
+    outcomes = recovery.reconcile()
+
+    assert sum(item["run_id"] == run["id"] for item in outcomes) == 1
+    assert db.get_run(owner.db_path, run["id"])["finalized_at"] is not None
+    assert db.get_report(owner.db_path, run["id"]) is not None
+    with supervisor._PROCESS_OWNED_RUNS_GUARD:
+        assert run["id"] not in supervisor._PROCESS_OWNED_RUNS
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="fork ownership semantics are POSIX-only",
+)
+@pytest.mark.parametrize("fail_first_capture", [False, True])
+def test_fork_drops_parent_authority_and_requires_fresh_child_supervisor(
+    git_repo, configure_project_repo, fail_first_capture, tmp_path, monkeypatch
+):
+    configure_project_repo("AIOS", git_repo)
+    parent = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(parent, git_repo)
+    parent_token = parent._finalization_owner_token
+    parent_pid = os.getpid()
+    cold_db_path = tmp_path / "cold-v24.db"
+    current_migrations = list(db.MIGRATIONS)
+    with monkeypatch.context() as pre_claim:
+        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "SCHEMA_VERSION", 24)
+        db.migrate(cold_db_path)
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    child = context.Process(
+        target=_fork_finalization_context_probe,
+        args=(
+            parent,
+            str(parent.db_path),
+            str(cold_db_path),
+            run["id"],
+            result_queue,
+            fail_first_capture,
+        ),
+    )
+
+    child.start()
+    child.join(timeout=30)
+
+    assert child.exitcode == 0
+    result = result_queue.get(timeout=5)
+    assert set(result["rejected"]) == {
+        "reconcile",
+        "cancel",
+        "wait",
+        "active",
+        "finalizer",
+    }
+    assert result["pid"] != parent_pid
+    assert result["global_pid"] == result["pid"]
+    assert result["first_owner_pid"] == result["pid"]
+    assert result["first_token"] == result["second_token"] == result["global_token"]
+    assert result["first_token"] != parent_token
+    assert result["identity_status"] == identity.ProcessQueryStatus.LIVE.value
+    assert result["identity_matches"] is True
+    assert bool(result["capture_error"]) is fail_first_capture
+    assert result["cold_version_before"] == 24
+    assert result["cold_version_after_failed_capture"] == 24
+    assert result["cold_version_after_retry"] == 25
+    # A fresh child sees the exact live parent identity and cannot steal its
+    # terminal-unfinalized claim merely because its own local PID namespace
+    # differs.
+    assert result["finalized_at"] is None
+    assert db.get_run(parent.db_path, run["id"])["finalized_at"] is None
+
+
+def test_dead_supervisor_claim_is_taken_over_before_terminal_recovery(
+    git_repo, configure_project_repo
+):
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo)
+    dead_token = "dead-owner-token"
+    replaced = db.claim_run_finalization(
+        original.db_path,
+        run["id"],
+        owner_token=dead_token,
+        owner_pid=999_999_999,
+        owner_identity="999999999|dead|dead",
+        expected_owner_token=original._finalization_owner_token,
+    )
+    assert replaced is not None
+
+    recovery = supervisor.Supervisor(db_path=original.db_path)
+    outcomes = recovery.reconcile()
+
+    final = db.get_run(original.db_path, run["id"])
+    assert final["finalized_at"] is not None
+    assert db.get_report(original.db_path, run["id"]) is not None
+    claim = db.get_run_finalization_claim(original.db_path, run["id"])
+    assert claim["owner_token"] == recovery._finalization_owner_token
+    assert claim["completed_at"] is not None
+    assert any(item["run_id"] == run["id"] for item in outcomes)
+
+
+@pytest.mark.parametrize(
+    ("query", "takeover"),
+    [
+        (identity.ProcessQuery(identity.ProcessQueryStatus.UNKNOWN), False),
+        (identity.ProcessQuery(identity.ProcessQueryStatus.LIVE), False),
+        (
+            identity.ProcessQuery(
+                identity.ProcessQueryStatus.LIVE,
+                identity.ProcessIdentity(4242, "old-start", "old-command"),
+            ),
+            False,
+        ),
+        (
+            identity.ProcessQuery(
+                identity.ProcessQueryStatus.LIVE,
+                identity.ProcessIdentity(4242, "old-start", "changed-command"),
+            ),
+            False,
+        ),
+        (
+            identity.ProcessQuery(
+                identity.ProcessQueryStatus.LIVE,
+                identity.ProcessIdentity(4242, "new-start", "new-command"),
+            ),
+            True,
+        ),
+        (identity.ProcessQuery(identity.ProcessQueryStatus.ABSENT), True),
+        (identity.ProcessQuery(identity.ProcessQueryStatus.ZOMBIE), True),
+    ],
+)
+def test_recovery_claim_requires_full_owner_death_proof(
+    git_repo, configure_project_repo, monkeypatch, query, takeover
+):
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo)
+    replaced = db.claim_run_finalization(
+        original.db_path,
+        run["id"],
+        owner_token="prior-owner",
+        owner_pid=4242,
+        owner_identity="old-start|old-command",
+        expected_owner_token=original._finalization_owner_token,
+    )
+    assert replaced is not None
+    recovery = supervisor.Supervisor(db_path=original.db_path)
+    recovery._finalization_owner_token = "recovery-owner"
+    recovery._finalizer.owner_token = "recovery-owner"
+    monkeypatch.setattr(supervisor.identity, "query_identity", lambda _pid: query)
+
+    assert recovery._acquire_recovery_finalization_claim(run["id"]) is takeover
+    claim = db.get_run_finalization_claim(original.db_path, run["id"])
+    assert claim["owner_token"] == ("recovery-owner" if takeover else "prior-owner")
+
+
+def test_recovery_registers_report_after_file_only_crash(
+    git_repo, configure_project_repo
+):
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo)
+    events = db.list_run_events(original.db_path, run["id"], after_seq=0, limit=1_000_000)
+    written = reports.save_report(run, events)
+    assert written.is_file()
+    assert db.get_report(original.db_path, run["id"]) is None
+    _replace_claim_with_dead_owner(original, run["id"])
+
+    recovery = supervisor.Supervisor(db_path=original.db_path)
+    outcomes = recovery.reconcile()
+
+    stored = db.get_report(original.db_path, run["id"])
+    assert stored is not None
+    assert reports.resolve_report_path(stored["path"]).is_file()
+    assert db.get_run(original.db_path, run["id"])["finalized_at"] is not None
+    assert sum(item["run_id"] == run["id"] for item in outcomes) == 1
+
+
+def test_recovery_reuses_committed_report_row_without_rewriting(
+    git_repo, configure_project_repo, monkeypatch
+):
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo)
+    events = db.list_run_events(original.db_path, run["id"], after_seq=0, limit=1_000_000)
+    written = reports.save_report(run, events)
+    stored = db.create_report(
+        original.db_path, run["id"], reports.stored_report_path(written)
+    )
+    _replace_claim_with_dead_owner(original, run["id"])
+    monkeypatch.setattr(
+        supervisor.reports,
+        "save_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("durable report must not be rewritten")
+        ),
+    )
+
+    recovery = supervisor.Supervisor(db_path=original.db_path)
+    recovery.reconcile()
+
+    assert db.get_report(original.db_path, run["id"]) == stored
+    assert db.get_run(original.db_path, run["id"])["finalized_at"] is not None
+
+
+def test_missing_report_file_keeps_claim_open_and_run_unfinalized(
+    git_repo, configure_project_repo
+):
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo)
+    missing = "reports/AIOS/intentionally-missing-report.md"
+    resolved = reports.resolve_report_path(missing)
+    if resolved is not None and resolved.exists():
+        resolved.unlink()
+    db.create_report(original.db_path, run["id"], missing)
+    _replace_claim_with_dead_owner(original, run["id"])
+
+    recovery = supervisor.Supervisor(db_path=original.db_path)
+    recovery.reconcile()
+    recovery.reconcile()
+
+    final = db.get_run(original.db_path, run["id"])
+    claim = db.get_run_finalization_claim(original.db_path, run["id"])
+    assert final["finalized_at"] is None
+    assert claim["completed_at"] is None
+    assert db.get_report(original.db_path, run["id"])["path"] == missing
+
+
+def test_marker_failure_is_recovered_without_repeating_report_or_commit(
+    git_repo, configure_project_repo, monkeypatch
+):
+    configure_project_repo("AIOS", git_repo)
+    owner = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(owner, git_repo)
+    real_mark = db.mark_run_finalized
+    monkeypatch.setattr(
+        db,
+        "mark_run_finalized",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("injected marker failure")
+        ),
+    )
+    assert not owner._complete_owned_terminal_finalization(
+        run["id"], exit_code=0, lifecycle="process_exited"
+    )
+    first_report = db.get_report(owner.db_path, run["id"])
+    assert first_report is not None
+    assert db.get_run(owner.db_path, run["id"])["finalized_at"] is None
+
+    monkeypatch.setattr(db, "mark_run_finalized", real_mark)
+    _replace_claim_with_dead_owner(owner, run["id"], token="failed-owner")
+    recovery = supervisor.Supervisor(db_path=owner.db_path)
+    monkeypatch.setattr(
+        recovery,
+        "_auto_commit_completed_work",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("auto-commit disposition must be reused")
+        ),
+    )
+    recovery.reconcile()
+
+    assert db.get_report(owner.db_path, run["id"]) == first_report
+    assert db.get_run(owner.db_path, run["id"])["finalized_at"] is not None
+
+
+def test_two_dead_owner_recoverers_have_one_cas_winner(
+    git_repo, configure_project_repo, monkeypatch
+):
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo)
+    _replace_claim_with_dead_owner(original, run["id"])
+    first = supervisor.Supervisor(db_path=original.db_path)
+    second = supervisor.Supervisor(db_path=original.db_path)
+    for contender, token in ((first, "recoverer-a"), (second, "recoverer-b")):
+        contender._finalization_owner_token = token
+        contender._finalizer.owner_token = token
+    barrier = threading.Barrier(2)
+    real_claim = db.claim_run_finalization
+
+    def synchronized_claim(*args, **kwargs):
+        if kwargs.get("expected_owner_token") == "dead-owner-token":
+            barrier.wait(timeout=5)
+        return real_claim(*args, **kwargs)
+
+    monkeypatch.setattr(db, "claim_run_finalization", synchronized_claim)
+    results: list[list[dict]] = []
+    errors: list[BaseException] = []
+
+    def recover(contender):
+        try:
+            results.append(contender.reconcile())
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=recover, args=(first,)),
+        threading.Thread(target=recover, args=(second,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(item["run_id"] == run["id"] for batch in results for item in batch) == 1
+    claim = db.get_run_finalization_claim(original.db_path, run["id"])
+    assert claim["owner_token"] in {"recoverer-a", "recoverer-b"}
+    assert claim["completed_at"] is not None
+    assert db.get_report(original.db_path, run["id"]) is not None
+
+
+@pytest.mark.parametrize(
+    ("state", "failure_reason", "outcome", "classification", "disposition", "error_code"),
+    [
+        ("COMPLETED", None, "succeeded", "success", "succeeded", None),
+        ("CANCELLED", None, "cancelled", "cancelled", "terminal", "cancelled"),
+        (
+            "FAILED",
+            "authentication_failed",
+            "failed",
+            "authentication",
+            "terminal",
+            "authentication_failed",
+        ),
+    ],
+)
+def test_recovery_finishes_started_provider_attempt_once(
+    git_repo,
+    configure_project_repo,
+    state,
+    failure_reason,
+    outcome,
+    classification,
+    disposition,
+    error_code,
+):
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo, state=state)
+    if failure_reason:
+        run = db.update_run_fields(
+            original.db_path,
+            run["id"],
+            expected_version=run["version"],
+            fields={"failure_reason": failure_reason},
+        )
+    db.start_provider_attempt(
+        original.db_path,
+        run_id=run["id"],
+        attempt_number=1,
+        provider_id="claude_code",
+        started_at=db.iso_now(),
+    )
+    _replace_claim_with_dead_owner(original, run["id"])
+
+    recovery = supervisor.Supervisor(db_path=original.db_path)
+    recovery.reconcile()
+    first = db.list_provider_attempts(original.db_path, run["id"])
+    recovery.reconcile()
+    second = db.list_provider_attempts(original.db_path, run["id"])
+
+    assert first == second
+    assert len(first) == 1
+    assert first[0]["outcome"] == outcome
+    assert first[0]["classification"] == classification
+    assert first[0]["disposition"] == disposition
+    assert first[0]["error_code"] == error_code
+    assert first[0]["completed_at"] is not None
 
 
 def test_a_failed_run_is_finalized_too(git_repo, configure_project_repo, fake_claude):
@@ -276,6 +817,9 @@ def test_a_reconciled_orphan_is_finalized(git_repo, configure_project_repo):
         prompt="orphan",
         is_resume=False,
         command=["claude", "--print"],
+        finalization_owner_token="dead-owner-token",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="999999999|dead|dead",
     )
     db.update_run_state(sup.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     current = db.get_run(sup.db_path, run["id"])
@@ -314,6 +858,9 @@ def test_reconciliation_retries_a_transient_finalization_marker_failure(
         prompt="orphan",
         is_resume=False,
         command=["claude", "--print"],
+        finalization_owner_token="dead-owner-token",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="999999999|dead|dead",
     )
     db.update_run_state(
         sup.db_path, run["id"], expected_version=run["version"], new_state="QUEUED"

@@ -459,6 +459,9 @@ def test_codex_restart_reconciliation_never_fabricates_success(tmp_path):
         prompt="[redacted]",
         is_resume=False,
         provider_id="codex",
+        finalization_owner_token="dead-owner",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     outcome = supervisor.Supervisor(db_path).reconcile()
     final = db.get_run(db_path, run["id"])
@@ -467,7 +470,7 @@ def test_codex_restart_reconciliation_never_fabricates_success(tmp_path):
     assert final["state"] != "COMPLETED"
 
 
-def test_codex_restart_reconciliation_uses_real_fake_process_identity(
+def test_codex_same_process_facade_preserves_real_fake_process_ownership(
     fake_codex, git_repo, tmp_path, monkeypatch
 ):
     worktree = _add_worktree(git_repo, tmp_path / "worktree")
@@ -484,13 +487,10 @@ def test_codex_restart_reconciliation_uses_real_fake_process_identity(
         time.sleep(0.02)
     restarted = supervisor.Supervisor(db_path)
     outcomes = restarted.reconcile()
-    assert outcomes == [
-        {
-            "run_id": run["id"],
-            "classification": "RUNNING",
-            "detail": "pid exists and identity matches; orphaned from this supervisor instance",
-        }
-    ]
+    # Supervisor ownership is process-scoped: another facade inside the same
+    # live backend is not a restart and must not orphan work owned by that
+    # process's real watcher.
+    assert outcomes == []
     assert db.get_run(db_path, run["id"])["state"] == "RUNNING"
     assert db.get_run(db_path, run["id"])["state"] != "COMPLETED"
     original.cancel(run["id"], confirmed=True, grace_seconds=1)
