@@ -1124,11 +1124,22 @@ class RunResult:
     def is_principal_isolation_error(self) -> bool:
         """The OS launcher refused or lost the isolated execution service.
 
-        The fixed signature is emitted only by the root-owned launcher/client,
-        before a provider verdict can be trusted.  It is therefore executor
-        infrastructure and safe to retry, never a completed task result.
+        The broker's failure response is structurally fixed: exit 125, empty
+        stdout, and a marker-prefixed stderr line.  Searching arbitrary model
+        output for the marker is unsafe because an independent review of this
+        very source contains the literal and previously classified its valid
+        verdict as infrastructure failure.  Match the transport envelope,
+        never prompt/transcript content.
         """
-        return _PRINCIPAL_ISOLATION_FAILURE in f"{self.stdout}\n{self.stderr}"
+        return (
+            self.status == "failed"
+            and self.exit_code == 125
+            and not self.stdout
+            and any(
+                line.startswith(f"{_PRINCIPAL_ISOLATION_FAILURE}:")
+                for line in self.stderr.splitlines()
+            )
+        )
 
 
 # How often the mid-run poll loop wakes to re-check `cancel_event` and the

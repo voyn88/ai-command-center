@@ -224,7 +224,9 @@ def _read_lane_registry(path: Path) -> str:
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise RolloutError(f"worker lane registry is a symlink: {path}") from exc
-        raise RolloutError(f"worker lane registry cannot be read safely: {path}") from exc
+        raise RolloutError(
+            f"worker lane registry cannot be read safely: {path}"
+        ) from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -712,6 +714,14 @@ def rollout(
     try:
         agent_uid = uid_for_user(agent_user)
         privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
+        # verify_all() has always refused an aliased agent/privileged UID, but
+        # a caller invoking this mutating rollout directly (bypassing the
+        # separate shell verifier) was not protected by that check: it could
+        # retire a healthy legacy fleet and start the new one under a UID
+        # that is not actually isolated from a privileged principal (review
+        # finding on 5f2f1dd). Refuse before the first mutation.
+        if agent_uid in privileged_uids:
+            raise RolloutError("agent UID aliases a privileged principal")
         # Legacy claimers retire BEFORE any templated lane starts claiming
         # (runbook step 5; review on d8920b6) -- and before the loop, so an
         # empty lane set cannot leave them enabled via a silent no-op.
