@@ -1436,6 +1436,7 @@ def _open_relative_regular(
             try:
                 next_fd = os.open(part, flags, dir_fd=current_fd)
             except FileNotFoundError:
+                os.close(current_fd)
                 return None
             os.close(current_fd)
             current_fd = next_fd

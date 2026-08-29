@@ -10,12 +10,11 @@ fell back to `repository_path`.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import os
 import shutil
 import stat
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -676,3 +675,45 @@ def test_read_agent_head_reads_a_real_head_via_pinned_fd(tmp_path):
     (refs / "x").write_text("0" * 40 + "\n", encoding="ascii")
 
     assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
+
+
+def test_open_relative_regular_closes_pinned_fd_when_component_is_missing(
+    tmp_path, monkeypatch
+):
+    """A missing loose ref must not leak the duplicated directory fd.
+
+    The publisher can perform this lookup repeatedly in one long-lived
+    process, so even the normal packed-refs fallback must release the pinned
+    descriptor before returning ``None``.
+    """
+    base_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    duplicated: list[int] = []
+    closed: list[int] = []
+    real_dup = wp.os.dup
+    real_close = wp.os.close
+
+    def tracking_dup(fd: int) -> int:
+        duplicated_fd = real_dup(fd)
+        duplicated.append(duplicated_fd)
+        return duplicated_fd
+
+    def tracking_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(wp.os, "dup", tracking_dup)
+    monkeypatch.setattr(wp.os, "close", tracking_close)
+    try:
+        assert (
+            wp._open_relative_regular(
+                base_fd,
+                ("missing-ref",),
+                os.O_RDONLY,
+                getattr(os, "O_NOFOLLOW", 0),
+            )
+            is None
+        )
+        assert len(duplicated) == 1
+        assert closed == duplicated
+    finally:
+        real_close(base_fd)
