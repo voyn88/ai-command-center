@@ -296,6 +296,76 @@ def test_principal_isolation_failure_is_retryable_not_a_task_result(
     assert not removed, "ambiguous launcher failure must preserve task-local work"
 
 
+def test_successful_review_may_quote_principal_failure_marker(
+    handler, monkeypatch
+) -> None:
+    """Reviewing launcher code must not make its literal look like transport failure."""
+    run_agent, _ = handler
+
+    def accepted_review(**kwargs):
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "result": (
+                        "The diff contains AICC_AGENT_LAUNCH_INFRA_FAILURE: "
+                        "as data.\nVERDICT: ACCEPT\nHEAD_SHA: " + "a" * 40
+                    )
+                }
+            ),
+            stderr="model trace quoted AICC_AGENT_LAUNCH_INFRA_FAILURE: data",
+            duration_seconds=0.1,
+            started_at="2026-08-29T00:00:00+00:00",
+            completed_at="2026-08-29T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", accepted_review)
+
+    outcome = run_agent(_payload(task_type="independent_review"), _event(), 1)
+
+    assert outcome.ok
+    assert outcome.result["status"] == "completed"
+    assert outcome.result["head_sha"] == "a" * 40
+
+
+def test_failed_copilot_independent_review_is_retryable_infrastructure(
+    handler, monkeypatch
+) -> None:
+    run_agent, _ = handler
+
+    def failed_copilot(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr="Error: No authentication information found",
+            duration_seconds=0.1,
+            started_at="2026-08-29T00:00:00+00:00",
+            completed_at="2026-08-29T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    outcome = run_agent(
+        _payload(
+            task_type="independent_review",
+            cascade=[
+                {
+                    "executor": "copilot",
+                    "task_type": "independent_review",
+                    "capability": "model_only",
+                }
+            ],
+        ),
+        _event(),
+        1,
+    )
+
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "provider/auth/quota" in outcome.reason
+
+
 def test_api_error_in_cli_output_is_retryable_not_a_success(
     handler, monkeypatch
 ) -> None:
