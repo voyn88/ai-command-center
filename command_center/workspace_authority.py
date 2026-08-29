@@ -13,6 +13,37 @@ _AUTHORITY_DECODE_ERRORS = (ValueError, binascii.Error)
 _AUTHORITY_MAX_BYTES = 1 << 16
 
 
+def _read_pinned_regular(
+    descriptor: int, initial: os.stat_result, *, max_bytes: int
+) -> bytes:
+    """Read the complete descriptor without trusting one ``read`` syscall."""
+    if initial.st_size > max_bytes:
+        raise ValueError("workspace authority environment is implausibly large")
+    chunks: list[bytes] = []
+    remaining = initial.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 64 * 1024))
+        if not chunk:
+            raise ValueError("workspace authority environment changed while read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise ValueError("workspace authority environment is implausibly large")
+    final = os.fstat(descriptor)
+    if (
+        final.st_dev != initial.st_dev
+        or final.st_ino != initial.st_ino
+        or final.st_size != initial.st_size
+        or final.st_mtime_ns != initial.st_mtime_ns
+        or final.st_ctime_ns != initial.st_ctime_ns
+        or final.st_uid != initial.st_uid
+        or final.st_gid != initial.st_gid
+        or stat.S_IMODE(final.st_mode) != stat.S_IMODE(initial.st_mode)
+    ):
+        raise ValueError("workspace authority environment changed while read")
+    return b"".join(chunks)
+
+
 def decode_workspace_authority_key(value: str | None) -> bytes | None:
     """Decode an explicit hex/base64 key and enforce 256-bit minimum entropy."""
     if not value:
@@ -53,13 +84,11 @@ def load_workspace_authority_environment(
             raise ValueError(
                 "workspace authority environment must be root-owned with mode 0640"
             )
-        if info.st_size > _AUTHORITY_MAX_BYTES:
-            raise ValueError("workspace authority environment is implausibly large")
-        raw_bytes = os.read(file_descriptor, _AUTHORITY_MAX_BYTES + 1)
+        raw_bytes = _read_pinned_regular(
+            file_descriptor, info, max_bytes=_AUTHORITY_MAX_BYTES
+        )
     finally:
         os.close(file_descriptor)
-    if len(raw_bytes) > _AUTHORITY_MAX_BYTES:
-        raise ValueError("workspace authority environment is implausibly large")
 
     assignments: list[tuple[str, str]] = []
     for raw in raw_bytes.decode("utf-8").splitlines():

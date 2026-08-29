@@ -1453,6 +1453,43 @@ _MAX_REF_BYTES = 4096
 _MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024
 
 
+def _read_pinned_regular(
+    descriptor: int, initial: os.stat_result, *, max_bytes: int
+) -> bytes:
+    """Read all bytes from a pinned regular-file fd and detect mutation.
+
+    ``os.read`` may legally return fewer bytes than requested.  A single call
+    would let a valid prefix hide trailing ref data, or make a transient short
+    read look like a different branch.  The fstat/EOF checks also fail closed
+    if the agent changes the file while the publisher is reading it.
+    """
+    if initial.st_size > max_bytes:
+        raise OSError("pinned regular file is implausibly large")
+    chunks: list[bytes] = []
+    remaining = initial.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 64 * 1024))
+        if not chunk:
+            raise OSError("pinned regular file was truncated while read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise OSError("pinned regular file grew while read")
+    final = os.fstat(descriptor)
+    if (
+        final.st_dev != initial.st_dev
+        or final.st_ino != initial.st_ino
+        or final.st_size != initial.st_size
+        or final.st_mtime_ns != initial.st_mtime_ns
+        or final.st_ctime_ns != initial.st_ctime_ns
+        or final.st_uid != initial.st_uid
+        or final.st_gid != initial.st_gid
+        or stat.S_IMODE(final.st_mode) != stat.S_IMODE(initial.st_mode)
+    ):
+        raise OSError("pinned regular file changed while read")
+    return b"".join(chunks)
+
+
 def _read_agent_head(workspace: Path, expected_branch: str) -> str:
     """Resolve HEAD without invoking Git against agent-controlled config."""
     git_dir = workspace / ".git"
@@ -1506,7 +1543,11 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
                 detail=".git must be a directory and HEAD a small unlinked regular file",
             )
         try:
-            head_text = os.read(head_fd, 4096).decode("ascii", "strict").strip()
+            head_text = (
+                _read_pinned_regular(head_fd, head_stat, max_bytes=_MAX_REF_BYTES)
+                .decode("ascii", "strict")
+                .strip()
+            )
         except _HEAD_READ_ERRORS:
             # Never echo the bytes: a non-ASCII HEAD is refused without
             # surfacing its content in the error (or a chained exception).
@@ -1535,10 +1576,10 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
             if opened is not None:
                 ref_fd, ref_stat = opened
                 try:
-                    if ref_stat.st_size > _MAX_REF_BYTES:
-                        raise OSError("branch ref is implausibly large")
                     candidate = (
-                        os.read(ref_fd, _MAX_REF_BYTES)
+                        _read_pinned_regular(
+                            ref_fd, ref_stat, max_bytes=_MAX_REF_BYTES
+                        )
                         .decode("ascii", "strict")
                         .strip()
                     )
@@ -1551,11 +1592,11 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
                 if packed is not None:
                     packed_fd, packed_stat = packed
                     try:
-                        if packed_stat.st_size > _MAX_PACKED_REFS_BYTES:
-                            raise OSError("packed-refs is implausibly large")
-                        packed_text = os.read(packed_fd, _MAX_PACKED_REFS_BYTES).decode(
-                            "ascii", "strict"
-                        )
+                        packed_text = _read_pinned_regular(
+                            packed_fd,
+                            packed_stat,
+                            max_bytes=_MAX_PACKED_REFS_BYTES,
+                        ).decode("ascii", "strict")
                     finally:
                         os.close(packed_fd)
                     for line in packed_text.splitlines():

@@ -52,6 +52,23 @@ def test_workspace_authority_accepts_explicit_32_byte_key(monkeypatch):
     assert wp._workspace_authority_key() == bytes.fromhex("ab" * 32)
 
 
+def test_workspace_authority_short_read_cannot_hide_trailing_assignment(
+    tmp_path, monkeypatch
+):
+    authority = tmp_path / "authority.env"
+    valid = f"AICC_WORKSPACE_AUTHORITY_KEY=hex:{'ab' * 32}\n"
+    authority.write_text(valid + "UNEXPECTED=value\n", encoding="ascii")
+    real_read = wp.os.read
+
+    def short_read(descriptor: int, count: int) -> bytes:
+        return real_read(descriptor, min(count, len(valid)))
+
+    monkeypatch.setattr(wp.os, "read", short_read)
+
+    with pytest.raises(ValueError, match="exactly one authority key"):
+        load_workspace_authority_environment(authority, require_root_owned=False)
+
+
 def test_workspace_authority_runtime_and_installer_decoder_accept_same_base64():
     encoded = "base64:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU="  # pragma: allowlist secret
 
@@ -673,6 +690,45 @@ def test_read_agent_head_reads_a_real_head_via_pinned_fd(tmp_path):
     refs = git_dir / "refs" / "heads" / "feature"
     refs.mkdir(parents=True)
     (refs / "x").write_text("0" * 40 + "\n", encoding="ascii")
+
+    assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
+
+
+def test_read_agent_head_handles_short_regular_file_reads(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/x\n", encoding="ascii")
+    refs = git_dir / "refs" / "heads" / "feature"
+    refs.mkdir(parents=True)
+    (refs / "x").write_text("0" * 40 + "\n", encoding="ascii")
+    real_read = wp.os.read
+
+    def short_read(descriptor: int, count: int) -> bytes:
+        return real_read(descriptor, min(count, 3))
+
+    monkeypatch.setattr(wp.os, "read", short_read)
+
+    assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
+
+
+def test_read_agent_head_handles_short_packed_refs_reads(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/x\n", encoding="ascii")
+    (git_dir / "packed-refs").write_text(
+        "# pack-refs with: peeled fully-peeled sorted\n"
+        + "0" * 40
+        + " refs/heads/feature/x\n",
+        encoding="ascii",
+    )
+    real_read = wp.os.read
+
+    def short_read(descriptor: int, count: int) -> bytes:
+        return real_read(descriptor, min(count, 5))
+
+    monkeypatch.setattr(wp.os, "read", short_read)
 
     assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
 
