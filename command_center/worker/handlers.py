@@ -797,12 +797,12 @@ def _run_agent(
                 ),
                 retryable=True,
             )
-        read_only_copilot_failure = (
+        non_mutating_copilot_failure = (
             executor == "copilot"
-            and task_type in agent_runner.READ_ONLY_TASK_TYPES
+            and task_type not in agent_runner.MUTATING_TASK_TYPES
             and run.status != "completed"
         )
-        if run.is_executor_provider_error(executor) or read_only_copilot_failure:
+        if run.is_executor_provider_error(executor) or non_mutating_copilot_failure:
             # Incident 2026-08-21 16:09 UTC: the CLI process itself started
             # (exit code 1, non-empty stdout) but the *account*, not the
             # task, failed -- a rate limit / auth / overload response the
