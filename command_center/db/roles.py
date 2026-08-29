@@ -123,6 +123,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_evidence",
     "backlog_task",
     "backlog_task_remediation",
+    "backlog_scan_cursor",
     "backlog_writer_lease",
     "completion",
     "completion_event",
@@ -261,6 +262,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_event": _READ,
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
+    "backlog_scan_cursor": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -270,6 +272,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_event": _NONE,
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
+    "backlog_scan_cursor": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -483,6 +486,12 @@ _APP_BACKLOG_FUNCTIONS = (
     # BO-S3, result ingest (0007; replaced 0006's backlog_release_terminal).
     "backlog_ingest_results(text)",
     "backlog_return_to_pool(text, text)",
+    # DEFER_TO_USER -> OPEN for technical parks only (0014); the function is
+    # the classification gate, so granting it does not grant a generic unpark.
+    "backlog_resume_deferred(text)",
+    # The persisted scan cursor for the tick windows (0015): returns this
+    # tick's offset and advances atomically per invocation.
+    "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
 )

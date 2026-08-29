@@ -79,6 +79,7 @@ def _map_task(task: dict) -> dict:
         "id": _clean_str(task.get("id")) or "unknown",
         "title": _clean_str(task.get("title")) or "Untitled",
         "blocker": blocker,
+        "state": _clean_str(task.get("state")),
         "evidence": evidence,
     }
 
@@ -153,6 +154,22 @@ def _map_lanes(runs: list[dict], now: datetime) -> list[dict]:
     return lanes
 
 
+# Exact rich-status vocabulary -> the projection's task state and the AICC
+# read-model lane it corresponds to. DEFER_TO_USER additionally carries a
+# blocker so the client's attention surface picks it up.
+_RICH_STATE = {
+    "UNTRIAGED": ("backlog", "Backlog"),
+    "OPEN": ("next", "Next"),
+    "NEEDS_REFINEMENT": ("backlog", "Backlog"),
+    "SPLIT": ("backlog", "Backlog"),
+    "IN_PROGRESS": ("in_progress", "In Progress"),
+    "READY_TO_REVIEW": ("review", "Review"),
+    "DONE": ("done", "Done"),
+    "DEFER_TO_USER": ("deferred", "Blocked"),
+    "UNKNOWN": ("backlog", "Backlog"),
+}
+
+
 def _backlog_tasks(
     backlog_path: Path | None, titles_path: Path | None = None
 ) -> list[dict]:
@@ -160,25 +177,44 @@ def _backlog_tasks(
 
     Reuses `backlog_client` (the sanctioned read side of the Backlog Engine —
     it has no write surface, so this cannot create a second task store).
-    Only machine `VOYN_RECOMMENDATION` records are visible to that client;
-    an unconfigured or missing file yields an empty list, never an error.
+    Two record surfaces merge here: machine `VOYN_RECOMMENDATION` lines
+    (planning) and the body's rich task lines (execution status, parsed by
+    the same shared module); on an id collision the rich EXECUTION status
+    wins, because that is the state the owner actually asks about.
+    An unconfigured or missing file yields an empty list, never an error.
     """
     projection = backlog_client.load_projection(backlog_path)
+    rich = backlog_client.load_rich_records(backlog_path)
     # Russian executive titles, produced offline by `localize_titles` on a
     # local model; a record absent from the cache keeps its humanized slug.
     titles = load_cache(titles_path)
-    tasks = []
+
+    tasks: dict[str, dict] = {}
     for rec in projection.records:
-        tasks.append(
+        tasks[rec.issue_id] = {
+            "id": rec.issue_id,
+            "project": rec.parallel_domain or rec.owner or "backlog",
+            "title": title_for(rec.issue_id, rec.title, titles),
+            "status": "Next" if rec.is_approved else "Backlog",
+            "state": "next" if rec.is_approved else "backlog",
+            "type": "backlog",
+        }
+    for record in rich:
+        state, lane = _RICH_STATE[record.status]
+        entry = tasks.setdefault(
+            record.record_id,
             {
-                "id": rec.issue_id,
-                "project": rec.parallel_domain or rec.owner or "backlog",
-                "title": title_for(rec.issue_id, rec.title, titles),
-                "status": "Next" if rec.is_approved else "Backlog",
+                "id": record.record_id,
+                "project": "backlog",
+                "title": title_for(record.record_id, record.title, titles),
                 "type": "backlog",
-            }
+            },
         )
-    return tasks
+        entry["status"] = lane
+        entry["state"] = state
+        if record.status == "DEFER_TO_USER":
+            entry["blocker"] = "Ждёт вашего решения"
+    return list(tasks.values())
 
 
 def _map_dialogs(root: Path) -> list[dict]:
@@ -212,6 +248,36 @@ def _map_dialogs(root: Path) -> list[dict]:
     return dialogs
 
 
+def _wave_goal(rich: list) -> dict | None:
+    """The calm 'nearest goal': the earliest unfinished wave's real progress.
+
+    Waves are the backlog's own ordering (protocol: earliest unfinished wave
+    first), so the goal card states exactly what the programme states —
+    nothing invented. Records whose wave is not 'Wave <n>' (e.g. section
+    codes) are out of scope for the card.
+    """
+    import re as _re
+
+    by_wave: dict[int, list] = {}
+    for record in rich:
+        match = _re.fullmatch(r"Wave (\d+)", record.wave.strip())
+        if match:
+            by_wave.setdefault(int(match.group(1)), []).append(record)
+    for number in sorted(by_wave):
+        records = by_wave[number]
+        done = sum(1 for r in records if r.status == "DONE")
+        if done >= len(records):
+            continue
+        return {
+            "title": f"Волна {number}",
+            "done": done,
+            "total": len(records),
+            "in_progress": sum(1 for r in records if r.status == "IN_PROGRESS"),
+            "review": sum(1 for r in records if r.status == "READY_TO_REVIEW"),
+        }
+    return None
+
+
 def build_projection(
     root: Path,
     *,
@@ -223,6 +289,7 @@ def build_projection(
     now = datetime.now(UTC)
     degraded = False
 
+    rich_records = backlog_client.load_rich_records(backlog_path)
     tasks = tasks_repository.load_tasks(root) + _backlog_tasks(
         backlog_path, titles_path
     )
@@ -244,6 +311,7 @@ def build_projection(
         "lanes": _map_lanes(runs, now),
         "events": _map_events(runs),
         "dialogs": _map_dialogs(root),
+        "goal": _wave_goal(rich_records),
         "decisions": [],
     }
     digest = hashlib.sha256(

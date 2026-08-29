@@ -11,8 +11,10 @@ import pytest
 
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import (
+    ReviewConfig,
     merge_once,
     publish_review_verdicts,
+    reconcile_merge_evidence,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -74,6 +76,21 @@ def _ready(store, factory, task_id, pr):
         cur.execute("SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)", (task_id, _rev()))
         cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", (task_id, pr))
         cur.execute("SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)", (task_id, _rev()))
+        c.commit()
+
+
+def _done(store, factory, task_id, pr, sha):
+    """A DONE task carrying pr + sha evidence, as merge_once leaves it --
+    built directly against the store rather than through merge_once, so
+    reconcile tests can plant a pre-fix sha value (a PR head, never a merge
+    commit) that merge_once itself would no longer produce."""
+    _ready(store, factory, task_id, pr)
+    with factory() as c, c.cursor() as cur:
+        def _rev():
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            return cur.fetchone()[0]
+        cur.execute("SELECT backlog_record_evidence(%s,'sha',%s)", (task_id, sha))
+        cur.execute("SELECT ok FROM backlog_transition(%s,'DONE',%s)", (task_id, _rev()))
         c.commit()
 
 
@@ -208,7 +225,10 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
     )
     chunk_calls = [c for c in calls if "review_chunk" in c[2]]
     assert len(chunk_calls) == len(chunks) > 1
-    assert len(calls) == len(chunks) + 1  # + one full-context adjudication
+    # Chunks only: the eager full-context adjudication is retired
+    # (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT) -- verification is enqueued lazily
+    # by publish_review_verdicts on REJECT, never here.
+    assert len(calls) == len(chunks)
     assert all(len(call[2]["review_chunk"]["content_hash"]) == 64 for call in chunk_calls)
     assert all(
         len(call[2]["prompt"].encode("utf-8"))
@@ -224,25 +244,41 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
     _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
     head = "a" * 40
 
+    merge_oid = "b" * 40
+    merged_state = {"merged": False}
+
     def fake_gh(argv, repo):
         import subprocess
         if argv[:2] == ["pr", "view"]:
-            body = json.dumps({
-                "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-            })
+            if merged_state["merged"]:
+                body = json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                    "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            else:
+                body = json.dumps({
+                    "state": "OPEN", "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
+            merged_state["merged"] = True
             return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M1", head) in report.merged
+    # Evidence is the TARGET-BRANCH merge commit, never the PR head
+    # (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY).
+    assert ("VOYN-W0-M1", merge_oid) in report.merged
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1",))
         assert cur.fetchone()[0] == "DONE"
+        cur.execute("SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='sha'", ("VOYN-W0-M1",))
+        assert cur.fetchone()[0] == merge_oid
 
 
 def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):  # noqa: F811
@@ -280,26 +316,42 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
     _ready(store, app_factory, "VOYN-W0-M1C", "https://github.com/x/y/pull/22")
     head = "1" * 40
 
+    merge_oid = "2" * 40
+    merged_state = {"merged": False}
+
     def fake_gh(argv, repo):
         import subprocess
         if argv[:2] == ["pr", "view"]:
-            body = json.dumps({
-                "state": "OPEN", "headRefOid": head,
-                "author": {"login": "dimastov-lab"},
-                "reviews": [{
-                    "body": f"ACCEPTANCE: ACCEPT {head}",
-                    "author": {"login": "voyn88-acceptance-gate[bot]"},
-                }],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-            })
+            if merged_state["merged"]:
+                body = json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                    "headRefOid": head,
+                    "author": {"login": "dimastov-lab"},
+                    "reviews": [{
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    }],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            else:
+                body = json.dumps({
+                    "state": "OPEN", "headRefOid": head,
+                    "author": {"login": "dimastov-lab"},
+                    "reviews": [{
+                        "body": f"ACCEPTANCE: ACCEPT {head}",
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    }],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
+            merged_state["merged"] = True
             return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M1C", head) in report.merged
+    assert ("VOYN-W0-M1C", merge_oid) in report.merged
 
 
 def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):  # noqa: F811
@@ -1006,48 +1058,59 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
     assert all(k.startswith("review:VOYN-W0-R5:20:") for k in keys)
 
 
-# --- VOYN-W0-AICC-REVIEW-ADJUDICATE: full-context adjudication gate ---------
+# --- VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: finding-verification adjudication -----
 
-def _force_chunk_reject(monkeypatch, adjudication):
+def _force_chunk_reject(monkeypatch, verification, findings="isolated-chunk finding text"):
     """Drive publish_review_verdicts down the multi-chunk REJECT path and make
-    the adjudication lookup return `adjudication` ((verdict_text) or None)."""
+    the finding-verification lookup return `verification` (a result text) or
+    None (no verification run has completed yet)."""
     monkeypatch.setattr(
         review_merge, "_chunk_review_rows",
         lambda factory, task_id, pr_url, snapshot: ("prefix", [{"chunk": 0}]),
     )
     monkeypatch.setattr(
         review_merge, "_aggregate_chunk_verdict",
-        lambda rows, snapshot, prefix: ("REJECT", "isolated-chunk finding text"),
+        lambda rows, snapshot, prefix: ("REJECT", findings),
     )
 
     def fake_latest(factory, task_id, key):
-        # Only the adjudication key is ever looked up on the multi-chunk path.
-        assert key.startswith("adjudicate:"), key
-        return {"result_text": adjudication} if adjudication is not None else None
+        # Only the verification key is ever looked up on the multi-chunk
+        # REJECT path -- keyed to head + the exact rejecting findings.
+        assert key.startswith("verify:"), key
+        assert ":findings:" in key
+        return {"result_text": verification} if verification is not None else None
 
     monkeypatch.setattr(review_merge, "_latest_review_result", fake_latest)
 
 
 def _fake_pr_view(head):
     import subprocess as sp
+    posted_comments = []
+
     def fake_gh(argv, repo):
         if argv[:2] == ["pr", "view"]:
             return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        if argv[:2] == ["pr", "comment"]:
+            posted_comments.append(argv)
         return sp.CompletedProcess(argv, 0, "", "")
+
+    fake_gh.posted_comments = posted_comments
     return fake_gh
 
 
-def test_chunk_reject_overridden_by_full_context_adjudication_accept(rig, monkeypatch):  # noqa: F811, E501
-    """A multi-chunk PR whose chunk aggregation REJECTs on isolation artifacts
-    must still be accepted when the full-context adjudication review ACCEPTs:
-    the marker is posted and NO remediation is dispatched."""
+def test_chunk_reject_overridden_by_verification_accept_with_audit(rig, monkeypatch):  # noqa: F811, E501
+    """A multi-chunk PR whose chunk aggregation REJECTs must still be accepted
+    when the finding-verification run at the exact head ACCEPTs: the audit
+    comment recording the overridden findings is posted FIRST, then the
+    marker, and no remediation is dispatched."""
     app_factory, store, _ = rig
     head = "a" * 40
     pr_url = "https://github.com/x/y/pull/21"
     _ready(store, app_factory, "VOYN-W0-ADJ-A", pr_url)
     SNAPSHOTS[pr_url] = _snapshot(head)
-    _force_chunk_reject(monkeypatch, f"All findings are chunk-isolation artifacts.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
-    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- tree contradicts the claim.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    fake_gh = _fake_pr_view(head)
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     monkeypatch.setattr(
         review_merge, "_acceptance_app_credentials",
         lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
@@ -1058,17 +1121,54 @@ def test_chunk_reject_overridden_by_full_context_adjudication_accept(rig, monkey
     report = publish_review_verdicts(app_factory, "/tmp")
     assert posted == [(pr_url, "ACCEPT", head)]
     assert not report.remediated
+    assert len(fake_gh.posted_comments) == 1
+    audit_body = fake_gh.posted_comments[0][-1]
+    assert f"AUTO-ACCEPT-AUDIT {head}" in audit_body
+    assert "isolated-chunk finding text" in audit_body  # every overridden finding
+    assert "ARTIFACT" in audit_body  # the verifier's classification
 
 
-def test_chunk_reject_confirmed_by_adjudication_reject_remediates(rig, monkeypatch):  # noqa: F811, E501
-    """When the full-context adjudication also REJECTs (a real blocking
-    defect), the chunk-REJECT stands: remediation is dispatched, no marker."""
+def test_auto_accept_is_conditioned_on_the_audit_comment(rig, monkeypatch):  # noqa: F811, E501
+    """No audit comment, no marker: if the audit post fails, the override is
+    withheld this tick (skip, retried later) rather than merging with no
+    trail of what was overridden."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "d" * 40
+    pr_url = "https://github.com/x/y/pull/24"
+    _ready(store, app_factory, "VOYN-W0-ADJ-E", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+
+    def failing_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 1, "", "boom")
+
+    monkeypatch.setattr(review_merge, "_gh", failing_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (posted.append(a) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-ADJ-E", "auto_accept_audit_post_failed") in report.skipped
+    assert not posted
+    assert not report.remediated
+
+
+def test_chunk_reject_confirmed_by_verification_reject_remediates(rig, monkeypatch):  # noqa: F811, E501
+    """When verification CONFIRMS a blocking finding, the REJECT stands:
+    remediation is dispatched carrying the confirmation, no marker."""
     app_factory, store, _ = rig
     head = "b" * 40
     pr_url = "https://github.com/x/y/pull/22"
     _ready(store, app_factory, "VOYN-W0-ADJ-B", pr_url)
     SNAPSHOTS[pr_url] = _snapshot(head)
-    _force_chunk_reject(monkeypatch, f"Real blocker: unauthenticated RCE path.\nVERDICT: REJECT\nHEAD_SHA: {head}\n")
+    _force_chunk_reject(monkeypatch, f"FINDING 1: CONFIRMED_BLOCKING -- reproduced.\nVERDICT: REJECT\nHEAD_SHA: {head}\n")
     posted = []
     monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
     monkeypatch.setattr(review_merge, "_post_marker_as_bot",
@@ -1076,32 +1176,297 @@ def test_chunk_reject_confirmed_by_adjudication_reject_remediates(rig, monkeypat
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-ADJ-B", "VOYN-W0-ADJ-B-REM") in report.remediated
     assert not posted
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT body FROM backlog_task WHERE task_id=%s", ("VOYN-W0-ADJ-B-REM",))
+        body = cur.fetchone()[0]
+    assert "Verification confirmed a blocking finding" in body
+    assert "CONFIRMED_BLOCKING" in body
 
 
-def test_chunk_reject_waits_while_adjudication_pending(rig, monkeypatch):  # noqa: F811, E501
-    """No adjudication result yet is a WAIT, never a REJECT: the task is
-    skipped as `adjudication_pending` with no remediation and no marker, so a
-    later tick can still ACCEPT once the full-context review lands."""
+def test_chunk_reject_enqueues_verification_and_waits(rig, monkeypatch):  # noqa: F811, E501
+    """No verification result yet: ONE verification run is enqueued -- keyed
+    to head + findings, task_type verification_review, head-pinned for the
+    worker -- and the task skips as `verification_pending` with no
+    remediation and no marker."""
     app_factory, store, _ = rig
     head = "c" * 40
     pr_url = "https://github.com/x/y/pull/23"
     _ready(store, app_factory, "VOYN-W0-ADJ-C", pr_url)
     SNAPSHOTS[pr_url] = _snapshot(head)
     _force_chunk_reject(monkeypatch, None)
+    from command_center.orchestrator import planner
+    monkeypatch.setattr(planner, "repo_route", lambda _r: ("AICC", "/srv/repo"))
+    monkeypatch.setattr(review_merge, "cascade_for", lambda _k: [{"executor": "codex"}])
+    posted = []
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (posted.append(a) or (True, "")))
+    enq = []
+    report = publish_review_verdicts(
+        app_factory, "/tmp",
+        enqueue=lambda q, k, pl, tid, mx: enq.append((q, k, pl, tid, mx)),
+    )
+    assert ("VOYN-W0-ADJ-C", "verification_enqueued") in report.skipped
+    assert not report.remediated
+    assert not posted
+    assert len(enq) == 1
+    _q, key, payload, tid, _mx = enq[0]
+    assert key.startswith("verify:VOYN-W0-ADJ-C:23:")
+    assert ":findings:" in key
+    assert tid == "VOYN-W0-ADJ-C"
+    assert payload["task_type"] == "verification_review"
+    assert payload["untrusted"] is True
+    assert payload["review_head"] == {"pr_number": "23", "head_sha": head}
+    assert all(link["task_type"] == "verification_review" for link in payload["cascade"])
+    # The findings travel as data in a hashed envelope, never as bare text.
+    marker = review_merge._VERIFICATION_INPUT_MARKER
+    envelope = json.loads(payload["prompt"].split(marker, 1)[1])
+    assert envelope["findings"]["text"] == "isolated-chunk finding text"
+    assert envelope["head_sha"] == head
+
+
+def test_chunk_reject_without_enqueue_falls_back_to_remediation(rig, monkeypatch):  # noqa: F811, E501
+    """A caller that cannot enqueue (legacy signature) keeps the
+    pre-AUTO-ACCEPT behavior: REJECT remediates on the original findings."""
+    app_factory, store, _ = rig
+    head = "e" * 40
+    pr_url = "https://github.com/x/y/pull/25"
+    _ready(store, app_factory, "VOYN-W0-ADJ-F", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, None)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-ADJ-F", "VOYN-W0-ADJ-F-REM") in report.remediated
+
+
+def test_oversized_findings_fall_closed_to_remediation(rig, monkeypatch):  # noqa: F811
+    """Findings over the verification byte cap are never auto-verified --
+    the REJECT remediates exactly as before AUTO-ACCEPT existed."""
+    app_factory, store, _ = rig
+    head = "f" * 40
+    pr_url = "https://github.com/x/y/pull/26"
+    _ready(store, app_factory, "VOYN-W0-ADJ-G", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, None)
+    monkeypatch.setattr(review_merge, "_MAX_VERIFICATION_FINDINGS_BYTES", 4)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    enq = []
+    report = publish_review_verdicts(
+        app_factory, "/tmp", enqueue=lambda *a: enq.append(a)
+    )
+    assert ("VOYN-W0-ADJ-G", "VOYN-W0-ADJ-G-REM") in report.remediated
+    assert enq == []
+
+
+def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_repo_routes):  # noqa: F811, E501
+    """The task's core acceptance: a SINGLE-chunk REJECT no longer remediates
+    on the reviewer's word alone -- it enqueues the same finding
+    verification, waits, and auto-accepts on verification ACCEPT."""
+    app_factory, store, worker = rig
+    head = "9" * 40
+    pr_url = "https://github.com/x/repo-d2/pull/27"
+    _ready(store, app_factory, "VOYN-W0-ADJ-H", pr_url)
+    findings = f"Speculative: helper may not validate input.\nVERDICT: REJECT\nHEAD_SHA: {head}\n"
+    _complete_review(app_factory, worker, "VOYN-W0-ADJ-H", pr_url, head, findings)
+    fake_gh = _fake_pr_view(head)
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append((decision, sha)) or (True, "")))
+    enq = []
+    report = publish_review_verdicts(
+        app_factory, "/tmp",
+        enqueue=lambda q, k, pl, tid, mx: enq.append((q, k, pl, tid, mx)),
+    )
+    assert ("VOYN-W0-ADJ-H", "verification_enqueued") in report.skipped
+    assert not report.remediated and not posted
+    assert len(enq) == 1
+    _q, vkey, payload, _tid, _mx = enq[0]
+    assert vkey.startswith("verify:VOYN-W0-ADJ-H:27:")
+    assert payload["review_head"]["head_sha"] == head
+
+    # The verification run completes with ACCEPT at the exact head -> the
+    # next tick posts audit + marker, zero-touch.
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    vstore = WorkQueueStore(app_factory)
+    vstore.enqueue("execution", idempotency_key=vkey, payload=payload, task_id="VOYN-W0-ADJ-H")
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert worker.complete(claimed, {
+        "status": "completed",
+        "result_text": f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}",
+    })
+    second = publish_review_verdicts(app_factory, "/tmp", enqueue=lambda *a: None)
+    assert posted == [("ACCEPT", head)]
+    assert not second.remediated
+    assert any(f"AUTO-ACCEPT-AUDIT {head}" in argv[-1] for argv in fake_gh.posted_comments)
+
+
+def test_verification_key_is_scoped_by_head_and_findings():
+    snap_a = _snapshot("a" * 40)
+    key = review_merge._verification_key("T", "https://github.com/x/y/pull/1", snap_a, "f1")
+    assert key.startswith("verify:T:1:" + "a" * 40)
+    other_findings = review_merge._verification_key(
+        "T", "https://github.com/x/y/pull/1", snap_a, "f2"
+    )
+    other_head = review_merge._verification_key(
+        "T", "https://github.com/x/y/pull/1", _snapshot("b" * 40), "f1"
+    )
+    assert len({key, other_findings, other_head}) == 3
+    assert review_merge._verification_key("T", "not-a-pr-url", snap_a, "f1") is None
+
+
+def test_malformed_verifier_output_never_auto_accepts(rig, monkeypatch):  # noqa: F811
+    """A verifier that cannot state its verdict/head cleanly (garbled text,
+    or a HEAD_SHA that is not the current head) must fall to remediation on
+    the ORIGINAL findings -- never to an override, and never to a permanent
+    park."""
+    app_factory, store, _ = rig
+    head = "3" * 40
+    pr_url = "https://github.com/x/y/pull/28"
+    _ready(store, app_factory, "VOYN-W0-ADJ-I", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, "VERDICT: ACCEPT\nHEAD_SHA: " + "4" * 40 + "\n")
     posted = []
     monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
     monkeypatch.setattr(review_merge, "_post_marker_as_bot",
                         lambda *a: (posted.append(a) or (True, "")))
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert ("VOYN-W0-ADJ-C", "adjudication_pending") in report.skipped
-    assert not report.remediated
+    assert ("VOYN-W0-ADJ-I", "VOYN-W0-ADJ-I-REM") in report.remediated
     assert not posted
 
 
-def test_review_once_enqueues_a_full_context_adjudication_for_multichunk(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
-    """review_once must enqueue exactly one extra adjudication item (keyed
-    `adjudicate:...`) for a PR that splits into more than one chunk, and none
-    for a single-chunk PR (which is already full-context)."""
+def test_a_malformed_accept_never_auto_accepts(rig, monkeypatch):  # noqa: F811
+    """Independent review of this change (32bf893, then 6eb71aa): an ACCEPT
+    that violates the verifier's machine-parsed output contract -- bare
+    trailer, a classification token merely QUOTED mid-line from the
+    untrusted findings, a CONFIRMED_BLOCKING disposition contradicting the
+    ACCEPT trailer, or a missing SECURITY_CLAIMS attestation -- is malformed
+    output, not an override. Fail closed to remediation."""
+    app_factory, store, _ = rig
+    head = "5" * 40
+    pr_url = "https://github.com/x/y/pull/29"
+    _ready(store, app_factory, "VOYN-W0-ADJ-J", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, f"VERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    posted = []
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (posted.append(a) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-ADJ-J", "VOYN-W0-ADJ-J-REM") in report.remediated
+    assert not posted
+
+    # The full contract, unit-level: every malformed shape is refused, the
+    # exact well-formed shape passes.
+    ok = review_merge._verification_accept_is_well_formed
+    assert not ok("VERDICT: ACCEPT")  # bare trailer
+    assert not ok("the findings mention ARTIFACT and UNVERIFIABLE tokens")  # quoted mid-line
+    assert not ok("FINDING 1: ARTIFACT -- cited.")  # no security attestation
+    assert not ok(  # disposition contradicts the ACCEPT trailer
+        "FINDING 1: CONFIRMED_BLOCKING -- reproduced.\nSECURITY_CLAIMS: NONE"
+    )
+    assert not ok("SECURITY_CLAIMS: NONE")  # attestation with no dispositions
+    assert not ok(  # attestation value outside the vocabulary
+        "FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: UNVERIFIABLE"
+    )
+    assert ok(
+        "FINDING 1: ARTIFACT -- src/x.py:10 already validates.\n"
+        "FINDING 2: CONFIRMED_MINOR -- naming only.\n"
+        "SECURITY_CLAIMS: DISPROVEN"
+    )
+
+
+# --- VOYN-OPS-AICC-VERIFY-DISPOSITION-FLOOR: disposition-count floor and ---
+# --- sequential FINDING numbering ------------------------------------------
+
+def test_disposition_floor_requires_one_per_rejecting_chunk_section():
+    """`_aggregate_chunk_verdict` builds the findings text handed to
+    verification as one `Chunk i/N:` section per REJECTing chunk --
+    orchestrator-known, not the verifier's self-report. A verifier that only
+    classifies chunk 1 of a 2-chunk rejection has silently dropped chunk 2's
+    findings and must not be honored as a well-formed ACCEPT."""
+    ok = review_merge._verification_accept_is_well_formed
+    two_chunk_findings = "Chunk 1/2:\nfoo bug\n\nChunk 2/2:\nbar bug"
+    one_disposition = "FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE"
+    two_dispositions = (
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "FINDING 2: ARTIFACT -- cited.\n"
+        "SECURITY_CLAIMS: NONE"
+    )
+    assert not ok(one_disposition, two_chunk_findings)
+    assert ok(two_dispositions, two_chunk_findings)
+    # A single-chunk (or non-aggregated) REJECT has no `Chunk i/N:` section
+    # at all and still floors at 1 -- unchanged from verify-v2.
+    assert ok(one_disposition, "free-text findings, no chunk headers here")
+    assert ok(one_disposition)  # default findings="" also floors at 1
+
+
+def test_disposition_numbering_must_be_sequential_without_gaps():
+    """FINDING numbers must cover exactly 1..K -- a gap or a duplicate means
+    the verifier skipped or double-counted a finding rather than classifying
+    each one, which the count-floor check alone would not catch."""
+    ok = review_merge._verification_accept_is_well_formed
+    assert not ok(  # gap: no FINDING 2
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "FINDING 3: ARTIFACT -- cited.\n"
+        "SECURITY_CLAIMS: NONE"
+    )
+    assert not ok(  # duplicate numbering, no FINDING 2
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "SECURITY_CLAIMS: NONE"
+    )
+    assert ok(
+        "FINDING 1: ARTIFACT -- cited.\n"
+        "FINDING 2: CONFIRMED_MINOR -- naming only.\n"
+        "SECURITY_CLAIMS: DISPROVEN"
+    )
+
+
+def test_partial_chunk_verification_coverage_remediates(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-OPS-AICC-VERIFY-DISPOSITION-FLOOR's core acceptance: two chunks
+    REJECT, but the verifier's ACCEPT only classifies one of them -- one
+    disposition against a two-section floor -- so the override is refused
+    and the task remediates on the original (both-chunk) findings, exactly
+    the malformed-output fail-closed leg."""
+    app_factory, store, _ = rig
+    head = "6" * 40
+    pr_url = "https://github.com/x/y/pull/30"
+    _ready(store, app_factory, "VOYN-W0-ADJ-K", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    two_chunk_findings = "Chunk 1/2:\nfoo bug\n\nChunk 2/2:\nbar bug"
+    _force_chunk_reject(
+        monkeypatch,
+        f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        findings=two_chunk_findings,
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (posted.append(a) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-ADJ-K", "VOYN-W0-ADJ-K-REM") in report.remediated
+    assert not posted
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT body FROM backlog_task WHERE task_id=%s", ("VOYN-W0-ADJ-K-REM",))
+        body = cur.fetchone()[0]
+    assert "Chunk 1/2" in body and "Chunk 2/2" in body  # both chunks, not just the verified one
+
+
+def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """The eager MODEL_ONLY full-context adjudication of VOYN-W0-AICC-REVIEW-
+    ADJUDICATE is retired (it ran with zero tools and could gather no
+    evidence): a multi-chunk PR enqueues its chunks and NOTHING else --
+    adjudication now happens lazily, by finding verification, on REJECT."""
     app_factory, store, _ = rig
     pr_url = "https://github.com/x/repo-d2/pull/31"
     _ready(store, app_factory, "VOYN-W0-ADJ-D", pr_url)
@@ -1109,15 +1474,14 @@ def test_review_once_enqueues_a_full_context_adjudication_for_multichunk(rig, _t
     snap = _snapshot(head)
     SNAPSHOTS[pr_url] = snap
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda _r, _p: snap)
-    # three chunks -> multi-chunk
     monkeypatch.setattr(review_merge, "_review_chunks", lambda s, t, p: review_merge._make_diff_chunks(["a", "b", "c"]))
     monkeypatch.setattr(review_merge, "_render_review_prompt", lambda t, p, s, c: "prompt")
     monkeypatch.setattr(review_merge, "_prompt_size_bytes", lambda s: 1)
     enq = []
     report = review_once(app_factory, lambda q, k, pay, task_id, mx: enq.append(k), "/tmp")
     assert ("VOYN-W0-ADJ-D", pr_url) in report.reviewed
-    adj = [k for k in enq if k.startswith("adjudicate:")]
-    assert len(adj) == 1, enq
+    assert len(enq) == 3
+    assert all(":chunk:" in k for k in enq), enq
 
 
 # --- VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR: keep behind PRs from gridlocking --
@@ -1291,3 +1655,1045 @@ def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch
     review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/1", sha)
     assert reran == ["111"]  # only the failing pull_request run for THIS head
     assert branches and "--branch" in branches[0] and "feature/x" in branches[0]
+
+
+# --- VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY + CI-FLAKE-AUTO-RERUN -----
+
+
+def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
+    """Live 2026-08-26 (PR #399): on a merge-queue-protected repo,
+    `gh pr merge` exits 0 having only ENQUEUED the PR. The task must stay
+    READY_TO_REVIEW (`merge_queued_awaiting_target`) until GitHub reports
+    MERGED -- and then complete idempotently on a later tick with the true
+    merge commit, even though `_pr_is_mergeable` reports a merged PR as
+    not-ready."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "3" * 40, "4" * 40
+    pr_url = "https://github.com/x/y/pull/30"
+    _ready(store, app_factory, "VOYN-W0-MQ", pr_url)
+    queue_state = {"merged": False}
+    merge_calls = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            if queue_state["merged"]:
+                body = json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                    "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            else:
+                body = json.dumps({
+                    "state": "OPEN", "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "merge"]:
+            merge_calls.append(argv)
+            return sp.CompletedProcess(argv, 0, "queued", "")  # enqueued, NOT merged
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MQ", "merge_queued_awaiting_target") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MQ",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+    # The queue lands the PR between ticks; the next tick completes DONE
+    # without calling `gh pr merge` again.
+    queue_state["merged"] = True
+    calls_before = len(merge_calls)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MQ", merge_oid) in report.merged
+    assert len(merge_calls) == calls_before
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MQ",))
+        assert cur.fetchone()[0] == "DONE"
+        cur.execute("SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='sha'", ("VOYN-W0-MQ",))
+        assert cur.fetchone()[0] == merge_oid
+
+
+def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN: a red required check on a PR that
+    already carries the ACCEPT marker triggers `gh run rerun --failed` for
+    completed-failed runs at attempt 1 on the current head -- and never for
+    a run already at attempt 2 (GitHub's own attempt counter is the bound),
+    never for other heads, never while checks are merely pending."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "6" * 40
+    pr_url = "https://github.com/x/y/pull/31"
+    _ready(store, app_factory, "VOYN-W0-MF", pr_url)
+    reruns = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"] and "headRefName" in argv[-1]:
+            return sp.CompletedProcess(argv, 0, json.dumps(
+                {"headRefName": "backlog/x", "headRefOid": head}), "")
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "list"]:
+            return sp.CompletedProcess(argv, 0, json.dumps([
+                {"databaseId": 11, "headSha": head, "status": "completed",
+                 "conclusion": "failure", "attempt": 1},
+                {"databaseId": 12, "headSha": head, "status": "completed",
+                 "conclusion": "failure", "attempt": 2},
+                {"databaseId": 13, "headSha": "7" * 40, "status": "completed",
+                 "conclusion": "failure", "attempt": 1},
+                {"databaseId": 14, "headSha": head, "status": "in_progress",
+                 "conclusion": None, "attempt": 1},
+            ]), "")
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv)
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    skip = dict(report.skipped)["VOYN-W0-MF"]
+    assert skip.startswith("checks_not_green") and "flaky_rerun_dispatched:1" in skip
+    assert reruns == [["run", "rerun", "11", "--failed"]]
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MF",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_no_rerun_without_an_accept_marker(rig, monkeypatch):  # noqa: F811
+    """An unaccepted PR's failures are the review path's business -- the
+    flake retry must not spend reruns on a PR that may never be accepted."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "8" * 40
+    pr_url = "https://github.com/x/y/pull/32"
+    _ready(store, app_factory, "VOYN-W0-MG", pr_url)
+    reruns = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "reviews": [],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv)
+        return sp.CompletedProcess(argv, 0, "[]", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MG", "no_accept_marker_on_head") in report.skipped
+    assert reruns == []
+
+
+def _fake_reconcile_gh(default_branch, statuses):
+    """statuses: {sha: compare-status}. `--jq` mocking is by-hand since the
+    real `gh` process never runs in these tests."""
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["api", "repos/x/y"] and argv[-1] == ".default_branch":
+            return sp.CompletedProcess(argv, 0, default_branch, "")
+        if argv[0] == "api" and "/compare/" in argv[1]:
+            sha = argv[1].rsplit("...", 1)[1]
+            status = statuses.get(sha)
+            if status is None:
+                return sp.CompletedProcess(argv, 1, "", "not found")
+            return sp.CompletedProcess(argv, 0, status, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    return fake_gh
+
+
+def test_reconcile_flags_a_sha_not_on_the_default_branch(rig, monkeypatch):  # noqa: F811
+    """VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY: a DONE task whose sha
+    evidence predates the fix (a PR head that a squash merge never puts on
+    main) is surfaced as suspect -- report-only."""
+    app_factory, store, _ = rig
+    bad_sha = "9" * 40
+    _done(store, app_factory, "VOYN-W0-RC1", "https://github.com/x/y/pull/40", bad_sha)
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_reconcile_gh("main", {bad_sha: "diverged"})
+    )
+    report = reconcile_merge_evidence(app_factory, "/tmp")
+    assert report.suspect == [("VOYN-W0-RC1", bad_sha, "sha_not_on_main")]
+    assert report.verified == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-RC1",))
+        assert cur.fetchone()[0] == "DONE"  # report-only: never flipped
+
+
+def test_reconcile_verifies_a_sha_that_is_an_ancestor(rig, monkeypatch):  # noqa: F811
+    """A post-fix DONE row, whose sha IS the target-branch merge commit,
+    is verified rather than flagged."""
+    app_factory, store, _ = rig
+    good_sha = "a" * 40
+    _done(store, app_factory, "VOYN-W0-RC2", "https://github.com/x/y/pull/41", good_sha)
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_reconcile_gh("main", {good_sha: "behind"})
+    )
+    report = reconcile_merge_evidence(app_factory, "/tmp")
+    assert report.verified == [("VOYN-W0-RC2", good_sha)]
+    assert report.suspect == []
+
+
+def test_reconcile_skips_without_pr_evidence_to_identify_the_repo(rig):  # noqa: F811
+    """A DONE task carrying sha evidence but no pr evidence cannot be
+    checked -- an inconclusive skip, never a false suspect."""
+    from tests.db.test_backlog_planner import _task
+
+    app_factory, store, _ = rig
+    assert store.upsert_task(_task("VOYN-W0-RC3", repo="repo-x", status="DONE"))[0]
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT backlog_record_evidence(%s,'sha',%s)", ("VOYN-W0-RC3", "b" * 40)
+        )
+        c.commit()
+    report = reconcile_merge_evidence(app_factory, "/tmp")
+    assert ("VOYN-W0-RC3", "no_pr_evidence_to_identify_repo") in report.skipped
+    assert report.suspect == []
+    assert report.verified == []
+
+
+def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeypatch):  # noqa: F811, E501
+    """A failed default-branch lookup (gh hiccup, auth issue) is inconclusive
+    -- it must never be reported as a suspect sha, which would read as a
+    confirmed defect rather than "the check itself didn't run"."""
+    app_factory, store, _ = rig
+    sha = "c" * 40
+    _done(store, app_factory, "VOYN-W0-RC4", "https://github.com/x/y/pull/42", sha)
+
+    import subprocess as sp
+
+    monkeypatch.setattr(
+        review_merge, "_gh", lambda argv, repo: sp.CompletedProcess(argv, 1, "", "down")
+    )
+    report = reconcile_merge_evidence(app_factory, "/tmp")
+    assert ("VOYN-W0-RC4", "default_branch_lookup_failed") in report.skipped
+    assert report.suspect == []
+
+
+def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeypatch):  # noqa: F811, E501
+    """Verification of 53c7b52 (CONFIRMED): a PR merged around the queue --
+    admin bypass, hand merge -- with no acceptance marker on its merged head
+    must not be silently blessed DONE. It skips loudly for the operator."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "a1" * 20, "b2" * 20
+    pr_url = "https://github.com/x/y/pull/33"
+    _ready(store, app_factory, "VOYN-W0-MX", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                "headRefOid": head, "reviews": [],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MX", "merged_without_acceptance_evidence") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MX",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):  # noqa: F811, E501
+    """Review of eabe0d3: `any()` over an empty rollup is False -- a merged
+    PR whose check data is unavailable must fail closed as missing
+    acceptance evidence, never be blessed DONE."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "d3" * 20, "e4" * 20
+    pr_url = "https://github.com/x/y/pull/34"
+    _ready(store, app_factory, "VOYN-W0-MY", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MY", "merged_without_acceptance_evidence") in report.skipped
+    assert not report.merged
+
+
+def test_permanent_skips_do_not_starve_the_publish_window(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (live 2026-08-26): with
+    max_per_tick=N old code selected the N oldest-updated rows -- which were
+    exactly the permanently-skipping ones (skips never bump updated_at), so
+    fresh work behind them was never even seen: 0 completions in 4 hours.
+    The bound is now on ACTIONS: skips cost nothing, and a task standing
+    behind any number of eternal skips still gets its marker this tick."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    # Ten tasks whose PR lookups permanently fail -- the eternal skips.
+    for i in range(10):
+        _ready(store, app_factory, f"VOYN-W0-ST{i}", f"https://github.com/x/y/pull/{100 + i}")
+    # And one real, accepted task, LAST by updated_at.
+    head = "ab" * 20
+    pr_url = "https://github.com/x/y/pull/99"
+    _ready(store, app_factory, "VOYN-W0-STREAL", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-STREAL", pr_url, head,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        if "/pull/99" not in url:
+            return sp.CompletedProcess(argv, 1, "", "no such pr")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append((pr, sha)) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=2))
+    # All ten eternal skips were scanned AND the real task still acted.
+    assert posted == [(pr_url, head)]
+    assert len(report.skipped) == 10
+
+
+def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):  # noqa: F811
+    """The other half of the same change: mutations per tick stay bounded --
+    with max_per_tick=1 and two acceptable tasks, exactly one marker posts
+    this tick; the second lands next tick."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    heads = {}
+    for i, n in enumerate((70, 71)):
+        head = f"{i}c" * 10 + "d" * 20
+        pr_url = f"https://github.com/x/y/pull/{n}"
+        heads[f"https://github.com/x/y/pull/{n}"] = head
+        _ready(store, app_factory, f"VOYN-W0-CAP{i}", pr_url)
+        _complete_review(
+            app_factory, worker, f"VOYN-W0-CAP{i}", pr_url, head,
+            f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        )
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        head = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and head:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert len(posted) == 1
+    publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    # Two DISTINCT markers -- a repost of the first PR would also reach
+    # len == 2 (review of a423194).
+    assert set(posted) == set(heads) and len(posted) == 2
+
+
+def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa: F811
+    """Review of fd46584 (CONFIRMED): an already-pending verification WAIT
+    must not consume the action cap -- otherwise pending tasks recreate the
+    starvation. Two tasks with verifications already IN the queue, cap 1: a
+    later accepted task still gets its marker in the same tick."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    vstore = WorkQueueStore(app_factory)
+    heads = {}
+    # Two tasks headed for pending verifications, one accepted task last by
+    # updated_at. ALL reviews complete first -- `_complete_review` claims the
+    # oldest ready queue item, so the verification rows must enter the queue
+    # only after every review item has been claimed and completed.
+    for i, n in enumerate((80, 81)):
+        head = f"{i}e" * 10 + "f" * 20
+        pr_url = f"https://github.com/x/y/pull/{n}"
+        heads[pr_url] = head
+        _ready(store, app_factory, f"VOYN-W0-PN{i}", pr_url)
+        _complete_review(
+            app_factory, worker, f"VOYN-W0-PN{i}", pr_url, head,
+            f"a claim.\nVERDICT: REJECT\nHEAD_SHA: {head}\n",
+        )
+    head = "9d" * 20
+    pr_url = "https://github.com/x/y/pull/82"
+    heads[pr_url] = head
+    _ready(store, app_factory, "VOYN-W0-PNOK", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-PNOK", pr_url, head,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+    for i, n in enumerate((80, 81)):
+        h = f"{i}e" * 10 + "f" * 20
+        u = f"https://github.com/x/y/pull/{n}"
+        vkey = review_merge._verification_key(
+            f"VOYN-W0-PN{i}", u, _snapshot(h),
+            f"a claim.\nVERDICT: REJECT\nHEAD_SHA: {h}\n",
+        )
+        vstore.enqueue("execution", idempotency_key=vkey,
+                       payload={"kind": "agent_run"}, task_id=f"VOYN-W0-PN{i}")
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    # Pin the scan order (pendings first, accepted last) so the cap-1 tick
+    # proves pendings cost nothing REGARDLESS of the per-minute rotation.
+    real_rows = review_merge._rows
+
+    def ordered_rows(factory, sql, params=()):
+        rows = real_rows(factory, sql, params)
+        if "READY_TO_REVIEW" in sql and "backlog_task t" in sql:
+            return sorted(rows, key=lambda r: r[0] == "VOYN-W0-PNOK")
+        return rows
+
+    monkeypatch.setattr(review_merge, "_rows", ordered_rows)  # fresh DB: cursor at 0, one batch
+    enq = []
+    report = publish_review_verdicts(
+        app_factory, "/tmp", ReviewConfig(max_per_tick=1),
+        enqueue=lambda q, k, pl, tid, mx: enq.append(k),
+    )
+    assert posted == [pr_url], (report.skipped, report.remediated)
+    assert report.remediated == []
+    assert enq == []  # nothing re-enqueued for the pending two
+    pending = [r for r in report.skipped if r[1] == "verification_pending"]
+    assert len(pending) == 2
+
+
+def test_a_dead_verification_falls_back_to_remediation(rig, monkeypatch):  # noqa: F811
+    """Review of 5443b6e (CONFIRMED): a dead-lettered verification item
+    (retries exhausted, unique key blocks re-enqueue) must not read as
+    pending forever -- that is a permanent silent stall. It falls back to
+    remediation on the original findings, loudly."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    head = "7a" * 20
+    pr_url = "https://github.com/x/y/pull/83"
+    findings = f"a claim.\nVERDICT: REJECT\nHEAD_SHA: {head}\n"
+    _ready(store, app_factory, "VOYN-W0-DV", pr_url)
+    _complete_review(app_factory, worker, "VOYN-W0-DV", pr_url, head, findings)
+    # Dead-letter the verification item: claim it and fail it out of budget.
+    vkey = review_merge._verification_key(
+        "VOYN-W0-DV", pr_url, _snapshot(head), findings
+    )
+    vstore = WorkQueueStore(app_factory)
+    vstore.enqueue("execution", idempotency_key=vkey,
+                   payload={"kind": "agent_run"}, task_id="VOYN-W0-DV",
+                   max_attempts=1)
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert worker.fail(claimed, reason="executor exploded", retryable=False)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT state FROM work_item WHERE idempotency_key=%s", (vkey,))
+        assert cur.fetchone()[0] == "dead"
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(
+        app_factory, "/tmp", enqueue=lambda *a: None,
+    )
+    assert ("VOYN-W0-DV", "VOYN-W0-DV-REM") in report.remediated
+
+
+def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa: F811
+    """Review of 24c124b (CONFIRMED): per-minute pseudo-random sampling could
+    leave a task unsampled indefinitely. The partition schedule is a
+    GUARANTEE: with N tasks and scan_cap C, cycling through all
+    ceil(N/C) pages examines every task exactly once per cycle."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    # 15 ids at scan_cap 5: three windows tile the id space with no wrap,
+    # so exactly-once is well-defined (12 ids left 3 pigeonhole duplicates
+    # on the wrapping third window).
+    ids = [f"VOYN-W0-PG{i:02d}" for i in range(15)]
+    for i, tid in enumerate(ids):
+        _ready(store, app_factory, tid, f"https://github.com/x/y/pull/{200 + i}")
+
+    def fake_gh(argv, repo):
+        return sp.CompletedProcess(argv, 1, "", "always fails -> pure skip")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    examined: list[str] = []
+    for _tick in range(3):  # cursor advances per invocation: 3 calls cover 15
+        report = publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=5, scan_cap=5)
+        )
+        examined += [task_id for task_id, _ in report.skipped]
+    # Every task exactly ONCE per full cycle -- set coverage alone would
+    # hide duplicate examinations (review of a423194).
+    assert sorted(examined) == sorted(ids)
+
+
+def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 2199a56 (CONFIRMED): a FIXED page starved its own tail when
+    its head rows consumed the action cap on every visit (persistently
+    failing merges stay READY and stay first). The sliding window's start
+    advances by max_per_tick per tick, so the tail task periodically sits
+    at the FRONT -- merged before the hogs can spend the cap."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    # Five hog tasks: ACCEPT marker present, checks green, but `gh pr merge`
+    # always fails -> each visit consumes a merge-attempt action forever.
+    heads = {}
+    for i in range(5):
+        pr_url = f"https://github.com/x/y/pull/{300 + i}"
+        heads[pr_url] = f"{i}b" * 10 + "a" * 20
+        _ready(store, app_factory, f"VOYN-W0-HOG{i}", pr_url)
+    # The victim, LAST in task_id order.
+    victim_url = "https://github.com/x/y/pull/399"
+    heads[victim_url] = "cd" * 20
+    _ready(store, app_factory, "VOYN-W0-ZVICTIM", victim_url)
+
+    merged_prs = []
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        head = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and "state,mergeCommit" in argv[-1]:
+            if url in merged_prs:
+                return sp.CompletedProcess(argv, 0, json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": "ef" * 20},
+                    "headRefOid": head,
+                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                }), "")
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "OPEN"}), "")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "mergeStateStatus": "CLEAN",
+            }), "")
+        if argv[:2] == ["pr", "merge"]:
+            if url == victim_url:
+                merged_prs.append(url)
+                return sp.CompletedProcess(argv, 0, "merged", "")
+            return sp.CompletedProcess(argv, 1, "", "spurious merge failure")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    merged_tasks = []
+    # cap 1: each invocation advances the cursor by 1 -> the victim is
+    # FIRST within 6 invocations and merges despite five eternal hogs.
+    for _tick in range(7):
+        report = merge_once(
+            app_factory, "/tmp",
+            ReviewConfig(max_per_tick=1, scan_cap=3, max_branch_updates_per_tick=0),
+        )
+        merged_tasks += [t for t, _ in report.merged]
+        if merged_tasks:
+            break
+    assert merged_tasks == ["VOYN-W0-ZVICTIM"]
+
+
+def test_stride_clamped_to_window_width_covers_every_position(rig, monkeypatch):  # noqa: F811, E501
+    """Review of cadc595 (CONFIRMED): step > scan_cap left permanent holes
+    (N=12, step=4, cap=3 skipped positions 3/7/11 forever). The stride is
+    clamped to the window width, so the pathological configuration now
+    covers everything within one lap."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    ids = [f"VOYN-W0-SC{i:02d}" for i in range(12)]
+    for i, tid in enumerate(ids):
+        _ready(store, app_factory, tid, f"https://github.com/x/y/pull/{400 + i}")
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        lambda argv, repo: sp.CompletedProcess(argv, 1, "", "fails -> pure skip"),
+    )
+    seen: set[str] = set()
+    for _tick in range(4):  # stride min(4,3)=3: 4 invocations cover 12
+        report = publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=4, scan_cap=3)
+        )
+        seen |= {task_id for task_id, _ in report.skipped}
+    assert seen == set(ids)
+
+
+def test_a_resultless_terminal_verification_remediates(rig, monkeypatch):  # noqa: F811
+    """Review of cadc595 (CONFIRMED): a succeeded verification item whose
+    result cannot be consumed (missing output) must not WAIT forever --
+    same fall-back as dead: remediation on the original findings."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    head = "8b" * 20
+    pr_url = "https://github.com/x/y/pull/84"
+    findings = f"a claim.\nVERDICT: REJECT\nHEAD_SHA: {head}\n"
+    _ready(store, app_factory, "VOYN-W0-TR", pr_url)
+    _complete_review(app_factory, worker, "VOYN-W0-TR", pr_url, head, findings)
+    vkey = review_merge._verification_key(
+        "VOYN-W0-TR", pr_url, _snapshot(head), findings
+    )
+    vstore = WorkQueueStore(app_factory)
+    vstore.enqueue("execution", idempotency_key=vkey,
+                   payload={"kind": "agent_run"}, task_id="VOYN-W0-TR")
+    claimed = worker.claim("execution", visibility_seconds=60)
+    # Succeeded, but with NO result_text anywhere in the payload.
+    assert worker.complete(claimed, {"status": "completed"})
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(app_factory, "/tmp", enqueue=lambda *a: None)
+    assert ("VOYN-W0-TR", "VOYN-W0-TR-REM") in report.remediated
+
+
+def test_a_failed_marker_post_attempt_still_consumes_the_cap(rig, monkeypatch):  # noqa: F811, E501
+    """Review of cadc595 (CONFIRMED): counting only successful posts let a
+    failing poster spend up to scan_cap write attempts per tick. The
+    ATTEMPT is the action: with cap 1 and a failing poster, exactly one
+    attempt happens per tick."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    heads = {}
+    for i, n in enumerate((90, 91)):
+        head = f"{i}f" * 10 + "e" * 20
+        pr_url = f"https://github.com/x/y/pull/{n}"
+        heads[pr_url] = head
+        _ready(store, app_factory, f"VOYN-W0-FM{i}", pr_url)
+        _complete_review(
+            app_factory, worker, f"VOYN-W0-FM{i}", pr_url, head,
+            f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        )
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    attempts = []
+    monkeypatch.setattr(
+        review_merge, "_post_marker_as_bot",
+        lambda creds, pr, decision, sha: (attempts.append(pr) or (False, "marker_post_failed: down")),
+    )
+    publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert len(attempts) == 1  # the failed attempt consumed the only action
+
+
+def test_override_audit_and_marker_are_separate_write_budget_units(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 2d1bc89 (CONFIRMED): audit+marker bundled under one action
+    let cap=1 perform two external writes. Budgeted separately: at cap 1
+    the audit posts on tick one (marker deferred, stated loudly) and the
+    idempotent sequence completes with the marker on tick two -- never more
+    than max_per_tick external writes per tick."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "5e" * 20
+    pr_url = "https://github.com/x/y/pull/95"
+    _ready(store, app_factory, "VOYN-W0-OB", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n")
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    writes = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = {"headRefOid": head, "reviews": [], "comments": []}
+            if "comments" in argv[-1] and writes:
+                body["comments"] = [{"body": writes[0][1]}]
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[:2] == ["pr", "comment"]:
+            writes.append(("audit", argv[-1]))
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_post_marker_as_bot",
+        lambda creds, pr, decision, sha: (writes.append(("marker", sha)) or (True, "")),
+    )
+    first = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert [k for k, _ in writes] == ["audit"]  # exactly ONE external write
+    assert ("VOYN-W0-OB", "marker_deferred_write_budget") in first.skipped
+
+    publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    # Tick two: the audit already stands (idempotent), the marker is the
+    # tick's single write.
+    assert [k for k, _ in writes] == ["audit", "marker"]
+
+
+def test_churn_before_a_waiter_cannot_starve_it(rig, monkeypatch):  # noqa: F811
+    """Review of c725613 (CONFIRMED): a numeric offset's ordinal meaning
+    shifts under membership churn -- tasks inserted BEFORE a waiter kept
+    pushing it out from under the cursor. The keyset cursor stores the last
+    examined task_id, immovable relative to persisting ids: the waiter is
+    reached within one lap regardless of insertions ahead of it."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-ZWAITER", "https://github.com/x/y/pull/500")
+    for i in range(3):
+        _ready(store, app_factory, f"VOYN-W0-A{i:02d}", f"https://github.com/x/y/pull/{510 + i}")
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        lambda argv, repo: sp.CompletedProcess(argv, 1, "", "fails -> pure skip"),
+    )
+    seen: set[str] = set()
+    for tick in range(4):
+        # Adversarial churn: every tick inserts fresh tasks that sort BEFORE
+        # the waiter (ids "VOYN-W0-B..." < "VOYN-W0-Z...").
+        _ready(store, app_factory, f"VOYN-W0-B{tick:02d}", f"https://github.com/x/y/pull/{520 + tick}")
+        report = publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=2, scan_cap=2)
+        )
+        seen |= {task_id for task_id, _ in report.skipped}
+        if "VOYN-W0-ZWAITER" in seen:
+            break
+    assert "VOYN-W0-ZWAITER" in seen
+
+
+def test_a_failed_audit_lookup_does_not_burn_the_write_budget(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 9098d44 (CONFIRMED): a failed comments READ before any
+    write returned wrote=True and consumed max_per_tick, blocking later
+    eligible tasks. A pure read failure now costs nothing: task A's audit
+    lookup fails, task B still receives its marker in the same cap-1 tick."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    # Task A: override path (verification ACCEPT) whose audit lookup fails.
+    head_a = "3c" * 20
+    pr_a = "https://github.com/x/y/pull/96"
+    _ready(store, app_factory, "VOYN-W0-AA", pr_a)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-AA", pr_a, head_a,
+        f"claim.\nVERDICT: REJECT\nHEAD_SHA: {head_a}\n",
+    )
+    from command_center.db.work_queue_store import WorkQueueStore
+    vkey = review_merge._verification_key(
+        "VOYN-W0-AA", pr_a, _snapshot(head_a),
+        f"claim.\nVERDICT: REJECT\nHEAD_SHA: {head_a}\n",
+    )
+    vstore = WorkQueueStore(app_factory)
+    vstore.enqueue("execution", idempotency_key=vkey,
+                   payload={"kind": "agent_run"}, task_id="VOYN-W0-AA")
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert worker.complete(claimed, {
+        "status": "completed",
+        "result_text": f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head_a}",
+    })
+    # Task B: plain ACCEPT.
+    head_b = "4d" * 20
+    pr_b = "https://github.com/x/y/pull/97"
+    _ready(store, app_factory, "VOYN-W0-BB", pr_b)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-BB", pr_b, head_b,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head_b}\n",
+    )
+    heads = {pr_a: head_a, pr_b: head_b}
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        if argv[:2] == ["pr", "view"] and "comments" in argv[-1]:
+            return sp.CompletedProcess(argv, 1, "", "comments lookup down")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert ("VOYN-W0-AA", "auto_accept_audit_post_failed") in report.skipped
+    assert posted == [pr_b]  # B's marker landed despite A's failed lookup
+
+
+def test_multiple_pr_rows_per_task_are_all_reached(rig, monkeypatch):  # noqa: F811
+    """Review of aba471f (CONFIRMED, medium): a task_id-only keyset skipped a
+    task's remaining pr evidence rows once the cursor passed its id. The
+    composite (task_id, value) keyset reaches every row across ticks."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MPR", "https://github.com/x/y/pull/600")
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT backlog_record_evidence(%s,'pr',%s)",
+            ("VOYN-W0-MPR", "https://github.com/x/y/pull/601"),
+        )
+        c.commit()
+    examined: list[str] = []
+
+    def failing_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        if url:
+            examined.append(url)
+        return sp.CompletedProcess(argv, 1, "", "fails -> pure skip")
+
+    monkeypatch.setattr(review_merge, "_gh", failing_gh)
+    for _tick in range(3):
+        publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=1, scan_cap=1)
+        )
+    # BOTH evidence rows were examined -- exact URLs, not just the shared
+    # task (review of a5b2a0d: the earlier assertion could not tell /600
+    # from /601 and a task-id-only cursor would have passed).
+    assert {"https://github.com/x/y/pull/600",
+            "https://github.com/x/y/pull/601"} <= set(examined)
+
+
+def test_cursor_advances_only_to_the_processed_boundary(rig, monkeypatch):  # noqa: F811, E501
+    """Review of aba471f (High, addressed to the achievable floor): the
+    cursor moves exactly as far as the tick actually processed, so a
+    budget break mid-window never jumps unexamined rows. With cap 1 and
+    three accepted tasks in one window, three ticks post three markers --
+    none skipped."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    heads = {}
+    for i, n in enumerate((700, 701, 702)):
+        head = f"{i}a" * 10 + "9" * 20
+        pr_url = f"https://github.com/x/y/pull/{n}"
+        heads[pr_url] = head
+        _ready(store, app_factory, f"VOYN-W0-PB{i}", pr_url)
+        _complete_review(
+            app_factory, worker, f"VOYN-W0-PB{i}", pr_url, head,
+            f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+        )
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    for _tick in range(3):
+        publish_review_verdicts(
+            app_factory, "/tmp", ReviewConfig(max_per_tick=1, scan_cap=3)
+        )
+    assert sorted(posted) == sorted(heads)  # all three, none skipped
+
+
+def test_a_same_key_item_in_another_queue_is_not_pending_here(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 653963d (CONFIRMED): idempotency is scoped by
+    (queue, idempotency_key) -- an item with the same key parked in a
+    DIFFERENT queue must not read as verification_pending and block this
+    queue's enqueue."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    head = "6f" * 20
+    pr_url = "https://github.com/x/y/pull/98"
+    findings = f"claim.\nVERDICT: REJECT\nHEAD_SHA: {head}\n"
+    _ready(store, app_factory, "VOYN-W0-QX", pr_url)
+    _complete_review(app_factory, worker, "VOYN-W0-QX", pr_url, head, findings)
+    vkey = review_merge._verification_key(
+        "VOYN-W0-QX", pr_url, _snapshot(head), findings
+    )
+    WorkQueueStore(app_factory).enqueue(
+        "another-queue", idempotency_key=vkey,
+        payload={"kind": "agent_run"}, task_id="VOYN-W0-QX",
+    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    from command_center.orchestrator import planner
+    monkeypatch.setattr(planner, "repo_route", lambda _r: ("AICC", "/srv/repo"))
+    monkeypatch.setattr(review_merge, "cascade_for", lambda _k: [{"executor": "codex"}])
+    enq = []
+    report = publish_review_verdicts(
+        app_factory, "/tmp",
+        enqueue=lambda q, k, pl, tid, mx: enq.append((q, k)),
+    )
+    # The execution-queue verification WAS enqueued despite the same-key
+    # item sitting in another-queue.
+    assert ("VOYN-W0-QX", "verification_enqueued") in report.skipped
+    assert enq and enq[0][0] == "execution" and enq[0][1] == vkey
+
+
+def test_a_deferred_marker_keeps_the_cursor_before_its_task(rig, monkeypatch):  # noqa: F811, E501
+    """Verification of c4426a4 (CONFIRMED_BLOCKING 1): advancing the cursor
+    past a task whose marker was budget-deferred made the marker wait a
+    full lap. The cursor stays BEFORE the task: the next tick re-enters it
+    first and the marker is that tick's first write -- a follower task does
+    not jump the queue."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    head_a = "1e" * 20
+    pr_a = "https://github.com/x/y/pull/85"
+    _ready(store, app_factory, "VOYN-W0-DA", pr_a)
+    SNAPSHOTS[pr_a] = _snapshot(head_a)
+    # Follower: plain ACCEPT, later in task_id order.
+    head_b = "2f" * 20
+    pr_b = "https://github.com/x/y/pull/86"
+    _ready(store, app_factory, "VOYN-W0-DB", pr_b)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-DB", pr_b, head_b,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head_b}\n",
+    )
+    _force_chunk_reject(monkeypatch, f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head_a}\n")
+    # _force_chunk_reject rigs chunk rows for EVERY task; restrict to A only.
+    monkeypatch.setattr(
+        review_merge, "_chunk_review_rows",
+        lambda factory, task_id, pr_url, snapshot: (
+            ("prefix", [{"chunk": 0}]) if task_id == "VOYN-W0-DA" else (None, [])
+        ),
+    )
+    real_latest = review_merge._latest_review_result
+
+    def latest(factory, task_id, key):
+        if key.startswith("verify:") and task_id == "VOYN-W0-DA":
+            return {"result_text": f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head_a}\n"}
+        return real_latest(factory, task_id, key)
+
+    monkeypatch.setattr(review_merge, "_latest_review_result", latest)
+    heads = {pr_a: head_a, pr_b: head_b}
+    audits = []
+
+    def fake_gh(argv, repo):
+        url = next((a for a in argv if a.startswith("https://")), "")
+        if argv[:2] == ["pr", "view"] and "comments" in argv[-1]:
+            body = {"comments": [{"body": audits[0]}] if audits else []}
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        h = heads.get(url, "")
+        if argv[:2] == ["pr", "view"] and h:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": h, "reviews": []}), "")
+        if argv[:2] == ["pr", "comment"]:
+            audits.append(argv[-1])
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append(pr) or (True, "")))
+    first = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    assert ("VOYN-W0-DA", "marker_deferred_write_budget") in first.skipped
+    assert posted == []  # tick one: only the audit write happened
+    second = publish_review_verdicts(app_factory, "/tmp", ReviewConfig(max_per_tick=1))
+    # Tick two re-enters A FIRST: its marker is the single write; B waits.
+    assert posted == [pr_a], second.skipped
+
+
+def test_targeted_invocations_leave_the_shared_cursor_alone(rig, monkeypatch):  # noqa: F811, E501
+    """Verification of c4426a4 (CONFIRMED_BLOCKING 2): --task-id runs were
+    repositioning the global cursor and starving unrelated rows. A targeted
+    run must not create or move the cursor."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    head = "3a" * 20
+    pr_url = "https://github.com/x/y/pull/87"
+    _ready(store, app_factory, "VOYN-W0-TG", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-TG", pr_url, head,
+        f"clean.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda *a: (True, ""))
+    publish_review_verdicts(app_factory, "/tmp", task_id="VOYN-W0-TG")
+    review_once(app_factory, lambda *a: None, "/tmp", task_id="VOYN-W0-TG")
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT count(*) FROM backlog_scan_cursor")
+        assert cur.fetchone()[0] == 0  # no cursor row was even created

@@ -80,22 +80,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     projection = backlog_client.load_projection(args.backlog)
+    rich = backlog_client.load_rich_records(args.backlog)
     cache = dict(load_cache(args.cache))
-    pending = [
-        rec for rec in projection.records if rec.issue_id and rec.issue_id not in cache
-    ]
-    print(
-        f"records={len(projection.records)} cached={len(cache)} pending={len(pending)}"
-    )
+    named = [(rec.issue_id, rec.title) for rec in projection.records if rec.issue_id]
+    named += [(rec.record_id, rec.title) for rec in rich]
+    pending = [(rid, title) for rid, title in named if rid not in cache]
+    print(f"records={len(named)} cached={len(cache)} pending={len(pending)}")
 
     done = 0
     failed = 0
-    for record in pending:
-        title = _translate(record.title, args.model, args.timeout)
+    for record_id, source_title in pending:
+        title = _translate(source_title, args.model, args.timeout)
         if title is None:
             failed += 1
             continue
-        cache[record.issue_id] = title
+        cache[record_id] = title
         done += 1
         if done % max(1, args.flush_every) == 0:
             storage.atomic_write_json(args.cache, cache)

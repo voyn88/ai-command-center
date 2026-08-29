@@ -678,3 +678,179 @@ def test_an_unrouted_repo_is_reported_not_dead_lettered(rig, monkeypatch) -> Non
     with app_factory() as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM work_item WHERE task_id = %s", ("VOYN-W0-RR",))
         assert cur.fetchone()[0] == 0
+
+
+# --- VOYN-W0-AICC-DEFER-AUTO-RESUME (0014): the machine exit from parks -----
+
+
+def _park_technically(app_factory, store, worker, task_id) -> None:
+    """Two cascade exhaustions through the real machine: the first returns to
+    OPEN (a finding), the second parks in DEFER_TO_USER -- exactly the
+    technical park 0014 exists to drain."""
+    assert store.upsert_task(_task(task_id))[0]
+    for expected in ("OPEN", "DEFER_TO_USER"):
+        assert _dispatch(app_factory, task_id)[0]
+        claimed = worker.claim("execution", visibility_seconds=60)
+        assert isinstance(claimed, ClaimedWork)
+        assert worker.fail(claimed, reason="boom", retryable=False)
+        with app_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+        assert store.get_task(task_id)["status"] == expected
+
+
+def _repark(app_factory, store, task_id, reason) -> None:
+    """OPEN -> IN_PROGRESS -> DEFER_TO_USER again, via the real
+    return_to_pool (prior granted returns >= 1, non-allowlisted reason)."""
+    assert _dispatch(app_factory, task_id)[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ok FROM backlog_return_to_pool(%s, %s)", (task_id, reason))
+            assert cur.fetchone()[0]
+    assert store.get_task(task_id)["status"] == "DEFER_TO_USER"
+
+
+def test_resume_deferred_returns_a_technical_park_to_open(rig) -> None:
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-RS")
+
+    ok, reason, revision = store.resume_deferred("VOYN-W0-RS")
+    assert ok and reason == "OPEN" and revision is not None
+    assert store.get_task("VOYN-W0-RS")["status"] == "OPEN"
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason, detail FROM backlog_event WHERE task_id = %s "
+                "AND event = 'resume_deferred' AND outcome = 'granted'",
+                ("VOYN-W0-RS",),
+            )
+            rows = cur.fetchall()
+    assert len(rows) == 1
+    # The grant records the ORIGINAL park reason -- "why did this come back"
+    # stays answerable from the audit alone.
+    assert rows[0][0].startswith("cascade_exhausted")
+    assert rows[0][1]["prior_resumes"] == 0
+
+
+def test_resume_deferred_refuses_an_owner_decision_park(rig) -> None:
+    """A park whose latest parking reason is NOT a technical cascade
+    exhaustion stays parked: an owner decision is never auto-lifted."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RO"))[0]
+    owner_reason = "owner must choose the product direction"
+    # First return targets OPEN (prior=0); the second, with a prior granted
+    # return on record and a non-technical reason, parks.
+    assert _dispatch(app_factory, "VOYN-W0-RO")[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ok FROM backlog_return_to_pool(%s, %s)", ("VOYN-W0-RO", owner_reason))
+            assert cur.fetchone()[0]
+    _repark(app_factory, store, "VOYN-W0-RO", owner_reason)
+
+    ok, reason, _revision = store.resume_deferred("VOYN-W0-RO")
+    assert (ok, reason) == (False, "owner_decision_park")
+    assert store.get_task("VOYN-W0-RO")["status"] == "DEFER_TO_USER"
+
+
+def test_resume_deferred_refuses_a_park_without_machine_evidence(rig) -> None:
+    """Imported or hand-upserted DEFER_TO_USER rows have no machine park
+    event: provenance unknown, treated as an owner decision. Fail closed."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RN", status="DEFER_TO_USER"))[0]
+    ok, reason, _revision = store.resume_deferred("VOYN-W0-RN")
+    assert (ok, reason) == (False, "no_machine_park_evidence")
+    assert store.get_task("VOYN-W0-RN")["status"] == "DEFER_TO_USER"
+
+
+def test_resume_deferred_budget_is_bounded(rig) -> None:
+    """Three granted resumes are the budget; the fourth attempt refuses --
+    a task that re-parks every time it runs is a fact for the owner, not
+    fuel for an infinite resume/exhaust loop."""
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-RB")
+
+    for round_no in range(3):
+        ok, reason, _rev = store.resume_deferred("VOYN-W0-RB")
+        assert ok, (round_no, reason)
+        _repark(app_factory, store, "VOYN-W0-RB", "cascade_exhausted: synthetic re-park")
+
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-RB")
+    assert (ok, reason) == (False, "resume_budget_exhausted")
+    assert store.get_task("VOYN-W0-RB")["status"] == "DEFER_TO_USER"
+
+
+def test_resume_deferred_refuses_everything_else(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RX"))[0]  # OPEN
+    assert store.resume_deferred("VOYN-W0-RX")[:2] == (False, "not_deferred")
+    assert store.upsert_task(_task("VOYN-W0-RG2", kind="gate", status="DEFER_TO_USER"))[0]
+    assert store.resume_deferred("VOYN-W0-RG2")[:2] == (False, "gate_is_control_record")
+    assert store.resume_deferred("VOYN-W0-NOPE")[:2] == (False, "unknown_task")
+
+
+def test_plan_once_reconciles_technical_parks_without_audit_spam(rig) -> None:
+    """The planner tick resumes eligible technical parks (bounded) and never
+    even ATTEMPTS ineligible ones -- an owner park must not accrete a
+    rejected `resume_deferred` audit row on every 5-minute tick."""
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-RP")
+    assert store.upsert_task(_task("VOYN-W0-RQ", status="DEFER_TO_USER"))[0]
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+    assert not report.planner_busy
+    resumed_ids = [task_id for task_id, _reason in report.resumed]
+    assert "VOYN-W0-RP" in resumed_ids
+    assert "VOYN-W0-RQ" not in resumed_ids
+    assert store.get_task("VOYN-W0-RQ")["status"] == "DEFER_TO_USER"
+    assert store.get_task("VOYN-W0-RP")["status"] in ("OPEN", "IN_PROGRESS")
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_event WHERE task_id = %s "
+                "AND event = 'resume_deferred'",
+                ("VOYN-W0-RQ",),
+            )
+            assert cur.fetchone()[0] == 0
+
+    # A zero cap disables the reconcile entirely.
+    _park_technically(app_factory, store, worker, "VOYN-W0-RZ")
+    report = plan_once(app_factory, PlanLimits(wip_limit=4, max_resumes_per_tick=0))
+    assert report.resumed == []
+    assert store.get_task("VOYN-W0-RZ")["status"] == "DEFER_TO_USER"
+
+
+def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
+    """Independent review of PR #401 at 2bc73ac: a task technically parked,
+    later resumed, and then hand-upserted BACK into DEFER_TO_USER (an owner
+    decision with no return_to_pool event) still carries its old technical
+    park event -- which must NOT reopen it. Any granted mutating event after
+    the park event supersedes the evidence: fail closed."""
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-RSS")
+
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-RSS")
+    assert ok and reason == "OPEN"
+
+    # The owner hand-parks it again -- via upsert, the only path that sets
+    # DEFER_TO_USER without a return_to_pool event.
+    assert store.upsert_task(_task("VOYN-W0-RSS", status="DEFER_TO_USER"))[0]
+
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-RSS")
+    assert (ok, reason) == (False, "superseded_park_evidence")
+    assert store.get_task("VOYN-W0-RSS")["status"] == "DEFER_TO_USER"
+
+    # And the planner filter mirrors the gate: the task is never attempted,
+    # so the refusal above stays the ONLY superseded audit row.
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+    assert "VOYN-W0-RSS" not in [task_id for task_id, _ in report.resumed]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_event WHERE task_id = %s "
+                "AND event = 'resume_deferred' AND outcome = 'rejected' "
+                "AND reason = 'superseded_park_evidence'",
+                ("VOYN-W0-RSS",),
+            )
+            assert cur.fetchone()[0] == 1
