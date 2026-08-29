@@ -887,7 +887,10 @@ def review_once(
             "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
             "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
             "ORDER BY e.value LIMIT %s",
-            (task_id, cfg.scan_cap),
+            # A targeted operator invocation has no shared scan cursor and
+            # no unrelated backlog to inspect.  Bound it by the action
+            # budget, not the full-scan examination cap.
+            (task_id, cfg.max_per_tick),
         ), None
     else:
         tasks, scan_token = _scan_tasks(
@@ -1616,7 +1619,9 @@ def publish_review_verdicts(
             "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
             "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
             "ORDER BY e.value LIMIT %s",
-            (task_id, cfg.scan_cap),
+            # Targeted calls must retain the same bounded per-tick contract
+            # as the mutation loop; ``scan_cap`` is only for rotating scans.
+            (task_id, cfg.max_per_tick),
         ), None
     else:
         tasks, scan_token = _scan_tasks(
