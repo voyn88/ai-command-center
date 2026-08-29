@@ -190,6 +190,24 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
     assert f"--property=BindPaths={tmp_path}:/workspace" in command
     assert "--property=ReadWritePaths=/workspace /agent-home" in command
     assert "--property=BindPaths=/run/aicc-agent-homes/test:/agent-home" in command
+    # `in command` only proves the expected property is *present*; a second,
+    # broader `--property=ReadWritePaths=` or `--property=BindPaths=` entry
+    # (systemd-run unions repeated list properties rather than overriding
+    # them) would still satisfy that membership check while granting the
+    # agent substantially wider host writes. Collect every occurrence of each
+    # property and require the exact expected set, nothing more (review
+    # finding on 5f2f1dd).
+    read_write_paths = [
+        value for value in command if value.startswith("--property=ReadWritePaths=")
+    ]
+    assert read_write_paths == ["--property=ReadWritePaths=/workspace /agent-home"]
+    bind_paths = {
+        value for value in command if value.startswith("--property=BindPaths=")
+    }
+    assert bind_paths == {
+        f"--property=BindPaths={tmp_path}:/workspace",
+        "--property=BindPaths=/run/aicc-agent-homes/test:/agent-home",
+    }
     # Check membership against the EXACT InaccessiblePaths value, not a
     # substring of the whole argv: /run/aicc-agent-homes also appears in the
     # BindPaths line above, so `in joined` reported it masked even if the
@@ -274,7 +292,9 @@ def test_workspace_allowlist_rejects_symlink_and_sibling(launcher, tmp_path):
         launcher._validated_workspace(str(unsafe), (root,))
 
 
-def test_workspace_bind_mounts_run_in_pid1_mount_namespace(launcher, monkeypatch, tmp_path):
+def test_workspace_bind_mounts_run_in_pid1_mount_namespace(
+    launcher, monkeypatch, tmp_path
+):
     # The broker's sandbox (ProtectSystem= etc.) puts it in a slave mount
     # namespace; a bind created there is invisible to PID 1, which resolves
     # the BindPaths source to the empty staging directory. Every mount and
