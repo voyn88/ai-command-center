@@ -99,6 +99,12 @@ class ReviewConfig:
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
     max_branch_updates_per_tick: int = 3
+    #: Per-tick cap on tasks EXAMINED (each examination costs gh API calls).
+    #: Fairness across ticks comes from the rotating deterministic scan order
+    #: below, not from unbounded scanning -- see the window-starvation note
+    #: in the tick functions (review of ce948c0: an unbounded scan meant
+    #: unbounded API traffic and runtime regardless of the action cap).
+    scan_cap: int = 40
 
 
 @dataclass
@@ -760,6 +766,70 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
 
 
+_SCAN_KEY_SEP = "\x1f"
+
+
+def _scan_tasks(
+    factory: Any,
+    cursor_name: str,
+    select_sql: str,
+    params: tuple,
+    scan_cap: int,
+) -> tuple[list[tuple[Any, ...]], str]:
+    """The tick's scan window over the COMPOSITE keyset (task_id, value)
+    with the persisted cursor of migration 0015 (reviews aba471f and five
+    predecessors: the composite key is unique even when one task carries
+    several pr evidence rows, so no row can be jumped past; ordinal
+    offsets, wall clocks, and fixed pages all fell to counterexamples).
+    ``select_sql`` must accept a trailing ``(after_task, after_value,
+    limit)`` triple (``WHERE (task_id, value) > (%s, %s) ORDER BY task_id,
+    value LIMIT %s``). Returns ``(rows, cursor_token)`` -- the caller MUST
+    call `_scan_commit` with the last row it actually PROCESSED, so the
+    cursor advances exactly as far as real progress: no row is ever
+    skipped, and progress is at least one row per tick. That is the
+    strongest fairness a bounded-work tick can offer: sustained starvation
+    of a waiter then requires an adversarial insertion rate of at least
+    the tick's processing rate (typically scan_cap per tick, since skips
+    are cheap) sourced from the trusted planner itself -- the theoretical
+    floor for any finite scheduler under unbounded arrivals, documented
+    here deliberately rather than claimed away."""
+    cursor_rows = _rows(
+        factory,
+        "SELECT position FROM backlog_scan_cursor WHERE name = %s",
+        (cursor_name,),
+    )
+    token = str(cursor_rows[0][0]) if cursor_rows else ""
+    after_task, _, after_value = token.partition(_SCAN_KEY_SEP)
+    tasks = _rows(factory, select_sql, params + (after_task, after_value, scan_cap))
+    if len(tasks) < scan_cap:
+        seen = {(row[0], row[1]) for row in tasks}
+        tasks += [
+            row
+            for row in _rows(
+                factory, select_sql, params + ("", "", scan_cap - len(tasks))
+            )
+            if (row[0], row[1]) not in seen
+        ]
+    return tasks, token
+
+
+def _scan_commit(
+    factory: Any, cursor_name: str, token: str, last_row: tuple[Any, ...] | None
+) -> None:
+    """Advance the cursor to the last row the tick actually processed --
+    an atomic compare-and-set; a lost race to a concurrent same-name tick
+    keeps that tick's advance (a bounded duplicate examination on the next
+    lap, never a skip)."""
+    if last_row is None:
+        return
+    new_token = f"{last_row[0]}{_SCAN_KEY_SEP}{last_row[1]}"
+    _rows(
+        factory,
+        "SELECT backlog_scan_claim(%s, %s, %s)",
+        (cursor_name, token, new_token),
+    )
+
+
 def review_once(
     factory: Any,
     enqueue: Any,
@@ -795,20 +865,51 @@ def review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where_task = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (
-        (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
-    )
-    tasks = _rows(
-        factory,
-        "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task + " "
-        "ORDER BY t.task_id LIMIT %s",
-        params,
-    )
+    # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
+    # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
+    # permanently filled by eternal skips (skips never bump updated_at --
+    # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
+    # UNBOUNDED scan costs one gh API round-trip per task per tick
+    # (review of ce948c0) -- also wrong. So: examinations are bounded by
+    # scan_cap, MUTATIONS by max_per_tick, and coverage is a HARD
+    # guarantee from _scan_window's sliding schedule: the window start
+    # advances by max_per_tick per tick interval (wrapping), so every task
+    # periodically sits at the FRONT of the window, examined before
+    # anything else can spend the action cap -- immune even to rows that
+    # consume actions on every visit (reviews of 24c124b and 2199a56).
+    if task_id is not None:
+        # A targeted invocation must not touch the shared scan cursor
+        # (verification of c4426a4, CONFIRMED: repeated targeted runs were
+        # resetting full-scan progress and starving unrelated rows).
+        tasks, scan_token = _rows(
+            factory,
+            "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "ORDER BY e.value LIMIT %s",
+            # A targeted operator invocation has no shared scan cursor and
+            # no unrelated backlog to inspect.  Bound it by the action
+            # budget, not the full-scan examination cap.
+            (task_id, cfg.max_per_tick),
+        ), None
+    else:
+        tasks, scan_token = _scan_tasks(
+            factory,
+            "scan:review_once",
+            "SELECT task_id, value FROM ("
+            "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
+            "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
+            "  WHERE t.status = 'READY_TO_REVIEW') pairs "
+            "WHERE (task_id, value) > (%s, %s) ORDER BY task_id, value LIMIT %s",
+            (), cfg.scan_cap,
+        )
+    last_processed = None
     cascade = _model_only_review_cascade()
+    actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
+        if actions >= cfg.max_per_tick:
+            break
+        last_processed = (task_id, pr_url)
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
@@ -878,6 +979,9 @@ def review_once(
         for review_key, payload in prepared:
             enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
+        actions += 1
+    if scan_token is not None:
+        _scan_commit(factory, "scan:review_once", scan_token, last_processed)
     return report
 
 
@@ -1339,6 +1443,35 @@ def _verified_rejection_outcome(
             f"{findings}\n\n--- Verification confirmed a blocking finding "
             f"(key {key}) ---\n{verification_text}"
         )
+    # Distinguish a FRESH enqueue from an already-pending verification: the
+    # queue's idempotent enqueue returns the same id either way, so ask the
+    # store directly. The caller counts only the fresh enqueue as a tick
+    # action -- an already-pending WAIT must cost nothing, or pending tasks
+    # recreate exactly the window starvation this change removes (review of
+    # fd46584, CONFIRMED).
+    existing = _rows(
+        factory,
+        # Idempotency is scoped by (queue, idempotency_key) -- review of
+        # 653963d: without the queue predicate, a same-key item in another
+        # queue read as pending here and blocked this queue's enqueue.
+        "SELECT state FROM work_item "
+        "WHERE queue = %s AND task_id = %s AND idempotency_key = %s",
+        (cfg.queue, task_id, key),
+    )
+    if existing:
+        state = str(existing[0][0])
+        if state in ("ready", "claimed"):
+            # Genuinely in flight: wait, costing the tick nothing.
+            return "WAIT", "verification_pending"
+        # dead (retries exhausted -- review of 5443b6e) or a TERMINAL
+        # succeeded/failed item whose result the lookup above could not
+        # consume (missing or malformed output -- review of cadc595: a
+        # commit race resolves by the next tick, but a truly resultless
+        # terminal item repeats WAIT forever). Either way the unique
+        # (queue, idempotency_key) makes re-enqueue impossible: fall back
+        # to the pre-AUTO-ACCEPT behavior -- remediate on the original
+        # findings, loudly.
+        return "REMEDIATE", findings
     if enqueue is None:
         # A legacy caller that cannot enqueue can still consume an existing
         # verdict (above) but cannot start a verification -- pre-AUTO-ACCEPT
@@ -1370,7 +1503,7 @@ def _verified_rejection_outcome(
         },
     }
     enqueue(cfg.queue, key, payload, task_id, len(cascade))
-    return "WAIT", "verification_pending"
+    return "WAIT", "verification_enqueued"
 
 
 _AUDIT_SECTION_LIMIT = 28_000  # chars per section; GitHub comment cap is 65536
@@ -1402,18 +1535,28 @@ def _post_auto_accept_audit(
     (head, findings): the tag line is searched in existing comments first,
     so a tick that posted the audit but failed on the marker does not stack
     duplicates. The same evidence is durable in PostgreSQL regardless, as
-    the verification work_result addressed by `verification_key`."""
+    the verification work_result addressed by `verification_key`.
+    Returns ``(ok, wrote)`` -- ``wrote`` is False only for the idempotent
+    already-posted case, which must not consume the caller's per-tick
+    write budget."""
     findings_hash = hashlib.sha256(findings.encode("utf-8")).hexdigest()[:16]
     tag = f"AUTO-ACCEPT-AUDIT {sha} findings:{findings_hash}"
     view = _gh(["pr", "view", pr_url, "--json", "comments"], repo_path)
     if view.returncode != 0:
-        return False
+        # A failed READ before any write was attempted: costs the caller's
+        # write budget nothing (review of 9098d44 -- a transient lookup
+        # failure must not block later eligible tasks in the same tick).
+        return False, False
     try:
         comments = (json.loads(view.stdout or "{}")).get("comments") or []
     except json.JSONDecodeError:
-        return False
+        return False, False
     if any(tag in ((c or {}).get("body") or "") for c in comments):
-        return True
+        # Already posted by an earlier tick: no write happened, so this
+        # costs the caller's write budget nothing (review of 2d1bc89's
+        # follow-through: an idempotent no-op must not defer the marker
+        # forever at max_per_tick=1).
+        return True, False
     body = (
         f"{tag}\n\n"
         f"Task: {task_id}\n"
@@ -1429,7 +1572,7 @@ def _post_auto_accept_audit(
         f"{_truncated_for_audit(verification_text)}\n"
     )
     posted = _gh(["pr", "comment", pr_url, "--body", body], repo_path)
-    return posted.returncode == 0
+    return posted.returncode == 0, True
 
 
 def publish_review_verdicts(
@@ -1455,19 +1598,49 @@ def publish_review_verdicts(
     not errors."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where_task = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (
-        (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
-    )
-    tasks = _rows(
-        factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where_task
-        + " ORDER BY t.updated_at LIMIT %s",
-        params,
-    )
+    # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
+    # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
+    # permanently filled by eternal skips (skips never bump updated_at --
+    # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
+    # UNBOUNDED scan costs one gh API round-trip per task per tick
+    # (review of ce948c0) -- also wrong. So: examinations are bounded by
+    # scan_cap, MUTATIONS by max_per_tick, and coverage is a HARD
+    # guarantee from _scan_window's sliding schedule: the window start
+    # advances by max_per_tick per tick interval (wrapping), so every task
+    # periodically sits at the FRONT of the window, examined before
+    # anything else can spend the action cap -- immune even to rows that
+    # consume actions on every visit (reviews of 24c124b and 2199a56).
+    if task_id is not None:
+        # Targeted invocation: never touch the shared scan cursor
+        # (verification of c4426a4, CONFIRMED).
+        tasks, scan_token = _rows(
+            factory,
+            "SELECT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "ORDER BY e.value LIMIT %s",
+            # Targeted calls must retain the same bounded per-tick contract
+            # as the mutation loop; ``scan_cap`` is only for rotating scans.
+            (task_id, cfg.max_per_tick),
+        ), None
+    else:
+        tasks, scan_token = _scan_tasks(
+            factory,
+            "scan:publish_review_verdicts",
+            "SELECT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' "
+            "AND (t.task_id, e.value) > (%s, %s) "
+            "ORDER BY t.task_id, e.value LIMIT %s",
+            (), cfg.scan_cap,
+        )
+    last_processed = None
+    actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
+        if actions >= cfg.max_per_tick:
+            break
+        prev_processed = last_processed
+        last_processed = (task_id, pr_url)
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
@@ -1526,6 +1699,10 @@ def publish_review_verdicts(
                 factory, enqueue, task_id, pr_url, snapshot, text, cfg
             )
             if outcome == "WAIT":
+                if detail == "verification_enqueued":
+                    # A fresh queue mutation; an already-pending verification
+                    # deliberately costs nothing (review of fd46584).
+                    actions += 1
                 report.skipped.append((task_id, detail))
                 continue
             if outcome != "ACCEPT":
@@ -1534,6 +1711,7 @@ def publish_review_verdicts(
                 )
                 if new_task_id:
                     report.remediated.append((task_id, new_task_id))
+                    actions += 1
                 else:
                     report.skipped.append((task_id, "review_verdict_reject_remediation_already_dispatched"))
                 continue
@@ -1557,15 +1735,37 @@ def publish_review_verdicts(
             # than a silently-ineffective marker.
             report.skipped.append((task_id, "acceptance_bot_not_configured"))
             continue
-        if override_audit is not None and not _post_auto_accept_audit(
-            repo_path, pr_url, task_id, sha,
-            override_audit[0], override_audit[1], override_audit[2],
-        ):
-            # The audit trail is a precondition of the override, not a
-            # best-effort side effect: no audit comment, no marker. The
-            # verification verdict is durable, so the next tick retries.
-            report.skipped.append((task_id, "auto_accept_audit_post_failed"))
-            continue
+        # EVERY external write attempt is one budget unit, success or not
+        # (reviews of cadc595 and 2d1bc89: success-only counting let a
+        # failing poster spend scan_cap attempts, and bundling audit+marker
+        # under one unit let cap=1 perform two writes). An override's audit
+        # comment and the marker are therefore budgeted separately; when
+        # the budget runs out between them, the marker honestly lands on a
+        # later tick -- the audit post is idempotent, so the sequence
+        # resumes exactly where it stopped.
+        if override_audit is not None:
+            audit_ok, audit_wrote = _post_auto_accept_audit(
+                repo_path, pr_url, task_id, sha,
+                override_audit[0], override_audit[1], override_audit[2],
+            )
+            if audit_wrote:
+                actions += 1
+            if not audit_ok:
+                # The audit trail is a precondition of the override, not a
+                # best-effort side effect: no audit comment, no marker. The
+                # verification verdict is durable, so a later tick retries.
+                report.skipped.append((task_id, "auto_accept_audit_post_failed"))
+                continue
+            if actions >= cfg.max_per_tick:
+                # Leave the cursor BEFORE this task (verification of
+                # c4426a4, CONFIRMED: advancing past a deferred marker made
+                # it wait a full cursor lap): the next tick re-enters here
+                # first, the audit's idempotent no-op costs nothing, and
+                # the marker is that tick's first write.
+                last_processed = prev_processed
+                report.skipped.append((task_id, "marker_deferred_write_budget"))
+                continue
+        actions += 1
         # The independent identity: posts as `voyn88-acceptance-gate[bot]`,
         # never the operational identity that authored and will merge this
         # PR -- closes the self-issued-marker gap live-confirmed on PRs
@@ -1579,6 +1779,10 @@ def publish_review_verdicts(
         # pre-marker run. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
         _rerun_failing_acceptance_gate(repo_path, pr_url, sha)
         report.reviewed.append((task_id, pr_url))
+    if scan_token is not None:
+        _scan_commit(
+            factory, "scan:publish_review_verdicts", scan_token, last_processed
+        )
     return report
 
 
@@ -1805,15 +2009,35 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     `_merged_target_sha`; a queued merge is a wait, not a completion)."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    tasks = _rows(
+    # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
+    # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
+    # permanently filled by eternal skips (skips never bump updated_at --
+    # 0 completions in 4 hours with 90+ tasks waiting unseen), while an
+    # UNBOUNDED scan costs one gh API round-trip per task per tick
+    # (review of ce948c0) -- also wrong. So: examinations are bounded by
+    # scan_cap, MUTATIONS by max_per_tick, and coverage is a HARD
+    # guarantee from _scan_window's sliding schedule: the window start
+    # advances by max_per_tick per tick interval (wrapping), so every task
+    # periodically sits at the FRONT of the window, examined before
+    # anything else can spend the action cap -- immune even to rows that
+    # consume actions on every visit (reviews of 24c124b and 2199a56).
+    tasks, scan_token = _scan_tasks(
         factory,
+        "scan:merge_once",
         "SELECT t.task_id, e.value FROM backlog_task t "
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW' ORDER BY t.updated_at LIMIT %s",
-        (cfg.max_per_tick,),
+        "WHERE t.status = 'READY_TO_REVIEW' "
+        "AND (t.task_id, e.value) > (%s, %s) "
+        "ORDER BY t.task_id, e.value LIMIT %s",
+        (), cfg.scan_cap,
     )
+    last_processed = None
     branch_updates = 0
+    actions = 0
     for task_id, pr_url in tasks:
+        if actions >= cfg.max_per_tick:
+            break
+        last_processed = (task_id, pr_url)
         # Readiness FIRST: only a PR that already carries an independent ACCEPT
         # marker on its head with green required checks is the merge tick's
         # business. An un-accepted or failing PR is reviewed by the review tick
@@ -1864,6 +2088,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     report.skipped.append((task_id, "branch_behind_update_capped"))
                     continue
                 branch_updates += 1
+                actions += 1
                 updated = _gh(["pr", "update-branch", pr_url], repo_path)
                 if updated.returncode == 0:
                     report.skipped.append((task_id, "branch_updated_behind_main"))
@@ -1872,6 +2097,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                         (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
                     )
                 continue
+            actions += 1
             merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
             # On a merge-queue-protected repo a zero exit only ENQUEUED the
             # PR; on a plain repo it merged synchronously. Either way the
@@ -1926,6 +2152,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     report.skipped.append((task_id, f"transition:{reason}"))
             finally:
                 conn.autocommit = True
+    _scan_commit(factory, "scan:merge_once", scan_token, last_processed)
     return report
 
 
