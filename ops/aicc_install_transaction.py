@@ -92,6 +92,27 @@ _DIR_OPEN_FLAGS = (
 )
 
 
+def _validate_directory_fd(descriptor: int, path: Path) -> None:
+    """Prove that an opened path component cannot be relocated by an
+    untrusted principal while the installer uses its pinned descriptor.
+
+    ``O_NOFOLLOW`` prevents symlink traversal, but it does not stop a writer
+    of the parent directory from renaming an already-open child elsewhere.
+    Every component must therefore be owned by root or by the installer and
+    must not grant group/other rename authority.  A sticky directory (for
+    example ``/tmp`` in an unprivileged test root) is the one safe exception:
+    only the trusted owner of the child, the directory owner, or root can
+    rename a trusted-owned child there.
+    """
+    info = os.fstat(descriptor)
+    mode = stat.S_IMODE(info.st_mode)
+    trusted_uids = {0, os.geteuid()}
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in trusted_uids:
+        raise ValueError(f"directory chain component is not trusted: {path}")
+    if mode & 0o022 and not mode & stat.S_ISVTX:
+        raise ValueError(f"directory chain component is rename-writable: {path}")
+
+
 def _open_directory_chain(path: Path, *, create: bool) -> int:
     """Open `path` by walking every component from `/` with O_NOFOLLOW.
 
@@ -111,7 +132,10 @@ def _open_directory_chain(path: Path, *, create: bool) -> int:
         raise ValueError(f"directory chain must be absolute: {path}")
     current_fd = os.open("/", _DIR_OPEN_FLAGS)
     try:
+        current_path = Path("/")
+        _validate_directory_fd(current_fd, current_path)
         for part in path.parts[1:]:
+            current_path /= part
             try:
                 next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=current_fd)
             except FileNotFoundError:
@@ -119,6 +143,11 @@ def _open_directory_chain(path: Path, *, create: bool) -> int:
                     raise
                 os.mkdir(part, 0o755, dir_fd=current_fd)
                 next_fd = os.open(part, _DIR_OPEN_FLAGS, dir_fd=current_fd)
+            try:
+                _validate_directory_fd(next_fd, current_path)
+            except BaseException:
+                os.close(next_fd)
+                raise
             os.close(current_fd)
             current_fd = next_fd
         return current_fd

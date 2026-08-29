@@ -158,6 +158,55 @@ def test_sigkill_mid_apply_is_recovered_from_write_ahead_journal(tmp_path):
     assert not list(state.glob("generation-*"))
 
 
+def test_atomic_write_refuses_rename_writable_parent(tmp_path):
+    module = _module()
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+
+    with pytest.raises(ValueError, match="rename-writable"):
+        module._atomic_bytes(
+            unsafe / "target",
+            b"must-not-land",
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
+
+    assert not (unsafe / "target").exists()
+
+
+def test_open_directory_chain_closes_rejected_component(tmp_path, monkeypatch):
+    module = _module()
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+    real_close = module.os.close
+    rejected_fd: list[int] = []
+    closed: list[int] = []
+    real_validate = module._validate_directory_fd
+
+    def tracking_validate(descriptor, path):
+        try:
+            real_validate(descriptor, path)
+        except ValueError:
+            rejected_fd.append(descriptor)
+            raise
+
+    def tracking_close(descriptor):
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(module, "_validate_directory_fd", tracking_validate)
+    monkeypatch.setattr(module.os, "close", tracking_close)
+
+    with pytest.raises(ValueError, match="rename-writable"):
+        module._open_directory_chain(unsafe, create=False)
+
+    assert len(rejected_fd) == 1
+    assert rejected_fd[0] in closed
+
+
 def test_applied_generation_is_not_committed_until_explicit_commit(tmp_path):
     module = _module()
     root = tmp_path / "root"
