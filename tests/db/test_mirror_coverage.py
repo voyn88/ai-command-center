@@ -76,6 +76,15 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
     # reconciliation path is the importer (backlog_store.import_markdown),
     # not the mirror machinery. One exclusion per table so a future table in
     # the family still has to sign in on its own.
+    "backlog_scan_cursor": Exclusion(
+        reason=(
+            "PostgreSQL-native tick-scheduler state from birth (0015): the "
+            "persisted scan cursor exists only so the review/publish/merge "
+            "tick windows advance atomically per invocation; there is no "
+            "SQLite incumbent and nothing to dual-write."
+        ),
+        task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
+    ),
     "backlog_task": Exclusion(
         reason=(
             "PostgreSQL-native authority from birth (BO-S1): the incumbent it "
