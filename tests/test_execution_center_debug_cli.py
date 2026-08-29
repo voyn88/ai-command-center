@@ -202,10 +202,21 @@ def test_no_orphan_at_any_level_when_cancelled_via_ctrl_c(configured_repo):
     try:
         deadline = time.monotonic() + 10
         pids = {}
+        identities = {}
         while time.monotonic() < deadline:
             if all(os.path.exists(f"{pidfile_base}.{role}") for role in ("parent", "child", "grandchild")):
                 for role in ("parent", "child", "grandchild"):
-                    pids[role] = int(Path(f"{pidfile_base}.{role}").read_text().strip())
+                    pid = int(Path(f"{pidfile_base}.{role}").read_text().strip())
+                    process_identity = identity.capture_identity(pid)
+                    if process_identity is None:
+                        break
+                    pids[role] = pid
+                    identities[role] = process_identity.as_string()
+                if len(identities) != 3:
+                    pids.clear()
+                    identities.clear()
+                    time.sleep(0.05)
+                    continue
                 break
             time.sleep(0.05)
         assert len(pids) == 3, "process tree never came up"
@@ -225,10 +236,24 @@ def test_no_orphan_at_any_level_when_cancelled_via_ctrl_c(configured_repo):
     # sleep, which raced under CI load and flaked. A genuinely orphaned process
     # still fails: it simply never disappears before the deadline.
     deadline = time.monotonic() + 10
+    def original_process_is_gone(pid: int, recorded_identity: str) -> bool:
+        query = identity.query_identity(pid)
+        if query.status in {
+            identity.ProcessQueryStatus.ABSENT,
+            identity.ProcessQueryStatus.ZOMBIE,
+        }:
+            return True
+        if query.status is identity.ProcessQueryStatus.LIVE and query.identity is not None:
+            return query.identity.as_string() != recorded_identity
+        return False
+
     for role, pid in pids.items():
-        while identity.process_exists(pid) and time.monotonic() < deadline:
+        recorded_identity = identities[role]
+        while not original_process_is_gone(pid, recorded_identity) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert identity.process_exists(pid) is False, f"{role} (pid {pid}) must not survive Ctrl+C cancellation"
+        assert original_process_is_gone(pid, recorded_identity), (
+            f"{role} (pid {pid}) must not survive Ctrl+C cancellation"
+        )
 
 
 def test_cli_does_not_advertise_a_cross_invocation_cancel_command():
