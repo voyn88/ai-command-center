@@ -41,10 +41,22 @@ This is a fail-closed deployment gate. Do not set
    Both must run under per-run systemd `DynamicUser` identities; a shared
    `aicc-agent` execution UID or direct worker-UID fallback is forbidden. Run
    two units concurrently and prove their kernel UIDs differ.
-7. Start the first configured `voyn-aicc-worker@<lane>.service` as the canary and require readiness plus one controlled
+7. Only now, with the launcher preflight proven, enable the fail-closed flag:
+   confirm `voyn-aicc-worker-principal-isolation.conf` (which sets
+   `AICC_AGENT_PRINCIPAL_ISOLATION=required`) is installed on both the
+   templated and legacy drop-in paths and run `systemctl daemon-reload`. Start
+   every worker lane exclusively through `aicc_staged_worker_rollout.py
+   rollout` — never a manual `systemctl start` — because its `verify_unit`
+   step reads the *running* MainPID's actual environment after each start and
+   refuses to proceed unless `AICC_AGENT_PRINCIPAL_ISOLATION=required` is
+   present there. This is the explicit enablement/verification gate: no
+   worker may process a canary task, in this step or step 8 below, while that
+   check has not yet passed for its unit, closing the gap where a worker
+   could otherwise fall back to optional/direct-worker mode during rollout.
+8. Start the first configured `voyn-aicc-worker@<lane>.service` as the canary and require readiness plus one controlled
    task -> local commit -> guarded publish/PR cycle. Verify the agent could not
    read sentinel publisher secrets and no process remains in its transient
    cgroup.
-8. Drain and roll every remaining discovered lane, one at a time, only after the previous lane stays ready. Record
+9. Drain and roll every remaining discovered lane, one at a time, only after the previous lane stays ready. Record
    exact deployed SHA and unit hashes. Roll back the unit/code to the previous
    merged SHA if any boundary or readiness check fails; do not disable isolation.

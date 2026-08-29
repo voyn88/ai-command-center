@@ -40,6 +40,7 @@ from typing import Any
 # rewrite an `except (A, B):` clause into the unparenthesized form that is a
 # SyntaxError on the Python 3.13 runtimes this launcher must also run on.
 _SYSTEMCTL_ERRORS = (OSError, subprocess.SubprocessError)
+_PROC_STAT_MISSING_ERRORS = (FileNotFoundError, ProcessLookupError)
 
 FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 SOCKET_PATH = "/run/aicc-agent-launcher/control.sock"
@@ -1146,7 +1147,7 @@ def _proc_starttime(pid: int) -> int | None:
     """
     try:
         data = Path(f"/proc/{pid}/stat").read_bytes()
-    except (FileNotFoundError, ProcessLookupError):
+    except _PROC_STAT_MISSING_ERRORS:
         return None
     except OSError:
         return None
@@ -1169,15 +1170,15 @@ def _boot_id() -> str:
     """Per-boot random id; empty when unavailable so callers fail closed."""
     try:
         return (
-            Path("/proc/sys/kernel/random/boot_id")
-            .read_text(encoding="utf-8")
-            .strip()
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
         )
     except OSError:
         return ""
 
 
-def _bind_owner_alive(owner_pid: int, recorded_starttime: object, recorded_boot_id: object) -> bool:
+def _bind_owner_alive(
+    owner_pid: int, recorded_starttime: object, recorded_boot_id: object
+) -> bool:
     """Is the journal's recorded owner still the live process that staged it?
 
     Liveness is kill-based so it keeps working under a hardened ``/proc``; the
@@ -1243,7 +1244,9 @@ def _recover_workspace_bind_journals() -> None:
                 raise LaunchRefused("workspace bind recovery journal drifted")
             record = json.loads(journal.read_text(encoding="utf-8"))
             owner_pid = record.get("pid") if isinstance(record, dict) else None
-            staging = Path(record.get("path", "")) if isinstance(record, dict) else Path()
+            staging = (
+                Path(record.get("path", "")) if isinstance(record, dict) else Path()
+            )
             if not isinstance(record, dict) or (
                 record.get("version") != 1
                 or record.get("phase") not in {"PREPARED", "MOUNTED"}
