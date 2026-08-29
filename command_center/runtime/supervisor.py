@@ -58,8 +58,8 @@ from command_center import (
     provider_route,
     workspace_provisioning,
 )
-from command_center.models import iso_now
 from command_center import run_lineage as provenance
+from command_center.models import iso_now
 from command_center.runtime import (
     context_service,
     db,
@@ -335,6 +335,10 @@ class _ActiveRun:
         self.process_exited_event = threading.Event()
         self.process_reaped_event = threading.Event()
         self.terminal_persisted_event = threading.Event()
+        # Process exit and terminal persistence happen before report and
+        # finalization writes. Synchronous callers wait for this distinct
+        # ownership boundary before they may tear down the workspace.
+        self.supervision_finished_event = threading.Event()
         # Which provider produced this process, and its per-run runtime state.
         # Ownership must know: reaping, signalling and finalization are all
         # provider-specific below.
@@ -1443,9 +1447,9 @@ class Supervisor:
     def _persist_supervision_failure(self, run_id: str, *, exit_code: int | None) -> bool:
         return self._finalizer.persist_supervision_failure(run_id, exit_code=exit_code)
 
-    def _mark_finalized(self, run_id: str) -> None:
+    def _mark_finalized(self, run_id: str) -> bool:
         """Delegates to `run_finalizer.RunFinalizer` (extracted side)."""
-        self._finalizer.mark_finalized(run_id)
+        return self._finalizer.mark_finalized(run_id)
 
     def _release_active(self, run_id: str, active: _ActiveRun) -> None:
         active.terminal_persisted_event.set()
@@ -2012,7 +2016,8 @@ class Supervisor:
             # "finalized" a consequence of the durable writes instead of a
             # promise made before them. Move it up and the column still exists
             # while the guarantee is gone.
-            self._mark_finalized(run_id)
+            if not self._mark_finalized(run_id):
+                raise SupervisorError(f"Run {run_id!r} finalization marker was not persisted.")
         except Exception:
             logger.exception("Unexpected supervision failure for run %s", run_id)
             exited = active.process_exited_event.is_set()
@@ -2044,8 +2049,11 @@ class Supervisor:
                     pid=active.process.pid,
                 )
         finally:
-            if terminal_persisted:
-                self._release_active(run_id, active)
+            try:
+                if terminal_persisted:
+                    self._release_active(run_id, active)
+            finally:
+                active.supervision_finished_event.set()
 
     # ------------------------------------------------------------------
     # Cancellation — requires explicit confirmation from the caller/UI
@@ -2159,21 +2167,28 @@ class Supervisor:
             raise SupervisorError(
                 f"Run {run_id!r} did not exit after cancellation escalation; ownership is retained."
             )
-        if not active.terminal_persisted_event.wait(timeout=max(grace_seconds, 0.0)):
+        # `grace_seconds` controls only TERM -> KILL escalation. Once process
+        # exit is confirmed, returning while the sole supervision writer is
+        # still active would race report/database teardown.
+        active.supervision_finished_event.wait()
+        if active.finalization_failed_event.is_set() and not self._retry_failed_finalization(
+            run_id, active
+        ):
             raise SupervisorError(
-                f"Run {run_id!r} exited after cancellation, but its terminal state was not persisted in time."
+                f"Run {run_id!r} exited after cancellation, but durable finalization failed."
             )
-        # Preserve the synchronous cancellation API contract: once it returns,
-        # best-effort event/report finalization has also released `_active`.
-        # This wait never controls TERM/KILL escalation; only the distinct
-        # `process_exited_event` does.
-        if not active.done_event.wait(timeout=DEFAULT_CANCEL_GRACE_SECONDS):
+        if not active.done_event.is_set():
             raise SupervisorError(
-                f"Run {run_id!r} reached a terminal state after cancellation, "
-                "but local finalization did not complete in time."
+                f"Run {run_id!r} exited after cancellation without releasing local ownership."
             )
-
-        return db.get_run(self.db_path, run_id)
+        final = db.get_run(self.db_path, run_id)
+        if final is None or final["state"] not in db.TERMINAL_STATES or not final.get(
+            "finalized_at"
+        ):
+            raise SupervisorError(
+                f"Run {run_id!r} cancellation lacks a durable finalized terminal row."
+            )
+        return final
 
     def _orphan_past_deadline(self, run: dict) -> bool:
         """Whether an adopted orphan (a RUNNING row from a previous incarnation of
@@ -2280,8 +2295,12 @@ class Supervisor:
         """Persist one reconciliation decision with bounded CAS retries."""
         for _ in range(_TERMINAL_CAS_MAX_ATTEMPTS):
             current = db.get_run(self.db_path, run_id)
-            if current is None or current["state"] in db.TERMINAL_STATES:
+            if current is None:
                 return current
+            if current["state"] in db.TERMINAL_STATES:
+                if current.get("finalized_at") or self._mark_finalized(run_id):
+                    return db.get_run(self.db_path, run_id)
+                continue
             if current["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
                 return current
             if classification == "RUNNING" and current["state"] == "RUNNING":
@@ -2296,7 +2315,7 @@ class Supervisor:
                 )
             except (db.LostUpdateError, db.InvalidTransitionError):
                 continue
-            if classification in db.TERMINAL_STATES:
+            if classification in db.TERMINAL_STATES and not self._mark_finalized(run_id):
                 # Reconciliation *is* the finalization for these runs: the
                 # supervisor that owned them is gone, so no report and no
                 # auto-commit are coming, and this decision is the last word on
@@ -2304,7 +2323,7 @@ class Supervisor:
                 # and the cutover predicate could never reach zero on any
                 # install that has ever restarted with a run in flight — a
                 # drain gate that never drains.
-                self._mark_finalized(run_id)
+                continue
             return reconciled
         raise SupervisorError(
             f"Run {run_id!r} could not persist reconciliation state "

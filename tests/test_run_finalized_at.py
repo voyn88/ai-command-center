@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -289,6 +290,56 @@ def test_a_reconciled_orphan_is_finalized(git_repo, configure_project_repo):
     row = db.get_run(sup.db_path, run["id"])
     assert row["state"] == "INTERRUPTED"
     assert row["finalized_at"] is not None
+    assert db.count_unfinalized_runs(sup.db_path) == 0
+
+
+def test_reconciliation_retries_a_transient_finalization_marker_failure(
+    git_repo, configure_project_repo, monkeypatch
+):
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    task = db.create_task(
+        sup.db_path, project="AIOS", title="orphan", task_type="implementation"
+    )
+    session = db.create_session(
+        sup.db_path, task_id=task["id"], project="AIOS", repository_path=str(git_repo)
+    )
+    run = db.create_run(
+        sup.db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="orphan",
+        is_resume=False,
+        command=["claude", "--print"],
+    )
+    db.update_run_state(
+        sup.db_path, run["id"], expected_version=run["version"], new_state="QUEUED"
+    )
+    current = db.get_run(sup.db_path, run["id"])
+    db.update_run_state(
+        sup.db_path, run["id"], expected_version=current["version"], new_state="RUNNING"
+    )
+    original_mark = db.mark_run_finalized
+    failures_remaining = 1
+
+    def fail_first_mark(*args, **kwargs):
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise sqlite3.OperationalError("injected finalization-marker failure")
+        return original_mark(*args, **kwargs)
+
+    monkeypatch.setattr(db, "mark_run_finalized", fail_first_mark)
+
+    reconciled = sup._persist_reconciliation_state(
+        run["id"], classification="INTERRUPTED"
+    )
+
+    assert reconciled["state"] == "INTERRUPTED"
+    assert reconciled["finalized_at"]
     assert db.count_unfinalized_runs(sup.db_path) == 0
 
 

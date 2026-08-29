@@ -103,7 +103,7 @@ class RunFinalizer:
         self.append_lifecycle_event_best_effort("auto_committed", run_id, head=head)
         return head
 
-    def mark_finalized(self, run_id: str) -> None:
+    def mark_finalized(self, run_id: str) -> bool:
         """Stamp the run's durability watermark — the last write of any
         finalization path (VOYN-W0-AICC-SRV-09-FINALIZED-AT).
 
@@ -125,6 +125,9 @@ class RunFinalizer:
         except Exception:
             logger.exception("Could not mark run %s finalized", run_id)
             self.append_lifecycle_event_best_effort("finalization_marker_failed", run_id)
+            return False
+        current = db.get_run(self.db_path, run_id)
+        return bool(current and current.get("finalized_at"))
 
     def persist_run_failure(
         self,
@@ -145,16 +148,45 @@ class RunFinalizer:
             if not attempts or attempts[-1]["outcome"] != "started":
                 return
             reason = current.get("failure_reason") or failure_reason
+            state = current["state"]
+            if state == "COMPLETED":
+                outcome = "succeeded"
+                classification = provider_route.SUCCESS
+                disposition = provider_route.SUCCEEDED
+                error_code = None
+            elif state == "CANCELLED":
+                outcome = "cancelled"
+                classification = provider_route.CANCELLED
+                disposition = provider_route.TERMINAL
+                error_code = "cancelled"
+            else:
+                outcome = "failed"
+                classification = provider_route.classify_failure(reason)
+                disposition = provider_route.TERMINAL
+                error_code = reason
             db.finish_provider_attempt(
                 self.db_path,
                 run_id=run_id,
                 attempt_number=attempts[-1]["attempt_number"],
-                outcome="failed",
-                classification=provider_route.classify_failure(reason),
-                disposition=provider_route.TERMINAL,
-                error_code=reason,
+                outcome=outcome,
+                classification=classification,
+                disposition=disposition,
+                error_code=error_code,
                 completed_at=current.get("completed_at") or iso_now(),
             )
+
+        def confirm_finalized(current: dict) -> bool:
+            finish_started_attempt(current)
+            if not current.get("finalized_at"):
+                self.append_lifecycle_event_best_effort(
+                    lifecycle,
+                    run_id,
+                    exit_code=exit_code,
+                )
+                if not self.mark_finalized(run_id):
+                    return False
+            stored = db.get_run(self.db_path, run_id)
+            return bool(stored and stored.get("finalized_at"))
 
         for _ in range(TERMINAL_CAS_MAX_ATTEMPTS):
             try:
@@ -162,9 +194,7 @@ class RunFinalizer:
                 if current is None:
                     return True
                 if current["state"] in db.TERMINAL_STATES:
-                    if current["state"] == "FAILED":
-                        finish_started_attempt(current)
-                    return True
+                    return confirm_finalized(current)
                 if current["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
                     return False
                 current = db.update_run_state(
@@ -178,20 +208,13 @@ class RunFinalizer:
                         "failure_reason": failure_reason,
                     },
                 )
-                finish_started_attempt(current)
-                self.append_lifecycle_event_best_effort(
-                    lifecycle,
-                    run_id,
-                    exit_code=exit_code,
-                )
                 # Last, as everywhere: this path *is* the whole finalization for
                 # a run whose supervision failed or whose child was confirmed
                 # gone — there is no report to wait for — so the marker goes
                 # after the attempt is finished and the lifecycle event is
                 # appended. Without it such runs would stay permanently
                 # unfinalized and the cutover predicate would never drain.
-                self.mark_finalized(run_id)
-                return True
+                return confirm_finalized(current)
             except (db.LostUpdateError, db.InvalidTransitionError):
                 continue
             except Exception:
