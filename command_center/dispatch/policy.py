@@ -12,6 +12,13 @@ The hard guarantees, enforced structurally here:
    single assignment is even considered — every task is deferred with
    `DEFER_KILL_SWITCH`. There is no code path that assigns while the switch is
    engaged.
+1b. **Unknown budget blocks everything, the same way.** `budget_unknown=True`
+   (the caller could not read the trailing-24h spend) is checked in the same
+   place, before any assignment, and defers every task with
+   `DEFER_COST_DATA_UNAVAILABLE`. This is deliberately a hard gate rather than
+   a simulated spend figure: a faked number can be silently absorbed by a
+   zero/unset daily cap or by a free executor, which would make "no cost
+   data" fail *open* instead of closed.
 2. **Budget is never exceeded.** An executor is only assigned when the
    *projected* cumulative spend (the trailing-24h spend already incurred plus
    every assignment made so far in this plan plus this one) stays at or under
@@ -32,6 +39,7 @@ from command_center.dispatch.models import (
     ASSIGNED,
     DEFER_AGENT_BUDGET,
     DEFER_AGENT_CAPACITY,
+    DEFER_COST_DATA_UNAVAILABLE,
     DEFER_DAILY_BUDGET,
     DEFER_KILL_SWITCH,
     DEFER_NO_AVAILABLE_EXECUTOR,
@@ -103,6 +111,7 @@ def plan_dispatch(
     daily_spend_usd: float,
     max_daily_spend_usd: float,
     kill_switch_engaged: bool,
+    budget_unknown: bool = False,
     active_by_executor: dict[str, int] | None = None,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
@@ -110,20 +119,27 @@ def plan_dispatch(
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
 
-    # (1) Kill switch first: no assignment is even considered.
-    if kill_switch_engaged:
+    # (1) Kill switch / unknown budget first: no assignment is even
+    #     considered. Checked ahead of the per-task loop, exactly like the
+    #     kill switch, so a caller can never accidentally leave a code path
+    #     that assigns while the trailing-24h spend is unreadable.
+    if kill_switch_engaged or budget_unknown:
+        reason = (
+            DEFER_KILL_SWITCH if kill_switch_engaged else DEFER_COST_DATA_UNAVAILABLE
+        )
         decisions = tuple(
             DispatchDecision(
                 task_id=t.id,
                 project=t.project,
                 priority=t.priority,
-                reason=DEFER_KILL_SWITCH,
+                reason=reason,
             )
             for t in sorted(tasks, key=lambda t: _task_sort_key(t, policy))
         )
         return DispatchPlan(
             decisions=decisions,
-            kill_switch_engaged=True,
+            kill_switch_engaged=kill_switch_engaged,
+            budget_unknown=budget_unknown,
             daily_spend_usd=daily_spend_usd,
             max_daily_spend_usd=max_daily_spend_usd,
             projected_spend_usd=daily_spend_usd,
