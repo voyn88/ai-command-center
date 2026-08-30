@@ -612,6 +612,14 @@ def test_reconcile_and_sync_reconciles_dead_process_and_marks_task_ready_for_ret
     (AICC-DESKTOP-017)."""
     api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
     run = _make_run(api.db_path, state="RUNNING")
+    assert db.claim_run_finalization(
+        api.db_path,
+        run["id"],
+        owner_token="dead-owner",
+        owner_pid=999_999_999,
+        owner_identity="dead-start|dead-command",
+        expected_owner_token=None,
+    ) is not None
 
     dead = subprocess.Popen(["true"])
     dead.wait()

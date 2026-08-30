@@ -163,6 +163,8 @@ def test_reconcile_stale_runs_through_the_api(tmp_path):
     run = db.create_run(
         api.db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-owner", finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(api.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     db.update_run_state(
