@@ -64,7 +64,6 @@ No new task store, no new queue, no second completion state machine.
 from __future__ import annotations
 
 import contextlib
-import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -91,8 +90,6 @@ from command_center.runtime import db as runtime_db
 from command_center.runtime import reports
 from command_center.runtime import scheduler, task_sync
 from command_center.runtime.completion import CompletionPolicy
-
-_LOG = logging.getLogger(__name__)
 
 PIPELINE_LOCK_FILE_NAME = "task_pipeline.lock"
 
@@ -171,6 +168,7 @@ TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
 LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
+LAUNCH_SPEND_UNKNOWN = "daily_spend_unknown"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -2228,18 +2226,27 @@ def _locked_tick(
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
     spend_budget_exhausted = False
+    spend_unknown = False
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
         try:
-            spend_budget_exhausted = (
-                daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
-            )
-        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+            spend = daily_spend_usd(api.db_path)
+        except SpendUnknownError as exc:
+            # Corrupt/untrustworthy cost data: the spend figure is *unknown*,
+            # never "exhausted" — reporting it as exhausted would claim a
+            # known, over-ceiling number we do not actually have.
             _record(exc, "daily_spend_budget")
-            spend_budget_exhausted = True
-    if settings.auto_launch_active and not spend_budget_exhausted:
+            spend_unknown = True
+        except Exception as exc:  # noqa: BLE001 — db/io failure: spend is unknown, not exhausted
+            _record(exc, "daily_spend_budget")
+            spend_unknown = True
+        else:
+            spend_budget_exhausted = spend >= settings.max_daily_spend_usd
+    if settings.auto_launch_active and not spend_budget_exhausted and not spend_unknown:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
+    elif spend_unknown:
+        launch_status = LAUNCH_SPEND_UNKNOWN
     else:
         launch_status = (
             LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
@@ -2404,6 +2411,29 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     }
 
 
+class SpendUnknownError(RuntimeError):
+    """Raised by `daily_spend_usd` when the trailing-24h spend cannot be
+    trusted as a number — a cost-bearing event is malformed, non-finite,
+    negative, or the running total itself overflowed.
+
+    `daily_spend_usd` has exactly two outcomes: a trustworthy `float`, or this
+    exception. It never fails open by returning a number a caller might
+    mistake for "genuinely $0" or "genuinely under/over the ceiling" — every
+    caller must treat this as *unknown* spend (block/defer), never as $0 and
+    never as "budget exhausted" (which would misrepresent an unreadable
+    number as a known, exceeded one)."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
+# The one reason code `SpendUnknownError` currently carries: a run_event that
+# matched the cost-event scan but whose cost data cannot be trusted (bad
+# shape, non-finite, negative, or an overflowed running total).
+CORRUPT_COST_EVENT = "corrupt_cost_event"
+
+
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
@@ -2411,16 +2441,38 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
 
-    `payload` may already be a `dict` rather than JSON text — a `jsonb`-backed
-    read (the PostgreSQL mirror this table has, VOYN-W0-AICC-SRV-01B) hands
-    back a decoded object, not a string, and `json.loads` on a `dict` raises
-    `TypeError`. A prior version caught `TypeError` alongside `ValueError` and
-    silently `continue`d past every row, which zeroes the whole sum with no
-    error and no log line — a spend cap that reads 0 stops gating without
-    ever saying so. Only malformed JSON *text* is tolerated (and logged); a
-    row of an unexpected shape is now visible instead of silently dropped.
+    Returns a trustworthy `float` or raises `SpendUnknownError` — never a
+    number a corrupt or missing cost event could have silently coerced into
+    "no spend" or "spend under the ceiling". Concretely:
+
+    - `payload` may already be a `dict` rather than JSON text — a `jsonb`-
+      backed read (the PostgreSQL mirror this table has, VOYN-W0-AICC-SRV-01B)
+      hands back a decoded object, not a string, and `json.loads` on a `dict`
+      raises `TypeError`. Handled below without ever calling `json.loads` on
+      a non-string payload.
+    - A row selected by the query (its raw text contains `total_cost_usd`)
+      that turns out not to be parseable JSON, or parses to something other
+      than an object, is `SpendUnknownError(CORRUPT_COST_EVENT)` — not a
+      logged-and-skipped row. The predicate is a coarse text scan; a row it
+      selects could be concealing real spend behind broken JSON, and
+      silently dropping it would let a corrupt cost event pass for zero.
+    - A selected row that, once parsed, has no top-level `total_cost_usd` key
+      is *not* treated as corrupt: the predicate can also match the phrase
+      appearing nested or inside an unrelated string (a message, a diagnostic
+      blob). Only a row that actually carries the key is a cost event; one
+      that does not is simply not a cost event and contributes 0.
+    - A `total_cost_usd` that is present but not a finite, non-negative
+      number — a string, `null`, a bool, `NaN`/`Infinity` (`json.loads`
+      accepts these as floats), or a negative value — raises
+      `SpendUnknownError(CORRUPT_COST_EVENT)` rather than being coerced or
+      skipped.
+    - The running total is re-checked for finiteness after every addition:
+      several individually finite costs (e.g. two values near `1e308`) can
+      still sum to `inf`, and that must raise exactly like a single bad
+      value would.
     """
     import json as _json
+    import math as _math
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
@@ -2441,19 +2493,37 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
         if isinstance(payload, (str, bytes, bytearray)):
             try:
                 payload = _json.loads(payload)
-            except ValueError:
-                _LOG.warning(
-                    "daily_spend_usd: skipping run_event with unparseable payload_json: %r",
-                    payload[:200] if isinstance(payload, str) else payload,
-                )
-                continue
+            except ValueError as exc:
+                raise SpendUnknownError(
+                    CORRUPT_COST_EVENT,
+                    f"run_event payload matched a cost event but failed to parse as JSON: {exc}",
+                ) from exc
         if not isinstance(payload, dict):
-            _LOG.warning(
-                "daily_spend_usd: skipping run_event whose payload is a %s, not an object",
-                type(payload).__name__,
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                f"run_event payload matched a cost event but is a {type(payload).__name__}, not an object",
             )
+        if "total_cost_usd" not in payload:
+            # The LIKE prefilter is a coarse text scan; this row matched it
+            # without actually carrying the top-level field, so it is not a
+            # cost event at all (not corrupt either).
             continue
-        cost = payload.get("total_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total += float(cost)
+        cost = payload["total_cost_usd"]
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                f"total_cost_usd is a {type(cost).__name__}, not a number",
+            )
+        cost = float(cost)
+        if not _math.isfinite(cost) or cost < 0:
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                f"total_cost_usd is not a finite, non-negative number: {cost!r}",
+            )
+        total += cost
+        if not _math.isfinite(total):
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                "accumulated daily spend overflowed to a non-finite value",
+            )
     return total

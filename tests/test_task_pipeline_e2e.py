@@ -533,44 +533,162 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     assert [d.task_id for d in ungated.launched()] == ["s"]
 
 
-def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeypatch, caplog):
-    """A `jsonb`-backed read (the PostgreSQL mirror, VOYN-W0-AICC-SRV-01B) hands
-    back a `payload` that is already a decoded `dict`, not JSON text, and
-    `json.loads(dict)` raises `TypeError`. A prior version caught `TypeError`
-    alongside `ValueError` and silently `continue`d — every row in the batch
-    was dropped with no error and no log line, so the spend cap read 0 and
-    stopped gating without ever saying so. A dict-shaped row must be summed
-    like any other, and a genuinely malformed JSON-text row must be skipped
-    *and logged*, without knocking out the well-formed rows around it."""
+def test_daily_spend_unknown_gates_launches_without_claiming_budget_exhausted(tmp_path, api, fake_claude):
+    """Corrupt cost data (here: a negative `total_cost_usd`, which cannot be a
+    real spend figure) must block new launches exactly like a genuinely
+    exhausted budget does, but the tick must say the spend is *unknown*
+    (`LAUNCH_SPEND_UNKNOWN`) rather than falsely claiming it read a known
+    figure that happened to be over the ceiling (`LAUNCH_BUDGET_EXHAUSTED`)."""
 
-    class _FakeCursor:
-        def __init__(self, rows):
-            self._rows = rows
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-u")
+    wt = tmp_path / "wt" / "u"
+    task = _task("u", "AIOS", wt, branch="task/u")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"u": task})
+    configs = project_config.load_project_configs()
 
-        def fetchall(self):
-            return self._rows
+    prior_task = runtime_db.create_task(
+        api.db_path, project="AIOS", title="prior", task_type="implementation"
+    )
+    prior_session = runtime_db.create_session(
+        api.db_path, task_id=prior_task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    prior = runtime_db.create_run(
+        api.db_path, session_id=prior_session["id"], task_id=prior_task["id"],
+        project="AIOS", task_type="implementation", repository_path="/tmp/x",
+        prompt="prior", is_resume=False,
+    )
+    runtime_db.append_run_event(
+        api.db_path, prior["id"], "stream_event",
+        {"type": "result", "total_cost_usd": -5.0, "usage": {"input_tokens": 1}},
+    )
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (models.iso_now(), prior["id"]),
+            )
 
-    class _FakeConn:
-        def __init__(self, rows):
-            self._rows = rows
+    with pytest.raises(task_pipeline.SpendUnknownError):
+        task_pipeline.daily_spend_usd(api.db_path)
 
-        def execute(self, *_args, **_kwargs):
-            return _FakeCursor(self._rows)
+    gated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
+    assert gated.launched() == []
+    assert gated.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN
 
-    rows = [
-        {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
-        {"payload": {"type": "result", "total_cost_usd": 3.5}},
-        {"payload": "{not valid json"},
-    ]
 
+class _FakeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, *_args, **_kwargs):
+        return _FakeCursor(self._rows)
+
+
+def _fake_daily_spend_rows(monkeypatch, rows):
     @contextlib.contextmanager
     def _fake_connect(_db_path):
         yield _FakeConn(rows)
 
     monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
 
-    with caplog.at_level("WARNING"):
-        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+def test_daily_spend_usd_tolerates_dict_payloads_and_unrelated_matches(tmp_path, monkeypatch):
+    """A `jsonb`-backed read (the PostgreSQL mirror, VOYN-W0-AICC-SRV-01B) hands
+    back a `payload` that is already a decoded `dict`, not JSON text, and
+    `json.loads(dict)` raises `TypeError`. A prior version caught `TypeError`
+    alongside `ValueError` and silently `continue`d — every row in the batch
+    was dropped with no error and no log line, so the spend cap read 0 and
+    stopped gating without ever saying so. A dict-shaped row must be summed
+    like any other. A row that merely matched the `LIKE '%total_cost_usd%'`
+    prefilter without carrying the key at its top level (e.g. the phrase only
+    appears nested) is not a cost event and must not be treated as corrupt."""
+
+    _fake_daily_spend_rows(
+        monkeypatch,
+        [
+            {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
+            {"payload": {"type": "result", "total_cost_usd": 3.5}},
+            {"payload": '{"type": "result", "note": "see total_cost_usd in the nested usage blob"}'},
+        ],
+    )
+
+    total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
 
     assert total == pytest.approx(5.5)
-    assert "unparseable" in caplog.text
+
+
+def test_daily_spend_usd_raises_on_unparseable_selected_payload(tmp_path, monkeypatch):
+    """A row selected by the `total_cost_usd` text scan that fails to parse as
+    JSON could be concealing real spend behind broken JSON — it must raise
+    `SpendUnknownError`, never be silently skipped (a truncated event like
+    this is exactly the shape a corrupted write could leave behind)."""
+
+    _fake_daily_spend_rows(monkeypatch, [{"payload": '{"total_cost_usd":100'}])
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as exc_info:
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+    assert exc_info.value.reason == task_pipeline.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_usd_raises_on_non_dict_selected_payload(tmp_path, monkeypatch):
+    _fake_daily_spend_rows(monkeypatch, [{"payload": '["total_cost_usd", 1.0]'}])
+
+    with pytest.raises(task_pipeline.SpendUnknownError):
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+
+@pytest.mark.parametrize(
+    "cost",
+    [
+        "1.0",  # a string, not a number
+        None,
+        True,
+        float("nan"),  # json.loads accepts NaN as a Python float
+        float("inf"),
+        -1.0,  # negative spend cannot be real
+    ],
+)
+def test_daily_spend_usd_raises_on_untrustworthy_cost_value(tmp_path, monkeypatch, cost):
+    import json
+
+    payload = json.dumps({"type": "result", "total_cost_usd": cost}, allow_nan=True)
+    _fake_daily_spend_rows(monkeypatch, [{"payload": payload}])
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as exc_info:
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+    assert exc_info.value.reason == task_pipeline.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_usd_raises_on_accumulated_overflow(tmp_path, monkeypatch):
+    """Each individual cost is finite, but the running total is not: two
+    values near the top of `float` range still sum to `inf`, which must be
+    caught the same way a single non-finite value would be."""
+
+    huge = 1e308
+    _fake_daily_spend_rows(
+        monkeypatch,
+        [
+            {"payload": f'{{"type": "result", "total_cost_usd": {huge}}}'},
+            {"payload": f'{{"type": "result", "total_cost_usd": {huge}}}'},
+        ],
+    )
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as exc_info:
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+    assert exc_info.value.reason == task_pipeline.CORRUPT_COST_EVENT
