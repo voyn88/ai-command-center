@@ -103,6 +103,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    exp = sub.add_parser(
+        "backlog-export",
+        help="Render the structured store back into the Markdown projection "
+        "(BO-S4; atomic replace so a concurrent importer or reader never "
+        "sees a truncated file).",
+    )
+    exp.add_argument("path", help="Path to write VOYN_TASKS_BACKLOG.md")
     plan = sub.add_parser(
         "backlog-plan",
         help="One planner tick (BO-S2): release finished lanes, dispatch "
@@ -322,6 +329,20 @@ def main(argv: list[str] | None = None) -> int:
                 # Refused records are a defect of the file or the vocabulary;
                 # surface them in the exit code so a timer/CI run goes red.
                 return 1 if report.refused else 0
+
+            if args.command == "backlog-export":
+                from pathlib import Path
+
+                from command_center.db.backlog_projection import (
+                    export_tasks,
+                    write_projection,
+                )
+                from command_center.db.backlog_store import BacklogStore
+
+                tasks = BacklogStore(lambda: nullcontext(conn)).export_all()
+                write_projection(Path(args.path), export_tasks(tasks))
+                print(f"exported {len(tasks)} tasks -> {args.path}")
+                return 0
 
             if args.command == "backlog-status":
                 from command_center.db.backlog_store import BacklogStore

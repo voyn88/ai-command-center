@@ -251,6 +251,29 @@ class BacklogStore:
                 )
                 return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
 
+    def export_all(self) -> list[dict[str, Any]]:
+        """Every task, the full column set the Markdown projection (BO-S4)
+        needs to render. Unpaged on purpose: the projection is a complete
+        snapshot of the store, not a page of it; ordering is the caller's
+        concern (``backlog_projection.export_tasks`` sorts by task_id)."""
+        keys = (
+            "task_id",
+            "wave",
+            "priority",
+            "status",
+            "kind",
+            "title",
+            "body",
+            "repo",
+        )
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT task_id, wave, priority, status, kind, title, body, "
+                    "repo FROM backlog_task"
+                )
+                return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
     # -- the importer ---------------------------------------------------------
 
     def import_markdown(self, text: str) -> ImportReport:

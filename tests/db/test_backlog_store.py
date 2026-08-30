@@ -210,6 +210,21 @@ def test_import_is_idempotent_and_loses_nothing(store) -> None:
     assert store.get_task("VOYN-W0-G1")["kind"] == "gate"
 
 
+def test_export_then_reimport_changes_nothing_already_in_the_store(store) -> None:
+    """BO-S4's fixed point, proved end to end against the real functions:
+    the store's own Markdown projection, fed straight back through the
+    importer, must not touch a single row it just produced."""
+    from command_center.db.backlog_projection import export_tasks
+
+    first = store.import_markdown(FIXTURE.read_text(encoding="utf-8"))
+    assert first.inserted > 0 and first.refused == []
+
+    exported = export_tasks(store.export_all())
+    reimported = store.import_markdown(exported)
+    assert reimported.changed == 0, "the store's own projection must reconcile to no-op"
+    assert reimported.refused == []
+
+
 def test_import_reports_a_record_the_schema_refuses(store) -> None:
     """The parser and the CHECKs are two fences; a record that leaps the
     first must still be caught, reported and not half-written by the second."""
