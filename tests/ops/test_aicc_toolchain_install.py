@@ -351,25 +351,79 @@ def _shell_commands(path: Path) -> list[tuple[int, str]]:
     return commands
 
 
-def test_no_production_shell_path_resolves_npm():
-    """The blocker this task closes, pinned across the privileged shell surface.
+def test_no_privileged_path_resolves_npm():
+    """The blocker this task closes, pinned across the whole repository.
 
-    `deploy/install-agent-toolchain.sh` used to run `npm install --global` as
-    root. Checking that one file would not hold: what matters is that no shell
-    script under deploy/ or ops/ invokes a package manager on the host. The
-    Python side is pinned separately and more strictly -- see
-    `test_nothing_in_the_installer_executes_a_subprocess`, which forbids
-    spawning anything at all.
+    An earlier version of this test scanned only `deploy/` and `ops/`, and an
+    independent reviewer was right to call that out: the commit claimed "no
+    production path resolves npm" while `scripts/start-web.sh` still ran
+    `npm ci`. The claim is now stated as narrowly as it is true, and checked
+    that widely -- every shell script in the repository is scanned, and the
+    frontend build is allowed by name, with its reason, rather than by being
+    outside the search.
+
+    The distinction that matters is privilege, not location: the toolchain gate
+    exists because the provider CLIs were installed AS ROOT on production
+    hosts, resolving packages and running their lifecycle scripts. Building the
+    web bundle is neither privileged nor part of the agent execution path.
+    """
+    root = Path(__file__).parents[2]
+    # Allowed, with the reason each is not what the gate is about.
+    allowed = {
+        # Frontend bundle build. Runs as the invoking user, never root, and
+        # produces web/dist -- nothing an agent executes.
+        "scripts/start-web.sh",
+    }
+    offenders = []
+    for path in sorted(root.rglob("*.sh")):
+        relative = path.relative_to(root).as_posix()
+        if relative.startswith((".git/", "web/node_modules/", ".venv/")):
+            continue
+        if relative in allowed:
+            continue
+        for number, code in _shell_commands(path):
+            for token in (
+                "npm install",
+                "npm ci",
+                "npm i ",
+                "npm root",
+                "npm exec",
+                "npx ",
+            ):
+                if token in code:
+                    offenders.append(f"{relative}:{number}: {code}")
+    assert offenders == [], "a shell path resolves packages:\n  " + "\n  ".join(
+        offenders
+    )
+
+
+def test_no_operator_facing_message_recommends_a_global_npm_install():
+    """A hint is a path too.
+
+    `agent_runner` used to tell an operator whose CLI was missing to run
+    `npm install -g @anthropic-ai/claude-code`. On a production host that is
+    precisely what the installer refuses, and an operator following it with
+    sudo would reintroduce the finding by hand. Independent review on 58b50b9.
     """
     root = Path(__file__).parents[2]
     offenders = []
-    for directory in ("deploy", "ops"):
-        for path in sorted((root / directory).rglob("*.sh")):
-            for number, code in _shell_commands(path):
-                for token in ("npm install", "npm i ", "npm root", "npm exec", "npx "):
-                    if token in code:
-                        offenders.append(f"{path.relative_to(root)}:{number}: {code}")
-    assert offenders == [], "production resolves packages:\n  " + "\n  ".join(offenders)
+    for path in sorted((root / "command_center").rglob("*.py")):
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+        ):
+            lowered = line.lower()
+            if "npm install -g" in lowered or "npm install --global" in lowered:
+                if (
+                    "forbid" in lowered
+                    or "no longer" in lowered
+                    or "used to" in lowered
+                ):
+                    continue
+                offenders.append(f"{path.relative_to(root)}:{number}: {line.strip()}")
+    assert offenders == [], (
+        "an operator-facing path recommends a global install:\n  "
+        + "\n  ".join(offenders)
+    )
 
 
 def test_the_retired_installer_fails_closed():

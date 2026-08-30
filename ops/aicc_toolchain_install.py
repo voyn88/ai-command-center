@@ -205,6 +205,16 @@ def install(
     manifest = state_dir / "releases" / f"{digest}.json"
     release_dir = release_root / digest
 
+    # The release root must exist before reconciliation looks inside it:
+    # `reconcile_release_publication` opens it with `create=False`, so on a
+    # first installation -- the case that matters most -- it would fail before
+    # anything else ran (independent review on 58b50b9).
+    release_root.mkdir(mode=0o755, parents=True, exist_ok=True)
+    os.chown(release_root, trusted_uid, trusted_gid)
+    os.chmod(release_root, 0o755)
+    (state_dir / "releases").mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chown(state_dir / "releases", trusted_uid, trusted_gid)
+
     resumed = reconcile_release_publication(
         release_root,
         manifest,
@@ -230,8 +240,6 @@ def install(
         if resumed is None:
             payload = fetch_artifact(lock, platform)
             staging = release_root / f".stage-{digest}.{os.getpid()}"
-            release_root.mkdir(mode=0o755, parents=True, exist_ok=True)
-            os.chown(release_root, trusted_uid, trusted_gid)
             extract_artifact(
                 payload, staging, trusted_uid=trusted_uid, trusted_gid=trusted_gid
             )

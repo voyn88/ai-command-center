@@ -45,22 +45,39 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           lock = json.load(open("deploy/agent-toolchain.lock.json"))
-          specs = " ".join(f"{name}@{version}" for name, version in sorted(lock["packages"].items()))
-          print(f"specs={specs}")
           print(f"platform={lock['platform']}")
           PY
 
-      - name: Install the pinned packages without running any lifecycle script
+      - name: Install from the committed lockfile, running no lifecycle script
         run: |
           set -euo pipefail
           mkdir -p build/pkg
-          # --ignore-scripts is the whole point: no preinstall/postinstall/prepare
-          # from any third-party package executes, here or later on the hosts.
-          # The packages' own postinstall is what normally fetches the native
-          # binary; it is unnecessary because the platform package carrying that
-          # binary is a declared optional dependency and npm installs it here.
-          npm install --prefix build/pkg --ignore-scripts --omit=dev \
-            --no-audit --no-fund ${{ steps.lock.outputs.specs }}
+          # `npm ci` from the committed lockfile, not `npm install` from version
+          # specs: the lockfile pins every transitive and optional dependency by
+          # integrity hash, so a rebuild resolves nothing from mutable registry
+          # metadata. Without it the artifact digest would be an accident of
+          # when the build ran rather than an identity (independent review on
+          # 58b50b9).
+          #
+          # --ignore-scripts is the other half: no preinstall/postinstall/
+          # prepare from any third-party package executes, here or on the hosts.
+          # A package's own postinstall normally fetches its native binary; that
+          # is unnecessary because the platform package carrying the binary is a
+          # declared optional dependency and the lockfile installs it directly.
+          cp deploy/agent-toolchain/package.json deploy/agent-toolchain/package-lock.json build/pkg/
+          npm ci --prefix build/pkg --ignore-scripts --omit=dev --no-audit --no-fund
+          # The lockfile must agree with the reviewed lock, or the artifact is
+          # not what the lock claims production will run.
+          python3 - <<'PY'
+          import json
+          declared = json.load(open("deploy/agent-toolchain.lock.json"))["packages"]
+          installed = json.load(open("deploy/agent-toolchain/package.json"))["dependencies"]
+          if declared != installed:
+              raise SystemExit(
+                  f"lock and package.json disagree: {declared} != {installed}"
+              )
+          print("pinned versions agree:", declared)
+          PY
 
       - name: Prove every executable runs with no lifecycle script and no Node
         run: |

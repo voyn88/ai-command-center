@@ -2071,6 +2071,7 @@ def publish_release_tree(
         release_id,
         trusted_uid=trusted_uid,
         trusted_gid=trusted_gid,
+        id_pattern=id_pattern,
     )
     root_fd = _open_directory_chain(release_root, create=False)
     try:
@@ -2173,6 +2174,7 @@ def reconcile_release_publication(
                 release_id,
                 trusted_uid=trusted_uid,
                 trusted_gid=trusted_gid,
+                id_pattern=id_pattern,
             )
             return destination
         if manifest.exists():
@@ -2186,6 +2188,7 @@ def reconcile_release_publication(
                     release_id,
                     trusted_uid=trusted_uid,
                     trusted_gid=trusted_gid,
+                    id_pattern=id_pattern,
                 )
             recorded = _read_regular(manifest, max_bytes=64 * 1024 * 1024)
             if (

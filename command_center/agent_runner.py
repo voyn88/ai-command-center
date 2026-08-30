@@ -522,10 +522,21 @@ def claude_cli_preflight(binary: str | None = None) -> tuple[bool, str]:
     resolved = binary or CLAUDE_BINARY
     if claude_cli_available(resolved):
         return True, ""
+    # The remedy deliberately no longer says `npm install -g`: on a production
+    # host that is the exact thing the toolchain gate forbids -- it resolves
+    # packages online and runs their lifecycle scripts, as root if the operator
+    # follows the hint with sudo (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED). An
+    # error message that sends an operator down a path the installer refuses is
+    # worse than no message.
     return False, (
         f"CLI `{resolved}` не найден в PATH — запуск Claude Code завершится ошибкой ещё до "
-        "старта агента. Установите Claude Code (`npm install -g @anthropic-ai/claude-code`) "
-        "и убедитесь, что бинарник доступен в PATH, либо выберите другой execution provider."
+        "старта агента. На production-хосте исполнители ставятся только content-addressed "
+        "артефактом: `deploy/install-agent-principal-isolation.sh` вызывает "
+        "`ops/aicc_toolchain_install.py`, который проверяет sha256 из "
+        "`deploy/agent-toolchain.lock.json` и выбирает релиз в "
+        "`/opt/aicc/toolchains/current`. Устанавливать пакеты вручную на хосте нельзя. "
+        "Локально для разработки достаточно любого доступного CLI в PATH, либо выберите "
+        "другой execution provider."
     )
 
 

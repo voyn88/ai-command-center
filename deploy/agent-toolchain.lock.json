@@ -1,16 +1,16 @@
 {
-  "$comment": "Exact provider CLI versions production may execute. Updating a version here is a reviewed dependency change, never an ambient `latest`. The build installs these with --ignore-scripts, so no package lifecycle script runs in CI or in production; the native binaries each package ships are what production executes.",
-  "platform": "linux-x64",
-  "packages": {
-    "@anthropic-ai/claude-code": "2.1.231",
-    "@openai/codex": "0.149.0",
-    "@github/copilot": "1.0.80"
-  },
+  "$comment": "Exact provider CLI versions production may execute, and the exact artifact that carries them. Updating any of this is a reviewed dependency change, never an ambient `latest`: edit the versions, run the build-agent-toolchain workflow, and record the digest it reports back here. The build installs from deploy/agent-toolchain/package-lock.json with --ignore-scripts, so no package lifecycle script runs in CI or in production; the native binaries each package ships are what production executes, with no Node runtime.",
+  "artifact_sha256": "0faa7ab6334ed07408e5ee8cd9f82e92479b87f44fa9f5ed2adee9bae49c8697",
   "executables": {
     "claude": "pkg/node_modules/@anthropic-ai/claude-code-linux-x64/claude",
     "codex": "pkg/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex",
     "copilot": "pkg/node_modules/@github/copilot-linux-x64/copilot"
   },
-  "artifact_sha256": null,
-  "release_tag": null
+  "packages": {
+    "@anthropic-ai/claude-code": "2.1.231",
+    "@github/copilot": "1.0.80",
+    "@openai/codex": "0.149.0"
+  },
+  "platform": "linux-x64",
+  "release_tag": "toolchain-2026.08.30"
 }
