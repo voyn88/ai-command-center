@@ -173,6 +173,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    backfill = sub.add_parser(
+        "historical-backfill",
+        help="One-time copy (VOYN-W0-AICC-SRV-07): every pre-dual-write row in "
+        "the SQLite runtime database into its PostgreSQL mirror, parents "
+        "before children, then reconcile each table (idempotent; safe to "
+        "re-run after a partial failure). Must run on a host in the SQLite "
+        "writer's own time zone -- see command_center/db/historical_backfill.py.",
+    )
+    backfill.add_argument("sqlite_path", help="Path to the SQLite runtime database.")
+    backfill.add_argument(
+        "--table",
+        action="append",
+        dest="tables",
+        default=None,
+        metavar="TABLE",
+        help="Restrict the run to this table (repeatable); default is every "
+        "mirrored table, in dependency order.",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -437,6 +456,31 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "historical-backfill":
+                from pathlib import Path as _Path
+
+                from command_center.db.historical_backfill import (
+                    run_historical_backfill,
+                )
+
+                report = run_historical_backfill(
+                    _Path(args.sqlite_path), lambda: nullcontext(conn), tables=args.tables
+                )
+                failed = False
+                for table_report in report.tables:
+                    print(
+                        f"{table_report.table:24} source={table_report.source_rows:<6} "
+                        f"upserted={table_report.upserted:<6} "
+                        f"errors={len(table_report.errors):<3} "
+                        f"divergent={len(table_report.divergent)}"
+                    )
+                    for error in table_report.errors:
+                        print(f"  ERROR      {error}")
+                    for row in table_report.divergent:
+                        print(f"  DIVERGENT  {row.get('id')}: {row.get('fields')}")
+                    failed = failed or not table_report.ok
+                return 1 if failed else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
