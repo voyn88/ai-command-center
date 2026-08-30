@@ -8,6 +8,24 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — the worker units are mechanically pinned to the system manager (`VOYN-W0-AICC-SRV-05-USER-UNIT-IS-NOT-A-BOUNDARY`)
+- `tests/ops/test_worker_unit_is_a_system_unit.py` — `WantedBy=multi-user.target`
+  is only install metadata, so a unit could still be copied into a systemd
+  *user* unit directory and started explicitly; this now also drives the real
+  installer (`ops/aicc_install_transaction.py`) end-to-end against a
+  throwaway root and reads back what it actually wrote, and sweeps
+  `deploy/`, `ops/`, and `scripts/` for any path that would stage a unit into
+  a user-unit directory. Directive assertions parse the unit as INI sections
+  rather than substring-matching the raw text, so a directive quoted in a
+  comment can no longer pass (independent-review REJECT on
+  `ee5f95858100fd123d58746194a64abd206f3cc2`).
+- `deploy/systemd/aicc-worker.service`, `voyn-aicc-worker@.service`,
+  `voyn-aicc-worker-principal-isolation.conf` — corrected header claim: the
+  mount/network sandbox directives still take mechanical effect in a user
+  unit (namespaces don't need a privilege transition to work); what a user
+  unit loses is the *boundary*, since the account that owns it can edit,
+  reload, or bypass it at will.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
