@@ -75,6 +75,12 @@ class BackupRecord:
     install_mode: int
     install_uid: int
     install_gid: int
+    # Set when the target was a SYMLINK that this generation replaced with a
+    # real file: the link's literal target, so rollback restores the link
+    # rather than leaving a file where one never was. Appended last to keep the
+    # positional constructor contract of every existing record, and defaulted
+    # so a journal written by an earlier generation still loads.
+    original_symlink: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1134,7 +1140,17 @@ class FileTransaction:
                 continue
             if spec.if_missing:
                 continue
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            if stat.S_ISLNK(info.st_mode):
+                # A symlink is the shape every legacy unit still has on these
+                # hosts: /etc/systemd/system/<unit> pointing into the operator's
+                # home. Replacing it with the repository's own root-owned file
+                # is the entire point of taking these units under repository
+                # ownership, so it is recorded and replaced rather than
+                # refused. Nothing follows the link: the backup stores the
+                # link's literal target, and the install renames a staged file
+                # over the link itself. Found live on the first worker install.
+                continue
+            if not stat.S_ISREG(info.st_mode):
                 raise ValueError(f"existing target is not a regular file: {target}")
         self._prepare_state_dir()
         if _path_present(self.pending) or _path_present(self.pending_release):
@@ -1195,7 +1211,26 @@ class FileTransaction:
                         )
                     )
                     continue
-                if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                if stat.S_ISLNK(info.st_mode):
+                    records.append(
+                        BackupRecord(
+                            spec.target,
+                            True,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            str(staged_path),
+                            source_states[spec.target].sha256,
+                            spec.mode,
+                            spec.uid,
+                            spec.gid,
+                            os.readlink(target),
+                        )
+                    )
+                    continue
+                if not stat.S_ISREG(info.st_mode):
                     raise ValueError(f"existing target is not a regular file: {target}")
                 original = _read_regular(target)
                 backup = backups / f"{index:03d}.bin"
@@ -1628,6 +1663,37 @@ class FileTransaction:
                 raise RuntimeError(
                     f"generation target shape changed before restore: {target}"
                 ) from exc
+            if record.existed and record.original_symlink is not None:
+                # The target was a symlink this generation replaced. Restore the
+                # link, not a file: leaving a regular file where a link belonged
+                # would silently change what the unit resolves to.
+                if current is not None and not _matches(
+                    current,
+                    record.install_sha256,
+                    record.install_mode,
+                    record.install_uid,
+                    record.install_gid,
+                ):
+                    raise RuntimeError(
+                        f"generation target changed before compare-and-restore: {target}"
+                    )
+                if target.is_symlink() and os.readlink(target) == record.original_symlink:
+                    continue
+                parent_fd = _open_directory_chain(target.parent, create=False)
+                try:
+                    temporary = f".{target.name}.restore.{secrets.token_hex(8)}"
+                    os.symlink(record.original_symlink, temporary, dir_fd=parent_fd)
+                    try:
+                        os.rename(
+                            temporary, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+                        )
+                    except OSError:
+                        os.unlink(temporary, dir_fd=parent_fd)
+                        raise
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+                continue
             if record.existed:
                 assert record.backup is not None
                 assert record.original_mode is not None

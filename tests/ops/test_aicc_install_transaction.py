@@ -1877,3 +1877,64 @@ def test_recovery_itself_refuses_an_unattested_pending_release(monkeypatch, tmp_
     # never selected, and the pending record survives for a later retry.
     assert os.readlink(current) == f"releases/{'b' * 40}"
     assert pending_release.exists()
+
+
+def test_a_legacy_symlink_target_is_replaced_and_restored(monkeypatch, tmp_path):
+    """Found on the first live worker install, not by any test here.
+
+    Every production unit is still a symlink from /etc/systemd/system into the
+    operator's home. Taking those units under repository ownership means
+    replacing the link with the repository's own root-owned file -- but prepare
+    refused any target that was not a regular file, so the install stopped at
+    `existing target is not a regular file`.
+
+    A symlink is now recorded (by its literal target, never followed) and
+    replaced; rollback puts the LINK back, not a file, because leaving a
+    regular file where a link belonged silently changes what the unit
+    resolves to.
+    """
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    elsewhere = tmp_path / "home" / "unit.service"
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_text("legacy unit\n", encoding="utf-8")
+    target_dir = root / "etc"
+    target_dir.mkdir(parents=True)
+    (target_dir / "unit.service").symlink_to(elsewhere)
+
+    source = tmp_path / "source"
+    source.write_bytes(b"repo-owned unit\n")
+
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/unit.service"),))
+    transaction.apply()
+
+    installed = target_dir / "unit.service"
+    assert not installed.is_symlink(), "the link must have been replaced by a file"
+    assert installed.read_bytes() == b"repo-owned unit\n"
+    # The link's own target is untouched -- we replaced the link, not what it
+    # pointed at.
+    assert elsewhere.read_text(encoding="utf-8") == "legacy unit\n"
+
+    transaction.recover()
+
+    assert installed.is_symlink(), "rollback must restore the link, not a file"
+    assert os.readlink(installed) == str(elsewhere)
+
+
+def test_a_target_that_is_neither_file_nor_symlink_is_still_refused(tmp_path):
+    """Allowing symlinks must not have opened the door to anything else."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    target_dir = root / "etc"
+    target_dir.mkdir(parents=True)
+    (target_dir / "unit.service").mkdir()
+
+    source = tmp_path / "source"
+    source.write_bytes(b"repo-owned unit\n")
+
+    transaction = module.FileTransaction(root, state)
+    with pytest.raises(ValueError, match="not a regular file"):
+        transaction.prepare((_spec(module, source, "/etc/unit.service"),))
