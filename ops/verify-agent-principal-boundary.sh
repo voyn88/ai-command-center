@@ -55,6 +55,13 @@ launcher=/usr/libexec/aicc-agent-launcher
 expected_hash=$(sha256sum "$repo_root/ops/aicc_agent_launcher.py" | cut -d' ' -f1)
 installed_hash=$(sha256sum "$launcher" | cut -d' ' -f1)
 [ "$installed_hash" = "$expected_hash" ] || fail "installed launcher SHA drifted"
+bootstrap=/usr/local/sbin/voyn-aicc-bootstrap
+[ "$(stat -Lc %U:%G:%a "$bootstrap")" = root:root:755 ] || \
+  fail "exact-SHA bootstrap is not immutable root-owned"
+expected_bootstrap_hash=$(sha256sum "$repo_root/ops/aicc_exact_sha_bootstrap.py" | cut -d' ' -f1)
+installed_bootstrap_hash=$(sha256sum "$bootstrap" | cut -d' ' -f1)
+[ "$installed_bootstrap_hash" = "$expected_bootstrap_hash" ] || \
+  fail "installed exact-SHA bootstrap SHA drifted"
 
 expected_template_hash=$(sha256sum "$repo_root/deploy/systemd/voyn-aicc-worker@.service" | cut -d' ' -f1)
 installed_template_hash=$(sha256sum "$worker_template" | cut -d' ' -f1) || \
