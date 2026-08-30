@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import sys
 import tarfile
 from pathlib import Path
@@ -517,3 +518,62 @@ def test_install_end_to_end_publishes_and_selects(tmp_path, monkeypatch):
         lock_path, root=root, state_dir=state, trusted_uid=UID, trusted_gid=GID
     )
     assert again == release
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="publication is Linux-only")
+def test_install_repairs_every_ancestor_it_creates(tmp_path, monkeypatch):
+    """Independent review on 78c019a.
+
+    Creating `<root>/releases` with parents=True also creates `<root>` and its
+    parent under the caller's umask. Repairing only the levels named in the
+    loop leaves a group-writable ancestor, and the publication guard walks
+    every ancestor -- so a clean first install fails one level higher instead
+    of succeeding. This drives install() under a permissive umask and requires
+    every directory it created to come out non-group-writable.
+    """
+    module = _module()
+    # `/opt` itself is a system directory that already exists as 0755 in
+    # production; the installer must not touch it. Model that, so the test
+    # exercises the levels the installer actually creates.
+    base = tmp_path / "opt"
+    base.mkdir(mode=0o755)
+    os.chmod(base, 0o755)
+    root = base / "aicc" / "toolchains"
+    state = tmp_path / "state"
+
+    payload_dir = tmp_path / "src"
+    (payload_dir / "pkg").mkdir(parents=True)
+    (payload_dir / "pkg" / "claude").write_bytes(b"#!/bin/sh\nexit 0\n")
+    (payload_dir / "pkg" / "claude").chmod(0o755)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        archive.add(payload_dir / "pkg", arcname="pkg")
+    artifact = buffer.getvalue()
+    digest = hashlib.sha256(artifact).hexdigest()
+    lock_path = _lock(
+        tmp_path, artifact_sha256=digest, executables={"claude": "pkg/claude"}
+    )
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, _limit):
+            return artifact
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _Response())
+
+    previous = os.umask(0o002)
+    try:
+        module.install(
+            lock_path, root=root, state_dir=state, trusted_uid=UID, trusted_gid=GID
+        )
+    finally:
+        os.umask(previous)
+
+    for directory in (root.parent, root, root / "releases"):
+        mode = stat.S_IMODE(directory.stat().st_mode)
+        assert not mode & 0o022, f"{directory} is group/world writable: {mode:o}"

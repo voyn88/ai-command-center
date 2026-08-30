@@ -216,7 +216,14 @@ def install(
     # publication guard rightly refuses it -- as a Linux run of the end-to-end
     # test showed. Modes are set after creation because `mkdir(mode=...)` is
     # itself masked by the umask.
+    # `root.parent` (/opt/aicc) is included deliberately: creating
+    # /opt/aicc/toolchains with parents=True also creates /opt/aicc under the
+    # umask, and repairing only the child leaves a group-writable ancestor that
+    # `_open_directory_chain` rightly refuses -- so a clean first install would
+    # still fail, just one level higher (independent review on 78c019a).
+    # Ordered outermost-first so each level exists before the next is created.
     for directory, mode in (
+        (root.parent, 0o755),
         (root, 0o755),
         (release_root, 0o755),
         (state_dir, 0o700),
