@@ -22,6 +22,11 @@ def test_queue_reap_takes_no_arguments() -> None:
     assert args.command == "queue-reap"
 
 
+def test_mirror_status_takes_no_arguments() -> None:
+    args = build_parser().parse_args(["mirror-status"])
+    assert args.command == "mirror-status"
+
+
 def test_backlog_review_can_target_one_exact_task() -> None:
     args = build_parser().parse_args(
         ["backlog-review", "--repo-path", "/srv/aicc", "--task-id", "VOYN-W0-X"]

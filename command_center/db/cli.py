@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="Show the applied schema version.")
     sub.add_parser(
+        "mirror-status",
+        help="Report SQLite/PostgreSQL divergence for the task and session "
+        "mirror (VOYN-W0-AICC-SRV-09-READ-POOL); read-only, writes to neither "
+        "store. Exits non-zero when any row diverges.",
+    )
+    sub.add_parser(
         "bootstrap",
         help="Create roles and set schema privileges (run once, as a superuser).",
     )
@@ -237,6 +243,38 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"applied: {list(migrations.applied_versions(conn))}")
                 print(f"version: {migrations.current_version(conn)}")
                 return 0
+
+            if args.command == "mirror-status":
+                from command_center.runtime.db.core import resolve_db_path
+                from command_center.db.execution_reconcile import (
+                    reconcile_execution_center,
+                )
+
+                # Reuses the connection already checked out above rather than
+                # letting each mirror default to its own `pool.connection()`
+                # checkout: this command previously exhausted a pool sized
+                # `AICC_PG_POOL_MAX=1` and timed out instead of reporting
+                # (independent-review finding).
+                report = reconcile_execution_center(
+                    resolve_db_path(), lambda: nullcontext(conn)
+                )
+                for label, differences in (
+                    ("task", report.task_divergence),
+                    ("session", report.session_divergence),
+                ):
+                    for diff in differences:
+                        print(
+                            f"DIVERGENT {label} id={diff['id']} "
+                            f"fields={','.join(diff['fields'])}"
+                        )
+                if report.clean:
+                    print("mirror-status: clean (task, session)")
+                    return 0
+                print(
+                    f"mirror-status: {len(report.task_divergence)} task, "
+                    f"{len(report.session_divergence)} session row(s) divergent"
+                )
+                return 1
 
             if args.command == "bootstrap":
                 count = roles.apply_bootstrap(conn)
