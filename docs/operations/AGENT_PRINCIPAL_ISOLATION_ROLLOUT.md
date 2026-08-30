@@ -9,9 +9,19 @@ This is a fail-closed deployment gate. Do not set
    move their Git metadata in place. The task-local clone dependency must
    create/reconcile each active task under `/srv/aicc-workspaces`; archive a
    legacy clone only after its branch/HEAD is durable and exact-SHA matched.
-2. Install root-owned provider CLIs at `/usr/local/bin/{claude,codex,copilot}`.
-   Every resolved executable and its package files must be owned by root and not
-   group/world-writable. Never point at `/home/voynadmin/.local`.
+2. Nothing to do: the provider CLIs install themselves. The installer runs
+   `ops/aicc_toolchain_install.py`, which downloads the artifact pinned by
+   `deploy/agent-toolchain.lock.json`, proves its sha256, extracts it root-owned
+   and selects it at `/opt/aicc/toolchains/current`
+   (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED, merged `91c7718`).
+   **Do not install the CLIs by hand**, and in particular never with
+   `npm install --global`: that is the finding this gate exists to close --
+   it resolves packages online and runs their lifecycle scripts as root. An
+   executable under `/usr/local/bin` or an operator's home is now ignored;
+   the installer refuses any executor that resolves outside the selected
+   release. To change a CLI version, edit the lock, run the
+   `build-agent-toolchain` workflow, and record the digest it reports -- a
+   reviewed change, never an ambient `latest`.
 3. Put only model credentials in `/etc/aicc/agent-claude.env` and
    `/etc/aicc/agent-codex.env` (root:`aicc-agent`, `0640`), or provider config
    below `/var/lib/aicc-agent` (`root:root`, `0600`). The broker uses only an
