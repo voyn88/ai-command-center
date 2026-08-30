@@ -173,6 +173,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    mirror = sub.add_parser(
+        "mirror-status",
+        help="Compare the Execution Center's SQLite authority (task/session) "
+        "against its PostgreSQL mirrors; report-only (VOYN-W0-AICC-SRV-09-"
+        "READ-POOL). Exits non-zero on any divergence.",
+    )
+    mirror.add_argument(
+        "--db-path",
+        default=None,
+        help="Runtime SQLite database (default: command_center.runtime.db.resolve_db_path()).",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -437,6 +449,39 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "mirror-status":
+                from pathlib import Path
+
+                from command_center.runtime.db import resolve_db_path
+                from command_center.runtime.execution_reconcile import (
+                    reconcile_execution_center,
+                )
+
+                db_path = (
+                    Path(args.db_path) if args.db_path else resolve_db_path()
+                )
+                # Reuse the connection this command already checked out above
+                # rather than let each mirror ask the pool for one of its own:
+                # with the valid configuration AICC_PG_POOL_MAX=1 a second
+                # checkout has nothing to draw from and the command hangs
+                # until it times out (adversarial review of PR #438).
+                report = reconcile_execution_center(db_path, lambda: nullcontext(conn))
+                for label, divergences in (
+                    ("task", report.task_divergences),
+                    ("session", report.session_divergences),
+                ):
+                    for row in divergences:
+                        print(f"DIVERGENT {label} {row['id']}: {row}")
+                if report.clean:
+                    print("mirror-status: task and session agree with PostgreSQL")
+                    return 0
+                print(
+                    f"mirror-status: {len(report.task_divergences)} task, "
+                    f"{len(report.session_divergences)} session divergence(s)",
+                    file=sys.stderr,
+                )
+                return 1
 
             if args.command == "downgrade":
                 if not args.confirmed:
