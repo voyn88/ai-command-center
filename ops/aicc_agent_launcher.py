@@ -63,9 +63,16 @@ MODEL_AUTH_TARGETS = {
     "codex": Path(".codex/auth.json"),
 }
 EPHEMERAL_HOME_ROOT = Path("/run/aicc-agent-homes")
+# The provider CLIs live in the content-addressed toolchain, not in
+# /usr/local/bin: production no longer installs them with `npm install
+# --global` as root (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED). `current` is an
+# atomically replaced symlink into a release proven by its own sha256 and a
+# root-owned content manifest, so this path resolves to verified bytes or to
+# nothing at all -- never to a half-installed package tree.
+TOOLCHAIN_BIN = "/opt/aicc/toolchains/current/bin"
 EXECUTOR_BINARIES = {
-    "claude": "/usr/local/bin/claude",
-    "codex": "/usr/local/bin/codex",
+    "claude": f"{TOOLCHAIN_BIN}/claude",
+    "codex": f"{TOOLCHAIN_BIN}/codex",
 }
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
