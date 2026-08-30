@@ -20,12 +20,22 @@ one a table that is neither mirrored nor declared and asserts it is reported. A
 coverage gate that has never been shown to fail is a coverage gate that
 guarantees nothing.
 
+A signed exclusion can itself lie. `queue_entry`'s entry says it is mirrored by
+`PostgresQueueMirror` rather than unmirrored — prose nothing re-checks, so an
+unrelated class at that name or a class edited to stop touching `queue_entry`
+would still leave every gate above green. `BESPOKE_MIRRORS` and
+`test_every_bespoke_mirror_is_real` close that: the named class's own read and
+write paths are run against a connection that only records what it was asked
+to do, and the SQL it actually sends is checked against the table the
+exclusion claims it covers — also proved to bite, the same way.
+
 No database is needed here, deliberately — the declarations are the thing under
 test, and they must stay checked on a machine with no PostgreSQL.
 """
 
 from __future__ import annotations
 
+import importlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +43,7 @@ from pathlib import Path
 import pytest
 
 from command_center.db import roles
-
+from command_center.db.table_mirror import PostgresTableMirror
 from tests.db.mirror_discovery import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,13 +53,31 @@ RUNTIME_DB_PACKAGE = COMMAND_CENTER / "runtime" / "db"
 #: The ledger is the runner's, not a domain table, on both sides.
 LEDGER_TABLES = frozenset({"schema_migration", "schema_version"})
 
+#: One SQL identifier, quoted or bare. SQLite — the runtime store's engine —
+#: accepts double quotes, backticks, and square brackets interchangeably with
+#: an unquoted name, and a declaration can lead a table name with a
+#: `.`-qualifying schema. A rule that only recognised the bare, unqualified
+#: spelling would let `CREATE TABLE "widget" (` or `CREATE TABLE main.widget
+#: (` add a table invisible to this scan while the hard-coded expectations
+#: elsewhere stayed green.
+_IDENTIFIER = r'(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)'
+
 #: The trailing `(` is what keeps prose out. `schema.py` discusses
 #: "`CREATE TABLE IF NOT EXISTS`," inside a docstring, and a rule that stops
 #: at the identifier reads the word `IF` as a table nobody declared — a gate
 #: failing on its own documentation, which is how a gate gets weakened.
 _CREATE_TABLE = re.compile(
-    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)\s*\(", re.IGNORECASE
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    rf"(?:{_IDENTIFIER}\s*\.\s*)?({_IDENTIFIER})\s*\(",
+    re.IGNORECASE,
 )
+
+
+def _unquote(identifier: str) -> str:
+    """Strip one layer of SQL quoting, whichever style `_CREATE_TABLE` matched."""
+    if identifier[0] in "\"`[":
+        return identifier[1:-1]
+    return identifier
 
 
 @dataclass(frozen=True)
@@ -244,6 +272,182 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
 
 
 # ---------------------------------------------------------------------------
+# Bespoke mirrors — proving a signed exclusion's claim, not just its prose
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BespokeMirror:
+    """Where a table's non-`PostgresTableMirror` mirror lives, and how to prove it.
+
+    A table can be signed out of `_mirrored_tables()` in `UNMIRRORED_SCHEMA_TABLES`
+    because it is mirrored by hand-written machinery instead of a
+    `PostgresTableMirror` subclass — see `queue_entry`'s entry for why. That
+    reason is prose a reviewer reads once and nothing re-checks it: an
+    unrelated class could be substituted at the same import path, or the real
+    class could be edited to touch a different table, and a check that stopped
+    at "the symbol exists and is not a `PostgresTableMirror`" would still pass
+    either way. `mutates` and `reads` name the methods this suite actually
+    calls, against a connection that only records what it is asked to run, so
+    the SQL the class emits is checked against `table` rather than trusted.
+    """
+
+    module: str
+    class_name: str
+    table: str
+    mutates: str
+    reads: str
+    task: str
+
+
+BESPOKE_MIRRORS: dict[str, BespokeMirror] = {
+    "queue_entry": BespokeMirror(
+        module="command_center.db.queue_store",
+        class_name="PostgresQueueMirror",
+        table="queue_entry",
+        mutates="replace_entries",
+        reads="list_entries",
+        task="VOYN-W0-AICC-QUEUE-ENTRY-PARITY",
+    ),
+}
+
+
+class _RecordingCursor:
+    """Enough of a DB-API cursor to catch the SQL a bespoke mirror sends."""
+
+    def __init__(self, statements: list[str]) -> None:
+        self._statements = statements
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def execute(self, sql: str, params: object = None) -> None:
+        self._statements.append(sql)
+
+    def executemany(self, sql: str, rows: object = ()) -> None:
+        self._statements.append(sql)
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return []
+
+
+class _RecordingConnection:
+    """A connection that answers every call asked of it and remembers every
+    statement it was told to run, so a bespoke mirror's real code path can be
+    driven with no PostgreSQL server behind it."""
+
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def transaction(self):
+        return self
+
+    def cursor(self) -> _RecordingCursor:
+        return _RecordingCursor(self.statements)
+
+
+def _bespoke_mirror_statements(bespoke: BespokeMirror) -> str:
+    """Every SQL statement `bespoke`'s read and write paths send, joined.
+
+    Drives the class's own production code — not a description of it — against
+    a connection that only records what it is asked to run.
+    """
+    module = importlib.import_module(bespoke.module)
+    cls = getattr(module, bespoke.class_name)
+    connection = _RecordingConnection()
+    instance = cls(connection_factory=lambda: connection)
+    getattr(instance, bespoke.reads)()
+    getattr(instance, bespoke.mutates)([])
+    return "\n".join(connection.statements)
+
+
+class _DecoyBespokeMirror:
+    """Same shape as `PostgresQueueMirror`, mentions no table at all.
+
+    Exists only for `test_the_bespoke_mirror_gate_fails_when_it_stops_mirroring_its_table`,
+    which needs a class that would satisfy "the symbol exists and is not a
+    `PostgresTableMirror`" while having stopped mirroring anything.
+    """
+
+    def __init__(self, connection_factory: object = None) -> None:
+        self._factory = connection_factory
+
+    def list_entries(self) -> list:
+        with self._factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchall()
+        return []
+
+    def replace_entries(self, entries: list) -> None:
+        with self._factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+
+
+@pytest.mark.parametrize(
+    "bespoke", list(BESPOKE_MIRRORS.values()), ids=list(BESPOKE_MIRRORS)
+)
+def test_every_bespoke_mirror_is_real(bespoke: BespokeMirror) -> None:
+    """The gate for `UNMIRRORED_SCHEMA_TABLES` entries that are not really
+    unmirrored — they are mirrored by something this suite cannot discover on
+    its own.
+
+    Importing the named class and checking it is not a `PostgresTableMirror`
+    proves only that *a* symbol exists at that path; an unrelated class could
+    stand in for it just as well. This instead runs the class's own read and
+    write paths and asserts the table named in the exclusion is the table the
+    SQL it actually sends names — a rename or a swapped-in class is caught
+    here instead of first showing up as a silently stale mirror in production.
+    """
+    module = importlib.import_module(bespoke.module)
+    cls = getattr(module, bespoke.class_name)
+    assert not issubclass(cls, PostgresTableMirror), (
+        f"{bespoke.class_name} is a PostgresTableMirror now — it belongs in the "
+        "discovered contract (see mirror_discovery.mirror_classes), not a "
+        "signed exclusion with a hand-maintained proof"
+    )
+
+    statements = _bespoke_mirror_statements(bespoke)
+    assert bespoke.table in statements, (
+        f"{bespoke.class_name}.{bespoke.reads}/{bespoke.mutates} never mentioned "
+        f"`{bespoke.table}` — it has stopped mirroring the table its exclusion "
+        "in UNMIRRORED_SCHEMA_TABLES claims it covers"
+    )
+
+
+def test_the_bespoke_mirror_gate_fails_when_it_stops_mirroring_its_table() -> None:
+    """The gate, shown to bite: a class that no longer touches its table is caught."""
+    decoy = BespokeMirror(
+        module=__name__,
+        class_name="_DecoyBespokeMirror",
+        table="queue_entry",
+        mutates="replace_entries",
+        reads="list_entries",
+        task="VOYN-TEST",
+    )
+    assert decoy.table not in _bespoke_mirror_statements(decoy)
+
+
+def test_every_bespoke_mirror_has_a_gate_a_exclusion() -> None:
+    """`BESPOKE_MIRRORS` proves an exclusion's claim; it does not replace one.
+
+    A table here with no entry in `UNMIRRORED_SCHEMA_TABLES` would be proven
+    "real" without ever having to justify why it is missing from
+    `_mirrored_tables()` in the first place.
+    """
+    missing = sorted(set(BESPOKE_MIRRORS) - set(UNMIRRORED_SCHEMA_TABLES))
+    assert missing == [], missing
+
+
+# ---------------------------------------------------------------------------
 # Signed exclusions — runtime-database tables with no PostgreSQL target
 # ---------------------------------------------------------------------------
 
@@ -338,7 +542,7 @@ def _modules_creating_runtime_tables() -> dict[Path, set[str]]:
         )
         if not reaches_runtime_store:
             continue
-        found[path] = {match.lower() for match in _CREATE_TABLE.findall(source)}
+        found[path] = {_unquote(match).lower() for match in _CREATE_TABLE.findall(source)}
     return found
 
 
@@ -431,6 +635,38 @@ def test_the_compliance_stores_are_not_dragged_into_this_gate() -> None:
     discovered = {path.name for path in _modules_creating_runtime_tables()}
     assert "aml_store.py" not in discovered
     assert "alert_store.py" not in discovered
+
+
+def test_the_create_table_scan_recognizes_quoting_and_schema_qualification() -> None:
+    """The positive control `_CREATE_TABLE` needs: SQLite accepts every one of
+    these spellings for the same statement, so a scan that recognised only the
+    bare, unqualified form would let a table declared with any of the others
+    slip past this gate uncovered while `test_every_runtime_table_has_a_...`
+    kept passing.
+    """
+    samples = {
+        "bare": "CREATE TABLE widget (id INTEGER PRIMARY KEY)",
+        "if_not_exists": "CREATE TABLE IF NOT EXISTS widget (id INTEGER PRIMARY KEY)",
+        "double_quoted": 'CREATE TABLE "widget" (id INTEGER PRIMARY KEY)',
+        "backtick_quoted": "CREATE TABLE `widget` (id INTEGER PRIMARY KEY)",
+        "bracket_quoted": "CREATE TABLE [widget] (id INTEGER PRIMARY KEY)",
+        "schema_qualified": "CREATE TABLE main.widget (id INTEGER PRIMARY KEY)",
+        "schema_qualified_quoted": 'CREATE TABLE "main"."widget" (id INTEGER PRIMARY KEY)',
+        "indented": "    CREATE TABLE\n        widget (\n            id INTEGER PRIMARY KEY)",
+        "lowercase": "create table if not exists widget (id integer primary key)",
+    }
+    for label, source in samples.items():
+        found = {_unquote(match).lower() for match in _CREATE_TABLE.findall(source)}
+        assert found == {"widget"}, f"{label}: matched {found}"
+
+
+def test_the_create_table_scan_does_not_read_prose_as_a_table() -> None:
+    """The negative control the comment on `_CREATE_TABLE` already promises but
+    nothing checked: a docstring that merely discusses `CREATE TABLE IF NOT
+    EXISTS`, with no trailing `(`, must not be read as a declaration.
+    """
+    source = "This module says `CREATE TABLE IF NOT EXISTS` a lot, in prose."
+    assert _CREATE_TABLE.findall(source) == []
 
 
 def test_every_runtime_table_has_a_postgres_target_or_a_signed_exclusion() -> None:
