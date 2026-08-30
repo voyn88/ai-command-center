@@ -241,6 +241,10 @@ def test_uninstall_is_attested_and_skips_authority_mutation(monkeypatch, tmp_pat
     monkeypatch.setattr(
         module, "_install_lock_fd", lambda *a, **k: os.open("/dev/null", os.O_RDONLY)
     )
+    # The private-root guard now also CREATES `attempts` (it replaced a bare
+    # `mkdir(exist_ok=True)` that accepted a planted symlink). Stubbing the
+    # guard therefore removes the creation too, so the test supplies it.
+    (tmp_path / "attempts").mkdir(mode=0o700, exist_ok=True)
     monkeypatch.setattr(module, "_require_private_root_directory", lambda *a, **k: None)
     monkeypatch.setattr(module, "_fetch_exact_checkout", lambda *a, **k: repo)
     monkeypatch.setattr(module, "_verify_checkout", lambda *a, **k: attestation)
@@ -296,9 +300,7 @@ def test_real_install_lock_rejects_contention_and_adopts_inherited_fd(tmp_path):
             module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
     finally:
         os.close(first)
-    replacement_owner = module._install_lock_fd(
-        lock, trusted_uid=uid, trusted_gid=gid
-    )
+    replacement_owner = module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
     os.close(replacement_owner)
 
 
@@ -332,9 +334,7 @@ def test_real_install_lock_refuses_closed_or_negative_inherited_fd(tmp_path):
     os.close(owner)
     for invalid in (-1, owner):
         with pytest.raises(module.BootstrapRefused, match="invalid inherited"):
-            module._install_lock_fd(
-                lock, invalid, trusted_uid=uid, trusted_gid=gid
-            )
+            module._install_lock_fd(lock, invalid, trusted_uid=uid, trusted_gid=gid)
 
 
 def test_unfinished_uninstall_blocks_before_authority_mutation(monkeypatch, tmp_path):
@@ -581,3 +581,49 @@ def test_git_argv_refuses_replacement_objects_and_execution_config():
     ):
         assert knob in flags, knob
     assert module._safe_environment(Path("/tmp"))["GIT_NO_REPLACE_OBJECTS"] == "1"
+
+
+def test_planted_attempts_symlink_cannot_redirect_the_bootstrap(tmp_path, monkeypatch):
+    """Independent review on 988de49.
+
+    `Path.mkdir(exist_ok=True)` succeeds against a SYMLINK that points at a
+    directory. An `attempts` link planted before the first run would send the
+    fetch, the tree verification and the privileged installer execution through
+    a path the attacker controls -- and every later check would look at the
+    redirected target and pass.
+
+    Driven through `main()` rather than the guard directly: a test of the guard
+    alone still passes when the call site is reverted to a bare `mkdir`, which
+    is precisely the regression that matters. The guard runs for real here --
+    only its trusted identity is relaxed, so an unprivileged runner exercises
+    the same lstat that refuses the link in production.
+    """
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    elsewhere = tmp_path / "attacker"
+    elsewhere.mkdir(mode=0o700)
+    (state / "attempts").symlink_to(elsewhere)
+
+    real_guard = module._require_private_root_directory
+    monkeypatch.setattr(
+        module,
+        "_require_private_root_directory",
+        lambda path, *, create, trusted_uid=None, trusted_gid=None: real_guard(
+            path, create=create, trusted_uid=os.getuid(), trusted_gid=os.getgid()
+        ),
+    )
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(module.os, "chown", lambda *a: None)
+
+    def unreached(*args, **kwargs):
+        raise AssertionError("bootstrap continued past the planted attempts link")
+
+    monkeypatch.setattr(module, "_fetch_exact_checkout", unreached)
+    monkeypatch.setattr(module, "_run", unreached)
+
+    with pytest.raises(module.BootstrapRefused, match="must be root:root mode 0700"):
+        module.main(["--expected-sha", "a" * 40, "--state-root", str(state)])
+
+    assert (state / "attempts").is_symlink(), "the link must not have been replaced"
+    assert not any(elsewhere.iterdir()), "nothing may be created through the link"

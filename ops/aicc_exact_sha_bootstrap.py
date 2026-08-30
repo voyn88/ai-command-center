@@ -28,9 +28,7 @@ from pathlib import Path
 TRUSTED_REMOTE = "https://github.com/voyn88/ai-command-center.git"
 DEFAULT_STATE_ROOT = Path("/var/lib/aicc-exact-sha-bootstrap")
 DEFAULT_AUTHORITY_ENV = Path("/etc/aicc/workspace-authority.env")
-DEFAULT_INSTALL_LOCK = Path(
-    "/var/lib/aicc-principal-isolation/install-recovery.lock"
-)
+DEFAULT_INSTALL_LOCK = Path("/var/lib/aicc-principal-isolation/install-recovery.lock")
 UNINSTALL_JOURNAL = Path("/var/lib/aicc-principal-isolation/uninstall.json")
 GIT = "/usr/bin/git"
 # Every repository-config knob that turns a plain Git read into code execution
@@ -231,11 +229,7 @@ def _install_lock_fd(
             try:
                 descriptor = os.open(
                     path.name,
-                    os.O_RDWR
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | os.O_NOFOLLOW
-                    | os.O_CLOEXEC,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                     0o600,
                     dir_fd=parent_fd,
                 )
@@ -276,7 +270,9 @@ def _install_lock_fd(
         except OSError as exc:
             if exc.errno not in {errno.EAGAIN, errno.EACCES}:
                 raise BootstrapRefused("cannot acquire install/recovery lock") from exc
-            raise BootstrapRefused("another install or recovery owns the host lock") from exc
+            raise BootstrapRefused(
+                "another install or recovery owns the host lock"
+            ) from exc
         return descriptor
     except BootstrapRefused:
         if descriptor >= 0:
@@ -662,9 +658,16 @@ def main(
     _require_private_root_directory(args.state_root, create=True)
     attempt_id = f"{int(time.time())}-{secrets.token_hex(12)}"
     attempt = args.state_root / "attempts" / attempt_id
-    attempt.parent.mkdir(mode=0o700, exist_ok=True)
+    # `mkdir(exist_ok=True)` accepts a pre-existing SYMLINK to a directory, so
+    # an `attempts` link planted before the first run would redirect the fetch,
+    # the verification and the installer execution through a path the attacker
+    # controls -- while every later check looked at the redirected target and
+    # passed (independent review on 988de49). The parent is therefore held to
+    # the same private-root contract as the state root itself, which lstats the
+    # path and refuses a link, wrong owner, or group/other-writable mode, and
+    # walks every component above it.
+    _require_private_root_directory(attempt.parent, create=True)
     attempt.mkdir(mode=0o700)
-    os.chown(attempt.parent, 0, 0)
     os.chown(attempt, 0, 0)
     env = _safe_environment(attempt)
     repo = _fetch_exact_checkout(attempt, env, args.expected_sha)
