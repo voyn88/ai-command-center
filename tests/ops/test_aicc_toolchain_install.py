@@ -435,3 +435,85 @@ def test_the_retired_installer_fails_closed():
     assert "aicc_toolchain_install.py" in script
     executed = [code for _number, code in _shell_commands(path)]
     assert not any("npm" in code for code in executed), executed
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason=(
+        "publication needs renameat2(RENAME_NOREPLACE), which is Linux-only; "
+        "the production hosts are Linux and CI runs this shard there"
+    ),
+)
+def test_install_end_to_end_publishes_and_selects(tmp_path, monkeypatch):
+    """The whole `install()` path, not its pieces.
+
+    Every unit here passed while the live bootstrap still refused with
+    "release manifest is missing or unsafe": `publish_release_tree` VERIFIES a
+    manifest and does not create one, and nothing in `install()` recorded it.
+    Testing the functions separately could never catch that -- only driving the
+    path end to end does. This is the third time in this task that a test of a
+    helper passed while its call site was wrong, so the pin is the path itself.
+    """
+    module = _module()
+    root = tmp_path / "toolchains"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+
+    payload_dir = tmp_path / "src"
+    (payload_dir / "pkg").mkdir(parents=True)
+    (payload_dir / "bin").mkdir()
+    (payload_dir / "pkg" / "claude").write_bytes(b"#!/bin/sh\necho 2.1.231\n")
+    (payload_dir / "pkg" / "claude").chmod(0o755)
+    (payload_dir / "bin" / "claude").symlink_to("../pkg/claude")
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        archive.add(payload_dir / "bin", arcname="bin")
+        archive.add(payload_dir / "pkg", arcname="pkg")
+    artifact = buffer.getvalue()
+    digest = hashlib.sha256(artifact).hexdigest()
+
+    lock_path = _lock(
+        tmp_path,
+        artifact_sha256=digest,
+        executables={"claude": "pkg/claude"},
+    )
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, _limit):
+            return artifact
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _Response())
+
+    release = module.install(
+        lock_path, root=root, state_dir=state, trusted_uid=UID, trusted_gid=GID
+    )
+
+    assert release == root / "releases" / digest
+    assert (release / "pkg" / "claude").is_file()
+    # The manifest must exist and authorise this release.
+    manifest = state / "releases" / f"{digest}.json"
+    assert manifest.is_file(), "publication left no manifest behind"
+    module.verify_release_manifest(
+        release,
+        manifest,
+        digest,
+        trusted_uid=UID,
+        trusted_gid=GID,
+        id_pattern=module.ARTIFACT_ID_RE,
+    )
+    # And the selector points at it.
+    assert os.readlink(root / "current") == f"releases/{digest}"
+    assert (root / "current" / "bin" / "claude").resolve().is_file()
+
+    # Running it again is idempotent: the release is proven, not rebuilt.
+    again = module.install(
+        lock_path, root=root, state_dir=state, trusted_uid=UID, trusted_gid=GID
+    )
+    assert again == release

@@ -33,6 +33,7 @@ from aicc_install_transaction import (  # noqa: E402
     ARTIFACT_ID_RE,
     ReleaseRefused,
     publish_release_tree,
+    record_release_manifest,
     reconcile_release_publication,
     verify_release_manifest,
 )
@@ -209,11 +210,21 @@ def install(
     # `reconcile_release_publication` opens it with `create=False`, so on a
     # first installation -- the case that matters most -- it would fail before
     # anything else ran (independent review on 58b50b9).
-    release_root.mkdir(mode=0o755, parents=True, exist_ok=True)
-    os.chown(release_root, trusted_uid, trusted_gid)
-    os.chmod(release_root, 0o755)
-    (state_dir / "releases").mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chown(state_dir / "releases", trusted_uid, trusted_gid)
+    # Every level is created and then given its mode explicitly. `parents=True`
+    # alone applies the caller's umask to the intermediate directories, so on a
+    # host with umask 002 the toolchain root comes out group-writable and the
+    # publication guard rightly refuses it -- as a Linux run of the end-to-end
+    # test showed. Modes are set after creation because `mkdir(mode=...)` is
+    # itself masked by the umask.
+    for directory, mode in (
+        (root, 0o755),
+        (release_root, 0o755),
+        (state_dir, 0o700),
+        (state_dir / "releases", 0o700),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chown(directory, trusted_uid, trusted_gid)
+        os.chmod(directory, mode)
 
     resumed = reconcile_release_publication(
         release_root,
@@ -242,6 +253,21 @@ def install(
             staging = release_root / f".stage-{digest}.{os.getpid()}"
             extract_artifact(
                 payload, staging, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+            )
+            # Record the manifest from the staging tree BEFORE publication:
+            # `publish_release_tree` verifies against it and does not create it,
+            # exactly as the shell installer records one before renaming a Git
+            # release into place. Missing this is what made the first live
+            # bootstrap refuse with "release manifest is missing or unsafe" --
+            # the artifact was downloaded and extracted correctly, and then had
+            # nothing authorising its publication.
+            record_release_manifest(
+                staging,
+                manifest,
+                digest,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+                id_pattern=ARTIFACT_ID_RE,
             )
             publish_release_tree(
                 staging,
