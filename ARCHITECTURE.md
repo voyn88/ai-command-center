@@ -50,11 +50,14 @@ keep it off-host unless the operator deliberately opts out:
 | `streamlit run app.py` | `.streamlit/config.toml` pins `[server] address = "localhost"` |
 | `scripts/start-ui.sh` | injects `--server.address localhost` unless one is passed |
 | container entrypoint | `scripts/aml-entrypoint.sh` has **no default** and exits `78` unless `STREAMLIT_SERVER_ADDRESS` is set |
-| `docker compose` | the port is published on `${AML_BIND_HOST:-127.0.0.1}` |
+| `docker compose` | the port is published on the fixed literal `127.0.0.1`, with no operator override |
 
 `tests/test_deployment_exposure.py` is the gate for all four. Not being exposed is not the same as
-being authenticated: HTTP authentication is a separate, still-open piece of work, so widening any of
-these controls means putting an unauthenticated privileged console on the network.
+being authenticated, and per [ADR-0011](docs/adr/0011-streamlit-console-no-remote-reachability.md)
+it never will be at this transport: four attempts to authenticate Streamlit's own WebSocket
+connection admission were rejected on review, so remote/off-host access to any deployment of this
+console — including the AML container image — is loopback plus an operator-controlled SSH tunnel or
+private network segment, never a published port.
 
 ## 2. UI and service boundaries
 

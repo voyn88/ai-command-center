@@ -8,6 +8,26 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Security — Streamlit console is architecturally loopback-only, not by default (`VOYN-W0-AICC-CONSOLE-NO-AUTH` family)
+
+Four remediation attempts (`-REM`, `-REM-REM`, `-REM-REM-REM`; PRs #408, #433, #480, #490) tried to
+authenticate Streamlit's own WebSocket connection admission and were each rejected on review for a
+reason rooted in the same fact: a browser cannot set an `Authorization` header on a WebSocket
+upgrade, and every workaround either left a revoked principal's session alive, made authorization
+optional, or required AICC to retain a credential it is designed never to hold. See
+[`docs/adr/0011-streamlit-console-no-remote-reachability.md`](docs/adr/0011-streamlit-console-no-remote-reachability.md)
+for the full record.
+
+- `docker-compose.aml.yml` now publishes the console on the fixed literal `127.0.0.1`. The
+  `AML_BIND_HOST` variable that used to widen this "behind a reviewed authenticating proxy" is
+  removed — no such proxy is safe to build for this transport, so the variable itself was the
+  vulnerability.
+- Remote or multi-operator access to any deployment of this console, including the AML bank image,
+  is an operator-controlled SSH tunnel or private network segment onto the loopback port, the same
+  pattern `docker-compose.server.yml` already uses for PostgreSQL — never a published port.
+- `tests/test_deployment_exposure.py` gained `test_compose_host_bind_address_has_no_operator_override`
+  so the removed variable cannot be quietly reintroduced.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

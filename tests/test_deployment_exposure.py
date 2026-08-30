@@ -208,8 +208,26 @@ def test_compose_publishes_ports_only_on_a_loopback_default() -> None:
             "interface on the host"
         )
         assert _is_loopback(host_address), (
-            f"port {entry!r} defaults to publishing on {host_address!r}; the default "
-            "must be loopback and any wider exposure must be an explicit operator choice"
+            f"port {entry!r} publishes on {host_address!r} instead of loopback"
+        )
+
+
+def test_compose_host_bind_address_has_no_operator_override() -> None:
+    """The published host address is a fixed loopback literal, not a variable.
+
+    ADR-0011 (docs/adr/0011-streamlit-console-no-remote-reachability.md) retired
+    the `AML_BIND_HOST` escape hatch after four attempts to build the
+    "reviewed authenticating proxy" it was conditioned on were rejected on
+    review. The service has no authentication, so an environment variable that
+    can widen this bind is itself the vulnerability regardless of what its
+    default is — it must not be reintroduced.
+    """
+    for entry in _compose_service().get("ports", []):
+        host_part = _published_host_address(entry)
+        assert host_part == "127.0.0.1", (
+            f"port {entry!r} names a host address other than the fixed loopback "
+            "literal '127.0.0.1' — remote reachability must not be configurable "
+            "via an environment variable (see ADR-0011)"
         )
 
 

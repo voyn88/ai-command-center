@@ -7,15 +7,20 @@ services:
     container_name: aml-service
     restart: unless-stopped
     ports:
-      # The host interface is named explicitly and defaults to loopback. An
-      # unqualified "8501:8501" publishes on EVERY host interface, and Docker
-      # writes that rule below a host firewall, so the exposure would not show
-      # up in the firewall's own configuration. This service has no
-      # authentication and performs privileged git/gh and subprocess
-      # operations, so reaching it off-host must be a deliberate act:
-      # set AML_BIND_HOST to widen it, in front of a reviewed authenticating
-      # proxy.
-      - "${AML_BIND_HOST:-127.0.0.1}:${AML_PORT:-8501}:8501"
+      # The host interface is a fixed loopback literal, not an operator
+      # variable. This service has no authentication and performs privileged
+      # git/gh and subprocess operations; an unqualified "8501:8501" (or any
+      # widened host) publishes on EVERY host interface, and Docker writes
+      # that rule below a host firewall, so the exposure would not show up in
+      # the firewall's own configuration. There used to be an AML_BIND_HOST
+      # variable to widen this "behind a reviewed authenticating proxy" — four
+      # attempts to build that proxy were rejected on review (see ADR-0011,
+      # docs/adr/0011-streamlit-console-no-remote-reachability.md) because
+      # Streamlit's WebSocket transport cannot be safely gated at connection
+      # admission. Remote access is an SSH tunnel or a private network segment
+      # onto this loopback port, never a published port, matching the
+      # Postgres precedent in docker-compose.server.yml.
+      - "127.0.0.1:${AML_PORT:-8501}:8501"
     volumes:
       - aml-data:/data
     environment:
