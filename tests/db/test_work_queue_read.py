@@ -138,3 +138,91 @@ def test_worker_role_cannot_enqueue(stores, psycopg) -> None:
     _app_write, _app_read, worker = stores
     with pytest.raises(psycopg.Error):
         worker.enqueue(QUEUE, idempotency_key="worker-try", payload={})
+
+
+def test_queue_metrics_covers_every_state(stores) -> None:
+    """One item driven into each terminal and non-terminal state, so a
+    swapped or miscounted state aggregate cannot pass unnoticed.
+
+    Each item is enqueued and claimed before the next is enqueued: `claim`
+    always takes the single oldest ready item queue-wide, so claiming with
+    more than one ready item outstanding would grab the wrong one.
+    """
+    app_write, app_read, worker = stores
+
+    claimed_source = app_write.enqueue(
+        QUEUE, idempotency_key="metrics-claimed", payload={}
+    )
+    claimed = worker.claim(QUEUE, visibility_seconds=60)
+    assert isinstance(claimed, ClaimedWork)
+
+    succeeded_source = app_write.enqueue(
+        QUEUE, idempotency_key="metrics-succeeded", payload={}
+    )
+    to_succeed = worker.claim(QUEUE, visibility_seconds=60)
+    assert isinstance(to_succeed, ClaimedWork)
+    assert worker.complete(to_succeed, {"ok": True}) is True
+
+    dead_source = app_write.enqueue(QUEUE, idempotency_key="metrics-dead", payload={})
+    to_kill = worker.claim(QUEUE, visibility_seconds=60)
+    assert isinstance(to_kill, ClaimedWork)
+    assert worker.fail(to_kill, reason="poison", retryable=False) is True
+
+    ready_id = app_write.enqueue(QUEUE, idempotency_key="metrics-ready", payload={})
+
+    rows = app_read.queue_metrics(queue=QUEUE)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["queue"] == QUEUE
+    assert row["ready"] == 1
+    assert row["claimed"] == 1
+    assert row["succeeded"] == 1
+    assert row["dead"] == 1
+    assert row["oldest_ready_seconds"] is not None and row["oldest_ready_seconds"] >= 0
+
+    # sanity: the four seeded items landed where the assertions above assume.
+    assert app_read.get_item(ready_id)["state"] == "ready"
+    assert app_read.get_item(claimed_source)["state"] == "claimed"
+    assert app_read.get_item(succeeded_source)["state"] == "succeeded"
+    assert app_read.get_item(dead_source)["state"] == "dead"
+
+
+def test_queue_metrics_excludes_delayed_ready_from_backlog(stores) -> None:
+    """A `ready` row with a future `available_at` cannot be claimed yet, so
+    it must not inflate the backlog count or produce a negative age."""
+    app_write, app_read, _worker = stores
+    app_write.enqueue(
+        QUEUE,
+        idempotency_key="metrics-delayed",
+        payload={},
+        delay_seconds=3600,
+    )
+
+    row = app_read.queue_metrics(queue=QUEUE)[0]
+    assert row["ready"] == 0, "a not-yet-claimable item is not backlog depth"
+    assert row["claimed"] == 0
+    assert row["succeeded"] == 0
+    assert row["dead"] == 0
+    assert row["oldest_ready_seconds"] is None, (
+        "no claimable item exists, so there is no age to report"
+    )
+
+
+def test_queue_metrics_mixes_claimable_and_delayed_ready(stores) -> None:
+    app_write, app_read, _worker = stores
+    app_write.enqueue(QUEUE, idempotency_key="metrics-mix-claimable", payload={})
+    app_write.enqueue(
+        QUEUE,
+        idempotency_key="metrics-mix-delayed",
+        payload={},
+        delay_seconds=3600,
+    )
+
+    row = app_read.queue_metrics(queue=QUEUE)[0]
+    assert row["ready"] == 1, "only the claimable item counts as backlog"
+    assert row["oldest_ready_seconds"] is not None and row["oldest_ready_seconds"] >= 0
+
+
+def test_queue_metrics_unknown_queue_is_an_empty_list(stores) -> None:
+    _app_write, app_read, _worker = stores
+    assert app_read.queue_metrics(queue="no-such-queue") == []

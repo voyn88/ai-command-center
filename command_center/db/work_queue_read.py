@@ -35,6 +35,8 @@ _ATTEMPT_COLUMNS = (
 
 _STATES = frozenset({"ready", "claimed", "succeeded", "dead"})
 
+_METRICS_COLUMNS = ("queue", "ready", "claimed", "succeeded", "dead", "oldest_ready_seconds")
+
 
 def _rows_to_dicts(columns: str, rows: list[tuple]) -> list[dict[str, Any]]:
     names = [column.strip() for column in columns.split(",")]
@@ -129,3 +131,37 @@ class WorkQueueReadStore:
                             json.loads(value) if isinstance(value, str) else value
                         )
         return item
+
+    def queue_metrics(self, *, queue: str | None = None) -> list[dict[str, Any]]:
+        """One row per queue: state counts plus the claimable backlog's age.
+
+        ``ready`` and ``oldest_ready_seconds`` both apply the same
+        claimability predicate, ``state = 'ready' AND available_at <= now()``.
+        A delayed retry or a deferred item sits in ``ready`` but cannot be
+        claimed yet, so it is neither backlog depth nor backlog age — without
+        the predicate a queue holding only delayed work would report a
+        positive ``ready`` count (nothing to claim, backlog looks nonempty)
+        and, since ``min(available_at)`` can be in the future, a negative
+        ``oldest_ready_seconds``. ``oldest_ready_seconds`` is ``None`` when
+        nothing is claimable, never zero or negative.
+        """
+        sql = (
+            "SELECT queue, "
+            "count(*) FILTER (WHERE state = 'ready' AND available_at <= now()) AS ready, "
+            "count(*) FILTER (WHERE state = 'claimed') AS claimed, "
+            "count(*) FILTER (WHERE state = 'succeeded') AS succeeded, "
+            "count(*) FILTER (WHERE state = 'dead') AS dead, "
+            "extract(epoch FROM now() - min(available_at) "
+            "FILTER (WHERE state = 'ready' AND available_at <= now()))::bigint "
+            "AS oldest_ready_seconds "
+            "FROM work_item_public"
+        )
+        params: list[Any] = []
+        if queue is not None:
+            sql += " WHERE queue = %s"
+            params.append(queue)
+        sql += " GROUP BY queue ORDER BY queue"
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                return _rows_to_dicts(",".join(_METRICS_COLUMNS), cur.fetchall())
