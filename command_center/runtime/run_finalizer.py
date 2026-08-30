@@ -132,16 +132,24 @@ class RunFinalizer:
         finalized when its report is missing — is the one that loses work.
         """
         self._assert_current_process()
+        # Preserve idempotency without reopening SQLite *after* publishing the
+        # marker.  ``finalized_at`` must be the final local DB access in the
+        # successful path; otherwise a teardown/cutover reader can observe the
+        # watermark while this process is still able to recreate WAL/SHM files.
+        # Production callers enter through Supervisor's process-global per-run
+        # finalization lock, so same-owner Supervisors cannot race this window.
+        current = db.get_run(self.db_path, run_id)
+        if current is not None and current.get("finalized_at"):
+            return True
         try:
-            db.mark_run_finalized(
+            stored = db.mark_run_finalized(
                 self.db_path, run_id, owner_token=self.owner_token
             )
         except Exception:
             logger.exception("Could not mark run %s finalized", run_id)
             self.append_lifecycle_event_best_effort("finalization_marker_failed", run_id)
             return False
-        current = db.get_run(self.db_path, run_id)
-        return bool(current and current.get("finalized_at"))
+        return bool(stored and stored.get("finalized_at"))
 
     def finish_started_attempt(
         self, current: dict, *, fallback_failure_reason: str

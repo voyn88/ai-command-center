@@ -45,7 +45,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center.runtime import db, identity, reports, supervisor
+from command_center.runtime import db, identity, reports, run_finalizer, supervisor
 
 PROBE = Path(__file__).parent / "fixtures" / "finalization_kill_probe.py"
 
@@ -629,6 +629,30 @@ def test_the_marker_is_write_once(git_repo, configure_project_repo, fake_claude)
         owner_token=sup._finalization_owner_token,
     )
     assert db.get_run(sup.db_path, run["id"])["version"] == before["version"]
+
+
+def test_successful_marker_is_final_local_database_access(monkeypatch, tmp_path):
+    """Publishing finalized_at must not be followed by a SQLite reopen."""
+    marker_written = False
+
+    def get_run(_db_path, _run_id):
+        assert not marker_written, "database was reopened after finalized_at became visible"
+        return {"id": "run-1", "finalized_at": None}
+
+    def mark_run_finalized(_db_path, _run_id, *, owner_token):
+        nonlocal marker_written
+        assert owner_token == "owner"
+        marker_written = True
+        return {"id": "run-1", "finalized_at": "2026-08-30T03:00:00Z"}
+
+    monkeypatch.setattr(run_finalizer.db, "get_run", get_run)
+    monkeypatch.setattr(run_finalizer.db, "mark_run_finalized", mark_run_finalized)
+    finalizer = run_finalizer.RunFinalizer(
+        tmp_path / "runtime.db", owner_token="owner", owner_pid=os.getpid()
+    )
+
+    assert finalizer.mark_finalized("run-1") is True
+    assert marker_written is True
 
 
 def test_same_process_supervisors_share_finalization_ownership(
