@@ -305,7 +305,8 @@ done < "$secret_manifest"
 python3 "$repo_root/ops/aicc_staged_worker_rollout.py" verify \
   --lanes "$lane_registry" || fail "worker lane readiness or UID isolation failed"
 
-for tool in /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/copilot; do
+toolchain_bin=/opt/aicc/toolchains/current/bin
+for tool in "$toolchain_bin/claude" "$toolchain_bin/codex" "$toolchain_bin/copilot"; do
   resolved=$(readlink -f -- "$tool")
   [ -x "$resolved" ] || fail "executor is missing: $tool"
   [ "$(stat -c %u "$resolved")" -eq 0 ] || fail "executor is not root-owned: $tool"
