@@ -421,8 +421,52 @@ def test_manifest_for_a_different_release_id_is_refused(release, tmp_path):
 
 def test_non_hex_release_id_is_refused(release, tmp_path):
     module = _module()
-    with pytest.raises(module.ReleaseRefused, match="40 lowercase hex"):
+    with pytest.raises(module.ReleaseRefused, match="identity pattern"):
         _record(module, release, tmp_path / "manifest.json", release_id="../escape")
+
+
+def test_the_git_identity_still_refuses_a_content_address(release, tmp_path):
+    """The identity pattern became a parameter so a content-addressed artifact
+    can reuse this machinery (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED). The
+    danger in that change is widening the default: a 64-hex sha256 is not a
+    commit, and the Git release path must keep refusing it."""
+    module = _module()
+    with pytest.raises(module.ReleaseRefused, match="identity pattern"):
+        _record(module, release, tmp_path / "manifest.json", release_id="c" * 64)
+
+
+def test_a_content_address_is_accepted_under_its_own_pattern(release, tmp_path):
+    """And the converse: under ARTIFACT_ID_RE the same machinery accepts a
+    sha256 and still refuses a Git commit, so neither identity can be passed
+    off as the other."""
+    module = _module()
+    manifest = tmp_path / "manifest.json"
+    digest = "d" * 64
+    module.record_release_manifest(
+        release,
+        manifest,
+        digest,
+        trusted_uid=UID,
+        trusted_gid=GID,
+        id_pattern=module.ARTIFACT_ID_RE,
+    )
+    module.verify_release_manifest(
+        release,
+        manifest,
+        digest,
+        trusted_uid=UID,
+        trusted_gid=GID,
+        id_pattern=module.ARTIFACT_ID_RE,
+    )
+    with pytest.raises(module.ReleaseRefused, match="identity pattern"):
+        module.record_release_manifest(
+            release,
+            tmp_path / "git.json",
+            "a" * 40,
+            trusted_uid=UID,
+            trusted_gid=GID,
+            id_pattern=module.ARTIFACT_ID_RE,
+        )
 
 
 def test_tampered_manifest_entries_fail_their_own_content_hash(release, tmp_path):
