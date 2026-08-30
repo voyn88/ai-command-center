@@ -8,6 +8,19 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added (`VOYN-W0-AICC-SRV-08`, worker-telemetry-contract)
+- `GET /api/v1/queue/metrics` — per-queue operational telemetry (ready/
+  claimed/succeeded/dead counts, oldest-ready backlog age, and stale-claim
+  count for leases the reaper has not yet swept), aggregated from the same
+  `work_item_public`/`work_attempt_public` read grant `WorkQueueReadStore`
+  already holds — no new SQL authority. Versioned via
+  `QUEUE_METRICS_SCHEMA_VERSION` (`command_center/db/work_queue_read.py`),
+  the output-contract counterpart to the input contract's
+  `AGENT_RUN_SCHEMA_VERSION`. Backlog age excludes `ready` items whose
+  `available_at` is still in the future (delayed enqueue or retry backoff),
+  matching `queue_claim`'s own claimability predicate — otherwise a queue
+  holding only delayed work would report a negative age.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

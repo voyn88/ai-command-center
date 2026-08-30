@@ -13,7 +13,7 @@ VOYN-W0-AICC-AUTH-HTTP-01) — not a second mechanism:
   table (``queue:audit:enqueue``) and the router-level ``enforce``
   dependency mounted in ``app.py``: platform-verified principal, then the
   local deny-by-default grant.
-* The two ``GET`` routes carry ``Depends(authenticate)`` explicitly. The
+* The three ``GET`` routes carry ``Depends(authenticate)`` explicitly. The
   platform doctrine leaves reads unauthenticated (AUTH-HTTP-02), but these
   reads return run transcripts and repository identifiers, so they demand a
   verified principal while *authorization* for reads stays with
@@ -21,6 +21,11 @@ VOYN-W0-AICC-AUTH-HTTP-01) — not a second mechanism:
   read queue status; only granted principals may enqueue. That asymmetry is
   deliberate and recorded here rather than inventing a read-grant vocabulary
   the accepted inventory does not have.
+* ``GET /metrics`` (VOYN-W0-AICC-SRV-08, worker-telemetry-contract) is the
+  same read authority as ``/items``, aggregated: per-queue backlog depth,
+  age and stale-claim counts for a monitoring consumer — see
+  `command_center/db/work_queue_read.py`'s `queue_metrics` for the query and
+  `QUEUE_METRICS_SCHEMA_VERSION` for the versioning discipline.
 
 The audit payload pins the safe profile by construction: ``task_type`` is
 hardwired to ``review`` (a `READ_ONLY_TASK_TYPES` member — the runner's
@@ -39,7 +44,10 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
-from command_center.db.work_queue_read import WorkQueueReadStore
+from command_center.db.work_queue_read import (
+    QUEUE_METRICS_SCHEMA_VERSION,
+    WorkQueueReadStore,
+)
 from command_center.db.work_queue_store import WorkQueueStore
 from command_center.http_auth import routing
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
@@ -82,6 +90,13 @@ def create_queue_router() -> APIRouter:
         if item is None:
             raise HTTPException(status_code=404, detail="unknown work item")
         return item
+
+    @router.get("/metrics", dependencies=[Depends(_authenticated_read)])
+    def queue_metrics(queue: str | None = None) -> dict:  # read-only, no mutation
+        return {
+            "schema_version": QUEUE_METRICS_SCHEMA_VERSION,
+            "queues": _read_store().queue_metrics(queue=queue),
+        }
 
     @router.post("/audit")
     def enqueue_audit(payload: dict = Body(default=None)) -> dict:

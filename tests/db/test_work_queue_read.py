@@ -14,6 +14,7 @@ Skipped wholesale unless ``AICC_TEST_PG_ADMIN_DSN`` is set — see ``conftest``.
 from __future__ import annotations
 
 import secrets
+import time
 
 import pytest
 
@@ -138,3 +139,63 @@ def test_worker_role_cannot_enqueue(stores, psycopg) -> None:
     _app_write, _app_read, worker = stores
     with pytest.raises(psycopg.Error):
         worker.enqueue(QUEUE, idempotency_key="worker-try", payload={})
+
+
+def test_queue_metrics_counts_states_and_backlog_age(stores) -> None:
+    app_write, app_read, worker = stores
+    app_write.enqueue(QUEUE, idempotency_key="metrics-ready-1", payload={"kind": "x"})
+    claimed = worker.claim(QUEUE, visibility_seconds=60)
+    assert claimed is not None
+    app_write.enqueue(QUEUE, idempotency_key="metrics-ready-2", payload={"kind": "x"})
+
+    rows = app_read.queue_metrics(queue=QUEUE)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["queue"] == QUEUE
+    assert row["ready"] == 1
+    assert row["claimed"] == 1
+    assert row["succeeded"] == 0
+    assert row["dead"] == 0
+    assert row["stale_claims"] == 0
+    assert row["oldest_ready_seconds"] is not None and row["oldest_ready_seconds"] >= 0
+
+
+def test_queue_metrics_counts_a_lease_the_reaper_has_not_yet_swept(stores) -> None:
+    """`stale_claims` is the telemetry surface for the exact incident this
+    task retries after: a claim whose lease has already expired but which
+    nothing has reaped yet."""
+    app_write, app_read, worker = stores
+    app_write.enqueue(QUEUE, idempotency_key="metrics-stale-1", payload={"kind": "x"})
+    claimed = worker.claim(QUEUE, visibility_seconds=1)
+    assert claimed is not None
+    time.sleep(1.2)
+
+    rows = app_read.queue_metrics(queue=QUEUE)
+    assert rows[0]["claimed"] == 1
+    assert rows[0]["stale_claims"] == 1
+
+
+def test_queue_metrics_empty_or_unknown_queue_returns_no_rows(stores) -> None:
+    """No item has ever named a queue: there is no registry of queue names to
+    report a zeroed row against, so absence of activity and a typo'd queue
+    name are the same observable fact — matching `list_items`'s own
+    absence-is-empty-not-error contract."""
+    _app_write, app_read, _worker = stores
+    assert app_read.queue_metrics(queue=QUEUE) == []
+    assert app_read.queue_metrics(queue="does-not-exist") == []
+
+
+def test_queue_metrics_ignores_delayed_ready_items_in_backlog_age(stores) -> None:
+    """A `ready` item can carry a future `available_at` (delayed enqueue, or
+    post-failure backoff) — it is not yet claimable, so it must not be
+    counted as backlog. Before this filter, a queue holding only delayed work
+    reported a *negative* `oldest_ready_seconds` (`now() - <future min>`)."""
+    app_write, app_read, _worker = stores
+    app_write.enqueue(
+        QUEUE, idempotency_key="metrics-delayed-1", payload={"kind": "x"},
+        delay_seconds=3600,
+    )
+
+    rows = app_read.queue_metrics(queue=QUEUE)
+    assert rows[0]["ready"] == 1
+    assert rows[0]["oldest_ready_seconds"] is None
