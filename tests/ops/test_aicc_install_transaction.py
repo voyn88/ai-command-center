@@ -556,7 +556,9 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
     current = root / "opt/aicc/current"
     current.parent.mkdir(parents=True)
     current.symlink_to(f"releases/{'b' * 40}")
-    (current.parent / "releases" / ("a" * 40)).mkdir(parents=True)
+    release_dir = current.parent / "releases" / ("a" * 40)
+    release_dir.mkdir(parents=True)
+    (release_dir / "marker").write_text("release\n", encoding="utf-8")
     source = tmp_path / "source"
     source.write_bytes(b"installed")
 
@@ -564,6 +566,20 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
     transaction.prepare((_spec(module, source, "/etc/new"),))
     transaction.apply()
     assert json.loads(transaction.pending.read_text())["phase"] == "APPLIED"
+
+    # Recovery now proves a release before selecting it, so this interrupted
+    # generation needs the root-owned manifest its staging step would have
+    # written (independent review on cacfc257). Created after `apply()` so the
+    # transaction owns the state directory's mode, exactly as the installer's
+    # `install -d -m 0700` does in production.
+    (state / "releases").mkdir(mode=0o700, parents=True, exist_ok=True)
+    module.record_release_manifest(
+        release_dir,
+        transaction.release_manifest_path("a" * 40),
+        "a" * 40,
+        trusted_uid=os.geteuid(),
+        trusted_gid=os.getegid(),
+    )
 
     pending_release = state / "pending-release"
     pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
@@ -617,3 +633,50 @@ def test_recover_refuses_a_selector_to_a_missing_release(tmp_path):
     with pytest.raises(RuntimeError, match="missing release"):
         transaction.recover()
     assert current.readlink() == Path(f"releases/{'b' * 40}")
+
+
+def test_recovery_itself_refuses_an_unattested_pending_release(monkeypatch, tmp_path):
+    """Independent review on cacfc257.
+
+    Proving a release is only worth anything if the recovery path actually
+    calls the proof. This drives `recover()` through its real interrupted-
+    generation branch with a `pending-release` whose release directory exists
+    and looks right but carries no root-owned manifest, and requires the
+    selector NOT to be repointed at it.
+
+    Deliberately written against `recover()` rather than against
+    `verify_release_selection` directly: a test of the helper alone still
+    passes when the call site is deleted, which is exactly the regression that
+    matters here.
+    """
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    release = current.parent / "releases" / ("a" * 40)
+    release.mkdir(parents=True)
+    (release / "marker").write_text("unattested\n", encoding="utf-8")
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/new"),))
+    transaction.apply()
+
+    pending_release = state / "pending-release"
+    pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
+    pending_release.chmod(0o600)
+    (state / "attempt-units.json").write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(module, "restore_service_snapshot", lambda *a, **k: None)
+
+    with pytest.raises(module.ReleaseRefused):
+        transaction.recover()
+
+    # The live selector still points where it did; an unproven release was
+    # never selected, and the pending record survives for a later retry.
+    assert os.readlink(current) == f"releases/{'b' * 40}"
+    assert pending_release.exists()

@@ -398,3 +398,74 @@ def test_installer_hardens_every_git_call_it_makes():
     ]
     assert raw == [], raw
     assert 'archive --format=tar "$release_id"' in installer
+
+
+def _transaction(module, tmp_path):
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    (root / "opt/aicc").mkdir(parents=True)
+    state.mkdir(mode=0o700)
+    return module.FileTransaction(root, state), root, state
+
+
+def test_recovery_refuses_to_select_an_unattested_release(tmp_path):
+    """Independent review on cacfc257: the forward path proved a release
+    before selection, but recovery reselected whatever `pending-release`
+    named after checking only that the pathname looked right and the
+    directory existed.
+
+    That is the same missing-manifest admission the forward gate exists to
+    close, reached through boot recovery instead -- and what it selects is the
+    code every worker ExecStart runs as its own principal.
+    """
+    module = _module()
+    transaction, root, _state = _transaction(module, tmp_path)
+    release = root / "opt/aicc/releases" / RELEASE_ID
+    release.mkdir(parents=True)
+    (release / "marker").write_text("planted\n", encoding="utf-8")
+
+    with pytest.raises(module.ReleaseRefused, match="missing or unsafe"):
+        transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+
+def test_recovery_refuses_a_release_that_drifted_since_it_was_recorded(tmp_path):
+    """A prior generation was proven once; that says nothing about now."""
+    module = _module()
+    transaction, root, state = _transaction(module, tmp_path)
+    release = root / "opt/aicc/releases" / RELEASE_ID
+    release.mkdir(parents=True)
+    (release / "marker").write_text("release\n", encoding="utf-8")
+    (state / "releases").mkdir(mode=0o700)
+    module.record_release_manifest(
+        release,
+        transaction.release_manifest_path(RELEASE_ID),
+        RELEASE_ID,
+        trusted_uid=UID,
+        trusted_gid=GID,
+    )
+    transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+    (release / "marker").write_text("implanted\n", encoding="utf-8")
+
+    with pytest.raises(module.ReleaseRefused, match="does not match manifest"):
+        transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+
+def test_rollback_and_uninstall_prove_the_release_they_restore():
+    """The shell paths that repoint `/opt/aicc/current` on rollback and
+    uninstall must go through the same proof, and rollback must remove the
+    selector rather than restore an unprovable release: stopped units beat
+    running unproven code as root.
+    """
+    installer = (
+        Path(__file__).parents[2] / "deploy" / "install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+
+    rollback = installer[installer.index("rollback() {") :]
+    assert "release-verify" in rollback.split("trap rollback")[0]
+    uninstall = installer[installer.index('if [ "${1:-}" = "--uninstall" ]') :]
+    assert (
+        "release-verify"
+        in uninstall.split("AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED")[0]
+    )
+    assert "previous release failed verification; selector removed" in installer

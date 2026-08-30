@@ -167,6 +167,15 @@ if [ "${1:-}" = "--uninstall" ]; then
   if [ "$baseline_release_value" = ABSENT ]; then
     rm -f -- "$current_release"
   else
+    # Uninstall is not a weaker moment than install: the baseline release is
+    # still code every worker ExecStart will run. Prove it before selecting it
+    # (independent review on cacfc257). No Git cross-check here -- uninstall
+    # must work without a repository checkout -- so the root-owned manifest is
+    # the authority.
+    run_release release-verify \
+      --release-tree "/opt/aicc/$baseline_release_value" \
+      --manifest "$release_manifest_dir/${baseline_release_value#releases/}.json" \
+      --release-id "${baseline_release_value#releases/}"
     baseline_tmp="/opt/aicc/.current-uninstall.$$"
     ln -s "$baseline_release_value" "$baseline_tmp"
     mv -Tf -- "$baseline_tmp" "$current_release"
@@ -252,12 +261,21 @@ rollback() {
   # restart any service from its snapshot. Otherwise an old unit path through
   # /opt/aicc/current could execute the failed generation during recovery.
   if [ "$release_selected" -eq 1 ]; then
-    if [ -n "$previous_release" ]; then
+    if [ -n "$previous_release" ] && run_release release-verify \
+         --release-tree "/opt/aicc/$previous_release" \
+         --manifest "$release_manifest_dir/${previous_release#releases/}.json" \
+         --release-id "${previous_release#releases/}"; then
       previous_tmp="/opt/aicc/.current-rollback.$$"
       ln -s "$previous_release" "$previous_tmp"
       mv -Tf -- "$previous_tmp" "$current_release"
     elif [ -L "$current_release" ]; then
+      # Either there was no previous release, or it can no longer be proven.
+      # Removing the selector stops the units; pointing it at an unproven
+      # release would run unproven code as root to restore service. Fail
+      # secure (independent review on cacfc257).
       rm -f -- "$current_release"
+      [ -n "$previous_release" ] && \
+        echo "previous release failed verification; selector removed" >&2
     fi
     release_selected=0
     if [ "$transaction_active" -eq 0 ]; then

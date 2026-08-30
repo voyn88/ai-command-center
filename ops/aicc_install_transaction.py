@@ -682,6 +682,14 @@ class FileTransaction:
                 raise RuntimeError(
                     "pending release selector points at a missing release"
                 )
+            # Selecting a release is selecting the code every worker ExecStart
+            # runs, and recovery is not a weaker moment than install: a prior
+            # generation can have been replaced, truncated or drifted since it
+            # was built. Independent review on cacfc257 found this path
+            # admitting exactly the unattested release the forward path now
+            # refuses. Fail secure -- an unproven release is never selected,
+            # even to restore service.
+            self.verify_release_selection(selector)
             temporary = current.parent / f".current-recover-{os.getpid()}"
             temporary.unlink(missing_ok=True)
             temporary.symlink_to(selector)
@@ -689,6 +697,29 @@ class FileTransaction:
         self.pending_release.unlink()
         _fsync_dir(current.parent)
         _fsync_dir(self.state_dir)
+
+    def release_manifest_path(self, release_id: str) -> Path:
+        """The root-owned manifest recorded when this release was staged."""
+        return self.state_dir / "releases" / f"{release_id}.json"
+
+    def verify_release_selection(self, selector: str) -> None:
+        """Prove a release before `/opt/aicc/current` may point at it.
+
+        Every selection goes through here -- install, recovery, rollback and
+        uninstall alike. The Git cross-check is not available on the boot
+        recovery path (there is no repository checkout at that point), so the
+        root-owned manifest is the authority there; the forward path adds the
+        committed-tree comparison on top of it.
+        """
+        release_id = selector.split("/", 1)[-1]
+        release_dir = self._target("/opt/aicc") / selector
+        verify_release_manifest(
+            release_dir,
+            self.release_manifest_path(release_id),
+            release_id,
+            trusted_uid=os.geteuid(),
+            trusted_gid=os.getegid(),
+        )
 
     def install(self, specs: Iterable[FileSpec]) -> None:
         self.prepare(specs)
@@ -1443,7 +1474,13 @@ def main() -> int:
                 f"{args.action}"
             )
         if args.action == "release-record":
-            record_release_manifest(args.release_tree, args.manifest, args.release_id)
+            record_release_manifest(
+                args.release_tree,
+                args.manifest,
+                args.release_id,
+                trusted_uid=os.geteuid(),
+                trusted_gid=os.getegid(),
+            )
             print(f"AICC_RELEASE_MANIFEST_RECORDED {args.release_id}")
         else:
             verify_release_manifest(
@@ -1451,6 +1488,8 @@ def main() -> int:
                 args.manifest,
                 args.release_id,
                 repo_root=args.repo_root if args.verify_against_git else None,
+                trusted_uid=os.geteuid(),
+                trusted_gid=os.getegid(),
             )
             print(f"AICC_RELEASE_MANIFEST_VERIFIED {args.release_id}")
         return 0
