@@ -177,11 +177,167 @@ def test_windows_runtime_lock_lives_outside_replaceable_data_directory(tmp_path)
 
     lock_path = supervisor._windows_runtime_lock_path(db_path)
 
-    assert lock_path.parent.name == "aicc-runtime-locks"
+    assert lock_path.parent == tmp_path.parent / ".aicc-runtime-locks"
     assert lock_path.parent != db_path.parent
     assert lock_path.suffix == ".lock"
     assert lock_path == supervisor._windows_runtime_lock_path(db_path)
     assert lock_path != supervisor._windows_runtime_lock_path(tmp_path / "other.db")
+
+
+def test_windows_shared_runtime_lock_is_refcounted_with_one_os_lock(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_RLCK = 2
+        LK_UNLCK = 3
+
+        @staticmethod
+        def locking(fd, mode, size):
+            calls.append((fd, mode, size))
+
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+    lock_path = tmp_path / "shared.lock"
+    with supervisor._WINDOWS_RUNTIME_LOCKS_CONDITION:
+        supervisor._WINDOWS_RUNTIME_LOCKS.clear()
+
+    first = supervisor._acquire_windows_runtime_lock(lock_path, exclusive=False)
+    second = supervisor._acquire_windows_runtime_lock(lock_path, exclusive=False)
+
+    assert first.handle is second.handle
+    assert [mode for _fd, mode, _size in calls] == [FakeMsvcrt.LK_RLCK]
+    supervisor._release_windows_runtime_lock(first)
+    assert not second.handle.closed
+    supervisor._release_windows_runtime_lock(second)
+    assert second.handle.closed
+    assert [mode for _fd, mode, _size in calls] == [
+        FakeMsvcrt.LK_RLCK,
+        FakeMsvcrt.LK_UNLCK,
+    ]
+    assert supervisor._WINDOWS_RUNTIME_LOCKS == {}
+
+
+def test_windows_exclusive_runtime_lock_waits_for_local_shared_users(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_RLCK = 2
+        LK_UNLCK = 3
+
+        @staticmethod
+        def locking(fd, mode, size):
+            calls.append((fd, mode, size))
+
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+    lock_path = tmp_path / "exclusive.lock"
+    with supervisor._WINDOWS_RUNTIME_LOCKS_CONDITION:
+        supervisor._WINDOWS_RUNTIME_LOCKS.clear()
+    shared = supervisor._acquire_windows_runtime_lock(lock_path, exclusive=False)
+    acquired = threading.Event()
+    result = {}
+
+    def acquire_exclusive():
+        result["handle"] = supervisor._acquire_windows_runtime_lock(
+            lock_path, exclusive=True
+        )
+        acquired.set()
+
+    thread = threading.Thread(target=acquire_exclusive)
+    thread.start()
+    assert not acquired.wait(timeout=0.2)
+    supervisor._release_windows_runtime_lock(shared)
+    assert acquired.wait(timeout=5)
+    supervisor._release_windows_runtime_lock(result["handle"])
+    thread.join(timeout=5)
+
+    assert [mode for _fd, mode, _size in calls] == [
+        FakeMsvcrt.LK_RLCK,
+        FakeMsvcrt.LK_UNLCK,
+        FakeMsvcrt.LK_LOCK,
+        FakeMsvcrt.LK_UNLCK,
+    ]
+    assert supervisor._WINDOWS_RUNTIME_LOCKS == {}
+
+
+def test_supervisor_late_startup_failure_releases_windows_registry_lock(
+    tmp_path, monkeypatch
+):
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_RLCK = 2
+        LK_UNLCK = 3
+
+        @staticmethod
+        def locking(_fd, _mode, _size):
+            return None
+
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+    db_path = tmp_path / "runtime.db"
+    lock_path = tmp_path.parent / ".aicc-runtime-locks" / "late-failure.lock"
+    with supervisor._WINDOWS_RUNTIME_LOCKS_CONDITION:
+        supervisor._WINDOWS_RUNTIME_LOCKS.clear()
+    monkeypatch.setattr(
+        supervisor,
+        "_acquire_runtime_lock",
+        lambda _path, *, exclusive: supervisor._acquire_windows_runtime_lock(
+            lock_path, exclusive=exclusive
+        ),
+    )
+
+    def fail_autopilot(_self):
+        raise RuntimeError("injected autopilot startup failure")
+
+    monkeypatch.setattr(supervisor.Supervisor, "start_completion_autopilot", fail_autopilot)
+
+    with pytest.raises(RuntimeError, match="injected autopilot"):
+        supervisor.Supervisor(db_path, enable_completion_autopilot=True)
+
+    assert supervisor._WINDOWS_RUNTIME_LOCKS == {}
+    later = supervisor._acquire_windows_runtime_lock(lock_path, exclusive=True)
+    supervisor._release_windows_runtime_lock(later)
+    assert supervisor._WINDOWS_RUNTIME_LOCKS == {}
+
+
+def test_cutover_marker_failure_releases_windows_registry_lock(tmp_path, monkeypatch):
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_RLCK = 2
+        LK_UNLCK = 3
+
+        @staticmethod
+        def locking(_fd, _mode, _size):
+            return None
+
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+    db_path = tmp_path / "runtime.db"
+    lock_path = tmp_path.parent / ".aicc-runtime-locks" / "cutover-failure.lock"
+    with supervisor._WINDOWS_RUNTIME_LOCKS_CONDITION:
+        supervisor._WINDOWS_RUNTIME_LOCKS.clear()
+    monkeypatch.setattr(
+        supervisor,
+        "_acquire_runtime_lock",
+        lambda _path, *, exclusive: supervisor._acquire_windows_runtime_lock(
+            lock_path, exclusive=exclusive
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor.secrets,
+        "token_hex",
+        lambda _size: (_ for _ in ()).throw(RuntimeError("injected marker failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="injected marker"):
+        supervisor.acquire_offline_cutover_fence(db_path)
+
+    assert supervisor._WINDOWS_RUNTIME_LOCKS == {}
+    later = supervisor._acquire_windows_runtime_lock(lock_path, exclusive=True)
+    supervisor._release_windows_runtime_lock(later)
+    assert supervisor._WINDOWS_RUNTIME_LOCKS == {}
 
 
 def test_offline_cutover_exclusive_lock_cannot_overlap_startup(

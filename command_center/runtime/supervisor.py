@@ -48,10 +48,10 @@ import os
 import secrets
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TextIO
@@ -99,6 +99,31 @@ _PROCESS_OWNED_RUNS_GUARD = threading.Lock()
 _PROCESS_OWNED_RUNS: set[str] = set()
 
 
+@dataclass
+class _WindowsRuntimeLockState:
+    mode: str
+    handle: TextIO | None = None
+    references: int = 0
+
+
+@dataclass
+class _WindowsRuntimeLockHandle:
+    key: str
+    handle: TextIO
+    released: bool = False
+
+    @property
+    def closed(self) -> bool:
+        return self.released
+
+
+RuntimeLockHandle = TextIO | _WindowsRuntimeLockHandle
+
+
+_WINDOWS_RUNTIME_LOCKS_CONDITION = threading.Condition()
+_WINDOWS_RUNTIME_LOCKS: dict[str, _WindowsRuntimeLockState] = {}
+
+
 def offline_cutover_fence_path(db_path: Path) -> Path:
     return db_path.with_name(f"{db_path.name}.offline-cutover")
 
@@ -110,11 +135,16 @@ def _windows_runtime_lock_path(db_path: Path) -> Path:
     holds this lock for its whole lifetime, so placing it beside ``runtime.db``
     makes an otherwise valid data-directory rotation or cleanup fail with
     ``WinError 32``. The normalized absolute DB path remains the lock identity;
-    only the physical lock file lives in the per-user temporary area.
+    only the physical lock file lives in a stable sibling directory outside
+    the replaceable data directory. Deriving that root from the canonical DB
+    path (rather than a per-user temp directory) makes different service
+    principals contend on the same machine-wide lock whenever they target the
+    same database.
     """
-    normalized = os.path.normcase(str(db_path.expanduser().resolve(strict=False)))
+    resolved = db_path.expanduser().resolve(strict=False)
+    normalized = os.path.normcase(str(resolved))
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-    return Path(tempfile.gettempdir()) / "aicc-runtime-locks" / f"{digest}.lock"
+    return resolved.parent.parent / ".aicc-runtime-locks" / f"{digest}.lock"
 
 
 def _runtime_lock_path(db_path: Path) -> Path:
@@ -123,64 +153,139 @@ def _runtime_lock_path(db_path: Path) -> Path:
     return db_path.with_name(f"{db_path.name}.runtime-lock")
 
 
-def _acquire_runtime_lock(db_path: Path, *, exclusive: bool) -> TextIO:
-    lock_path = _runtime_lock_path(db_path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+", encoding="utf-8")
-    if os.name == "nt":
-        import msvcrt
+def _acquire_windows_runtime_lock(
+    lock_path: Path, *, exclusive: bool
+) -> _WindowsRuntimeLockHandle:
+    """Make Windows byte-range locks re-entrant for shared in-process users."""
+    import msvcrt
 
+    key = os.path.normcase(str(lock_path.resolve(strict=False)))
+    requested_mode = "exclusive" if exclusive else "shared"
+    with _WINDOWS_RUNTIME_LOCKS_CONDITION:
+        while True:
+            state = _WINDOWS_RUNTIME_LOCKS.get(key)
+            if state is None:
+                _WINDOWS_RUNTIME_LOCKS[key] = _WindowsRuntimeLockState(
+                    mode=f"acquiring-{requested_mode}"
+                )
+                break
+            if not exclusive and state.mode == "shared":
+                if state.handle is None:
+                    raise RuntimeError("shared Windows runtime lock has no handle")
+                state.references += 1
+                return _WindowsRuntimeLockHandle(key=key, handle=state.handle)
+            _WINDOWS_RUNTIME_LOCKS_CONDITION.wait()
+
+    handle: TextIO | None = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+", encoding="utf-8")
         if lock_path.stat().st_size == 0:
             handle.write("0")
             handle.flush()
         handle.seek(0)
         mode = msvcrt.LK_LOCK if exclusive else msvcrt.LK_RLCK
         msvcrt.locking(handle.fileno(), mode, 1)
-    else:
-        import fcntl
+    except BaseException:
+        if handle is not None:
+            handle.close()
+        with _WINDOWS_RUNTIME_LOCKS_CONDITION:
+            _WINDOWS_RUNTIME_LOCKS.pop(key, None)
+            _WINDOWS_RUNTIME_LOCKS_CONDITION.notify_all()
+        raise
 
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    with _WINDOWS_RUNTIME_LOCKS_CONDITION:
+        state = _WINDOWS_RUNTIME_LOCKS[key]
+        state.mode = requested_mode
+        state.handle = handle
+        state.references = 1
+        _WINDOWS_RUNTIME_LOCKS_CONDITION.notify_all()
+    return _WindowsRuntimeLockHandle(key=key, handle=handle)
+
+
+def _acquire_runtime_lock(
+    db_path: Path, *, exclusive: bool
+) -> RuntimeLockHandle:
+    lock_path = _runtime_lock_path(db_path)
+    if os.name == "nt":
+        return _acquire_windows_runtime_lock(lock_path, exclusive=exclusive)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
     return handle
 
 
-def _release_runtime_lock(handle: TextIO) -> None:
+def _release_windows_runtime_lock(handle: _WindowsRuntimeLockHandle) -> None:
+    import msvcrt
+
+    with _WINDOWS_RUNTIME_LOCKS_CONDITION:
+        if handle.released:
+            return
+        handle.released = True
+        state = _WINDOWS_RUNTIME_LOCKS.get(handle.key)
+        if state is None or state.handle is not handle.handle:
+            raise RuntimeError("Windows runtime lock registry lost its handle")
+        state.references -= 1
+        if state.references:
+            return
+        state.mode = "releasing"
+        raw = state.handle
+    if raw is None:
+        raise RuntimeError("Windows runtime lock registry has no raw handle")
+    try:
+        raw.seek(0)
+        msvcrt.locking(raw.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        raw.close()
+        with _WINDOWS_RUNTIME_LOCKS_CONDITION:
+            _WINDOWS_RUNTIME_LOCKS.pop(handle.key, None)
+            _WINDOWS_RUNTIME_LOCKS_CONDITION.notify_all()
+
+
+def _release_runtime_lock(handle: RuntimeLockHandle) -> None:
+    if isinstance(handle, _WindowsRuntimeLockHandle):
+        _release_windows_runtime_lock(handle)
+        return
     if handle.closed:
         return
-    if os.name == "nt":
-        import msvcrt
+    import fcntl
 
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     handle.close()
 
 
-def acquire_offline_cutover_fence(db_path: Path) -> tuple[str, bool, TextIO]:
+def acquire_offline_cutover_fence(
+    db_path: Path,
+) -> tuple[str, bool, RuntimeLockHandle]:
     """Hold an exclusive runtime lock and create/resume the restart marker."""
     lock_handle = _acquire_runtime_lock(db_path, exclusive=True)
-    marker = offline_cutover_fence_path(db_path)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_hex(32)
     try:
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        existing = marker.read_text(encoding="utf-8").strip()
-        if not existing:
-            _release_runtime_lock(lock_handle)
-            raise SupervisorError("offline cutover fence exists but has no token")
-        return existing, False, lock_handle
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(f"{token}\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    return token, True, lock_handle
+        marker = offline_cutover_fence_path(db_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_hex(32)
+        try:
+            fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            existing = marker.read_text(encoding="utf-8").strip()
+            if not existing:
+                raise SupervisorError("offline cutover fence exists but has no token")
+            return existing, False, lock_handle
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{token}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return token, True, lock_handle
+    except BaseException:
+        _release_runtime_lock(lock_handle)
+        raise
 
 
 def release_offline_cutover_fence(
-    db_path: Path, token: str, lock_handle: TextIO
+    db_path: Path,
+    token: str,
+    lock_handle: RuntimeLockHandle,
 ) -> None:
     """Remove only the fence owned by this successful cutover process."""
     marker = offline_cutover_fence_path(db_path)
@@ -609,7 +714,7 @@ class Supervisor:
         db_path: Path | None = None,
         *,
         maintenance_token: str | None = None,
-        maintenance_lock_handle: TextIO | None = None,
+        maintenance_lock_handle: RuntimeLockHandle | None = None,
         enable_completion_autopilot: bool | None = None,
     ) -> None:
         self._creator_pid = os.getpid()
@@ -631,53 +736,49 @@ class Supervisor:
                         "runtime is fenced for an offline finalization cutover"
                     )
             db.migrate(self.db_path)
-        except Exception:
+            # Extracted sides of the supervisor (NIGHT-W9): stream consumption
+            # and finalize/outcome persistence live behind small interfaces;
+            # this class keeps orchestration (process lifecycle, `_active`
+            # registry, locks).
+            self._streams = stream_reader.StreamReader(self.db_path)
+            self._finalizer = run_finalizer.RunFinalizer(
+                self.db_path,
+                owner_token=self._finalization_owner_token,
+                owner_pid=self._creator_pid,
+            )
+            self._active: dict[str, _ActiveRun] = {}
+            # Run ids this instance has committed to launching (persisted as
+            # PREPARED/QUEUED) but has not yet `Popen`'d — the gap
+            # `self._active` alone cannot cover, because `_active` is populated
+            # only after a process actually exists and its ownership record is
+            # constructed (see `_launch_process`). Guarded by the same
+            # `_active_lock`. See `reconcile()` for why this must be included
+            # in its "don't touch this, it's mine" guard.
+            self._launching: set[str] = set()
+            self._active_lock = threading.Lock()
+            # Cross-process reconcile debounce (audit P0). A run can *look*
+            # gone because another process owns it and is in-flight. Require
+            # the observation to persist before a non-owner terminalizes it.
+            self._suspected_gone: dict[str, float] = {}
+            self._suspected_gone_lock = threading.Lock()
+            self._reconcile_absence_grace = _RECONCILE_ABSENCE_GRACE_SECONDS
+            self._autopilot_thread: threading.Thread | None = None
+            self._autopilot_stop: threading.Event | None = None
+            # Opt-in: auto-start completion processing for a backend process.
+            autopilot_enabled = (
+                bool(os.environ.get("AICC_COMPLETION_AUTOPILOT"))
+                if enable_completion_autopilot is None
+                else enable_completion_autopilot
+            )
+            if autopilot_enabled:
+                self.start_completion_autopilot()
+        except BaseException:
             if owns_runtime_lock:
                 try:
                     _release_runtime_lock(self._runtime_lock_handle)
                 except Exception:
                     logger.exception("Could not release failed Supervisor startup lock")
             raise
-        # Extracted sides of the supervisor (NIGHT-W9): stream consumption and
-        # finalize/outcome persistence live behind small interfaces; this class
-        # keeps orchestration (process lifecycle, `_active` registry, locks).
-        self._streams = stream_reader.StreamReader(self.db_path)
-        self._finalizer = run_finalizer.RunFinalizer(
-            self.db_path,
-            owner_token=self._finalization_owner_token,
-            owner_pid=self._creator_pid,
-        )
-        self._active: dict[str, _ActiveRun] = {}
-        # Run ids this instance has committed to launching (persisted as
-        # PREPARED/QUEUED) but has not yet `Popen`'d — the gap `self._active`
-        # alone cannot cover, because `_active` is populated only after a
-        # process actually exists and its ownership record is constructed (see
-        # `_launch_process`). Guarded by the same
-        # `_active_lock`. See `reconcile()` for why this must be included in
-        # its "don't touch this, it's mine" guard, not just `self._active`.
-        self._launching: set[str] = set()
-        self._active_lock = threading.Lock()
-        # Cross-process reconcile debounce (audit P0). A run can *look* gone not
-        # because it died but because another process owns it and is in-flight
-        # (pid still None between create_run and Popen, or exited-but-finalizing).
-        # We require the "gone" observation to persist across
-        # `_reconcile_absence_grace` seconds (per-instance, monotonic) before a
-        # non-owning reconcile() terminalizes it. run_id -> first-seen monotonic.
-        self._suspected_gone: dict[str, float] = {}
-        self._suspected_gone_lock = threading.Lock()
-        self._reconcile_absence_grace = _RECONCILE_ABSENCE_GRACE_SECONDS
-        self._autopilot_thread: threading.Thread | None = None
-        self._autopilot_stop: threading.Event | None = None
-        # Opt-in: an env flag auto-starts the completion autopilot for a
-        # backend process (e.g. a headless/desktop host). Off by default, so
-        # tests and the plain Streamlit app never spawn it implicitly.
-        autopilot_enabled = (
-            bool(os.environ.get("AICC_COMPLETION_AUTOPILOT"))
-            if enable_completion_autopilot is None
-            else enable_completion_autopilot
-        )
-        if autopilot_enabled:
-            self.start_completion_autopilot()
 
     def _assert_current_process(self) -> None:
         """Reject a Supervisor facade inherited across ``fork``.

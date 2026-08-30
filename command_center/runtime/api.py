@@ -24,7 +24,7 @@ need to exercise process-lifecycle mechanics directly.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, TextIO
+from typing import Iterable
 
 from command_center import project_config, provider_route, workspace_provisioning
 from command_center import run_lineage as provenance
@@ -40,7 +40,7 @@ class ExecutionCenterAPI:
         sup: supervisor.Supervisor | None = None,
         *,
         maintenance_token: str | None = None,
-        maintenance_lock_handle: TextIO | None = None,
+        maintenance_lock_handle: supervisor.RuntimeLockHandle | None = None,
         enable_completion_autopilot: bool | None = None,
     ) -> None:
         self.supervisor = sup or supervisor.Supervisor(
