@@ -119,9 +119,22 @@ def _payload_for(
         f"Central task: {task['task_id']} ({task['title']}).\n"
         f"Wave {task['wave']}, priority {task['priority'] or 'unset'}.\n\n"
         f"{task['body']}\n\n"
-        "When you open or update a pull request, include its URL in your "
-        "final message, and end the message with a line of exactly this "
-        "form so the orchestrator can record the evidence:\n"
+        # The publisher (`orchestrator.publish.publish_run`, under the writer
+        # lease) refuses a task clone that is not clean, and an agent has no
+        # push capability at all. Asking the agent to "open a pull request"
+        # therefore asked for the one thing it cannot do, while never asking
+        # for the one thing it must: the commit. Live consequence
+        # (VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP): completed work sat
+        # uncommitted in the clone, `agent_worktree_clean` refused it, and the
+        # cascade spent every remaining attempt reproducing the same refusal.
+        "Commit every change you make to the task branch in this clone before "
+        "you finish -- `git add` and `git commit` are yours to run, and an "
+        "uncommitted change is discarded work, not a result. Do NOT push and "
+        "do NOT open a pull request: you have no push capability, and the "
+        "orchestrator publishes your commits through the guarded publisher "
+        "after you exit.\n"
+        "End your final message with a line of exactly this form so the "
+        "orchestrator can record the evidence:\n"
         "HEAD_SHA: <the branch head commit sha>"
     ).strip()
     payload = {
