@@ -36,6 +36,24 @@ release_staging=
 previous_release=
 release_selected=0
 
+# Every privileged Git read here must be config-free AND must refuse
+# replacement refs: `git archive HEAD` would otherwise stage a planted
+# `refs/replace/<sha>` tree while the SHA comparison above still passed
+# (independent review on aaf1a502). Kept in lockstep with `_git_argv` in
+# ops/aicc_exact_sha_bootstrap.py.
+git_trusted() {
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+  GIT_OPTIONAL_LOCKS=0 GIT_NO_REPLACE_OBJECTS=1 \
+  /usr/bin/git --no-replace-objects \
+    -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.pager=cat \
+    -c core.sshCommand=/bin/false -c core.gitProxy= -c core.symlinks=false \
+    -c protocol.ext.allow=never -c protocol.file.allow=never \
+    -c credential.helper= -c diff.external= \
+    -c filter.lfs.smudge= -c filter.lfs.clean= -c filter.lfs.process= \
+    -c uploadpack.packObjectsHook= \
+    "$@"
+}
+
 run_transaction() {
   action=$1
   /usr/bin/python3 "$transaction" "$action" \
@@ -56,7 +74,7 @@ run_release() {
 }
 
 stage_immutable_release() {
-  release_id=$(/usr/bin/git -C "$repo_root" rev-parse --verify HEAD)
+  release_id=$(git_trusted -C "$repo_root" rev-parse --verify HEAD)
   case "$release_id" in
     *[!0-9a-f]*|'') echo "invalid release commit" >&2; exit 1 ;;
   esac
@@ -75,7 +93,8 @@ stage_immutable_release() {
     # Archive the committed tree, never the operator worktree. This makes the
     # release identity equal to committed content even when the checkout has
     # unrelated untracked files.
-    /usr/bin/git -C "$repo_root" archive --format=tar HEAD | tar -xf - -C "$release_staging"
+    git_trusted -C "$repo_root" archive --format=tar "$release_id" \
+      | tar -xf - -C "$release_staging"
     /usr/bin/python3 -m venv "$release_staging/.venv"
     "$release_staging/.venv/bin/python" -m pip install \
       --disable-pip-version-check --require-hashes \

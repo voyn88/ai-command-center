@@ -67,8 +67,17 @@ GIT_CONFIG_FREE = (
 
 
 def _git_argv(*arguments: str) -> list[str]:
-    """The only way this module builds a Git command line."""
-    return [GIT, *GIT_CONFIG_FREE, *arguments]
+    """The only way this module builds a Git command line.
+
+    `--no-replace-objects` is not a config knob and so cannot live in
+    `GIT_CONFIG_FREE`: replacement refs (`refs/replace/<oid>`) are repository
+    DATA, honoured by default. A planted `refs/replace/<expected_sha>` leaves
+    `rev-parse HEAD^{commit}` reporting the accepted SHA while `ls-tree`,
+    `checkout`, `status` and every blob read return the attacker's tree --
+    the exact-SHA boundary would report success over substituted content.
+    Independent review on aaf1a502.
+    """
+    return [GIT, "--no-replace-objects", *GIT_CONFIG_FREE, *arguments]
 
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -124,6 +133,10 @@ def _safe_environment(home: Path) -> dict[str, str]:
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",
+        # Belt to `--no-replace-objects`' braces: any Git this module spawns
+        # indirectly (a helper, a subprocess of a subprocess) inherits the
+        # refusal to honour replacement refs.
+        "GIT_NO_REPLACE_OBJECTS": "1",
     }
 
 

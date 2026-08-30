@@ -319,3 +319,82 @@ def test_read_only_release_still_verifies(committed, tmp_path):
         )
     finally:
         subprocess.run(["chmod", "-R", "u+w", str(tree)], check=True)
+
+
+def test_git_authority_ignores_a_planted_replacement_object(committed, tmp_path):
+    """Independent review on aaf1a502.
+
+    `_git_tree_blobs` is the INDEPENDENT authority a release is checked
+    against -- the one thing that still catches a same-name/wrong-tree release
+    whose manifest was rewritten to match. A replacement ref would make that
+    authority read the attacker's tree too, so manifest and Git check would
+    agree on substituted content and `/opt/aicc/current` would select it with
+    every gate reporting success.
+    """
+    module = _module()
+    repo, tree, sha = committed
+    manifest = tmp_path / "manifest.json"
+    _record(module, tree, manifest, release_id=sha)
+
+    attacker = tmp_path / "attacker"
+    _git(tmp_path, "clone", "--quiet", str(repo), str(attacker))
+    (attacker / "command_center" / "worker.py").write_text("import os  # implanted\n")
+    _git(attacker, "add", "-A")
+    _git(attacker, "commit", "-m", "implanted")
+    evil = _git(attacker, "rev-parse", "HEAD")
+    _git(repo, "fetch", "--quiet", str(attacker), f"{evil}:refs/heads/implanted")
+    _git(repo, "replace", "-f", sha, evil)
+
+    # The replacement is in force for an unhardened read of the same repo ...
+    assert "implanted" in _git(repo, "show", f"{sha}:command_center/worker.py")
+
+    # ... and the release still verifies against the genuinely committed tree.
+    module.verify_release_manifest(
+        tree, manifest, sha, repo_root=repo, trusted_uid=UID, trusted_gid=GID
+    )
+
+
+def test_the_two_git_hardening_lists_cannot_drift(tmp_path):
+    """`ops/aicc_exact_sha_bootstrap.py` is extracted from Git as a single blob
+    and executed before this module exists, so it cannot import the list from
+    here and the duplication is deliberate. What must not happen is drift: a
+    knob added to one boundary and forgotten in the other. This is the pin.
+    """
+    import importlib.util
+
+    transaction = _module()
+    path = Path(__file__).parents[2] / "ops" / "aicc_exact_sha_bootstrap.py"
+    spec = importlib.util.spec_from_file_location("aicc_exact_sha_bootstrap", path)
+    assert spec and spec.loader
+    bootstrap = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = bootstrap
+    spec.loader.exec_module(bootstrap)
+
+    assert transaction.GIT_CONFIG_FREE == bootstrap.GIT_CONFIG_FREE
+    assert (
+        transaction._git_safe_environment()["GIT_NO_REPLACE_OBJECTS"]
+        == bootstrap._safe_environment(tmp_path)["GIT_NO_REPLACE_OBJECTS"]
+        == "1"
+    )
+
+
+def test_installer_hardens_every_git_call_it_makes():
+    """The shell installer runs `rev-parse` and `archive` as root against a
+    checkout it does not own. Both must go through the hardened wrapper, and
+    `archive` must name the verified release id rather than the symbolic HEAD.
+    """
+    installer = (
+        Path(__file__).parents[2] / "deploy" / "install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "git_trusted()" in installer
+    assert "--no-replace-objects" in installer
+    assert "GIT_NO_REPLACE_OBJECTS=1" in installer
+    # No raw Git invocation outside the wrapper's own definition.
+    raw = [
+        line
+        for line in installer.splitlines()
+        if "/usr/bin/git" in line and "--no-replace-objects" not in line
+    ]
+    assert raw == [], raw
+    assert 'archive --format=tar "$release_id"' in installer

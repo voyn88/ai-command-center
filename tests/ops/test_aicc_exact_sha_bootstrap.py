@@ -167,8 +167,13 @@ def test_safe_environment_drops_git_and_dynamic_loader_injection(monkeypatch, tm
         "GIT_CONFIG_GLOBAL",
         "GIT_TERMINAL_PROMPT",
         "GIT_OPTIONAL_LOCKS",
+        "GIT_NO_REPLACE_OBJECTS",
     }
     assert safe["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    # Replacement refs are repository data, not config: no `-c` flag disables
+    # them, so the environment carries the refusal for any Git this module
+    # spawns indirectly (independent review on aaf1a502).
+    assert safe["GIT_NO_REPLACE_OBJECTS"] == "1"
 
 
 def test_installer_requires_attestation_before_transaction_code():
@@ -410,3 +415,74 @@ def test_installer_failure_leaves_no_completed_marker(tmp_path, monkeypatch):
 
     assert not list(state.rglob("completed.json"))
     assert list(state.rglob("attestation.json"))
+
+
+def test_planted_replacement_object_cannot_substitute_the_verified_tree(tmp_path):
+    """Independent review on aaf1a502: `refs/replace/<oid>` is repository DATA,
+    honoured by default, and no `-c` config flag disables it.
+
+    With a replacement ref in place, `rev-parse HEAD^{commit}` still reports
+    the accepted SHA while `ls-tree`, `checkout`, `status` and every blob read
+    return the attacker's tree -- so the exact-SHA boundary would attest
+    substituted content under the trusted commit id.
+
+    The implanted commit is built in a SEPARATE clone and fetched in, so the
+    verified checkout stays byte-identical and clean: the replacement ref is
+    the only difference between the honest run and this one. Otherwise the
+    refusal could come from the dirty tree rather than from the hardening
+    under test.
+    """
+    module = _module()
+    repo, sha, env = _trusted_repo(module, tmp_path)
+    honest = _verify(module, repo, env, sha)
+
+    attacker = tmp_path / "attacker"
+    _git(tmp_path, "clone", "--quiet", str(repo), str(attacker))
+    implanted = attacker / module.REQUIRED_ENTRYPOINTS[0]
+    implanted.write_text("trusted:implanted-by-replacement\n", encoding="utf-8")
+    _git(attacker, "add", ".")
+    _git(
+        attacker,
+        "-c",
+        "user.name=A",
+        "-c",
+        "user.email=a@example.invalid",
+        "commit",
+        "-m",
+        "implanted",
+    )
+    evil = _git(attacker, "rev-parse", "HEAD")
+    _git(repo, "fetch", "--quiet", str(attacker), f"{evil}:refs/heads/implanted")
+    _git(repo, "replace", "-f", sha, evil)
+
+    # The replacement really is in force for an unhardened read ...
+    assert _git(repo, "rev-parse", f"refs/replace/{sha}")
+    assert "implanted-by-replacement" in _git(
+        repo, "show", f"{sha}:{module.REQUIRED_ENTRYPOINTS[0]}"
+    )
+
+    # ... and the hardened verification is unmoved by it.
+    replaced = _verify(module, repo, env, sha)
+    assert replaced.tree_manifest_sha256 == honest.tree_manifest_sha256
+    assert replaced == honest
+
+
+def test_git_argv_refuses_replacement_objects_and_execution_config():
+    """The one builder every Git call goes through carries the whole boundary:
+    a future call site cannot opt out of part of it."""
+    module = _module()
+    argv = module._git_argv("status")
+
+    assert argv[0] == module.GIT
+    assert argv[1] == "--no-replace-objects", "must precede the subcommand"
+    assert argv[-1] == "status"
+    flags = " ".join(argv)
+    for knob in (
+        "core.fsmonitor=false",
+        "core.hooksPath=/dev/null",
+        "core.sshCommand=/bin/false",
+        "filter.lfs.smudge=",
+        "uploadpack.packObjectsHook=",
+    ):
+        assert knob in flags, knob
+    assert module._safe_environment(Path("/tmp"))["GIT_NO_REPLACE_OBJECTS"] == "1"

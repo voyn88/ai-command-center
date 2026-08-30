@@ -874,6 +874,55 @@ class FileTransaction:
         self._remove_orphan_generations()
 
 
+# Kept identical to `GIT_CONFIG_FREE` in ops/aicc_exact_sha_bootstrap.py; the
+# bootstrap runs as a standalone blob before this module exists, so the list is
+# duplicated deliberately and pinned by tests/ops/test_aicc_release_manifest.py.
+GIT_CONFIG_FREE = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "core.sshCommand=/bin/false",
+    "-c",
+    "core.gitProxy=",
+    "-c",
+    "core.symlinks=false",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "protocol.file.allow=never",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "diff.external=",
+    "-c",
+    "filter.lfs.smudge=",
+    "-c",
+    "filter.lfs.clean=",
+    "-c",
+    "filter.lfs.process=",
+    "-c",
+    "uploadpack.packObjectsHook=",
+)
+
+
+def _git_safe_environment() -> dict[str, str]:
+    return {
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+    }
+
+
 RELEASE_MANIFEST_VERSION = 1
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 GIT_TREE_ENTRY_RE = re.compile(
@@ -993,8 +1042,18 @@ def _git_tree_blobs(repo_root: Path, release_id: str) -> dict[str, tuple[str, in
     result = subprocess.run(
         [
             "/usr/bin/git",
-            "-c",
-            "core.fsmonitor=false",
+            # This read is the INDEPENDENT authority a release is checked
+            # against, so it must not inherit anything the release directory's
+            # own repository can influence. Replacement refs would otherwise
+            # let one planted `refs/replace/<release_id>` satisfy both the
+            # manifest and this check with the same substituted tree
+            # (independent review on aaf1a502). Kept in lockstep with
+            # `_git_argv` in ops/aicc_exact_sha_bootstrap.py -- that module is
+            # extracted from Git as a single blob and executed before this one
+            # exists, so it cannot import from here; a fitness test pins the
+            # two lists together instead.
+            "--no-replace-objects",
+            *GIT_CONFIG_FREE,
             "-C",
             str(repo_root),
             "ls-tree",
@@ -1005,6 +1064,7 @@ def _git_tree_blobs(repo_root: Path, release_id: str) -> dict[str, tuple[str, in
         capture_output=True,
         stdin=subprocess.DEVNULL,
         check=False,
+        env=_git_safe_environment(),
     )
     if result.returncode:
         detail = result.stderr.decode("utf-8", "replace").strip()
