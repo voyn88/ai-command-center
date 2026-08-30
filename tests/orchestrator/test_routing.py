@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from command_center import agent_runner
+from command_center.orchestrator.planner import PlanLimits, _payload_for
 from command_center.orchestrator.routing import ROUTING_MATRIX, cascade_for
 
 #: The executors the worker can actually run, read from the SAME table the
@@ -59,3 +60,40 @@ def test_review_uses_copilot_then_claude_once_each():
 
 def test_unknown_task_class_falls_back_to_implementation():
     assert cascade_for("martian") == cascade_for("implementation")
+
+
+def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> None:
+    """VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP (found live 2026-08-30).
+
+    The dispatch prompt used to say "When you open or update a pull request..."
+    -- the one action an agent cannot perform, since push capability is
+    withheld and `orchestrator.publish.publish_run` under the writer lease is
+    the only publisher -- while never asking for the one action that publisher
+    requires: the commit. Completed work therefore sat uncommitted in the task
+    clone, `workspace_provisioning`'s `agent_worktree_clean` refused it, and
+    the cascade spent every remaining attempt (and the model call behind each)
+    reproducing the same refusal before reporting `cascade_exhausted`.
+
+    This lives beside the routing matrix rather than in `tests/db` because the
+    planner's prompt is a hermetic property of the payload: the database-backed
+    planner suite is skipped wholesale without `AICC_TEST_PG_ADMIN_DSN`, and a
+    gate that only runs when a database happens to be configured is not a gate
+    on the contract it is meant to hold.
+    """
+    task = {
+        "task_id": "VOYN-W0-PROMPT-CONTRACT",
+        "wave": "0",
+        "priority": "P0",
+        "title": "t",
+        "body": "b",
+    }
+    payload, _budget = _payload_for(task, PlanLimits(), ("AICC", "/srv/repo"))
+    prompt = payload["prompt"]
+
+    assert "git commit" in prompt
+    assert "Do NOT push" in prompt
+    assert "do NOT open a pull request" in prompt
+    # The evidence trailer the orchestrator parses must survive any rewrite.
+    assert "HEAD_SHA: <the branch head commit sha>" in prompt
+    # The instruction that asked the agent to publish its own work is gone.
+    assert "When you open or update a pull request" not in prompt
