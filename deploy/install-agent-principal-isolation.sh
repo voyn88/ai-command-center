@@ -160,6 +160,19 @@ if [ "${1:-}" = "--uninstall" ]; then
     echo "baseline release selector is invalid" >&2
     exit 1
   fi
+  # Prove the baseline release BEFORE any privileged mutation. Uninstall is
+  # not a weaker moment than install -- the baseline is still code every
+  # worker ExecStart will run -- and this branch has no rollback trap, so a
+  # check that runs after `run_transaction uninstall` and the service disables
+  # can only report a partial uninstall it cannot undo (independent review on
+  # 25eb0a0c). No Git cross-check here: uninstall must work without a
+  # repository checkout, so the root-owned manifest is the authority.
+  if [ "$baseline_release_value" != ABSENT ]; then
+    run_release release-verify \
+      --release-tree "/opt/aicc/$baseline_release_value" \
+      --manifest "$release_manifest_dir/${baseline_release_value#releases/}.json" \
+      --release-id "${baseline_release_value#releases/}"
+  fi
   systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
   systemctl disable aicc-principal-recovery.service >/dev/null 2>&1 || true
   run_transaction uninstall
@@ -167,15 +180,6 @@ if [ "${1:-}" = "--uninstall" ]; then
   if [ "$baseline_release_value" = ABSENT ]; then
     rm -f -- "$current_release"
   else
-    # Uninstall is not a weaker moment than install: the baseline release is
-    # still code every worker ExecStart will run. Prove it before selecting it
-    # (independent review on cacfc257). No Git cross-check here -- uninstall
-    # must work without a repository checkout -- so the root-owned manifest is
-    # the authority.
-    run_release release-verify \
-      --release-tree "/opt/aicc/$baseline_release_value" \
-      --manifest "$release_manifest_dir/${baseline_release_value#releases/}.json" \
-      --release-id "${baseline_release_value#releases/}"
     baseline_tmp="/opt/aicc/.current-uninstall.$$"
     ln -s "$baseline_release_value" "$baseline_tmp"
     mv -Tf -- "$baseline_tmp" "$current_release"

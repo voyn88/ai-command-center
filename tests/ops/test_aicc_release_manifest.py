@@ -464,8 +464,25 @@ def test_rollback_and_uninstall_prove_the_release_they_restore():
     rollback = installer[installer.index("rollback() {") :]
     assert "release-verify" in rollback.split("trap rollback")[0]
     uninstall = installer[installer.index('if [ "${1:-}" = "--uninstall" ]') :]
-    assert (
-        "release-verify"
-        in uninstall.split("AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED")[0]
-    )
+    uninstall = uninstall.split("AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED")[0]
+    # Compare COMMANDS, not prose: the comments explaining this ordering name
+    # the very commands being ordered.
+    commands = [
+        line.strip()
+        for line in uninstall.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+    def first(fragment: str) -> int:
+        for index, line in enumerate(commands):
+            if fragment in line:
+                return index
+        raise AssertionError(f"uninstall never runs {fragment!r}")
+
+    # The proof must precede every privileged mutation: this branch has no
+    # rollback trap, so a check that runs after the service disables and the
+    # file transaction can only report a partial uninstall it cannot undo
+    # (independent review on 25eb0a0c).
+    assert first("release-verify") < first("systemctl disable")
+    assert first("release-verify") < first("run_transaction uninstall")
     assert "previous release failed verification; selector removed" in installer
