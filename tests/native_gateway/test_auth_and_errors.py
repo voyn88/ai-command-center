@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from native_gateway.provision import revoke
+
 from .conftest import auth_headers
 
 
@@ -34,10 +36,12 @@ def test_unauthorized_with_wrong_token(client):
 
 
 def test_unauthorized_when_device_disabled(client, device_token, registry_path):
-    registry = json.loads(registry_path.read_text(encoding="utf-8"))
-    registry["devices"][0]["disabled"] = True
-    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    """Revocation actually bites: a device revoked through the real operator
+    lever is refused on its very next request, with no cache to outlast it."""
+    assert revoke(registry_path, "mac-owner-01", "lost device") is True
+
     response = client.get("/v1/snapshot", headers=auth_headers(device_token))
+
     _assert_safe_error(response, 401, "unauthorized")
 
 

@@ -56,9 +56,21 @@ Errors: `401` (missing/invalid/disabled token, `WWW-Authenticate: Bearer`),
 ## Authentication
 
 Pre-provisioned per-device bearer tokens: `python -m native_gateway.provision
---registry <file> --device-id <id>` prints the token once and stores only its
-SHA-256 hash (file mode 0600, outside the repository). Constant-time
-comparison; disable-without-delete revocation; v1 issues only scope `read`.
+mint --registry <file> --device-id <id>` prints the token once and stores
+only its SHA-256 hash (file mode 0600, outside the repository). Constant-time
+comparison; v1 issues only scope `read`. The bare `--registry ... --device-id
+...` form (no subcommand) still works as a deprecated alias for `mint`, for
+existing deployment scripts.
+
+Revocation is disable-without-delete: `python -m native_gateway.provision
+revoke --registry <file> --device-id <id> --reason <text>` flips the device's
+`disabled` flag (checked fresh on every request — no cache, so a revoked
+device is refused on its very next call) and appends an `audit` entry to the
+registry recording who was revoked, why, and when. Idempotent: revoking an
+already-disabled device is not an error. Every mint/revoke write holds a file
+lock across its full read-modify-write cycle and lands atomically (temp file
++ fsync + rename), so concurrent CLI invocations cannot corrupt the registry
+or lose each other's updates.
 
 ## Operations
 
