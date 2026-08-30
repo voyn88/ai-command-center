@@ -183,7 +183,122 @@ def test_linux_procfs_identity_uses_high_resolution_start_ticks():
     assert query is not None
     assert query.status is identity.ProcessQueryStatus.LIVE
     assert query.identity is not None
-    assert query.identity.start_time.startswith("linux-procfs-startticks-v1:")
+    assert query.identity.start_time.startswith(
+        "linux-procfs-bootid-startticks-v2:"
+    )
+
+
+def _procfs_stat(*, start_ticks: int, mutable_counter: int, state: str = "S") -> str:
+    # Values after ``comm`` begin at procfs field 3. Index 19 is starttime
+    # (field 22); surrounding counters are intentionally synthetic.
+    fields = [state, *[str(mutable_counter)] * 18, str(start_ticks), "0", "0"]
+    return f"4242 (python worker) {' '.join(fields)}\n"
+
+
+def test_linux_procfs_identity_ignores_mutable_fields_between_reads(monkeypatch):
+    snapshots = iter(
+        [
+            _procfs_stat(start_ticks=987654, mutable_counter=1),
+            _procfs_stat(start_ticks=987654, mutable_counter=2),
+        ]
+    )
+    monkeypatch.setattr(identity.os.path, "isdir", lambda _path: True)
+    def read_text(path, *_args, **_kwargs):
+        if path.name == "boot_id":
+            return "11111111-2222-3333-4444-555555555555\n"
+        return next(snapshots)
+
+    monkeypatch.setattr(identity.Path, "read_text", read_text)
+
+    query = identity._query_identity_linux_procfs(4242)
+
+    assert query is not None
+    assert query.status is identity.ProcessQueryStatus.LIVE
+    assert query.identity == identity.ProcessIdentity(
+        pid=4242,
+        start_time=(
+            "linux-procfs-bootid-startticks-v2:"
+            "11111111-2222-3333-4444-555555555555:987654"
+        ),
+        command="python worker",
+    )
+
+
+def test_linux_procfs_identity_rejects_pid_reuse_between_reads(monkeypatch):
+    snapshots = iter(
+        [
+            _procfs_stat(start_ticks=111, mutable_counter=1),
+            _procfs_stat(start_ticks=222, mutable_counter=1),
+        ]
+    )
+    monkeypatch.setattr(identity.os.path, "isdir", lambda _path: True)
+    monkeypatch.setattr(
+        identity.Path, "read_text", lambda *_args, **_kwargs: next(snapshots)
+    )
+
+    query = identity._query_identity_linux_procfs(4242)
+
+    assert query is not None
+    assert query.status is identity.ProcessQueryStatus.UNKNOWN
+    assert query.identity is None
+
+
+def test_linux_procfs_identity_requires_boot_id(monkeypatch):
+    snapshots = iter(
+        [
+            _procfs_stat(start_ticks=987654, mutable_counter=1),
+            _procfs_stat(start_ticks=987654, mutable_counter=2),
+        ]
+    )
+    monkeypatch.setattr(identity.os.path, "isdir", lambda _path: True)
+
+    def read_text(path, *_args, **_kwargs):
+        if path.name == "boot_id":
+            raise PermissionError("boot identity unavailable")
+        return next(snapshots)
+
+    monkeypatch.setattr(identity.Path, "read_text", read_text)
+
+    query = identity._query_identity_linux_procfs(4242)
+
+    assert query is not None
+    assert query.status is identity.ProcessQueryStatus.UNKNOWN
+    assert query.identity is None
+
+
+def test_linux_procfs_identity_detects_same_ticks_from_another_boot():
+    current = identity.ProcessIdentity(
+        42,
+        (
+            "linux-procfs-bootid-startticks-v2:"
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:987654"
+        ),
+        "python",
+    )
+    recorded = (
+        "linux-procfs-bootid-startticks-v2:"
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb:987654|python"
+    )
+
+    assert identity.compare_recorded_identity(current, recorded) is False
+
+
+def test_linux_procfs_v1_and_v2_identities_are_incomparable():
+    current = identity.ProcessIdentity(
+        42,
+        (
+            "linux-procfs-bootid-startticks-v2:"
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:987654"
+        ),
+        "python",
+    )
+
+    assert (
+        identity.compare_recorded_identity(
+            current, "linux-procfs-startticks-v1:987654|python"
+        )
+        is None
+    )
 
 
 def test_capture_identity_handles_invalid_pid_gracefully():

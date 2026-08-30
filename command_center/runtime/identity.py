@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -29,10 +30,12 @@ from pathlib import Path
 
 _POSIX_PS_START_SCHEME = "posix-ps-utc-v1:"
 _LINUX_PROCFS_START_SCHEME = "linux-procfs-startticks-v1:"
+_LINUX_PROCFS_BOOT_START_SCHEME = "linux-procfs-bootid-startticks-v2:"
 _WINDOWS_FILETIME_START_SCHEME = "windows-filetime-v1:"
 _KNOWN_START_SCHEMES = (
     _POSIX_PS_START_SCHEME,
     _LINUX_PROCFS_START_SCHEME,
+    _LINUX_PROCFS_BOOT_START_SCHEME,
     _WINDOWS_FILETIME_START_SCHEME,
 )
 
@@ -222,29 +225,58 @@ def _query_identity_linux_procfs(pid: int) -> ProcessQuery | None:
         return ProcessQuery(ProcessQueryStatus.ABSENT)
     except (OSError, UnicodeError):
         return ProcessQuery(ProcessQueryStatus.UNKNOWN)
-    if first != second:
+    def parse(raw: str) -> tuple[str, str, str] | None:
+        closing = raw.rfind(")")
+        opening = raw.find("(")
+        if opening < 0 or closing <= opening:
+            return None
+        fields = raw[closing + 1 :].split()
+        # After ``comm`` the first value is field 3 (state); starttime is
+        # field 22. The other fields are mutable counters and must not be used
+        # to decide whether two reads observed the same process.
+        if len(fields) <= 19:
+            return None
+        start_ticks = fields[19]
+        command = raw[opening + 1 : closing]
+        if not start_ticks.isdigit() or not command:
+            return None
+        return fields[0], start_ticks, command
+
+    first_snapshot = parse(first)
+    second_snapshot = parse(second)
+    if first_snapshot is None or second_snapshot is None:
         return ProcessQuery(ProcessQueryStatus.UNKNOWN)
-    closing = first.rfind(")")
-    opening = first.find("(")
-    if opening < 0 or closing <= opening:
+    first_state, first_start_ticks, _first_command = first_snapshot
+    second_state, start_ticks, command = second_snapshot
+    # A different immutable birth tick means the PID was reused between reads.
+    # Mutable procfs counters are expected to change and are deliberately
+    # ignored. A zombie cannot become live again without PID reuse.
+    if first_start_ticks != start_ticks or (
+        first_state.startswith("Z") and not second_state.startswith("Z")
+    ):
         return ProcessQuery(ProcessQueryStatus.UNKNOWN)
-    fields = first[closing + 1 :].split()
-    # After ``comm`` the first value is field 3 (state); starttime is field 22.
-    if len(fields) <= 19:
-        return ProcessQuery(ProcessQueryStatus.UNKNOWN)
-    if fields[0].startswith("Z"):
+    if second_state.startswith("Z"):
         return ProcessQuery(ProcessQueryStatus.ZOMBIE)
-    start_ticks = fields[19]
-    if not start_ticks.isdigit():
-        return ProcessQuery(ProcessQueryStatus.UNKNOWN)
-    command = first[opening + 1 : closing]
-    if not command:
+    try:
+        boot_id = str(
+            uuid.UUID(
+                (Path("/proc/sys/kernel/random/boot_id")).read_text(
+                    encoding="ascii"
+                ).strip()
+            )
+        )
+    except (FileNotFoundError, OSError, UnicodeError, ValueError):
+        # Start ticks restart from zero at boot. Without the kernel boot ID,
+        # a durable identity could collide with an unrelated process after a
+        # host reboot, so an available-but-incomplete procfs must fail closed.
         return ProcessQuery(ProcessQueryStatus.UNKNOWN)
     return ProcessQuery(
         ProcessQueryStatus.LIVE,
         ProcessIdentity(
             pid=pid,
-            start_time=f"{_LINUX_PROCFS_START_SCHEME}{start_ticks}",
+            start_time=(
+                f"{_LINUX_PROCFS_BOOT_START_SCHEME}{boot_id}:{start_ticks}"
+            ),
             command=command,
         ),
     )
