@@ -464,9 +464,13 @@ def main(argv: list[str] | None = None) -> int:
                     run_historical_backfill,
                 )
 
-                report = run_historical_backfill(
-                    _Path(args.sqlite_path), lambda: nullcontext(conn), tables=args.tables
-                )
+                try:
+                    report = run_historical_backfill(
+                        _Path(args.sqlite_path), lambda: nullcontext(conn), tables=args.tables
+                    )
+                except ValueError as exc:
+                    print(f"refused: {exc}", file=sys.stderr)
+                    return 2
                 failed = False
                 for table_report in report.tables:
                     print(

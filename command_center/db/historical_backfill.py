@@ -153,7 +153,9 @@ def run_historical_backfill(
     (a test, or the CLI reusing one checked-out connection for the whole run)
     supplies its own. `tables` restricts the run to a subset — a resume after a
     partial failure, or a focused check — and defaults to every declared
-    mirror, in dependency order.
+    mirror, in dependency order. A name that names no declared mirror raises
+    `ValueError` rather than being dropped: an operator's `--table` typo must
+    not read back as a successful, empty backfill.
 
     A row whose `upsert()` raises is recorded and does not abort the table: one
     malformed historical row (unparseable JSON, a value a `CHECK` constraint
@@ -166,6 +168,12 @@ def run_historical_backfill(
     order = wave_order(mirrors)
     if tables is not None:
         wanted = set(tables)
+        unknown = wanted - mirrors.keys()
+        if unknown:
+            raise ValueError(
+                "no such mirrored table(s): "
+                f"{', '.join(sorted(unknown))} (declared: {', '.join(sorted(mirrors))})"
+            )
         order = [table for table in order if table in wanted]
 
     reports: list[TableBackfillReport] = []

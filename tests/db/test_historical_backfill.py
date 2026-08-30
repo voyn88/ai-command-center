@@ -111,6 +111,21 @@ def test_historical_backfill_can_be_restricted_to_a_subset(
     assert report.tables[0].ok
 
 
+def test_historical_backfill_rejects_an_unknown_table_name(
+    tmp_path, pg_connection_factory
+) -> None:
+    """A `--table` typo must fail loudly, not read back as an empty success:
+    an unrecognized name silently dropped from `order` would copy and
+    reconcile nothing while still reporting `report.ok`."""
+    sqlite_path = tmp_path / "runtime.db"
+    _seed_one_row_per_table(sqlite_path)
+
+    with pytest.raises(ValueError, match="typo"):
+        run_historical_backfill(
+            sqlite_path, pg_connection_factory, tables=["task", "typo"]
+        )
+
+
 def test_identity_tables_resync_their_sequence_after_backfill(
     tmp_path, pg_connection_factory
 ) -> None:
