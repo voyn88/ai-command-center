@@ -34,8 +34,21 @@ DEFAULT_TIMEOUT_SECONDS = 900
 
 
 class ExecutionCenterAPI:
-    def __init__(self, db_path: Path | None = None, sup: supervisor.Supervisor | None = None) -> None:
-        self.supervisor = sup or supervisor.Supervisor(db_path)
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        sup: supervisor.Supervisor | None = None,
+        *,
+        maintenance_token: str | None = None,
+        maintenance_lock_handle: supervisor.RuntimeLockHandle | None = None,
+        enable_completion_autopilot: bool | None = None,
+    ) -> None:
+        self.supervisor = sup or supervisor.Supervisor(
+            db_path,
+            maintenance_token=maintenance_token,
+            maintenance_lock_handle=maintenance_lock_handle,
+            enable_completion_autopilot=enable_completion_autopilot,
+        )
         self.db_path = self.supervisor.db_path
 
     # ------------------------------------------------------------------

@@ -24,6 +24,9 @@ def _make_running_row(db_path, *, pid, process_start_identity):
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(
@@ -88,8 +91,11 @@ def test_reconcile_never_signals_a_process_matched_only_by_reused_pid(tmp_path):
 
     unrelated = subprocess.Popen(["sleep", "3"])
     try:
+        current = identity.capture_identity(unrelated.pid)
+        assert current is not None
+        stale_identity = f"{current.start_time}-different|{current.command}"
         run = _make_running_row(
-            db_path, pid=unrelated.pid, process_start_identity="totally-bogus-recorded-identity"
+            db_path, pid=unrelated.pid, process_start_identity=stale_identity
         )
         sup = supervisor.Supervisor(db_path)
         outcomes = sup.reconcile()
@@ -97,6 +103,27 @@ def test_reconcile_never_signals_a_process_matched_only_by_reused_pid(tmp_path):
         assert outcomes[0]["classification"] == "INTERRUPTED"
         assert db.get_run(db_path, run["id"])["state"] == "INTERRUPTED"
         # The unrelated process must still be alive — it was never signalled.
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait()
+
+
+def test_reconcile_legacy_live_identity_mismatch_is_unknown(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+
+    unrelated = subprocess.Popen(["sleep", "3"])
+    try:
+        run = _make_running_row(
+            db_path,
+            pid=unrelated.pid,
+            process_start_identity="Sat Aug 29 17:23:45 2026|sleep 3",
+        )
+        outcomes = supervisor.Supervisor(db_path).reconcile()
+
+        assert outcomes[0]["classification"] == "UNKNOWN"
+        assert db.get_run(db_path, run["id"])["state"] == "UNKNOWN"
         assert unrelated.poll() is None
     finally:
         unrelated.terminate()
@@ -159,10 +186,16 @@ def test_reconcile_only_touches_running_rows(tmp_path):
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="RUNNING")
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="COMPLETED")
+    assert db.mark_run_finalized(
+        db_path, run["id"], owner_token="dead-supervisor"
+    ) is not None
 
     sup = supervisor.Supervisor(db_path)
     outcomes = sup.reconcile()
@@ -201,6 +234,9 @@ def _make_queued_row(db_path, *, pid=None, process_start_identity=None):
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     if pid is not None:
@@ -217,6 +253,9 @@ def _make_prepared_row(db_path):
     return db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
 
 
@@ -429,6 +468,9 @@ def _make_running_row_with_timeout(db_path, *, pid, process_start_identity, star
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False, timeout_seconds=timeout_seconds,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(
@@ -444,7 +486,9 @@ def test_reconcile_reaps_an_orphan_past_its_timeout(tmp_path):
     # A real, own-session-group process so os.killpg(pid) targets exactly it.
     proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
-        recorded = identity.capture_identity(proc.pid).as_string()
+        captured = identity.capture_identity(proc.pid)
+        assert captured is not None
+        recorded = captured.as_string()
         run = _make_running_row_with_timeout(
             db_path, pid=proc.pid, process_start_identity=recorded,
             started_at="2020-01-01T00:00:00", timeout_seconds=1,  # long past its deadline
@@ -452,9 +496,11 @@ def test_reconcile_reaps_an_orphan_past_its_timeout(tmp_path):
         sup = supervisor.Supervisor(db_path)
         sup.reconcile()
 
-        assert db.get_run(db_path, run["id"])["state"] == "INTERRUPTED"
-        proc.wait(timeout=5)  # its process group was killed
-        assert proc.poll() is not None
+        # A database identity is not a live ownership handle. Even past the
+        # deadline, cross-restart reconciliation never sends a destructive
+        # signal without pidfd+cgroup/job-object ownership.
+        assert db.get_run(db_path, run["id"])["state"] == "RUNNING"
+        assert proc.poll() is None
     finally:
         if proc.poll() is None:
             proc.kill()
