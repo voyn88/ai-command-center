@@ -1032,7 +1032,32 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "voyn-aicc-worker-2.service" not in verifier
     assert "lane_registry=/etc/aicc/worker-lanes" in verifier
     assert "/etc/voyn/aicc-worker-lanes.conf" not in verifier
-    assert "run_rollout snapshot --lanes /etc/aicc/worker-lanes" in installer
+    assert (
+        'run_rollout snapshot --lanes "$repo_root/deploy/aicc/worker-lanes"'
+        in installer
+    )
+    uninstall = installer[installer.index('if [ "${1:-}" = "--uninstall" ]') :]
+    uninstall = uninstall.split("# Validate the stable authority")[0]
+    assert "run_rollout snapshot --lanes /etc/aicc/worker-lanes" in uninstall
+    assert "run_transaction uninstall-begin" in uninstall
+    assert "run_transaction uninstall-arm" in uninstall
+    assert "run_transaction uninstall-complete" in uninstall
+    assert 'run_transaction quiesce --service-snapshot "$uninstall_units"' in uninstall
+    assert uninstall.count("run_rollout verify-snapshot-closure") == 3
+    assert uninstall.index("run_transaction recover") < uninstall.index(
+        "baseline_release_value="
+    )
+    assert uninstall.index("release-verify") < uninstall.index(
+        "run_rollout snapshot --lanes /etc/aicc/worker-lanes"
+    )
+    assert uninstall.index(
+        "run_rollout snapshot --lanes /etc/aicc/worker-lanes"
+    ) < uninstall.index("run_transaction quiesce")
+    assert uninstall.rindex("run_rollout verify-snapshot-closure") < uninstall.rindex(
+        "run_transaction uninstall-complete"
+    )
+    assert ": \"${AICC_INSTALL_LOCK_FD:?" in installer
+    assert '--lock-fd "$AICC_INSTALL_LOCK_FD"' in installer
     assert "run_rollout rollout --lanes /etc/aicc/worker-lanes" in installer
     assert "repo_lanes=" not in installer
     assert "source " not in installer
