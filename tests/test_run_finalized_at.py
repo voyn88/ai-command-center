@@ -1433,3 +1433,147 @@ def test_without_the_widening_the_marker_and_the_report_never_disagree(
         # assertions above already proved it stayed visible.
         assert result.returncode == -signal.SIGKILL, result.stderr
         assert not finalized
+
+
+def test_persist_run_failure_does_not_finalize_a_pre_existing_terminal_row(
+    git_repo, configure_project_repo
+):
+    """`_persist_run_failure` is only the bounded CAS fallback that confirms a
+    process is gone; it must never be the thing that stamps `finalized_at`.
+
+    A run can already be terminal here without this call having done it — a
+    concurrent exit-detection path (another `_persist_run_failure` caller, a
+    `_timeout_watchdog` race, a `reconcile()` pass) may have CAS'd the state
+    first and be mid-way through creating the report or the auto-commit. Prior
+    to VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY, this branch
+    finalized on the spot (`confirm_finalized()`), which could publish the
+    marker before that other writer's report existed. Finalization now happens
+    exclusively through the claim-gated `_complete_owned_terminal_finalization`,
+    so this call must leave the row exactly as it found it: terminal, but with
+    no report and no marker of its own making.
+    """
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(sup, git_repo, state="FAILED")
+    assert run["finalized_at"] is None
+
+    result = sup._persist_run_failure(
+        run["id"],
+        exit_code=1,
+        failure_reason="supervision_failed",
+        lifecycle="supervision_failed",
+    )
+
+    assert result is False
+    row = db.get_run(sup.db_path, run["id"])
+    assert row["state"] == "FAILED"
+    assert row["finalized_at"] is None
+    assert db.get_report(sup.db_path, run["id"]) is None
+    assert not sup._has_lifecycle_event(run["id"], "supervision_failed")
+
+
+def test_persist_run_failure_transition_defers_finalization_to_completion(
+    git_repo, configure_project_repo
+):
+    """The primary path (this call performs the ACTIVE -> FAILED transition
+    itself) must draw the same boundary as the pre-existing-terminal branch
+    above: persisting the terminal decision is not finalizing it. A regression
+    that re-inlines `mark_finalized` into this call would reintroduce exactly
+    the race the adversarial review of PR #473 (51bfa483) flagged — the marker
+    published before the report or auto-commit its meaning depends on.
+    """
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    task = db.create_task(
+        sup.db_path, project="AIOS", title="active", task_type="implementation"
+    )
+    session = db.create_session(
+        sup.db_path, task_id=task["id"], project="AIOS", repository_path=str(git_repo)
+    )
+    run = db.create_run(
+        sup.db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="active",
+        is_resume=False,
+        command=["claude", "--print"],
+        finalization_owner_token=sup._finalization_owner_token,
+        finalization_owner_pid=sup._finalization_owner_pid,
+        finalization_owner_identity=sup._finalization_owner_identity,
+    )
+    run = db.update_run_state(
+        sup.db_path, run["id"], expected_version=run["version"], new_state="QUEUED"
+    )
+    run = db.update_run_state(
+        sup.db_path, run["id"], expected_version=run["version"], new_state="RUNNING"
+    )
+
+    result = sup._persist_run_failure(
+        run["id"],
+        exit_code=1,
+        failure_reason="supervision_failed",
+        lifecycle="supervision_failed",
+    )
+
+    assert result is True
+    mid_flight = db.get_run(sup.db_path, run["id"])
+    assert mid_flight["state"] == "FAILED"
+    assert mid_flight["finalized_at"] is None
+    assert db.get_report(sup.db_path, run["id"]) is None
+    assert sup._has_lifecycle_event(run["id"], "supervision_failed")
+
+    assert sup._complete_owned_terminal_finalization(
+        run["id"], exit_code=1, lifecycle="supervision_failed"
+    )
+    settled = db.get_run(sup.db_path, run["id"])
+    assert settled["finalized_at"] is not None
+    assert db.get_report(sup.db_path, run["id"]) is not None
+
+
+def test_reconciliation_state_does_not_finalize_a_row_owned_by_a_live_supervisor(
+    git_repo, configure_project_repo, monkeypatch
+):
+    """`_persist_reconciliation_state` must fail closed on a terminal but
+    unfinalized row that belongs to another still-live supervisor, rather than
+    racing that owner's in-flight report/commit writes to publish the marker
+    first. Prior to VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY,
+    this path stamped `finalized_at` unconditionally for every terminal row it
+    saw, with no ownership check and no reconstructed report.
+    """
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo, state="FAILED")
+    replaced = db.claim_run_finalization(
+        original.db_path,
+        run["id"],
+        owner_token="live-owner",
+        owner_pid=4242,
+        owner_identity="posix-ps-utc-v1:live-start|live-command",
+        expected_owner_token=original._finalization_owner_token,
+    )
+    assert replaced is not None
+
+    contender = supervisor.Supervisor(db_path=original.db_path)
+    contender._finalization_owner_token = "contender"
+    contender._finalizer.owner_token = "contender"
+    monkeypatch.setattr(
+        supervisor.identity,
+        "query_identity",
+        lambda _pid: identity.ProcessQuery(
+            identity.ProcessQueryStatus.LIVE,
+            identity.ProcessIdentity(
+                4242, "posix-ps-utc-v1:live-start", "live-command"
+            ),
+        ),
+    )
+
+    persisted = contender._persist_reconciliation_state(run["id"], classification="FAILED")
+
+    assert persisted["finalized_at"] is None
+    assert db.get_report(original.db_path, run["id"]) is None
+    claim = db.get_run_finalization_claim(original.db_path, run["id"])
+    assert claim["owner_token"] == "live-owner"
+    assert claim["completed_at"] is None
