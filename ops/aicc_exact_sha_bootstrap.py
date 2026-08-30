@@ -201,8 +201,17 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
 
 
 def _git_blob_oid(payload: bytes) -> str:
+    """The blob's Git object name.
+
+    SHA-1 is not a choice here and carries no security claim of its own: it is
+    the identity function of the repository format, and the value is compared
+    against an oid Git itself produced. `usedforsecurity=False` states that,
+    so neither a reader nor a scanner mistakes it for hashing a secret. The
+    trust in this payload comes from the exact commit SHA the bootstrap pins,
+    not from the strength of this digest.
+    """
     prefix = f"blob {len(payload)}\0".encode("ascii")
-    return hashlib.sha1(prefix + payload).hexdigest()
+    return hashlib.new("sha1", prefix + payload, usedforsecurity=False).hexdigest()
 
 
 def _verify_owned_tree(root: Path, *, trusted_uid: int, trusted_gid: int) -> None:

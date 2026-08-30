@@ -886,8 +886,13 @@ class ReleaseRefused(RuntimeError):
 
 
 def _git_blob_oid(payload: bytes) -> str:
-    return hashlib.sha1(  # noqa: S324 - Git object identity, not a security digest
-        f"blob {len(payload)}\0".encode("ascii") + payload
+    # Git's own identity function for a blob, not a security digest: the value
+    # is only ever compared against an oid Git produced. See the same helper in
+    # ops/aicc_exact_sha_bootstrap.py.
+    return hashlib.new(
+        "sha1",
+        f"blob {len(payload)}\0".encode("ascii") + payload,
+        usedforsecurity=False,
     ).hexdigest()
 
 
