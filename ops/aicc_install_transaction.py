@@ -649,6 +649,67 @@ def _read_regular(path: Path, *, max_bytes: int = 128 * 1024 * 1024) -> FileStat
         os.close(descriptor)
 
 
+def _digest_regular(
+    path: Path, *, max_bytes: int = 8 * 1024 * 1024 * 1024
+) -> tuple[str, int, int, int, int]:
+    """`_read_regular`'s guarantees for a file too large to hold in memory.
+
+    Returns `(sha256, size, mode, uid, gid)` and never materialises the
+    content. The release manifest needs a digest of every file in a tree that
+    includes ~300 MB native binaries -- `_read_regular` would read each one
+    whole, which is why its 128 MB bound refused them outright (found on the
+    first live install: the copilot binary is 180 MB, claude 311 MB).
+
+    The safety properties are identical and deliberately kept in lockstep:
+    O_NOFOLLOW so a symlink cannot be followed, a single link so no other name
+    aliases the inode, a regular file only, and an fstat before and after that
+    must agree on device, inode, size, both timestamps, ownership and mode --
+    so a file rewritten while it was being hashed is refused rather than
+    recorded. The bound stays, just at a size an artifact can actually be.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size > max_bytes
+        ):
+            raise RuntimeError(f"protected file shape is unsafe: {path}")
+        digest = hashlib.sha256()
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 4 * 1024 * 1024))
+            if not chunk:
+                raise RuntimeError(f"protected file was truncated: {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        final = os.fstat(descriptor)
+        if (
+            final.st_dev != info.st_dev
+            or final.st_ino != info.st_ino
+            or final.st_size != info.st_size
+            or final.st_mtime_ns != info.st_mtime_ns
+            or final.st_ctime_ns != info.st_ctime_ns
+            or final.st_uid != info.st_uid
+            or final.st_gid != info.st_gid
+            or stat.S_IMODE(final.st_mode) != stat.S_IMODE(info.st_mode)
+        ):
+            raise RuntimeError(f"protected file changed while being read: {path}")
+        return (
+            digest.hexdigest(),
+            info.st_size,
+            stat.S_IMODE(info.st_mode),
+            info.st_uid,
+            info.st_gid,
+        )
+    finally:
+        os.close(descriptor)
+
+
 def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bool:
     return (
         state.sha256 == sha256
@@ -1846,15 +1907,18 @@ def _release_entry(
         # A hardlink lets a writer of any other directory keep a mutable alias
         # to release content that `chmod -R a-w` appears to have frozen.
         raise ReleaseRefused(f"release file is hardlinked: {relative}")
-    state = _read_regular(path)
-    if state.uid != trusted_uid or state.gid != trusted_gid:
+    # Streamed rather than read whole: a release tree carries native binaries
+    # of a few hundred megabytes, and holding each one in memory to hash it is
+    # both wasteful and, at `_read_regular`'s 128 MB bound, a hard refusal.
+    digest, size, mode, uid, gid = _digest_regular(path)
+    if uid != trusted_uid or gid != trusted_gid:
         raise ReleaseRefused(f"release file ownership changed while read: {relative}")
     return {
         "path": relative,
         "kind": "file",
-        "mode": state.mode,
-        "sha256": state.sha256,
-        "size": len(state.payload),
+        "mode": mode,
+        "sha256": digest,
+        "size": size,
     }
 
 
