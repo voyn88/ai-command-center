@@ -173,6 +173,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    backfill = sub.add_parser(
+        "historical-backfill",
+        help="Copy pre-existing SQLite rows into their PostgreSQL mirrors, in "
+        "dependency order (parents before children). Idempotent, safe to "
+        "re-run. A row that fails to upsert is reported, not fatal to the "
+        "rest of the run (VOYN-W0-AICC-SRV-07).",
+    )
+    backfill.add_argument("sqlite_path", help="Path to the application's SQLite database.")
+    backfill.add_argument(
+        "--table",
+        dest="tables",
+        action="append",
+        default=None,
+        metavar="TABLE",
+        help="Restrict the run to this mirrored table (repeatable). Default: "
+        "every mirrored table. A name no mirror declares refuses the run "
+        "rather than silently backfilling nothing.",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -437,6 +456,42 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "historical-backfill":
+                from command_center.db.historical_backfill import (
+                    UnknownTablesError,
+                    run_historical_backfill,
+                )
+
+                wanted = set(args.tables) if args.tables else None
+                try:
+                    report = run_historical_backfill(
+                        args.sqlite_path, lambda: nullcontext(conn), tables=wanted
+                    )
+                except UnknownTablesError as exc:
+                    print(f"refused: {exc}", file=sys.stderr)
+                    return 2
+                for table_report in report.tables:
+                    print(
+                        f"{table_report.table}: read {table_report.rows_read}, "
+                        f"wrote {table_report.rows_written}, "
+                        f"errors {len(table_report.errors)}, "
+                        f"divergent {len(table_report.divergence)}"
+                    )
+                    for key, reason in table_report.errors:
+                        print(f"  ERROR {key}: {reason}")
+                    if table_report.identity_resynced_to is not None:
+                        print(f"  identity resynced to {table_report.identity_resynced_to}")
+                    if table_report.resync_error:
+                        print(f"  RESYNC-ERROR: {table_report.resync_error}")
+                print(
+                    f"total: wrote {report.total_rows_written} row(s), "
+                    f"{report.total_errors} error(s)"
+                )
+                # Non-zero on any row/resync error so a mistyped or partial
+                # run cannot be mistaken for a clean one from the exit code
+                # alone.
+                return 1 if report.total_errors else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
