@@ -77,10 +77,16 @@ UMask=0077
 StateDirectory=aicc-worker
 StateDirectoryMode=0700
 ReadWritePaths=/srv/aicc-workspaces
-# Resource envelope (SRV-05): declared limits, enforced by cgroups — which,
-# unlike the mount/network sandbox directives, apply for user units too.
-# Acceptance of the *sandbox* directives is measurement-from-inside per
-# SRV-05-B and deliberately not claimed here.
+# Resource envelope (SRV-05): declared limits, enforced by cgroups.
+# The mount/namespace directives above are not weaker under a user manager --
+# namespaces work the same way there. What makes them a BOUNDARY here is that
+# this is a system unit: root-owned under /etc/systemd/system, so the
+# User=aicc-worker account this confines has no write access to its own
+# confinement and cannot edit-and-reload its way out. A user unit inverts
+# that (the confined account owns the unit file too), which is exactly what
+# tests/ops/test_user_unit_boundary.py exists to keep this unit out of.
+# Acceptance of the *sandbox* directives' effect from inside the process is
+# measurement-from-inside per SRV-05-B and deliberately not claimed here.
 MemoryMax=6G
 MemoryHigh=5G
 CPUQuota=300%
