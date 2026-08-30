@@ -42,6 +42,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
@@ -195,29 +196,59 @@ class AcceptanceController:
         clock: Callable[[], float] = time.monotonic,
         metrics: ControllerMetrics | None = None,
         audit: Callable[[dict], None] | None = None,
+        app_id: int | None = None,
     ) -> None:
         self._checks = checks
         self._reviews = reviews
         self._clock = clock
+        self._app_id = app_id
+        self._create_lock = threading.Lock()
         self.metrics = metrics or ControllerMetrics()
         self._audit = audit or (lambda _record: None)
 
     # -- check lifecycle -------------------------------------------------
 
+    def _owns(self, run: dict, key: CheckKey) -> bool:
+        """Whether this run is genuinely ours.
+
+        `external_id` alone is not ownership: it is derived from public facts
+        (repository, SHA, policy version), so anyone able to create a check on
+        the commit can produce the same value. Adopting such a check would let
+        another producer decide what our required context reports. Ownership
+        therefore requires the name we publish under AND, when the API reports
+        it, the app id we run as (independent review on 708afbb).
+        """
+        if run.get("external_id") != key.external_id:
+            return False
+        if run.get("name") != CHECK_NAME:
+            return False
+        app_id = (run.get("app") or {}).get("id")
+        if self._app_id is not None and app_id is not None and app_id != self._app_id:
+            return False
+        return True
+
     def _find_check(self, key: CheckKey) -> dict | None:
         """The check this controller already owns for this exact question.
 
-        Looked up by `external_id` among the checks GitHub reports for the SHA,
-        rather than remembered locally: after a restart the API is the state,
-        and a controller that trusted its own memory would create a second
-        check for a question already answered.
+        Looked up among the checks GitHub reports for the SHA rather than
+        remembered locally: after a restart the API is the state, and a
+        controller that trusted its own memory would create a second check for
+        a question already answered.
         """
-        for run in self._checks.list_check_runs(key.repository, key.head_sha):
-            if not isinstance(run, dict):
-                continue
-            if run.get("external_id") == key.external_id:
-                return run
-        return None
+        owned = [
+            run
+            for run in self._checks.list_check_runs(key.repository, key.head_sha)
+            if isinstance(run, dict) and self._owns(run, key)
+        ]
+        if len(owned) > 1:
+            # Two checks for one question means two controllers, or a lost
+            # race. Either way the answer is ambiguous and ambiguity fails
+            # closed rather than picking one arbitrarily.
+            raise ControllerError(
+                f"{len(owned)} controller-owned checks exist for {key.head_sha}; "
+                "refusing to decide while ownership is ambiguous"
+            )
+        return owned[0] if owned else None
 
     def ensure_in_progress(self, key: CheckKey) -> dict:
         """Create the check for a head SHA, or return the existing one.
@@ -231,6 +262,21 @@ class AcceptanceController:
         existing = self._find_check(key)
         if existing is not None:
             return existing
+        # find-then-create is not atomic and the Checks API has no uniqueness
+        # constraint on external_id, so two first deliveries can both find
+        # nothing and both create. A local lock closes the in-process race; the
+        # cross-process one is closed by re-reading after the create and
+        # failing closed if a second check appeared (independent review on
+        # 708afbb). Failing closed is right here: a duplicated required check
+        # blocks the merge until a human looks, which is the safe direction.
+        with self._create_lock:
+            existing = self._find_check(key)
+            if existing is not None:
+                return existing
+            created = self._create_and_confirm(key)
+        return created
+
+    def _create_and_confirm(self, key: CheckKey) -> dict:
         created = self._checks.create_check_run(
             key.repository,
             {
@@ -259,6 +305,9 @@ class AcceptanceController:
                 "check_run_id": created.get("id"),
             }
         )
+        # Re-read: if another controller created one in the same window, this
+        # raises rather than letting two checks answer for one commit.
+        self._find_check(key)
         return created
 
     def _complete(self, key: CheckKey, check: dict, decision: Decision) -> dict:
@@ -292,11 +341,30 @@ class AcceptanceController:
 
     # -- decisions -------------------------------------------------------
 
-    def decide_pull_request(self, repository: str, number: int) -> Decision:
-        """Apply the shared policy to a pull request's current reviews."""
+    def decide_pull_request(
+        self, repository: str, number: int, head_sha: str
+    ) -> Decision:
+        """Apply the shared policy to one pull request AT ONE EXACT COMMIT.
+
+        `head_sha` is passed in rather than read from the API on purpose. A
+        delivery can arrive after the branch has moved, and "the pull request's
+        current head" would then be a different commit than the one this
+        decision is about -- the check would be attached to the event's commit
+        while the verdict was judged against a newer one. Acceptance is per
+        commit, so the commit is an argument, not something rediscovered.
+        """
         try:
             pull = self._reviews.pull_request(repository, number)
             reviews = self._reviews.reviews(repository, number)
+            # Reading the shape belongs INSIDE the guard: a call can return
+            # 200 and still hand back something that is not the object we
+            # expect, and a TypeError escaping here would crash the handler
+            # instead of failing the check closed (independent review on
+            # 708afbb).
+            if not isinstance(pull, dict):
+                raise TypeError(f"pull request payload is not an object: {pull!r}")
+            author = ((pull.get("user") or {}).get("login")) or ""
+            api_head = ((pull.get("head") or {}).get("sha") or "").lower()
         except Exception as exc:  # noqa: BLE001 - any API failure is ambiguity
             # Fail closed: an unreadable answer is not evidence of acceptance,
             # and leaving it pending would let a merge wait on a check that
@@ -309,8 +377,21 @@ class AcceptanceController:
                     f"reviews, so independence is unproven: {exc}"
                 ),
             )
-        head = ((pull.get("head") or {}).get("sha") or "").lower()
-        author = ((pull.get("user") or {}).get("login")) or ""
+        head = head_sha.lower()
+        if api_head and api_head != head:
+            # The branch moved since this event was emitted. Deciding for the
+            # commit the caller named is correct -- that is the commit whose
+            # check this is -- and saying so keeps the reason on the record
+            # rather than leaving a silently stale-looking result.
+            self._audit(
+                {
+                    "event": "head_moved_since_event",
+                    "repository": repository,
+                    "number": number,
+                    "deciding_for": head,
+                    "current_head": api_head,
+                }
+            )
         try:
             reviewer = evaluate(reviews, head, author)
         except AcceptanceError as refusal:
@@ -358,7 +439,7 @@ class AcceptanceController:
         key = CheckKey(repository=repository, head_sha=head)
         started = self._clock()
         check = self.ensure_in_progress(key)
-        decision = self.decide_pull_request(repository, number)
+        decision = self.decide_pull_request(repository, number, key.head_sha)
         if not decision.is_pending:
             self._complete(key, check, decision)
         self.metrics.record(decision, self._clock() - started)
@@ -380,7 +461,7 @@ class AcceptanceController:
         key = CheckKey(repository=repository, head_sha=head)
         started = self._clock()
         check = self.ensure_in_progress(key)
-        decision = self.decide_pull_request(repository, number)
+        decision = self.decide_pull_request(repository, number, key.head_sha)
         if not decision.is_pending:
             self._complete(key, check, decision)
         self.metrics.record(decision, self._clock() - started)
@@ -418,6 +499,15 @@ class AcceptanceController:
                     f"this merge group contains: {exc}"
                 ),
             )
+        if not isinstance(members, list):
+            return Decision(
+                conclusion=_FAILURE,
+                title="Merge group composition could not be established",
+                summary=(
+                    "The merge group's membership was not a list, so its "
+                    f"composition is unproven: {members!r}"
+                ),
+            )
         if not members:
             return Decision(
                 conclusion=_FAILURE,
@@ -429,6 +519,12 @@ class AcceptanceController:
             )
         accepted: list[str] = []
         for member in members:
+            if not isinstance(member, dict):
+                return Decision(
+                    conclusion=_FAILURE,
+                    title="Merge group member is not identifiable",
+                    summary=f"A merge group entry was not an object: {member!r}",
+                )
             number = member.get("number")
             member_head = (member.get("head_sha") or "").lower()
             if not isinstance(number, int) or SHA_RE.fullmatch(member_head) is None:
@@ -440,7 +536,32 @@ class AcceptanceController:
                         f"exact head commit: {member!r}"
                     ),
                 )
-            decision = self.decide_pull_request(repository, number)
+            try:
+                current = self._reviews.pull_request(repository, number)
+                current_head = ((current.get("head") or {}).get("sha") or "").lower()
+            except Exception as exc:  # noqa: BLE001 - ambiguity fails closed
+                return Decision(
+                    conclusion=_FAILURE,
+                    title="Merge group member could not be verified",
+                    summary=(
+                        f"#{number} could not be read, so the group's composition "
+                        f"is unproven: {exc}"
+                    ),
+                )
+            if current_head and current_head != member_head:
+                # The queue entry names one commit and the pull request is now
+                # at another. Accepting the group would approve a chain that no
+                # longer describes the pull requests in it (independent review
+                # on 708afbb).
+                return Decision(
+                    conclusion=_FAILURE,
+                    title="Merge group no longer matches its pull requests",
+                    summary=(
+                        f"#{number} is queued at {member_head} but its head is now "
+                        f"{current_head}; the group must be rebuilt"
+                    ),
+                )
+            decision = self.decide_pull_request(repository, number, member_head)
             if decision.conclusion != _SUCCESS:
                 detail = (
                     decision.summary
@@ -477,7 +598,7 @@ class AcceptanceController:
         key = CheckKey(repository=repository, head_sha=head_sha.lower())
         started = self._clock()
         check = self.ensure_in_progress(key)
-        decision = self.decide_pull_request(repository, number)
+        decision = self.decide_pull_request(repository, number, key.head_sha)
         if not decision.is_pending:
             self._complete(key, check, decision)
         self.metrics.record(decision, self._clock() - started)

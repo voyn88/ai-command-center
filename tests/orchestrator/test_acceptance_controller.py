@@ -454,3 +454,142 @@ def test_a_check_from_an_older_policy_version_is_not_adopted():
     assert len(checks.created) == 2
     assert checks.created[1]["status"] == "in_progress"
     assert checks.updated == []
+
+
+# -- findings from the independent review of 708afbb ----------------------
+
+
+def test_a_foreign_check_with_a_guessed_external_id_is_not_adopted():
+    """`external_id` is derived from public facts, so it is guessable.
+
+    Anyone able to create a check on the commit can produce the same value.
+    Ownership therefore also requires our published name -- otherwise another
+    producer could plant a check and have this controller drive it, deciding
+    what our required context reports.
+    """
+    reviews = FakeReviews()
+    checks = FakeChecks()
+    stolen = CheckKey(repository=REPO, head_sha=SHA_A).external_id
+    checks.create_check_run(
+        REPO,
+        {
+            "name": "Some other producer's check",
+            "head_sha": SHA_A,
+            "status": "completed",
+            "conclusion": "success",
+            "external_id": stolen,
+        },
+    )
+    controller = AcceptanceController(checks, reviews)
+
+    controller.handle_pull_request_event(REPO, _pr_event(SHA_A))
+
+    assert len(checks.created) == 2
+    assert checks.created[1]["name"] == CHECK_NAME
+    assert checks.updated == [], "the planted check must not be driven"
+
+
+def test_a_check_created_by_another_app_is_not_adopted():
+    reviews = FakeReviews()
+    checks = FakeChecks()
+    key = CheckKey(repository=REPO, head_sha=SHA_A)
+    checks.create_check_run(
+        REPO,
+        {
+            "name": CHECK_NAME,
+            "head_sha": SHA_A,
+            "status": "in_progress",
+            "external_id": key.external_id,
+            "app": {"id": 999},
+        },
+    )
+    controller = AcceptanceController(checks, reviews, app_id=4685414)
+
+    controller.handle_pull_request_event(REPO, _pr_event(SHA_A))
+
+    assert len(checks.created) == 2, "a check from another App is not ours"
+
+
+def test_two_checks_for_one_question_fail_closed():
+    """Two owned checks means two controllers, or a lost race.
+
+    Picking one arbitrarily would let whichever the API listed first decide a
+    required context. Refusing blocks the merge until a human looks, which is
+    the safe direction.
+    """
+    reviews = FakeReviews()
+    checks = FakeChecks()
+    key = CheckKey(repository=REPO, head_sha=SHA_A)
+    for _ in range(2):
+        checks.create_check_run(
+            REPO,
+            {
+                "name": CHECK_NAME,
+                "head_sha": SHA_A,
+                "status": "in_progress",
+                "external_id": key.external_id,
+            },
+        )
+    controller = AcceptanceController(checks, reviews)
+
+    with pytest.raises(ControllerError, match="ambiguous"):
+        controller.ensure_in_progress(key)
+
+
+def test_a_malformed_pull_request_shape_fails_closed_rather_than_crashing():
+    """A 200 response is not a promise about shape."""
+
+    class Malformed(FakeReviews):
+        def pull_request(self, repository: str, number: int):
+            return "not an object"
+
+    controller, checks = _controller(Malformed())
+
+    decision = controller.handle_pull_request_event(REPO, _pr_event())
+
+    assert decision.conclusion == "failure"
+    assert checks.runs[checks.created[0]["id"]]["conclusion"] == "failure"
+
+
+def test_a_merge_group_member_that_has_moved_since_queueing_blocks_the_group():
+    """The queue entry names a commit; the pull request must still be at it."""
+    reviews = FakeReviews()
+    reviews.head = SHA_B  # the PR has moved on
+    reviews.members = [{"number": 1, "head_sha": SHA_A}]
+    reviews.review_list = [_accept(SHA_A)]
+    controller, _checks = _controller(reviews)
+
+    decision = controller.handle_merge_group_event(
+        REPO, {"merge_group": {"head_sha": "c" * 40}}
+    )
+
+    assert decision.conclusion == "failure"
+    assert "no longer matches" in decision.title
+
+
+def test_a_malformed_merge_group_membership_fails_closed():
+    class Malformed(FakeReviews):
+        def merge_group_pull_requests(self, repository: str, head_sha: str):
+            return {"not": "a list"}
+
+    controller, _checks = _controller(Malformed())
+
+    decision = controller.handle_merge_group_event(
+        REPO, {"merge_group": {"head_sha": "c" * 40}}
+    )
+
+    assert decision.conclusion == "failure"
+    assert "not a list" in decision.summary
+
+
+def test_a_merge_group_entry_that_is_not_an_object_fails_closed():
+    reviews = FakeReviews()
+    reviews.members = ["#1"]
+    controller, _checks = _controller(reviews)
+
+    decision = controller.handle_merge_group_event(
+        REPO, {"merge_group": {"head_sha": "c" * 40}}
+    )
+
+    assert decision.conclusion == "failure"
+    assert "not an object" in decision.summary
