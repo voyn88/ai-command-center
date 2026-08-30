@@ -821,3 +821,72 @@ def test_rollback_and_uninstall_prove_the_release_they_restore():
     assert first("release-verify") < first("systemctl disable")
     assert first("release-verify") < commands.index("run_transaction uninstall")
     assert "run_transaction uninstall-select-baseline" in uninstall
+
+
+def test_a_release_file_larger_than_the_read_bound_is_recorded(release, tmp_path):
+    """Found on the first live install, not by any test here.
+
+    `release_entries` hashed each file through `_read_regular`, which reads the
+    whole file into memory and refuses anything over 128 MB. A real toolchain
+    release carries native binaries far past that -- copilot 180 MB, claude
+    311 MB -- so publication failed with "protected file shape is unsafe" on a
+    perfectly valid artifact.
+
+    The fixture writes just past the old bound rather than a real 300 MB
+    binary: the property under test is that the size ceiling no longer refuses
+    a legitimate release file, and reproducing it at 129 MB proves that as
+    exactly as 311 MB would, in a second instead of a minute.
+    """
+    module = _module()
+    big = release / "pkg-big"
+    big.mkdir()
+    payload = b"\0" * (1024 * 1024)
+    with (big / "binary").open("wb") as handle:
+        for _ in range(129):
+            handle.write(payload)
+    (big / "binary").chmod(0o755)
+
+    manifest = tmp_path / "manifest.json"
+    entries = _record(module, release, manifest)
+
+    recorded = {entry["path"]: entry for entry in entries}
+    assert recorded["pkg-big/binary"]["size"] == 129 * 1024 * 1024
+    assert len(recorded["pkg-big/binary"]["sha256"]) == 64
+    # And it verifies -- the digest has to be the streamed one, not a truncation.
+    _trusted(module, release, manifest)
+
+
+def test_the_streamed_digest_matches_a_whole_file_hash(tmp_path):
+    """The streaming path must produce exactly the digest a plain hash would;
+    a chunking bug would otherwise be invisible until a verify failed."""
+    import hashlib as _hashlib
+
+    module = _module()
+    target = tmp_path / "payload"
+    body = bytes(range(256)) * 40_000
+    target.write_bytes(body)
+    target.chmod(0o644)
+
+    digest, size, mode, uid, gid = module._digest_regular(target)
+
+    assert digest == _hashlib.sha256(body).hexdigest()
+    assert size == len(body)
+    assert mode == 0o644
+    assert (uid, gid) == (UID, GID)
+
+
+def test_the_streamed_digest_still_refuses_an_unsafe_shape(tmp_path):
+    """Streaming relaxed the size bound and nothing else: a hardlinked file,
+    a symlink and a non-regular file must still be refused."""
+    module = _module()
+    target = tmp_path / "payload"
+    target.write_bytes(b"content")
+    os.link(target, tmp_path / "alias")
+
+    with pytest.raises(RuntimeError, match="shape is unsafe"):
+        module._digest_regular(target)
+
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    with pytest.raises(OSError):
+        module._digest_regular(link)
