@@ -35,7 +35,6 @@ import contextlib
 import json
 import logging
 import os as _os
-import shutil
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -171,6 +170,10 @@ def _dedupe_by_id(tasks: list[dict]) -> tuple[list[dict], list[str]]:
 def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = False) -> list[dict]:
     """Load the task list. A missing file is created empty (or seeded from
     `example_file`) and read back as `[]` — that is a legitimate fresh store.
+    That creation is exclusive (`storage.create_json_if_absent`), never an
+    overwrite: this function is called on unlocked read paths, so seeding a
+    store another writer is concurrently populating must never replace what
+    that writer already committed.
 
     `strict` controls what happens when the file *exists* but cannot be decoded
     (transient `OSError`, a torn write, or non-JSON): the read-only default
@@ -191,10 +194,17 @@ def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = F
     data_dir.mkdir(parents=True, exist_ok=True)
     tasks_file = tasks_file_path(root)
     if not tasks_file.exists():
-        if example_file and example_file.exists():
-            shutil.copyfile(example_file, tasks_file)
-        else:
-            save_tasks(root, [])
+        # Creation, never replacement. This runs on the *read* path — including
+        # `JSONTasksRepository.load_all`, which `task_import.apply_task_package`
+        # calls before it takes the store lock — so an unconditional write here
+        # races every locked writer and can erase a record that was already
+        # committed: `save_tasks(root, [])` was exactly that lost update (the
+        # first task of a concurrently imported package disappeared while every
+        # writer reported success — VOYN-W0-AICC-TASK-IMPORT-CONCURRENCY-FLAKE).
+        # `create_json_if_absent` publishes only when the file is still absent,
+        # so losing this race costs nothing but an unused temp file.
+        seed = json.loads(example_file.read_text(encoding="utf-8")) if (example_file and example_file.exists()) else []
+        storage.create_json_if_absent(tasks_file, seed)
     try:
         tasks = _decode_tasks(tasks_file)
     except (json.JSONDecodeError, OSError, ValueError):
