@@ -1938,3 +1938,72 @@ def test_a_target_that_is_neither_file_nor_symlink_is_still_refused(tmp_path):
     transaction = module.FileTransaction(root, state)
     with pytest.raises(ValueError, match="not a regular file"):
         transaction.prepare((_spec(module, source, "/etc/unit.service"),))
+
+
+def test_symlink_restore_is_idempotent(monkeypatch, tmp_path):
+    """Independent review on 2b8826a.
+
+    `restore` read the target with `_read_regular` before looking at the
+    record, and that call opens with O_NOFOLLOW -- so on a target that is still
+    (or already again) a symlink it raises, and recovery aborted with "target
+    shape changed" on a generation that was simply not applied yet or already
+    rolled back. Boot recovery runs unattended and can itself be interrupted,
+    so it has to be safe to run twice.
+    """
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    elsewhere = tmp_path / "home" / "unit.service"
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_text("legacy unit\n", encoding="utf-8")
+    (root / "etc").mkdir(parents=True)
+    installed = root / "etc" / "unit.service"
+    installed.symlink_to(elsewhere)
+
+    source = tmp_path / "source"
+    source.write_bytes(b"repo-owned unit\n")
+
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/unit.service"),))
+    transaction.apply()
+
+    # `restore` is driven directly, twice, against the same journal: that is
+    # what an interrupted boot recovery looks like. Going through `recover()`
+    # would delete the journal on the first pass and the second call would
+    # silently do nothing, which is why an earlier version of this test passed
+    # against the very bug it was written for.
+    manifest = next(state.rglob("manifest.json"))
+    transaction.restore(manifest, clear_pending=False)
+    assert installed.is_symlink()
+
+    transaction.restore(manifest, clear_pending=False)
+    assert installed.is_symlink()
+    assert os.readlink(installed) == str(elsewhere)
+
+
+def test_symlink_restore_refuses_a_vanished_target(tmp_path):
+    """Independent review on 2b8826a: the symlink branch accepted a missing
+    target and recreated the link, papering over whatever removed it. The
+    regular-file branch refuses that, and so must this one."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    elsewhere = tmp_path / "home" / "unit.service"
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_text("legacy\n", encoding="utf-8")
+    (root / "etc").mkdir(parents=True)
+    installed = root / "etc" / "unit.service"
+    installed.symlink_to(elsewhere)
+
+    source = tmp_path / "source"
+    source.write_bytes(b"repo-owned\n")
+
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/unit.service"),))
+    transaction.apply()
+
+    installed.unlink()  # a third party removes the installed file
+
+    manifest = next(state.rglob("manifest.json"))
+    with pytest.raises(RuntimeError, match="disappeared"):
+        transaction.restore(manifest)

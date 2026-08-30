@@ -1655,19 +1655,40 @@ class FileTransaction:
                 # durably gone; without it a reboot could bypass recovery.
                 continue
             target = self._target(record.target)
-            try:
-                current = _read_regular(target)
-            except FileNotFoundError:
-                current = None
-            except OSError as exc:
-                raise RuntimeError(
-                    f"generation target shape changed before restore: {target}"
-                ) from exc
             if record.existed and record.original_symlink is not None:
                 # The target was a symlink this generation replaced. Restore the
                 # link, not a file: leaving a regular file where a link belonged
                 # would silently change what the unit resolves to.
-                if current is not None and not _matches(
+                #
+                # Handled BEFORE `_read_regular`: that call opens with
+                # O_NOFOLLOW, so on a target that is still (or already again) a
+                # symlink it raises, and the generic branch below would abort
+                # recovery with "target shape changed" on a generation that is
+                # simply not applied yet, or already rolled back. Recovery has
+                # to be idempotent -- it runs at boot and can itself be
+                # interrupted (independent review on 2b8826a).
+                if target.is_symlink():
+                    if os.readlink(target) == record.original_symlink:
+                        continue
+                    raise RuntimeError(
+                        f"generation target is a different symlink before restore: "
+                        f"{target}"
+                    )
+                try:
+                    current = _read_regular(target)
+                except FileNotFoundError as exc:
+                    # Neither the installed file nor the link is there. Something
+                    # outside this transaction removed it; recreating the link
+                    # would paper over that, exactly as the regular-file branch
+                    # refuses to (independent review on 2b8826a).
+                    raise RuntimeError(
+                        f"generation target disappeared: {target}"
+                    ) from exc
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"generation target shape changed before restore: {target}"
+                    ) from exc
+                if not _matches(
                     current,
                     record.install_sha256,
                     record.install_mode,
@@ -1677,8 +1698,6 @@ class FileTransaction:
                     raise RuntimeError(
                         f"generation target changed before compare-and-restore: {target}"
                     )
-                if target.is_symlink() and os.readlink(target) == record.original_symlink:
-                    continue
                 parent_fd = _open_directory_chain(target.parent, create=False)
                 try:
                     temporary = f".{target.name}.restore.{secrets.token_hex(8)}"
@@ -1694,6 +1713,15 @@ class FileTransaction:
                 finally:
                     os.close(parent_fd)
                 continue
+            # Every other record: read the target as the generic branches expect.
+            try:
+                current = _read_regular(target)
+            except FileNotFoundError:
+                current = None
+            except OSError as exc:
+                raise RuntimeError(
+                    f"generation target shape changed before restore: {target}"
+                ) from exc
             if record.existed:
                 assert record.backup is not None
                 assert record.original_mode is not None
