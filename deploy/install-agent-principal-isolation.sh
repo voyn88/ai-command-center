@@ -9,6 +9,14 @@ fi
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 : "${AICC_BOOTSTRAP_ATTESTATION:?exact-SHA bootstrap attestation is required}"
 : "${AICC_EXPECTED_RELEASE_SHA:?exact-SHA release identity is required}"
+: "${AICC_INSTALL_LOCK_FD:?inherited host install lock is required}"
+case "$AICC_INSTALL_LOCK_FD" in
+  *[!0-9]*|'') echo "invalid inherited host install lock descriptor" >&2; exit 1 ;;
+esac
+[ -e "/proc/self/fd/$AICC_INSTALL_LOCK_FD" ] || {
+  echo "inherited host install lock descriptor is closed" >&2
+  exit 1
+}
 case "$AICC_EXPECTED_RELEASE_SHA" in
   *[!0-9a-f]*|'') echo "invalid expected release commit" >&2; exit 1 ;;
 esac
@@ -20,12 +28,16 @@ esac
   --expected-sha "$AICC_EXPECTED_RELEASE_SHA" \
   --verify-attestation "$AICC_BOOTSTRAP_ATTESTATION" \
   --repo-root "$repo_root"
+# The verifier proves this descriptor is the fixed named root-owned inode and
+# re-flocks the inherited open-file-description. The shell keeps that same OFD
+# open, so the lock spans rollout/systemctl gaps between transaction children.
+/usr/bin/flock -n "$AICC_INSTALL_LOCK_FD"
 workspace_authority_env=/etc/aicc/workspace-authority.env
 state_dir=/var/lib/aicc-principal-isolation
 baseline_units="$state_dir/baseline-units.json"
 baseline_release="$state_dir/baseline-release"
 attempt_units="$state_dir/attempt-units.json"
-pending_release="$state_dir/pending-release"
+uninstall_units="$state_dir/uninstall-units.json"
 release_manifest_dir="$state_dir/releases"
 pending_release_manifest=
 transaction="$repo_root/ops/aicc_install_transaction.py"
@@ -33,8 +45,10 @@ rollout="$repo_root/ops/aicc_staged_worker_rollout.py"
 release_root=/opt/aicc/releases
 current_release=/opt/aicc/current
 release_staging=
-previous_release=
-release_selected=0
+
+path_present() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
 
 # Every privileged Git read here must be config-free AND must refuse
 # replacement refs: `git archive HEAD` would otherwise stage a planted
@@ -56,10 +70,13 @@ git_trusted() {
 
 run_transaction() {
   action=$1
+  shift
   /usr/bin/python3 "$transaction" "$action" \
     --repo-root "$repo_root" \
     --state-dir "$state_dir" \
-    --authority-env "$workspace_authority_env"
+    --authority-env "$workspace_authority_env" \
+    --lock-fd "$AICC_INSTALL_LOCK_FD" \
+    "$@"
 }
 
 run_rollout() {
@@ -70,7 +87,8 @@ run_release() {
   /usr/bin/python3 "$transaction" "$@" \
     --repo-root "$repo_root" \
     --state-dir "$state_dir" \
-    --authority-env "$workspace_authority_env"
+    --authority-env "$workspace_authority_env" \
+    --lock-fd "$AICC_INSTALL_LOCK_FD"
 }
 
 stage_immutable_release() {
@@ -87,7 +105,15 @@ stage_immutable_release() {
     exit 1
   }
   release_dir="$release_root/$release_id"
+  pending_release_manifest="$release_manifest_dir/$release_id.json"
   install -d -m 0755 -o root -g root "$release_root"
+  # Reconcile a prior SIGKILL before building anything. A digest-matching
+  # staging generation is published; an unattested incomplete stage is
+  # discarded; ambiguous or unsafe state fails closed under the host lock.
+  run_release release-reconcile \
+    --release-root "$release_root" \
+    --manifest "$pending_release_manifest" \
+    --release-id "$release_id"
   if [ ! -d "$release_dir" ]; then
     release_staging=$(mktemp -d "$release_root/.stage-$release_id.XXXXXX")
     # Archive the committed tree, never the operator worktree. This makes the
@@ -110,13 +136,16 @@ PY
     # authorises its later reuse. A crash between the two leaves only staging,
     # which the rollback trap removes.
     install -d -m 0700 -o root -g root "$release_manifest_dir"
-    pending_release_manifest="$release_manifest_dir/$release_id.json"
     run_release release-record \
       --release-tree "$release_staging" \
       --manifest "$pending_release_manifest" \
       --release-id "$release_id"
     sync -f "$state_dir"
-    mv -- "$release_staging" "$release_dir"
+    run_release release-publish \
+      --release-tree "$release_staging" \
+      --release-root "$release_root" \
+      --manifest "$pending_release_manifest" \
+      --release-id "$release_id"
     release_staging=
   fi
   # Every generation -- freshly built or pre-existing -- must prove itself
@@ -128,28 +157,38 @@ PY
     --manifest "$release_manifest_dir/$release_id.json" \
     --release-id "$release_id" \
     --verify-against-git
-  previous_release=$(readlink "$current_release" 2>/dev/null || true)
-  if [ -n "$previous_release" ] && \
-     ! printf '%s\n' "$previous_release" | grep -Eq '^releases/[0-9a-f]{40}$'; then
-    echo "previous release selector is invalid" >&2
-    exit 1
-  fi
-  pending_release_tmp="$state_dir/.pending-release.$$"
-  if [ -n "$previous_release" ]; then
-    printf '%s\n' "$previous_release" >"$pending_release_tmp"
-  else
-    printf '%s\n' ABSENT >"$pending_release_tmp"
-  fi
-  chmod 0600 "$pending_release_tmp"
-  mv -f -- "$pending_release_tmp" "$pending_release"
-  sync -f "$state_dir"
-  current_tmp="/opt/aicc/.current.$$"
-  ln -s "releases/$release_id" "$current_tmp"
-  mv -Tf -- "$current_tmp" "$current_release"
-  release_selected=1
+  run_release release-select \
+    --release-id "$release_id" \
+    --repo-root "$repo_root"
 }
 
+# The permanent boot-recovery anchor must precede both a fresh install WAL and
+# a fresh uninstall WAL. An already-journalled uninstall is resumed only by
+# its digest-bound capsule, so it cannot swap recovery code mid-transaction.
+if ! path_present "$state_dir/uninstall.json"; then
+  run_transaction recovery-anchor-install
+  # Resolve any earlier install WAL under the already-held OFD, then load and
+  # activate the permanent no-op barrier while NO journal exists. If activation
+  # waited until after prepare(), its ExecStart capsule would contend on this
+  # same host lock and make first install fail deterministically.
+  run_transaction recover
+  systemctl daemon-reload
+  systemctl start aicc-principal-recovery.service
+fi
+
 if [ "${1:-}" = "--uninstall" ]; then
+  if path_present "$state_dir/uninstall.json"; then
+    uninstall_phase=$(run_transaction uninstall-status)
+    run_transaction recover-uninstall-safe
+    if [ "$uninstall_phase" != INTENT ]; then
+      echo "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED"
+      exit 0
+    fi
+    # INTENT precedes every uninstall mutation, so recovery safely aborted it.
+    # Reactivate the no-op barrier before creating the replacement WAL.
+    systemctl reset-failed aicc-principal-recovery.service >/dev/null 2>&1 || true
+    systemctl start aicc-principal-recovery.service
+  fi
   [ -f "$baseline_units" ] && [ -f "$baseline_release" ] || {
     echo "principal-isolation baseline state is missing" >&2
     exit 1
@@ -173,26 +212,37 @@ if [ "${1:-}" = "--uninstall" ]; then
       --manifest "$release_manifest_dir/${baseline_release_value#releases/}.json" \
       --release-id "${baseline_release_value#releases/}"
   fi
+  # Write durable INTENT before snapshot creation, then bind ARMED to the
+  # exact snapshot digest. A normal install refuses while this journal exists;
+  # a retry can continue after the lane registry itself has been removed.
+  uninstall_phase=$(run_transaction uninstall-begin \
+    --baseline-selector "$baseline_release_value" \
+    --current-selector "$current_release" \
+    --lane-registry /etc/aicc/worker-lanes)
+  if [ "$uninstall_phase" = INTENT ]; then
+    run_rollout snapshot --lanes /etc/aicc/worker-lanes --state "$uninstall_units" \
+      --include-unit aicc-agent-launcher.socket \
+      --include-unit aicc-principal-recovery.service \
+      --include-unit voyn-aicc-worker.service \
+      --include-unit voyn-aicc-worker-2.service \
+      --include-unit aicc-worker.service
+    sync -f "$state_dir"
+  fi
+  run_transaction uninstall-arm --service-snapshot "$uninstall_units"
+  run_rollout verify-snapshot-closure --state "$uninstall_units"
+  run_transaction quiesce --service-snapshot "$uninstall_units"
+  run_rollout verify-snapshot-closure --state "$uninstall_units"
   systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
-  systemctl disable aicc-principal-recovery.service >/dev/null 2>&1 || true
   run_transaction uninstall
   systemctl daemon-reload
-  if [ "$baseline_release_value" = ABSENT ]; then
-    rm -f -- "$current_release"
-  else
-    baseline_tmp="/opt/aicc/.current-uninstall.$$"
-    ln -s "$baseline_release_value" "$baseline_tmp"
-    mv -Tf -- "$baseline_tmp" "$current_release"
-  fi
+  run_transaction uninstall-select-baseline \
+    --baseline-selector "$baseline_release_value"
   run_rollout restore --state "$baseline_units"
-  rm -f -- "$baseline_units" "$baseline_release" "$attempt_units"
+  run_rollout verify-snapshot-closure --state "$uninstall_units"
+  run_transaction uninstall-complete --service-snapshot "$uninstall_units"
   echo "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED"
   exit 0
 fi
-
-# A prior SIGKILL leaves a durable write-ahead journal. Recover it before
-# validating or preparing a new versioned generation.
-run_transaction recover
 
 # Validate the stable authority using the exact runtime decoder before any
 # replaceable target is mutated.
@@ -232,7 +282,8 @@ fi
 # snapshotted even when absent from the installed lane registry. The two
 # legacy units below mirror LEGACY_WORKER_UNITS in
 # ops/aicc_staged_worker_rollout.py -- keep the lists in lockstep.
-run_rollout snapshot --lanes /etc/aicc/worker-lanes --state "$attempt_units" \
+run_rollout snapshot --lanes "$repo_root/deploy/aicc/worker-lanes" \
+  --state "$attempt_units" \
   --include-unit aicc-agent-launcher.socket \
   --include-unit aicc-principal-recovery.service \
   --include-unit voyn-aicc-worker.service \
@@ -261,38 +312,8 @@ rollback() {
   result=$?
   trap - EXIT HUP INT TERM
   rollback_complete=1
-  # Restore the old immutable release selector before the transaction may
-  # restart any service from its snapshot. Otherwise an old unit path through
-  # /opt/aicc/current could execute the failed generation during recovery.
-  if [ "$release_selected" -eq 1 ]; then
-    if [ -n "$previous_release" ] && run_release release-verify \
-         --release-tree "/opt/aicc/$previous_release" \
-         --manifest "$release_manifest_dir/${previous_release#releases/}.json" \
-         --release-id "${previous_release#releases/}"; then
-      previous_tmp="/opt/aicc/.current-rollback.$$"
-      ln -s "$previous_release" "$previous_tmp"
-      mv -Tf -- "$previous_tmp" "$current_release"
-    elif [ -L "$current_release" ]; then
-      # Either there was no previous release, or it can no longer be proven.
-      # Removing the selector stops the units; pointing it at an unproven
-      # release would run unproven code as root to restore service. Fail
-      # secure (independent review on cacfc257).
-      rm -f -- "$current_release"
-      [ -n "$previous_release" ] && \
-        echo "previous release failed verification; selector removed" >&2
-    fi
-    release_selected=0
-    if [ "$transaction_active" -eq 0 ]; then
-      rm -f -- "$pending_release"
-      sync -f "$state_dir"
-    fi
-  fi
-  if [ "$transaction_active" -eq 1 ] && [ -f "$state_dir/pending.json" ]; then
+  if [ "$transaction_active" -eq 1 ] && path_present "$state_dir/pending.json"; then
     systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
-    # The uninstall path disables this too; a rolled-back FIRST install must
-    # not leave the enable symlink dangling after the transaction removes the
-    # unit file (independent-review finding on d661d8f).
-    systemctl disable aicc-principal-recovery.service >/dev/null 2>&1 || true
     if ! run_transaction recover; then
       # Keep pending.json, its generation, and attempt-units.json intact.
       # The boot recovery unit retries the same compare-and-restore plus
@@ -322,7 +343,7 @@ rollback() {
 trap rollback EXIT HUP INT TERM
 
 # Identity and directory creation are additive/idempotent prerequisites. Every
-# replaceable file belongs to the versioned, write-ahead transaction below.
+# other replaceable file belongs to the versioned transaction below.
 systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
 systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
 run_transaction prepare
@@ -333,7 +354,6 @@ run_transaction apply
 stage_immutable_release
 
 systemctl daemon-reload
-systemctl enable aicc-principal-recovery.service
 systemctl enable --now aicc-agent-launcher.socket
 
 # The orchestrator discovers configured plus already-instantiated lanes, then
@@ -347,9 +367,6 @@ run_rollout rollout --lanes /etc/aicc/worker-lanes
 
 run_transaction commit
 transaction_active=0
-# The committed install owns its state: a stale pending-release would point
-# boot recovery at the PREVIOUS release after success (review on 6e22b93).
-rm -f -- "$pending_release"
 rm -f -- "$attempt_units"
 trap - EXIT HUP INT TERM
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"

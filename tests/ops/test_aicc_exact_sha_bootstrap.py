@@ -235,9 +235,12 @@ def test_uninstall_is_attested_and_skips_authority_mutation(monkeypatch, tmp_pat
         repository=module.TRUSTED_REMOTE,
         attempt_id="attempt-test",
     )
-    calls: list[list[str]] = []
+    calls: list[tuple[list[str], dict[str, str], tuple[int, ...]]] = []
     monkeypatch.setattr(module.os, "geteuid", lambda: 0)
     monkeypatch.setattr(module.os, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module, "_install_lock_fd", lambda *a, **k: os.open("/dev/null", os.O_RDONLY)
+    )
     monkeypatch.setattr(module, "_require_private_root_directory", lambda *a, **k: None)
     monkeypatch.setattr(module, "_fetch_exact_checkout", lambda *a, **k: repo)
     monkeypatch.setattr(module, "_verify_checkout", lambda *a, **k: attestation)
@@ -248,19 +251,100 @@ def test_uninstall_is_attested_and_skips_authority_mutation(monkeypatch, tmp_pat
         lambda *a, **k: pytest.fail("uninstall must not mutate authority state"),
     )
 
-    def fake_run(argv, *, cwd, env):
-        calls.append(argv)
+    def fake_run(argv, *, cwd, env, pass_fds=()):
+        calls.append((argv, env, pass_fds))
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     monkeypatch.setattr(module, "_run", fake_run)
 
     assert (
-        module.main(["uninstall", "--expected-sha", sha, "--state-root", str(tmp_path)])
+        module.main(
+            [
+                "uninstall",
+                "--expected-sha",
+                sha,
+                "--state-root",
+                str(tmp_path),
+            ],
+            install_lock_path=tmp_path / "install-recovery.lock",
+        )
         == 0
     )
-    assert calls == [
-        [str(repo / "deploy/install-agent-principal-isolation.sh"), "--uninstall"]
+    assert len(calls) == 1
+    argv, installer_env, passed = calls[0]
+    assert argv == [
+        str(repo / "deploy/install-agent-principal-isolation.sh"),
+        "--uninstall",
     ]
+    assert passed == (int(installer_env["AICC_INSTALL_LOCK_FD"]),)
+
+
+def test_real_install_lock_rejects_contention_and_adopts_inherited_fd(tmp_path):
+    module = _module()
+    lock = tmp_path / "lock-state" / "install-recovery.lock"
+    uid, gid = os.geteuid(), os.getegid()
+    first = module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
+    try:
+        inherited = module._install_lock_fd(
+            lock, first, trusted_uid=uid, trusted_gid=gid
+        )
+        try:
+            assert os.fstat(inherited).st_ino == os.fstat(first).st_ino
+        finally:
+            os.close(inherited)
+        with pytest.raises(module.BootstrapRefused, match="another install"):
+            module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
+    finally:
+        os.close(first)
+    replacement_owner = module._install_lock_fd(
+        lock, trusted_uid=uid, trusted_gid=gid
+    )
+    os.close(replacement_owner)
+
+
+@pytest.mark.parametrize("shape", ("symlink", "hardlink", "mode"))
+def test_real_install_lock_refuses_unsafe_inode_shapes(tmp_path, shape):
+    module = _module()
+    parent = tmp_path / "lock-state"
+    parent.mkdir(mode=0o700)
+    lock = parent / "install-recovery.lock"
+    target = parent / "target"
+    target.write_bytes(b"")
+    target.chmod(0o600)
+    if shape == "symlink":
+        lock.symlink_to(target.name)
+    elif shape == "hardlink":
+        os.link(target, lock)
+    else:
+        lock.write_bytes(b"")
+        lock.chmod(0o644)
+    with pytest.raises(module.BootstrapRefused):
+        module._install_lock_fd(
+            lock, trusted_uid=os.geteuid(), trusted_gid=os.getegid()
+        )
+
+
+def test_real_install_lock_refuses_closed_or_negative_inherited_fd(tmp_path):
+    module = _module()
+    lock = tmp_path / "lock-state" / "install-recovery.lock"
+    uid, gid = os.geteuid(), os.getegid()
+    owner = module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
+    os.close(owner)
+    for invalid in (-1, owner):
+        with pytest.raises(module.BootstrapRefused, match="invalid inherited"):
+            module._install_lock_fd(
+                lock, invalid, trusted_uid=uid, trusted_gid=gid
+            )
+
+
+def test_unfinished_uninstall_blocks_before_authority_mutation(monkeypatch, tmp_path):
+    module = _module()
+    journal = tmp_path / "uninstall.json"
+    journal.write_text("{}", encoding="utf-8")
+    mutated = []
+    with pytest.raises(module.BootstrapRefused, match="unfinished uninstall"):
+        module._refuse_unfinished_uninstall(journal)
+    assert mutated == []
 
 
 def test_poisoned_repository_config_cannot_run_code_during_verification(tmp_path):
@@ -382,7 +466,7 @@ def test_installer_failure_leaves_no_completed_marker(tmp_path, monkeypatch):
     (state / "attempts").mkdir(mode=0o700, parents=True)
     calls: list[list[str]] = []
 
-    def fake_run(argv, *, cwd, env):
+    def fake_run(argv, *, cwd, env, pass_fds=()):
         calls.append(argv)
         if argv[0].endswith("install-agent-principal-isolation.sh"):
             raise module.BootstrapRefused("installer failed")
@@ -406,12 +490,23 @@ def test_installer_failure_leaves_no_completed_marker(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_run", fake_run)
     monkeypatch.setattr(module.os, "geteuid", lambda: 0)
     monkeypatch.setattr(module.os, "chown", lambda *a: None)
+    monkeypatch.setattr(
+        module, "_install_lock_fd", lambda *a, **k: os.open("/dev/null", os.O_RDONLY)
+    )
     # `_atomic_write` pins every durable record to root; the test asserts which
     # records exist, not that an unprivileged runner can create root-owned ones.
     monkeypatch.setattr(module.os, "fchown", lambda *a: None)
 
     with pytest.raises(module.BootstrapRefused, match="installer failed"):
-        module.main(["--expected-sha", "a" * 40, "--state-root", str(state)])
+        module.main(
+            [
+                "--expected-sha",
+                "a" * 40,
+                "--state-root",
+                str(state),
+            ],
+            install_lock_path=tmp_path / "install-recovery.lock",
+        )
 
     assert not list(state.rglob("completed.json"))
     assert list(state.rglob("attestation.json"))

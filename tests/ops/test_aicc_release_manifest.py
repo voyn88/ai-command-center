@@ -12,6 +12,7 @@ root, and the production caller passes 0/0.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -32,9 +33,130 @@ def _module():
     return module
 
 
+def _bootstrap_module():
+    path = Path(__file__).parents[2] / "ops" / "aicc_exact_sha_bootstrap.py"
+    spec = importlib.util.spec_from_file_location("aicc_exact_sha_bootstrap", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 UID = os.geteuid()
 GID = os.getegid()
 RELEASE_ID = "a" * 40
+
+
+@pytest.mark.parametrize("loader", (_module, _bootstrap_module))
+def test_git_blob_oid_is_delegated_to_trusted_git_for_binary_bytes(loader):
+    module = loader()
+    payload = b"binary\x00payload\xff\n"
+    expected = (
+        subprocess.run(
+            ["/usr/bin/git", "hash-object", "--no-filters", "--stdin"],
+            input=payload,
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode("ascii")
+        .strip()
+    )
+
+    assert module._git_blob_oid(payload) == expected
+
+
+@pytest.mark.parametrize("loader", (_module, _bootstrap_module))
+@pytest.mark.parametrize(
+    "stdout,returncode,stderr",
+    (
+        (b"A" * 40 + b"\n", 0, b""),
+        (b"a" * 40, 0, b""),
+        (b"a" * 64 + b"\n", 0, b""),
+        (b"a" * 40 + b"\nextra\n", 0, b""),
+        (b"a" * 40 + b"\n", 1, b"failed"),
+        (b"a" * 40 + b"\n", 0, b"warning"),
+    ),
+)
+def test_git_blob_oid_fails_closed_on_noncanonical_git_output(
+    monkeypatch, loader, stdout, returncode, stderr
+):
+    module = loader()
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], returncode, stdout=stdout, stderr=stderr
+        ),
+    )
+
+    refused = getattr(module, "ReleaseRefused", None) or module.BootstrapRefused
+    with pytest.raises(refused):
+        module._git_blob_oid(b"secret-adjacent\x00bytes")
+
+
+@pytest.mark.parametrize("loader", (_module, _bootstrap_module))
+def test_git_blob_oid_uses_config_free_absolute_git_outside_repository(
+    monkeypatch, loader
+):
+    module = loader()
+    observed = {}
+
+    def run(argv, **kwargs):
+        observed.update(argv=argv, kwargs=kwargs)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=b"a" * 40 + b"\n", stderr=b""
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    payload = b"binary\x00payload"
+
+    assert module._git_blob_oid(payload) == "a" * 40
+    assert observed["argv"][0] == "/usr/bin/git"
+    assert "--no-replace-objects" in observed["argv"]
+    assert observed["argv"][-3:] == ["hash-object", "--no-filters", "--stdin"]
+    assert observed["kwargs"]["cwd"] == Path("/")
+    assert observed["kwargs"]["input"] == payload
+    assert observed["kwargs"]["env"]["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert observed["kwargs"]["env"]["GIT_CONFIG_GLOBAL"] == "/dev/null"
+
+
+@pytest.mark.parametrize("loader", (_module, _bootstrap_module))
+def test_git_blob_oid_fails_closed_when_trusted_git_cannot_execute(monkeypatch, loader):
+    module = loader()
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("missing git")),
+    )
+    refused = getattr(module, "ReleaseRefused", None) or module.BootstrapRefused
+
+    with pytest.raises(refused, match="cannot execute trusted Git"):
+        module._git_blob_oid(b"payload")
+
+
+def test_privileged_release_modules_do_not_compute_sha1_in_process():
+    root = Path(__file__).parents[2]
+    for relative in (
+        "ops/aicc_exact_sha_bootstrap.py",
+        "ops/aicc_install_transaction.py",
+    ):
+        source = (root / relative).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=relative)
+        forbidden = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr == "sha1":
+                forbidden.append(node.lineno)
+            if (
+                node.func.attr == "new"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and str(node.args[0].value).lower() == "sha1"
+            ):
+                forbidden.append(node.lineno)
+        assert forbidden == []
 
 
 def _trusted(module, path: Path, manifest: Path, release_id: str = RELEASE_ID):
@@ -47,6 +169,129 @@ def _record(module, tree: Path, manifest: Path, release_id: str = RELEASE_ID):
     return module.record_release_manifest(
         tree, manifest, release_id, trusted_uid=UID, trusted_gid=GID
     )
+
+
+def test_release_manifest_is_exactly_idempotent_and_never_clobbered(tmp_path):
+    module = _module()
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "payload").write_text("one\n", encoding="utf-8")
+    manifest = tmp_path / "state/manifest.json"
+    _record(module, tree, manifest)
+    original = manifest.read_bytes()
+
+    _record(module, tree, manifest)
+    assert manifest.read_bytes() == original
+
+    (tree / "payload").write_text("two\n", encoding="utf-8")
+    with pytest.raises(module.ReleaseRefused, match="manifest differs"):
+        _record(module, tree, manifest)
+    assert manifest.read_bytes() == original
+
+
+def test_release_publication_is_atomic_no_replace_when_supported(tmp_path):
+    module = _module()
+    if getattr(module.ctypes.CDLL(None), "renameat2", None) is None:
+        pytest.skip("renameat2 is a Linux production primitive")
+    release_root = tmp_path / "releases"
+    release_root.mkdir()
+    staging = release_root / ".stage-one"
+    staging.mkdir()
+    (staging / "payload").write_text("one\n", encoding="utf-8")
+    manifest = tmp_path / "state/releases" / f"{RELEASE_ID}.json"
+    _record(module, staging, manifest)
+    published = module.publish_release_tree(
+        staging,
+        release_root,
+        manifest,
+        RELEASE_ID,
+        trusted_uid=os.geteuid(),
+        trusted_gid=os.getegid(),
+    )
+    assert published.is_dir() and not staging.exists()
+
+    collision = release_root / ".stage-two"
+    collision.mkdir()
+    (collision / "payload").write_text("one\n", encoding="utf-8")
+    with pytest.raises(module.ReleaseRefused, match="already exists"):
+        module.publish_release_tree(
+            collision,
+            release_root,
+            manifest,
+            RELEASE_ID,
+            trusted_uid=os.geteuid(),
+            trusted_gid=os.getegid(),
+        )
+    assert collision.is_dir()
+    assert (published / "payload").read_text(encoding="utf-8") == "one\n"
+
+
+def test_release_reconcile_resumes_exact_stage(tmp_path):
+    module = _module()
+    if getattr(module.ctypes.CDLL(None), "renameat2", None) is None:
+        pytest.skip("renameat2 is a Linux production primitive")
+    state = tmp_path / "state"
+    release_root = tmp_path / "releases"
+    release_root.mkdir()
+    staging = release_root / f".stage-{RELEASE_ID}.resume"
+    staging.mkdir()
+    (staging / "payload").write_text("one\n", encoding="utf-8")
+    manifest = state / "releases" / f"{RELEASE_ID}.json"
+    _record(module, staging, manifest)
+
+    published = module.reconcile_release_publication(
+        release_root,
+        manifest,
+        RELEASE_ID,
+        state_dir=state,
+        trusted_uid=UID,
+        trusted_gid=GID,
+    )
+    assert published == release_root / RELEASE_ID
+    assert published.is_dir() and not staging.exists()
+
+
+def test_release_reconcile_cleans_unattested_stage_and_orphan_manifest(tmp_path):
+    module = _module()
+    state = tmp_path / "state"
+    release_root = tmp_path / "releases"
+    release_root.mkdir()
+
+    other_id = "b" * 40
+    incomplete = release_root / f".stage-{other_id}.incomplete"
+    incomplete.mkdir()
+    (incomplete / "partial").write_text("partial", encoding="utf-8")
+    assert (
+        module.reconcile_release_publication(
+            release_root,
+            state / "releases" / f"{other_id}.json",
+            other_id,
+            state_dir=state,
+            trusted_uid=UID,
+            trusted_gid=GID,
+        )
+        is None
+    )
+    assert not incomplete.exists()
+
+    orphan_id = "c" * 40
+    orphan_tree = tmp_path / "orphan-tree"
+    orphan_tree.mkdir()
+    (orphan_tree / "payload").write_text("orphan\n", encoding="utf-8")
+    orphan_manifest = state / "releases" / f"{orphan_id}.json"
+    _record(module, orphan_tree, orphan_manifest, orphan_id)
+    assert (
+        module.reconcile_release_publication(
+            release_root,
+            orphan_manifest,
+            orphan_id,
+            state_dir=state,
+            trusted_uid=UID,
+            trusted_gid=GID,
+        )
+        is None
+    )
+    assert not orphan_manifest.exists()
 
 
 @pytest.fixture()
@@ -398,6 +643,9 @@ def test_installer_hardens_every_git_call_it_makes():
     ]
     assert raw == [], raw
     assert 'archive --format=tar "$release_id"' in installer
+    assert 'mv -- "$release_staging" "$release_dir"' not in installer
+    assert "release-publish" in installer
+    assert "release-select" in installer
 
 
 def _transaction(module, tmp_path):
@@ -451,6 +699,44 @@ def test_recovery_refuses_a_release_that_drifted_since_it_was_recorded(tmp_path)
         transaction.verify_release_selection(f"releases/{RELEASE_ID}")
 
 
+def test_selector_parent_is_fsynced_before_pending_release_is_consumed(
+    monkeypatch, tmp_path
+):
+    module = _module()
+    transaction, root, state = _transaction(module, tmp_path)
+    release = root / "opt/aicc/releases" / RELEASE_ID
+    release.mkdir(parents=True)
+    (release / "marker").write_text("release\n", encoding="utf-8")
+    (state / "releases").mkdir(mode=0o700)
+    module.record_release_manifest(
+        release,
+        transaction.release_manifest_path(RELEASE_ID),
+        RELEASE_ID,
+        trusted_uid=UID,
+        trusted_gid=GID,
+    )
+    pending = state / "pending-release"
+    pending.write_text(f"releases/{RELEASE_ID}\n", encoding="ascii")
+    pending.chmod(0o600)
+    events = []
+    real_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path == pending:
+            events.append("unlink-pending")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "unlink", unlink)
+    monkeypatch.setattr(
+        module, "_fsync_dir", lambda path: events.append(f"fsync:{path}")
+    )
+
+    transaction._restore_release_selector()
+
+    assert events.index(f"fsync:{root / 'opt/aicc'}") < events.index("unlink-pending")
+    assert events.index("unlink-pending") < events.index(f"fsync:{state}")
+
+
 def test_rollback_and_uninstall_prove_the_release_they_restore():
     """The shell paths that repoint `/opt/aicc/current` on rollback and
     uninstall must go through the same proof, and rollback must remove the
@@ -462,9 +748,14 @@ def test_rollback_and_uninstall_prove_the_release_they_restore():
     ).read_text(encoding="utf-8")
 
     rollback = installer[installer.index("rollback() {") :]
-    assert "release-verify" in rollback.split("trap rollback")[0]
+    rollback = rollback.split("trap rollback")[0]
+    transaction = (
+        Path(__file__).parents[2] / "ops" / "aicc_install_transaction.py"
+    ).read_text(encoding="utf-8")
+    assert "run_transaction recover" in rollback
+    assert "self.verify_release_selection(selector)" in transaction
     uninstall = installer[installer.index('if [ "${1:-}" = "--uninstall" ]') :]
-    uninstall = uninstall.split("AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED")[0]
+    uninstall = uninstall.split("# Validate the stable authority")[0]
     # Compare COMMANDS, not prose: the comments explaining this ordering name
     # the very commands being ordered.
     commands = [
@@ -484,5 +775,5 @@ def test_rollback_and_uninstall_prove_the_release_they_restore():
     # file transaction can only report a partial uninstall it cannot undo
     # (independent review on 25eb0a0c).
     assert first("release-verify") < first("systemctl disable")
-    assert first("release-verify") < first("run_transaction uninstall")
-    assert "previous release failed verification; selector removed" in installer
+    assert first("release-verify") < commands.index("run_transaction uninstall")
+    assert "run_transaction uninstall-select-baseline" in uninstall

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import argparse
+import hashlib
 import importlib.util
 import json
 import os
+import runpy
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -226,7 +230,9 @@ def test_applied_generation_is_not_committed_until_explicit_commit(tmp_path):
     assert not transaction.pending.exists()
 
 
-def test_first_install_boot_generator_uses_self_contained_recovery(tmp_path):
+def test_first_install_boot_generator_is_early_pulled_and_dispatches_capsule(
+    monkeypatch, tmp_path
+):
     generator = _generator_module()
     state = tmp_path / "state"
     generation = state / "generation-0123456789abcdef"
@@ -240,19 +246,911 @@ def test_first_install_boot_generator_uses_self_contained_recovery(tmp_path):
     (state / "pending.json").chmod(0o600)
     destination = tmp_path / "generator"
 
-    assert generator.generate(destination, state, expected_uid=os.getuid())
+    assert generator.generate(destination, state)
 
     unit = (destination / "aicc-principal-recovery.service").read_text()
-    assert f"ExecStart=/usr/bin/python3 {recovery} recover" in unit
+    assert f"ExecStart={generator.ANCHOR} --recover {state}" in unit
+    assert "Before=sysinit.target basic.target" in unit
+    assert "RemainAfterExit=yes" in unit
+    assert "ReadWritePaths=-/opt/aicc " in unit
+    dependency = destination / "sysinit.target.requires/aicc-principal-recovery.service"
+    assert dependency.readlink() == Path("../aicc-principal-recovery.service")
+    for claimer in generator.CLAIMERS:
+        dropin = destination / f"{claimer}.d/10-aicc-recovery.conf"
+        assert "Requires=aicc-principal-recovery.service" in dropin.read_text()
+
+    called = []
+    monkeypatch.setattr(generator.os, "execv", lambda *args: called.append(args))
+    with pytest.raises(AssertionError, match="unreachable"):
+        generator.recover(state, expected_uid=os.getuid())
+    assert called[0][1][1] == str(recovery)
+    assert called[0][1][2] == "recover-boot"
+
     alias = generation / "alias.py"
     alias.symlink_to(recovery)
     (state / "pending.json").write_text(
         json.dumps({"recovery": str(alias)}), encoding="utf-8"
     )
-    assert not generator.generate(destination, state, expected_uid=os.getuid())
+    with pytest.raises(RuntimeError, match="capsule path"):
+        generator.recover(state, expected_uid=os.getuid())
 
 
-def test_recovery_generator_is_the_first_destination_of_clean_install(tmp_path):
+def test_static_and_generated_recovery_units_have_identical_write_paths(tmp_path):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    generation = state / "generation-0123456789abcdef"
+    generation.mkdir(parents=True)
+    recovery = generation / "recovery.py"
+    recovery.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+    recovery.chmod(0o700)
+    (state / "pending.json").write_text(
+        json.dumps({"recovery": str(recovery)}), encoding="utf-8"
+    )
+    (state / "pending.json").chmod(0o600)
+    destination = tmp_path / "generator"
+    assert generator.generate(destination, state)
+
+    static = (
+        Path(__file__).parents[2] / "deploy/systemd/aicc-principal-recovery.service"
+    ).read_text(encoding="utf-8")
+    generated = (destination / "aicc-principal-recovery.service").read_text(
+        encoding="utf-8"
+    )
+
+    def write_paths(unit: str) -> set[str]:
+        line = next(
+            value for value in unit.splitlines() if value.startswith("ReadWritePaths=")
+        )
+        return set(line.removeprefix("ReadWritePaths=").split())
+
+    assert write_paths(static) == write_paths(generated)
+    assert "-/opt/aicc" in write_paths(static)
+
+
+def test_recovery_generator_main_uses_only_early_precedence_directory(
+    monkeypatch, tmp_path
+):
+    generator = _generator_module()
+    normal = tmp_path / "normal"
+    early = tmp_path / "early"
+    late = tmp_path / "late"
+    monkeypatch.setattr(
+        generator.sys,
+        "argv",
+        ["aicc-principal-recovery", str(normal), str(early), str(late)],
+    )
+
+    assert generator.main() == 0
+    assert (early / "aicc-principal-recovery.service").is_file()
+    assert not normal.exists()
+    assert not late.exists()
+
+
+def test_recovery_generator_runtime_is_noop_without_journal_and_fails_on_both(
+    tmp_path,
+):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    state.mkdir()
+    assert generator.recover(state, expected_uid=os.getuid()) == 0
+
+    (state / "pending.json").write_text("{}", encoding="utf-8")
+    (state / "uninstall.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="coexist"):
+        generator.recover(state, expected_uid=os.getuid())
+
+
+def test_recovery_generator_rejects_selector_wal_without_install_journal(
+    tmp_path,
+):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    state.mkdir()
+    pending_release = state / "pending-release"
+    pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
+    pending_release.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="without install journal"):
+        generator.recover(state, expected_uid=os.getuid())
+
+
+@pytest.mark.parametrize("phase", ["PREPARED", "APPLYING"])
+def test_recovery_generator_rejects_selector_before_install_is_applied(
+    monkeypatch, tmp_path, phase
+):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    generation = state / "generation-0123456789abcdef"
+    generation.mkdir(parents=True)
+    recovery = generation / "recovery.py"
+    recovery.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+    recovery.chmod(0o700)
+    pending = state / "pending.json"
+    pending.write_text(
+        json.dumps({"recovery": str(recovery), "phase": phase}),
+        encoding="utf-8",
+    )
+    pending.chmod(0o600)
+    pending_release = state / "pending-release"
+    pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
+    pending_release.chmod(0o600)
+    called = []
+    monkeypatch.setattr(generator.os, "execv", lambda *args: called.append(args))
+
+    with pytest.raises(RuntimeError, match="not paired with an applied install"):
+        generator.recover(state, expected_uid=os.getuid())
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    "journal_name", ["pending.json", "pending-release", "uninstall.json"]
+)
+def test_recovery_generator_rejects_dangling_journal_symlink(
+    tmp_path, journal_name
+):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / journal_name).symlink_to(state / "missing")
+
+    with pytest.raises(RuntimeError):
+        generator.recover(state, expected_uid=os.getuid())
+
+
+def test_recovery_generator_dispatches_digest_bound_uninstall_capsule(
+    monkeypatch, tmp_path
+):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    transaction_id = "a" * 32
+    capsule_dir = state / f"uninstall-{transaction_id}"
+    capsule_dir.mkdir(parents=True)
+    recovery = capsule_dir / "recovery.py"
+    recovery.write_bytes(b"#!/usr/bin/python3\n")
+    recovery.chmod(0o700)
+    payload = {
+        "version": 2,
+        "transaction_id": transaction_id,
+        "phase": "INTENT",
+        "baseline_selector": "ABSENT",
+        "start_selector": f"releases/{'b' * 40}",
+        "registry_sha256": "c" * 64,
+        "snapshot_sha256": None,
+        "recovery": str(recovery),
+        "recovery_sha256": hashlib.sha256(recovery.read_bytes()).hexdigest(),
+    }
+    journal = state / "uninstall.json"
+    journal.write_text(json.dumps(payload), encoding="utf-8")
+    journal.chmod(0o600)
+    called = []
+    monkeypatch.setattr(generator.os, "execv", lambda *args: called.append(args))
+
+    with pytest.raises(AssertionError, match="unreachable"):
+        generator.recover(state, expected_uid=os.getuid())
+    assert called[0][1][1] == str(recovery)
+    assert called[0][1][2] == "recover-uninstall-boot"
+
+    payload["recovery_sha256"] = "d" * 64
+    journal.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="digest drifted"):
+        generator.recover(state, expected_uid=os.getuid())
+
+
+def test_quiesce_validates_complete_snapshot_before_first_systemd_call(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-agent-launcher.socket": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    },
+                    "not/allowlisted.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    with pytest.raises(RuntimeError, match="invalid service snapshot unit"):
+        module.quiesce_service_snapshot(
+            snapshot, run=lambda *args, **kwargs: calls.append(args)
+        )
+
+    assert calls == []
+
+
+def test_quiesce_requires_inactive_state_and_zero_main_pid(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if "LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if argv[1] == "stop":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "ActiveState" in argv:
+            return SimpleNamespace(returncode=0, stdout="inactive\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="9123\n", stderr="")
+
+    with pytest.raises(RuntimeError, match="did not quiesce exactly"):
+        module.quiesce_service_snapshot(snapshot, run=run)
+
+    assert ["/usr/bin/systemctl", "stop", "voyn-aicc-worker@blue.service"] in calls
+
+
+def test_quiesce_accepts_a_proven_not_found_unit_without_extra_probes(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@retired.service": {
+                        "exists": False,
+                        "enabled": False,
+                        "active": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="not-found\n", stderr="")
+
+    module.quiesce_service_snapshot(snapshot, run=run)
+
+    assert calls == [
+        [
+            "/usr/bin/systemctl",
+            "show",
+            "voyn-aicc-worker@retired.service",
+            "--property=LoadState",
+            "--value",
+        ]
+    ]
+
+
+def test_quiesce_refuses_when_an_expected_active_unit_disappeared(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="not-found\n", stderr="")
+
+    with pytest.raises(RuntimeError, match="expected unit disappeared"):
+        module.quiesce_service_snapshot(snapshot, run=run)
+
+    assert len(calls) == 1
+
+
+def test_transaction_host_lock_contends_and_adopts_the_inherited_inode(tmp_path):
+    module = _module()
+    lock = tmp_path / "state" / "install-recovery.lock"
+    lock.parent.mkdir(mode=0o700)
+    uid, gid = os.geteuid(), os.getegid()
+    first = module._install_lock_fd(
+        lock, trusted_uid=uid, trusted_gid=gid
+    )
+    try:
+        adopted = module._install_lock_fd(
+            lock, first, trusted_uid=uid, trusted_gid=gid
+        )
+        try:
+            assert os.fstat(adopted).st_ino == os.fstat(first).st_ino
+        finally:
+            os.close(adopted)
+        with pytest.raises(RuntimeError, match="another install"):
+            module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
+    finally:
+        os.close(first)
+
+
+def test_transaction_host_lock_handoff_is_cross_process_and_same_ofd(tmp_path):
+    module = _module()
+    lock = tmp_path / "state" / "install-recovery.lock"
+    lock.parent.mkdir(mode=0o700)
+    uid, gid = os.geteuid(), os.getegid()
+    held = module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
+    script = str(Path(__file__).parents[2] / "ops/aicc_install_transaction.py")
+    child = (
+        "import os,runpy,sys; from pathlib import Path; "
+        "m=runpy.run_path(sys.argv[1]); fd=int(sys.argv[3]); "
+        "adopt=m['_install_lock_fd'](Path(sys.argv[2]),fd,"
+        "trusted_uid=os.geteuid(),trusted_gid=os.getegid()); "
+        "assert os.fstat(adopt).st_ino==os.fstat(fd).st_ino; os.close(adopt)"
+    )
+    contender = (
+        "import os,runpy,sys; from pathlib import Path; "
+        "m=runpy.run_path(sys.argv[1]); "
+        "\ntry: m['_install_lock_fd'](Path(sys.argv[2]),"
+        "trusted_uid=os.geteuid(),trusted_gid=os.getegid())"
+        "\nexcept RuntimeError: raise SystemExit(0)"
+        "\nraise SystemExit(9)"
+    )
+    try:
+        adopted = subprocess.run(
+            [sys.executable, "-c", child, script, str(lock), str(held)],
+            pass_fds=(held,),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert adopted.returncode == 0, adopted.stderr
+        blocked = subprocess.run(
+            [sys.executable, "-c", contender, script, str(lock)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert blocked.returncode == 0, blocked.stderr
+    finally:
+        os.close(held)
+
+
+def test_bootstrap_and_transaction_use_one_fixed_host_lock_path():
+    transaction = _module()
+    bootstrap = runpy.run_path(
+        str(Path(__file__).parents[2] / "ops/aicc_exact_sha_bootstrap.py")
+    )
+    assert transaction.INSTALL_LOCK == bootstrap["DEFAULT_INSTALL_LOCK"]
+
+
+def test_uninstall_wal_blocks_install_and_resumes_after_registry_removal(tmp_path):
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    current = tmp_path / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = tmp_path / "worker-lanes"
+    lanes.write_text("blue\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    snapshot = state / "uninstall-units.json"
+
+    assert (
+        module.begin_uninstall(
+            state,
+            baseline_selector="ABSENT",
+            current_selector=current,
+            lane_registry=lanes,
+        )
+        == "INTENT"
+    )
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    snapshot.chmod(0o600)
+    module.arm_uninstall(state, snapshot)
+    lanes.unlink()
+
+    assert (
+        module.begin_uninstall(
+            state,
+            baseline_selector="ABSENT",
+            current_selector=current,
+            lane_registry=lanes,
+        )
+        == "ARMED"
+    )
+    args = SimpleNamespace(action="validate", state_dir=state)
+    with pytest.raises(RuntimeError, match="unfinished uninstall"):
+        module._dispatch(args, argparse.ArgumentParser())
+
+    module.complete_uninstall(state, snapshot)
+    assert not (state / "uninstall.json").exists()
+    assert not snapshot.exists()
+
+
+def test_uninstall_wal_refuses_registry_or_snapshot_drift(tmp_path):
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    current = tmp_path / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = tmp_path / "worker-lanes"
+    lanes.write_text("blue\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    snapshot = state / "uninstall-units.json"
+    module.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=current,
+        lane_registry=lanes,
+    )
+    lanes.write_text("green\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="registry changed"):
+        module.begin_uninstall(
+            state,
+            baseline_selector="ABSENT",
+            current_selector=current,
+            lane_registry=lanes,
+        )
+    lanes.write_text("blue\n", encoding="utf-8")
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    snapshot.chmod(0o600)
+    module.arm_uninstall(state, snapshot)
+    snapshot.write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="snapshot drifted"):
+        module.arm_uninstall(state, snapshot)
+
+
+def test_boot_recovery_aborts_unarmed_uninstall_intent_with_wal_last(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = root / "etc/aicc/worker-lanes"
+    lanes.parent.mkdir(parents=True)
+    lanes.write_text("blue\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    module.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=current,
+        lane_registry=lanes,
+    )
+    capsule = Path(json.loads((state / "uninstall.json").read_text())["recovery"])
+    (state / "uninstall-units.json").write_text("partial", encoding="utf-8")
+
+    module.recover_uninstall(state, root=root, boot=True)
+
+    assert current.readlink() == Path(f"releases/{'b' * 40}")
+    assert lanes.read_text(encoding="utf-8") == "blue\n"
+    assert not (state / "uninstall.json").exists()
+    assert not (state / "uninstall-units.json").exists()
+    assert not capsule.exists()
+
+
+def test_boot_recovery_completes_armed_uninstall_from_capsule(
+    monkeypatch, tmp_path
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.install((_spec(module, source, "/etc/aicc-installed"),))
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = root / "etc/aicc/worker-lanes"
+    lanes.parent.mkdir(parents=True)
+    lanes.write_text("blue\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    (state / "baseline-units.json").write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    snapshot = state / "uninstall-units.json"
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    snapshot.chmod(0o600)
+    module.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=current,
+        lane_registry=lanes,
+    )
+    module.arm_uninstall(state, snapshot)
+    restored = []
+    closure_checks = []
+    monkeypatch.setattr(
+        module,
+        "verify_service_snapshot_closure",
+        lambda path: closure_checks.append(path),
+    )
+    monkeypatch.setattr(module, "quiesce_service_snapshot", lambda path: None)
+    monkeypatch.setattr(
+        module,
+        "restore_service_snapshot",
+        lambda path, *, defer_starts=False: restored.append(
+            (path, defer_starts)
+        ),
+    )
+
+    module.recover_uninstall(state, root=root, boot=True)
+
+    assert not (root / "etc/aicc-installed").exists()
+    assert not current.exists()
+    assert not (state / "uninstall.json").exists()
+    assert not snapshot.exists()
+    assert restored == [(state / "baseline-units.json", True)]
+    assert closure_checks == [snapshot, snapshot, snapshot]
+
+
+@pytest.mark.parametrize("boot", [False, True])
+def test_armed_uninstall_recovery_refuses_late_lane_before_mutation(
+    monkeypatch, tmp_path, boot
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.install((_spec(module, source, "/etc/aicc-installed"),))
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = root / "etc/aicc/worker-lanes"
+    lanes.parent.mkdir(parents=True)
+    lanes.write_text("blue\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    snapshot = state / "uninstall-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot.chmod(0o600)
+    module.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=current,
+        lane_registry=lanes,
+    )
+    module.arm_uninstall(state, snapshot)
+
+    late_lane_visible = False
+
+    def run(argv, **kwargs):
+        output = "voyn-aicc-worker@blue.service enabled\n"
+        if late_lane_visible and argv[1] == "list-unit-files":
+            output += "voyn-aicc-worker@late.service enabled\n"
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    closure = module.verify_service_snapshot_closure
+
+    def check_closure(path):
+        nonlocal late_lane_visible
+        closure(path, run=run)
+        late_lane_visible = True
+
+    monkeypatch.setattr(
+        module,
+        "verify_service_snapshot_closure",
+        check_closure,
+    )
+    quiesced = []
+    monkeypatch.setattr(
+        module, "quiesce_service_snapshot", lambda path: quiesced.append(path)
+    )
+
+    with pytest.raises(RuntimeError, match="outside service snapshot"):
+        module.recover_uninstall(state, root=root, boot=boot)
+
+    assert (root / "etc/aicc-installed").read_bytes() == b"installed"
+    assert current.readlink() == Path(f"releases/{'b' * 40}")
+    assert (state / "uninstall.json").exists()
+    assert snapshot.exists()
+    assert quiesced == [snapshot]
+
+
+def test_snapshot_closure_fails_closed_when_systemd_inventory_fails(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "uninstall-units.json"
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+
+    def run(argv, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="inventory failed")
+
+    with pytest.raises(RuntimeError, match="inventory failed"):
+        module.verify_service_snapshot_closure(snapshot, run=run)
+
+
+@pytest.mark.parametrize("boot", [False, True])
+def test_install_recovery_rechecks_closure_after_quiesce_before_mutation(
+    monkeypatch, tmp_path, boot
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/new"),))
+    transaction.apply()
+    snapshot = state / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    checks = 0
+
+    def closure(path):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("worker lanes exist outside service snapshot: late")
+
+    quiesced = []
+    monkeypatch.setattr(module, "verify_service_snapshot_closure", closure)
+    monkeypatch.setattr(
+        module, "quiesce_service_snapshot", lambda path: quiesced.append(path)
+    )
+
+    with pytest.raises(RuntimeError, match="outside service snapshot"):
+        transaction.recover(boot=boot)
+
+    assert (root / "etc/new").read_bytes() == b"installed"
+    assert transaction.pending.exists()
+    assert snapshot.exists()
+    assert quiesced == [snapshot]
+
+
+def test_pending_release_without_install_journal_is_unreachable(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    state.mkdir()
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'a' * 40}")
+    pending_release = state / "pending-release"
+    pending_release.write_text(f"releases/{'b' * 40}\n", encoding="ascii")
+    pending_release.chmod(0o600)
+    with pytest.raises(RuntimeError, match="without install journal"):
+        module.FileTransaction(root, state).recover()
+
+    assert current.readlink() == Path(f"releases/{'a' * 40}")
+    assert pending_release.exists()
+
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    with pytest.raises(RuntimeError, match="blocks a new install"):
+        module.FileTransaction(root, state).prepare(
+            (_spec(module, source, "/etc/new"),)
+        )
+    assert not (root / "etc/new").exists()
+    assert pending_release.exists()
+
+
+@pytest.mark.parametrize("phase", ["PREPARED", "APPLYING"])
+@pytest.mark.parametrize("boot", [False, True])
+def test_recovery_rejects_selector_marker_paired_with_unapplied_install(
+    tmp_path, phase, boot
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare((_spec(module, source, "/etc/new"),))
+    transaction._write_journal(manifest, phase, 0)
+    pending_release = state / "pending-release"
+    pending_release.write_text(f"releases/{'b' * 40}\n", encoding="ascii")
+    pending_release.chmod(0o600)
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'a' * 40}")
+
+    with pytest.raises(RuntimeError, match="not paired with an applied install"):
+        transaction.recover(boot=boot)
+
+    assert current.readlink() == Path(f"releases/{'a' * 40}")
+    assert not (root / "etc/new").exists()
+    assert transaction.pending.exists()
+    assert pending_release.exists()
+
+
+@pytest.mark.parametrize("name", ["pending.json", "pending-release"])
+def test_transaction_recovery_rejects_dangling_journal_path(tmp_path, name):
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / name).symlink_to(state / "missing")
+
+    with pytest.raises((RuntimeError, OSError)):
+        module.FileTransaction(tmp_path / "root", state).recover()
+
+
+def test_mutation_guards_reject_dangling_uninstall_journal(tmp_path):
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "uninstall.json").symlink_to(state / "missing")
+    parser = argparse.ArgumentParser()
+
+    for action in ("recovery-anchor-install", "validate"):
+        args = SimpleNamespace(
+            action=action,
+            state_dir=state,
+            repo_root=tmp_path,
+        )
+        with pytest.raises(RuntimeError, match="unfinished uninstall"):
+            module._dispatch(args, parser)
+
+    with pytest.raises((RuntimeError, OSError)):
+        module.begin_uninstall(
+            state,
+            baseline_selector="ABSENT",
+            current_selector=tmp_path / "current",
+            lane_registry=tmp_path / "lanes",
+        )
+
+
+def test_uninstall_completion_keeps_wal_until_all_adjuncts_are_durable(
+    monkeypatch, tmp_path
+):
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    current = tmp_path / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = tmp_path / "worker-lanes"
+    lanes.write_text("blue\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    snapshot = state / "uninstall-units.json"
+    module.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=current,
+        lane_registry=lanes,
+    )
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    snapshot.chmod(0o600)
+    module.arm_uninstall(state, snapshot)
+    for name in ("baseline-units.json", "baseline-release", "attempt-units.json"):
+        (state / name).write_text("state", encoding="utf-8")
+    real_unlink = module.Path.unlink
+
+    def crash_mid_cleanup(self, *args, **kwargs):
+        if self == state / "baseline-release":
+            raise OSError("injected cleanup crash")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "unlink", crash_mid_cleanup)
+    with pytest.raises(OSError, match="cleanup crash"):
+        module.complete_uninstall(state, snapshot)
+    monkeypatch.setattr(module.Path, "unlink", real_unlink)
+
+    assert module.uninstall_phase(state) == "COMPLETING"
+    args = SimpleNamespace(action="validate", state_dir=state)
+    with pytest.raises(RuntimeError, match="unfinished uninstall"):
+        module._dispatch(args, argparse.ArgumentParser())
+    module.complete_uninstall(state, snapshot)
+    assert not (state / "uninstall.json").exists()
+    assert not any(
+        (state / name).exists()
+        for name in (
+            "uninstall-units.json",
+            "baseline-units.json",
+            "baseline-release",
+            "attempt-units.json",
+        )
+    )
+
+
+def test_uninstall_baseline_selection_requires_matching_armed_journal(
+    monkeypatch, tmp_path
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    (root / "opt/aicc").mkdir(parents=True)
+    state.mkdir(mode=0o700)
+    transaction = module.FileTransaction(root, state)
+    monkeypatch.setattr(transaction, "verify_release_selection", lambda value: None)
+
+    with pytest.raises((FileNotFoundError, RuntimeError)):
+        transaction.select_uninstall_baseline("ABSENT")
+    current = root / "opt/aicc/current"
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = root / "etc/aicc/worker-lanes"
+    lanes.parent.mkdir(parents=True)
+    lanes.write_text("blue\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    module.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=current,
+        lane_registry=lanes,
+    )
+    with pytest.raises(RuntimeError, match="armed journal"):
+        transaction.select_uninstall_baseline("ABSENT")
+
+
+def test_release_selection_arms_pending_selector_without_clobber(monkeypatch, tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    release_id = "b" * 40
+    release = root / "opt/aicc/releases" / release_id
+    release.mkdir(parents=True)
+    current = root / "opt/aicc/current"
+    current.symlink_to(f"releases/{'a' * 40}")
+    transaction = module.FileTransaction(root, state)
+    state.mkdir(mode=0o700)
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction.prepare((_spec(module, source, "/etc/aicc-installed"),))
+    transaction.apply()
+    monkeypatch.setattr(module, "verify_release_manifest", lambda *a, **k: [])
+
+    assert transaction.select_release(release_id, tmp_path) == f"releases/{'a' * 40}"
+    assert transaction.pending_release.read_text(encoding="ascii").strip() == (
+        f"releases/{'a' * 40}"
+    )
+    assert current.readlink() == Path(f"releases/{release_id}")
+
+    with pytest.raises(RuntimeError, match="pending release selector"):
+        transaction.select_release(release_id, tmp_path)
+
+
+def test_recovery_generator_is_a_permanent_pretransaction_anchor(tmp_path):
     module = _module()
     repo = Path(__file__).parents[2]
     specs = module.default_specs(
@@ -262,8 +1160,12 @@ def test_recovery_generator_is_the_first_destination_of_clean_install(tmp_path):
         codex_auth=tmp_path / "codex.json",
         resolve_identities=False,
     )
-    assert (
-        specs[0].target == "/usr/lib/systemd/system-generators/aicc-principal-recovery"
+    assert module.RECOVERY_ANCHOR_TARGET not in {spec.target for spec in specs}
+    installer = (
+        Path(__file__).parents[2] / "deploy/install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+    assert installer.index("run_transaction recovery-anchor-install") < installer.index(
+        "run_transaction prepare"
     )
     by_target = {spec.target: spec for spec in specs}
     for target in (
@@ -279,6 +1181,24 @@ def test_recovery_generator_is_the_first_destination_of_clean_install(tmp_path):
             0,
             0o600,
         )
+
+
+def test_same_boot_barrier_is_active_before_first_wal_or_claimer_start():
+    installer = (
+        Path(__file__).parents[2] / "deploy/install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+    commands = [line.strip() for line in installer.splitlines()]
+    anchor = commands.index("run_transaction recovery-anchor-install")
+    inline_recover = commands.index("run_transaction recover", anchor)
+    reload_units = commands.index("systemctl daemon-reload", inline_recover)
+    activate = commands.index(
+        "systemctl start aicc-principal-recovery.service", reload_units
+    )
+    prepare = commands.index("run_transaction prepare")
+    launcher = commands.index("systemctl enable --now aicc-agent-launcher.socket")
+
+    assert anchor < inline_recover < reload_units < activate < prepare < launcher
+    assert "systemctl enable aicc-principal-recovery.service" not in installer
 
 
 def test_boot_recovery_restores_dynamic_worker_and_auxiliary_unit_state(tmp_path):
@@ -352,6 +1272,9 @@ def test_failed_boot_service_restore_keeps_journal_for_retry(monkeypatch, tmp_pa
     transaction.apply()
     (state / "attempt-units.json").write_text(
         json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        module, "verify_service_snapshot_closure", lambda path: None
     )
     monkeypatch.setattr(
         module,
@@ -452,6 +1375,141 @@ def test_absent_unit_restore_verifies_final_stop_disable_state(tmp_path):
         module.restore_service_snapshot(snapshot, run=run)
 
 
+def test_boot_restore_queues_active_worker_without_dependency_deadlock(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if "--property=LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if "--property=MainPID" in argv:
+            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+        if argv[1] == "is-active":
+            return SimpleNamespace(returncode=3, stdout="inactive\n", stderr="")
+        if argv[1] == "is-enabled":
+            return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+
+    assert [
+        "/usr/bin/systemctl",
+        "--no-block",
+        "start",
+        "voyn-aicc-worker@blue.service",
+    ] in calls
+    assert [
+        "/usr/bin/systemctl",
+        "start",
+        "voyn-aicc-worker@blue.service",
+    ] not in calls
+
+
+def test_boot_restore_never_synchronously_stops_its_own_recovery_service(
+    tmp_path,
+):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-principal-recovery.service": {
+                        "exists": False,
+                        "enabled": False,
+                        "active": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if "--property=LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if "--property=MainPID" in argv:
+            return SimpleNamespace(
+                returncode=0, stdout=f"{os.getpid()}\n", stderr=""
+            )
+        if argv[1] == "is-active":
+            return SimpleNamespace(returncode=0, stdout="active\n", stderr="")
+        if argv[1] == "is-enabled":
+            return SimpleNamespace(returncode=1, stdout="disabled\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+
+    assert [
+        "/usr/bin/systemctl",
+        "stop",
+        "aicc-principal-recovery.service",
+    ] not in calls
+
+
+def test_boot_restore_existing_inactive_recovery_defers_self_stop(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-principal-recovery.service": {
+                        "exists": True,
+                        "enabled": False,
+                        "active": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if "--property=LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if "--property=MainPID" in argv:
+            return SimpleNamespace(
+                returncode=0, stdout=f"{os.getpid()}\n", stderr=""
+            )
+        if argv[1] == "is-active":
+            return SimpleNamespace(returncode=0, stdout="active\n", stderr="")
+        if argv[1] == "is-enabled":
+            return SimpleNamespace(returncode=1, stdout="disabled\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+
+    assert not any(
+        argv[1] in {"start", "stop"}
+        and argv[-1] == "aicc-principal-recovery.service"
+        for argv in calls
+    )
+
+
 def test_invalid_source_is_rejected_before_any_target_mutation(tmp_path):
     module = _module()
     root = tmp_path / "root"
@@ -538,6 +1596,97 @@ def test_recover_finishes_an_interrupted_commit_instead_of_reverting_it(
     assert json.loads(transaction.current.read_text())["manifest"]
 
 
+def test_commit_crash_after_pending_release_unlink_cannot_restore_old_selector(
+    monkeypatch, tmp_path
+):
+    """The rollback selector is retired durably before the transaction WAL.
+
+    A crash while unlinking pending.json must leave recovery in COMMITTING,
+    never with an old pending-release that can revert the already-live code.
+    """
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "payload"
+    source.write_bytes(b"new")
+    current_release = root / "opt/aicc/current"
+    current_release.parent.mkdir(parents=True)
+    current_release.symlink_to(f"releases/{'b' * 40}")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/payload"),))
+    transaction.apply()
+    transaction.pending_release.write_text(
+        f"releases/{'a' * 40}\n", encoding="ascii"
+    )
+    transaction.pending_release.chmod(0o600)
+    real_unlink = module.Path.unlink
+
+    def crash_on_pending_unlink(self, *args, **kwargs):
+        if self == transaction.pending:
+            raise OSError("crash after selector retirement")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "unlink", crash_on_pending_unlink)
+    with pytest.raises(OSError, match="selector retirement"):
+        transaction.commit()
+    monkeypatch.setattr(module.Path, "unlink", real_unlink)
+
+    assert not transaction.pending_release.exists()
+    assert transaction.pending.exists()
+    transaction.recover()
+
+    assert current_release.readlink() == Path(f"releases/{'b' * 40}")
+    assert not transaction.pending.exists()
+
+
+def test_committing_recovery_can_crash_after_selector_retirement_and_retry(
+    monkeypatch, tmp_path
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "payload"
+    source.write_bytes(b"new")
+    current_release = root / "opt/aicc/current"
+    current_release.parent.mkdir(parents=True)
+    current_release.symlink_to(f"releases/{'b' * 40}")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/payload"),))
+    transaction.apply()
+    transaction.pending_release.write_text(
+        f"releases/{'a' * 40}\n", encoding="ascii"
+    )
+    transaction.pending_release.chmod(0o600)
+    real_unlink = module.Path.unlink
+
+    def crash_commit_selector_unlink(self, *args, **kwargs):
+        if self == transaction.pending_release:
+            raise OSError("crash before selector retirement")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "unlink", crash_commit_selector_unlink)
+    with pytest.raises(OSError, match="before selector retirement"):
+        transaction.commit()
+    monkeypatch.setattr(module.Path, "unlink", real_unlink)
+    assert transaction.pending_release.exists()
+
+    def crash_recovery_pending_unlink(self, *args, **kwargs):
+        if self == transaction.pending:
+            raise OSError("crash after selector retirement")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "unlink", crash_recovery_pending_unlink)
+    with pytest.raises(OSError, match="after selector retirement"):
+        transaction.recover()
+    monkeypatch.setattr(module.Path, "unlink", real_unlink)
+    assert not transaction.pending_release.exists()
+    assert transaction.pending.exists()
+
+    transaction.recover()
+    assert current_release.readlink() == Path(f"releases/{'b' * 40}")
+    assert not transaction.pending.exists()
+
+
 def test_recover_restores_release_selector_before_any_service_snapshot(
     monkeypatch, tmp_path
 ):
@@ -591,9 +1740,17 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
     order: list[str] = []
     original_selector_restore = module.FileTransaction._restore_release_selector
 
-    def recording_selector_restore(self):
+    def recording_quiesce(path):
+        assert path == state / "attempt-units.json"
+        order.append("quiesce")
+
+    def recording_selector_restore(self, **kwargs):
         order.append("selector")
-        return original_selector_restore(self)
+        return original_selector_restore(self, **kwargs)
+
+    def recording_closure(path):
+        assert path == state / "attempt-units.json"
+        order.append("closure")
 
     def recording_service_restore(path):
         assert path == state / "attempt-units.json"
@@ -604,11 +1761,22 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
         "_restore_release_selector",
         recording_selector_restore,
     )
+    monkeypatch.setattr(module, "quiesce_service_snapshot", recording_quiesce)
+    monkeypatch.setattr(
+        module, "verify_service_snapshot_closure", recording_closure
+    )
     monkeypatch.setattr(module, "restore_service_snapshot", recording_service_restore)
 
     transaction.recover()
 
-    assert order == ["selector", "services"], order
+    assert order == [
+        "closure",
+        "quiesce",
+        "closure",
+        "selector",
+        "services",
+        "closure",
+    ], order
     assert current.readlink() == Path(f"releases/{'a' * 40}")
     assert not pending_release.exists()
     assert not (root / "etc/new").exists()
@@ -630,7 +1798,7 @@ def test_recover_refuses_a_selector_to_a_missing_release(tmp_path):
     pending.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
     pending.chmod(0o600)
     transaction = module.FileTransaction(root, state)
-    with pytest.raises(RuntimeError, match="missing release"):
+    with pytest.raises(RuntimeError, match="without install journal"):
         transaction.recover()
     assert current.readlink() == Path(f"releases/{'b' * 40}")
 
@@ -670,6 +1838,9 @@ def test_recovery_itself_refuses_an_unattested_pending_release(monkeypatch, tmp_
     pending_release.chmod(0o600)
     (state / "attempt-units.json").write_text(
         json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        module, "verify_service_snapshot_closure", lambda path: None
     )
     monkeypatch.setattr(module, "restore_service_snapshot", lambda *a, **k: None)
 

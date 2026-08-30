@@ -10,6 +10,8 @@ and verified inside a private root-owned attempt directory first.
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import grp
 import hashlib
 import json
@@ -26,6 +28,10 @@ from pathlib import Path
 TRUSTED_REMOTE = "https://github.com/voyn88/ai-command-center.git"
 DEFAULT_STATE_ROOT = Path("/var/lib/aicc-exact-sha-bootstrap")
 DEFAULT_AUTHORITY_ENV = Path("/etc/aicc/workspace-authority.env")
+DEFAULT_INSTALL_LOCK = Path(
+    "/var/lib/aicc-principal-isolation/install-recovery.lock"
+)
+UNINSTALL_JOURNAL = Path("/var/lib/aicc-principal-isolation/uninstall.json")
 GIT = "/usr/bin/git"
 # Every repository-config knob that turns a plain Git read into code execution
 # by the invoking (root) principal. `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL`
@@ -107,7 +113,11 @@ class TreeAttestation:
 
 
 def _run(
-    argv: list[str], *, cwd: Path | None, env: dict[str, str]
+    argv: list[str],
+    *,
+    cwd: Path | None,
+    env: dict[str, str],
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     result = subprocess.run(
         argv,
@@ -116,6 +126,7 @@ def _run(
         stdin=subprocess.DEVNULL,
         capture_output=True,
         check=False,
+        pass_fds=pass_fds,
     )
     if result.returncode:
         detail = result.stderr.decode("utf-8", "replace").strip()
@@ -140,7 +151,9 @@ def _safe_environment(home: Path) -> dict[str, str]:
     }
 
 
-def _require_private_root_directory(path: Path, *, create: bool) -> None:
+def _require_private_root_directory(
+    path: Path, *, create: bool, trusted_uid: int = 0, trusted_gid: int = 0
+) -> None:
     if not path.is_absolute():
         raise BootstrapRefused("bootstrap state root must be absolute")
     if create:
@@ -148,15 +161,15 @@ def _require_private_root_directory(path: Path, *, create: bool) -> None:
     info = path.lstat()
     if (
         not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != 0
-        or info.st_gid != 0
+        or info.st_uid != trusted_uid
+        or info.st_gid != trusted_gid
         or stat.S_IMODE(info.st_mode) != 0o700
     ):
         raise BootstrapRefused("bootstrap state root must be root:root mode 0700")
     current = path
     while current != Path("/"):
         info = current.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in {0, trusted_uid}:
             raise BootstrapRefused(f"untrusted bootstrap path component: {current}")
         if stat.S_IMODE(info.st_mode) & 0o022 and not info.st_mode & stat.S_ISVTX:
             raise BootstrapRefused(
@@ -183,6 +196,98 @@ def _require_root_owned_directory_chain(path: Path, *, create: bool) -> None:
         if current == Path("/"):
             break
         current = current.parent
+
+
+def _install_lock_fd(
+    path: Path,
+    inherited_fd: int | None = None,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> int:
+    """Open or adopt the persistent host-wide install/recovery lock safely."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise BootstrapRefused("host kernel lacks required no-follow lock support")
+    _require_private_root_directory(
+        path.parent,
+        create=True,
+        trusted_uid=trusted_uid,
+        trusted_gid=trusted_gid,
+    )
+    parent_fd = os.open(
+        path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    descriptor = -1
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != trusted_uid
+            or parent.st_gid != trusted_gid
+            or stat.S_IMODE(parent.st_mode) & 0o077
+        ):
+            raise BootstrapRefused("install lock directory is unsafe")
+        if inherited_fd is None:
+            try:
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                os.fchmod(descriptor, 0o600)
+                os.fchown(descriptor, trusted_uid, trusted_gid)
+                os.fsync(descriptor)
+                os.fsync(parent_fd)
+            except OSError as exc:
+                if exc.errno != errno.EEXIST:
+                    raise
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+        else:
+            if inherited_fd < 0:
+                raise BootstrapRefused("invalid inherited install lock descriptor")
+            try:
+                descriptor = os.dup(inherited_fd)
+            except OSError as exc:
+                raise BootstrapRefused(
+                    "invalid inherited install lock descriptor"
+                ) from exc
+        observed = os.fstat(descriptor)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != trusted_uid
+            or observed.st_gid != trusted_gid
+            or stat.S_IMODE(observed.st_mode) != 0o600
+            or (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise BootstrapRefused("install/recovery lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in {errno.EAGAIN, errno.EACCES}:
+                raise BootstrapRefused("cannot acquire install/recovery lock") from exc
+            raise BootstrapRefused("another install or recovery owns the host lock") from exc
+        return descriptor
+    except BootstrapRefused:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise BootstrapRefused("cannot safely open install/recovery lock") from exc
+    finally:
+        os.close(parent_fd)
 
 
 def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
@@ -214,22 +319,23 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
 
 
 def _git_blob_oid(blob_bytes: bytes) -> str:
-    """The Git object name of committed file content.
-
-    SHA-1 is not a choice here and carries no security claim of its own: it is
-    the identity function of the repository format, and the value is only ever
-    compared against an oid Git itself produced. `usedforsecurity=False` states
-    that. Trust on this path comes from the exact commit SHA the bootstrap
-    pins, not from the strength of this digest.
-
-    The parameter is named for what it is -- committed file content, never a
-    key. `payload` was ambiguous enough that CodeQL's
-    `py/weak-sensitive-data-hashing` joined it to `_atomic_write`'s
-    identically named parameter, which does carry the workspace-authority key,
-    and reported this as hashing a secret.
-    """
-    prefix = f"blob {len(blob_bytes)}\0".encode("ascii")
-    return hashlib.new("sha1", prefix + blob_bytes, usedforsecurity=False).hexdigest()
+    """Ask trusted Git for the repository-format identity of raw blob bytes."""
+    try:
+        result = subprocess.run(
+            _git_argv("hash-object", "--no-filters", "--stdin"),
+            cwd=Path("/"),
+            env=_safe_environment(Path("/nonexistent")),
+            input=blob_bytes,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise BootstrapRefused("cannot execute trusted Git blob identity") from exc
+    if result.returncode or result.stderr:
+        raise BootstrapRefused("trusted Git blob identity failed")
+    if re.fullmatch(rb"[0-9a-f]{40}\n", result.stdout) is None:
+        raise BootstrapRefused("trusted Git returned an invalid blob identity")
+    return result.stdout[:-1].decode("ascii")
 
 
 def _verify_owned_tree(root: Path, *, trusted_uid: int, trusted_gid: int) -> None:
@@ -410,6 +516,15 @@ def _prepare_authority_file(path: Path) -> None:
     _atomic_write(path, f"AICC_WORKSPACE_AUTHORITY_KEY=hex:{key}\n".encode(), 0o640)
 
 
+def _refuse_unfinished_uninstall(path: Path = UNINSTALL_JOURNAL) -> None:
+    """Prevent even additive host mutation while uninstall WAL is active."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise BootstrapRefused("unfinished uninstall journal blocks installation")
+
+
 def _fetch_exact_checkout(
     attempt: Path, env: dict[str, str], expected_sha: str
 ) -> Path:
@@ -507,7 +622,9 @@ def _verify_existing_attestation(
     return observed
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None, *, install_lock_path: Path | None = None
+) -> int:
     args = _parse_args(argv)
     if os.geteuid() != 0:
         raise BootstrapRefused("exact-SHA bootstrap must run as root")
@@ -515,16 +632,31 @@ def main(argv: list[str] | None = None) -> int:
         raise BootstrapRefused(
             "expected SHA must be exactly 40 lowercase hex characters"
         )
+    lock_path = install_lock_path or DEFAULT_INSTALL_LOCK
+    inherited_raw = os.environ.get("AICC_INSTALL_LOCK_FD")
+    try:
+        inherited_fd = int(inherited_raw) if inherited_raw is not None else None
+    except ValueError as exc:
+        raise BootstrapRefused("invalid inherited install lock descriptor") from exc
     if args.verify_attestation is not None:
-        if args.repo_root is None:
-            raise BootstrapRefused(
-                "--repo-root is required for attestation verification"
-            )
-        _verify_existing_attestation(
-            args.verify_attestation, args.repo_root, args.expected_sha
+        lock_fd = (
+            _install_lock_fd(lock_path, inherited_fd)
+            if inherited_fd is not None
+            else None
         )
-        print(f"AICC_EXACT_SHA_BOOTSTRAP_ATTESTED {args.expected_sha}")
-        return 0
+        try:
+            if args.repo_root is None:
+                raise BootstrapRefused(
+                    "--repo-root is required for attestation verification"
+                )
+            _verify_existing_attestation(
+                args.verify_attestation, args.repo_root, args.expected_sha
+            )
+            print(f"AICC_EXACT_SHA_BOOTSTRAP_ATTESTED {args.expected_sha}")
+            return 0
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
     if args.repo_root is not None:
         raise BootstrapRefused("--repo-root is only valid with --verify-attestation")
     _require_private_root_directory(args.state_root, create=True)
@@ -542,28 +674,34 @@ def main(argv: list[str] | None = None) -> int:
         attestation_path,
         (json.dumps(asdict(attestation), sort_keys=True) + "\n").encode(),
     )
-    installer_env = {
-        **env,
-        "AICC_BOOTSTRAP_ATTESTATION": str(attestation_path),
-        "AICC_EXPECTED_RELEASE_SHA": args.expected_sha,
-    }
-    if args.action == "install":
-        _prepare_authority_file(args.authority_env)
-    installer_argv = [str(repo / "deploy/install-agent-principal-isolation.sh")]
-    if args.action == "uninstall":
-        installer_argv.append("--uninstall")
-    _run(
-        installer_argv,
-        cwd=repo,
-        env=installer_env,
-    )
-    completed = {**asdict(attestation), "completed_at": int(time.time())}
-    _atomic_write(
-        attempt / "completed.json",
-        (json.dumps(completed, sort_keys=True) + "\n").encode(),
-    )
-    print(f"AICC_EXACT_SHA_BOOTSTRAP_{args.action.upper()}ED {args.expected_sha}")
-    return 0
+    lock_fd = _install_lock_fd(lock_path, inherited_fd)
+    try:
+        # The network fetch is intentionally outside the production lock, but
+        # the exact tree is re-proven after acquisition before host mutation.
+        if _verify_checkout(repo, env, args.expected_sha, attempt_id) != attestation:
+            raise BootstrapRefused("bootstrap checkout changed before installation")
+        installer_env = {
+            **env,
+            "AICC_BOOTSTRAP_ATTESTATION": str(attestation_path),
+            "AICC_EXPECTED_RELEASE_SHA": args.expected_sha,
+            "AICC_INSTALL_LOCK_FD": str(lock_fd),
+        }
+        if args.action == "install":
+            _refuse_unfinished_uninstall()
+            _prepare_authority_file(args.authority_env)
+        installer_argv = [str(repo / "deploy/install-agent-principal-isolation.sh")]
+        if args.action == "uninstall":
+            installer_argv.append("--uninstall")
+        _run(installer_argv, cwd=repo, env=installer_env, pass_fds=(lock_fd,))
+        completed = {**asdict(attestation), "completed_at": int(time.time())}
+        _atomic_write(
+            attempt / "completed.json",
+            (json.dumps(completed, sort_keys=True) + "\n").encode(),
+        )
+        print(f"AICC_EXACT_SHA_BOOTSTRAP_{args.action.upper()}ED {args.expected_sha}")
+        return 0
+    finally:
+        os.close(lock_fd)
 
 
 if __name__ == "__main__":
