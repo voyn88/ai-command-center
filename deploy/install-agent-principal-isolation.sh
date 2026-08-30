@@ -43,6 +43,7 @@ pending_release_manifest=
 transaction="$repo_root/ops/aicc_install_transaction.py"
 rollout="$repo_root/ops/aicc_staged_worker_rollout.py"
 release_root=/opt/aicc/releases
+toolchain_root=/opt/aicc/toolchains
 current_release=/opt/aicc/current
 release_staging=
 
@@ -255,8 +256,26 @@ from command_center.workspace_authority import load_workspace_authority_environm
 load_workspace_authority_environment(pathlib.Path(sys.argv[1]))
 PY
 
-for tool in /usr/local/bin/claude /usr/local/bin/codex /usr/local/bin/copilot; do
+# Install the content-addressed provider toolchain before anything requires it.
+# This replaces the previous `npm install --global` as root: the artifact is
+# pinned by sha256 in a reviewed lock, downloaded, proven, extracted under a
+# root-owned tree and selected atomically -- production resolves no package and
+# executes no package lifecycle script
+# (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED).
+/usr/bin/python3 "$repo_root/ops/aicc_toolchain_install.py" \
+  --lock "$repo_root/deploy/agent-toolchain.lock.json"
+
+for tool in "$toolchain_root/current/bin/claude" \
+            "$toolchain_root/current/bin/codex" \
+            "$toolchain_root/current/bin/copilot"; do
   resolved=$(readlink -f -- "$tool" 2>/dev/null || true)
+  # The resolved target must stay inside the selected release: `current` is a
+  # symlink and so are the `bin/` entries, so a link out of the proven tree
+  # would otherwise pass every check below against some other file.
+  case "$resolved" in
+    "$toolchain_root"/releases/*) : ;;
+    *) echo "executor resolves outside the selected toolchain: $tool" >&2; exit 1 ;;
+  esac
   if [ -z "$resolved" ] || [ ! -x "$resolved" ] || \
      [ "$(stat -c %u -- "$resolved" 2>/dev/null || echo -1)" -ne 0 ] || \
      find "$resolved" -maxdepth 0 -perm /022 -print -quit | grep -q .; then

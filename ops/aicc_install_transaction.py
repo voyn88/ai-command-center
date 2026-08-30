@@ -1767,6 +1767,15 @@ def _git_safe_environment() -> dict[str, str]:
 
 RELEASE_MANIFEST_VERSION = 1
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
+# A content-addressed artifact identifies itself by its own sha256 rather than
+# by a Git commit. The publication machinery is otherwise identical -- same
+# ownership, mode, digest and symlink-target proof, same atomic rename, same
+# crash reconciliation -- so it takes the identity pattern as a parameter
+# instead of growing a second copy of itself
+# (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED). Widening RELEASE_ID_RE itself
+# would weaken the Git path, which must keep refusing a 64-hex value that is
+# not a commit.
+ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_TREE_ENTRY_RE = re.compile(
     rb"([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t(.+)", re.DOTALL
 )
@@ -1984,14 +1993,17 @@ def record_release_manifest(
     *,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> list[dict[str, object]]:
     """Write the root-owned content manifest for a freshly staged release.
 
     Recorded before the staging tree is renamed into place, so a release
     directory never exists without the manifest that authorises its reuse.
     """
-    if RELEASE_ID_RE.fullmatch(release_id) is None:
-        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if id_pattern.fullmatch(release_id) is None:
+        raise ReleaseRefused(
+            f"release id does not match its identity pattern {id_pattern.pattern}"
+        )
     entries = release_entries(
         release_tree, trusted_uid=trusted_uid, trusted_gid=trusted_gid
     )
@@ -2042,10 +2054,13 @@ def publish_release_tree(
     *,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> Path:
     """Verify and publish one release atomically without replacing a name."""
-    if RELEASE_ID_RE.fullmatch(release_id) is None:
-        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if id_pattern.fullmatch(release_id) is None:
+        raise ReleaseRefused(
+            f"release id does not match its identity pattern {id_pattern.pattern}"
+        )
     if staging.parent != release_root or staging.name == release_id:
         raise ReleaseRefused("release staging path is outside the release root")
     # The publication primitive itself proves the authority it was given.
@@ -2114,6 +2129,7 @@ def reconcile_release_publication(
     state_dir: Path = Path("/var/lib/aicc-principal-isolation"),
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> Path | None:
     """Recover every crash point around manifest + directory publication.
 
@@ -2123,8 +2139,10 @@ def reconcile_release_publication(
     safely discarded; an incomplete stage without a manifest is discarded and
     rebuilt. Ambiguous or untrusted state fails closed.
     """
-    if RELEASE_ID_RE.fullmatch(release_id) is None:
-        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if id_pattern.fullmatch(release_id) is None:
+        raise ReleaseRefused(
+            f"release id does not match its identity pattern {id_pattern.pattern}"
+        )
     if manifest.parent != state_dir / "releases":
         raise ReleaseRefused("release manifest path is outside trusted state")
     if manifest.name != f"{release_id}.json":
@@ -2206,6 +2224,7 @@ def verify_release_manifest(
     repo_root: Path | None = None,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> list[dict[str, object]]:
     """Prove a pre-existing release directory before it may be selected.
 
@@ -2213,8 +2232,10 @@ def verify_release_manifest(
     is exactly the case this gate exists for, and rebuilding trust from the
     directory itself would only re-record whatever an attacker left there.
     """
-    if RELEASE_ID_RE.fullmatch(release_id) is None:
-        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if id_pattern.fullmatch(release_id) is None:
+        raise ReleaseRefused(
+            f"release id does not match its identity pattern {id_pattern.pattern}"
+        )
     try:
         recorded = _read_regular(manifest)
     except (OSError, RuntimeError) as exc:
