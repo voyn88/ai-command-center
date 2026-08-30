@@ -213,18 +213,23 @@ def _atomic_write(path: Path, payload: bytes, mode: int = 0o600) -> None:
             pass
 
 
-def _git_blob_oid(payload: bytes) -> str:
-    """The blob's Git object name.
+def _git_blob_oid(blob_bytes: bytes) -> str:
+    """The Git object name of committed file content.
 
     SHA-1 is not a choice here and carries no security claim of its own: it is
-    the identity function of the repository format, and the value is compared
-    against an oid Git itself produced. `usedforsecurity=False` states that,
-    so neither a reader nor a scanner mistakes it for hashing a secret. The
-    trust in this payload comes from the exact commit SHA the bootstrap pins,
-    not from the strength of this digest.
+    the identity function of the repository format, and the value is only ever
+    compared against an oid Git itself produced. `usedforsecurity=False` states
+    that. Trust on this path comes from the exact commit SHA the bootstrap
+    pins, not from the strength of this digest.
+
+    The parameter is named for what it is -- committed file content, never a
+    key. `payload` was ambiguous enough that CodeQL's
+    `py/weak-sensitive-data-hashing` joined it to `_atomic_write`'s
+    identically named parameter, which does carry the workspace-authority key,
+    and reported this as hashing a secret.
     """
-    prefix = f"blob {len(payload)}\0".encode("ascii")
-    return hashlib.new("sha1", prefix + payload, usedforsecurity=False).hexdigest()
+    prefix = f"blob {len(blob_bytes)}\0".encode("ascii")
+    return hashlib.new("sha1", prefix + blob_bytes, usedforsecurity=False).hexdigest()
 
 
 def _verify_owned_tree(root: Path, *, trusted_uid: int, trusted_gid: int) -> None:
