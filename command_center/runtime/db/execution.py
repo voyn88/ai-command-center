@@ -229,6 +229,9 @@ def create_run(
     base_branch: str | None = None,
     base_sha: str | None = None,
     head_sha: str | None = None,
+    finalization_owner_token: str | None = None,
+    finalization_owner_pid: int | None = None,
+    finalization_owner_identity: str | None = None,
     enforce_workspace_lock: bool = False,
     max_global_concurrency: int | None = None,
 ) -> dict:
@@ -251,6 +254,22 @@ def create_run(
     same workspace the way a separate pre-flight query (e.g. `launch_service.
     find_active_run_conflict`) can — raises `WorkspaceLockedError` instead of
     inserting."""
+    finalization_owner_values = (
+        finalization_owner_token,
+        finalization_owner_pid,
+        finalization_owner_identity,
+    )
+    if any(value is not None for value in finalization_owner_values) and not all(
+        value is not None for value in finalization_owner_values
+    ):
+        raise ValueError("finalization owner token, pid and identity must be supplied together")
+    if finalization_owner_pid is not None and finalization_owner_pid <= 0:
+        raise ValueError("finalization_owner_pid must be positive")
+    if finalization_owner_token is not None and not finalization_owner_token:
+        raise ValueError("finalization_owner_token must be non-empty")
+    if finalization_owner_identity is not None and not finalization_owner_identity:
+        raise ValueError("finalization_owner_identity must be non-empty")
+
     if provider_route is not None:
         if not provider_route or any(not item for item in provider_route):
             raise ValueError("provider_route must contain non-empty provider ids")
@@ -270,10 +289,19 @@ def create_run(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             if enforce_workspace_lock:
-                placeholders = ", ".join("?" for _ in db.EXECUTION_CENTER_ACTIVE_STATES)
+                active_states = tuple(sorted(db.EXECUTION_CENTER_ACTIVE_STATES))
+                terminal_states = tuple(sorted(db.TERMINAL_STATES))
+                active_placeholders = ", ".join("?" for _ in active_states)
+                terminal_placeholders = ", ".join("?" for _ in terminal_states)
+                lock_predicate = (
+                    f"(state IN ({active_placeholders}) OR "
+                    f"(state IN ({terminal_placeholders}) "
+                    "AND finalized_at IS NULL))"
+                )
+                lock_params = (*active_states, *terminal_states)
                 conflict = conn.execute(
-                    f"SELECT * FROM run WHERE repository_path = ? AND state IN ({placeholders})",
-                    (repository_path, *db.EXECUTION_CENTER_ACTIVE_STATES),
+                    f"SELECT * FROM run WHERE repository_path = ? AND {lock_predicate}",
+                    (repository_path, *lock_params),
                 ).fetchone()
                 if conflict is not None:
                     raise db.WorkspaceLockedError(db._row_to_dict(conflict))
@@ -288,8 +316,8 @@ def create_run(
                 # workspace check so a same-workspace conflict still surfaces as
                 # WorkspaceLockedError (unchanged behaviour).
                 task_conflict = conn.execute(
-                    f"SELECT * FROM run WHERE task_id = ? AND state IN ({placeholders})",
-                    (task_id, *db.EXECUTION_CENTER_ACTIVE_STATES),
+                    f"SELECT * FROM run WHERE task_id = ? AND {lock_predicate}",
+                    (task_id, *lock_params),
                 ).fetchone()
                 if task_conflict is not None:
                     raise db.TaskAlreadyActiveError(db._row_to_dict(task_conflict))
@@ -374,6 +402,20 @@ def create_run(
             stored_run = dict(
                 conn.execute("SELECT * FROM run WHERE id = ?", (record["id"],)).fetchone()
             )
+            if finalization_owner_token is not None:
+                conn.execute(
+                    """INSERT INTO run_finalization_claim (
+                           run_id, owner_token, owner_pid, owner_identity,
+                           claimed_at, completed_at
+                       ) VALUES (?, ?, ?, ?, ?, NULL)""",
+                    (
+                        record["id"],
+                        finalization_owner_token,
+                        finalization_owner_pid,
+                        finalization_owner_identity,
+                        now,
+                    ),
+                )
             provenance_table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provenance'"
             ).fetchone()
@@ -676,7 +718,82 @@ def update_run_state(
     return stored_run
 
 
-def mark_run_finalized(db_path: Path, run_id: str) -> dict | None:
+def get_run_finalization_claim(db_path: Path, run_id: str) -> dict | None:
+    with db.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM run_finalization_claim WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return db._row_to_dict(row)
+
+
+def claim_run_finalization(
+    db_path: Path,
+    run_id: str,
+    *,
+    owner_token: str,
+    owner_pid: int,
+    owner_identity: str,
+    expected_owner_token: str | None,
+) -> dict | None:
+    """Acquire or take over the durable finalization claim by exact CAS.
+
+    Liveness proof is intentionally outside this persistence primitive: the
+    caller must first prove that the prior full process identity is gone.  The
+    expected token then makes two simultaneous recoverers serialize here; only
+    one can replace the observed owner.
+    """
+    if not owner_token or not owner_identity or owner_pid <= 0:
+        raise ValueError("a non-empty owner token/identity and positive pid are required")
+    now = db.iso_now()
+    with db.connect(db_path) as conn:
+        with db.transaction(conn):
+            run = conn.execute("SELECT finalized_at FROM run WHERE id = ?", (run_id,)).fetchone()
+            if run is None or run["finalized_at"] is not None:
+                return None
+            current = conn.execute(
+                "SELECT * FROM run_finalization_claim WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if current is None:
+                if expected_owner_token is not None:
+                    return None
+                conn.execute(
+                    """INSERT INTO run_finalization_claim (
+                           run_id, owner_token, owner_pid, owner_identity,
+                           claimed_at, completed_at
+                       ) VALUES (?, ?, ?, ?, ?, NULL)""",
+                    (run_id, owner_token, owner_pid, owner_identity, now),
+                )
+            else:
+                if (
+                    current["completed_at"] is not None
+                    or current["owner_token"] != expected_owner_token
+                ):
+                    return None
+                cur = conn.execute(
+                    """UPDATE run_finalization_claim
+                       SET owner_token = ?, owner_pid = ?, owner_identity = ?,
+                           claimed_at = ?, completed_at = NULL
+                       WHERE run_id = ? AND owner_token = ? AND completed_at IS NULL""",
+                    (
+                        owner_token,
+                        owner_pid,
+                        owner_identity,
+                        now,
+                        run_id,
+                        expected_owner_token,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    return None
+            row = conn.execute(
+                "SELECT * FROM run_finalization_claim WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return dict(row)
+
+
+def mark_run_finalized(
+    db_path: Path, run_id: str, *, owner_token: str
+) -> dict | None:
     """Stamp `run.finalized_at` — the last write of finalization, never part of
     the terminal-state UPDATE (VOYN-W0-AICC-SRV-09-FINALIZED-AT).
 
@@ -708,12 +825,33 @@ def mark_run_finalized(db_path: Path, run_id: str) -> dict | None:
     """
     with db.connect(db_path) as conn:
         with db.transaction(conn):
+            now = db.iso_now()
+            claim = conn.execute(
+                """SELECT owner_token, completed_at
+                   FROM run_finalization_claim WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()
+            if (
+                claim is None
+                or claim["owner_token"] != owner_token
+                or claim["completed_at"] is not None
+            ):
+                return None
             cur = conn.execute(
                 "UPDATE run SET finalized_at = ? WHERE id = ? AND finalized_at IS NULL",
-                (db.iso_now(), run_id),
+                (now, run_id),
             )
             if cur.rowcount != 1:
                 return None
+            completed = conn.execute(
+                """UPDATE run_finalization_claim SET completed_at = ?
+                   WHERE run_id = ? AND owner_token = ? AND completed_at IS NULL""",
+                (now, run_id, owner_token),
+            )
+            if completed.rowcount != 1:
+                raise db.LostUpdateError(
+                    f"Run {run_id!r} finalization claim changed before completion"
+                )
             stored_run = dict(conn.execute("SELECT * FROM run WHERE id = ?", (run_id,)).fetchone())
     _mirror_run(stored_run)
     return stored_run

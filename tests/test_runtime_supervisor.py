@@ -319,7 +319,7 @@ def test_report_never_truncates_large_assistant_output(git_repo, configure_proje
     assert huge_text in content
 
 
-def test_report_failure_releases_active_ownership_and_signals_waiters(
+def test_report_failure_retains_ownership_and_leaves_visible_unfinalized_run(
     git_repo, configure_project_repo, fake_claude, monkeypatch
 ):
     hold_file = git_repo.parent / "report-failure.hold"
@@ -344,12 +344,14 @@ def test_report_failure_releases_active_ownership_and_signals_waiters(
         active = sup._active[run["id"]]
 
     hold_file.unlink()
-    assert active.done_event.wait(timeout=10)
+    assert active.supervision_finished_event.wait(timeout=10)
+    assert not active.done_event.is_set()
 
     final = db.get_run(sup.db_path, run["id"])
     assert final["state"] == "COMPLETED"
     assert final["exit_code"] == 0
-    assert run["id"] not in sup.active_run_ids()
+    assert final["finalized_at"] is None
+    assert run["id"] in sup.active_run_ids()
     assert db.get_report(sup.db_path, run["id"]) is None
 
     events = db.list_run_events(sup.db_path, run["id"])
@@ -1130,10 +1132,11 @@ def test_terminal_persistence_respects_concurrent_terminal_owner(
     assert final["state"] == "FAILED"
     assert final["failure_reason"] == "concurrent_terminal_owner"
     assert run["id"] not in sup.active_run_ids()
-    assert db.get_report(sup.db_path, run["id"]) is None
+    assert db.get_report(sup.db_path, run["id"]) is not None
+    assert final["finalized_at"] is not None
 
     events = db.list_run_events(sup.db_path, run["id"])
-    assert not any(
+    assert any(
         event["event_type"] == "lifecycle"
         and event["payload"].get("lifecycle") == "process_exited"
         for event in events
@@ -1712,9 +1715,18 @@ def test_launching_set_is_cleared_after_a_prepared_to_queued_transition_failure(
     assert observed["run_id_guarded_during_transition"] is True
     assert not sup._launching
 
-    runs = db.list_runs(sup.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert db.list_runs(sup.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES) == []
+    runs = db.list_runs(sup.db_path)
     assert len(runs) == 1
-    assert runs[0]["state"] == "PREPARED"
+    failed = runs[0]
+    assert failed["state"] == "FAILED"
+    assert failed["failure_reason"] == "launch_preparation_failed"
+    assert failed["finalized_at"] is not None
+    assert db.get_report(sup.db_path, failed["id"]) is not None
+    claim = db.get_run_finalization_claim(sup.db_path, failed["id"])
+    assert claim["completed_at"] is not None
+    with supervisor._PROCESS_OWNED_RUNS_GUARD:
+        assert failed["id"] not in supervisor._PROCESS_OWNED_RUNS
 
 
 def test_concurrent_reconcile_cannot_claim_a_just_created_live_launch(
