@@ -172,6 +172,18 @@ def test_crashed_cutover_marker_fails_closed_after_lock_release(tmp_path):
     supervisor.release_offline_cutover_fence(db_path, token, resumed_lock)
 
 
+def test_windows_runtime_lock_lives_outside_replaceable_data_directory(tmp_path):
+    db_path = tmp_path / "runtime.db"
+
+    lock_path = supervisor._windows_runtime_lock_path(db_path)
+
+    assert lock_path.parent.name == "aicc-runtime-locks"
+    assert lock_path.parent != db_path.parent
+    assert lock_path.suffix == ".lock"
+    assert lock_path == supervisor._windows_runtime_lock_path(db_path)
+    assert lock_path != supervisor._windows_runtime_lock_path(tmp_path / "other.db")
+
+
 def test_offline_cutover_exclusive_lock_cannot_overlap_startup(
     tmp_path, monkeypatch
 ):

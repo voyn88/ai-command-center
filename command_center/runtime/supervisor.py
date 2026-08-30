@@ -42,11 +42,13 @@ project without having gone through `context_service` first.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import secrets
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -101,7 +103,23 @@ def offline_cutover_fence_path(db_path: Path) -> Path:
     return db_path.with_name(f"{db_path.name}.offline-cutover")
 
 
+def _windows_runtime_lock_path(db_path: Path) -> Path:
+    """Keep the lifetime lock outside the replaceable SQLite data directory.
+
+    Windows does not permit deleting an open file. A Supervisor deliberately
+    holds this lock for its whole lifetime, so placing it beside ``runtime.db``
+    makes an otherwise valid data-directory rotation or cleanup fail with
+    ``WinError 32``. The normalized absolute DB path remains the lock identity;
+    only the physical lock file lives in the per-user temporary area.
+    """
+    normalized = os.path.normcase(str(db_path.expanduser().resolve(strict=False)))
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return Path(tempfile.gettempdir()) / "aicc-runtime-locks" / f"{digest}.lock"
+
+
 def _runtime_lock_path(db_path: Path) -> Path:
+    if os.name == "nt":
+        return _windows_runtime_lock_path(db_path)
     return db_path.with_name(f"{db_path.name}.runtime-lock")
 
 
