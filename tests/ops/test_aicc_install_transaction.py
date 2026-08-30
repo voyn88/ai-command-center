@@ -690,6 +690,32 @@ def test_uninstall_wal_blocks_install_and_resumes_after_registry_removal(tmp_pat
     assert not snapshot.exists()
 
 
+def test_uninstall_cli_emits_only_closed_phase_literals(capsys, tmp_path):
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    current = tmp_path / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = tmp_path / "worker-lanes-secret-name"
+    lanes.write_text("secret-lane-name\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    parser = argparse.ArgumentParser()
+    begin_args = SimpleNamespace(
+        action="uninstall-begin",
+        state_dir=state,
+        baseline_selector="ABSENT",
+        current_selector=current,
+        lane_registry=lanes,
+    )
+
+    assert module._dispatch(begin_args, parser) == 0
+    assert capsys.readouterr().out == "INTENT\n"
+    status_args = SimpleNamespace(action="uninstall-status", state_dir=state)
+    assert module._dispatch(status_args, parser) == 0
+    assert capsys.readouterr().out == "INTENT\n"
+
+
 def test_uninstall_wal_refuses_registry_or_snapshot_drift(tmp_path):
     module = _module()
     state = tmp_path / "state"

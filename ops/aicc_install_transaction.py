@@ -347,6 +347,18 @@ def uninstall_phase(state_dir: Path) -> str:
     return str(phase)
 
 
+def _print_uninstall_phase(phase: str) -> None:
+    """Emit only a closed-vocabulary status, never journal-derived text."""
+    if phase == "INTENT":
+        print("INTENT")
+    elif phase == "ARMED":
+        print("ARMED")
+    elif phase == "COMPLETING":
+        print("COMPLETING")
+    else:
+        raise RuntimeError("uninstall journal phase is invalid")
+
+
 def _fsync_dir(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -2433,7 +2445,7 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         )
         return 0
     if args.action == "uninstall-status":
-        print(uninstall_phase(args.state_dir))
+        _print_uninstall_phase(uninstall_phase(args.state_dir))
         return 0
     if args.action == "recover-uninstall-boot":
         recover_uninstall(args.state_dir, root=args.root, boot=True)
@@ -2511,7 +2523,7 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.action == "uninstall-begin":
         if args.baseline_selector is None:
             parser.error("uninstall-begin requires --baseline-selector")
-        print(
+        _print_uninstall_phase(
             begin_uninstall(
                 args.state_dir,
                 baseline_selector=args.baseline_selector,
