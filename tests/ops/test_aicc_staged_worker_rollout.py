@@ -187,6 +187,45 @@ def test_discovery_combines_configured_and_existing_lanes(tmp_path):
     )
 
 
+def test_uninstall_snapshot_audit_refuses_a_lane_created_after_snapshot():
+    module = _module()
+    systemd = FakeSystemd(
+        ("voyn-aicc-worker@blue.service", "voyn-aicc-worker@late.service")
+    )
+    state = {
+        "version": 3,
+        "units": {
+            "voyn-aicc-worker@blue.service": {
+                "exists": True,
+                "enabled": True,
+                "active": True,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="outside service snapshot"):
+        module.verify_snapshot_closure(systemd, state)
+
+
+def test_uninstall_snapshot_audit_accepts_the_exact_discovered_lane_set():
+    module = _module()
+    systemd = FakeSystemd(("voyn-aicc-worker@blue.service",))
+    state = {
+        "version": 3,
+        "units": {
+            "voyn-aicc-worker@blue.service": {
+                "exists": True,
+                "enabled": True,
+                "active": True,
+                "properties": {},
+            }
+        },
+    }
+
+    module.verify_snapshot_closure(systemd, state)
+
+
 def test_registry_expands_arbitrary_lane_and_rejects_duplicates(tmp_path):
     module = _module()
     lanes = tmp_path / "lanes"
