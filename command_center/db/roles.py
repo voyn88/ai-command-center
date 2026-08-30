@@ -155,6 +155,7 @@ ALL_TABLES: tuple[str, ...] = (
     "report",
     "run",
     "run_event",
+    "run_finalization_claim",
     "run_provenance",
     "run_provider_route",
     "schema_migration",
@@ -240,6 +241,12 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
     "work_result": _READ,
     "work_event": _READ,
     "work_attempt": _NONE,  # holds `claim_token_hash`; read via the view
+}
+
+# Host-local fencing state has no generic runtime reader or writer.  A future
+# PostgreSQL authority must expose a dedicated CAS function, never blanket DML.
+_FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
+    "run_finalization_claim": _NONE,
 }
 
 # The structured backlog store (0005, BO-S1), the queue-claim idiom again:
@@ -575,6 +582,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                         if table not in _APP_QUEUE_TABLES
                         and table not in _APP_ENROLMENT_TABLES
                         and table not in _APP_BACKLOG_TABLES
+                        and table not in _FINALIZATION_CLAIM_TABLES
                     },
                     # Declared policies. A second task adding rows here for a
                     # table this one already names must union with it, not
@@ -582,18 +590,22 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _APP_QUEUE_TABLES,
                     _APP_ENROLMENT_TABLES,
                     _APP_BACKLOG_TABLES,
+                    _FINALIZATION_CLAIM_TABLES,
                 )
             ),
             WORKER_ROLE: MappingProxyType(
                 merge_privileges(
-                    _WORKER_TABLES, _WORKER_ENROLMENT_TABLES, _WORKER_BACKLOG_TABLES
+                    _WORKER_TABLES,
+                    _WORKER_ENROLMENT_TABLES,
+                    _WORKER_BACKLOG_TABLES,
+                    _FINALIZATION_CLAIM_TABLES,
                 )
             ),
             # No blanket default: this role is not a general-purpose one, and
             # folding the default in would hand the admission lever DML on every
             # domain table in the schema.
             OPERATOR_ROLE: MappingProxyType(
-                merge_privileges(_OPERATOR_ENROLMENT_TABLES)
+                merge_privileges(_OPERATOR_ENROLMENT_TABLES, _FINALIZATION_CLAIM_TABLES)
             ),
         }
     )

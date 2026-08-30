@@ -43,6 +43,7 @@ from command_center.runtime import api as runtime_api
 from command_center.runtime import completion as completion_domain
 from command_center.runtime import db as runtime_db
 from command_center.runtime import scheduler
+from command_center.runtime import supervisor as supervisor_runtime
 from command_center.runtime.github import FakeGitHubClient
 from tests.completion_helpers import build_repo, git, merge_into_main
 from tests.test_task_pipeline import _drain_runs
@@ -331,13 +332,28 @@ def test_dispatcher_restart_mid_run_yields_no_duplicates(tmp_path, api, fake_cla
     # in-process watcher finish, then reconstruct the exact crash window it
     # would have left behind: the run row still RUNNING, the pid dead --
     # precisely the state `Supervisor.reconcile()` exists to classify.
-    api.supervisor.wait_for_run(run_id, timeout=30)
+    finished = api.supervisor.wait_for_run(run_id, timeout=30)
+    assert finished["state"] in runtime_db.TERMINAL_STATES, finished["state"]
     with runtime_db.connect(api.db_path) as conn:
         with runtime_db.transaction(conn):
             conn.execute(
-                "UPDATE run SET state=?, completed_at=NULL, failure_reason=NULL, exit_code=NULL WHERE id=?",
+                "UPDATE run SET state=?, completed_at=NULL, finalized_at=NULL, "
+                "failure_reason=NULL, exit_code=NULL WHERE id=?",
                 ("RUNNING", run_id),
             )
+            conn.execute(
+                "UPDATE run_finalization_claim SET owner_token=?, owner_pid=?, "
+                "owner_identity=?, completed_at=NULL WHERE run_id=?",
+                ("dead-owner", 999_999_999, "dead-start|dead-command", run_id),
+            )
+    # A real dispatcher restart creates a new Python process, so its
+    # process-local ownership registry starts empty.  This E2E test keeps the
+    # restart inside one pytest process; explicitly reproduce that one piece
+    # of process-boundary state after the old watcher has finished.  Creating
+    # a second API facade alone must *not* clear the registry: other tests
+    # intentionally prove that same-process facades cannot steal live claims.
+    with supervisor_runtime._PROCESS_OWNED_RUNS_GUARD:
+        supervisor_runtime._PROCESS_OWNED_RUNS.discard(run_id)
     del api  # the old dispatcher, and its in-memory Popen registry, are gone
 
     # ------------------------------------- restart: fresh dispatcher instance

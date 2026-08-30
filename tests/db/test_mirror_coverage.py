@@ -70,6 +70,16 @@ class Exclusion:
 # ---------------------------------------------------------------------------
 
 UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
+    "run_finalization_claim": Exclusion(
+        reason=(
+            "The PostgreSQL target is reserved for a future native authority, "
+            "but the current SQLite claim is deliberately host-local: PID and "
+            "process identity have meaning only on that execution host and a "
+            "best-effort mirror cannot preserve its atomic fencing semantics. "
+            "Cutover requires zero open claims and unfinalized runs."
+        ),
+        task="VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY",
+    ),
     # The backlog store (0005, BO-S1) is PostgreSQL-native authority from
     # birth, like the work_item family below: there is no SQLite source to
     # dual-write from — the incumbent it replaces is a Markdown FILE, and its

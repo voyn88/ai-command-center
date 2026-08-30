@@ -1142,6 +1142,10 @@ def test_the_operator_role_holds_no_dml_on_any_domain_table() -> None:
         "principal_credential",
         "enrollment_ticket",
         "worker_host_fingerprint",
+        # Explicit zero-grant declaration for the reserved finalization
+        # fencing table.  Presence in the matrix is not access: the empty
+        # privilege set proves the operator cannot read or mutate it.
+        "run_finalization_claim",
     }
     for table, privileges in granted.items():
         assert privileges <= frozenset({"SELECT"}), table
