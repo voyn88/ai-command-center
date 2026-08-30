@@ -874,6 +874,288 @@ class FileTransaction:
         self._remove_orphan_generations()
 
 
+RELEASE_MANIFEST_VERSION = 1
+RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
+GIT_TREE_ENTRY_RE = re.compile(
+    rb"([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t(.+)", re.DOTALL
+)
+
+
+class ReleaseRefused(RuntimeError):
+    """A staged or pre-existing immutable release could not be proven."""
+
+
+def _git_blob_oid(payload: bytes) -> str:
+    return hashlib.sha1(  # noqa: S324 - Git object identity, not a security digest
+        f"blob {len(payload)}\0".encode("ascii") + payload
+    ).hexdigest()
+
+
+def _release_entry(
+    path: Path, relative: str, *, trusted_uid: int, trusted_gid: int
+) -> dict[str, object]:
+    """Describe one release path from its own `lstat`, refusing anything that
+    a non-root principal could still influence.
+
+    Ownership and the absence of group/other write authority are checked here
+    rather than only against the recorded manifest: a manifest that faithfully
+    records a world-writable tree must not make that tree acceptable.
+    """
+    info = path.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid != trusted_uid or info.st_gid != trusted_gid:
+        raise ReleaseRefused(f"release path is not trusted-owned: {relative}")
+    if mode & 0o022 and not stat.S_ISLNK(info.st_mode):
+        raise ReleaseRefused(f"release path is group/world writable: {relative}")
+    if stat.S_ISLNK(info.st_mode):
+        # A symlink is legitimate inside the interpreter venv, but only as the
+        # exact link recorded when root built the release. The target is data,
+        # never followed during verification.
+        return {
+            "path": relative,
+            "kind": "symlink",
+            "mode": mode,
+            "target": os.readlink(path),
+        }
+    if stat.S_ISDIR(info.st_mode):
+        return {"path": relative, "kind": "dir", "mode": mode}
+    if not stat.S_ISREG(info.st_mode):
+        raise ReleaseRefused(f"release path is not a regular file: {relative}")
+    if info.st_nlink != 1:
+        # A hardlink lets a writer of any other directory keep a mutable alias
+        # to release content that `chmod -R a-w` appears to have frozen.
+        raise ReleaseRefused(f"release file is hardlinked: {relative}")
+    state = _read_regular(path)
+    if state.uid != trusted_uid or state.gid != trusted_gid:
+        raise ReleaseRefused(f"release file ownership changed while read: {relative}")
+    return {
+        "path": relative,
+        "kind": "file",
+        "mode": state.mode,
+        "sha256": state.sha256,
+        "size": len(state.payload),
+    }
+
+
+def release_entries(
+    root: Path, *, trusted_uid: int = 0, trusted_gid: int = 0
+) -> list[dict[str, object]]:
+    """Every path below `root`, deterministically ordered.
+
+    `os.walk(followlinks=False)` never descends a symlink, so a symlinked
+    directory is recorded as a link and its target tree is not absorbed into
+    the release identity.
+    """
+    entries = [
+        _release_entry(root, ".", trusted_uid=trusted_uid, trusted_gid=trusted_gid)
+    ]
+    for directory, names, files in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in sorted([*names, *files]):
+            path = directory_path / name
+            relative = path.relative_to(root).as_posix()
+            entries.append(
+                _release_entry(
+                    path, relative, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+                )
+            )
+    entries.sort(key=lambda entry: entry["path"])
+    seen = {entry["path"] for entry in entries}
+    if len(seen) != len(entries):
+        raise ReleaseRefused("duplicate release path")
+    return entries
+
+
+def _manifest_document(release_id: str, entries: list[dict[str, object]]) -> bytes:
+    body = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    document = {
+        "version": RELEASE_MANIFEST_VERSION,
+        "release_id": release_id,
+        "entry_count": len(entries),
+        "entries_sha256": hashlib.sha256(body).hexdigest(),
+        "entries": entries,
+    }
+    return (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _git_tree_blobs(repo_root: Path, release_id: str) -> dict[str, tuple[str, int]]:
+    """`path -> (blob oid, mode)` for the exact commit, read config-free.
+
+    This is what makes a same-name/wrong-tree release detectable even if its
+    manifest was rewritten: the committed content is the independent authority,
+    not the manifest.
+    """
+    result = subprocess.run(
+        [
+            "/usr/bin/git",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(repo_root),
+            "ls-tree",
+            "-rz",
+            "--full-tree",
+            release_id,
+        ],
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise ReleaseRefused(detail or "cannot read trusted Git tree")
+    blobs: dict[str, tuple[str, int]] = {}
+    for raw in result.stdout.rstrip(b"\0").split(b"\0") if result.stdout else []:
+        match = GIT_TREE_ENTRY_RE.fullmatch(raw)
+        if match is None:
+            raise ReleaseRefused("unparseable Git tree entry")
+        mode_raw, kind, oid_raw, path_raw = match.groups()
+        try:
+            relative = path_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReleaseRefused("non-UTF-8 path in trusted tree") from exc
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise ReleaseRefused("unsafe path in trusted tree")
+        if kind != b"blob" or mode_raw not in {b"100644", b"100755"}:
+            raise ReleaseRefused(f"unsupported tree entry: {relative}")
+        blobs[relative] = (
+            oid_raw.decode("ascii"),
+            0o755 if mode_raw == b"100755" else 0o644,
+        )
+    return blobs
+
+
+def _verify_against_git_tree(
+    release_dir: Path,
+    repo_root: Path,
+    release_id: str,
+    entries: list[dict[str, object]],
+    *,
+    trusted_uid: int,
+    trusted_gid: int,
+) -> None:
+    by_path = {entry["path"]: entry for entry in entries}
+    for relative, (oid, git_mode) in _git_tree_blobs(repo_root, release_id).items():
+        entry = by_path.get(relative)
+        if entry is None or entry["kind"] != "file":
+            raise ReleaseRefused(f"committed file missing from release: {relative}")
+        target = release_dir / relative
+        state = _read_regular(target)
+        if state.uid != trusted_uid or state.gid != trusted_gid:
+            raise ReleaseRefused(f"committed file is not trusted-owned: {relative}")
+        if _git_blob_oid(state.payload) != oid:
+            raise ReleaseRefused(
+                f"release content does not match committed blob: {relative}"
+            )
+        # `chmod -R a-w` clears write bits; the executable bit is the part of
+        # the committed mode a release must still carry faithfully.
+        if bool(state.mode & 0o111) != bool(git_mode & 0o111):
+            raise ReleaseRefused(f"release executable bit drifted: {relative}")
+
+
+def record_release_manifest(
+    release_tree: Path,
+    manifest: Path,
+    release_id: str,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> list[dict[str, object]]:
+    """Write the root-owned content manifest for a freshly staged release.
+
+    Recorded before the staging tree is renamed into place, so a release
+    directory never exists without the manifest that authorises its reuse.
+    """
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    entries = release_entries(
+        release_tree, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+    )
+    _atomic_bytes(
+        manifest,
+        _manifest_document(release_id, entries),
+        0o600,
+        trusted_uid,
+        trusted_gid,
+    )
+    return entries
+
+
+def verify_release_manifest(
+    release_dir: Path,
+    manifest: Path,
+    release_id: str,
+    *,
+    repo_root: Path | None = None,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> list[dict[str, object]]:
+    """Prove a pre-existing release directory before it may be selected.
+
+    Refuses a missing manifest outright: an unattested `/opt/aicc/releases/<sha>`
+    is exactly the case this gate exists for, and rebuilding trust from the
+    directory itself would only re-record whatever an attacker left there.
+    """
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    try:
+        recorded = _read_regular(manifest)
+    except (OSError, RuntimeError) as exc:
+        raise ReleaseRefused(
+            f"release manifest is missing or unsafe: {manifest}"
+        ) from exc
+    if (
+        recorded.uid != trusted_uid
+        or recorded.gid != trusted_gid
+        or recorded.mode != 0o600
+    ):
+        raise ReleaseRefused("release manifest is not trusted-owned mode 0600")
+    try:
+        document = json.loads(recorded.payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseRefused("release manifest is malformed") from exc
+    if not isinstance(document, dict):
+        raise ReleaseRefused("release manifest is malformed")
+    if document.get("version") != RELEASE_MANIFEST_VERSION:
+        raise ReleaseRefused("unsupported release manifest version")
+    if document.get("release_id") != release_id:
+        raise ReleaseRefused("release manifest identity mismatch")
+    expected = document.get("entries")
+    if not isinstance(expected, list):
+        raise ReleaseRefused("release manifest is malformed")
+    body = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if document.get("entries_sha256") != hashlib.sha256(body).hexdigest():
+        raise ReleaseRefused("release manifest content hash mismatch")
+    if document.get("entry_count") != len(expected):
+        raise ReleaseRefused("release manifest entry count mismatch")
+
+    observed = release_entries(
+        release_dir, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+    )
+    expected_by_path = {entry["path"]: entry for entry in expected}
+    observed_by_path = {entry["path"]: entry for entry in observed}
+    missing = sorted(set(expected_by_path) - set(observed_by_path))
+    if missing:
+        raise ReleaseRefused(f"release is incomplete: {missing[:5]}")
+    extra = sorted(set(observed_by_path) - set(expected_by_path))
+    if extra:
+        raise ReleaseRefused(f"release has unattested content: {extra[:5]}")
+    for relative, entry in sorted(observed_by_path.items()):
+        if entry != expected_by_path[relative]:
+            raise ReleaseRefused(f"release path does not match manifest: {relative}")
+    if repo_root is not None:
+        _verify_against_git_tree(
+            release_dir,
+            repo_root,
+            release_id,
+            observed,
+            trusted_uid=trusted_uid,
+            trusted_gid=trusted_gid,
+        )
+    return observed
+
+
 def default_specs(
     repo_root: Path,
     *,
@@ -892,6 +1174,13 @@ def default_specs(
         FileSpec(
             repo_root / "ops/aicc_principal_recovery_generator.py",
             "/usr/lib/systemd/system-generators/aicc-principal-recovery",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "ops/aicc_exact_sha_bootstrap.py",
+            "/usr/local/sbin/voyn-aicc-bootstrap",
             0o755,
             root_uid,
             root_gid,
@@ -1051,6 +1340,8 @@ def main() -> int:
             "recover",
             "rollback",
             "uninstall",
+            "release-record",
+            "release-verify",
         ),
     )
     parser.add_argument("--repo-root", type=Path, default=Path("/opt/aicc"))
@@ -1071,7 +1362,33 @@ def main() -> int:
         type=Path,
         default=Path("/home/voynadmin/.codex/auth.json"),
     )
+    parser.add_argument("--release-tree", type=Path)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--release-id")
+    parser.add_argument("--verify-against-git", action="store_true")
     args = parser.parse_args()
+    if args.action in {"release-record", "release-verify"}:
+        if (
+            args.release_tree is None
+            or args.manifest is None
+            or args.release_id is None
+        ):
+            parser.error(
+                "--release-tree, --manifest and --release-id are required for "
+                f"{args.action}"
+            )
+        if args.action == "release-record":
+            record_release_manifest(args.release_tree, args.manifest, args.release_id)
+            print(f"AICC_RELEASE_MANIFEST_RECORDED {args.release_id}")
+        else:
+            verify_release_manifest(
+                args.release_tree,
+                args.manifest,
+                args.release_id,
+                repo_root=args.repo_root if args.verify_against_git else None,
+            )
+            print(f"AICC_RELEASE_MANIFEST_VERIFIED {args.release_id}")
+        return 0
     transaction = FileTransaction(args.root, args.state_dir)
     if args.action in {"validate", "prepare", "install"}:
         specs = default_specs(

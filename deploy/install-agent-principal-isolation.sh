@@ -7,12 +7,27 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+: "${AICC_BOOTSTRAP_ATTESTATION:?exact-SHA bootstrap attestation is required}"
+: "${AICC_EXPECTED_RELEASE_SHA:?exact-SHA release identity is required}"
+case "$AICC_EXPECTED_RELEASE_SHA" in
+  *[!0-9a-f]*|'') echo "invalid expected release commit" >&2; exit 1 ;;
+esac
+[ "${#AICC_EXPECTED_RELEASE_SHA}" -eq 40 ] || {
+  echo "invalid expected release commit length" >&2
+  exit 1
+}
+/usr/bin/python3 "$repo_root/ops/aicc_exact_sha_bootstrap.py" \
+  --expected-sha "$AICC_EXPECTED_RELEASE_SHA" \
+  --verify-attestation "$AICC_BOOTSTRAP_ATTESTATION" \
+  --repo-root "$repo_root"
 workspace_authority_env=/etc/aicc/workspace-authority.env
 state_dir=/var/lib/aicc-principal-isolation
 baseline_units="$state_dir/baseline-units.json"
 baseline_release="$state_dir/baseline-release"
 attempt_units="$state_dir/attempt-units.json"
 pending_release="$state_dir/pending-release"
+release_manifest_dir="$state_dir/releases"
+pending_release_manifest=
 transaction="$repo_root/ops/aicc_install_transaction.py"
 rollout="$repo_root/ops/aicc_staged_worker_rollout.py"
 release_root=/opt/aicc/releases
@@ -23,18 +38,25 @@ release_selected=0
 
 run_transaction() {
   action=$1
-  python3 "$transaction" "$action" \
+  /usr/bin/python3 "$transaction" "$action" \
     --repo-root "$repo_root" \
     --state-dir "$state_dir" \
     --authority-env "$workspace_authority_env"
 }
 
 run_rollout() {
-  python3 "$rollout" "$@"
+  /usr/bin/python3 "$rollout" "$@"
+}
+
+run_release() {
+  /usr/bin/python3 "$transaction" "$@" \
+    --repo-root "$repo_root" \
+    --state-dir "$state_dir" \
+    --authority-env "$workspace_authority_env"
 }
 
 stage_immutable_release() {
-  release_id=$(git -C "$repo_root" rev-parse --verify HEAD)
+  release_id=$(/usr/bin/git -C "$repo_root" rev-parse --verify HEAD)
   case "$release_id" in
     *[!0-9a-f]*|'') echo "invalid release commit" >&2; exit 1 ;;
   esac
@@ -42,6 +64,10 @@ stage_immutable_release() {
   # non-40 hex id written here would self-lockout a later run or uninstall
   # (review on 6e22b93).
   [ "${#release_id}" -eq 40 ] || { echo "invalid release commit length" >&2; exit 1; }
+  [ "$release_id" = "$AICC_EXPECTED_RELEASE_SHA" ] || {
+    echo "release commit differs from exact-SHA bootstrap attestation" >&2
+    exit 1
+  }
   release_dir="$release_root/$release_id"
   install -d -m 0755 -o root -g root "$release_root"
   if [ ! -d "$release_dir" ]; then
@@ -49,8 +75,8 @@ stage_immutable_release() {
     # Archive the committed tree, never the operator worktree. This makes the
     # release identity equal to committed content even when the checkout has
     # unrelated untracked files.
-    git -C "$repo_root" archive --format=tar HEAD | tar -xf - -C "$release_staging"
-    python3 -m venv "$release_staging/.venv"
+    /usr/bin/git -C "$repo_root" archive --format=tar HEAD | tar -xf - -C "$release_staging"
+    /usr/bin/python3 -m venv "$release_staging/.venv"
     "$release_staging/.venv/bin/python" -m pip install \
       --disable-pip-version-check --require-hashes \
       -r "$release_staging/requirements-ci-linux.lock"
@@ -60,13 +86,29 @@ assert worker is not None
 PY
     chown -R root:root "$release_staging"
     chmod -R a-w "$release_staging"
+    # Record the root-owned content manifest from the staging tree BEFORE the
+    # rename, so a release directory can never exist without the manifest that
+    # authorises its later reuse. A crash between the two leaves only staging,
+    # which the rollback trap removes.
+    install -d -m 0700 -o root -g root "$release_manifest_dir"
+    pending_release_manifest="$release_manifest_dir/$release_id.json"
+    run_release release-record \
+      --release-tree "$release_staging" \
+      --manifest "$pending_release_manifest" \
+      --release-id "$release_id"
+    sync -f "$state_dir"
     mv -- "$release_staging" "$release_dir"
     release_staging=
   fi
-  [ "$(stat -c %U:%G "$release_dir")" = root:root ] || {
-    echo "release ownership drifted" >&2
-    exit 1
-  }
+  # Every generation -- freshly built or pre-existing -- must prove itself
+  # against the root-owned manifest and the committed Git tree before it may
+  # be selected. A same-name/wrong-tree, partial, hardlinked, symlink-swapped
+  # or group-writable release is refused here rather than executed.
+  run_release release-verify \
+    --release-tree "$release_dir" \
+    --manifest "$release_manifest_dir/$release_id.json" \
+    --release-id "$release_id" \
+    --verify-against-git
   previous_release=$(readlink "$current_release" 2>/dev/null || true)
   if [ -n "$previous_release" ] && \
      ! printf '%s\n' "$previous_release" | grep -Eq '^releases/[0-9a-f]{40}$'; then
@@ -122,7 +164,7 @@ run_transaction recover
 
 # Validate the stable authority using the exact runtime decoder before any
 # replaceable target is mutated.
-PYTHONPATH="$repo_root" python3 - "$workspace_authority_env" <<'PY'
+PYTHONPATH="$repo_root" /usr/bin/python3 - "$workspace_authority_env" <<'PY'
 import pathlib
 import sys
 
@@ -226,6 +268,13 @@ rollback() {
   fi
   if [ -n "$release_staging" ] && [ -d "$release_staging" ]; then
     rm -rf -- "$release_staging"
+    # Only a manifest recorded for a staging tree this attempt failed to
+    # rename is removed. A manifest whose release directory exists stays: it
+    # is the authority a later run and the boot recovery path verify against.
+    if [ -n "$pending_release_manifest" ] && [ ! -d "$release_dir" ]; then
+      rm -f -- "$pending_release_manifest"
+      sync -f "$state_dir"
+    fi
   fi
   exit "$result"
 }
