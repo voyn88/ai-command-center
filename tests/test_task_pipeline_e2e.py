@@ -574,3 +574,104 @@ def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeyp
 
     assert total == pytest.approx(5.5)
     assert "unparseable" in caplog.text
+
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, *_args, **_kwargs):
+        return _FakeCursor(self._rows)
+
+
+def _monkeypatch_spend_rows(monkeypatch, rows):
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn(rows)
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+
+@pytest.mark.parametrize(
+    "bad_cost",
+    ["2.0", None, True, False, float("nan"), float("inf"), -1.5],
+    ids=["string", "null", "true", "false", "nan", "inf", "negative"],
+)
+def test_daily_spend_usd_raises_on_corrupt_cost_value(tmp_path, monkeypatch, bad_cost):
+    """A malformed `total_cost_usd` — wrong type, `null`, a bool, non-finite
+    (`json.loads` happily decodes the `NaN`/`Infinity` tokens `json.dumps`
+    emits by default into real Python floats), or negative — must not be
+    silently skipped or coerced into the sum. Skipping it would let a corrupt
+    or adversarial cost event zero out real spend and make a caller believe
+    the budget has headroom it does not have; the 'trustworthy or raises'
+    contract requires `SpendUnknownError(CORRUPT_COST_EVENT)` instead."""
+    import json
+
+    payload = json.dumps({"type": "result", "total_cost_usd": bad_cost})
+    _monkeypatch_spend_rows(monkeypatch, [{"payload": payload}])
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+    assert excinfo.value.reason == task_pipeline.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_usd_raises_on_aggregate_overflow(tmp_path, monkeypatch):
+    """Two individually finite costs (`1e308` each) overflow the running total
+    to `inf` even though each value passes per-row validation on its own. The
+    accumulator must be checked after every addition, not just each cost in
+    isolation, or `daily_spend_usd` can return `inf` — a value no ceiling
+    comparison can use — while claiming to be trustworthy."""
+    import json
+
+    rows = [
+        {"payload": json.dumps({"type": "result", "total_cost_usd": 1e308})},
+        {"payload": json.dumps({"type": "result", "total_cost_usd": 1e308})},
+    ]
+    _monkeypatch_spend_rows(monkeypatch, rows)
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+    assert excinfo.value.reason == task_pipeline.SPEND_TOTAL_OVERFLOW
+
+
+def test_tick_reports_spend_unknown_not_budget_exhausted_on_corrupt_cost(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    """A corrupt cost event must defer as `LAUNCH_SPEND_UNKNOWN`, never
+    `LAUNCH_BUDGET_EXHAUSTED` — the latter asserts a *known* spend at/over the
+    ceiling, which a corrupt/unreadable figure is not. Folding the two
+    together previously let a corrupt cost event masquerade as a real budget
+    cap (VOYN-W0-AICC-REPORT-319)."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-u")
+    wt = tmp_path / "wt" / "u"
+    task = _task("u", "AIOS", wt, branch="task/u")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"u": task})
+    configs = project_config.load_project_configs()
+
+    def _raise(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(task_pipeline.CORRUPT_COST_EVENT, "test")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+
+    result = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+    assert result.launched() == []
+    assert result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN
+    assert result.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED

@@ -171,6 +171,12 @@ TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
 LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
+# Distinct from LAUNCH_BUDGET_EXHAUSTED on purpose: "exhausted" asserts a
+# *known* spend at/over the ceiling. When `daily_spend_usd` cannot be trusted
+# (a corrupt cost event, an overflowed total, an unreadable DB) the honest
+# verdict is "unknown", not "exhausted" — conflating the two previously made a
+# corrupt event masquerade as a real budget cap (VOYN-W0-AICC-REPORT-319).
+LAUNCH_SPEND_UNKNOWN = "daily_spend_unknown"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -2228,18 +2234,32 @@ def _locked_tick(
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
     spend_budget_exhausted = False
+    # Known/unknown, not folded into one bit: "exhausted" is a verdict about a
+    # *known* spend figure, "unknown" is the honest report that the figure
+    # itself could not be trusted (`SpendUnknownError`, e.g. a corrupt cost
+    # event or an overflowed total) or read at all (any other exception —
+    # a DB outage). Both fail closed the same way, but a diagnostic branch
+    # keeps them from being reported as the same thing: collapsing them
+    # previously made a corrupt cost event masquerade as a real budget cap
+    # (VOYN-W0-AICC-REPORT-319).
+    spend_status_unknown = False
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
         try:
-            spend_budget_exhausted = (
-                daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
-            )
-        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+            spend = daily_spend_usd(api.db_path)
+        except SpendUnknownError as exc:
+            _record(exc, f"daily_spend_budget:{exc.reason}")
+            spend_status_unknown = True
+        except Exception as exc:  # noqa: BLE001 — DB unreadable: fail closed too
             _record(exc, "daily_spend_budget")
-            spend_budget_exhausted = True
-    if settings.auto_launch_active and not spend_budget_exhausted:
+            spend_status_unknown = True
+        else:
+            spend_budget_exhausted = spend >= settings.max_daily_spend_usd
+    if settings.auto_launch_active and not spend_budget_exhausted and not spend_status_unknown:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
+    elif spend_status_unknown:
+        launch_status = LAUNCH_SPEND_UNKNOWN
     else:
         launch_status = (
             LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
@@ -2404,12 +2424,47 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     }
 
 
+class SpendUnknownError(Exception):
+    """Raised by `daily_spend_usd` when the trailing-24h spend cannot be
+    trusted as a real number.
+
+    This is the function's failure mode for "known garbage", as opposed to a
+    `runtime_db`/SQL exception propagating for "unreadable". Either way, a
+    caller must fail closed exactly like it would for a DB outage — but must
+    never spell the result `LAUNCH_BUDGET_EXHAUSTED`/`DEFER_DAILY_BUDGET`,
+    which asserts a *known* spend at/over the ceiling. This is `daily_spend_usd`
+    refusing to guess, not a verdict that the budget was hit.
+    """
+
+    def __init__(self, reason: str, detail: str = ""):
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+
+
+# `SpendUnknownError.reason` values.
+CORRUPT_COST_EVENT = "corrupt_cost_event"
+SPEND_TOTAL_OVERFLOW = "spend_total_overflow"
+
+
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
     work started in it). Reads only the final `result` stream events, which are
     the single truthful cost source — nothing is estimated or fabricated; a
-    run whose provider reported no cost contributes 0.
+    run with no matching event at all (no result reported yet) contributes 0.
+
+    Trustworthy or raises: every row this reads was already selected because
+    its JSON text contains `total_cost_usd`, so a row whose decoded
+    `total_cost_usd` is not a finite, non-negative number — a string, `null`,
+    a bool, `NaN`/`Infinity` (valid Python floats `json.loads` will happily
+    hand back), or a negative number — raises `SpendUnknownError
+    (CORRUPT_COST_EVENT)` rather than being silently skipped or coerced. A
+    skip-and-continue here would let one corrupt or adversarial event zero out
+    real spend and make a caller believe the budget has headroom it does not
+    have. The running `total` is checked the same way after every addition,
+    so individually finite costs that overflow the accumulator (e.g. two
+    `1e308` values) raise `SpendUnknownError(SPEND_TOTAL_OVERFLOW)` instead of
+    silently becoming `inf` — a total no comparison against a ceiling can use.
 
     `payload` may already be a `dict` rather than JSON text — a `jsonb`-backed
     read (the PostgreSQL mirror this table has, VOYN-W0-AICC-SRV-01B) hands
@@ -2421,6 +2476,7 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     row of an unexpected shape is now visible instead of silently dropped.
     """
     import json as _json
+    import math as _math
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
@@ -2454,6 +2510,20 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             )
             continue
         cost = payload.get("total_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total += float(cost)
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, (int, float))
+            or not _math.isfinite(cost)
+            or cost < 0
+        ):
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                f"total_cost_usd={cost!r} is not a finite, non-negative number",
+            )
+        total += float(cost)
+        if not _math.isfinite(total):
+            raise SpendUnknownError(
+                SPEND_TOTAL_OVERFLOW,
+                f"trailing-24h total overflowed to {total!r} after adding {cost!r}",
+            )
     return total

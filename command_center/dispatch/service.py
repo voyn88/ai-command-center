@@ -20,6 +20,7 @@ the task up and launches it on the recorded executor.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,8 @@ from command_center.runtime import db as runtime_db
 
 if TYPE_CHECKING:  # a type-only import: the service layer stays free of FastAPI
     from command_center.http_auth.identity import Principal
+
+_LOG = logging.getLogger(__name__)
 
 # Kanban statuses that mean "waiting to be dispatched" — not yet running,
 # not in review, not done. These are the only tasks a dispatch plan considers.
@@ -177,7 +180,17 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     budget_unknown = False
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
+    except task_pipeline.SpendUnknownError as exc:
+        # A corrupt cost event or an overflowed accumulator: the spend figure
+        # itself cannot be trusted, distinct from the DB simply being
+        # unreadable. Both fail closed identically (`budget_unknown`), but
+        # `exc.reason` is logged so the two are distinguishable in practice
+        # rather than folded into one silent `except Exception`.
+        _LOG.warning("dispatch.plan: daily spend untrustworthy (%s): %s", exc.reason, exc)
+        spend = 0.0
+        budget_unknown = True
+    except Exception as exc:  # noqa: BLE001 — no cost data => fail closed: block dispatch
+        _LOG.warning("dispatch.plan: daily spend unreadable: %s", exc)
         spend = 0.0
         budget_unknown = True
 

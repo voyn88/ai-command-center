@@ -205,6 +205,27 @@ def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
     assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
 
 
+def test_plan_fails_closed_when_a_cost_event_is_corrupt(monkeypatch, pool):
+    """`daily_spend_usd` raising `SpendUnknownError` (a corrupt cost event or
+    an overflowed total, not merely a DB outage) must fail closed identically
+    to any other unreadable-spend case — the diagnostic branch changes what
+    gets logged, not the fail-closed outcome."""
+    _enable_master_switch()
+
+    def _raise(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(task_pipeline.CORRUPT_COST_EVENT, "test")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+
+
 def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
     _enable_master_switch()
     _spend_unavailable(monkeypatch)
