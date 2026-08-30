@@ -248,10 +248,8 @@ def _configured_users(path: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(users))
 
 
-def discover_units(
-    systemd: Systemd, lanes_path: Path = DEFAULT_LANES
-) -> tuple[str, ...]:
-    units = _configured_units(lanes_path)
+def _listed_template_units(systemd: Systemd, *, check: bool) -> frozenset[str]:
+    units: set[str] = set()
     for command in (
         ("list-unit-files", "voyn-aicc-worker@*.service", "--no-legend", "--no-pager"),
         (
@@ -262,13 +260,40 @@ def discover_units(
             "--no-pager",
         ),
     ):
-        for line in systemd.run(*command, check=False).splitlines():
-            candidate = line.split(maxsplit=1)[0] if line.split() else ""
+        for line in systemd.run(*command, check=check).splitlines():
+            fields = line.split()
+            if fields and fields[0] == "●":
+                fields = fields[1:]
+            candidate = fields[0] if fields else ""
             if UNIT_RE.fullmatch(candidate):
                 units.add(candidate)
+    return frozenset(units)
+
+
+def discover_units(
+    systemd: Systemd, lanes_path: Path = DEFAULT_LANES
+) -> tuple[str, ...]:
+    units = _configured_units(lanes_path)
+    units.update(_listed_template_units(systemd, check=False))
     if not units:
         raise RolloutError("no worker lanes discovered")
     return tuple(sorted(units))
+
+
+def verify_snapshot_closure(systemd: Systemd, state: dict[str, object]) -> None:
+    """Fail closed if a retry would leave a worker outside its old snapshot."""
+    raw_units = state.get("units")
+    if state.get("version") not in {2, 3} or not isinstance(raw_units, dict):
+        raise RolloutError("invalid service snapshot")
+    expected = set(raw_units)
+    if any(
+        not isinstance(unit, str) or not RESTORABLE_UNIT_RE.fullmatch(unit)
+        for unit in expected
+    ):
+        raise RolloutError("invalid service snapshot unit")
+    extras = sorted(_listed_template_units(systemd, check=True) - expected)
+    if extras:
+        raise RolloutError(f"worker lanes exist outside service snapshot: {extras}")
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
@@ -762,7 +787,16 @@ def rollout(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("snapshot", "restore", "rollout", "verify"))
+    parser.add_argument(
+        "action",
+        choices=(
+            "snapshot",
+            "restore",
+            "verify-snapshot-closure",
+            "rollout",
+            "verify",
+        ),
+    )
     parser.add_argument("--lanes", type=Path, default=DEFAULT_LANES)
     parser.add_argument(
         "--privileged-users-file", type=Path, default=DEFAULT_PRIVILEGED_USERS
@@ -777,6 +811,13 @@ def main() -> int:
         if args.state is None:
             parser.error("restore requires --state")
         restore(systemd, json.loads(args.state.read_text(encoding="utf-8")))
+        return 0
+    if args.action == "verify-snapshot-closure":
+        if args.state is None:
+            parser.error("verify-snapshot-closure requires --state")
+        verify_snapshot_closure(
+            systemd, json.loads(args.state.read_text(encoding="utf-8"))
+        )
         return 0
     units = discover_units(systemd, args.lanes)
     if args.action in {"rollout", "verify"}:
