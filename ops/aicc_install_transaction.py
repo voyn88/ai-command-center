@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
+import fcntl
 import grp
 import hashlib
 import json
@@ -23,6 +26,9 @@ RESTORABLE_UNIT_RE = re.compile(
     r"aicc-worker\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
 )
+TEMPLATE_WORKER_UNIT_RE = re.compile(
+    r"voyn-aicc-worker@[^/@\s]+\.service"
+)
 # Ordered: aicc_staged_worker_rollout imports this and iterates it; every
 # set-equality check wraps it in set(...). One definition, no drift.
 SNAPSHOT_PROPERTIES = (
@@ -38,6 +44,10 @@ SNAPSHOT_PROPERTIES = (
     "ProtectSystem",
     "ProtectHome",
     "ProtectControlGroups",
+)
+INSTALL_LOCK = Path("/var/lib/aicc-principal-isolation/install-recovery.lock")
+RECOVERY_ANCHOR_TARGET = (
+    "/usr/lib/systemd/system-generators/aicc-principal-recovery"
 )
 
 
@@ -74,6 +84,279 @@ class FileState:
     mode: int
     uid: int
     gid: int
+
+
+UNINSTALL_JOURNAL_VERSION = 2
+
+
+def _path_present(path: Path) -> bool:
+    """Return pathname presence without hiding a dangling or malformed symlink."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _release_selector(path: Path) -> str:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "ABSENT"
+    if not stat.S_ISLNK(info.st_mode):
+        raise RuntimeError("release selector is not a symlink")
+    selector = os.readlink(path)
+    if not re.fullmatch(r"releases/[0-9a-f]{40}", selector):
+        raise RuntimeError("release selector is invalid")
+    return selector
+
+
+def _trusted_journal(path: Path) -> dict[str, object]:
+    state = _read_regular(path, max_bytes=64 * 1024)
+    if (
+        state.uid not in {0, os.geteuid()}
+        or state.gid not in {0, os.getegid()}
+        or state.mode != 0o600
+    ):
+        raise RuntimeError("uninstall journal ownership or mode drifted")
+    try:
+        payload = json.loads(state.payload)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("uninstall journal is malformed") from exc
+    if not isinstance(payload, dict):
+        raise TypeError("uninstall journal is malformed")
+    return payload
+
+
+def _trusted_uninstall_recovery(
+    state_dir: Path, payload: dict[str, object]
+) -> Path:
+    transaction_id = payload.get("transaction_id")
+    recovery_value = payload.get("recovery")
+    recovery_sha256 = payload.get("recovery_sha256")
+    if (
+        not isinstance(transaction_id, str)
+        or not re.fullmatch(r"[0-9a-f]{32}", transaction_id)
+        or not isinstance(recovery_value, str)
+        or not isinstance(recovery_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", recovery_sha256)
+    ):
+        raise RuntimeError("uninstall recovery identity is invalid")
+    recovery = Path(recovery_value)
+    expected = state_dir.resolve() / f"uninstall-{transaction_id}" / "recovery.py"
+    try:
+        resolved = recovery.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("uninstall recovery capsule is unavailable") from exc
+    if recovery != resolved or resolved != expected:
+        raise RuntimeError("uninstall recovery capsule path drifted")
+    state = _read_regular(resolved)
+    if (
+        state.mode != 0o700
+        or state.uid not in {0, os.geteuid()}
+        or state.gid not in {0, os.getegid()}
+        or state.sha256 != recovery_sha256
+    ):
+        raise RuntimeError("uninstall recovery capsule drifted")
+    return resolved
+
+
+def _uninstall_identity(
+    *, baseline_selector: str, current_selector: Path, lane_registry: Path
+) -> dict[str, str]:
+    if baseline_selector != "ABSENT" and not re.fullmatch(
+        r"releases/[0-9a-f]{40}", baseline_selector
+    ):
+        raise RuntimeError("baseline release selector is invalid")
+    registry = _read_regular(lane_registry, max_bytes=64 * 1024)
+    if registry.mode & 0o022 or registry.uid not in {0, os.geteuid()}:
+        raise RuntimeError("worker lane registry is not trusted")
+    return {
+        "baseline_selector": baseline_selector,
+        "start_selector": _release_selector(current_selector),
+        "registry_sha256": registry.sha256,
+    }
+
+
+def begin_uninstall(
+    state_dir: Path,
+    *,
+    baseline_selector: str,
+    current_selector: Path,
+    lane_registry: Path,
+) -> str:
+    """Durably record uninstall intent before its service snapshot is made."""
+    journal_path = state_dir / "uninstall.json"
+    if _path_present(journal_path):
+        payload = _trusted_journal(journal_path)
+        required = {
+            "version",
+            "transaction_id",
+            "phase",
+            "baseline_selector",
+            "start_selector",
+            "registry_sha256",
+            "snapshot_sha256",
+            "recovery",
+            "recovery_sha256",
+        }
+        if (
+            set(payload) != required
+            or payload["version"] != UNINSTALL_JOURNAL_VERSION
+            or payload["phase"] not in {"INTENT", "ARMED", "COMPLETING"}
+            or not isinstance(payload["transaction_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", payload["transaction_id"])
+            or payload["baseline_selector"] != baseline_selector
+            or not isinstance(payload["start_selector"], str)
+            or not isinstance(payload["registry_sha256"], str)
+            or (
+                payload["snapshot_sha256"] is not None
+                and not isinstance(payload["snapshot_sha256"], str)
+            )
+            or not isinstance(payload["recovery"], str)
+            or not isinstance(payload["recovery_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", payload["recovery_sha256"])
+        ):
+            raise RuntimeError("uninstall journal identity drifted")
+        _trusted_uninstall_recovery(state_dir, payload)
+        current = _release_selector(current_selector)
+        if current not in {
+            payload["start_selector"],
+            payload["baseline_selector"],
+        }:
+            raise RuntimeError("release selector changed during uninstall")
+        if _path_present(lane_registry):
+            registry = _read_regular(lane_registry, max_bytes=64 * 1024)
+            if registry.sha256 != payload["registry_sha256"]:
+                raise RuntimeError("worker lane registry changed during uninstall")
+        elif payload["phase"] == "INTENT":
+            raise RuntimeError("worker lane registry disappeared before uninstall armed")
+        return str(payload["phase"])
+
+    identity = _uninstall_identity(
+        baseline_selector=baseline_selector,
+        current_selector=current_selector,
+        lane_registry=lane_registry,
+    )
+    transaction_id = secrets.token_hex(16)
+    capsule_dir = state_dir / f"uninstall-{transaction_id}"
+    capsule_dir.mkdir(mode=0o700)
+    recovery = capsule_dir / "recovery.py"
+    source = _read_regular(Path(__file__))
+    _atomic_bytes(
+        recovery,
+        source.payload,
+        0o700,
+        os.geteuid(),
+        os.getegid(),
+    )
+    _fsync_dir(capsule_dir)
+    _fsync_dir(state_dir)
+    payload: dict[str, object] = {
+        "version": UNINSTALL_JOURNAL_VERSION,
+        "transaction_id": transaction_id,
+        "phase": "INTENT",
+        **identity,
+        "snapshot_sha256": None,
+        "recovery": str(recovery.resolve(strict=True)),
+        "recovery_sha256": source.sha256,
+    }
+    _atomic_bytes(
+        journal_path,
+        (json.dumps(payload, sort_keys=True) + "\n").encode(),
+        0o600,
+        os.geteuid(),
+        os.getegid(),
+    )
+    return "INTENT"
+
+
+def arm_uninstall(state_dir: Path, service_snapshot: Path) -> None:
+    """Bind the uninstall intent to one immutable service snapshot."""
+    journal_path = state_dir / "uninstall.json"
+    payload = _trusted_journal(journal_path)
+    _trusted_uninstall_recovery(state_dir, payload)
+    snapshot = _read_regular(service_snapshot, max_bytes=4 * 1024 * 1024)
+    if snapshot.mode != 0o600 or snapshot.uid not in {0, os.geteuid()}:
+        raise RuntimeError("uninstall service snapshot is not trusted")
+    phase = payload.get("phase")
+    if phase == "ARMED":
+        if payload.get("snapshot_sha256") != snapshot.sha256:
+            raise RuntimeError("uninstall service snapshot drifted")
+        return
+    if phase != "INTENT" or payload.get("snapshot_sha256") is not None:
+        raise RuntimeError("uninstall journal cannot be armed")
+    payload["phase"] = "ARMED"
+    payload["snapshot_sha256"] = snapshot.sha256
+    _atomic_bytes(
+        journal_path,
+        (json.dumps(payload, sort_keys=True) + "\n").encode(),
+        0o600,
+        os.geteuid(),
+        os.getegid(),
+    )
+
+
+def complete_uninstall(state_dir: Path, service_snapshot: Path) -> None:
+    """Clean adjuncts first and consume the uninstall WAL strictly last."""
+    journal_path = state_dir / "uninstall.json"
+    payload = _trusted_journal(journal_path)
+    recovery = _trusted_uninstall_recovery(state_dir, payload)
+    phase = payload.get("phase")
+    if phase == "ARMED":
+        snapshot = _read_regular(service_snapshot, max_bytes=4 * 1024 * 1024)
+        if payload.get("snapshot_sha256") != snapshot.sha256:
+            raise RuntimeError("uninstall completion evidence drifted")
+        payload["phase"] = "COMPLETING"
+        _atomic_bytes(
+            journal_path,
+            (json.dumps(payload, sort_keys=True) + "\n").encode(),
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
+    elif phase != "COMPLETING":
+        raise RuntimeError("uninstall is not ready for completion")
+    for adjunct in (
+        service_snapshot,
+        state_dir / "baseline-units.json",
+        state_dir / "baseline-release",
+        state_dir / "attempt-units.json",
+    ):
+        adjunct.unlink(missing_ok=True)
+        _fsync_dir(state_dir)
+    journal_path.unlink()
+    _fsync_dir(state_dir)
+    # The WAL is the safety authority and is consumed only after every
+    # privileged restore is durable.  Its self-contained capsule is harmless
+    # after that point; cleanup is deliberately post-commit so a crash can
+    # leave only an inert orphan, never a journal without executable recovery.
+    try:
+        recovery.unlink(missing_ok=True)
+        recovery.parent.rmdir()
+        _fsync_dir(state_dir)
+    except OSError:
+        pass
+
+
+def uninstall_phase(state_dir: Path) -> str:
+    payload = _trusted_journal(state_dir / "uninstall.json")
+    phase = payload.get("phase")
+    if phase not in {"INTENT", "ARMED", "COMPLETING"}:
+        raise RuntimeError("uninstall journal phase is invalid")
+    return str(phase)
+
+
+def _print_uninstall_phase(phase: str) -> None:
+    """Emit only a closed-vocabulary status, never journal-derived text."""
+    if phase == "INTENT":
+        print("INTENT")
+    elif phase == "ARMED":
+        print("ARMED")
+    elif phase == "COMPLETING":
+        print("COMPLETING")
+    else:
+        raise RuntimeError("uninstall journal phase is invalid")
 
 
 def _fsync_dir(path: Path) -> None:
@@ -156,6 +439,96 @@ def _open_directory_chain(path: Path, *, create: bool) -> int:
         raise
 
 
+def _install_lock_fd(
+    path: Path = INSTALL_LOCK,
+    inherited_fd: int | None = None,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> int:
+    """Adopt or acquire the same persistent lock used by exact bootstrap."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("host kernel lacks required no-follow lock support")
+    if not path.parent.exists():
+        raise RuntimeError("install lock directory is missing")
+    parent_fd = os.open(
+        path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    descriptor = -1
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != trusted_uid
+            or parent.st_gid != trusted_gid
+            or stat.S_IMODE(parent.st_mode) & 0o077
+        ):
+            raise RuntimeError("install lock directory is unsafe")
+        if inherited_fd is None:
+            try:
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                os.fchmod(descriptor, 0o600)
+                os.fchown(descriptor, trusted_uid, trusted_gid)
+                os.fsync(descriptor)
+                os.fsync(parent_fd)
+            except OSError as exc:
+                if exc.errno != errno.EEXIST:
+                    raise
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=parent_fd,
+                )
+        else:
+            if inherited_fd < 0:
+                raise RuntimeError("invalid inherited install lock descriptor")
+            try:
+                descriptor = os.dup(inherited_fd)
+            except OSError as exc:
+                raise RuntimeError(
+                    "invalid inherited install lock descriptor"
+                ) from exc
+        observed = os.fstat(descriptor)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or observed.st_uid != trusted_uid
+            or observed.st_gid != trusted_gid
+            or stat.S_IMODE(observed.st_mode) != 0o600
+            or (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            raise RuntimeError("install/recovery lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EAGAIN, errno.EACCES}:
+                raise RuntimeError(
+                    "another install or recovery owns the host lock"
+                ) from exc
+            raise RuntimeError("cannot acquire install/recovery lock") from exc
+        return descriptor
+    except RuntimeError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RuntimeError("cannot safely open install/recovery lock") from exc
+    finally:
+        os.close(parent_fd)
+
+
 def _atomic_bytes(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> None:
     directory_fd = _open_directory_chain(path.parent, create=True)
     try:
@@ -183,6 +556,52 @@ def _atomic_bytes(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> 
                 pass
     finally:
         os.close(directory_fd)
+
+
+def _exclusive_bytes(path: Path, payload: bytes, mode: int, uid: int, gid: int) -> None:
+    directory_fd = _open_directory_chain(path.parent, create=True)
+    descriptor = -1
+    try:
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise RuntimeError("host lacks no-follow exclusive-write support")
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            mode,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, mode)
+        os.fchown(descriptor, uid, gid)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def install_recovery_anchor(source: Path, target: Path) -> None:
+    """Atomically install the permanent boot-recovery generator.
+
+    The anchor intentionally lives outside reversible generations: it must
+    exist before the first transaction WAL is created and must survive an
+    interrupted uninstall. With no journal it emits a fast no-op barrier.
+    """
+    expected = _read_regular(source)
+    if expected.mode & 0o022 or expected.uid not in {0, os.geteuid()}:
+        raise RuntimeError("recovery anchor source is not trusted")
+    _atomic_bytes(target, expected.payload, 0o755, 0, 0)
+    installed = _read_regular(target)
+    if (
+        installed.sha256 != expected.sha256
+        or installed.mode != 0o755
+        or installed.uid != 0
+        or installed.gid != 0
+    ):
+        raise RuntimeError("recovery anchor installation could not be proven")
 
 
 def _read_regular(path: Path, *, max_bytes: int = 128 * 1024 * 1024) -> FileState:
@@ -239,7 +658,9 @@ def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bo
     )
 
 
-def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
+def restore_service_snapshot(
+    path: Path, *, run=subprocess.run, defer_starts: bool = False
+) -> None:
     """Restore the pre-attempt unit state after file generation recovery."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -298,7 +719,9 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
         )
         return result.returncode, result.stdout.strip()
 
-    def assert_restored(unit: str, state: dict[str, bool]) -> None:
+    def assert_restored(
+        unit: str, state: dict[str, bool], *, queued_start: bool = False
+    ) -> None:
         load_rc, load_state = probe("show", unit, "--property=LoadState", "--value")
         pid_rc, main_pid = probe("show", unit, "--property=MainPID", "--value")
         _active_rc, active = probe("is-active", unit)
@@ -307,7 +730,24 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
             raise RuntimeError(f"cannot prove restored service state: {unit}")
         expected_active = state["active"]
         expected_enabled = state["enabled"]
+        self_recovery = (
+            defer_starts
+            and unit == "aicc-principal-recovery.service"
+            and active == "active"
+            and main_pid == str(os.getpid())
+        )
         active_matches = (active == "active") is expected_active
+        if self_recovery and not expected_active:
+            # This oneshot cannot synchronously transition itself to inactive.
+            # WAL remains until it returns; its restored file/enablement state
+            # is authoritative for the next activation.
+            active_matches = True
+        if queued_start and expected_active:
+            # Boot recovery is ordered before sysinit. A synchronous start of
+            # a normal worker would deadlock on its dependency back to this
+            # oneshot. A successfully queued --no-block job may still be
+            # inactive until the recovery barrier exits successfully.
+            active_matches = active in {"inactive", "activating", "active"}
         enabled_matches = (enabled == "enabled") is expected_enabled
         if state["exists"]:
             exists_matches = load_state not in {"", "not-found"}
@@ -316,11 +756,6 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
             # itself. It may remain loaded/active only when systemd proves
             # that this exact process is the service MainPID; its enablement
             # and every file target have already been rolled back durably.
-            self_recovery = (
-                unit == "aicc-principal-recovery.service"
-                and active == "active"
-                and main_pid == str(os.getpid())
-            )
             exists_matches = load_state in {"", "not-found"} or self_recovery
             active_matches = active != "active" or self_recovery
             enabled_matches = enabled != "enabled"
@@ -328,7 +763,7 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
             raise RuntimeError(f"service snapshot did not restore exactly: {unit}")
         if active != "active" and main_pid not in {"", "0"}:
             raise RuntimeError(f"inactive restored service retains MainPID: {unit}")
-        if version == 3 and state["exists"]:
+        if version == 3 and state["exists"] and not self_recovery:
             properties = state["properties"]
             for name, expected in properties.items():
                 property_rc, actual = probe(
@@ -341,16 +776,25 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
 
     systemctl("daemon-reload")
     for unit, state in validated:
+        _pid_rc, current_pid = probe(
+            "show", unit, "--property=MainPID", "--value"
+        )
+        self_recovery = (
+            defer_starts
+            and unit == "aicc-principal-recovery.service"
+            and current_pid == str(os.getpid())
+        )
         if state["exists"] is False:
             # Best-effort mutations are followed by authoritative state
             # probes. A failed command is harmless only when the desired
             # state is nevertheless proven; otherwise recover() keeps WAL
             # and the service snapshot for the next retry.
-            probe("stop", unit)
+            if not self_recovery:
+                probe("stop", unit)
             probe("disable", unit)
             assert_restored(unit, state)
             continue
-        if version == 3:
+        if version == 3 and not self_recovery:
             for name, expected in state["properties"].items():
                 property_rc, actual = probe(
                     "show", unit, f"--property={name}", "--value"
@@ -360,8 +804,166 @@ def restore_service_snapshot(path: Path, *, run=subprocess.run) -> None:
                         f"refusing unsafe snapshot restart: {unit} {name}"
                     )
         systemctl("enable" if state["enabled"] else "disable", unit)
-        systemctl("start" if state["active"] else "stop", unit)
-        assert_restored(unit, state)
+        queued_start = defer_starts and state["active"] and not self_recovery
+        if not self_recovery:
+            if queued_start:
+                systemctl("--no-block", "start", unit)
+            else:
+                systemctl("start" if state["active"] else "stop", unit)
+        assert_restored(unit, state, queued_start=queued_start)
+
+
+def quiesce_service_snapshot(path: Path, *, run=subprocess.run) -> None:
+    """Stop snapshotted admission/worker units before rollback mutation."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        version = payload["version"]
+        units = payload["units"]
+    except (
+        FileNotFoundError,
+        KeyError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise RuntimeError("missing or invalid service snapshot for quiesce") from exc
+    if version not in {2, 3} or not isinstance(units, dict):
+        raise RuntimeError("invalid service snapshot for quiesce")
+    validated: list[tuple[str, dict[str, object]]] = []
+    for unit, state in sorted(units.items()):
+        if (
+            not isinstance(unit, str)
+            or not RESTORABLE_UNIT_RE.fullmatch(unit)
+            or not isinstance(state, dict)
+            or not isinstance(state.get("exists"), bool)
+            or not isinstance(state.get("enabled"), bool)
+            or not isinstance(state.get("active"), bool)
+            or (
+                version == 3
+                and (
+                    not isinstance(state.get("properties"), dict)
+                    or (
+                        state["exists"]
+                        and set(state["properties"]) != set(SNAPSHOT_PROPERTIES)
+                    )
+                    or any(
+                        not isinstance(name, str) or not isinstance(value, str)
+                        for name, value in state["properties"].items()
+                    )
+                )
+            )
+        ):
+            raise RuntimeError("invalid service snapshot unit for quiesce")
+        if unit != "aicc-principal-recovery.service":
+            validated.append((unit, state))
+
+    def command(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return run(
+            ["/usr/bin/systemctl", *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+    for unit, expected in validated:
+        load = command("show", unit, "--property=LoadState", "--value")
+        load_state = load.stdout.strip()
+        if load_state == "not-found":
+            if (
+                expected["exists"] is False
+                and expected["active"] is False
+                and expected["enabled"] is False
+            ):
+                continue
+            raise RuntimeError(f"expected unit disappeared before quiesce: {unit}")
+        if load.returncode or not load_state:
+            raise RuntimeError(f"cannot prove unit load state before quiesce: {unit}")
+        stopped = command("stop", unit)
+        if stopped.returncode:
+            raise RuntimeError(f"cannot stop unit before rollback: {unit}")
+        active = command("show", unit, "--property=ActiveState", "--value")
+        main_pid = command("show", unit, "--property=MainPID", "--value")
+        if (
+            active.returncode
+            or main_pid.returncode
+            or active.stdout.strip() != "inactive"
+            or main_pid.stdout.strip() not in {"", "0"}
+        ):
+            raise RuntimeError(f"unit did not quiesce exactly: {unit}")
+
+
+def verify_service_snapshot_closure(
+    path: Path, *, run=subprocess.run
+) -> None:
+    """Prove every installed or loaded template lane is in the bound snapshot.
+
+    This check intentionally lives in the recovery capsule rather than only in
+    the installer shell. A boot/runtime resume must not trust a point-in-time
+    pre-crash audit before it removes or switches executable code.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        version = payload["version"]
+        units = payload["units"]
+    except (
+        FileNotFoundError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise RuntimeError("missing or invalid service snapshot for closure") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"version", "units"}
+        or version not in {2, 3}
+        or not isinstance(units, dict)
+        or any(
+            not isinstance(unit, str) or not RESTORABLE_UNIT_RE.fullmatch(unit)
+            for unit in units
+        )
+    ):
+        raise RuntimeError("invalid service snapshot for closure")
+
+    discovered: set[str] = set()
+    for arguments in (
+        (
+            "list-unit-files",
+            "voyn-aicc-worker@*.service",
+            "--no-legend",
+            "--no-pager",
+        ),
+        (
+            "list-units",
+            "voyn-aicc-worker@*.service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+        ),
+    ):
+        result = run(
+            ["/usr/bin/systemctl", *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                result.stderr.strip()
+                or "cannot enumerate worker lanes for snapshot closure"
+            )
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if fields and fields[0] == "●":
+                fields = fields[1:]
+            candidate = fields[0] if fields else ""
+            if TEMPLATE_WORKER_UNIT_RE.fullmatch(candidate):
+                discovered.add(candidate)
+
+    extras = sorted(discovered - set(units))
+    if extras:
+        raise RuntimeError(f"worker lanes exist outside service snapshot: {extras}")
 
 
 class FileTransaction:
@@ -452,6 +1054,10 @@ class FileTransaction:
     def prepare(self, specs: Iterable[FileSpec]) -> Path:
         """Durably journal backups and staged payloads without touching targets."""
         validated = self.validate_sources(specs)
+        if _path_present(self.pending_release):
+            raise RuntimeError(
+                "pending release selector blocks a new install transaction"
+            )
         source_states = {spec.target: _read_regular(spec.source) for spec in validated}
         previous_current = (
             self.current.read_text(encoding="utf-8") if self.current.exists() else None
@@ -470,7 +1076,7 @@ class FileTransaction:
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 raise ValueError(f"existing target is not a regular file: {target}")
         self._prepare_state_dir()
-        if self.pending.exists():
+        if _path_present(self.pending) or _path_present(self.pending_release):
             # A prior install was interrupted after prepare/apply but before
             # commit. Overwriting pending.json here would orphan that
             # generation's backups and permanently destroy the restore path
@@ -587,7 +1193,7 @@ class FileTransaction:
         return manifest
 
     def _pending_manifest(self) -> Path:
-        value = json.loads(self.pending.read_text(encoding="utf-8"))
+        value = _trusted_journal(self.pending)
         manifest = Path(value["manifest"]).resolve(strict=True)
         if (
             not manifest.is_relative_to(self.state_dir)
@@ -631,7 +1237,7 @@ class FileTransaction:
     def commit(self) -> None:
         """Publish an applied generation only after service rollout succeeds."""
         manifest = self._pending_manifest()
-        journal = json.loads(self.pending.read_text(encoding="utf-8"))
+        journal = _trusted_journal(self.pending)
         if journal.get("phase") != "APPLIED":
             raise RuntimeError("only a fully applied generation can be committed")
         self._write_journal(manifest, "COMMITTING", journal.get("next_index", 0))
@@ -643,6 +1249,7 @@ class FileTransaction:
             os.getegid(),
         )
         self.pending_release.unlink(missing_ok=True)
+        _fsync_dir(self.state_dir)
         self.pending.unlink()
         # The snapshot is spent once committed; leaving it at the fixed path
         # lets a later recover() apply a stale snapshot against a different
@@ -650,8 +1257,8 @@ class FileTransaction:
         (self.state_dir / "attempt-units.json").unlink(missing_ok=True)
         _fsync_dir(self.state_dir)
 
-    def _restore_release_selector(self) -> None:
-        if not self.pending_release.exists():
+    def _restore_release_selector(self, *, clear_pending: bool = True) -> None:
+        if not _path_present(self.pending_release):
             return
         info = self.pending_release.lstat()
         if (
@@ -682,28 +1289,176 @@ class FileTransaction:
                 raise RuntimeError(
                     "pending release selector points at a missing release"
                 )
+            # Selecting a release is selecting the code every worker ExecStart
+            # runs, and recovery is not a weaker moment than install: a prior
+            # generation can have been replaced, truncated or drifted since it
+            # was built. Independent review on cacfc257 found this path
+            # admitting exactly the unattested release the forward path now
+            # refuses. Fail secure -- an unproven release is never selected,
+            # even to restore service.
+            self.verify_release_selection(selector)
             temporary = current.parent / f".current-recover-{os.getpid()}"
             temporary.unlink(missing_ok=True)
             temporary.symlink_to(selector)
             os.replace(temporary, current)
-        self.pending_release.unlink()
         _fsync_dir(current.parent)
-        _fsync_dir(self.state_dir)
+        if clear_pending:
+            self.pending_release.unlink()
+            _fsync_dir(self.state_dir)
+
+    def release_manifest_path(self, release_id: str) -> Path:
+        """The root-owned manifest recorded when this release was staged."""
+        return self.state_dir / "releases" / f"{release_id}.json"
+
+    def verify_release_selection(self, selector: str) -> None:
+        """Prove a release before `/opt/aicc/current` may point at it.
+
+        Every selection goes through here -- install, recovery, rollback and
+        uninstall alike. The Git cross-check is not available on the boot
+        recovery path (there is no repository checkout at that point), so the
+        root-owned manifest is the authority there; the forward path adds the
+        committed-tree comparison on top of it.
+        """
+        release_id = selector.split("/", 1)[-1]
+        release_dir = self._target("/opt/aicc") / selector
+        verify_release_manifest(
+            release_dir,
+            self.release_manifest_path(release_id),
+            release_id,
+            trusted_uid=os.geteuid(),
+            trusted_gid=os.getegid(),
+        )
+
+    def select_release(self, release_id: str, repo_root: Path) -> str:
+        """Arm rollback and atomically activate an exact, re-proven release."""
+        if RELEASE_ID_RE.fullmatch(release_id) is None:
+            raise ReleaseRefused(
+                "release id must be exactly 40 lowercase hex characters"
+            )
+        selector = f"releases/{release_id}"
+        release_dir = self._target("/opt/aicc") / selector
+        manifest = self.release_manifest_path(release_id)
+        if not _path_present(self.pending):
+            raise RuntimeError("release selection requires an active install journal")
+        install_journal = _trusted_journal(self.pending)
+        if install_journal.get("phase") != "APPLIED":
+            raise RuntimeError("release selection requires an applied install")
+        if _path_present(self.pending_release):
+            raise RuntimeError("pending release selector already exists")
+        current = self._target("/opt/aicc/current")
+        previous = _release_selector(current)
+        _exclusive_bytes(
+            self.pending_release,
+            f"{previous}\n".encode("ascii"),
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
+        # Re-prove immediately before the single selector mutation. The
+        # manifest was created before publication and Git is the independent
+        # authority for the exact tree selected here.
+        verify_release_manifest(
+            release_dir,
+            manifest,
+            release_id,
+            repo_root=repo_root,
+            trusted_uid=os.geteuid(),
+            trusted_gid=os.getegid(),
+        )
+        parent_fd = _open_directory_chain(current.parent, create=False)
+        temporary = f".current-select-{os.getpid()}-{secrets.token_hex(4)}"
+        try:
+            os.symlink(selector, temporary, dir_fd=parent_fd)
+            os.replace(
+                temporary,
+                current.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
+        return previous
+
+    def select_uninstall_baseline(self, selector: str) -> None:
+        """Restore the pre-install selector under the armed uninstall WAL."""
+        if selector != "ABSENT" and not re.fullmatch(
+            r"releases/[0-9a-f]{40}", selector
+        ):
+            raise RuntimeError("baseline release selector is invalid")
+        journal = _trusted_journal(self.state_dir / "uninstall.json")
+        if journal.get("version") != UNINSTALL_JOURNAL_VERSION:
+            raise RuntimeError("uninstall journal version is unsupported")
+        _trusted_uninstall_recovery(self.state_dir, journal)
+        if (
+            journal.get("phase") != "ARMED"
+            or journal.get("baseline_selector") != selector
+        ):
+            raise RuntimeError("uninstall baseline does not match armed journal")
+        if selector != "ABSENT":
+            self.verify_release_selection(selector)
+        current = self._target("/opt/aicc/current")
+        parent_fd = _open_directory_chain(current.parent, create=False)
+        temporary = f".current-uninstall-{os.getpid()}-{secrets.token_hex(4)}"
+        try:
+            if selector == "ABSENT":
+                try:
+                    os.unlink(current.name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            else:
+                os.symlink(selector, temporary, dir_fd=parent_fd)
+                os.replace(
+                    temporary,
+                    current.name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            os.fsync(parent_fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
 
     def install(self, specs: Iterable[FileSpec]) -> None:
         self.prepare(specs)
         self.apply()
         self.commit()
 
-    def recover(self) -> None:
+    def recover(self, *, boot: bool = False) -> None:
         """Idempotently roll back an interrupted prepared/applying generation."""
-        if not self.pending.exists():
-            self._restore_release_selector()
+        if not _path_present(self.pending):
+            if _path_present(self.pending_release):
+                raise RuntimeError(
+                    "pending release selector exists without install journal"
+                )
+            # A crash after a completed recovery can leave only the inert
+            # fixed-name snapshot. With no governing WAL it has no authority
+            # and must not bleed into the next transaction.
+            snapshot = self.state_dir / "attempt-units.json"
+            if _path_present(snapshot):
+                _read_regular(snapshot, max_bytes=4 * 1024 * 1024)
+                snapshot.unlink()
+                _fsync_dir(self.state_dir)
             self._remove_orphan_generations()
             return
         manifest = self._pending_manifest()
         transaction = manifest.parent
-        journal = json.loads(self.pending.read_text(encoding="utf-8"))
+        journal = _trusted_journal(self.pending)
+        pending_release_present = _path_present(self.pending_release)
+        if pending_release_present and journal.get("phase") not in {
+            "APPLIED",
+            "COMMITTING",
+        }:
+            raise RuntimeError(
+                "pending release selector is not paired with an applied install"
+            )
         current_manifest = None
         if self.current.exists():
             current_manifest = json.loads(self.current.read_text(encoding="utf-8")).get(
@@ -722,8 +1477,9 @@ class FileTransaction:
                 os.geteuid(),
                 os.getegid(),
             )
-            self.pending.unlink()
             self.pending_release.unlink(missing_ok=True)
+            _fsync_dir(self.state_dir)
+            self.pending.unlink()
             # The interrupted commit's service snapshot is spent: leaving it
             # at the fixed path lets a LATER recover() apply it against a
             # different generation (review on 0f4d77e).
@@ -731,10 +1487,26 @@ class FileTransaction:
             self._remove_orphan_generations()
             _fsync_dir(self.state_dir)
             return
+        snapshot = self.state_dir / "attempt-units.json"
+        snapshot_present = _path_present(snapshot)
+        if snapshot_present:
+            verify_service_snapshot_closure(snapshot)
+            quiesce_service_snapshot(snapshot)
+            verify_service_snapshot_closure(snapshot)
+        elif self.root == Path("/"):
+            raise RuntimeError("production recovery requires a service snapshot")
         self.restore(manifest, clear_pending=False)
         self._restore_release_selector()
-        restore_service_snapshot(self.state_dir / "attempt-units.json")
+        if snapshot_present:
+            if boot:
+                restore_service_snapshot(snapshot, defer_starts=True)
+            else:
+                restore_service_snapshot(snapshot)
+            verify_service_snapshot_closure(snapshot)
         self._clear_pending(manifest)
+        if snapshot_present:
+            snapshot.unlink()
+            _fsync_dir(self.state_dir)
         shutil.rmtree(transaction)
         self._remove_orphan_generations()
         _fsync_dir(self.state_dir)
@@ -762,9 +1534,9 @@ class FileTransaction:
                 shutil.rmtree(generation)
 
     def _clear_pending(self, manifest: Path) -> None:
-        if not self.pending.exists():
+        if not _path_present(self.pending):
             return
-        pending = json.loads(self.pending.read_text(encoding="utf-8"))
+        pending = _trusted_journal(self.pending)
         if Path(pending.get("manifest", "")).resolve() == manifest.resolve():
             self.pending.unlink()
             _fsync_dir(self.state_dir)
@@ -778,6 +1550,14 @@ class FileTransaction:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         records = [BackupRecord(**value) for value in payload["records"]]
         for record in reversed(records):
+            if (
+                record.target == RECOVERY_ANCHOR_TARGET
+                and _path_present(self.state_dir / "uninstall.json")
+            ):
+                # Historical generations treated the generator as reversible.
+                # Preserve the permanent anchor until the uninstall WAL is
+                # durably gone; without it a reboot could bypass recovery.
+                continue
             target = self._target(record.target)
             try:
                 current = _read_regular(target)
@@ -861,9 +1641,9 @@ class FileTransaction:
         if clear_pending:
             self._clear_pending(manifest)
 
-    def uninstall_all(self) -> None:
+    def uninstall_all(self, *, boot: bool = False) -> None:
         """Unwind every installed generation to the original pre-install state."""
-        self.recover()
+        self.recover(boot=boot)
         while self.current.exists():
             value = json.loads(self.current.read_text(encoding="utf-8"))
             manifest = Path(value["manifest"]).resolve(strict=True)
@@ -872,6 +1652,624 @@ class FileTransaction:
             shutil.rmtree(transaction)
             _fsync_dir(self.state_dir)
         self._remove_orphan_generations()
+
+
+def recover_uninstall(
+    state_dir: Path, *, root: Path = Path("/"), boot: bool = False
+) -> None:
+    """Resume or safely abort a journalled uninstall after a crash/reboot."""
+    journal_path = state_dir / "uninstall.json"
+    payload = _trusted_journal(journal_path)
+    if payload.get("version") != UNINSTALL_JOURNAL_VERSION:
+        raise RuntimeError("uninstall recovery journal version is unsupported")
+    recovery = _trusted_uninstall_recovery(state_dir, payload)
+    phase = payload.get("phase")
+    snapshot = state_dir / "uninstall-units.json"
+
+    if phase == "INTENT":
+        # No privileged uninstall mutation is permitted before ARMED. Prove
+        # the installation identity is unchanged, then abort the intent with
+        # the journal removed last. A partially written snapshot is inert.
+        current = _release_selector(root / "opt/aicc/current")
+        if current != payload.get("start_selector"):
+            raise RuntimeError("release selector changed during uninstall intent")
+        registry = _read_regular(root / "etc/aicc/worker-lanes", max_bytes=64 * 1024)
+        if registry.sha256 != payload.get("registry_sha256"):
+            raise RuntimeError("worker lane registry changed during uninstall intent")
+        snapshot.unlink(missing_ok=True)
+        _fsync_dir(state_dir)
+        journal_path.unlink()
+        _fsync_dir(state_dir)
+        try:
+            recovery.unlink(missing_ok=True)
+            recovery.parent.rmdir()
+            _fsync_dir(state_dir)
+        except OSError:
+            pass
+        return
+
+    if phase == "COMPLETING":
+        complete_uninstall(state_dir, snapshot)
+        return
+    if phase != "ARMED":
+        raise RuntimeError("uninstall recovery phase is invalid")
+
+    bound_snapshot = _read_regular(snapshot, max_bytes=4 * 1024 * 1024)
+    if bound_snapshot.sha256 != payload.get("snapshot_sha256"):
+        raise RuntimeError("uninstall service snapshot drifted")
+    verify_service_snapshot_closure(snapshot)
+    quiesce_service_snapshot(snapshot)
+    verify_service_snapshot_closure(snapshot)
+    transaction = FileTransaction(root, state_dir)
+    transaction.uninstall_all(boot=boot)
+    baseline = payload.get("baseline_selector")
+    if not isinstance(baseline, str):
+        raise TypeError("uninstall baseline selector is invalid")
+    transaction.select_uninstall_baseline(baseline)
+    if boot:
+        restore_service_snapshot(
+            state_dir / "baseline-units.json", defer_starts=True
+        )
+    else:
+        restore_service_snapshot(state_dir / "baseline-units.json")
+    verify_service_snapshot_closure(snapshot)
+    complete_uninstall(state_dir, snapshot)
+
+
+# Kept identical to `GIT_CONFIG_FREE` in ops/aicc_exact_sha_bootstrap.py; the
+# bootstrap runs as a standalone blob before this module exists, so the list is
+# duplicated deliberately and pinned by tests/ops/test_aicc_release_manifest.py.
+GIT_CONFIG_FREE = (
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "core.sshCommand=/bin/false",
+    "-c",
+    "core.gitProxy=",
+    "-c",
+    "core.symlinks=false",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "protocol.file.allow=never",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "diff.external=",
+    "-c",
+    "filter.lfs.smudge=",
+    "-c",
+    "filter.lfs.clean=",
+    "-c",
+    "filter.lfs.process=",
+    "-c",
+    "uploadpack.packObjectsHook=",
+)
+
+
+def _git_safe_environment() -> dict[str, str]:
+    return {
+        "HOME": "/nonexistent",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+    }
+
+
+RELEASE_MANIFEST_VERSION = 1
+RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
+GIT_TREE_ENTRY_RE = re.compile(
+    rb"([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t(.+)", re.DOTALL
+)
+
+
+class ReleaseRefused(RuntimeError):
+    """A staged or pre-existing immutable release could not be proven."""
+
+
+def _git_blob_oid(blob_bytes: bytes) -> str:
+    """Ask trusted Git for the repository-format identity of raw blob bytes."""
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/git",
+                "--no-replace-objects",
+                *GIT_CONFIG_FREE,
+                "hash-object",
+                "--no-filters",
+                "--stdin",
+            ],
+            cwd=Path("/"),
+            env=_git_safe_environment(),
+            input=blob_bytes,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ReleaseRefused("cannot execute trusted Git blob identity") from exc
+    if result.returncode or result.stderr:
+        raise ReleaseRefused("trusted Git blob identity failed")
+    if re.fullmatch(rb"[0-9a-f]{40}\n", result.stdout) is None:
+        raise ReleaseRefused("trusted Git returned an invalid blob identity")
+    return result.stdout[:-1].decode("ascii")
+
+
+def _release_entry(
+    path: Path, relative: str, *, trusted_uid: int, trusted_gid: int
+) -> dict[str, object]:
+    """Describe one release path from its own `lstat`, refusing anything that
+    a non-root principal could still influence.
+
+    Ownership and the absence of group/other write authority are checked here
+    rather than only against the recorded manifest: a manifest that faithfully
+    records a world-writable tree must not make that tree acceptable.
+    """
+    info = path.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid != trusted_uid or info.st_gid != trusted_gid:
+        raise ReleaseRefused(f"release path is not trusted-owned: {relative}")
+    if mode & 0o022 and not stat.S_ISLNK(info.st_mode):
+        raise ReleaseRefused(f"release path is group/world writable: {relative}")
+    if stat.S_ISLNK(info.st_mode):
+        # A symlink is legitimate inside the interpreter venv, but only as the
+        # exact link recorded when root built the release. The target is data,
+        # never followed during verification.
+        return {
+            "path": relative,
+            "kind": "symlink",
+            "mode": mode,
+            "target": os.readlink(path),
+        }
+    if stat.S_ISDIR(info.st_mode):
+        return {"path": relative, "kind": "dir", "mode": mode}
+    if not stat.S_ISREG(info.st_mode):
+        raise ReleaseRefused(f"release path is not a regular file: {relative}")
+    if info.st_nlink != 1:
+        # A hardlink lets a writer of any other directory keep a mutable alias
+        # to release content that `chmod -R a-w` appears to have frozen.
+        raise ReleaseRefused(f"release file is hardlinked: {relative}")
+    state = _read_regular(path)
+    if state.uid != trusted_uid or state.gid != trusted_gid:
+        raise ReleaseRefused(f"release file ownership changed while read: {relative}")
+    return {
+        "path": relative,
+        "kind": "file",
+        "mode": state.mode,
+        "sha256": state.sha256,
+        "size": len(state.payload),
+    }
+
+
+def release_entries(
+    root: Path, *, trusted_uid: int = 0, trusted_gid: int = 0
+) -> list[dict[str, object]]:
+    """Every path below `root`, deterministically ordered.
+
+    `os.walk(followlinks=False)` never descends a symlink, so a symlinked
+    directory is recorded as a link and its target tree is not absorbed into
+    the release identity.
+    """
+    entries = [
+        _release_entry(root, ".", trusted_uid=trusted_uid, trusted_gid=trusted_gid)
+    ]
+    for directory, names, files in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        for name in sorted([*names, *files]):
+            path = directory_path / name
+            relative = path.relative_to(root).as_posix()
+            entries.append(
+                _release_entry(
+                    path, relative, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+                )
+            )
+    entries.sort(key=lambda entry: entry["path"])
+    seen = {entry["path"] for entry in entries}
+    if len(seen) != len(entries):
+        raise ReleaseRefused("duplicate release path")
+    return entries
+
+
+def _manifest_document(release_id: str, entries: list[dict[str, object]]) -> bytes:
+    body = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    document = {
+        "version": RELEASE_MANIFEST_VERSION,
+        "release_id": release_id,
+        "entry_count": len(entries),
+        "entries_sha256": hashlib.sha256(body).hexdigest(),
+        "entries": entries,
+    }
+    return (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _git_tree_blobs(repo_root: Path, release_id: str) -> dict[str, tuple[str, int]]:
+    """`path -> (blob oid, mode)` for the exact commit, read config-free.
+
+    This is what makes a same-name/wrong-tree release detectable even if its
+    manifest was rewritten: the committed content is the independent authority,
+    not the manifest.
+    """
+    result = subprocess.run(
+        [
+            "/usr/bin/git",
+            # This read is the INDEPENDENT authority a release is checked
+            # against, so it must not inherit anything the release directory's
+            # own repository can influence. Replacement refs would otherwise
+            # let one planted `refs/replace/<release_id>` satisfy both the
+            # manifest and this check with the same substituted tree
+            # (independent review on aaf1a502). Kept in lockstep with
+            # `_git_argv` in ops/aicc_exact_sha_bootstrap.py -- that module is
+            # extracted from Git as a single blob and executed before this one
+            # exists, so it cannot import from here; a fitness test pins the
+            # two lists together instead.
+            "--no-replace-objects",
+            *GIT_CONFIG_FREE,
+            "-C",
+            str(repo_root),
+            "ls-tree",
+            "-rz",
+            "--full-tree",
+            release_id,
+        ],
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+        env=_git_safe_environment(),
+    )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise ReleaseRefused(detail or "cannot read trusted Git tree")
+    blobs: dict[str, tuple[str, int]] = {}
+    for raw in result.stdout.rstrip(b"\0").split(b"\0") if result.stdout else []:
+        match = GIT_TREE_ENTRY_RE.fullmatch(raw)
+        if match is None:
+            raise ReleaseRefused("unparseable Git tree entry")
+        mode_raw, kind, oid_raw, path_raw = match.groups()
+        try:
+            relative = path_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReleaseRefused("non-UTF-8 path in trusted tree") from exc
+        path = Path(relative)
+        if path.is_absolute() or ".." in path.parts:
+            raise ReleaseRefused("unsafe path in trusted tree")
+        if kind != b"blob" or mode_raw not in {b"100644", b"100755"}:
+            raise ReleaseRefused(f"unsupported tree entry: {relative}")
+        blobs[relative] = (
+            oid_raw.decode("ascii"),
+            0o755 if mode_raw == b"100755" else 0o644,
+        )
+    return blobs
+
+
+def _verify_against_git_tree(
+    release_dir: Path,
+    repo_root: Path,
+    release_id: str,
+    entries: list[dict[str, object]],
+    *,
+    trusted_uid: int,
+    trusted_gid: int,
+) -> None:
+    by_path = {entry["path"]: entry for entry in entries}
+    for relative, (oid, git_mode) in _git_tree_blobs(repo_root, release_id).items():
+        entry = by_path.get(relative)
+        if entry is None or entry["kind"] != "file":
+            raise ReleaseRefused(f"committed file missing from release: {relative}")
+        target = release_dir / relative
+        state = _read_regular(target)
+        if state.uid != trusted_uid or state.gid != trusted_gid:
+            raise ReleaseRefused(f"committed file is not trusted-owned: {relative}")
+        if _git_blob_oid(state.payload) != oid:
+            raise ReleaseRefused(
+                f"release content does not match committed blob: {relative}"
+            )
+        # `chmod -R a-w` clears write bits; the executable bit is the part of
+        # the committed mode a release must still carry faithfully.
+        if bool(state.mode & 0o111) != bool(git_mode & 0o111):
+            raise ReleaseRefused(f"release executable bit drifted: {relative}")
+
+
+def record_release_manifest(
+    release_tree: Path,
+    manifest: Path,
+    release_id: str,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> list[dict[str, object]]:
+    """Write the root-owned content manifest for a freshly staged release.
+
+    Recorded before the staging tree is renamed into place, so a release
+    directory never exists without the manifest that authorises its reuse.
+    """
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    entries = release_entries(
+        release_tree, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+    )
+    payload = _manifest_document(release_id, entries)
+    directory_fd = _open_directory_chain(manifest.parent, create=True)
+    descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise ReleaseRefused("host lacks no-follow manifest support")
+        flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                manifest.name, flags, 0o600, dir_fd=directory_fd
+            )
+        except FileExistsError:
+            try:
+                existing = _read_regular(manifest, max_bytes=64 * 1024 * 1024)
+            except (OSError, RuntimeError) as exc:
+                raise ReleaseRefused("existing release manifest is unsafe") from exc
+            if (
+                existing.uid != trusted_uid
+                or existing.gid != trusted_gid
+                or existing.mode != 0o600
+                or existing.payload != payload
+            ):
+                raise ReleaseRefused("existing release manifest differs")
+            return entries
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, trusted_uid, trusted_gid)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+    return entries
+
+
+def publish_release_tree(
+    staging: Path,
+    release_root: Path,
+    manifest: Path,
+    release_id: str,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> Path:
+    """Verify and publish one release atomically without replacing a name."""
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if staging.parent != release_root or staging.name == release_id:
+        raise ReleaseRefused("release staging path is outside the release root")
+    # The publication primitive itself proves the authority it was given.
+    # Callers cannot accidentally pass a manifest argument that is ignored.
+    verify_release_manifest(
+        staging,
+        manifest,
+        release_id,
+        trusted_uid=trusted_uid,
+        trusted_gid=trusted_gid,
+    )
+    root_fd = _open_directory_chain(release_root, create=False)
+    try:
+        root_state = os.fstat(root_fd)
+        if (
+            root_state.st_uid != trusted_uid
+            or root_state.st_gid != trusted_gid
+            or stat.S_IMODE(root_state.st_mode) & 0o022
+        ):
+            raise ReleaseRefused("release root is not trusted")
+        staging_state = os.stat(
+            staging.name, dir_fd=root_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISDIR(staging_state.st_mode)
+            or staging_state.st_uid != trusted_uid
+            or staging_state.st_gid != trusted_gid
+        ):
+            raise ReleaseRefused("release staging directory is not trusted")
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise ReleaseRefused("kernel lacks atomic no-replace release publication")
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        if renameat2(
+            root_fd,
+            os.fsencode(staging.name),
+            root_fd,
+            os.fsencode(release_id),
+            1,  # RENAME_NOREPLACE
+        ) != 0:
+            error = ctypes.get_errno()
+            if error == errno.EEXIST:
+                raise ReleaseRefused("release destination already exists")
+            raise ReleaseRefused(
+                f"atomic release publication failed: errno {error}"
+            )
+        os.fsync(root_fd)
+        return release_root / release_id
+    finally:
+        os.close(root_fd)
+
+
+def reconcile_release_publication(
+    release_root: Path,
+    manifest: Path,
+    release_id: str,
+    *,
+    state_dir: Path = Path("/var/lib/aicc-principal-isolation"),
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> Path | None:
+    """Recover every crash point around manifest + directory publication.
+
+    The root-owned, non-writable release directory plus the host-global lock
+    form the staging authority. A manifest with one exact staging directory is
+    resumed; a manifest whose unpublished staging tree was already removed is
+    safely discarded; an incomplete stage without a manifest is discarded and
+    rebuilt. Ambiguous or untrusted state fails closed.
+    """
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if manifest.parent != state_dir / "releases":
+        raise ReleaseRefused("release manifest path is outside trusted state")
+    if manifest.name != f"{release_id}.json":
+        raise ReleaseRefused("release manifest name does not match release id")
+    root_fd = _open_directory_chain(release_root, create=False)
+    try:
+        root_state = os.fstat(root_fd)
+        if (
+            root_state.st_uid != trusted_uid
+            or root_state.st_gid != trusted_gid
+            or stat.S_IMODE(root_state.st_mode) & 0o022
+        ):
+            raise ReleaseRefused("release root is not trusted")
+        prefix = f".stage-{release_id}."
+        stages = sorted(
+            release_root / entry.name
+            for entry in os.scandir(root_fd)
+            if entry.name.startswith(prefix)
+        )
+        destination = release_root / release_id
+        destination_exists = destination.exists()
+        if destination_exists:
+            if stages:
+                raise ReleaseRefused("published release coexists with staging state")
+            verify_release_manifest(
+                destination,
+                manifest,
+                release_id,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            return destination
+        if manifest.exists():
+            if len(stages) > 1:
+                raise ReleaseRefused("release publication staging is ambiguous")
+            if len(stages) == 1:
+                return publish_release_tree(
+                    stages[0],
+                    release_root,
+                    manifest,
+                    release_id,
+                    trusted_uid=trusted_uid,
+                    trusted_gid=trusted_gid,
+                )
+            recorded = _read_regular(manifest, max_bytes=64 * 1024 * 1024)
+            if (
+                recorded.uid != trusted_uid
+                or recorded.gid != trusted_gid
+                or recorded.mode != 0o600
+            ):
+                raise ReleaseRefused("orphan release manifest is unsafe")
+            manifest.unlink()
+            _fsync_dir(manifest.parent)
+            return None
+        if len(stages) > 1:
+            raise ReleaseRefused("unattested release staging is ambiguous")
+        if stages:
+            stage_info = stages[0].lstat()
+            if (
+                not stat.S_ISDIR(stage_info.st_mode)
+                or stat.S_ISLNK(stage_info.st_mode)
+                or stage_info.st_uid != trusted_uid
+                or stage_info.st_gid != trusted_gid
+                or stat.S_IMODE(stage_info.st_mode) & 0o022
+            ):
+                raise ReleaseRefused("unattested release staging is unsafe")
+            shutil.rmtree(stages[0])
+            os.fsync(root_fd)
+        return None
+    finally:
+        os.close(root_fd)
+
+
+def verify_release_manifest(
+    release_dir: Path,
+    manifest: Path,
+    release_id: str,
+    *,
+    repo_root: Path | None = None,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+) -> list[dict[str, object]]:
+    """Prove a pre-existing release directory before it may be selected.
+
+    Refuses a missing manifest outright: an unattested `/opt/aicc/releases/<sha>`
+    is exactly the case this gate exists for, and rebuilding trust from the
+    directory itself would only re-record whatever an attacker left there.
+    """
+    if RELEASE_ID_RE.fullmatch(release_id) is None:
+        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    try:
+        recorded = _read_regular(manifest)
+    except (OSError, RuntimeError) as exc:
+        raise ReleaseRefused(
+            f"release manifest is missing or unsafe: {manifest}"
+        ) from exc
+    if (
+        recorded.uid != trusted_uid
+        or recorded.gid != trusted_gid
+        or recorded.mode != 0o600
+    ):
+        raise ReleaseRefused("release manifest is not trusted-owned mode 0600")
+    try:
+        document = json.loads(recorded.payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseRefused("release manifest is malformed") from exc
+    if not isinstance(document, dict):
+        raise ReleaseRefused("release manifest is malformed")
+    if document.get("version") != RELEASE_MANIFEST_VERSION:
+        raise ReleaseRefused("unsupported release manifest version")
+    if document.get("release_id") != release_id:
+        raise ReleaseRefused("release manifest identity mismatch")
+    expected = document.get("entries")
+    if not isinstance(expected, list):
+        raise ReleaseRefused("release manifest is malformed")
+    body = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if document.get("entries_sha256") != hashlib.sha256(body).hexdigest():
+        raise ReleaseRefused("release manifest content hash mismatch")
+    if document.get("entry_count") != len(expected):
+        raise ReleaseRefused("release manifest entry count mismatch")
+
+    observed = release_entries(
+        release_dir, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+    )
+    expected_by_path = {entry["path"]: entry for entry in expected}
+    observed_by_path = {entry["path"]: entry for entry in observed}
+    missing = sorted(set(expected_by_path) - set(observed_by_path))
+    if missing:
+        raise ReleaseRefused(f"release is incomplete: {missing[:5]}")
+    extra = sorted(set(observed_by_path) - set(expected_by_path))
+    if extra:
+        raise ReleaseRefused(f"release has unattested content: {extra[:5]}")
+    for relative, entry in sorted(observed_by_path.items()):
+        if entry != expected_by_path[relative]:
+            raise ReleaseRefused(f"release path does not match manifest: {relative}")
+    if repo_root is not None:
+        _verify_against_git_tree(
+            release_dir,
+            repo_root,
+            release_id,
+            observed,
+            trusted_uid=trusted_uid,
+            trusted_gid=trusted_gid,
+        )
+    return observed
 
 
 def default_specs(
@@ -886,12 +2284,11 @@ def default_specs(
     agent_gid = grp.getgrnam("aicc-agent").gr_gid if resolve_identities else 0
     publisher_gid = grp.getgrnam("aicc-publisher").gr_gid if resolve_identities else 0
     return (
-        # The generator is intentionally the first destination mutation. Once
-        # its atomic rename lands, every later mutation can recover on boot
-        # from the self-contained generation copy referenced by pending.json.
+        # The recovery generator is a permanent bootstrap anchor installed
+        # atomically before prepare(), not part of reversible generations.
         FileSpec(
-            repo_root / "ops/aicc_principal_recovery_generator.py",
-            "/usr/lib/systemd/system-generators/aicc-principal-recovery",
+            repo_root / "ops/aicc_exact_sha_bootstrap.py",
+            "/usr/local/sbin/voyn-aicc-bootstrap",
             0o755,
             root_uid,
             root_gid,
@@ -1038,6 +2435,158 @@ def default_specs(
     )
 
 
+def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.action == "recovery-anchor-install":
+        if _path_present(args.state_dir / "uninstall.json"):
+            raise RuntimeError("unfinished uninstall blocks recovery anchor update")
+        install_recovery_anchor(
+            args.repo_root / "ops/aicc_principal_recovery_generator.py",
+            Path(RECOVERY_ANCHOR_TARGET),
+        )
+        return 0
+    if args.action == "uninstall-status":
+        _print_uninstall_phase(uninstall_phase(args.state_dir))
+        return 0
+    if args.action == "recover-uninstall-boot":
+        recover_uninstall(args.state_dir, root=args.root, boot=True)
+        return 0
+    if args.action == "recover-uninstall-safe":
+        # Runtime resume uses the same deferred-start semantics as boot. Any
+        # claimer start is queued until the generated barrier has observed the
+        # now-cleared WAL and reached active successfully.
+        recover_uninstall(args.state_dir, root=args.root, boot=True)
+        return 0
+    if args.action == "release-select":
+        if args.release_id is None:
+            parser.error("release-select requires --release-id")
+        previous = FileTransaction(args.root, args.state_dir).select_release(
+            args.release_id, args.repo_root
+        )
+        print("" if previous == "ABSENT" else previous)
+        return 0
+    if args.action == "release-reconcile":
+        if args.manifest is None or args.release_id is None:
+            parser.error("--manifest and --release-id are required for release-reconcile")
+        result = reconcile_release_publication(
+            args.release_root,
+            args.manifest,
+            args.release_id,
+            state_dir=args.state_dir,
+            trusted_uid=os.geteuid(),
+            trusted_gid=os.getegid(),
+        )
+        print("AICC_RELEASE_RECONCILED " + (str(result) if result else "ABSENT"))
+        return 0
+    if args.action in {"release-record", "release-verify", "release-publish"}:
+        if (
+            args.release_tree is None
+            or args.manifest is None
+            or args.release_id is None
+        ):
+            parser.error(
+                "--release-tree, --manifest and --release-id are required for "
+                f"{args.action}"
+            )
+        expected_manifest = args.state_dir / "releases" / f"{args.release_id}.json"
+        if args.manifest != expected_manifest:
+            raise ReleaseRefused("release action manifest is outside trusted state")
+        if args.action == "release-record":
+            record_release_manifest(
+                args.release_tree,
+                args.manifest,
+                args.release_id,
+                trusted_uid=os.geteuid(),
+                trusted_gid=os.getegid(),
+            )
+            print(f"AICC_RELEASE_MANIFEST_RECORDED {args.release_id}")
+        elif args.action == "release-verify":
+            verify_release_manifest(
+                args.release_tree,
+                args.manifest,
+                args.release_id,
+                repo_root=args.repo_root if args.verify_against_git else None,
+                trusted_uid=os.geteuid(),
+                trusted_gid=os.getegid(),
+            )
+            print(f"AICC_RELEASE_MANIFEST_VERIFIED {args.release_id}")
+        else:
+            publish_release_tree(
+                args.release_tree,
+                args.release_root,
+                args.manifest,
+                args.release_id,
+                trusted_uid=os.geteuid(),
+                trusted_gid=os.getegid(),
+            )
+            print(f"AICC_RELEASE_PUBLISHED {args.release_id}")
+        return 0
+    if args.action == "uninstall-begin":
+        if args.baseline_selector is None:
+            parser.error("uninstall-begin requires --baseline-selector")
+        _print_uninstall_phase(
+            begin_uninstall(
+                args.state_dir,
+                baseline_selector=args.baseline_selector,
+                current_selector=args.current_selector,
+                lane_registry=args.lane_registry,
+            )
+        )
+        return 0
+    if args.action == "uninstall-arm":
+        if args.service_snapshot is None:
+            parser.error("uninstall-arm requires --service-snapshot")
+        arm_uninstall(args.state_dir, args.service_snapshot)
+        return 0
+    if args.action == "uninstall-complete":
+        if args.service_snapshot is None:
+            parser.error("uninstall-complete requires --service-snapshot")
+        complete_uninstall(args.state_dir, args.service_snapshot)
+        return 0
+    if args.action == "uninstall-select-baseline":
+        if args.baseline_selector is None:
+            parser.error("uninstall-select-baseline requires --baseline-selector")
+        FileTransaction(args.root, args.state_dir).select_uninstall_baseline(
+            args.baseline_selector
+        )
+        return 0
+    if _path_present(args.state_dir / "uninstall.json") and args.action in {
+        "validate",
+        "prepare",
+        "apply",
+        "commit",
+        "install",
+    }:
+        raise RuntimeError("unfinished uninstall journal blocks installation")
+    transaction = FileTransaction(args.root, args.state_dir)
+    if args.action in {"validate", "prepare", "install"}:
+        specs = default_specs(
+            args.repo_root,
+            authority_env=args.authority_env,
+            claude_auth=args.claude_auth,
+            codex_auth=args.codex_auth,
+            resolve_identities=args.action != "validate",
+        )
+    if args.action == "validate":
+        transaction.validate_sources(specs)
+    elif args.action == "prepare":
+        transaction.prepare(specs)
+    elif args.action == "apply":
+        transaction.apply()
+    elif args.action == "commit":
+        transaction.commit()
+    elif args.action == "quiesce":
+        quiesce_service_snapshot(
+            args.service_snapshot or args.state_dir / "attempt-units.json"
+        )
+    elif args.action == "install":
+        transaction.install(specs)
+    elif args.action in {"recover", "rollback", "recover-boot"}:
+        transaction.recover(boot=args.action == "recover-boot")
+    else:
+        transaction.uninstall_all()
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1047,10 +2596,25 @@ def main() -> int:
             "prepare",
             "apply",
             "commit",
+            "quiesce",
             "install",
             "recover",
+            "recover-boot",
+            "recover-uninstall-boot",
+            "recover-uninstall-safe",
             "rollback",
             "uninstall",
+            "uninstall-begin",
+            "uninstall-arm",
+            "uninstall-complete",
+            "uninstall-select-baseline",
+            "uninstall-status",
+            "release-record",
+            "release-verify",
+            "release-publish",
+            "release-reconcile",
+            "release-select",
+            "recovery-anchor-install",
         ),
     )
     parser.add_argument("--repo-root", type=Path, default=Path("/opt/aicc"))
@@ -1071,31 +2635,39 @@ def main() -> int:
         type=Path,
         default=Path("/home/voynadmin/.codex/auth.json"),
     )
+    parser.add_argument("--release-tree", type=Path)
+    parser.add_argument("--release-root", type=Path, default=Path("/opt/aicc/releases"))
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--release-id")
+    parser.add_argument("--verify-against-git", action="store_true")
+    parser.add_argument("--service-snapshot", type=Path)
+    parser.add_argument("--baseline-selector")
+    parser.add_argument(
+        "--current-selector", type=Path, default=Path("/opt/aicc/current")
+    )
+    parser.add_argument(
+        "--lane-registry", type=Path, default=Path("/etc/aicc/worker-lanes")
+    )
+    parser.add_argument("--lock-fd", type=int)
     args = parser.parse_args()
-    transaction = FileTransaction(args.root, args.state_dir)
-    if args.action in {"validate", "prepare", "install"}:
-        specs = default_specs(
-            args.repo_root,
-            authority_env=args.authority_env,
-            claude_auth=args.claude_auth,
-            codex_auth=args.codex_auth,
-            resolve_identities=args.action != "validate",
-        )
-    if args.action == "validate":
-        transaction.validate_sources(specs)
-    elif args.action == "prepare":
-        transaction.prepare(specs)
-    elif args.action == "apply":
-        transaction.apply()
-    elif args.action == "commit":
-        transaction.commit()
-    elif args.action == "install":
-        transaction.install(specs)
-    elif args.action in {"recover", "rollback"}:
-        transaction.recover()
-    else:
-        transaction.uninstall_all()
-    return 0
+    inherited = args.lock_fd
+    if inherited is None and os.environ.get("AICC_INSTALL_LOCK_FD") is not None:
+        try:
+            inherited = int(os.environ["AICC_INSTALL_LOCK_FD"])
+        except ValueError as exc:
+            raise RuntimeError("invalid inherited install lock descriptor") from exc
+    if inherited is None and args.action not in {
+        "recover",
+        "recover-boot",
+        "recover-uninstall-boot",
+        "rollback",
+    }:
+        raise RuntimeError("mutating transaction requires inherited host lock")
+    lock_fd = _install_lock_fd(inherited_fd=inherited)
+    try:
+        return _dispatch(args, parser)
+    finally:
+        os.close(lock_fd)
 
 
 if __name__ == "__main__":

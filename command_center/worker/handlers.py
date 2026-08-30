@@ -986,6 +986,16 @@ def _run_agent(
                 "pinned_base_sha_missing",
                 "head_not_descendant_of_pinned_base",
             }:
+                # Retryable on purpose. The task clone is preserved above and
+                # the next attempt's `provision_workspace` reuses it, so a
+                # later run can still commit what this one left behind -- the
+                # corrected dispatch prompt (VOYN-W0-AICC-AGENT-COMMIT-
+                # CONTRACT-GAP) is what makes that recovery likely rather than
+                # a lottery. A missing pinned base can likewise arrive with a
+                # later fetch. Independent review on c923ad33 rejected an
+                # earlier revision that made these terminal: it would have
+                # dead-lettered recoverable work in the name of saving a retry
+                # budget the prompt fix already stops wasting.
                 return HandlerOutcome(
                     ok=False,
                     reason=f"publish precondition failed: {pub.reason}",
