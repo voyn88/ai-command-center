@@ -1,10 +1,35 @@
 import os
 import subprocess
+import sys
 import time
 
 import pytest
 
 from command_center.runtime import identity
+
+
+def _sleep_process(seconds: int = 10) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [sys.executable, "-c", f"import time; time.sleep({seconds})"],
+        text=True,
+    )
+
+
+def _completed_process() -> subprocess.Popen[str]:
+    return subprocess.Popen([sys.executable, "-c", ""], text=True)
+
+
+def _stable_identity(pid: int) -> identity.ProcessIdentity:
+    """Wait until an exec'ing child exposes the same identity twice."""
+    deadline = time.monotonic() + 5.0
+    previous: identity.ProcessIdentity | None = None
+    while time.monotonic() < deadline:
+        current = identity.capture_identity(pid)
+        if current is not None and current == previous:
+            return current
+        previous = current
+        time.sleep(0.01)
+    raise AssertionError("process identity did not stabilize")
 
 
 def _process_state(pid: int) -> str | None:
@@ -21,12 +46,11 @@ def _process_state(pid: int) -> str | None:
 
 
 def test_capture_identity_for_running_process():
-    proc = subprocess.Popen(["sleep", "2"])
+    proc = _sleep_process()
     try:
-        ident = identity.capture_identity(proc.pid)
-        assert ident is not None
+        ident = _stable_identity(proc.pid)
         assert ident.pid == proc.pid
-        assert "sleep" in ident.command
+        assert ident.command
         assert ident.start_time
     finally:
         proc.terminate()
@@ -34,7 +58,7 @@ def test_capture_identity_for_running_process():
 
 
 def test_capture_identity_returns_none_for_dead_process():
-    proc = subprocess.Popen(["true"])
+    proc = _completed_process()
     proc.wait()
     time.sleep(0.2)
     assert identity.capture_identity(proc.pid) is None
@@ -62,7 +86,7 @@ def test_zombie_is_not_treated_as_a_running_process():
 
 
 def test_process_exists_true_while_running_false_after_exit():
-    proc = subprocess.Popen(["sleep", "1"])
+    proc = _sleep_process(1)
     try:
         assert identity.process_exists(proc.pid) is True
     finally:
@@ -73,9 +97,9 @@ def test_process_exists_true_while_running_false_after_exit():
 
 
 def test_identity_matches_true_for_same_running_process():
-    proc = subprocess.Popen(["sleep", "2"])
+    proc = _sleep_process()
     try:
-        recorded = identity.capture_identity(proc.pid).as_string()
+        recorded = _stable_identity(proc.pid).as_string()
         assert identity.identity_matches(proc.pid, recorded) is True
     finally:
         proc.terminate()
@@ -83,7 +107,7 @@ def test_identity_matches_true_for_same_running_process():
 
 
 def test_identity_matches_false_when_recorded_identity_is_stale_text():
-    proc = subprocess.Popen(["sleep", "2"])
+    proc = _sleep_process()
     try:
         assert identity.identity_matches(proc.pid, "bogus start time|bogus command") is False
     finally:
@@ -92,14 +116,14 @@ def test_identity_matches_false_when_recorded_identity_is_stale_text():
 
 
 def test_identity_matches_false_when_process_gone():
-    proc = subprocess.Popen(["true"])
+    proc = _completed_process()
     proc.wait()
     time.sleep(0.2)
     assert identity.identity_matches(proc.pid, "anything") is False
 
 
 def test_identity_matches_false_when_recorded_identity_missing():
-    proc = subprocess.Popen(["sleep", "2"])
+    proc = _sleep_process()
     try:
         assert identity.identity_matches(proc.pid, None) is False
         assert identity.identity_matches(proc.pid, "") is False
@@ -108,13 +132,123 @@ def test_identity_matches_false_when_recorded_identity_missing():
         proc.wait()
 
 
+def test_versioned_birth_identity_ignores_mutable_command_text():
+    current = identity.ProcessIdentity(
+        42, "posix-ps-utc-v1:Sun Aug 30 00:23:45 2026", "new argv"
+    )
+    recorded = "posix-ps-utc-v1:Sun Aug 30 00:23:45 2026|old argv"
+
+    assert identity.compare_recorded_identity(current, recorded) is True
+
+
+def test_versioned_birth_identity_proves_pid_reuse():
+    current = identity.ProcessIdentity(
+        42, "posix-ps-utc-v1:Sun Aug 30 00:23:46 2026", "same argv"
+    )
+    recorded = "posix-ps-utc-v1:Sun Aug 30 00:23:45 2026|same argv"
+
+    assert identity.compare_recorded_identity(current, recorded) is False
+
+
+def test_legacy_live_identity_mismatch_is_unknown_during_upgrade():
+    current = identity.ProcessIdentity(
+        42, "posix-ps-utc-v1:Sun Aug 30 00:23:45 2026", "python worker.py"
+    )
+
+    assert (
+        identity.compare_recorded_identity(
+            current, "Sat Aug 29 17:23:45 2026|python worker.py"
+        )
+        is None
+    )
+
+
+def test_different_known_identity_schemes_are_not_comparable():
+    current = identity.ProcessIdentity(
+        42, "windows-filetime-v1:133700000000000000", r"C:\Python\python.exe"
+    )
+
+    assert (
+        identity.compare_recorded_identity(
+            current, "posix-ps-utc-v1:Sun Aug 30 00:23:45 2026|python"
+        )
+        is None
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux procfs")
+def test_linux_procfs_identity_uses_high_resolution_start_ticks():
+    query = identity._query_identity_linux_procfs(os.getpid())
+
+    assert query is not None
+    assert query.status is identity.ProcessQueryStatus.LIVE
+    assert query.identity is not None
+    assert query.identity.start_time.startswith("linux-procfs-startticks-v1:")
+
+
 def test_capture_identity_handles_invalid_pid_gracefully():
     assert identity.capture_identity(-1) is None
 
 
+def test_windows_identity_query_uses_native_helper_without_signals(monkeypatch) -> None:
+    expected = identity.ProcessQuery(
+        identity.ProcessQueryStatus.LIVE,
+        identity.ProcessIdentity(
+            pid=4242,
+            start_time="133700000000000000",
+            command=r"C:\\Python\\python.exe",
+        ),
+    )
+    monkeypatch.setattr(identity.os, "name", "nt")
+    monkeypatch.setattr(identity, "_query_identity_windows", lambda pid: expected)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Windows identity query must not use ps or os.kill")
+
+    monkeypatch.setattr(identity.subprocess, "run", forbidden)
+    monkeypatch.setattr(identity.os, "kill", forbidden)
+
+    assert identity.query_identity(4242) == expected
+
+
+def test_failed_ps_fallback_never_signals_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(identity.os, "name", "nt")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Windows identity fallback must not call os.kill")
+
+    monkeypatch.setattr(identity.os, "kill", forbidden)
+
+    assert identity._status_after_failed_ps(4242) is identity.ProcessQueryStatus.UNKNOWN
+
+
+def test_windows_native_api_failure_is_unknown(monkeypatch) -> None:
+    monkeypatch.setattr(
+        identity,
+        "_query_identity_windows_native",
+        lambda _pid: (_ for _ in ()).throw(OSError("native API unavailable")),
+    )
+
+    assert identity._query_identity_windows(4242).status is identity.ProcessQueryStatus.UNKNOWN
+
+
+def test_windows_pid_outside_dword_is_unknown_without_native_call(monkeypatch) -> None:
+    def forbidden(_pid: int):
+        raise AssertionError("out-of-range pid must not cross the native boundary")
+
+    monkeypatch.setattr(identity, "_query_identity_windows_native", forbidden)
+
+    assert (
+        identity._query_identity_windows(0x1_0000_0000).status
+        is identity.ProcessQueryStatus.UNKNOWN
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="tests the POSIX ps fallback")
 def test_failed_ps_for_existing_pid_is_unknown_and_conservatively_exists(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid: None)
     monkeypatch.setattr(
         identity.subprocess,
         "run",
@@ -132,7 +266,9 @@ def test_failed_ps_for_existing_pid_is_unknown_and_conservatively_exists(
     assert identity.identity_matches(4242, "recorded|identity") is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="tests the POSIX ps fallback")
 def test_failed_ps_for_absent_pid_is_confirmed_absent(monkeypatch) -> None:
+    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid: None)
     monkeypatch.setattr(
         identity.subprocess,
         "run",
@@ -150,7 +286,9 @@ def test_failed_ps_for_absent_pid_is_confirmed_absent(monkeypatch) -> None:
     assert identity.process_exists(4242) is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="tests the POSIX ps fallback")
 def test_malformed_successful_ps_output_is_unknown_not_absent(monkeypatch) -> None:
+    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid: None)
     monkeypatch.setattr(
         identity.subprocess,
         "run",
@@ -161,3 +299,26 @@ def test_malformed_successful_ps_output_is_unknown_not_absent(monkeypatch) -> No
 
     assert identity.query_identity(4242).status is identity.ProcessQueryStatus.UNKNOWN
     assert identity.process_exists(4242) is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="tests the POSIX ps environment")
+def test_posix_identity_query_canonicalizes_ps_locale_and_timezone(monkeypatch) -> None:
+    observed: dict[str, str] = {}
+    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid: None)
+
+    def fake_ps(*_args, **kwargs):
+        observed.update(kwargs["env"])
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="S Sun Aug 30 00:23:45 2026 /usr/bin/python\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(identity.subprocess, "run", fake_ps)
+
+    query = identity.query_identity(4242)
+    assert query.status is identity.ProcessQueryStatus.LIVE
+    assert query.identity.start_time.startswith("posix-ps-utc-v1:")
+    assert observed["LANG"] == observed["LC_ALL"] == "C"
+    assert observed["TZ"] == "UTC"

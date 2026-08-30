@@ -128,6 +128,97 @@ def _replace_claim_with_dead_owner(
     assert replaced is not None
 
 
+def test_offline_cutover_fence_blocks_supervisor_restarts(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    token, created, lock_handle = supervisor.acquire_offline_cutover_fence(db_path)
+    assert created is True
+    ordinary_started = threading.Event()
+    result: dict[str, object] = {}
+
+    def start_ordinary():
+        result["ordinary"] = supervisor.Supervisor(db_path)
+        ordinary_started.set()
+
+    thread = threading.Thread(target=start_ordinary)
+    thread.start()
+    assert not ordinary_started.wait(timeout=0.2)
+
+    maintenance = supervisor.Supervisor(
+        db_path,
+        maintenance_token=token,
+        maintenance_lock_handle=lock_handle,
+        enable_completion_autopilot=False,
+    )
+    assert maintenance._autopilot_thread is None
+    supervisor.release_offline_cutover_fence(db_path, token, lock_handle)
+    assert ordinary_started.wait(timeout=5)
+    thread.join(timeout=5)
+    assert not supervisor.offline_cutover_fence_path(db_path).exists()
+
+
+def test_crashed_cutover_marker_fails_closed_after_lock_release(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    token, _created, lock_handle = supervisor.acquire_offline_cutover_fence(db_path)
+    supervisor._release_runtime_lock(lock_handle)
+
+    with pytest.raises(supervisor.SupervisorError, match="fenced"):
+        supervisor.Supervisor(db_path)
+
+    resumed_token, created, resumed_lock = supervisor.acquire_offline_cutover_fence(
+        db_path
+    )
+    assert resumed_token == token
+    assert created is False
+    supervisor.release_offline_cutover_fence(db_path, token, resumed_lock)
+
+
+def test_offline_cutover_exclusive_lock_cannot_overlap_startup(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "runtime.db"
+    original_migrate = db.migrate
+    startup_in_migrate = threading.Event()
+    allow_startup = threading.Event()
+    startup_done = threading.Event()
+    cutover_acquired = threading.Event()
+    result: dict[str, object] = {}
+
+    def paused_migrate(path):
+        startup_in_migrate.set()
+        assert allow_startup.wait(timeout=5)
+        return original_migrate(path)
+
+    monkeypatch.setattr(supervisor.db, "migrate", paused_migrate)
+
+    def start_supervisor():
+        result["supervisor"] = supervisor.Supervisor(db_path)
+        startup_done.set()
+
+    def acquire_cutover():
+        result["cutover"] = supervisor.acquire_offline_cutover_fence(db_path)
+        cutover_acquired.set()
+
+    startup_thread = threading.Thread(target=start_supervisor)
+    startup_thread.start()
+    assert startup_in_migrate.wait(timeout=5)
+
+    cutover_thread = threading.Thread(target=acquire_cutover)
+    cutover_thread.start()
+    assert not cutover_acquired.wait(timeout=0.2)
+
+    allow_startup.set()
+    assert startup_done.wait(timeout=5)
+    assert not cutover_acquired.wait(timeout=0.2)
+
+    running = result["supervisor"]
+    supervisor._release_runtime_lock(running._runtime_lock_handle)
+    assert cutover_acquired.wait(timeout=5)
+    token, _created, lock_handle = result["cutover"]
+    supervisor.release_offline_cutover_fence(db_path, token, lock_handle)
+    startup_thread.join(timeout=5)
+    cutover_thread.join(timeout=5)
+
+
 def _fork_finalization_context_probe(
     inherited,
     db_path: str,
@@ -172,6 +263,16 @@ def _fork_finalization_context_probe(
 
     first = child_supervisor.Supervisor(db_path=Path(db_path))
     second = child_supervisor.Supervisor(db_path=Path(db_path))
+    owner_pid, owner_identity, owner_token = (
+        child_supervisor._ensure_process_finalization_context()
+    )
+    db.bootstrap_finalization_claim_cutover(
+        Path(cold_db_path),
+        owner_token=owner_token,
+        owner_pid=owner_pid,
+        owner_identity=owner_identity.as_string(),
+        offline_confirmed=True,
+    )
     child_supervisor.Supervisor(db_path=Path(cold_db_path))
     first.reconcile()
     observed = child_identity.query_identity(os.getpid())
@@ -503,21 +604,36 @@ def test_dead_supervisor_claim_is_taken_over_before_terminal_recovery(
         (
             identity.ProcessQuery(
                 identity.ProcessQueryStatus.LIVE,
-                identity.ProcessIdentity(4242, "old-start", "old-command"),
+                identity.ProcessIdentity(
+                    4242, "posix-ps-utc-v1:old-start", "old-command"
+                ),
             ),
             False,
         ),
         (
             identity.ProcessQuery(
                 identity.ProcessQueryStatus.LIVE,
-                identity.ProcessIdentity(4242, "old-start", "changed-command"),
+                identity.ProcessIdentity(
+                    4242, "posix-ps-utc-v1:old-start", "changed-command"
+                ),
             ),
             False,
         ),
         (
             identity.ProcessQuery(
                 identity.ProcessQueryStatus.LIVE,
-                identity.ProcessIdentity(4242, "new-start", "new-command"),
+                identity.ProcessIdentity(
+                    4242, "posix-ps-utc-v1:new-start", "new-command"
+                ),
+            ),
+            True,
+        ),
+        (
+            identity.ProcessQuery(
+                identity.ProcessQueryStatus.LIVE,
+                identity.ProcessIdentity(
+                    4242, "posix-ps-utc-v1:new-start", "old-command"
+                ),
             ),
             True,
         ),
@@ -536,7 +652,7 @@ def test_recovery_claim_requires_full_owner_death_proof(
         run["id"],
         owner_token="prior-owner",
         owner_pid=4242,
-        owner_identity="old-start|old-command",
+        owner_identity="posix-ps-utc-v1:old-start|old-command",
         expected_owner_token=original._finalization_owner_token,
     )
     assert replaced is not None
@@ -548,6 +664,44 @@ def test_recovery_claim_requires_full_owner_death_proof(
     assert recovery._acquire_recovery_finalization_claim(run["id"]) is takeover
     claim = db.get_run_finalization_claim(original.db_path, run["id"])
     assert claim["owner_token"] == ("recovery-owner" if takeover else "prior-owner")
+
+
+def test_recovery_never_steals_legacy_live_claim_on_format_or_timezone_mismatch(
+    git_repo, configure_project_repo, monkeypatch
+):
+    configure_project_repo("AIOS", git_repo)
+    original = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(original, git_repo)
+    replaced = db.claim_run_finalization(
+        original.db_path,
+        run["id"],
+        owner_token="legacy-owner",
+        owner_pid=4242,
+        owner_identity="Sat Aug 29 17:23:45 2026|python worker.py",
+        expected_owner_token=original._finalization_owner_token,
+    )
+    assert replaced is not None
+    recovery = supervisor.Supervisor(db_path=original.db_path)
+    recovery._finalization_owner_token = "recovery-owner"
+    recovery._finalizer.owner_token = "recovery-owner"
+    monkeypatch.setattr(
+        supervisor.identity,
+        "query_identity",
+        lambda _pid: identity.ProcessQuery(
+            identity.ProcessQueryStatus.LIVE,
+            identity.ProcessIdentity(
+                4242,
+                "posix-ps-utc-v1:Sun Aug 30 00:23:45 2026",
+                "python worker.py",
+            ),
+        ),
+    )
+
+    assert recovery._acquire_recovery_finalization_claim(run["id"]) is False
+    assert (
+        db.get_run_finalization_claim(original.db_path, run["id"])["owner_token"]
+        == "legacy-owner"
+    )
 
 
 def test_recovery_registers_report_after_file_only_crash(

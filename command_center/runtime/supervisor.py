@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import signal
 import subprocess
 import threading
@@ -51,6 +52,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import TextIO
 
 from command_center import (
     agent_runner,
@@ -93,6 +95,82 @@ _FINALIZATION_LOCKS_GUARD = threading.Lock()
 _FINALIZATION_LOCKS: dict[str, threading.Lock] = {}
 _PROCESS_OWNED_RUNS_GUARD = threading.Lock()
 _PROCESS_OWNED_RUNS: set[str] = set()
+
+
+def offline_cutover_fence_path(db_path: Path) -> Path:
+    return db_path.with_name(f"{db_path.name}.offline-cutover")
+
+
+def _runtime_lock_path(db_path: Path) -> Path:
+    return db_path.with_name(f"{db_path.name}.runtime-lock")
+
+
+def _acquire_runtime_lock(db_path: Path, *, exclusive: bool) -> TextIO:
+    lock_path = _runtime_lock_path(db_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    if os.name == "nt":
+        import msvcrt
+
+        if lock_path.stat().st_size == 0:
+            handle.write("0")
+            handle.flush()
+        handle.seek(0)
+        mode = msvcrt.LK_LOCK if exclusive else msvcrt.LK_RLCK
+        msvcrt.locking(handle.fileno(), mode, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    return handle
+
+
+def _release_runtime_lock(handle: TextIO) -> None:
+    if handle.closed:
+        return
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
+def acquire_offline_cutover_fence(db_path: Path) -> tuple[str, bool, TextIO]:
+    """Hold an exclusive runtime lock and create/resume the restart marker."""
+    lock_handle = _acquire_runtime_lock(db_path, exclusive=True)
+    marker = offline_cutover_fence_path(db_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_hex(32)
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        existing = marker.read_text(encoding="utf-8").strip()
+        if not existing:
+            _release_runtime_lock(lock_handle)
+            raise SupervisorError("offline cutover fence exists but has no token")
+        return existing, False, lock_handle
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{token}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return token, True, lock_handle
+
+
+def release_offline_cutover_fence(
+    db_path: Path, token: str, lock_handle: TextIO
+) -> None:
+    """Remove only the fence owned by this successful cutover process."""
+    marker = offline_cutover_fence_path(db_path)
+    current = marker.read_text(encoding="utf-8").strip()
+    if not token or current != token:
+        raise SupervisorError("offline cutover fence ownership changed")
+    marker.unlink()
+    _release_runtime_lock(lock_handle)
 
 
 def _reset_process_finalization_context() -> None:
@@ -508,14 +586,40 @@ class Supervisor:
     RUNNING.
     """
 
-    def __init__(self, db_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: Path | None = None,
+        *,
+        maintenance_token: str | None = None,
+        maintenance_lock_handle: TextIO | None = None,
+        enable_completion_autopilot: bool | None = None,
+    ) -> None:
         self._creator_pid = os.getpid()
         owner_pid, owner_identity, owner_token = _ensure_process_finalization_context()
         self._finalization_owner_token = owner_token
         self._finalization_owner_pid = owner_pid
         self._finalization_owner_identity = owner_identity.as_string()
         self.db_path = db_path or db.resolve_db_path()
-        db.migrate(self.db_path)
+        owns_runtime_lock = maintenance_lock_handle is None
+        self._runtime_lock_handle = maintenance_lock_handle or _acquire_runtime_lock(
+            self.db_path, exclusive=False
+        )
+        try:
+            fence = offline_cutover_fence_path(self.db_path)
+            if fence.exists():
+                expected = fence.read_text(encoding="utf-8").strip()
+                if not expected or maintenance_token != expected:
+                    raise SupervisorError(
+                        "runtime is fenced for an offline finalization cutover"
+                    )
+            db.migrate(self.db_path)
+        except Exception:
+            if owns_runtime_lock:
+                try:
+                    _release_runtime_lock(self._runtime_lock_handle)
+                except Exception:
+                    logger.exception("Could not release failed Supervisor startup lock")
+            raise
         # Extracted sides of the supervisor (NIGHT-W9): stream consumption and
         # finalize/outcome persistence live behind small interfaces; this class
         # keeps orchestration (process lifecycle, `_active` registry, locks).
@@ -549,7 +653,12 @@ class Supervisor:
         # Opt-in: an env flag auto-starts the completion autopilot for a
         # backend process (e.g. a headless/desktop host). Off by default, so
         # tests and the plain Streamlit app never spawn it implicitly.
-        if os.environ.get("AICC_COMPLETION_AUTOPILOT"):
+        autopilot_enabled = (
+            bool(os.environ.get("AICC_COMPLETION_AUTOPILOT"))
+            if enable_completion_autopilot is None
+            else enable_completion_autopilot
+        )
+        if autopilot_enabled:
             self.start_completion_autopilot()
 
     def _assert_current_process(self) -> None:
@@ -1619,12 +1728,13 @@ class Supervisor:
                 # prove that this live PID is a later process.
                 if owner_query.identity is None:
                     return False
-                if owner_query.identity.as_string() == claim["owner_identity"]:
-                    return False
-                recorded_start, separator, _recorded_command = claim[
-                    "owner_identity"
-                ].partition("|")
-                if not separator or recorded_start == owner_query.identity.start_time:
+                owner_match = identity.compare_recorded_identity(
+                    owner_query.identity, claim["owner_identity"]
+                )
+                # True means the same birth identity. None means a legacy or
+                # unknown scheme: during a rolling upgrade a timezone/format
+                # change is not proof of PID reuse, so remain fail-closed.
+                if owner_match is not False:
                     return False
             expected = claim["owner_token"]
         else:
@@ -2538,12 +2648,14 @@ class Supervisor:
         return datetime.now() >= started + timedelta(seconds=float(timeout_seconds))
 
     def _sigkill_orphan_group(self, run_id: str, pid: int | None, recorded_identity: str | None) -> bool:
-        """SIGKILL the process group of a past-deadline adopted orphan. Re-verifies
-        the pid still belongs to *our* run immediately before signalling (never
-        signal a reused pid — the same guarantee reconcile's classification makes).
-        Returns True when the group was signalled or is already gone (safe to
-        terminalize the row), False when the pid no longer matches (leave the row
-        RUNNING for a later reconcile to reclassify)."""
+        """Terminalize only an orphan whose process is already confirmed gone.
+
+        A persisted PID plus birth token can classify reuse, but cannot close
+        the check-to-signal race or prove ownership of every descendant in a
+        process group. Cross-restart destructive cleanup therefore requires a
+        future pidfd+cgroup/job-object ownership handle; this conservative path
+        never signals an adopted orphan from database metadata alone.
+        """
         if pid is None:
             return True  # nothing to signal; safe to terminalize
         process_query = identity.query_identity(pid)
@@ -2554,19 +2666,7 @@ class Supervisor:
             return True  # already gone; terminalize
         if process_query.status is identity.ProcessQueryStatus.UNKNOWN:
             return False  # unreadable is not safe to signal or terminalize
-        current = process_query.identity
-        if current is None:  # defensive: LIVE always carries an identity
-            return False
-        if recorded_identity and current.as_string() != recorded_identity:
-            return False  # pid reused since classification — must not signal it
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass  # exited between the identity check and here — fine
-        except OSError:
-            logger.exception("Could not SIGKILL orphan process group for run %s (pid %s)", run_id, pid)
-            return False
-        return True
+        return False
 
     def _timeout_watchdog(
         self,
@@ -2898,12 +2998,22 @@ class Supervisor:
                     elif not recorded_identity:
                         classification = "UNKNOWN"
                         detail = "pid exists but no identity was recorded at launch time"
-                    elif process_query.identity.as_string() == recorded_identity:
+                    elif identity.compare_recorded_identity(
+                        process_query.identity, recorded_identity
+                    ) is True:
                         classification = "RUNNING"
                         detail = "pid exists and identity matches; orphaned from this supervisor instance"
-                    else:
+                    elif identity.compare_recorded_identity(
+                        process_query.identity, recorded_identity
+                    ) is False:
                         classification = "INTERRUPTED"
                         detail = "pid exists but identity does not match recorded identity (pid reuse)"
+                    else:
+                        classification = "UNKNOWN"
+                        detail = (
+                            "live pid has a legacy or unknown identity scheme; "
+                            "PID reuse cannot be proved safely"
+                        )
 
                 if looks_gone:
                     # Debounce (audit P0): another process may own this row and be

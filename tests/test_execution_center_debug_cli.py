@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from command_center import project_config
-from command_center.runtime import db, identity
+from command_center.runtime import db, identity, supervisor
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI_SCRIPT = ROOT / "scripts" / "execution_center_debug.py"
@@ -72,6 +72,80 @@ def configured_repo(git_repo):
     project_config.save_repository_path("AIOS", str(git_repo))
     yield git_repo
     project_config.save_repository_path("AIOS", None)
+
+
+def test_offline_finalization_cutover_recovers_v24_terminal_crash_row(
+    configured_repo, monkeypatch
+):
+    path = db.resolve_db_path()
+    current_migrations = list(db.MIGRATIONS)
+    with monkeypatch.context() as pre_claim:
+        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "SCHEMA_VERSION", 24)
+        db.migrate(path)
+        task = db.create_task(
+            path, project="AIOS", title="legacy crash", task_type="implementation"
+        )
+        session = db.create_session(
+            path,
+            task_id=task["id"],
+            project="AIOS",
+            repository_path=str(configured_repo),
+        )
+        run = db.create_run(
+            path,
+            session_id=session["id"],
+            task_id=task["id"],
+            project="AIOS",
+            repository_path=str(configured_repo),
+            task_type="implementation",
+            prompt="legacy terminal crash",
+            is_resume=False,
+            command=["claude", "--print"],
+        )
+        with db.connect(path) as conn:
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE run SET state = 'COMPLETED', completed_at = ?, "
+                    "exit_code = 0 WHERE id = ?",
+                    (db.iso_now(), run["id"]),
+                )
+
+    refused = subprocess.run(
+        [sys.executable, str(CLI_SCRIPT), "offline-finalization-cutover"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_cli_env(),
+    )
+    assert refused.returncode == 7
+    assert "CUTOVER REFUSED" in refused.stderr
+    assert db.current_schema_version(path) == 24
+    assert not supervisor.offline_cutover_fence_path(path).exists()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CLI_SCRIPT),
+            "offline-finalization-cutover",
+            "--confirm-offline",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=_cli_env(AICC_COMPLETION_AUTOPILOT="1"),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    evidence = _extract_last_json_object(result.stdout)
+    assert evidence["schema_version"] == 25
+    assert evidence["claims_seeded"] == 1
+    assert evidence["unfinalized_remaining"] == 0
+    recovered = db.get_run(path, run["id"])
+    assert recovered["finalized_at"] is not None
+    claim = db.get_run_finalization_claim(path, run["id"])
+    assert claim["completed_at"] is not None
+    assert not supervisor.offline_cutover_fence_path(path).exists()
 
 
 def test_launch_blocks_until_terminal_state_and_persists_final_events(configured_repo):

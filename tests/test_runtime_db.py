@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center.runtime import db
+from command_center.runtime import db, supervisor
 
 
 def _fresh_db(tmp_path):
@@ -124,7 +124,9 @@ def test_v25_migration_refuses_every_active_v24_run(
         tmp_path, monkeypatch, state=state, finalized=finalized
     )
 
-    with pytest.raises(RuntimeError, match="offline zero-active"):
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
         db.migrate(path)
 
     assert db.current_schema_version(path) == 24
@@ -147,7 +149,9 @@ def test_v25_migration_refuses_unknown_or_future_state(
         finalized=finalized,
     )
 
-    with pytest.raises(RuntimeError, match="offline zero-active"):
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
         db.migrate(path)
 
     assert db.current_schema_version(path) == 24
@@ -170,7 +174,13 @@ def test_v25_migration_rolls_back_table_when_ledger_stamp_fails(
             lambda: (_ for _ in ()).throw(RuntimeError("stamp failed")),
         )
         with pytest.raises(RuntimeError, match="stamp failed"):
-            db.migrate(path)
+            db.bootstrap_finalization_claim_cutover(
+                path,
+                owner_token="cutover-owner",
+                owner_pid=123,
+                owner_identity="birth|command",
+                offline_confirmed=True,
+            )
 
     assert db.current_schema_version(path) == 24
     with db.connect(path) as conn:
@@ -193,8 +203,17 @@ def test_v25_migration_rejects_unversioned_preexisting_claim_table(
     with db.connect(path) as conn:
         conn.execute("CREATE TABLE run_finalization_claim (run_id TEXT PRIMARY KEY)")
 
-    with pytest.raises(RuntimeError, match="unversioned finalization claim"):
-        db.migrate(path)
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="unversioned finalization claim",
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
 
     assert db.current_schema_version(path) == 24
 
@@ -207,7 +226,9 @@ def test_v25_migration_refuses_every_unfinalized_terminal_v24_run(
         tmp_path, monkeypatch, state=state, finalized=False
     )
 
-    with pytest.raises(RuntimeError, match="zero-unfinalized drain"):
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
         db.migrate(path)
 
     assert db.current_schema_version(path) == 24
@@ -220,7 +241,7 @@ def test_v25_migration_refuses_every_unfinalized_terminal_v24_run(
 
 
 @pytest.mark.parametrize("state", sorted(db.TERMINAL_STATES))
-def test_v25_migration_accepts_only_finalized_terminal_v24_runs(
+def test_v25_migration_requires_explicit_cutover_even_for_clean_v24_history(
     tmp_path, monkeypatch, state
 ):
     path, run_id = _v24_db_with_run(
@@ -228,19 +249,233 @@ def test_v25_migration_accepts_only_finalized_terminal_v24_runs(
     )
     before = db.get_run(path, run_id)["finalized_at"]
 
-    db.migrate(path)
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        db.migrate(path)
 
-    assert db.current_schema_version(path) == 25
+    assert db.current_schema_version(path) == 24
     assert db.get_run(path, run_id)["finalized_at"] == before
     with db.connect(path) as conn:
-        claim_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM run_finalization_claim"
-        ).fetchone()["c"]
-        v25_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM schema_version WHERE version = 25"
-        ).fetchone()["c"]
-    assert claim_count == 0
-    assert v25_count == 1
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'run_finalization_claim'"
+        ).fetchone()
+    assert table is None
+
+
+def test_supervisor_startup_cannot_bypass_clean_v24_cutover(tmp_path, monkeypatch):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        supervisor.Supervisor(path)
+
+    assert db.current_schema_version(path) == 24
+
+
+def test_v25_offline_cutover_requires_explicit_confirmation(tmp_path, monkeypatch):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=False
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit confirmation"
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=False,
+        )
+
+    assert db.current_schema_version(path) == 24
+
+
+@pytest.mark.parametrize("state", sorted(db.EXECUTION_CENTER_ACTIVE_STATES))
+def test_v25_offline_cutover_refuses_active_rows_atomically(
+    tmp_path, monkeypatch, state
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state=state, finalized=False
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="refuses active"
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+
+    assert db.current_schema_version(path) == 24
+    with db.connect(path) as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'run_finalization_claim'"
+        ).fetchone()
+    assert table is None
+
+
+@pytest.mark.parametrize("state", sorted(db.TERMINAL_STATES))
+def test_v25_offline_cutover_fences_each_legacy_terminal_crash_row(
+    tmp_path, monkeypatch, state
+):
+    path, run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state=state, finalized=False
+    )
+
+    seeded = db.bootstrap_finalization_claim_cutover(
+        path,
+        owner_token="cutover-owner",
+        owner_pid=123,
+        owner_identity="birth|command",
+        offline_confirmed=True,
+    )
+
+    assert seeded == 1
+    assert db.current_schema_version(path) == 25
+    claim = db.get_run_finalization_claim(path, run_id)
+    assert claim is not None
+    assert claim["owner_token"] == "cutover-owner"
+    assert claim["owner_pid"] == 123
+    assert claim["owner_identity"] == "birth|command"
+    assert claim["completed_at"] is None
+    assert db.get_run(path, run_id)["finalized_at"] is None
+    assert (
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="another-owner",
+            owner_pid=456,
+            owner_identity="later|command",
+            offline_confirmed=True,
+        )
+        == 0
+    )
+    assert db.get_run_finalization_claim(path, run_id)["owner_token"] == "cutover-owner"
+
+
+def test_v25_offline_cutover_accepts_finalized_history_without_claim(
+    tmp_path, monkeypatch
+):
+    path, run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+
+    seeded = db.bootstrap_finalization_claim_cutover(
+        path,
+        owner_token="cutover-owner",
+        owner_pid=123,
+        owner_identity="birth|command",
+        offline_confirmed=True,
+    )
+
+    assert seeded == 0
+    assert db.current_schema_version(path) == 25
+    assert db.get_run_finalization_claim(path, run_id) is None
+
+
+def test_v25_offline_cutover_rejects_ledger_without_claim_schema(
+    tmp_path, monkeypatch
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (25, ?)",
+                (db.iso_now(),),
+            )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="invalid columns or key constraints",
+    ):
+        db.migrate(path)
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="invalid columns or key constraints",
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+
+
+def test_v25_offline_cutover_rejects_name_compatible_but_unfenced_schema(
+    tmp_path, monkeypatch
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "CREATE TABLE run_finalization_claim ("
+                "run_id TEXT, owner_token TEXT, owner_pid INTEGER, "
+                "owner_identity TEXT, claimed_at TEXT, completed_at TEXT)"
+            )
+            conn.execute(
+                "CREATE INDEX idx_run_finalization_claim_open "
+                "ON run_finalization_claim(owner_pid) WHERE owner_pid IS NULL"
+            )
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (25, ?)",
+                (db.iso_now(),),
+            )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="invalid columns or key constraints",
+    ):
+        db.migrate(path)
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="invalid columns or key constraints",
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+
+
+def test_v25_offline_cutover_rejects_future_schema(tmp_path, monkeypatch):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (26, ?)",
+                (db.iso_now(),),
+            )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="only understands v25"
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
 
 
 # Parametrized over the *actual* recorded migration versions below the current
@@ -279,7 +514,21 @@ def test_upgrade_from_every_supported_historical_schema(
     # made this test fail on every schema addition for a reason unrelated to
     # what it verifies (that a historical database upgrades cleanly).
     assert db.SCHEMA_VERSION == current_version
-    db.migrate(path)
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        db.migrate(path)
+    assert db.current_schema_version(path) == 24
+    assert (
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+        == 0
+    )
     db.migrate(path)
     assert db.current_schema_version(path) == db.SCHEMA_VERSION
     with db.connect(path) as conn:
@@ -338,7 +587,16 @@ def test_v5_historical_runs_migrate_to_claude_provider_default(tmp_path, monkeyp
                 "UPDATE run SET finalized_at = ? WHERE id = ?",
                 (db.iso_now(), "historical-run"),
             )
-    db.migrate(path)
+    assert (
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+        == 0
+    )
     historical_run = db.get_run(path, "historical-run")
     assert historical_run["provider_id"] == "claude_code"
     assert historical_run["provider_metadata_json"] is None

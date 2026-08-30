@@ -11,6 +11,7 @@ they did against the single module.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 from typing import Callable
 
 
@@ -242,6 +243,88 @@ def _migration_24_add_finalized_at(conn: sqlite3.Connection) -> None:
         )
 
 
+class FinalizationClaimCutoverRequired(RuntimeError):
+    """Schema v25 needs an explicit offline recovery of legacy crash rows."""
+
+
+def _create_finalization_claim_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS run_finalization_claim ("
+        "run_id TEXT NOT NULL PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE, "
+        "owner_token TEXT NOT NULL CHECK (owner_token <> ''), "
+        "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), "
+        "owner_identity TEXT NOT NULL CHECK (owner_identity <> ''), "
+        "claimed_at TEXT NOT NULL, completed_at TEXT, "
+        "CHECK (completed_at IS NULL OR completed_at >= claimed_at))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_finalization_claim_open "
+        "ON run_finalization_claim(completed_at) WHERE completed_at IS NULL"
+    )
+
+
+def _validate_finalization_claim_schema(conn: sqlite3.Connection) -> None:
+    expected_columns = {
+        "run_id": ("TEXT", 1, 1),
+        "owner_token": ("TEXT", 1, 0),
+        "owner_pid": ("INTEGER", 1, 0),
+        "owner_identity": ("TEXT", 1, 0),
+        "claimed_at": ("TEXT", 1, 0),
+        "completed_at": ("TEXT", 0, 0),
+    }
+    columns = {
+        row["name"]: (row["type"].upper(), row["notnull"], row["pk"])
+        for row in conn.execute(
+            "PRAGMA table_info(run_finalization_claim)"
+        ).fetchall()
+    }
+    if columns != expected_columns:
+        raise FinalizationClaimCutoverRequired(
+            "runtime schema v25 claim fencing has invalid columns or key constraints"
+        )
+    foreign_keys = conn.execute(
+        "PRAGMA foreign_key_list(run_finalization_claim)"
+    ).fetchall()
+    if not any(
+        row["table"] == "run"
+        and row["from"] == "run_id"
+        and row["to"] == "id"
+        and row["on_delete"].upper() == "CASCADE"
+        for row in foreign_keys
+    ):
+        raise FinalizationClaimCutoverRequired(
+            "runtime schema v25 claim fencing lacks run_id foreign-key cascade"
+        )
+    indexes = {
+        row["name"]: row
+        for row in conn.execute(
+            "PRAGMA index_list(run_finalization_claim)"
+        ).fetchall()
+    }
+    open_index = indexes.get("idx_run_finalization_claim_open")
+    if open_index is None or open_index["partial"] != 1:
+        raise FinalizationClaimCutoverRequired(
+            "runtime schema v25 claim fencing lacks the partial open-claim index"
+        )
+    indexed_columns = [
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA index_info(idx_run_finalization_claim_open)"
+        ).fetchall()
+    ]
+    index_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+        ("idx_run_finalization_claim_open",),
+    ).fetchone()
+    normalized_index_sql = "".join(
+        (index_sql_row["sql"] if index_sql_row else "").lower().split()
+    )
+    if indexed_columns != ["completed_at"] or "wherecompleted_atisnull" not in normalized_index_sql:
+        raise FinalizationClaimCutoverRequired(
+            "runtime schema v25 open-claim index has invalid columns or predicate"
+        )
+
+
 def _migration_25_add_finalization_claim(conn: sqlite3.Connection) -> None:
     """Install claim fencing only after an offline, fully-finalized drain.
 
@@ -262,7 +345,7 @@ def _migration_25_add_finalization_claim(conn: sqlite3.Connection) -> None:
             "WHERE type = 'table' AND name = 'run_finalization_claim'"
         ).fetchone()
         if preexisting is not None:
-            raise RuntimeError(
+            raise FinalizationClaimCutoverRequired(
                 "runtime schema v25 found an unversioned finalization claim table"
             )
         # Fail closed: only a known terminal state with durable finalization
@@ -275,23 +358,12 @@ def _migration_25_add_finalization_claim(conn: sqlite3.Connection) -> None:
             terminal_states,
         ).fetchone()
         if unsafe is not None:
-            raise RuntimeError(
+            raise FinalizationClaimCutoverRequired(
                 "runtime schema v25 requires an offline zero-active, "
-                "zero-unfinalized drain before finalization claims are enabled"
+                "zero-unfinalized drain before finalization claims are enabled; "
+                "use the explicit offline finalization cutover for legacy crash rows"
             )
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS run_finalization_claim ("
-            "run_id TEXT NOT NULL PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE, "
-            "owner_token TEXT NOT NULL CHECK (owner_token <> ''), "
-            "owner_pid INTEGER NOT NULL CHECK (owner_pid > 0), "
-            "owner_identity TEXT NOT NULL CHECK (owner_identity <> ''), "
-            "claimed_at TEXT NOT NULL, completed_at TEXT, "
-            "CHECK (completed_at IS NULL OR completed_at >= claimed_at))"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_run_finalization_claim_open "
-            "ON run_finalization_claim(completed_at) WHERE completed_at IS NULL"
-        )
+        _create_finalization_claim_schema(conn)
         # The fencing table and its ledger record are one atomic fact.  The
         # generic migration loop's following INSERT is deliberately idempotent
         # and will observe this row as already present.
@@ -299,6 +371,115 @@ def _migration_25_add_finalization_claim(conn: sqlite3.Connection) -> None:
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (25, db.iso_now()),
         )
+
+
+def bootstrap_finalization_claim_cutover(
+    db_path: Path,
+    *,
+    owner_token: str,
+    owner_pid: int,
+    owner_identity: str,
+    offline_confirmed: bool,
+) -> int:
+    """Serialize the explicit cutover against every ordinary migration."""
+    with db._migration_file_lock(db_path):
+        return _bootstrap_finalization_claim_cutover_unlocked(
+            db_path,
+            owner_token=owner_token,
+            owner_pid=owner_pid,
+            owner_identity=owner_identity,
+            offline_confirmed=offline_confirmed,
+        )
+
+
+def _bootstrap_finalization_claim_cutover_unlocked(
+    db_path: Path,
+    *,
+    owner_token: str,
+    owner_pid: int,
+    owner_identity: str,
+    offline_confirmed: bool,
+) -> int:
+    """Atomically fence legacy terminal crash rows during an offline cutover.
+
+    Version-24 writers cannot honor the claim table, so their absence cannot
+    be inferred from SQLite. The caller must first stop intake and every old
+    Supervisor, then opt in explicitly. Active/corrupt/future-state rows remain
+    unchanged and refused. If this process dies after the atomic schema+claim
+    commit, a later v25 Supervisor can take the dead owner's exact-token claim.
+    """
+    if not offline_confirmed:
+        raise FinalizationClaimCutoverRequired(
+            "offline finalization cutover requires explicit confirmation that "
+            "intake and every pre-v25 Supervisor are stopped"
+        )
+    if not owner_token or not owner_identity or owner_pid <= 0:
+        raise ValueError("a non-empty owner token/identity and positive pid are required")
+
+    with db.connect(db_path) as conn:
+        with db.transaction(conn):
+            row = conn.execute(
+                "SELECT MAX(version) AS version FROM schema_version"
+            ).fetchone()
+            current = int(row["version"] or 0)
+            if current > db.SCHEMA_VERSION:
+                raise FinalizationClaimCutoverRequired(
+                    "offline finalization cutover refuses runtime schema "
+                    f"v{current}; this binary only understands v{db.SCHEMA_VERSION}"
+                )
+            if current == 25:
+                _validate_finalization_claim_schema(conn)
+                return 0
+            if current != 24:
+                raise FinalizationClaimCutoverRequired(
+                    f"offline finalization cutover requires schema v24, found v{current}"
+                )
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'run_finalization_claim'"
+            ).fetchone() is not None:
+                raise FinalizationClaimCutoverRequired(
+                    "runtime schema v25 found an unversioned finalization claim table"
+                )
+
+            terminal_states = tuple(sorted(db.TERMINAL_STATES))
+            placeholders = ",".join("?" for _ in terminal_states)
+            unsafe = conn.execute(
+                "SELECT id, state FROM run WHERE "
+                f"state NOT IN ({placeholders}) LIMIT 1",
+                terminal_states,
+            ).fetchone()
+            if unsafe is not None:
+                raise FinalizationClaimCutoverRequired(
+                    "offline finalization cutover refuses active, corrupt, or "
+                    f"future-state run {unsafe['id']!r} ({unsafe['state']!r})"
+                )
+
+            _create_finalization_claim_schema(conn)
+            claimed_at = db.iso_now()
+            pending = conn.execute(
+                "SELECT id FROM run WHERE finalized_at IS NULL "
+                f"AND state IN ({placeholders}) ORDER BY id",
+                terminal_states,
+            ).fetchall()
+            for pending_run in pending:
+                conn.execute(
+                    "INSERT INTO run_finalization_claim ("
+                    "run_id, owner_token, owner_pid, owner_identity, "
+                    "claimed_at, completed_at) VALUES (?, ?, ?, ?, ?, NULL)",
+                    (
+                        pending_run["id"],
+                        owner_token,
+                        owner_pid,
+                        owner_identity,
+                        claimed_at,
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (25, claimed_at),
+            )
+            return len(pending)
 
 
 # Autonomous completion pipeline (AICC-AUTONOMY-001). One `completion` row per
