@@ -65,13 +65,47 @@ python scripts/daily_audit_daemon.py --preflight
 python scripts/daily_audit_daemon.py --reset-circuit
 ```
 
-`deploy/com.ai-command-center.daily-audit.plist` is a launchd template. Replace
-`__ROOT__`, `__PYTHON__`, `__PATH__` and `__DATA_DIR__` with absolute paths
-before installing it. `AICC_DATA_DIR` must be the same directory used by the
-Streamlit application; otherwise campaigns run correctly but cannot appear in
-the application UI. The
+`deploy/com.ai-command-center.daily-audit.plist` is a launchd template for a
+**system LaunchDaemon** (`system/com.ai-command-center.daily-audit`), which
+keeps the service running whether or not any user is logged in graphically --
+unlike a per-user GUI LaunchAgent, whose `gui/<uid>` domain only exists while
+that user has an active login session. Replace `__ROOT__`, `__PYTHON__`,
+`__PATH__`, `__DATA_DIR__`, `__USER__` and `__GROUP__` with absolute paths and
+the account that should own campaign commits/pushes, then install it as root:
+
+```text
+sudo cp com.ai-command-center.daily-audit.plist \
+  /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo chown root:wheel /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo chmod 644 /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl bootstrap system \
+  /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+```
+
+`AICC_DATA_DIR` must be the same directory used by the Streamlit application;
+otherwise campaigns run correctly but cannot appear in the application UI. The
 process is kept alive, while the SQLite due time and lease ensure that only one
 campaign is dispatched per day and that another host cannot duplicate it.
+
+### Migrating from the legacy GUI LaunchAgent
+
+Earlier deployments loaded this same label into the per-user GUI domain
+(`gui/<uid>/com.ai-command-center.daily-audit`, typically installed under
+`~/Library/LaunchAgents`). That agent is not automatically removed by
+installing the system LaunchDaemon above, and having both loaded means two
+independent copies can dispatch campaigns concurrently. Before or immediately
+after bootstrapping the daemon, remove the legacy agent for every account it
+was installed under:
+
+```text
+launchctl bootout gui/$(id -u) com.ai-command-center.daily-audit
+rm -f ~/Library/LaunchAgents/com.ai-command-center.daily-audit.plist
+```
+
+The "Ежедневный аудит" page in the Streamlit UI probes both the `system/` and
+`gui/<uid>/` domains on every load -- regardless of which one answers first --
+and shows an explicit migration warning if a legacy GUI-domain agent is still
+installed or running, whether or not the new daemon is also present.
 
 ## Safety and recovery contract
 

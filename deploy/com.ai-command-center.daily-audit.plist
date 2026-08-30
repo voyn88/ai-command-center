@@ -12,6 +12,10 @@
   </array>
   <key>WorkingDirectory</key>
   <string>__ROOT__</string>
+  <key>UserName</key>
+  <string>__USER__</string>
+  <key>GroupName</key>
+  <string>__GROUP__</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

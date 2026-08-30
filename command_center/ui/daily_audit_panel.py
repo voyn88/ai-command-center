@@ -24,25 +24,60 @@ def _local_time(value: str | None) -> str:
         return value
 
 
-def launch_agent_status(label: str = LAUNCH_AGENT_LABEL) -> tuple[bool, str]:
-    """Read launchd state without changing or restarting the service."""
-    launchctl = shutil.which("launchctl")
-    if launchctl is None:
-        return False, "launchd недоступен"
+def _domain_status(launchctl: str, target: str) -> tuple[bool, bool] | None:
+    """Return (installed, running) for a single launchd domain target.
+
+    Returns None if the domain could not be queried at all (missing binary
+    call failure), as opposed to a clean "not installed" response.
+    """
     try:
         result = subprocess.run(
-            [launchctl, "print", f"gui/{os.getuid()}/{label}"],
+            [launchctl, "print", target],
             capture_output=True,
             text=True,
             check=False,
             timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False, "статус недоступен"
+        return None
     if result.returncode != 0:
-        return False, "не установлен"
+        return False, False
     running = "\n\tstate = running\n" in result.stdout
-    return running, "работает" if running else "установлен, но не запущен"
+    return True, running
+
+
+def launch_agent_status(label: str = LAUNCH_AGENT_LABEL) -> tuple[bool, str]:
+    """Read launchd state without changing or restarting the service.
+
+    The migrated system LaunchDaemon (`system/<label>`) and the legacy
+    per-user GUI LaunchAgent (`gui/<uid>/<label>`) are both probed
+    unconditionally -- a successful system-domain lookup never short-circuits
+    the legacy check, so a leftover legacy agent (stopped, running, or
+    coexisting alongside the daemon) is always surfaced instead of hidden.
+    """
+    launchctl = shutil.which("launchctl")
+    if launchctl is None:
+        return False, "launchd недоступен"
+
+    system = _domain_status(launchctl, f"system/{label}")
+    gui = _domain_status(launchctl, f"gui/{os.getuid()}/{label}")
+    if system is None and gui is None:
+        return False, "статус недоступен"
+
+    system_installed, system_running = system or (False, False)
+    gui_installed, gui_running = gui or (False, False)
+
+    if system_running and gui_running:
+        return True, "работает (обнаружен и устаревший gui-агент — выполните миграцию, bootout gui-домена)"
+    if system_running:
+        return True, "работает"
+    if gui_running:
+        return False, "устаревший gui-агент активен — требуется миграция на системный LaunchDaemon"
+    if system_installed:
+        return False, "установлен, но не запущен"
+    if gui_installed:
+        return False, "устаревший gui-агент установлен, но не запущен — требуется миграция"
+    return False, "не установлен"
 
 
 def _latest_daily_runs(db_path: Path) -> list[dict]:
@@ -73,6 +108,13 @@ def render_daily_audit_page(db_path: Path) -> None:
     cols[1].metric("Кампания", state_label)
     cols[2].metric("Следующий запуск", _local_time(status.get("next_run_at")))
     cols[3].metric("Последний результат", campaigns[0]["status"] if campaigns else "—")
+
+    if "миграц" in agent_label:
+        st.warning(
+            "Обнаружен устаревший gui-агент launchd. Выполните миграцию на "
+            "системный LaunchDaemon (см. docs/DAILY_SELF_AUDIT.md), иначе "
+            "может одновременно работать две копии сервиса."
+        )
 
     if not agent_running:
         st.error(
