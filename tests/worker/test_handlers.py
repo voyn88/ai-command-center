@@ -979,6 +979,50 @@ def test_publish_falls_back_to_project_id_without_a_backlog_task_id(
     assert captured[0].task == "proj"  # _payload()'s project_id
 
 
+def test_publish_preconditions_block_instead_of_spending_the_retry_budget(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP (found live 2026-08-30).
+
+    A publish precondition describes the state of the clone, not a transient
+    fault: the tree is still uncommitted, the pinned base is still missing,
+    the head is still not a descendant. Running the same task again cannot
+    change any of them, so marking them retryable handed the cascade a budget
+    it could only spend reproducing one refusal -- three model calls to reach
+    `cascade_exhausted`, with the real cause buried behind it.
+
+    Blocking here is not a loss of work: the task clone is preserved on this
+    path either way, so what survives is a stated reason instead of a spent
+    budget.
+    """
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    for reason in sorted(handlers_module._PUBLISH_PRECONDITION_REASONS):
+        monkeypatch.setattr(
+            handlers_module,
+            "publish_run",
+            lambda repository, cfg, _reason=reason: PublishResult(
+                ok=False, reason=_reason
+            ),
+        )
+
+        outcome = run_agent(
+            _payload(task_type="implementation", backlog_task_id="VOYN-W0-PRECOND"),
+            _event(),
+            1,
+        )
+
+        assert not outcome.ok, reason
+        assert not outcome.retryable, (
+            f"{reason} cannot change on a re-run; retrying it only spends the "
+            "cascade budget and hides the cause behind cascade_exhausted"
+        )
+        assert reason in outcome.reason
+
+
 def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:
     """Only the labelled trailer counts: a transcript is full of object ids,
     and guessing which one is the head is the substring-matching the rules
@@ -1506,7 +1550,10 @@ def test_review_head_checkout_is_removed_on_failure_paths_too(
 
     def failed_run(**kwargs):
         return agent_runner.RunResult(
-            status="failed", exit_code=1, stdout="", stderr="agent died",
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr="agent died",
             duration_seconds=0.1,
             started_at="2026-08-26T12:00:00+00:00",
             completed_at="2026-08-26T12:00:01+00:00",
@@ -1581,16 +1628,38 @@ def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
     def git(cwd, *args):
         return subprocess.run(
             ["git", "-C", str(cwd), *args],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout.strip()
 
     origin = tmp_path / "origin"
     origin.mkdir()
     git(tmp_path, "init", "-q", str(origin))
-    git(origin, "-c", "user.email=t@t", "-c", "user.name=t",
-        "commit", "--allow-empty", "-q", "-m", "base")
-    git(origin, "-c", "user.email=t@t", "-c", "user.name=t",
-        "commit", "--allow-empty", "-q", "-m", "pr head")
+    git(
+        origin,
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "base",
+    )
+    git(
+        origin,
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "pr head",
+    )
     head_sha = git(origin, "rev-parse", "HEAD")
     git(origin, "update-ref", "refs/pull/7/head", head_sha)
     git(origin, "reset", "-q", "--hard", "HEAD~1")
@@ -1598,7 +1667,9 @@ def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
     clone = tmp_path / "clone"
     subprocess.run(
         ["git", "clone", "-q", str(origin), str(clone)],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     assert git(clone, "rev-parse", "HEAD") != head_sha
 

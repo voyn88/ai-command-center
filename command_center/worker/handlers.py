@@ -220,6 +220,17 @@ _PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 _HEAD_SHA_TRAILER = re.compile(r"^HEAD_SHA:\s*([0-9a-f]{7,40})\s*$", re.MULTILINE)
 
 
+# Publish preconditions that a re-run cannot change. Deterministic blockers,
+# never retry budget (VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP).
+_PUBLISH_PRECONDITION_REASONS = frozenset(
+    {
+        "uncommitted_changes",
+        "pinned_base_sha_missing",
+        "head_not_descendant_of_pinned_base",
+    }
+)
+
+
 def _machine_outcome(result_text: str) -> dict[str, str | None]:
     pr_match = _PR_URL.search(result_text)
     sha_match = _HEAD_SHA_TRAILER.search(result_text)
@@ -981,15 +992,20 @@ def _run_agent(
                         evidence.workspace_inode,
                     ),
                 )
-            if pub.reason in {
-                "uncommitted_changes",
-                "pinned_base_sha_missing",
-                "head_not_descendant_of_pinned_base",
-            }:
+            if pub.reason in _PUBLISH_PRECONDITION_REASONS:
+                # None of these change by running the same task again: the
+                # clone still has the same uncommitted tree, the same missing
+                # base, the same non-descendant head. Marking them retryable
+                # made the cascade spend every remaining attempt -- and every
+                # model call behind it -- reproducing one refusal, then report
+                # `cascade_exhausted` instead of the real cause
+                # (VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP, found live). The
+                # clone is preserved either way, so the durable result is a
+                # stated blocking reason, not a spent retry budget.
                 return HandlerOutcome(
                     ok=False,
                     reason=f"publish precondition failed: {pub.reason}",
-                    retryable=True,
+                    retryable=False,
                     result=result,
                 )
         elif isolated_workspace is not None:
