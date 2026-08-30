@@ -24,25 +24,97 @@ def _local_time(value: str | None) -> str:
         return value
 
 
-def launch_agent_status(label: str = LAUNCH_AGENT_LABEL) -> tuple[bool, str]:
-    """Read launchd state without changing or restarting the service."""
-    launchctl = shutil.which("launchctl")
-    if launchctl is None:
-        return False, "launchd недоступен"
+def _probe_launchctl(launchctl: str, target: str) -> tuple[bool, bool]:
+    """Return (installed, running) for a `launchctl print` domain/service target."""
     try:
         result = subprocess.run(
-            [launchctl, "print", f"gui/{os.getuid()}/{label}"],
+            [launchctl, "print", target],
             capture_output=True,
             text=True,
             check=False,
             timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return False, "статус недоступен"
+        return False, False
     if result.returncode != 0:
-        return False, "не установлен"
+        return False, False
     running = "\n\tstate = running\n" in result.stdout
-    return running, "работает" if running else "установлен, но не запущен"
+    return True, running
+
+
+def _legacy_gui_uids() -> list[int]:
+    """UIDs to probe for a pre-migration per-user GUI agent.
+
+    Enumerates every real user account via `dscl` (macOS reserves UIDs below
+    500 for system/service accounts) so an agent left loaded under another
+    logged-in account is not missed. Falls back to just the current process
+    UID when account enumeration is unavailable.
+    """
+    uids = {os.getuid()}
+    dscl = shutil.which("dscl")
+    if dscl is None:
+        return sorted(uids)
+    try:
+        result = subprocess.run(
+            [dscl, ".", "-list", "/Users", "UniqueID"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return sorted(uids)
+    if result.returncode != 0:
+        return sorted(uids)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            uid = int(parts[1])
+        except ValueError:
+            continue
+        if uid >= 500:
+            uids.add(uid)
+    return sorted(uids)
+
+
+def launch_agent_status(label: str = LAUNCH_AGENT_LABEL) -> tuple[bool, str]:
+    """Read launchd state without changing or restarting the service.
+
+    Always probes the `system/` LaunchDaemon domain *and* every real user's
+    legacy `gui/<uid>/` domain, so a still-loaded pre-migration agent is
+    surfaced even when the system daemon is already healthy (and vice versa)
+    instead of being hidden behind a short-circuited lookup.
+    """
+    launchctl = shutil.which("launchctl")
+    if launchctl is None:
+        return False, "launchd недоступен"
+
+    system_installed, system_running = _probe_launchctl(launchctl, f"system/{label}")
+
+    legacy_installed_uids = []
+    legacy_running = False
+    for uid in _legacy_gui_uids():
+        installed, running = _probe_launchctl(launchctl, f"gui/{uid}/{label}")
+        if installed:
+            legacy_installed_uids.append(uid)
+        if running:
+            legacy_running = True
+
+    if legacy_installed_uids:
+        uid_list = ", ".join(str(uid) for uid in legacy_installed_uids)
+        legacy_note = (
+            f"обнаружен устаревший gui-агент (uid {uid_list}) — выполните миграцию"
+        )
+        if system_installed:
+            base = "работает" if system_running else "установлен, но не запущен"
+            return system_running, f"{base}; {legacy_note}"
+        return legacy_running, f"не мигрирован; {legacy_note}"
+
+    if not system_installed:
+        return False, "не установлен"
+    return system_running, "работает" if system_running else "установлен, но не запущен"
 
 
 def _latest_daily_runs(db_path: Path) -> list[dict]:

@@ -73,6 +73,43 @@ the application UI. The
 process is kept alive, while the SQLite due time and lease ensure that only one
 campaign is dispatched per day and that another host cannot duplicate it.
 
+The service must run as a `system`-domain LaunchDaemon, not a per-user
+`gui/<uid>` LaunchAgent: a GUI-domain agent only runs while that account is
+logged in, so autonomy is tied to an open, logged-in session. A LaunchDaemon
+starts at boot and keeps running with no user logged in. Install it with:
+
+```text
+sudo cp deploy/com.ai-command-center.daily-audit.plist \
+    /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl bootstrap system \
+    /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+```
+
+### Migrating an existing per-user (`gui/<uid>`) install
+
+Installs predating the LaunchDaemon migration loaded the same label under the
+current user's GUI domain (`~/Library/LaunchAgents/com.ai-command-center.daily-audit.plist`).
+That legacy agent is not replaced automatically by installing the LaunchDaemon
+above; both would otherwise keep running and dispatch duplicate campaigns.
+Remove it explicitly, on **every** account it was ever loaded under, before or
+immediately after installing the LaunchDaemon:
+
+```text
+launchctl bootout gui/$(id -u)/com.ai-command-center.daily-audit
+rm -f ~/Library/LaunchAgents/com.ai-command-center.daily-audit.plist
+```
+
+Note the target form: `gui/$(id -u)/com.ai-command-center.daily-audit` is a
+single `domain/service` argument. Passing the label as a second, separate
+argument (`gui/$(id -u) com.ai-command-center.daily-audit`) is interpreted as
+a service-plist path instead and silently fails to remove the agent, leaving
+it running alongside the new daemon.
+
+The daily-audit panel's "Сервис" tile probes both the `system` domain and
+every real user's `gui/<uid>` domain and reports a "устаревший gui-агент"
+(legacy GUI agent) warning if any pre-migration agent is still loaded, so
+check it after installing to confirm the migration is complete.
+
 ## Safety and recovery contract
 
 - The active scheduler renews its lease throughout the campaign. A replacement
