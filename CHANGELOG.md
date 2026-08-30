@@ -8,6 +8,22 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Decided — the Streamlit console's remote-identity gate now requires authorization, not just identity (`VOYN-W0-AICC-CONSOLE-NO-AUTH-REM-REM`)
+
+[ADR-0011](docs/adr/0011-streamlit-console-identity-boundary.md) closes two gaps adversarial review
+found in its second draft (#433): it made Streamlit-specific *authorization* — as opposed to bare
+platform *identity* — an optional future extension, so any valid platform principal would satisfy
+the gate and gain git/`gh`/subprocess capabilities; and it described the WebSocket revalidation
+cadence as merely "configurable" with no stated maximum, which bounds nothing. The gate is now:
+identity-aware reverse proxy authentication through the AIOS-identity boundary
+(`command_center/http_auth/`, `VOYN-W0-AICC-AUTH-HTTP-01`) **and** a mandatory authorization check
+against that boundary's existing deny-by-default `authz.py` grant map for a dedicated
+`console:connect`-style operation **and** bounded periodic revalidation of both checks — hard-capped
+at 60 seconds, not merely defaulted — with forced disconnection and no trust on a reconnect's cached
+credential. No code changes ship with this decision; it is the standing justification for rejecting
+a future bind-only widening, an admission-only proxy, an authorization-optional proxy, or an
+uncapped-interval proxy in review.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

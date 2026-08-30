@@ -55,6 +55,14 @@ keep it off-host unless the operator deliberately opts out:
 `tests/test_deployment_exposure.py` is the gate for all four. Not being exposed is not the same as
 being authenticated: HTTP authentication is a separate, still-open piece of work, so widening any of
 these controls means putting an unauthenticated privileged console on the network.
+[ADR-0011](docs/adr/0011-streamlit-console-identity-boundary.md) records the decision for if that
+widening is ever proposed: it is not authorized by a flag alone, by identity alone, or by a one-time
+check alone. It requires an identity-aware reverse proxy authenticated through the same
+AIOS-identity boundary already accepted for the mutating HTTP surface (`command_center/http_auth/`),
+a mandatory authorization check against that boundary's existing deny-by-default `authz.py` grant
+map (not identity alone), and bounded periodic revalidation — capped at 60 seconds, not merely
+"configurable" — with forced disconnection and no trust on reconnect over the life of the WebSocket
+session.
 
 ## 2. UI and service boundaries
 
