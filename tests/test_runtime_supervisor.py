@@ -1258,6 +1258,21 @@ def _wait_for_text(path, needle: str, *, timeout: float = 10.0, interval: float 
         return False
 
 
+def _wait_for_run_event(sup, run_id, event_type, *, timeout: float = 10.0, interval: float = 0.02) -> bool:
+    """Wait until the run has recorded an event of `event_type`.
+
+    The durable event row is the fact the test is about; a fixed sleep merely
+    guesses when it lands, and guesses lose on loaded shards.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        events = db.list_run_events(sup.db_path, run_id)
+        if any(e["event_type"] == event_type for e in events):
+            return True
+        time.sleep(interval)
+    return False
+
+
 def _wait_for_file(path, *, timeout: float = 10.0, interval: float = 0.02) -> bool:
     """Wait for a fixture-written marker instead of guessing with a sleep."""
     deadline = time.monotonic() + timeout
@@ -1321,7 +1336,13 @@ def test_cancel_preserves_output_received_before_cancellation(git_repo, configur
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
     )
-    time.sleep(0.5)
+    # Wait for the message to actually be recorded before cancelling: the test
+    # is about output received BEFORE cancellation surviving it, so cancelling
+    # before anything was received asserts nothing. A fixed 0.5s sleep raced
+    # the fake process and lost on loaded shards (post-merge main, 2026-08-31).
+    assert _wait_for_run_event(sup, run["id"], "assistant_message"), (
+        "fake process never produced its assistant message"
+    )
     sup.cancel(run["id"], confirmed=True, grace_seconds=2)
 
     events = db.list_run_events(sup.db_path, run["id"])
