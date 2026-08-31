@@ -496,6 +496,10 @@ _APP_BACKLOG_FUNCTIONS = (
     # DEFER_TO_USER -> OPEN for technical parks only (0014); the function is
     # the classification gate, so granting it does not grant a generic unpark.
     "backlog_resume_deferred(text)",
+    # OPEN -> DEFER_TO_USER for a task the fleet cannot satisfy, called by the
+    # planner INSTEAD OF backlog_dispatch (0017,
+    # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR).
+    "backlog_park_requires_authority(text, text)",
     # The persisted scan cursor for the tick windows (0015): returns this
     # tick's offset and advances atomically per invocation.
     "backlog_scan_claim(text, text, text)",

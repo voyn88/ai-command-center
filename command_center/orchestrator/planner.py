@@ -22,6 +22,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from command_center.orchestrator import authority_preflight
 from command_center.orchestrator.routing import cascade_for
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
@@ -59,6 +60,14 @@ class PlanReport:
     #: (task, original park reason) — DEFER_TO_USER technical parks the 0014
     #: gate returned to OPEN this tick (VOYN-W0-AICC-DEFER-AUTO-RESUME).
     resumed: list[tuple[str, str]] = field(default_factory=list)
+    #: (task, missing authority) — parked straight to DEFER_TO_USER via
+    #: `backlog_park_requires_authority`, never `backlog_dispatch`: the task
+    #: declares or plainly demands a privilege (root, a named Postgres role,
+    #: an external credential) no executor in this fleet grants. Zero WIP
+    #: slots claimed, zero model calls spent (VOYN-W0-AICC-PRIVILEGED-TASK-
+    #: ROUTED-TO-UNPRIVILEGED-EXECUTOR) — kept distinct from `undispatchable`
+    #: (a routing fact) so the two causes stay separately measurable.
+    blocked_authority: list[tuple[str, str]] = field(default_factory=list)
     planner_busy: bool = False
 
 
@@ -256,6 +265,23 @@ class Planner:
                     # a guaranteed dead-letter (the first live tick proved the
                     # worker refuses unknown projects three times, honestly).
                     report.undispatchable.append((task_id, "unknown_repo_route"))
+                    continue
+                authority_decision = authority_preflight.decide(title, body)
+                if not authority_decision.ok:
+                    # This fleet cannot satisfy the requirement no matter
+                    # which cascade link is tried — every executor is the
+                    # same unprivileged worker. Park straight to
+                    # DEFER_TO_USER INSTEAD OF backlog_dispatch: no WIP slot,
+                    # no cascade attempt, no model call.
+                    reason = authority_preflight.park_reason(authority_decision)
+                    ok, park_result, _revision = self._row(
+                        "SELECT * FROM backlog_park_requires_authority(%s, %s)",
+                        (task_id, reason),
+                    )
+                    if ok:
+                        report.blocked_authority.append((task_id, reason))
+                    else:
+                        report.refused.append((task_id, park_result))
                     continue
                 payload, budget = _payload_for(task, limits, route)
                 ok, reason, work_item_id, _revision = self._row(
