@@ -808,6 +808,51 @@ def verify_all(
         )
 
 
+# Test seam: whether a required environment file is present. Production is
+# the filesystem. Tests drive a fake systemd against paths that do not exist
+# on the machine running them, and the property under test there is the
+# rollout's ordering, not this host's /etc.
+_environment_file_exists = os.path.exists
+
+
+def verify_required_environment_files(systemd: "Systemd", units: tuple[str, ...]) -> None:
+    """Refuse before the first mutation if a required environment file is
+    absent from the host.
+
+    `verify_unit_configuration` proves the unit *declares* the right files and
+    does not mark a required one optional. It says nothing about whether the
+    file exists, because that is not a property of the unit. So a fleet could
+    pass every configuration check, have its legacy lanes retired, and only
+    then discover at start time that `/etc/aicc/lease.env` was never placed on
+    the host — leaving the machine between the old configuration and the new
+    one, which is the single worst outcome a rollout can produce.
+
+    That is not hypothetical: it is what happened on worker-01 (2026-08-31).
+    The new `voyn-aicc-worker@1.service` failed with `result 'resources'`
+    because `lease.env` did not exist, after the legacy lanes were already
+    gone.
+
+    The file carries the lease DSN and is therefore *not* installable from the
+    repository — no secret belongs in a versioned tree. It is placed by the
+    operator or by credential rotation, which is exactly why the installer has
+    to check for it rather than create it, and has to check *first*.
+    """
+    missing: list[str] = []
+    for unit in units:
+        entries = _environment_file_entries(
+            systemd.property(unit, "EnvironmentFiles"), unit=unit
+        )
+        for path, optional in entries:
+            if optional:
+                continue
+            if not _environment_file_exists(path) and path not in missing:
+                missing.append(path)
+    if missing:
+        raise RolloutError(
+            "required environment files are absent: " + ", ".join(sorted(missing))
+        )
+
+
 def rollout(
     systemd: Systemd,
     units: tuple[str, ...],
@@ -826,6 +871,10 @@ def rollout(
     # a configured/live template lane is masked or fail-open.
     for unit in units:
         verify_unit_configuration(systemd, unit)
+    # Declaring the right files is not the same as having them. Checked here,
+    # before anything is retired, so an absent authority file cannot strand
+    # the host between configurations.
+    verify_required_environment_files(systemd, units)
     try:
         agent_uid = uid_for_user(agent_user)
         privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
