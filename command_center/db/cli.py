@@ -173,6 +173,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    sub.add_parser(
+        "mirror-status",
+        help="Reconcile the SQLite authority's execution family (task, "
+        "session, run, run_event, report) against its PostgreSQL mirrors. "
+        "Report-only; never touches either store.",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -449,6 +456,33 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "mirror-status":
+                from command_center.db.execution_reconcile import (
+                    reconcile_execution_center,
+                )
+                from command_center.runtime.db import resolve_db_path
+
+                report = reconcile_execution_center(
+                    resolve_db_path(), pg_connection_factory=lambda: nullcontext(conn)
+                )
+                if not report.stable:
+                    print(
+                        f"UNSTABLE: the SQLite authority kept changing across "
+                        f"{report.attempts} attempt(s); no comparison was made",
+                        file=sys.stderr,
+                    )
+                    return 2
+                total = 0
+                for table, rows in report.divergence.items():
+                    for row in rows:
+                        total += 1
+                        print(f"DIVERGENT {table} id={row['id']} fields={row['fields']}")
+                print(
+                    f"stable after {report.attempts} attempt(s); "
+                    f"{total} divergent row(s)"
+                )
+                return 1 if total else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
