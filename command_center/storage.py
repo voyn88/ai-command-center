@@ -70,6 +70,78 @@ def atomic_write_json(path: Path, data: Any) -> None:
         raise
 
 
+def create_json_if_absent(path: Path, data: Any) -> bool:
+    """Create `path` holding `data` **only if it does not already exist**, and
+    report whether this call was the one that created it.
+
+    This is the initialisation counterpart to `atomic_write_json`, and the
+    difference is the whole point: `atomic_write_json` ends in `os.replace`,
+    which overwrites unconditionally. Using it to seed a store that another
+    writer may be creating at the same instant is a lost update — the classic
+    check-then-write race, where two callers each observe "the file is
+    missing" and the slower one's empty seed lands *after* the faster one has
+    already committed a real record under the store's lock, silently erasing
+    it (measured live: see `VOYN-W0-AICC-TASK-IMPORT-CONCURRENCY-FLAKE`, where
+    the first task of a concurrently imported package vanished from
+    `tasks.json` while every writer reported success).
+
+    A lock cannot close this on its own, because the read paths that seed the
+    store (`tasks_repository.load_tasks` via `JSONTasksRepository.load_all`)
+    are deliberately *not* holding the store's write lock — they are reads.
+    So the creation itself is made exclusive instead: the payload is written
+    to a temp file and published with `os.link`, which fails rather than
+    replaces when the target already exists. A loser of the race gets
+    `False` and leaves the winner's content — whatever it now contains —
+    completely untouched.
+
+    `os.link` is used rather than `open(..., "x")` so the file is never
+    observable in a half-written state: it becomes visible at its final path
+    only once it is complete and fsynced. On the filesystems that do not
+    support hard links, the exclusive `open` is the fallback, which keeps the
+    no-overwrite guarantee (the only thing correctness depends on here) and
+    gives up only the invisibility of the write window.
+    """
+    return create_bytes_if_absent(
+        path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    )
+
+
+def create_bytes_if_absent(path: Path, payload: bytes) -> bool:
+    """`create_json_if_absent` for content that is already serialized.
+
+    Exists so a caller can seed a store from a file it must copy **verbatim**,
+    without parsing it first. Parsing to re-serialize looks equivalent and is
+    not: it moves the decode error to a different place in the call stack,
+    where the caller's own error handling may not cover it (independent review
+    of `4b058ff`, on exactly that regression in `tasks_repository.load_tasks`).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return False
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp_name, path)
+        except FileExistsError:
+            return False
+        except OSError:
+            # Filesystem without hard links: fall back to an exclusive create.
+            try:
+                with open(path, "xb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except FileExistsError:
+                return False
+        return True
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+
+
 def atomic_write_text(path: Path, content: str) -> None:
     """Durably write text (e.g. a markdown report) via temp + flush + fsync + os.replace.
 
@@ -108,10 +180,12 @@ def ensure_seeded(path: Path, empty_default: Any) -> None:
     doing so would present fabricated data as if it were real, which the app must
     never do. Compare `app.py`'s `load_tasks()`, which seeds from
     `tasks.example.json` deliberately, because that example is `[]` (truly empty).
+
+    Seeding goes through `create_json_if_absent`, never `atomic_write_json`: a
+    concurrent writer that has already created and populated `path` must not
+    have its content replaced by this empty default (see that function).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        atomic_write_json(path, empty_default)
+    create_json_if_absent(path, empty_default)
 
 
 def append_jsonl(path: Path, record: dict) -> None:
@@ -146,10 +220,16 @@ def read_jsonl(path: Path) -> list[dict]:
 
 def ensure_seeded_jsonl(path: Path) -> None:
     """Ensure `path` exists as an empty log. See `ensure_seeded` for why the
-    tracked `.example.jsonl` sibling is never copied into the live file."""
+    tracked `.example.jsonl` sibling is never copied into the live file, and
+    why the creation is exclusive: `write_text` truncates, so a writer that
+    appended a record between the existence check and this call would have it
+    erased."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
-        path.write_text("", encoding="utf-8")
+    try:
+        with open(path, "x", encoding="utf-8"):
+            pass
+    except FileExistsError:
+        pass
 
 
 def fold_latest_by_id(records: Iterable[dict], id_key: str = "id") -> dict[str, dict]:
