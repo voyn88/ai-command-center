@@ -251,6 +251,7 @@ def self_deploy_once(
         )
     report.steps.append("import_smoke_passed")
 
+    schema_mutated = False
     if cfg.migrate:
         migrated = _run_migrations(repo_path, timeout)
         if migrated.returncode != 0:
@@ -264,6 +265,12 @@ def self_deploy_once(
                 services_touched=False,
             )
         report.steps.append("migrations_applied")
+        # `command_center.db upgrade` prints "already up to date" when
+        # nothing was pending -- a successful command is not the same claim
+        # as a schema mutation (review of 5eb6f62: reporting the latter
+        # whenever the former was merely true made every migrate=True
+        # no-op run falsely claim an un-rolled-back mutation below).
+        schema_mutated = "already up to date" not in migrated.stdout
 
     # Applied migrations are deliberately NOT rolled back on a later restart
     # failure: this codebase's migration policy is expand-contract (each
@@ -276,7 +283,13 @@ def self_deploy_once(
     failure = _restart_services(cfg, report)
     if failure is not None:
         # Half old, half new is the state rollback exists to prevent -- so
-        # the restored services are re-verified inside rollback() too.
+        # the restored services are re-verified inside rollback() too. When
+        # a confirmed schema mutation preceded this failure, the checkout
+        # rollback leaves the database ahead of the restored code by
+        # design (expand-contract) -- provenance says so explicitly rather
+        # than reading like an ordinary, fully-restored rollback.
+        if schema_mutated:
+            failure = f"{failure}; database_migrations_applied_not_rolled_back"
         return rollback(failure, services_touched=True)
 
     return finish("deployed", report.target_sha)

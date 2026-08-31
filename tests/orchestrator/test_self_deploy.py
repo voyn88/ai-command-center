@@ -272,6 +272,61 @@ def test_a_failed_service_restore_is_reported_failed(pair, calls, tmp_path):
     assert _git(clone, "rev-parse", "HEAD") == first  # checkout DID restore
 
 
+def test_applied_migration_survives_a_later_restart_failure_asymmetrically(
+    pair, calls, tmp_path, monkeypatch
+):
+    """rollback-does-not-span-databases: a restart failure AFTER a confirmed
+    schema mutation rolls back the checkout only -- the database stays
+    migrated by design (expand-contract). Provenance must say so explicitly
+    rather than reading like an ordinary, fully-restored rollback."""
+    origin, clone, first = pair
+    _commit(origin, "advance with migration")
+    monkeypatch.setattr(
+        self_deploy, "_run_migrations",
+        lambda repo_path, timeout: subprocess.CompletedProcess(
+            [], 0, "applied: [7]", ""
+        ),
+    )
+    calls["systemctl_rc"][("restart",)] = 1  # every restart fails
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "failed"  # restore restart also fails -> unverified
+    assert "database_migrations_applied_not_rolled_back" in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first
+
+
+def test_noop_migration_does_not_falsely_claim_an_unrolled_back_mutation(
+    pair, calls, tmp_path, monkeypatch
+):
+    """Review of 5eb6f62: `db upgrade` exiting 0 is not the same claim as a
+    schema mutation -- it also exits 0 when the database was already
+    current. A migrate=True run that changed nothing must not tag a later
+    restart failure with `database_migrations_applied_not_rolled_back`."""
+    origin, clone, first = pair
+    _commit(origin, "advance, database already current")
+    monkeypatch.setattr(
+        self_deploy, "_run_migrations",
+        lambda repo_path, timeout: subprocess.CompletedProcess(
+            [], 0, "already up to date", ""
+        ),
+    )
+
+    def one_shot_systemctl(args, timeout):
+        calls["systemctl"].append(args)
+        if args[0] == "restart" and not calls.get("restore_attempted"):
+            calls["restore_attempted"] = True
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        out = "active" if args[0] == "is-active" else ""
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(self_deploy, "_systemctl", one_shot_systemctl)
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "rolled_back"
+    assert "database_migrations_applied_not_rolled_back" not in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first
+
+
 def test_migration_failure_provenance_names_the_partial_database(
     pair, calls, tmp_path, monkeypatch
 ):
