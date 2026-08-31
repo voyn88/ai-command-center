@@ -892,7 +892,7 @@ def _complete_review_with_key_suffix(
     assert worker.complete(claimed, {"status": "completed", "result_text": result_text})
 
 
-def test_a_malformed_review_result_is_retried_under_a_new_key(rig, monkeypatch):  # noqa: F811
+def test_a_malformed_review_result_is_retried_under_a_new_key(rig, _test_repo_routes, monkeypatch):  # noqa: F811
     """The stall this bounds: the queue's idempotency treats a repeated key as
     "already ran", so one malformed-but-succeeded result blocked every future
     review of that head forever -- the tick logged the same skip for the same
@@ -902,7 +902,7 @@ def test_a_malformed_review_result_is_retried_under_a_new_key(rig, monkeypatch):
 
     app_factory, store, worker = rig
     head = "d" * 40
-    pr_url = "https://github.com/x/y/pull/71"
+    pr_url = "https://github.com/x/repo-d2/pull/71"
     _ready(store, app_factory, "VOYN-W0-MR1", pr_url)
     _complete_review(
         app_factory, worker, "VOYN-W0-MR1", pr_url, head, "gibberish, no verdict\n"
@@ -924,14 +924,14 @@ def test_a_malformed_review_result_is_retried_under_a_new_key(rig, monkeypatch):
     assert ("VOYN-W0-MR1", pr_url) in report.reviewed
 
 
-def test_malformed_retries_stop_at_the_cap(rig, monkeypatch):  # noqa: F811
+def test_malformed_retries_stop_at_the_cap(rig, _test_repo_routes, monkeypatch):  # noqa: F811
     """Bounded, or this recreates the remediation-chain mistake with a
     different actor: each retry is a real agent run with a real cost."""
     import subprocess as sp
 
     app_factory, store, worker = rig
     head = "d" * 40
-    pr_url = "https://github.com/x/y/pull/72"
+    pr_url = "https://github.com/x/repo-d2/pull/72"
     _ready(store, app_factory, "VOYN-W0-MR2", pr_url)
     _complete_review(
         app_factory, worker, "VOYN-W0-MR2", pr_url, head, "still no verdict\n"

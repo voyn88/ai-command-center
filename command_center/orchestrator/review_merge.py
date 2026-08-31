@@ -1249,7 +1249,11 @@ def _latest_family_review_result(
         "WHERE i.task_id = %s "
         "AND (i.idempotency_key = %s OR i.idempotency_key LIKE %s) "
         "AND i.state = 'succeeded' "
-        "ORDER BY wr.created_at DESC",
+        # The key is the tiebreak: two attempts completed in the same clock
+        # tick order identically by created_at, and ':mrN' sorts after its own
+        # base key (and mr2 after mr1), so the later attempt wins the tie
+        # deterministically instead of by row order.
+        "ORDER BY wr.created_at DESC, i.idempotency_key DESC",
         (task_id, key, key + ":mr%"),
     )
     if not rows:
