@@ -20,19 +20,39 @@ one a table that is neither mirrored nor declared and asserts it is reported. A
 coverage gate that has never been shown to fail is a coverage gate that
 guarantees nothing.
 
+A third gate closes a narrower hole the first two cannot see. `queue_entry` is
+excluded from Gate A not because nothing mirrors it, but because something
+does — `PostgresQueueMirror`, which predates `PostgresTableMirror` and was
+never folded into it (see `table_mirror.py` and `queue_store.py` for why).
+Signing that off as prose — "it's mirrored elsewhere, trust the docstring" —
+is indistinguishable from an omission once the exclusion exists: the symbol
+could be renamed, replaced with an unrelated class, or quietly stop touching
+the table, and Gate A would still see a signed exclusion and stay green. Gate
+C proves the claim instead of accepting it: `BESPOKE_MIRRORS` names the class
+and the two methods — one that reads, one that writes — and
+`assert_bespoke_mirror_covers_its_table` parses each method's own source for a
+real SQL reference to the table, not a substring or a same-named value. The
+two are also proved to agree: an exclusion cannot claim "bespoke mirror" while
+`BESPOKE_MIRRORS` forgets it, or vice versa.
+
 No database is needed here, deliberately — the declarations are the thing under
 test, and they must stay checked on a machine with no PostgreSQL.
 """
 
 from __future__ import annotations
 
+import ast
+import importlib
+import inspect
 import re
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from command_center.db import roles
+from command_center.db.table_mirror import PostgresTableMirror
 
 from tests.db.mirror_discovery import mirror_classes
 
@@ -56,13 +76,24 @@ _CREATE_TABLE = re.compile(
 class Exclusion:
     """A signed decision that a table is not mirrored, and why.
 
-    Both fields are required and checked. A reason without an owning task is an
-    opinion that nothing will revisit; a task without a reason makes the next
-    reader open the backlog to find out what was decided here.
+    `reason` and `task` are both required and checked. A reason without an
+    owning task is an opinion that nothing will revisit; a task without a
+    reason makes the next reader open the backlog to find out what was
+    decided here.
+
+    `bespoke_mirror` is a narrower, machine-checked claim: it says the table
+    *is* mirrored, just not through `PostgresTableMirror`, and that the entry
+    naming it lives in `BESPOKE_MIRRORS` below. Default `False` — most
+    exclusions mean "genuinely unmirrored" — and
+    `test_bespoke_mirrors_and_their_exclusions_agree` holds the two registries
+    to the same set of tables, so setting this flag without adding the
+    `BESPOKE_MIRRORS` entry (or the reverse) fails on its own, rather than
+    resting on the reason text saying so.
     """
 
     reason: str
     task: str
+    bespoke_mirror: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +187,7 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
             "in a hand-written count."
         ),
         task="VOYN-W0-AICC-QUEUE-ENTRY-PARITY",
+        bespoke_mirror=True,
     ),
     "work_item": Exclusion(
         reason=(
@@ -457,6 +489,221 @@ def test_the_runtime_gate_fails_on_an_undeclared_ad_hoc_table() -> None:
     assert _uncovered(
         tables, set(roles.ALL_TABLES), RUNTIME_TABLES_WITHOUT_A_TARGET
     ) == ["another_daemon_table"]
+
+
+# ---------------------------------------------------------------------------
+# Gate C — a table excluded as "mirrored under a bespoke contract" really is
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BespokeMirror:
+    """A table mirrored by hand-written code instead of a `PostgresTableMirror`.
+
+    `read_attr`/`mutation_attr` name the two methods that have to prove the
+    claim: one on the path a reconciliation read would take, one on the path a
+    write would take. Naming both, and checking each on its own, is what
+    catches a class that keeps writing the table but stops reading it back (or
+    the reverse) — concatenating the two methods' SQL before checking would
+    not, because the other method's reference would still be in the pool.
+    """
+
+    module: str
+    class_name: str
+    read_attr: str
+    mutation_attr: str
+
+    def load(self) -> type:
+        return getattr(importlib.import_module(self.module), self.class_name)
+
+
+BESPOKE_MIRRORS: dict[str, BespokeMirror] = {
+    "queue_entry": BespokeMirror(
+        module="command_center.db.queue_store",
+        class_name="PostgresQueueMirror",
+        read_attr="list_entries",
+        mutation_attr="replace_entries",
+    ),
+}
+
+#: A real reference to `table`, not the table as a substring or a quoted
+#: value. Requires a clause keyword immediately before the identifier, so
+#: `SELECT 'queue_entry'` (the name as a value) and `FROM queue_entry_archive`
+#: (the name as a prefix) both fail to match — `\b` alone accepts both, since
+#: neither a quote nor an underscore breaks a word boundary.
+def _table_reference_pattern(table: str) -> re.Pattern[str]:
+    return re.compile(
+        rf'\b(?:FROM|INTO|UPDATE|JOIN)\s+"?{re.escape(table)}"?\b', re.IGNORECASE
+    )
+
+
+def _literal_text(node: ast.AST) -> str:
+    """The fixed text of a string or f-string node.
+
+    An f-string's `{...}` slots hold column lists and placeholders, never a
+    table name a caller would choose per-call, so only the surrounding
+    `Constant` pieces are read. Implicit adjacent-literal concatenation (two
+    string literals back to back) is already one `JoinedStr`/`Constant` node
+    by the time the parser hands it over, so no special case is needed for it.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            piece.value
+            for piece in node.values
+            if isinstance(piece, ast.Constant) and isinstance(piece.value, str)
+        )
+    return ""
+
+
+def _touches_table(cls: type, method_name: str, table: str) -> bool:
+    """True when `method_name`, read from `cls` alone, sends `table` a real
+    statement.
+
+    Scoped to one method's own AST — a table mentioned only in a sibling
+    method, a docstring, or a comment does not count, because none of those
+    is this method touching the table.
+    """
+    method = inspect.getattr_static(cls, method_name)
+    assert inspect.isfunction(method), (
+        f"{cls.__name__}.{method_name} is not a method — nothing to inspect"
+    )
+    tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+    pattern = _table_reference_pattern(table)
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("execute", "executemany")
+        ):
+            continue
+        for arg in node.args:
+            if pattern.search(_literal_text(arg)):
+                return True
+    return False
+
+
+def assert_bespoke_mirror_covers_its_table(
+    cls: type, table: str, read_attr: str, mutation_attr: str
+) -> None:
+    """The one function every real check and every control below calls.
+
+    A control that hand-rolls its own string comparison instead of calling
+    this proves only that the control's own logic works — the production gate
+    could be deleted, inverted, or changed to concatenate both paths and the
+    control would not notice. Routing everything through this function means
+    a change here that weakens the check turns every one of the negative
+    controls green, which is the failure the controls exist to catch.
+    """
+    assert not issubclass(cls, PostgresTableMirror), (
+        f"{cls.__name__} is a PostgresTableMirror subclass — it belongs in the "
+        "generic contract (test_mirror_contract.py), not BESPOKE_MIRRORS."
+    )
+    for attr in (read_attr, mutation_attr):
+        if not _touches_table(cls, attr, table):
+            raise AssertionError(
+                f"{cls.__name__}.{attr} sends {table!r} no FROM/INTO/UPDATE/JOIN "
+                "statement of its own — it does not mirror this table on this path."
+            )
+
+
+@pytest.mark.parametrize(
+    ("table", "mirror"), sorted(BESPOKE_MIRRORS.items()), ids=list(BESPOKE_MIRRORS)
+)
+def test_every_bespoke_mirror_is_real(table: str, mirror: BespokeMirror) -> None:
+    """The exclusion's prose says "mirrored elsewhere" — proved, not trusted."""
+    assert_bespoke_mirror_covers_its_table(
+        mirror.load(), table, mirror.read_attr, mirror.mutation_attr
+    )
+
+
+def test_bespoke_mirrors_and_their_exclusions_agree() -> None:
+    """Both directions of one claim, checked as a single set equality.
+
+    A `BESPOKE_MIRRORS` entry with no matching exclusion would be a table
+    the two other gates have never heard needs signing off. The reverse is the
+    gap a previous review found: an exclusion marked `bespoke_mirror=True`
+    survives on its own even after its `BESPOKE_MIRRORS` entry is deleted,
+    because nothing but this test reads the two registries together — deleting
+    the entry silently drops `test_every_bespoke_mirror_is_real`'s parametrized
+    proof for that table while Gate A stays green on the exclusion's prose
+    alone. Equality between the two sets closes it from either direction.
+    """
+    claimed = {
+        table
+        for table, exclusion in UNMIRRORED_SCHEMA_TABLES.items()
+        if exclusion.bespoke_mirror
+    }
+    assert set(BESPOKE_MIRRORS) == claimed, (
+        f"BESPOKE_MIRRORS declares {sorted(BESPOKE_MIRRORS)}; exclusions claiming "
+        f"bespoke_mirror=True declare {sorted(claimed)}. Every bespoke mirror needs "
+        "both, naming the same table."
+    )
+
+
+# --- the check proved to bite, via the same function it uses in earnest -----
+
+
+class _BespokeDecoyMissingReadReference:
+    """Writes the table, but the read path never mentions it."""
+
+    def read(self) -> None:
+        self._cursor.execute("SELECT 1")
+
+    def write(self) -> None:
+        self._cursor.execute("DELETE FROM queue_entry")
+
+
+class _BespokeDecoyMissingMutationReference:
+    """Reads the table, but the write path never mentions it."""
+
+    def read(self) -> None:
+        self._cursor.execute("SELECT * FROM queue_entry")
+
+    def write(self) -> None:
+        self._cursor.execute("SELECT 1")
+
+
+class _BespokeDecoySubstringAndValueOnly:
+    """Names the table on both paths, but never as a table reference."""
+
+    def read(self) -> None:
+        self._cursor.execute("SELECT * FROM queue_entry_archive")
+
+    def write(self) -> None:
+        self._cursor.execute("SELECT 'queue_entry' AS label")
+
+
+def test_the_bespoke_check_fails_when_the_read_path_drops_the_table() -> None:
+    with pytest.raises(AssertionError):
+        assert_bespoke_mirror_covers_its_table(
+            _BespokeDecoyMissingReadReference, "queue_entry", "read", "write"
+        )
+
+
+def test_the_bespoke_check_fails_when_the_mutation_path_drops_the_table() -> None:
+    with pytest.raises(AssertionError):
+        assert_bespoke_mirror_covers_its_table(
+            _BespokeDecoyMissingMutationReference, "queue_entry", "read", "write"
+        )
+
+
+def test_the_bespoke_check_rejects_a_substring_or_a_quoted_value() -> None:
+    with pytest.raises(AssertionError):
+        assert_bespoke_mirror_covers_its_table(
+            _BespokeDecoySubstringAndValueOnly, "queue_entry", "read", "write"
+        )
+
+
+def test_the_bespoke_check_passes_the_real_mirror() -> None:
+    """The positive control for the same shared function the controls above
+    use negatively — without it, an `assert_bespoke_mirror_covers_its_table`
+    that always raised would pass every test in this section."""
+    mirror = BESPOKE_MIRRORS["queue_entry"]
+    assert_bespoke_mirror_covers_its_table(
+        mirror.load(), "queue_entry", mirror.read_attr, mirror.mutation_attr
+    )
 
 
 # ---------------------------------------------------------------------------
