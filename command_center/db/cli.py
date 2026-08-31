@@ -375,11 +375,23 @@ def main(argv: list[str] | None = None) -> int:
                 from command_center.db.work_queue_store import WorkQueueStore
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
+                    reconcile_pr_evidence,
                     review_once,
                 )
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
+                # Before selecting anything: a task whose PR exists but was
+                # never recorded is invisible to every gate downstream. This
+                # derives that evidence from the task's own branch, so a pull
+                # request opened outside `publish_run` still reaches review.
+                evidence = reconcile_pr_evidence(
+                    lambda: _nc(conn), task_id=args.task_id
+                )
+                for evidence_task_id, pr in evidence.recorded:
+                    print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                for evidence_task_id, reason in evidence.skipped:
+                    print(f"PR-SKIP   {evidence_task_id}: {reason}")
                 report = review_once(
                     lambda: _nc(conn),
                     enqueue,

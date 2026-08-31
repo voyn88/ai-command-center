@@ -1066,3 +1066,142 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "st_gid != 0" in verifier
     assert "st_ino" in verifier
     assert "changed while being read" in verifier
+
+
+# ---------------------------------------------------------------------------
+# Installation profiles. Before these existed there was one profile for every
+# host, and it demanded the agent's Claude and Codex credentials
+# unconditionally -- so installing the control plane meant either putting
+# agent secrets on a host that must never hold them, or not installing it at
+# all. The live attempt on control-01 took the second branch and stopped at
+# `source is not a safe regular file: /home/voynadmin/.claude/.credentials.json`,
+# on a file whose absence was correct.
+# ---------------------------------------------------------------------------
+
+
+def _specs(profile, tmp_path):
+    import importlib
+
+    root = Path(__file__).parents[2]
+    sys.path.insert(0, str(root / "ops"))
+    tx = importlib.import_module("aicc_install_transaction")
+    return tx, {
+        spec.target
+        for spec in tx.default_specs(
+            root,
+            authority_env=tmp_path / "authority.env",
+            claude_auth=tmp_path / "claude.json",
+            codex_auth=tmp_path / "codex.json",
+            resolve_identities=False,
+            profile=profile,
+        )
+    }
+
+
+def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
+    """An existing caller that knows nothing about profiles must install
+    exactly what it always installed."""
+    tx, explicit = _specs("worker", tmp_path)
+    default = {
+        spec.target
+        for spec in tx.default_specs(
+            Path(__file__).parents[2],
+            authority_env=tmp_path / "authority.env",
+            claude_auth=tmp_path / "claude.json",
+            codex_auth=tmp_path / "codex.json",
+            resolve_identities=False,
+        )
+    }
+    assert explicit == default
+    assert tx.WORKER_ONLY_TARGETS <= explicit
+
+
+def test_control_profile_installs_no_agent_credentials(tmp_path):
+    """The specific failure that stopped control-01: the profile must not ask
+    for credentials a control-plane host is right not to have."""
+    _tx, targets = _specs("control", tmp_path)
+
+    assert "/var/lib/aicc-agent/claude/.claude/.credentials.json" not in targets
+    assert "/var/lib/aicc-agent/codex/.codex/auth.json" not in targets
+
+
+def test_control_profile_drops_every_worker_only_target_and_nothing_else(tmp_path):
+    tx, control = _specs("control", tmp_path)
+    _tx, worker = _specs("worker", tmp_path)
+
+    assert worker - control == tx.WORKER_ONLY_TARGETS
+
+
+def test_control_profile_keeps_the_recovery_anchor_and_the_transaction_tool(tmp_path):
+    """Dropping the agent layer must not drop the machinery that installs and
+    recovers anything at all."""
+    _tx, targets = _specs("control", tmp_path)
+
+    assert "/usr/local/sbin/voyn-aicc-bootstrap" in targets
+    assert "/usr/libexec/aicc-install-transaction" in targets
+    assert "/etc/aicc/workspace-authority.env" in targets
+
+
+def test_an_unknown_profile_is_refused_rather_than_treated_as_worker(tmp_path):
+    tx, _targets = _specs("worker", tmp_path)
+    root = Path(__file__).parents[2]
+
+    with pytest.raises(ValueError, match="unknown installation profile"):
+        tx.default_specs(
+            root,
+            authority_env=tmp_path / "authority.env",
+            claude_auth=tmp_path / "claude.json",
+            codex_auth=tmp_path / "codex.json",
+            resolve_identities=False,
+            profile="controlplane",
+        )
+
+
+def _installer_text() -> str:
+    return (
+        Path(__file__).parents[2] / "deploy" / "install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+
+
+def test_control_profile_refuses_a_host_that_still_carries_worker_artefacts():
+    """Excluding a target from the transaction does not delete what is already
+    on disk. A worker→control install that just skipped those specs would
+    leave agent credentials and the launcher socket live on the control plane
+    — the precise boundary this installer exists to create (independent review
+    of `090afcf`). It must refuse and name them instead.
+    """
+    text = _installer_text()
+
+    assert 'if [ "$install_profile" = "control" ]; then' in text
+    assert "control profile refuses: worker artefacts present:" in text
+    for candidate in (
+        "/var/lib/aicc-agent",
+        "/etc/aicc/worker-lanes",
+        "/etc/systemd/system/aicc-agent-launcher.socket",
+        "/etc/systemd/system/voyn-aicc-worker@.service",
+    ):
+        assert candidate in text
+    # Removal is the transactional uninstall's job, never a side effect here.
+    assert "this run will not remove them" in text
+
+
+def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
+    """The launcher socket brokers agent principals, the rollout drives worker
+    lanes, and the boundary verifier asserts a separation a control host has
+    no parties for. None may run unconditionally."""
+    text = _installer_text()
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+
+    for line in (
+        "systemctl enable --now aicc-agent-launcher.socket",
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes",
+        '"$repo_root/ops/verify-agent-principal-boundary.sh"',
+    ):
+        assert line in text
+        # The last occurrence: the boundary verifier is also named earlier,
+        # where it is only being checked for existence.
+        before = text[: text.rindex(line)]
+        assert guard in before, f"{line} is not behind the worker-profile guard"
+        # The guard must still be open where the line sits: no `fi` may close
+        # it between the two, or the line runs unconditionally after all.
+        assert "\nfi\n" not in before[before.rindex(guard):]

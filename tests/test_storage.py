@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from command_center import storage
 
@@ -97,3 +98,57 @@ def test_resolve_data_dir_env_override(monkeypatch, tmp_path):
 def test_resolve_data_dir_default_when_unset(monkeypatch, tmp_path):
     monkeypatch.delenv("AICC_DATA_DIR", raising=False)
     assert storage.resolve_data_dir(tmp_path) == tmp_path / "data"
+
+
+def test_create_json_if_absent_creates_and_reports_it(tmp_path):
+    path = tmp_path / "sub" / "store.json"
+    assert storage.create_json_if_absent(path, []) is True
+    assert storage.read_json(path, None) == []
+
+
+def test_create_json_if_absent_never_replaces_existing_content(tmp_path):
+    """The whole reason this exists instead of `atomic_write_json`: seeding an
+    empty default must not erase a record a concurrent writer already
+    committed. `atomic_write_json` ends in `os.replace` and would."""
+    path = tmp_path / "store.json"
+    storage.atomic_write_json(path, [{"id": "ALREADY-COMMITTED"}])
+
+    assert storage.create_json_if_absent(path, []) is False
+    assert storage.read_json(path, None) == [{"id": "ALREADY-COMMITTED"}]
+
+
+def test_ensure_seeded_does_not_replace_existing_content(tmp_path):
+    path = tmp_path / "store.json"
+    storage.atomic_write_json(path, [{"id": "ALREADY-COMMITTED"}])
+
+    storage.ensure_seeded(path, [])
+
+    assert storage.read_json(path, None) == [{"id": "ALREADY-COMMITTED"}]
+
+
+def test_ensure_seeded_jsonl_does_not_truncate_a_log_created_in_the_race_window(
+    tmp_path, monkeypatch
+):
+    """Seeding an empty log must create it, never truncate it.
+
+    Two callers can both find the log missing; the slower one then seeds it
+    after the faster one has already appended a record. The window is made
+    deterministic here rather than raced for: the record is written at the
+    moment the seed has prepared the directory and is about to create the
+    file. A truncating create loses it; an exclusive one leaves it alone.
+    """
+    path = tmp_path / "log.jsonl"
+    record = '{"id": "appended-in-the-window"}\n'
+    real_mkdir = Path.mkdir
+
+    def mkdir_then_let_the_other_writer_in(self: Path, *args, **kwargs):
+        result = real_mkdir(self, *args, **kwargs)
+        if self == path.parent and not path.exists():
+            path.write_text(record, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "mkdir", mkdir_then_let_the_other_writer_in)
+    storage.ensure_seeded_jsonl(path)
+    monkeypatch.undo()
+
+    assert path.read_text(encoding="utf-8") == record
