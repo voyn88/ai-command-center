@@ -673,8 +673,11 @@ def _chain(store, factory, base, links, pr_url, head_sha):
     ids = [base]
     for _ in range(links):
         ids.append(ids[-1] + "-REM")
-    for task_id in ids:
+    for task_id in ids[:-1]:
         assert store.upsert_task(_task(task_id, repo="repo-x", status="OPEN"))[0]
+    # The last link is the one about to be rejected, so it must be in the state
+    # a rejection actually arrives from: READY_TO_REVIEW carrying its PR.
+    _ready(store, factory, ids[-1], pr_url)
     for parent, child in itertools.pairwise(ids):
         assert store.record_remediation(child, parent, pr_url, head_sha)[0]
     return ids
@@ -742,13 +745,17 @@ def test_the_remediation_chain_stops_at_the_depth_limit(rig):  # noqa: F811
         )
         assert cur.fetchone()[0] == 0
 
-        # Parked for a person rather than dropped, and rather than left in
-        # READY_TO_REVIEW where the merge tick would reconsider it forever.
+        # Closed through the state machine, not around it: READY_TO_REVIEW
+        # fans out to DONE and REJECTED only, so a nicer-reading DEFER_TO_USER
+        # would have to be written past `backlog_transition` -- the very rule
+        # this code exists to uphold. The body carries why it stopped.
         cur.execute("SELECT status, body FROM backlog_task WHERE task_id = %s", (last,))
         status, body = cur.fetchone()
-        assert status == "DEFER_TO_USER"
+        assert status == "REJECTED"
         assert "Remediation chain stopped" in body
         assert pr_url in body
+        # And it is not left where the merge tick would reconsider it forever.
+        assert status != "READY_TO_REVIEW"
 
 
 def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):  # noqa: F811

@@ -1505,26 +1505,38 @@ def _remediate_rejection(
                 wave, priority, title, body, repo, revision = row
 
             if depth + 1 > MAX_REMEDIATION_DEPTH:
-                # Stop the chain rather than extend it. The task is parked for
-                # a person, not silently dropped and not left READY_TO_REVIEW
-                # where the merge tick would keep considering it forever.
+                # Stop the chain rather than extend it, using the state
+                # machine rather than around it. READY_TO_REVIEW fans out to
+                # DONE and REJECTED only -- DEFER_TO_USER would read better
+                # here, but it is not a legal transition from this state, and
+                # writing the status through `upsert_task` to get it would be
+                # exactly the "validate transitions mechanically" rule being
+                # bypassed by the code meant to uphold it. REJECTED is honest:
+                # the task WAS rejected, and this is the last time it will be.
+                # What changes is only that no further attempt is spawned, and
+                # the body says so, so the stop is legible to whoever reads it.
                 store = BacklogStore(lambda: nullcontext(conn))
+                ok, _reason, _revision = store.transition(task_id, "REJECTED", revision)
+                if not ok:
+                    conn.rollback()
+                    return None
+                stopped_body = (
+                    f"{body}\n\n---\n"
+                    f"Remediation chain stopped at depth {depth} "
+                    f"(limit {MAX_REMEDIATION_DEPTH}). The last rejection was on "
+                    f"{pr_url} at {head_sha}:\n\n{review_text}\n\n"
+                    "Automatic remediation will not produce another attempt: this "
+                    "many consecutive rejections is evidence about the task or the "
+                    "review, not about the implementation. Decide whether to "
+                    "respecify it, split it, or accept the reviewer's objection as "
+                    "correct and leave it closed."
+                )
+                # Status is already terminal; this writes the explanation only.
                 ok, _reason, _changed = store.upsert_task(
                     ParsedTask(
                         task_id=task_id, wave=wave, priority=priority,
-                        status="DEFER_TO_USER", kind="task", title=title,
-                        body=(
-                            f"{body}\n\n---\n"
-                            f"Remediation chain stopped at depth {depth} "
-                            f"(limit {MAX_REMEDIATION_DEPTH}). The last rejection "
-                            f"was on {pr_url} at {head_sha}:\n\n{review_text}\n\n"
-                            "Automatic remediation will not produce another attempt: "
-                            "this many consecutive rejections is evidence about the "
-                            "task or the review, not about the implementation. "
-                            "Decide whether to respecify it, split it, or accept the "
-                            "reviewer's objection as correct and close it."
-                        ),
-                        repo=repo, line_no=0,
+                        status="REJECTED", kind="task", title=title,
+                        body=stopped_body, repo=repo, line_no=0,
                     )
                 )
                 if not ok:
