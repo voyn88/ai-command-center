@@ -280,12 +280,26 @@ def _run_command(args: argparse.Namespace) -> int:
 
     manifest = _load_manifest(args.manifest)
     nodeids = _selected_nodeids(manifest, args.partition, args.shard)
+    # The receipt is taken by a separate collect-only pass, not by observing
+    # the run. Under `-n auto` the items are collected in xdist's workers and
+    # `pytest_collection_finish` never sees them in the controller, so a
+    # plugin attached to the real run reports an empty suite — which is
+    # exactly how this failed in CI. Collecting here, in this process, with
+    # xdist disabled, still answers the question the receipt exists to answer:
+    # what THIS shard resolves the manifest's nodeids to, in its own
+    # environment. It costs seconds and cannot silently observe nothing.
     plugin = _CollectionPlugin()
-    command = [*args.pytest_arg, *nodeids]
-    print(f"running {len(nodeids)} exactly-once tests from {manifest['digest']}")
-    result = pytest.main(command, plugins=[plugin])
+    collect_rc = pytest.main(
+        ["--collect-only", "-q", "-p", "no:xdist", *nodeids], plugins=[plugin]
+    )
+    if collect_rc != 0:
+        raise RuntimeError(f"collection pass failed with exit code {collect_rc}")
     if not plugin.tests:
         raise RuntimeError("pytest run collected an empty suite")
+
+    command = [*args.pytest_arg, *nodeids]
+    print(f"running {len(nodeids)} exactly-once tests from {manifest['digest']}")
+    result = pytest.main(command)
 
     collection = {
         "partition": args.partition,

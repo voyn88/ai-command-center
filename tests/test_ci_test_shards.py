@@ -155,13 +155,22 @@ def test_run_receipt_uses_the_live_collection_not_the_planned_nodeids(
     actual_nodeid = "tests/test_runtime.py::test_collected_during_run"
 
     class FakePytest:
+        """Two calls now: a collect-only pass that carries the plugin, then
+        the real run without it. Under `-n auto` the controller never sees the
+        items, so the receipt cannot be taken from the run itself."""
+
+        calls: list[list[str]] = []
+
         @staticmethod
-        def main(_command: list[str], *, plugins: list[object]) -> int:
-            (plugin,) = plugins
-            plugin.tests = [shards.CollectedTest(actual_nodeid, frozenset())]
+        def main(command: list[str], *, plugins: list[object] | None = None) -> int:
+            FakePytest.calls.append(command)
+            if plugins is not None:
+                (plugin,) = plugins
+                plugin.tests = [shards.CollectedTest(actual_nodeid, frozenset())]
             return 0
 
     monkeypatch.setitem(sys.modules, "pytest", FakePytest)
+    FakePytest.calls = []
     assert (
         shards._run_command(
             argparse.Namespace(
@@ -177,3 +186,47 @@ def test_run_receipt_uses_the_live_collection_not_the_planned_nodeids(
 
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["collections"][0]["nodeids"] == [actual_nodeid]
+
+
+def test_the_receipt_is_collected_with_xdist_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The failure this guards against is silent, not loud.
+
+    Under `-n auto` pytest collects in xdist's workers, so a plugin attached
+    to the real run sees no items in the controller and the receipt comes back
+    empty — which is how the first live run of build-once failed, after 1304
+    tests had passed. The receipt is therefore taken by its own collect-only
+    pass with xdist switched off; if that pass ever inherits the run's
+    parallel flags again, this fails.
+    """
+    manifest = _manifest()
+    manifest_path = tmp_path / "test-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    receipt = tmp_path / "collection.json"
+    seen: list[list[str]] = []
+
+    class FakePytest:
+        @staticmethod
+        def main(command: list[str], *, plugins: list[object] | None = None) -> int:
+            seen.append(command)
+            if plugins is not None:
+                (plugin,) = plugins
+                plugin.tests = [shards.CollectedTest("tests/test_a.py::test_one", frozenset())]
+            return 0
+
+    monkeypatch.setitem(sys.modules, "pytest", FakePytest)
+    shards._run_command(
+        argparse.Namespace(
+            manifest=manifest_path,
+            partition="core",
+            shard=1,
+            collected_output=receipt,
+            pytest_arg=["-n", "auto", "--dist", "loadscope"],
+        )
+    )
+
+    collect_pass, run_pass = seen
+    assert "--collect-only" in collect_pass
+    assert collect_pass[collect_pass.index("-p") + 1] == "no:xdist"
+    assert "-n" not in collect_pass
+    # The real run keeps its parallelism; only the receipt pass gives it up.
+    assert "-n" in run_pass
