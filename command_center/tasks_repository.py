@@ -203,8 +203,15 @@ def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = F
         # writer reported success — VOYN-W0-AICC-TASK-IMPORT-CONCURRENCY-FLAKE).
         # `create_json_if_absent` publishes only when the file is still absent,
         # so losing this race costs nothing but an unused temp file.
-        seed = json.loads(example_file.read_text(encoding="utf-8")) if (example_file and example_file.exists()) else []
-        storage.create_json_if_absent(tasks_file, seed)
+        if example_file and example_file.exists():
+            # Copied verbatim, never parsed. Decoding the example here would
+            # move its decode error *outside* the handler below, so a malformed
+            # example would raise from a read that `strict=False` promises will
+            # not (independent review of `4b058ff`). Copying keeps the failure
+            # exactly where it was before: in `_decode_tasks`, under `strict`.
+            storage.create_bytes_if_absent(tasks_file, example_file.read_bytes())
+        else:
+            storage.create_json_if_absent(tasks_file, [])
     try:
         tasks = _decode_tasks(tasks_file)
     except (json.JSONDecodeError, OSError, ValueError):

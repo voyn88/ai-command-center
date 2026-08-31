@@ -101,13 +101,27 @@ def create_json_if_absent(path: Path, data: Any) -> bool:
     no-overwrite guarantee (the only thing correctness depends on here) and
     gives up only the invisibility of the write window.
     """
+    return create_bytes_if_absent(
+        path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    )
+
+
+def create_bytes_if_absent(path: Path, payload: bytes) -> bool:
+    """`create_json_if_absent` for content that is already serialized.
+
+    Exists so a caller can seed a store from a file it must copy **verbatim**,
+    without parsing it first. Parsing to re-serialize looks equivalent and is
+    not: it moves the decode error to a different place in the call stack,
+    where the caller's own error handling may not cover it (independent review
+    of `4b058ff`, on exactly that regression in `tasks_repository.load_tasks`).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         return False
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}_", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         try:
@@ -117,8 +131,8 @@ def create_json_if_absent(path: Path, data: Any) -> bool:
         except OSError:
             # Filesystem without hard links: fall back to an exclusive create.
             try:
-                with open(path, "x", encoding="utf-8") as handle:
-                    json.dump(data, handle, ensure_ascii=False, indent=2)
+                with open(path, "xb") as handle:
+                    handle.write(payload)
                     handle.flush()
                     os.fsync(handle.fileno())
             except FileExistsError:
