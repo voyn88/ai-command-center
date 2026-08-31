@@ -5,6 +5,7 @@ by patching the module's _gh, and enqueue is a recording stub."""
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -662,6 +663,92 @@ def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):  # 
             ("VOYN-W0-P2B-REM%",),
         )
         assert cur.fetchone()[0] == 1
+
+
+def _chain(store, factory, base, links, pr_url, head_sha):
+    """Build a recorded remediation chain `base -> base-REM -> ...` of `links`
+    links, the way successive rejections would have built it."""
+    from tests.db.test_backlog_planner import _task
+
+    ids = [base]
+    for _ in range(links):
+        ids.append(ids[-1] + "-REM")
+    for task_id in ids:
+        assert store.upsert_task(_task(task_id, repo="repo-x", status="OPEN"))[0]
+    for parent, child in itertools.pairwise(ids):
+        assert store.record_remediation(child, parent, pr_url, head_sha)[0]
+    return ids
+
+
+def test_remediation_depth_counts_the_recorded_chain_not_the_name(rig):  # noqa: F811
+    """Depth walks the recorded parent links, not the `-REM` suffix. The suffix
+    is a naming convention; a task named by hand would make a string count
+    wrong in the direction that matters -- silently unbounded."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/40"
+    head = "1" * 40
+    ids = _chain(store, app_factory, "VOYN-W0-DEPTHCOUNT", 3, pr_url, head)
+
+    with app_factory() as c, c.cursor() as cur:
+        assert review_merge._remediation_depth(cur, ids[0]) == 0
+        assert review_merge._remediation_depth(cur, ids[1]) == 1
+        assert review_merge._remediation_depth(cur, ids[3]) == 3
+        # A task with no remediation record at all is depth 0, not an error.
+        assert review_merge._remediation_depth(cur, "VOYN-W0-NOT-A-REMEDIATION") == 0
+
+
+def test_a_rejection_below_the_depth_limit_still_spawns_a_remediation(rig):  # noqa: F811
+    """The boundary from below: the limit must not shorten the chain by one."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/41"
+    head = "2" * 40
+    ids = _chain(
+        store, app_factory, "VOYN-W0-DEPTHOK",
+        review_merge.MAX_REMEDIATION_DEPTH - 1, pr_url, head,
+    )
+
+    spawned = review_merge._remediate_rejection(
+        app_factory, ids[-1], pr_url, head, "Still wrong.\nVERDICT: REJECT\n"
+    )
+    assert spawned == ids[-1] + "-REM"
+
+
+def test_the_remediation_chain_stops_at_the_depth_limit(rig):  # noqa: F811
+    """Nothing bounded this chain: each rejected remediation spawned another
+    task, branch, pull request and full CI run, and the live backlog reached
+    158 `-REM` tasks with chains nine links deep. Past a few attempts the
+    evidence is about the task or the reviewer, not the implementation, and a
+    further link fixes neither while still costing a full pipeline."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/42"
+    head = "3" * 40
+    ids = _chain(
+        store, app_factory, "VOYN-W0-DEPTHSTOP",
+        review_merge.MAX_REMEDIATION_DEPTH, pr_url, head,
+    )
+    last = ids[-1]
+
+    assert review_merge._remediate_rejection(
+        app_factory, last, pr_url, head, "Rejected again.\nVERDICT: REJECT\n"
+    ) is None
+
+    with app_factory() as c, c.cursor() as cur:
+        # No further link was created.
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id = %s", (last + "-REM",))
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "SELECT count(*) FROM backlog_task_remediation WHERE parent_task_id = %s",
+            (last,),
+        )
+        assert cur.fetchone()[0] == 0
+
+        # Parked for a person rather than dropped, and rather than left in
+        # READY_TO_REVIEW where the merge tick would reconsider it forever.
+        cur.execute("SELECT status, body FROM backlog_task WHERE task_id = %s", (last,))
+        status, body = cur.fetchone()
+        assert status == "DEFER_TO_USER"
+        assert "Remediation chain stopped" in body
+        assert pr_url in body
 
 
 def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):  # noqa: F811
