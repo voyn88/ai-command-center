@@ -84,6 +84,13 @@ _REQUIRED_OWNER_UID = 0
 #: deep enough to look like one) is refused rather than followed forever.
 _MAX_SYMLINK_HOPS = 8
 
+# Test seam: where the ancestor walk stops. Production == the filesystem root,
+# because a writable directory ANYWHERE above the interpreter can have the
+# whole subtree renamed out from under it. Tests point it at their own temp
+# tree, whose ancestors (`/tmp` is world-writable and sticky) cannot be made
+# to pass and are not what is under test. Never read from configuration.
+_TRUSTED_ROOT = Path("/")
+
 
 def _verify_immutable_object(path: Path) -> os.stat_result:
     """Refuse `path` unless root owns it and nobody else can rewrite it.
@@ -110,6 +117,21 @@ def _verify_immutable_object(path: Path) -> os.stat_result:
     return info
 
 
+def _ancestors_of(path: Path) -> tuple[Path, ...]:
+    """Every directory between `path` and `_TRUSTED_ROOT`, inclusive.
+
+    Terminates at the trusted root, and also when a parent stops changing, so
+    a path outside the trusted root still ends rather than looping at `/`.
+    """
+    ancestors: list[Path] = []
+    current = path.parent
+    while True:
+        ancestors.append(current)
+        if current == _TRUSTED_ROOT or current == current.parent:
+            return tuple(ancestors)
+        current = current.parent
+
+
 def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
     """Every path the kernel touches to reach the real interpreter, plus the
     directory each one lives in.
@@ -118,15 +140,20 @@ def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
     `.venv/bin/python -> python3 -> /usr/bin/python3 -> python3.12`. Verifying
     only the paths inside the release therefore proves nothing about the binary
     that actually runs -- the last two hops are system paths this function is
-    the only thing that looks at. Each hop's parent directory is included
-    because write permission on it is exactly what would allow the hop to be
-    repointed.
+    the only thing that looks at.
+
+    Every ancestor of every hop is included, not just its immediate parent.
+    Write permission on any directory above the interpreter is enough to
+    rename the subtree out and drop a replacement in its place, so checking
+    `/usr/bin` while ignoring `/usr` would leave the binary swappable by
+    anyone who can write to `/usr` (independent review of `ab887b2` caught
+    exactly that: only the hop and its immediate parent were checked).
     """
     chain: list[Path] = []
     current = executable
     for _ in range(_MAX_SYMLINK_HOPS + 1):
         chain.append(current)
-        chain.append(current.parent)
+        chain.extend(_ancestors_of(current))
         try:
             info = current.lstat()
         except OSError as exc:

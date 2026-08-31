@@ -763,6 +763,11 @@ def _install_release(module, monkeypatch, tmp_path, **kwargs):
     # The chain cannot be built root-owned without root; assert against the
     # user that actually owns it, so every other property stays under test.
     monkeypatch.setattr(module, "_REQUIRED_OWNER_UID", os.getuid())
+    # The ancestor walk runs to the filesystem root in production. A temp tree
+    # cannot satisfy that -- `/tmp` is world-writable and sticky by design --
+    # and those directories are not what these tests examine, so the walk is
+    # bounded at the tree the fixture actually built.
+    monkeypatch.setattr(module, "_TRUSTED_ROOT", tmp_path)
     return opt
 
 
@@ -806,4 +811,20 @@ def test_a_symlink_cycle_is_refused_rather_than_followed(tmp_path, monkeypatch):
     venv_bin.chmod(0o555)
 
     with pytest.raises(module.RolloutError, match="too deep"):
+        module.verify_immutable_release()
+
+
+def test_a_writable_directory_far_above_the_interpreter_is_refused(tmp_path, monkeypatch):
+    """Not just the immediate parent. Write permission on any directory above
+    the interpreter is enough to rename the whole subtree out and drop a
+    replacement -- so checking `/usr/bin` while ignoring `/usr` would leave the
+    binary swappable by anyone who can write to `/usr`.
+    """
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    # Two levels above the real interpreter: `usr/bin/python3.12` lives under
+    # `usr/`, which nothing but the ancestor walk looks at.
+    (tmp_path / "usr").chmod(0o777)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
         module.verify_immutable_release()
