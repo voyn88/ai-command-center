@@ -1408,6 +1408,46 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return accept, head
 
 
+#: How many remediation links may stand above a task before the chain stops
+#: producing another one.
+#:
+#: Each rejected remediation spawns its own task, its own branch, its own pull
+#: request and its own full CI run, and nothing bounded the chain: the live
+#: backlog carries 158 `-REM` tasks and chains nine links deep
+#: (`...-REM-REM-REM-REM-REM-REM-REM-REM-REM`). Past a small number of attempts
+#: the evidence stops being "this implementation was wrong" and starts being
+#: "this task cannot be settled by another automatic attempt" -- a
+#: mis-specified task, or a reviewer rejecting for something the writer cannot
+#: act on. A further link does not fix either, and it is not free.
+MAX_REMEDIATION_DEPTH = 3
+
+
+def _remediation_depth(cur: Any, task_id: str) -> int:
+    """How many remediation links already stand above `task_id` (0 if none).
+
+    Walks the recorded parent chain rather than counting `-REM` suffixes: the
+    suffix is a naming convention, and a task named by hand or renamed would
+    make a string count silently wrong in the direction that matters.
+    """
+    cur.execute(
+        """
+        WITH RECURSIVE ancestry(task_id, parent_task_id, depth) AS (
+            SELECT task_id, parent_task_id, 1
+              FROM backlog_task_remediation
+             WHERE task_id = %s
+            UNION ALL
+            SELECT r.task_id, r.parent_task_id, a.depth + 1
+              FROM backlog_task_remediation r
+              JOIN ancestry a ON r.task_id = a.parent_task_id
+        )
+        SELECT COALESCE(MAX(depth), 0) FROM ancestry
+        """,
+        (task_id,),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def _remediate_rejection(
     factory: Any, task_id: str, pr_url: str, head_sha: str, review_text: str
 ) -> str | None:
@@ -1451,6 +1491,8 @@ def _remediate_rejection(
                     conn.rollback()
                     return None
 
+                depth = _remediation_depth(cur, task_id)
+
                 cur.execute(
                     "SELECT wave, priority, title, body, repo, revision "
                     "FROM backlog_task WHERE task_id = %s",
@@ -1461,6 +1503,47 @@ def _remediate_rejection(
                     conn.rollback()
                     return None
                 wave, priority, title, body, repo, revision = row
+
+            if depth + 1 > MAX_REMEDIATION_DEPTH:
+                # Stop the chain rather than extend it, using the state
+                # machine rather than around it. READY_TO_REVIEW fans out to
+                # DONE and REJECTED only -- DEFER_TO_USER would read better
+                # here, but it is not a legal transition from this state, and
+                # writing the status through `upsert_task` to get it would be
+                # exactly the "validate transitions mechanically" rule being
+                # bypassed by the code meant to uphold it. REJECTED is honest:
+                # the task WAS rejected, and this is the last time it will be.
+                # What changes is only that no further attempt is spawned, and
+                # the body says so, so the stop is legible to whoever reads it.
+                store = BacklogStore(lambda: nullcontext(conn))
+                ok, _reason, _revision = store.transition(task_id, "REJECTED", revision)
+                if not ok:
+                    conn.rollback()
+                    return None
+                stopped_body = (
+                    f"{body}\n\n---\n"
+                    f"Remediation chain stopped at depth {depth} "
+                    f"(limit {MAX_REMEDIATION_DEPTH}). The last rejection was on "
+                    f"{pr_url} at {head_sha}:\n\n{review_text}\n\n"
+                    "Automatic remediation will not produce another attempt: this "
+                    "many consecutive rejections is evidence about the task or the "
+                    "review, not about the implementation. Decide whether to "
+                    "respecify it, split it, or accept the reviewer's objection as "
+                    "correct and leave it closed."
+                )
+                # Status is already terminal; this writes the explanation only.
+                ok, _reason, _changed = store.upsert_task(
+                    ParsedTask(
+                        task_id=task_id, wave=wave, priority=priority,
+                        status="REJECTED", kind="task", title=title,
+                        body=stopped_body, repo=repo, line_no=0,
+                    )
+                )
+                if not ok:
+                    conn.rollback()
+                    return None
+                conn.commit()
+                return None
 
             new_task_id = f"{task_id}-REM"
             new_title = f"Remediation: {title}"
