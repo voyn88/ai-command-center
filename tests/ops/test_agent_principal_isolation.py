@@ -1205,3 +1205,61 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
         # The guard must still be open where the line sits: no `fi` may close
         # it between the two, or the line runs unconditionally after all.
         assert "\nfi\n" not in before[before.rindex(guard):]
+
+
+# ---------------------------------------------------------------------------
+# The two comparisons that blocked installation on both hosts, 2026-08-31.
+# ---------------------------------------------------------------------------
+
+
+def _tx_module():
+    import importlib
+
+    sys.path.insert(0, str(Path(__file__).parents[2] / "ops"))
+    return importlib.import_module("aicc_install_transaction")
+
+
+def test_a_restored_command_property_ignores_the_last_invocation_fields():
+    """systemd renders `ExecStart` with the *last run's* pid, exit code and
+    timestamps appended. Those change every time the unit starts, so comparing
+    the whole string makes a successful restore report failure — which is what
+    kept worker-01's recovery from ever completing, leaving the WAL in place
+    and refusing every later install.
+    """
+    tx = _tx_module()
+    snapshot = (
+        "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m command_center.worker ; "
+        "ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; "
+        "code=(null) ; status=0/0 }"
+    )
+    after_a_run = (
+        "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m command_center.worker ; "
+        "ignore_errors=no ; start_time=[Sun 2026-08-31 01:00:00 UTC] ; "
+        "stop_time=[n/a] ; pid=76841 ; code=(null) ; status=0/0 }"
+    )
+
+    assert tx._normalise_property(snapshot) == tx._normalise_property(after_a_run)
+
+
+def test_a_changed_command_is_still_a_failed_restore():
+    """The normalisation must not swallow the thing it exists to detect."""
+    tx = _tx_module()
+    original = (
+        "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m command_center.worker ; "
+        "ignore_errors=no ; pid=0 }"
+    )
+    replaced = (
+        "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m attacker ; "
+        "ignore_errors=no ; pid=0 }"
+    )
+
+    assert tx._normalise_property(original) != tx._normalise_property(replaced)
+
+
+def test_a_plain_property_value_is_compared_unchanged():
+    tx = _tx_module()
+
+    assert tx._normalise_property("/etc/systemd/system/x.service") == (
+        "/etc/systemd/system/x.service"
+    )
+    assert tx._normalise_property("") == ""
