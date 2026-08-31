@@ -8,6 +8,28 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — verified legacy-state migration into PostgreSQL (`VOYN-W0-AICC-SRV-07`)
+
+- `command_center/db/legacy_migration.py` and four `python -m command_center.db`
+  subcommands (`legacy-snapshot`, `legacy-import`, `legacy-freeze`,
+  `legacy-verify`) that cut the SQLite/JSON authority over to PostgreSQL.
+  `legacy-snapshot` takes a transactionally consistent SQLite backup, copies
+  every file-shaped legacy store beside it, and hashes all of them into a
+  read-only manifest — the rollback artefact. `legacy-import` verifies every
+  checksum before opening a target transaction, imports parents before
+  children with their original keys, repairs identity sequences, and
+  reconciles counts, keys, converted values, relationships and event order
+  inside the same transaction as the writes; re-running it is idempotent
+  (upserts, atomic queue replacement). `legacy-freeze` retires the legacy
+  authority only after a green report bound to that exact snapshot — per
+  store, since one mechanism does not fit both (`runtime.db` loses its write
+  bits in place; `execution_queue.json` is renamed aside, because
+  `atomic_write_json`'s `os.replace` checks the directory, never the target's
+  mode). `legacy-verify` re-checks that retirement afterwards, since a rename
+  cannot stop a legacy writer nobody stopped. Stores this schema does not yet
+  replace stay writable and are named under `retained_writable` rather than
+  hidden. See `docs/postgres-foundation.md` for the operator runbook.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
