@@ -56,8 +56,73 @@ permissions:
   pull-requests: read
 
 jobs:
+  prepare:
+    name: Prepare CI shared inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AICC_AIOS_SDK_WHEEL: ${{ github.workspace }}/.artifacts/aios_sdk-0.2.0-py3-none-any.whl
+      AICC_AIOS_DB_WHEEL: ${{ github.workspace }}/.artifacts/aios_db-0.1.0-py3-none-any.whl
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-ci-linux.lock
+
+      # Building the manifest collects the suite, and collection imports
+      # pytest-qt, which dlopens libEGL. The shards install these already; the
+      # prepare job must too, or collection dies with
+      # `ImportError: libEGL.so.1` before it can plan anything.
+      - name: Install Qt system libraries (for optional desktop shell)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes --no-deps -r requirements-ci-linux.lock
+
+      - name: Fetch and verify exact accepted AIOS SDK and DB artifacts
+        shell: bash
+        env:
+          AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
+          AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/assert_trusted_head_repository.py
+          python scripts/fetch_aios_sdk_artifact.py --output .artifacts
+          pip install "$AICC_AIOS_SDK_WHEEL"
+          python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
+          pip install "$AICC_AIOS_DB_WHEEL"
+
+      - name: Build exactly-once test manifest
+        run: |
+          python scripts/ci/test_shards.py build \
+            --shards 4 \
+            --output test-manifest.json
+
+      - name: Publish prepared SDK, DB, and test manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-shared-inputs
+          path: |
+            .artifacts/
+            test-manifest.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
   quality-gates:
     name: Linux quality shard ${{ matrix.shard }} of 4
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -123,6 +188,11 @@ jobs:
         if: github.event_name == 'pull_request' && matrix.shard == 1 && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-linux')
         run: exit 1
 
+      - name: Download prepared SDK, DB, and test manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ci-shared-inputs
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -161,34 +231,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-linux.lock
 
-      - name: Install exact accepted AIOS SDK and DB artifacts
-        # `bash` is not cosmetic here and is pinned by
-        # `test_a_refused_guard_actually_stops_the_step`: GitHub runs it as
-        # `bash --noprofile --norc -eo pipefail`, so the guard's non-zero exit
-        # aborts the step. Under `pwsh` it would not — a failed native command
-        # is not a terminating error there, and the fetch below would run with
-        # the token anyway.
-        shell: bash
-        env:
-          AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
-          AIOS_ARTIFACT_READ_TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install prepared AIOS SDK and DB artifacts
         run: |
-          python scripts/assert_trusted_head_repository.py
-          python scripts/fetch_aios_sdk_artifact.py --output .artifacts
           pip install "$AICC_AIOS_SDK_WHEEL"
-          python scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json --output .artifacts
           pip install "$AICC_AIOS_DB_WHEEL"
-
-      # Every shard independently collects the exact same nodeid universe.
-      # The signed manifest partitions it into mutually-exclusive core,
-      # serial and real-browser sets; a missing or empty partition fails before
-      # pytest can accidentally turn an empty argv into a full-suite run.
-      - name: Build exactly-once test manifest
-        run: |
-          python scripts/ci/test_shards.py build \
-            --shards 4 \
-            --output test-manifest.json
 
       - name: Whitespace errors
         shell: bash
@@ -226,6 +272,7 @@ jobs:
             --manifest test-manifest.json \
             --partition core \
             --shard "${{ matrix.shard }}" \
+            --collected-output test-collection.json \
             "${args[@]}"
 
       - name: Pytest (serial tail)
@@ -243,6 +290,7 @@ jobs:
           python scripts/ci/test_shards.py run \
             --manifest test-manifest.json \
             --partition serial \
+            --collected-output test-collection.json \
             "${args[@]}"
 
       # Informational, non-blocking signal. It never fails the job so the merge
@@ -273,14 +321,15 @@ jobs:
           python scripts/ci/test_shards.py run \
             --manifest test-manifest.json \
             --partition e2e \
+            --collected-output test-collection.json \
             --pytest-arg=-q
 
-      - name: Publish exact test manifest
+      - name: Publish actual test collection receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: test-manifest-${{ matrix.shard }}
-          path: test-manifest.json
+          name: test-collection-${{ matrix.shard }}
+          path: test-collection.json
           if-no-files-found: error
           retention-days: 7
 
@@ -297,29 +346,36 @@ jobs:
   manifest-gate:
     name: Linux manifest gate (exactly once)
     if: always()
-    needs: [quality-gates]
+    needs: [prepare, quality-gates]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - name: Download shard manifests
+      - name: Download prepared test manifest
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: test-manifest-*
-          path: manifests
+          name: ci-shared-inputs
 
-      - name: Verify four identical non-empty manifests
+      - name: Download shard collection receipts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: test-collection-*
+          path: collections
+
+      - name: Verify actual collections equal planned partition
         shell: bash
         run: |
           shopt -s nullglob
-          manifests=(manifests/*/test-manifest.json)
-          if [[ "${#manifests[@]}" -ne 4 ]]; then
-            echo "expected 4 manifests, found ${#manifests[@]}"
+          reports=(collections/*/test-collection.json)
+          if [[ "${#reports[@]}" -ne 4 ]]; then
+            echo "expected 4 collection receipts, found ${#reports[@]}"
             exit 1
           fi
-          python scripts/ci/test_shards.py verify "${manifests[@]}"
+          python scripts/ci/test_shards.py verify \
+            --manifest test-manifest.json \
+            "${reports[@]}"
 
   coverage-gate:
     name: Main coverage aggregation
