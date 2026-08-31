@@ -1,4 +1,10 @@
 # Canonical minimum lanes. Additional enabled/loaded template instances are
 # discovered automatically; deployments can scale by adding instance names.
+#
+# Do not add a third lane without first reading
+# docs/operations/GITHUB_MERGE_ENFORCEMENT_DECISION.md: this file's current
+# 2-lane count is an accepted-risk ceiling, enforced by
+# tests/ops/test_aicc_staged_worker_rollout.py::test_canonical_worker_lane_registry_stays_at_the_accepted_risk_ceiling,
+# not just this comment.
 1
 2

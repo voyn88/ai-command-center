@@ -463,7 +463,10 @@ gate remains a repository-setting concern outside this codebase.
 - `app.py` and several runtime and Portfolio modules are large, concentrated change surfaces.
 - The MyPy type check is informational and non-blocking: it does not gate merges, and the codebase is not yet fully typed.
 - CI runs automatically, but required-check/branch-protection enforcement is not configured by
-  repository code and cannot be inferred from the workflow alone.
+  repository code and cannot be inferred from the workflow alone — see
+  [docs/operations/GITHUB_MERGE_ENFORCEMENT_DECISION.md](docs/operations/GITHUB_MERGE_ENFORCEMENT_DECISION.md)
+  for what is and is not verified about GitHub's own enforcement, and the accepted-risk decision
+  covering the gap.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
   it, and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and

@@ -187,6 +187,30 @@ def test_discovery_combines_configured_and_existing_lanes(tmp_path):
     )
 
 
+def test_canonical_worker_lane_registry_stays_at_the_accepted_risk_ceiling():
+    """GitHub's own enforcement on `main` is not verified beyond three
+    permissive classic-protection fields (see
+    docs/operations/GITHUB_MERGE_ENFORCEMENT_DECISION.md); the accepted-risk
+    mitigation is to not grow the number of parallel autonomous worker lanes
+    past the canonical minimum until that gap is audited or
+    VOYN-W0-AICC-PRIVILEGED-MERGE-GATEWAY ships. `_configured_units`/
+    `discover_units` accept an arbitrary lane count by design --
+    `test_discovery_combines_configured_and_existing_lanes` above proves a
+    third lane is accepted -- so the ceiling is enforced here instead."""
+    lanes_path = Path(__file__).parents[2] / "deploy" / "aicc" / "worker-lanes"
+    lanes = [
+        line.strip()
+        for line in lanes_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert len(lanes) <= 2, (
+        f"deploy/aicc/worker-lanes now lists {len(lanes)} lanes; raise this "
+        "ceiling only after re-running the audit in "
+        "docs/operations/GITHUB_MERGE_ENFORCEMENT_DECISION.md and recording "
+        "the result there"
+    )
+
+
 def test_uninstall_snapshot_audit_refuses_a_lane_created_after_snapshot():
     module = _module()
     systemd = FakeSystemd(
