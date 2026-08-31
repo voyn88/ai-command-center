@@ -73,3 +73,33 @@ def test_missing_file_is_still_a_legitimate_empty_store(isolated_data_dir):
         return tasks
 
     assert tr.mutate_tasks(root, _noop) == []
+
+
+def test_a_malformed_example_does_not_raise_from_a_lenient_read(tmp_path, monkeypatch):
+    """`strict=False` promises a read that never raises. Seeding from an
+    example must not break that promise.
+
+    Found by independent review of `4b058ff`: seeding used to copy the example
+    verbatim, and the exclusive-create fix briefly parsed it instead. Parsing
+    moved the decode error outside the `_decode_tasks` handler below, so a
+    malformed example escaped from a call whose whole contract is that it
+    returns `[]` rather than raising.
+    """
+    monkeypatch.setenv("AICC_DATA_DIR", str(tmp_path / "data"))
+    example = tmp_path / "tasks.example.json"
+    example.write_text("{not valid json", encoding="utf-8")
+    tr.tasks_file_path(tmp_path).unlink(missing_ok=True)
+
+    assert tr.load_tasks(tmp_path, example_file=example) == []
+
+
+def test_a_malformed_example_still_raises_on_the_strict_path(tmp_path, monkeypatch):
+    """The other half of the same contract: `strict=True` must still refuse,
+    so a write cycle never proceeds against a wrongly-empty list."""
+    monkeypatch.setenv("AICC_DATA_DIR", str(tmp_path / "data"))
+    example = tmp_path / "tasks.example.json"
+    example.write_text("{not valid json", encoding="utf-8")
+    tr.tasks_file_path(tmp_path).unlink(missing_ok=True)
+
+    with pytest.raises((json.JSONDecodeError, ValueError)):
+        tr.load_tasks(tmp_path, example_file=example, strict=True)
