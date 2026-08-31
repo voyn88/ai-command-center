@@ -1899,7 +1899,7 @@ def test_a_legacy_symlink_target_is_replaced_and_restored(monkeypatch, tmp_path)
     elsewhere = tmp_path / "home" / "unit.service"
     elsewhere.parent.mkdir(parents=True)
     elsewhere.write_text("legacy unit\n", encoding="utf-8")
-    target_dir = root / "etc"
+    target_dir = root / "etc" / "systemd" / "system"
     target_dir.mkdir(parents=True)
     (target_dir / "unit.service").symlink_to(elsewhere)
 
@@ -1907,7 +1907,7 @@ def test_a_legacy_symlink_target_is_replaced_and_restored(monkeypatch, tmp_path)
     source.write_bytes(b"repo-owned unit\n")
 
     transaction = module.FileTransaction(root, state)
-    transaction.prepare((_spec(module, source, "/etc/unit.service"),))
+    transaction.prepare((_spec(module, source, "/etc/systemd/system/unit.service"),))
     transaction.apply()
 
     installed = target_dir / "unit.service"
@@ -1928,7 +1928,7 @@ def test_a_target_that_is_neither_file_nor_symlink_is_still_refused(tmp_path):
     module = _module()
     root = tmp_path / "root"
     state = tmp_path / "state"
-    target_dir = root / "etc"
+    target_dir = root / "etc" / "systemd" / "system"
     target_dir.mkdir(parents=True)
     (target_dir / "unit.service").mkdir()
 
@@ -1937,7 +1937,7 @@ def test_a_target_that_is_neither_file_nor_symlink_is_still_refused(tmp_path):
 
     transaction = module.FileTransaction(root, state)
     with pytest.raises(ValueError, match="not a regular file"):
-        transaction.prepare((_spec(module, source, "/etc/unit.service"),))
+        transaction.prepare((_spec(module, source, "/etc/systemd/system/unit.service"),))
 
 
 def test_symlink_restore_is_idempotent(monkeypatch, tmp_path):
@@ -1956,15 +1956,15 @@ def test_symlink_restore_is_idempotent(monkeypatch, tmp_path):
     elsewhere = tmp_path / "home" / "unit.service"
     elsewhere.parent.mkdir(parents=True)
     elsewhere.write_text("legacy unit\n", encoding="utf-8")
-    (root / "etc").mkdir(parents=True)
-    installed = root / "etc" / "unit.service"
+    (root / "etc" / "systemd" / "system").mkdir(parents=True)
+    installed = root / "etc" / "systemd" / "system" / "unit.service"
     installed.symlink_to(elsewhere)
 
     source = tmp_path / "source"
     source.write_bytes(b"repo-owned unit\n")
 
     transaction = module.FileTransaction(root, state)
-    transaction.prepare((_spec(module, source, "/etc/unit.service"),))
+    transaction.prepare((_spec(module, source, "/etc/systemd/system/unit.service"),))
     transaction.apply()
 
     # `restore` is driven directly, twice, against the same journal: that is
@@ -1991,15 +1991,15 @@ def test_symlink_restore_refuses_a_vanished_target(tmp_path):
     elsewhere = tmp_path / "home" / "unit.service"
     elsewhere.parent.mkdir(parents=True)
     elsewhere.write_text("legacy\n", encoding="utf-8")
-    (root / "etc").mkdir(parents=True)
-    installed = root / "etc" / "unit.service"
+    (root / "etc" / "systemd" / "system").mkdir(parents=True)
+    installed = root / "etc" / "systemd" / "system" / "unit.service"
     installed.symlink_to(elsewhere)
 
     source = tmp_path / "source"
     source.write_bytes(b"repo-owned\n")
 
     transaction = module.FileTransaction(root, state)
-    transaction.prepare((_spec(module, source, "/etc/unit.service"),))
+    transaction.prepare((_spec(module, source, "/etc/systemd/system/unit.service"),))
     transaction.apply()
 
     installed.unlink()  # a third party removes the installed file

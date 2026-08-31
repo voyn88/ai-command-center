@@ -29,6 +29,67 @@ RESTORABLE_UNIT_RE = re.compile(
 TEMPLATE_WORKER_UNIT_RE = re.compile(
     r"voyn-aicc-worker@[^/@\s]+\.service"
 )
+
+# systemd's own unit-type suffixes -- fixed and documented (systemd.unit(5)),
+# unlike the set of places a *user*-scoped unit can live, which is open-ended
+# (XDG variables, per-uid runtime trees, the user manager's own "link" verb
+# targeting an arbitrary path). Enumerating suffixes is exhaustive by
+# construction; enumerating user-unit directories to block is not, which is
+# why the directory check below is an allow-list of real search paths rather
+# than a deny-list (review finding: an earlier deny-list omitted
+# $XDG_DATA_HOME/systemd/user and $XDG_RUNTIME_DIR/systemd).
+_SYSTEMD_UNIT_TYPE_SUFFIXES = frozenset(
+    {
+        "service",
+        "socket",
+        "device",
+        "mount",
+        "automount",
+        "swap",
+        "target",
+        "path",
+        "timer",
+        "slice",
+        "scope",
+    }
+)
+_UNIT_DROPIN_DIRECTORY_RE = re.compile(
+    r".+\.(?:" + "|".join(sorted(_SYSTEMD_UNIT_TYPE_SUFFIXES)) + r")\.d"
+)
+
+# The real search path systemd's *system* manager loads units from. Anything
+# not in this set -- including every per-user tree -- is refused as an
+# installation target for a unit or unit drop-in, below.
+SYSTEM_UNIT_DIRECTORIES = frozenset(
+    {
+        "/etc/systemd/system",
+        "/run/systemd/system",
+        "/usr/lib/systemd/system",
+        "/lib/systemd/system",
+        "/usr/local/lib/systemd/system",
+    }
+)
+
+
+def _unit_root_directory(absolute: str) -> str | None:
+    """The directory a systemd unit or unit drop-in at `absolute` installs into.
+
+    Returns `None` when `absolute` is not shaped like either -- a bare
+    `name.<type>` file, or a `NN-name.conf` staged into a `unit.<type>.d/`
+    override directory. Used to gate every installation target through one
+    real allow-list (`SYSTEM_UNIT_DIRECTORIES`) at the point a file is
+    actually about to be written, so the check applies no matter how the
+    target string was produced upstream.
+    """
+    path = Path(absolute)
+    suffix = path.suffix.lstrip(".")
+    if suffix in _SYSTEMD_UNIT_TYPE_SUFFIXES:
+        return str(path.parent)
+    if _UNIT_DROPIN_DIRECTORY_RE.fullmatch(path.parent.name):
+        return str(path.parent.parent)
+    return None
+
+
 # Ordered: aicc_staged_worker_rollout imports this and iterates it; every
 # set-equality check wraps it in set(...). One definition, no drift.
 SNAPSHOT_PROPERTIES = (
@@ -1125,6 +1186,17 @@ class FileTransaction:
         relative = absolute.lstrip("/")
         if not relative:
             raise ValueError(f"unsafe installation target: {absolute}")
+        unit_root = _unit_root_directory(absolute)
+        if unit_root is not None and unit_root not in SYSTEM_UNIT_DIRECTORIES:
+            # A dev-mode convenience path -- or any future caller -- that
+            # tries to stage a unit under a user's own unit tree is refused
+            # here, on the concrete resolved string, rather than relying on
+            # every caller of this installer to have chosen a safe target
+            # (VOYN-W0-AICC-SRV-05-USER-UNIT-IS-NOT-A-BOUNDARY).
+            raise ValueError(
+                "refusing to stage a systemd unit outside a system unit "
+                f"directory: {absolute}"
+            )
         return self.root / relative
 
     def _validate_parent_chain(self, target: Path) -> None:
