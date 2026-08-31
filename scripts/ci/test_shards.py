@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import subprocess
 import sys
 from collections import Counter
 from collections.abc import Sequence
@@ -16,6 +15,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DURATIONS = ROOT / "scripts" / "ci" / "test_durations.json"
 MANIFEST_SCHEMA_VERSION = 1
+COLLECTION_REPORT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -189,6 +189,61 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     return manifest
 
 
+def _report_digest(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_collection_report(report: dict[str, Any]) -> None:
+    """Reject an unsigned, malformed, empty, or internally duplicated receipt."""
+    digest = report.get("digest")
+    unsigned = {key: value for key, value in report.items() if key != "digest"}
+    if digest != _report_digest(unsigned):
+        raise ValueError("collection report digest mismatch")
+    if report.get("schema_version") != COLLECTION_REPORT_SCHEMA_VERSION:
+        raise ValueError("unsupported collection report schema")
+    if not isinstance(report.get("manifest_digest"), str) or not report["manifest_digest"]:
+        raise ValueError("collection report has no manifest digest")
+
+    collections = report.get("collections")
+    if not isinstance(collections, list) or not collections:
+        raise ValueError("collection report must contain at least one collection")
+    identities: set[tuple[str, int | None]] = set()
+    for collection in collections:
+        if not isinstance(collection, dict) or set(collection) != {
+            "partition",
+            "shard",
+            "nodeids",
+        }:
+            raise ValueError("collection report has an invalid collection entry")
+        partition = collection["partition"]
+        shard = collection["shard"]
+        nodeids = collection["nodeids"]
+        if partition not in {"core", "serial", "e2e"}:
+            raise ValueError("collection report has an invalid partition")
+        if partition == "core":
+            if not isinstance(shard, int) or shard < 1:
+                raise ValueError("core collection requires a positive shard")
+        elif shard is not None:
+            raise ValueError("non-core collection cannot have a shard")
+        if not isinstance(nodeids, list) or not nodeids or any(
+            not isinstance(nodeid, str) or not nodeid for nodeid in nodeids
+        ):
+            raise ValueError("collection report has an empty or invalid nodeid list")
+        if len(set(nodeids)) != len(nodeids):
+            raise ValueError("collection report has duplicate nodeids")
+        identity = (partition, shard)
+        if identity in identities:
+            raise ValueError(f"collection report duplicates {partition} collection")
+        identities.add(identity)
+
+
+def _load_collection_report(path: Path) -> dict[str, Any]:
+    report = json.loads(path.read_text(encoding="utf-8"))
+    validate_collection_report(report)
+    return report
+
+
 def _selected_nodeids(
     manifest: dict[str, Any], partition: str, shard: int | None
 ) -> list[str]:
@@ -221,19 +276,74 @@ def _build_command(args: argparse.Namespace) -> int:
 
 
 def _run_command(args: argparse.Namespace) -> int:
+    import pytest
+
     manifest = _load_manifest(args.manifest)
     nodeids = _selected_nodeids(manifest, args.partition, args.shard)
-    command = [sys.executable, "-m", "pytest", *args.pytest_arg, *nodeids]
+    plugin = _CollectionPlugin()
+    command = [*args.pytest_arg, *nodeids]
     print(f"running {len(nodeids)} exactly-once tests from {manifest['digest']}")
-    return subprocess.run(command, check=False).returncode
+    result = pytest.main(command, plugins=[plugin])
+    if not plugin.tests:
+        raise RuntimeError("pytest run collected an empty suite")
+
+    collection = {
+        "partition": args.partition,
+        "shard": args.shard,
+        "nodeids": [test.nodeid for test in plugin.tests],
+    }
+    if args.collected_output.exists():
+        report = _load_collection_report(args.collected_output)
+        if report["manifest_digest"] != manifest["digest"]:
+            raise ValueError("collection report binds a different manifest")
+        collections = report["collections"]
+    else:
+        collections = []
+    report = {
+        "schema_version": COLLECTION_REPORT_SCHEMA_VERSION,
+        "manifest_digest": manifest["digest"],
+        "collections": [*collections, collection],
+    }
+    report["digest"] = _report_digest(report)
+    validate_collection_report(report)
+    args.collected_output.write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    return int(result)
 
 
 def _verify_command(args: argparse.Namespace) -> int:
-    manifests = [_load_manifest(path) for path in args.manifests]
-    digests = {manifest["digest"] for manifest in manifests}
-    if len(digests) != 1:
-        raise ValueError(f"shard jobs produced different manifests: {sorted(digests)}")
-    print(f"verified {len(manifests)} identical manifests: {digests.pop()}")
+    manifest = _load_manifest(args.manifest)
+    reports = [_load_collection_report(path) for path in args.collection_reports]
+    if any(report["manifest_digest"] != manifest["digest"] for report in reports):
+        raise ValueError("collection report binds a different manifest")
+
+    expected = {
+        ("core", shard): _selected_nodeids(manifest, "core", shard)
+        for shard in range(1, manifest["shard_count"] + 1)
+    }
+    expected[("serial", None)] = _selected_nodeids(manifest, "serial", None)
+    expected[("e2e", None)] = _selected_nodeids(manifest, "e2e", None)
+    observed = {
+        (collection["partition"], collection["shard"]): collection["nodeids"]
+        for report in reports
+        for collection in report["collections"]
+    }
+    if len(observed) != sum(len(report["collections"]) for report in reports):
+        raise ValueError("shard jobs published duplicate collection receipts")
+    if set(observed) != set(expected):
+        raise ValueError("shard jobs did not publish the planned collections")
+
+    planned_counts = Counter(nodeid for nodeids in expected.values() for nodeid in nodeids)
+    observed_counts = Counter(nodeid for nodeids in observed.values() for nodeid in nodeids)
+    if observed_counts != planned_counts:
+        raise ValueError("collected test union does not equal the planned partition")
+    if any(observed[key] != expected[key] for key in expected):
+        raise ValueError("a shard collected a different planned partition")
+    print(
+        f"verified {len(reports)} shard collection reports against "
+        f"{manifest['digest']}"
+    )
     return 0
 
 
@@ -252,11 +362,13 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--manifest", type=Path, required=True)
     run.add_argument("--partition", choices=("core", "serial", "e2e"), required=True)
     run.add_argument("--shard", type=int)
+    run.add_argument("--collected-output", type=Path, required=True)
     run.add_argument("--pytest-arg", action="append", default=[])
     run.set_defaults(handler=_run_command)
 
     verify = subparsers.add_parser("verify")
-    verify.add_argument("manifests", nargs="+", type=Path)
+    verify.add_argument("--manifest", type=Path, required=True)
+    verify.add_argument("collection_reports", nargs="+", type=Path)
     verify.set_defaults(handler=_verify_command)
     return parser
 
