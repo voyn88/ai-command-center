@@ -210,7 +210,12 @@ if ! path_present "$state_dir/uninstall.json"; then
   # same host lock and make first install fail deterministically.
   run_transaction recover
   systemctl daemon-reload
-  systemctl start aicc-principal-recovery.service
+  # Same profile boundary: the recovery unit is worker-only, so on a control
+  # host it was never installed and starting it fails on a unit that does not
+  # exist. The anchor itself is profile-independent and stays above.
+  if [ "$install_profile" = "worker" ]; then
+    systemctl start aicc-principal-recovery.service
+  fi
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -222,9 +227,13 @@ if [ "${1:-}" = "--uninstall" ]; then
       exit 0
     fi
     # INTENT precedes every uninstall mutation, so recovery safely aborted it.
-    # Reactivate the no-op barrier before creating the replacement WAL.
-    systemctl reset-failed aicc-principal-recovery.service >/dev/null 2>&1 || true
-    systemctl start aicc-principal-recovery.service
+    # Reactivate the no-op barrier before creating the replacement WAL --
+    # worker only, for the same reason as the install path above: the unit does
+    # not exist on a control host, so starting it there fails on absence.
+    if [ "$install_profile" = "worker" ]; then
+      systemctl reset-failed aicc-principal-recovery.service >/dev/null 2>&1 || true
+      systemctl start aicc-principal-recovery.service
+    fi
   fi
   [ -f "$baseline_units" ] && [ -f "$baseline_release" ] || {
     echo "principal-isolation baseline state is missing" >&2
@@ -399,8 +408,20 @@ trap rollback EXIT HUP INT TERM
 
 # Identity and directory creation are additive/idempotent prerequisites. Every
 # other replaceable file belongs to the versioned transaction below.
-systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
-systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+#
+# Both belong to the agent layer, which is the worker profile's alone:
+# `/usr/lib/sysusers.d/aicc-agent.conf` and `/usr/lib/tmpfiles.d/aicc-agent.conf`
+# are in WORKER_ONLY_TARGETS, so the transaction already excludes them for
+# control. Running them anyway created `/var/lib/aicc-agent` on a control host
+# -- the very artefact the profile preflight at the top of this script treats as
+# proof that a worker installation is present. A control install therefore
+# poisoned the next control install: the first run created the leftover, the
+# second refused because of it. Gate them on the profile, so the preflight is
+# describing the host rather than this script's own side effect.
+if [ "$install_profile" = "worker" ]; then
+  systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
+  systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+fi
 run_transaction prepare
 transaction_active=1
 run_transaction apply

@@ -1207,6 +1207,87 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
         assert "\nfi\n" not in before[before.rindex(guard):]
 
 
+def _is_behind_worker_guard(text: str, line: str) -> bool:
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+    if line not in text:
+        return False
+    before = text[: text.rindex(line)]
+    if guard not in before:
+        return False
+    # The guard must still be open: an unindented `fi` between the two would
+    # have closed it, leaving the line unconditional after all.
+    return "\nfi\n" not in before[before.rindex(guard):]
+
+
+def test_control_profile_does_not_create_the_artefact_it_refuses():
+    """The defect that made a control install non-idempotent.
+
+    `/usr/lib/tmpfiles.d/aicc-agent.conf` is in WORKER_ONLY_TARGETS, so the
+    transaction never installs it for control — but the script also applied the
+    tmpfiles config straight from the repository, unconditionally, which
+    created `/var/lib/aicc-agent` on the control host anyway. That directory is
+    the first entry in the control preflight's leftovers list, so the first
+    control install manufactured the exact evidence the second one refuses on:
+
+        control profile refuses: worker artefacts present: /var/lib/aicc-agent
+
+    The preflight is not the bug — it runs before any mutation, which is right.
+    The bug is a control run creating worker state at all.
+    """
+    text = _installer_text()
+
+    for line in (
+        'systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"',
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"',
+    ):
+        assert _is_behind_worker_guard(text, line), (
+            f"{line} runs unconditionally; on a control host it creates the "
+            "worker artefact the profile preflight refuses on"
+        )
+
+    # And the preflight still refuses a host that genuinely carries it.
+    assert "/var/lib/aicc-agent" in text
+    assert "control profile refuses: worker artefacts present:" in text
+
+
+def test_the_recovery_unit_is_only_started_for_the_worker_profile():
+    """`/etc/systemd/system/aicc-principal-recovery.service` is worker-only, so
+    on a control host it is never installed and starting it fails on a unit
+    that does not exist. The anchor it recovers from is profile-independent and
+    is installed either way — only the start is gated."""
+    text = _installer_text()
+
+    assert _is_behind_worker_guard(text, "systemctl start aicc-principal-recovery.service"), (
+        "the recovery unit is started unconditionally, but it is not installed "
+        "for the control profile"
+    )
+    # The anchor itself must stay unconditional.
+    assert "run_transaction recovery-anchor-install" in text
+    assert not _is_behind_worker_guard(text, "run_transaction recovery-anchor-install")
+
+
+def test_every_worker_only_unit_the_installer_starts_is_profile_gated():
+    """A standing check rather than a list of the two bugs found: any unit the
+    script starts by name, whose target is in WORKER_ONLY_TARGETS, must be
+    behind the worker guard. This fails if a third one is ever added."""
+    text = _installer_text()
+    tx = _tx_module()
+
+    worker_only_units = {
+        target.rsplit("/", 1)[-1]
+        for target in tx.WORKER_ONLY_TARGETS
+        if target.startswith("/etc/systemd/system/") and "@" not in target
+    }
+    for unit in sorted(worker_only_units):
+        for verb in ("start", "enable --now"):
+            line = f"systemctl {verb} {unit}"
+            if line in text:
+                assert _is_behind_worker_guard(text, line), (
+                    f"{line!r} is worker-only but is not behind the worker guard"
+                )
+
+
+
 # ---------------------------------------------------------------------------
 # The two comparisons that blocked installation on both hosts, 2026-08-31.
 # ---------------------------------------------------------------------------
