@@ -10,6 +10,7 @@ fell back to `repository_path`.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -333,3 +334,159 @@ def test_verification_never_modifies_the_repository(tmp_path):
     after = git_info.get_status(repo)
     assert after["dirty"] is False
     assert after["status_lines"] == before["status_lines"] == []
+
+
+# --------------------------------------------------------------------------
+# Teardown — remove_workspace (VOYN-W0-AICC-ISOLATED-WORKTREE-PER-ATTEMPT)
+# --------------------------------------------------------------------------
+
+
+def test_remove_workspace_removes_a_clean_pipeline_owned_worktree(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-a"
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="task/a",
+        base_branch="main",
+        repository_path=str(repo),
+    )
+    wp.provision_and_verify(spec)
+    assert workspace.is_dir()
+
+    outcome = wp.remove_workspace(workspace, repo)
+
+    assert outcome == "removed"
+    assert not workspace.exists()
+    # No dangling `.git/worktrees/<name>` entry left behind for `task/a`.
+    assert all(entry.get("branch") != "task/a" for entry in git_info.get_worktrees(repo))
+
+
+def test_remove_workspace_on_an_already_removed_path_does_not_raise(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "never-existed"
+
+    assert wp.remove_workspace(workspace, repo) == "not_found"
+
+
+def test_remove_workspace_twice_in_a_row_is_safe(tmp_path):
+    """A second cleanup call (e.g. a retried handler, or a crash-recovery
+    sweep) after the worktree is already gone must not raise or misreport."""
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-b"
+    wp.provision_and_verify(
+        wp.WorkspaceSpec(
+            workspace_path=str(workspace),
+            expected_branch="task/b",
+            base_branch="main",
+            repository_path=str(repo),
+        )
+    )
+
+    first = wp.remove_workspace(workspace, repo)
+    second = wp.remove_workspace(workspace, repo)
+
+    assert first == "removed"
+    assert second == "not_found"
+
+
+def test_remove_workspace_refuses_the_primary_working_tree(tmp_path):
+    """The safety boundary this shares with `is_pipeline_owned_worktree`:
+    never remove the primary checkout, however it is asked."""
+    repo = _make_repo(tmp_path / "repo")
+
+    outcome = wp.remove_workspace(repo, repo)
+
+    assert outcome == "not_owned"
+    assert repo.is_dir() and (repo / "f.txt").exists()
+
+
+def test_remove_workspace_refuses_a_different_repositorys_worktree(tmp_path):
+    repo_a = _make_repo(tmp_path / "repo_a")
+    repo_b = _make_repo(tmp_path / "repo_b")
+    workspace = tmp_path / "wt_a"
+    _git(repo_a, "worktree", "add", "-b", "feature/x", str(workspace), "main")
+
+    outcome = wp.remove_workspace(workspace, repo_b)
+
+    assert outcome == "not_owned"
+    assert workspace.is_dir()
+
+
+def test_remove_workspace_leaves_a_dirty_worktree_for_the_next_reuse(tmp_path):
+    """A dirty worktree (uncommitted/untracked leftovers) refuses a plain
+    `git worktree remove` -- deliberately not force-removed here, so an
+    operator can still inspect it, and the identical path is simply reused
+    ("reused") on the next provision_workspace call for the same branch."""
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-c"
+    spec = wp.WorkspaceSpec(
+        workspace_path=str(workspace),
+        expected_branch="task/c",
+        base_branch="main",
+        repository_path=str(repo),
+    )
+    wp.provision_and_verify(spec)
+    (workspace / "leftover.txt").write_text("uncommitted\n")
+
+    outcome = wp.remove_workspace(workspace, repo)
+
+    assert outcome == "remove_failed"
+    assert workspace.is_dir()
+    assert (workspace / "leftover.txt").exists()
+
+    # The next provision call for the same branch reuses it untouched.
+    reused = wp.provision_and_verify(spec)
+    assert reused.provision_outcome == "reused"
+    assert (workspace / "leftover.txt").exists()
+
+
+# --------------------------------------------------------------------------
+# prune_repository (periodic sweep primitive)
+# --------------------------------------------------------------------------
+
+
+def test_prune_repository_reconciles_metadata_left_by_a_directory_that_vanished(tmp_path):
+    """Simulates the gap `remove_workspace`'s own inline prune cannot reach:
+    a worker killed after `provision_workspace` but before any cleanup call,
+    which leaves the worktree directory deleted (e.g. by the host reclaiming
+    disk) but its `.git/worktrees/<name>` entry still registered."""
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-d"
+    _git(repo, "worktree", "add", "-b", "task/d", str(workspace), "main")
+    assert any(entry.get("branch") == "task/d" for entry in git_info.get_worktrees(repo))
+
+    shutil.rmtree(workspace)  # directory gone; metadata not yet reconciled
+
+    outcome = wp.prune_repository(repo)
+
+    assert outcome == "pruned"
+    assert all(entry.get("branch") != "task/d" for entry in git_info.get_worktrees(repo))
+
+
+def test_prune_repository_is_a_noop_when_nothing_is_dangling(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+
+    assert wp.prune_repository(repo) == "pruned"
+
+
+def test_prune_repository_never_touches_a_live_worktree(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-e"
+    _git(repo, "worktree", "add", "-b", "task/e", str(workspace), "main")
+
+    outcome = wp.prune_repository(repo)
+
+    assert outcome == "pruned"
+    assert workspace.is_dir()
+    assert any(entry.get("branch") == "task/e" for entry in git_info.get_worktrees(repo))
+
+
+def test_prune_repository_refuses_a_non_repository_path(tmp_path):
+    not_a_repo = tmp_path / "plain-dir"
+    not_a_repo.mkdir()
+
+    assert wp.prune_repository(not_a_repo) == "not_a_repository"
+
+
+def test_prune_repository_refuses_a_missing_path(tmp_path):
+    assert wp.prune_repository(tmp_path / "does-not-exist") == "not_a_repository"

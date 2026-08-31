@@ -326,6 +326,9 @@
     "command_center/worker/handlers.py": [
       "orchestration"
     ],
+    "command_center/worker/lease_client.py": [
+      "orchestration"
+    ],
     "command_center/worker/payloads.py": [
       "orchestration"
     ],
@@ -333,6 +336,9 @@
       "orchestration"
     ],
     "command_center/worker/worktree_lease.py": [
+      "orchestration"
+    ],
+    "command_center/worker/writer_lease.py": [
       "orchestration"
     ],
     "command_center/worktree_launcher.py": [

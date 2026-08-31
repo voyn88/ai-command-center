@@ -5,9 +5,27 @@ and go nowhere until this module publishes them. Publishing is gated by the
 same single-writer invariant the pre-push hook enforces: a branch is pushed
 only while this process holds the repository's writer lease, acquired through
 the very tool the hook verifies (``voyn-lease``) — never bypassed with
-``--no-verify``. The deploy key (added to GitHub with write access) is the
-push credential; ``gh`` opens the PR carrying the ``HEAD_SHA:`` trailer that
-result-ingest already parses.
+``--no-verify``. ``gh``'s own OAuth credential over the HTTPS-rewritten
+``origin`` is the push credential (see ``_https_push_target``); the deploy
+key is the opt-in switch for publishing at all and the credential only on
+the SSH fallback. ``gh`` also opens the PR carrying the ``HEAD_SHA:`` trailer
+that result-ingest already parses.
+
+That lease has an on-disk shadow, which is why every ``acquire`` here is
+followed by ``install-hooks`` under the identity it just acquired (#351).
+The hook presents repository/owner/session/task/pid/process-start read from
+``voyn-lease.env`` — one file in the clone's common git dir, shared by every
+worktree of that clone — and it used to be written once per host, so it froze
+on a long-dead process and ``verify`` refused every push no matter who really
+held the lease. The refresh buys exactly one thing, and it is not a standing
+invariant: while this publish holds the lease, the file names this publisher.
+``release`` leaves it behind, so between publishes the file names a writer
+that already released — harmless, because ``verify`` then finds no matching
+row and refuses. Nor can it come to name the wrong *live* holder: the lease
+authority keys one row per repository id, which every worktree of this clone
+publishes under, so no two of them hold it at once, and ``verify`` recomputes
+worktree, branch and head from the pushing checkout rather than trusting the
+file. Deleting the call brings the frozen identity back; it is not redundant.
 
 Every outcome is data (a ``PublishResult``); this never raises into the
 worker loop. A run that produced no commit is reported as ``nothing_to_publish``,
@@ -19,6 +37,8 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from command_center.worker import lease_client
 
 __all__ = ["PublishConfig", "PublishResult", "publish_run"]
 
@@ -33,6 +53,19 @@ class PublishConfig:
     deploy_key: str  # path to the per-repo deploy private key
     base: str = "main"
     ttl: int = 600
+    # False when the caller already holds the writer lease for the whole
+    # provision->agent->tests->publish lifecycle (`writer_lease.hold`,
+    # VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE) and will release it itself.
+    # `acquire`/`install-hooks` stay unconditional either way -- both are
+    # idempotent re-affirmations under an already-held lease -- but
+    # `release` here is a real termination of the row, not a re-affirmation:
+    # dropping it mid-function, before this call's own `gh pr view`/
+    # `gh pr create` and the caller's post-publish worktree cleanup, would
+    # reopen exactly the unfenced window that lease exists to close. Default
+    # True preserves this module's own standalone behavior (its docstring's
+    # "acquired through... never bypassed" contract) for any caller that
+    # does not hold an outer lease.
+    release_lease: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,14 +89,16 @@ def _run(argv: list[str], cwd: Path, env_extra: dict[str, str] | None = None) ->
 
 
 def _lease_argv(cfg: PublishConfig, verb: str, repo_path: Path) -> list[str]:
-    import os
-
-    return [
-        cfg.lease_tool, "--repo", str(repo_path), verb,
-        "--repository", cfg.repository, "--owner", cfg.owner,
-        "--session", cfg.session, "--task", cfg.task,
-        "--pid", str(os.getpid()), "--process-start", _process_start(),
-    ]
+    # Delegates to the shared `lease_client` module so this argv shape and
+    # `writer_lease.py`'s (VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE, the
+    # lease held across the whole provision->agent->tests->publish
+    # lifecycle, not just this push) can never drift apart.
+    identity = lease_client.LeaseIdentity(
+        lease_tool=cfg.lease_tool, repository=cfg.repository,
+        owner=cfg.owner, session=cfg.session, task=cfg.task,
+        ttl=cfg.ttl,
+    )
+    return lease_client.lease_argv(identity, verb, repo_path)
 
 
 def _https_push_target(repo_path: Path) -> str | None:
@@ -90,18 +125,6 @@ def _https_push_target(repo_path: Path) -> str | None:
     return None
 
 
-def _process_start() -> str:
-    # The lease binds ownership to (pid, process-start) so a recycled pid
-    # cannot inherit a dead process's lease. Read this process's start from
-    # /proc; falls back to "0" where unavailable (the lease tool still keys
-    # on pid+owner+session, which is enough for the single-writer guarantee).
-    try:
-        with open(f"/proc/{__import__('os').getpid()}/stat", encoding="ascii") as fh:
-            return fh.read().split(") ", 1)[1].split()[19]
-    except (OSError, IndexError):
-        return "0"
-
-
 def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     """Acquire the lease, push a branch, open a PR. Idempotent on the branch
     name (``backlog/<task>``): a re-run force-updates the same branch and
@@ -121,6 +144,29 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         # The lease is held by another writer: a data refusal, the attempt
         # returns to the pool and a later tick retries — never a forced push.
         return PublishResult(ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}")
+    # Live-reproduced 2026-08-21: `install-hooks` is what writes the
+    # pre-push hook's `voyn-lease.env` (repository/owner/session/task/pid/
+    # process-start) -- and it had only ever been run once, at whatever
+    # moment the hooks were first provisioned on this host. The pre-push
+    # hook reads that FROZEN file on every push and compares it against the
+    # lease row THIS `acquire` just wrote fresh, so `verify` refused every
+    # push with `VOYN_LEASE_REFUSED verify mismatch` once the identity that
+    # provisioned the hooks (an old, long-dead process) no longer matched
+    # anything this or any later worker process would ever present. Calling
+    # `install-hooks` with the exact same identity args as the `acquire`
+    # that just succeeded keeps the hook's on-disk copy of "who currently
+    # holds this lease" in lockstep with the database row `verify` actually
+    # checks against -- every acquire re-provisions it, not just the first
+    # one ever run on a host. Failing this fails closed (release, refuse to
+    # push) rather than attempting a push `verify` is already known to
+    # reject with this stale a file.
+    hooks = _run(_lease_argv(cfg, "install-hooks", repo_path), repo_path)
+    if hooks.returncode != 0:
+        if cfg.release_lease:
+            _run(_lease_argv(cfg, "release", repo_path), repo_path)
+        return PublishResult(
+            ok=False, reason=f"install_hooks_failed: {hooks.stderr.strip()[:120]}"
+        )
     try:
         https_target = _https_push_target(repo_path)
         if https_target is not None:
@@ -140,7 +186,8 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         if push.returncode != 0:
             return PublishResult(ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}")
     finally:
-        _run(_lease_argv(cfg, "release", repo_path), repo_path)
+        if cfg.release_lease:
+            _run(_lease_argv(cfg, "release", repo_path), repo_path)
 
     body = (
         f"Autonomous delivery of {cfg.task}.\n\n"

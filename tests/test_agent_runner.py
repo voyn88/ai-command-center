@@ -1,5 +1,8 @@
+import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -237,18 +240,58 @@ def test_build_command_includes_model_only_when_given():
 
 # --------------------------------------------------------------------------
 # run_claude_code — subprocess safety and every terminal status
+#
+# These tests deliberately run REAL subprocesses (monkeypatching only
+# `build_command`, never `subprocess`/`Popen` itself), per VOYN-W0-AICC-
+# FORCED-AGENT-CANCELLATION: the defect this task closes -- a killed PID
+# leaving its process-GROUP alive -- is invisible to a mocked subprocess and
+# can only be proven by actually spawning a child and checking it is gone.
 # --------------------------------------------------------------------------
 
 
-def test_run_claude_code_never_uses_shell_true(monkeypatch, tmp_path):
-    captured = {}
+def _fake_command(script: str, *extra_args: str) -> list[str]:
+    """A real, runnable command: `python -c <script> <extra_args>`."""
+    return [sys.executable, "-c", script, *extra_args]
 
-    def fake_run(command, **kwargs):
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just not signalable by us -- still "alive"
+    return True
+
+
+def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def test_run_claude_code_never_uses_shell_true(monkeypatch, tmp_path):
+    """`Popen` is called with an argv list and no shell, exactly like the
+    previous `subprocess.run` form. This one test stays a mock (only Popen's
+    *kwargs*, not the OS behavior, are under test here)."""
+    captured = {}
+    real_popen = subprocess.Popen
+
+    def _spy_popen(command, **kwargs):
         captured["command"] = command
         captured["kwargs"] = kwargs
-        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+        return real_popen(command, **kwargs)
 
-    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(agent_runner.subprocess, "Popen", _spy_popen)
+    monkeypatch.setattr(
+        agent_runner, "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
+            "import sys; sys.exit(0)"
+        ),
+    )
     result = agent_runner.run_claude_code(
         repository_path=tmp_path, prompt="hello", task_type="implementation", timeout_seconds=30
     )
@@ -256,43 +299,204 @@ def test_run_claude_code_never_uses_shell_true(monkeypatch, tmp_path):
     assert isinstance(captured["command"], list)
     assert captured["kwargs"].get("shell", False) is False
     assert captured["kwargs"]["cwd"] == tmp_path
-    assert captured["kwargs"]["timeout"] == 30
-
-
-def test_run_claude_code_handles_timeout(monkeypatch, tmp_path):
-    def fake_run(command, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout", 30))
-
-    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
-    result = agent_runner.run_claude_code(
-        repository_path=tmp_path, prompt="hello", task_type="implementation", timeout_seconds=5
-    )
-    assert result.status == "timed_out"
-    assert result.exit_code is None
+    # Process-group leader kwargs (VOYN-W0-AICC-FORCED-AGENT-CANCELLATION):
+    # without this, group-wide termination would also reach the test runner.
+    if sys.platform == "win32":
+        assert captured["kwargs"].get("creationflags", 0) & subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        assert captured["kwargs"].get("start_new_session") is True
 
 
 def test_run_claude_code_handles_nonzero_exit(monkeypatch, tmp_path):
-    def fake_run(command, **kwargs):
-        return subprocess.CompletedProcess(command, 1, stdout="", stderr="boom")
-
-    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        agent_runner, "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
+            "import sys; sys.stderr.write('boom'); sys.exit(1)"
+        ),
+    )
     result = agent_runner.run_claude_code(
         repository_path=tmp_path, prompt="hello", task_type="review", timeout_seconds=5
     )
     assert result.status == "failed"
     assert result.exit_code == 1
+    assert "boom" in result.stderr
 
 
 def test_run_claude_code_handles_missing_binary(monkeypatch, tmp_path):
-    def fake_run(command, **kwargs):
-        raise FileNotFoundError("claude not found")
-
-    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        agent_runner, "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: [
+            "/no/such/claude-binary-for-test", "-p", prompt
+        ],
+    )
     result = agent_runner.run_claude_code(
         repository_path=tmp_path, prompt="hello", task_type="review", timeout_seconds=5
     )
     assert result.status == "failed"
     assert result.exit_code is None
+
+
+def test_run_claude_code_handles_timeout_and_kills_the_process_group(monkeypatch, tmp_path):
+    """The existing `timeout_seconds` path, preserved: a run that outlives its
+    timeout is reported `timed_out` with `exit_code is None`, exactly as the
+    previous `subprocess.run(timeout=...)` implementation reported it — but
+    now the process is actually confirmed terminated (group-wide) rather than
+    merely abandoned to its own devices once `TimeoutExpired` was raised."""
+    monkeypatch.setattr(
+        agent_runner, "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
+            "import time; time.sleep(60)"
+        ),
+    )
+    started = time.monotonic()
+    result = agent_runner.run_claude_code(
+        repository_path=tmp_path, prompt="hello", task_type="implementation", timeout_seconds=1
+    )
+    elapsed = time.monotonic() - started
+    assert result.status == "timed_out"
+    assert result.exit_code is None
+    # Default SIGTERM handling kills a plain `time.sleep` almost immediately —
+    # this must not take anywhere near the full termination grace period.
+    assert elapsed < 10
+
+
+def test_run_claude_code_completed_process_is_never_signaled(monkeypatch, tmp_path):
+    """A run that exits cleanly on its own, before any cancellation trigger
+    fires, must never receive a signal at all."""
+    killpg_calls: list[tuple[int, int]] = []
+    if sys.platform != "win32":
+        real_killpg = os.killpg
+
+        def _spy_killpg(pgid, sig):
+            killpg_calls.append((pgid, sig))
+            return real_killpg(pgid, sig)
+
+        monkeypatch.setattr(agent_runner.os, "killpg", _spy_killpg)
+
+    monkeypatch.setattr(
+        agent_runner, "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
+            "import sys; sys.stdout.write('done'); sys.exit(0)"
+        ),
+    )
+    cancel_event = threading.Event()  # never set
+    result = agent_runner.run_claude_code(
+        repository_path=tmp_path, prompt="hello", task_type="implementation",
+        timeout_seconds=30, cancel_event=cancel_event,
+    )
+    assert result.status == "completed"
+    assert result.exit_code == 0
+    assert result.stdout == "done"
+    assert killpg_calls == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM/killpg semantics are POSIX-specific")
+def test_run_claude_code_cancel_event_sigterms_a_running_process(monkeypatch, tmp_path):
+    """A process still running when `cancel_event` fires gets SIGTERM'd and
+    exits within the grace period — SIGKILL is never needed."""
+    monkeypatch.setattr(
+        agent_runner, "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
+            # No custom handler: the platform default action for SIGTERM
+            # (immediate termination) is exactly what "responds to SIGTERM"
+            # means for this test.
+            "import time; time.sleep(60)"
+        ),
+    )
+    cancel_event = threading.Event()
+
+    def _trigger_cancel_shortly() -> None:
+        time.sleep(agent_runner.CANCEL_POLL_INTERVAL_SECONDS * 2)
+        cancel_event.set()
+
+    threading.Thread(target=_trigger_cancel_shortly, daemon=True).start()
+
+    started = time.monotonic()
+    result = agent_runner.run_claude_code(
+        repository_path=tmp_path, prompt="hello", task_type="implementation",
+        timeout_seconds=300, cancel_event=cancel_event,
+        termination_grace_seconds=10,
+    )
+    elapsed = time.monotonic() - started
+    assert result.status == "cancelled"
+    # Responded to SIGTERM well within the 10s grace period — SIGKILL was
+    # never required, so this returns quickly rather than waiting out the
+    # whole grace window.
+    assert elapsed < 8
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM/killpg semantics are POSIX-specific")
+def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(monkeypatch, tmp_path):
+    """A process that ignores SIGTERM is SIGKILL'd once the grace period
+    elapses, and the run is still reported (never hangs forever)."""
+    monkeypatch.setattr(
+        agent_runner, "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: _fake_command(
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(60)"
+        ),
+    )
+    cancel_event = threading.Event()
+    cancel_event.set()  # already lost before the run even starts polling
+
+    started = time.monotonic()
+    result = agent_runner.run_claude_code(
+        repository_path=tmp_path, prompt="hello", task_type="implementation",
+        timeout_seconds=300, cancel_event=cancel_event,
+        termination_grace_seconds=1.0,
+    )
+    elapsed = time.monotonic() - started
+    assert result.status == "cancelled"
+    # Had to wait out the (short, test-scoped) grace period before SIGKILL —
+    # proves escalation actually happened, not just an early SIGTERM success.
+    assert elapsed >= 1.0
+    assert elapsed < 10
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="process-group semantics are POSIX-specific")
+def test_run_claude_code_cancellation_kills_the_whole_process_group(monkeypatch, tmp_path, tmp_path_factory):
+    """The actual defect class under test: killing only the direct child PID
+    (what a plain `Popen.kill()`/`proc.terminate()` would do) leaves a
+    grandchild the CLI spawned running and orphaned. This spawns a real
+    grandchild, cancels the run, and asserts the grandchild is also dead —
+    proof of process-GROUP termination, not merely "terminate() was called"."""
+    pid_file = tmp_path_factory.mktemp("pidfile") / "child.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        f"pid_file = {str(pid_file)!r}\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "open(pid_file, 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(
+        agent_runner, "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: [sys.executable, "-c", script],
+    )
+    cancel_event = threading.Event()
+
+    def _trigger_cancel_once_child_exists() -> None:
+        _wait_until(pid_file.exists, timeout=5.0)
+        cancel_event.set()
+
+    threading.Thread(target=_trigger_cancel_once_child_exists, daemon=True).start()
+
+    result = agent_runner.run_claude_code(
+        repository_path=tmp_path, prompt="hello", task_type="implementation",
+        timeout_seconds=300, cancel_event=cancel_event,
+        termination_grace_seconds=10,
+    )
+    assert result.status == "cancelled"
+    assert pid_file.exists()
+    grandchild_pid = int(pid_file.read_text().strip())
+    # `run_claude_code` does not return until the group is confirmed
+    # terminated, so the grandchild must already be gone — no extra wait
+    # should be necessary, but a short bounded poll absorbs kernel-level
+    # reaping/scheduling jitter without masking a real regression.
+    assert _wait_until(lambda: not _pid_alive(grandchild_pid), timeout=5.0), (
+        f"grandchild pid {grandchild_pid} survived process-group cancellation "
+        "— only the direct child was killed, not the whole group"
+    )
 
 
 # --------------------------------------------------------------------------

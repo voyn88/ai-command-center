@@ -25,12 +25,32 @@ Two responsibilities, kept separate so callers can compose them:
 
 `provision_and_verify(spec)` runs both in order.
 
-Git-write surface: the only mutating git subcommand this module ever runs is
-`git worktree add` (and only from `provision_workspace`, only when the target
-path does not already exist). It never runs `commit`/`push`/`merge`/`reset`/
-`rebase`/`clean`/`checkout`/branch-delete, and never touches a worktree it did
-not itself create. All other git access is read-only, via
-`command_center.git_info`.
+`remove_workspace(workspace_path, repository_path)` is the lifecycle's other
+half (VOYN-W0-AICC-ISOLATED-WORKTREE-PER-ATTEMPT): best-effort `git worktree
+remove` for a worktree this module (or an equivalent provisioner using the
+same convention) provisioned, gated by `is_pipeline_owned_worktree` so it can
+never remove a human's primary working tree, a different repository, or a
+worktree it cannot prove it owns.
+
+`prune_repository(repository_path)` closes the gap `remove_workspace`'s
+paired prune does not cover: a worker crash between `provision_workspace`
+and any cleanup attempt, or a `remove_workspace` call that returned
+`"not_owned"`/`"remove_failed"`, leaves a dangling `.git/worktrees/<name>`
+entry that nothing else ever revisits. `command_center.worktree_sweep` calls
+this periodically (via `aicc-worktree-prune.timer`) for every repository this
+host has configured, rather than adding a standalone reconciler here — the
+prune primitive belongs beside `remove_workspace`'s own use of it, the
+scheduling loop does not.
+
+Git-write surface: the only mutating git subcommands this module ever runs
+are `git worktree add` (from `provision_workspace`, only when the target path
+does not already exist) and `git worktree remove` / `git worktree prune`
+(from `remove_workspace`, only on a path already proven pipeline-owned, and
+from `prune_repository`, scoped to a repository path the caller already
+verified is configured on this host). It never runs
+`commit`/`push`/`merge`/`reset`/`rebase`/`clean`/`checkout`/branch-delete,
+and never touches a worktree it did not itself create or cannot prove it
+owns. All other git access is read-only, via `command_center.git_info`.
 """
 
 from __future__ import annotations
@@ -577,3 +597,95 @@ def provision_and_verify(spec: WorkspaceSpec) -> VerificationEvidence:
     evidence = verify_workspace(spec)
     evidence.provision_outcome = outcome
     return evidence
+
+
+# --------------------------------------------------------------------------
+# Teardown (the other mutating git subcommands: `worktree remove` / `prune`)
+# --------------------------------------------------------------------------
+
+
+def remove_workspace(workspace_path: str | Path, repository_path: str | Path) -> str:
+    """Best-effort teardown of a worktree this module (or a caller using the
+    same convention) provisioned. Never raises: this runs after a task's
+    outcome is already decided, so a cleanup failure must turn into a log
+    line for the next sweep, never into a retried or lost report.
+
+    Scoped by `is_pipeline_owned_worktree` — it removes only a linked
+    worktree of `repository_path`, never the primary working tree, a
+    different repository, or a path it cannot prove it owns — so a caller may
+    invoke this unconditionally on every attempt without risking a directory
+    it did not create.
+
+    Returns one of:
+    - `"removed"` — the worktree and its `.git/worktrees/<name>` metadata are
+      gone.
+    - `"not_found"` — nothing was there to remove (already cleaned by a prior
+      attempt, or provisioning never got far enough to create it).
+    - `"not_owned"` — fails closed rather than delete something unproven.
+    - `"remove_failed"` — `git worktree remove` refused, most commonly a
+      dirty tree (uncommitted or untracked leftovers). Deliberately not
+      retried with `--force`: force-removing would destroy whatever an agent
+      or an operator might still want to inspect after a failure. The path is
+      simply left in place and reused (`"reused"`) by the next
+      `provision_workspace` call for the same branch.
+    """
+    workspace = _resolve(workspace_path)
+    if not workspace.exists():
+        return "not_found"
+    if not is_pipeline_owned_worktree(workspace, repository_path):
+        return "not_owned"
+    repo = _resolve(repository_path)
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "remove", str(workspace)],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "remove_failed"
+    if result.returncode != 0:
+        return "remove_failed"
+    # Reconciles this worktree's own `.git/worktrees/<name>` entry
+    # immediately, on the success path. `prune_repository` below covers every
+    # other path (crash, "not_owned", "remove_failed") via the periodic sweep.
+    prune_repository(repo)
+    return "removed"
+
+
+def prune_repository(repository_path: str | Path) -> str:
+    """Reconcile dangling `.git/worktrees/<name>` metadata for
+    `repository_path` via `git worktree prune`.
+
+    Read-mostly and safe: it only removes bookkeeping for a worktree whose
+    directory is already gone, never a worktree directory itself, and never
+    touches this repository's working tree or any other worktree's files.
+
+    Exists for the sweep `remove_workspace`'s inline prune cannot cover: a
+    worker crash between `provision_workspace` and any cleanup attempt, or a
+    `remove_workspace` call that returned `"not_owned"`/`"remove_failed"`,
+    leaves dangling metadata that only a later, independent pass ever
+    revisits. `command_center.worktree_sweep` is that pass — it calls this
+    once per repository this host has configured, on a periodic cadence.
+
+    Returns `"pruned"` on success, `"not_a_repository"` if `repository_path`
+    is not a git repository on this host, or `"prune_failed"` on any other
+    git/OS error. Never raises, so a sweep over many repositories cannot be
+    aborted by one bad path — same contract as `remove_workspace`."""
+    repo = _resolve(repository_path)
+    if not repo.is_dir() or not git_info.get_status(repo).get("is_repo"):
+        return "not_a_repository"
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "prune_failed"
+    return "pruned" if result.returncode == 0 else "prune_failed"
