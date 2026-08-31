@@ -261,12 +261,25 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
             continue
         pr_url = matches[0]["url"]
+        # Written through `backlog_record_evidence`, never a direct INSERT:
+        # the control plane's role has no write grant on `backlog_evidence`
+        # itself, and every other writer in this codebase goes through the
+        # same SECURITY DEFINER entry point. A direct INSERT passed locally
+        # and failed in CI with `permission denied for table
+        # backlog_evidence` -- which is exactly what it would have done in
+        # production.
         with factory() as conn, conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO backlog_evidence (task_id, kind, value) "
-                "VALUES (%s, 'pr', %s) ON CONFLICT DO NOTHING",
+                "SELECT * FROM backlog_record_evidence(%s, 'pr', %s)",
                 (row_task_id, pr_url),
             )
+            verdict = cur.fetchone()
+        # The function reports a refusal rather than raising, so a refusal
+        # that is not surfaced would look exactly like a successful record.
+        if not verdict or not verdict[0]:
+            reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+            report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
+            continue
         report.recorded.append((row_task_id, pr_url))
     return report
 
