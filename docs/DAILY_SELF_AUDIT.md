@@ -69,9 +69,56 @@ python scripts/daily_audit_daemon.py --reset-circuit
 `__ROOT__`, `__PYTHON__`, `__PATH__` and `__DATA_DIR__` with absolute paths
 before installing it. `AICC_DATA_DIR` must be the same directory used by the
 Streamlit application; otherwise campaigns run correctly but cannot appear in
-the application UI. The
-process is kept alive, while the SQLite due time and lease ensure that only one
+the application UI. The service is installed as a **system** LaunchDaemon so
+it keeps running whether or not any account is logged in -- it is not loaded
+into a per-user GUI session:
+
+```text
+sudo cp deploy/com.ai-command-center.daily-audit.plist \
+    /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl bootstrap system \
+    /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+```
+
+The process is kept alive, while the SQLite due time and lease ensure that only one
 campaign is dispatched per day and that another host cannot duplicate it.
+
+## Migrating from the legacy per-user LaunchAgent
+
+Earlier deployments loaded this plist into a signed-in user's GUI domain
+(`gui/<uid>`) instead of the system domain. That LaunchAgent stops as soon as
+the account logs out, so it has been superseded by the system LaunchDaemon
+above. Installing the LaunchDaemon does **not** unload the old agent --
+leaving both loaded means two long-lived processes can dispatch the same
+day's campaign. Remove the legacy agent explicitly, for every account it was
+ever loaded under:
+
+```text
+launchctl bootout gui/$(id -u)/com.ai-command-center.daily-audit
+```
+
+The target must be `gui/<uid>/<label>` -- one path naming a single service
+inside the domain. `gui/<uid> <label>` (the label as a second,
+space-separated argument) is a different invocation that `launchctl` accepts
+without error but that does not remove the service, leaving the old
+LaunchAgent running underneath the new LaunchDaemon.
+
+Confirm removal, then delete the old plist so `RunAtLoad` cannot reinstate it
+on the next login:
+
+```text
+launchctl print gui/$(id -u)/com.ai-command-center.daily-audit   # expect: not found
+rm -f ~/Library/LaunchAgents/com.ai-command-center.daily-audit.plist
+```
+
+The Streamlit panel's "Сервис" tile always probes both the system
+LaunchDaemon domain and every reachable `gui/<uid>` domain on the Mac -- a
+running LaunchDaemon does not suppress the legacy check -- and warns if a
+legacy agent is still loaded anywhere it could inspect, including other
+local accounts when this process has permission to read their GUI domain.
+An account it cannot inspect (insufficient privilege) is reported as
+unverified rather than as clean/absent; run the check once as an
+administrator if you need certainty across every account on a shared Mac.
 
 ## Safety and recovery contract
 
