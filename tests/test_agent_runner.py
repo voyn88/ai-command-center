@@ -554,6 +554,9 @@ def test_run_claude_code_cancel_event_sigterms_a_running_process(monkeypatch, tm
     assert elapsed < 8
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="os.killpg and SIG_IGN are POSIX-specific"
+)
 def test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored(
     monkeypatch, tmp_path
 ):
