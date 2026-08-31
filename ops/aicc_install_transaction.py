@@ -826,7 +826,19 @@ def restore_service_snapshot(
         pid_rc, main_pid = probe("show", unit, "--property=MainPID", "--value")
         _active_rc, active = probe("is-active", unit)
         _enabled_rc, enabled = probe("is-enabled", unit)
-        if load_rc or pid_rc or not load_state or not main_pid:
+        # `MainPID` is a service property. A `.socket`, `.timer` or `.path`
+        # unit has none, so systemd returns an empty value and a non-zero
+        # probe -- and a unit the snapshot records as absent has none either,
+        # for the obvious reason. Demanding it unconditionally made recovery
+        # unable to prove the state of `aicc-agent-launcher.socket`, and a
+        # recovery that cannot finish blocks every install behind it
+        # (observed live on worker-01, 2026-08-31).
+        expects_main_pid = unit.endswith(".service") and state["exists"]
+        if (
+            load_rc
+            or not load_state
+            or (expects_main_pid and (pid_rc or not main_pid))
+        ):
             raise RuntimeError(f"cannot prove restored service state: {unit}")
         expected_active = state["active"]
         expected_enabled = state["enabled"]

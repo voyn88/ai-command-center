@@ -2007,3 +2007,87 @@ def test_symlink_restore_refuses_a_vanished_target(tmp_path):
     manifest = next(state.rglob("manifest.json"))
     with pytest.raises(RuntimeError, match="disappeared"):
         transaction.restore(manifest)
+
+
+def test_recovery_does_not_demand_a_mainpid_from_a_socket_unit(tmp_path):
+    """`MainPID` is a service property. A `.socket` has none, so systemd
+    returns an empty value and a non-zero probe — and demanding it anyway made
+    recovery unable to prove the state of `aicc-agent-launcher.socket`. A
+    recovery that cannot finish leaves its WAL in place, and the retained WAL
+    then refuses every install behind it (observed live on worker-01,
+    2026-08-31).
+    """
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-agent-launcher.socket": {
+                        "exists": True,
+                        "enabled": False,
+                        "active": False,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(command, **kwargs):
+        action = command[1]
+        stdout = ""
+        if action == "is-active":
+            stdout = "inactive\n"
+        elif action == "is-enabled":
+            stdout = "disabled\n"
+        elif action == "show":
+            if "LoadState" in " ".join(command):
+                stdout = "loaded\n"
+            else:
+                # What systemd actually answers for a socket: nothing, and a
+                # non-zero status for the unknown property.
+                return SimpleNamespace(returncode=1, stderr="", stdout="")
+        return SimpleNamespace(returncode=0, stderr="", stdout=stdout)
+
+    module.restore_service_snapshot(snapshot, run=run)
+
+
+def test_a_service_that_exists_must_still_report_a_mainpid(tmp_path):
+    """The relaxation is for units that have no such property, not for
+    services that fail to answer — that remains unprovable state."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(command, **kwargs):
+        action = command[1]
+        stdout = ""
+        if action == "is-active":
+            stdout = "active\n"
+        elif action == "is-enabled":
+            stdout = "enabled\n"
+        elif action == "show":
+            if "LoadState" in " ".join(command):
+                stdout = "loaded\n"
+            else:
+                return SimpleNamespace(returncode=1, stderr="", stdout="")
+        return SimpleNamespace(returncode=0, stderr="", stdout=stdout)
+
+    with pytest.raises(RuntimeError, match="cannot prove restored service state"):
+        module.restore_service_snapshot(snapshot, run=run)
