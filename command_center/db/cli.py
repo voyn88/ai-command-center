@@ -386,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
                 # derives that evidence from the task's own branch, so a pull
                 # request opened outside `publish_run` still reaches review.
                 evidence = reconcile_pr_evidence(
-                    lambda: _nc(conn), task_id=args.task_id
+                    lambda: _nc(conn), args.repo_path, task_id=args.task_id
                 )
                 for evidence_task_id, pr in evidence.recorded:
                     print(f"PR-FOUND  {evidence_task_id} -> {pr}")

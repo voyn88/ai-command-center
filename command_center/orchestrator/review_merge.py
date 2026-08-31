@@ -154,6 +154,7 @@ def _task_branch(task_id: str) -> str:
 
 def reconcile_pr_evidence(
     factory: Any,
+    repo_path: str,
     *,
     task_id: str | None = None,
     limit: int = 25,
@@ -180,6 +181,17 @@ def reconcile_pr_evidence(
     * exactly one open PR may match, because two would make the choice a guess;
     * a task that already has any `pr` evidence is left alone, so this can
       never overwrite or compete with what `publish_run` recorded.
+
+    The lookup runs in `repo_path` -- the checkout this tick was given --
+    exactly as `review_once` does for its own `gh` calls. The route table is
+    consulted only to confirm the task belongs to a routed repository at all:
+    its second element is a *worker's* local path, which need not exist on the
+    host running the tick. Using it here made the first live run die with
+    `FileNotFoundError: /home/voynadmin/Projects/ai-command-center`. A task
+    whose repository is not the one `repo_path` points at simply finds no
+    branch and is skipped, which is the safe outcome -- `gh` searches the
+    origin of that checkout and nothing else, so a task can never be attached
+    to a pull request in another repository.
 
     Reporting only: no status is changed here. A task becomes reviewable
     because it is `READY_TO_REVIEW` and now has evidence, through the same
@@ -213,11 +225,9 @@ def reconcile_pr_evidence(
         if not repo:
             report.skipped.append((row_task_id, "no_repo_on_task"))
             continue
-        route = repo_route(repo)
-        if route is None:
+        if repo_route(repo) is None:
             report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
             continue
-        _project_id, repository_path = route
         branch = _task_branch(row_task_id)
         listed = _gh(
             [
@@ -230,7 +240,7 @@ def reconcile_pr_evidence(
                 "--json",
                 "url,headRefName",
             ],
-            repository_path,
+            repo_path,
         )
         if listed.returncode != 0:
             report.skipped.append((row_task_id, "pr_list_failed"))

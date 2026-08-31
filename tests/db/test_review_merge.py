@@ -2726,6 +2726,11 @@ def _ready_without_pr(store, factory, task_id, repo="repo-d2"):
         c.commit()
 
 
+#: The checkout a tick is given. `gh` runs here, never in the route table's
+#: worker-local path, which need not exist on the host running the tick.
+REPO = "/srv/repo-d2"
+
+
 def _pr_rows(factory, task_id):
     with factory() as c, c.cursor() as cur:
         cur.execute(
@@ -2758,7 +2763,7 @@ def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, 
         _fake_pr_list([{"url": url, "headRefName": f"backlog/{task_id}"}]),
     )
 
-    report = reconcile_pr_evidence(app_factory)
+    report = reconcile_pr_evidence(app_factory, REPO)
 
     assert (task_id, url) in report.recorded
     assert _pr_rows(app_factory, task_id) == [url]
@@ -2780,7 +2785,7 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
         ),
     )
 
-    report = reconcile_pr_evidence(app_factory)
+    report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
     assert (task_id, "no_open_pr_on_task_branch") in report.skipped
@@ -2800,7 +2805,7 @@ def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_r
         ),
     )
 
-    report = reconcile_pr_evidence(app_factory)
+    report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
     assert (task_id, "ambiguous_open_prs_on_branch") in report.skipped
@@ -2822,7 +2827,7 @@ def test_an_existing_pr_evidence_row_is_never_touched(rig, _test_repo_routes, mo
         ),
     )
 
-    report = reconcile_pr_evidence(app_factory)
+    report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == [recorded]
     assert all(entry[0] != task_id for entry in report.recorded)
@@ -2833,11 +2838,11 @@ def test_a_failed_or_undecodable_lookup_records_nothing(rig, _test_repo_routes, 
     failed, garbage = "VOYN-W0-PRE5", "VOYN-W0-PRE6"
     _ready_without_pr(store, app_factory, failed)
     monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([], returncode=1))
-    assert (failed, "pr_list_failed") in reconcile_pr_evidence(app_factory).skipped
+    assert (failed, "pr_list_failed") in reconcile_pr_evidence(app_factory, REPO).skipped
 
     _ready_without_pr(store, app_factory, garbage)
     monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([], stdout="{not json"))
-    report = reconcile_pr_evidence(app_factory)
+    report = reconcile_pr_evidence(app_factory, REPO)
 
     assert (garbage, "pr_list_undecodable") in report.skipped
     assert _pr_rows(app_factory, failed) == []
@@ -2861,7 +2866,29 @@ def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeyp
         ),
     )
 
-    report = reconcile_pr_evidence(app_factory)
+    report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
     assert all(entry[0] != task_id for entry in report.recorded)
+
+
+def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Not the route table's path. That second element is a worker's local
+    directory and need not exist on the host running the tick — using it made
+    the first live run die with `FileNotFoundError` on a path that exists only
+    on another machine."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE8"
+    _ready_without_pr(store, app_factory, task_id)
+    seen: list[str] = []
+
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        seen.append(repo)
+        return sp.CompletedProcess(argv, 0, json.dumps([]), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    reconcile_pr_evidence(app_factory, REPO)
+
+    assert seen == [REPO]
