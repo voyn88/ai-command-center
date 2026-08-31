@@ -1501,6 +1501,15 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
 
     monkeypatch.setattr(supervisor.agent_runner, "git_snapshot", block_post_run_snapshot)
 
+    # The watchdog's deadline starts when the process is spawned, so this
+    # budget has to clear interpreter startup with room to spare. At 0.5s it
+    # did not: on a loaded shard the child had not finished within the
+    # deadline, the watchdog correctly timed it out, and the test failed with
+    # `assert True is False` — reporting a product defect where there was only
+    # a runner slow enough to invalidate the test's own premise. That premise
+    # is now asserted explicitly instead of assumed.
+    timeout_seconds = 2.0
+    started = time.monotonic()
     sup = supervisor.Supervisor()
     run = sup.start_raw(
         project="AIOS",
@@ -1508,15 +1517,28 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
         task_type="implementation",
         prompt="p",
         confirmed=True,
-        timeout_seconds=0.5,
+        timeout_seconds=timeout_seconds,
     )
     with sup._active_lock:
         active = sup._active[run["id"]]
 
     try:
-        assert finalization_entered.wait(timeout=5)
+        assert finalization_entered.wait(timeout=10)
         assert active.process_exited_event.is_set()
-        time.sleep(0.7)
+        exited_after = time.monotonic() - started
+        assert exited_after < timeout_seconds, (
+            "premise not met: the process took "
+            f"{exited_after:.3f}s to exit, past its own {timeout_seconds}s "
+            "deadline, so a timeout here is correct behaviour and this test "
+            "cannot say anything about slow finalization"
+        )
+
+        # Wait past the deadline while finalization is still blocked: this is
+        # the whole scenario — the run is finished, the bookkeeping is not, and
+        # the watchdog must stay out of it.
+        remaining = (started + timeout_seconds + 0.5) - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
 
         assert active.timeout_triggered.is_set() is False
         events = db.list_run_events(sup.db_path, run["id"])
