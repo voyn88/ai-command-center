@@ -725,6 +725,39 @@ def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bo
     )
 
 
+#: Fields systemd reports inside a command property that describe the *last
+#: invocation*, not the configuration. `ExecStart` is rendered as
+#: `{ path=… ; argv[]=… ; ignore_errors=… ; start_time=… ; stop_time=… ;
+#: pid=… ; code=… ; status=… }`, and the tail of that changes every time the
+#: unit runs. Comparing the whole string therefore fails as soon as the
+#: service has started once since the snapshot -- which is exactly the state a
+#: recovery runs in.
+_RUNTIME_COMMAND_FIELDS = ("start_time", "stop_time", "pid", "code", "status")
+
+
+def _normalise_property(value: str) -> str:
+    """A property with its last-invocation fields dropped.
+
+    Restoration means the unit is configured as it was, not that it has the
+    same process id it had. Keeping the runtime fields in the comparison made
+    a *successful* restore report failure, leave the WAL in place and refuse
+    every later install -- observed live on worker-01, where the correct
+    `ExecStart` was in place and the recovery still raised
+    `service snapshot property did not restore: voyn-aicc-worker.service
+    ExecStart` (2026-08-31).
+    """
+    if "{" not in value or ";" not in value:
+        return value.strip()
+    kept = [
+        part.strip()
+        for part in value.strip().lstrip("{").rstrip("}").split(";")
+        if part.strip()
+        and not part.strip().startswith(_RUNTIME_COMMAND_FIELDS)
+    ]
+    return "{ " + " ; ".join(kept) + " }"
+
+
+
 def restore_service_snapshot(
     path: Path, *, run=subprocess.run, defer_starts: bool = False
 ) -> None:
@@ -836,7 +869,9 @@ def restore_service_snapshot(
                 property_rc, actual = probe(
                     "show", unit, f"--property={name}", "--value"
                 )
-                if property_rc or actual != expected:
+                if property_rc or _normalise_property(actual) != _normalise_property(
+                    expected
+                ):
                     raise RuntimeError(
                         f"service snapshot property did not restore: {unit} {name}"
                     )
@@ -1015,7 +1050,13 @@ def verify_service_snapshot_closure(
             check=False,
             text=True,
         )
-        if result.returncode:
+        # `list-unit-files` exits 1 when a pattern matches nothing, and on a
+        # control-plane host it matches nothing by design: that profile
+        # installs no worker lanes at all. An empty result is the answer, not
+        # a failure -- treating it as one made the control install die at
+        # `cannot enumerate worker lanes for snapshot closure` (observed live
+        # on control-01, 2026-08-31). A real failure still reports on stderr.
+        if result.returncode and (result.stderr.strip() or result.stdout.strip()):
             raise RuntimeError(
                 result.stderr.strip()
                 or "cannot enumerate worker lanes for snapshot closure"
