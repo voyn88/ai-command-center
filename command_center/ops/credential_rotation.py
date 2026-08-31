@@ -327,9 +327,7 @@ class Audit:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             descriptor = self._open_data_file()
             try:
-                repair = self._quarantine_tail(
-                    descriptor, os.fstat(descriptor).st_size
-                )
+                repair = self._quarantine_tail(descriptor, os.fstat(descriptor).st_size)
                 if repair is not None and repair["whole_generation"]:
                     os.close(descriptor)
                     descriptor = self._open_data_file()
@@ -1238,8 +1236,7 @@ class RotationController:
                         unit,
                         config,
                         allow_restart=(
-                            wave_number == 1
-                            and len(self.config.worker_units) > 1
+                            wave_number == 1 and len(self.config.worker_units) > 1
                         ),
                     )
                 except Exception as error:  # noqa: BLE001 - audited below
@@ -1358,9 +1355,7 @@ class RotationController:
         for stale in sorted(self.config.env_file.parent.glob(pattern)):
             try:
                 stale.unlink()
-                self.audit.emit(
-                    "rotation_stale_prepared_removed", file=stale.name
-                )
+                self.audit.emit("rotation_stale_prepared_removed", file=stale.name)
             except OSError:
                 continue
 

@@ -89,7 +89,9 @@ def resolve(verb: str, unit: str, lanes: tuple[str, ...]) -> list[str]:
     return VERB_ARGV[verb](unit)
 
 
-def resolve_many(verb: str, units: tuple[str, ...], lanes: tuple[str, ...]) -> list[str]:
+def resolve_many(
+    verb: str, units: tuple[str, ...], lanes: tuple[str, ...]
+) -> list[str]:
     """Resolve a registry-derived multi-unit reload as one systemd transaction.
 
     Only reload is batchable: drain/restart remain deliberately single-lane,

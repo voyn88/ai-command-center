@@ -564,7 +564,9 @@ def test_retry_lifetime_covers_every_failed_attempt_and_all_delays(
     )
 
 
-def test_batch_failure_fails_closed_for_whole_unproved_generation(tmp_path: Path) -> None:
+def test_batch_failure_fails_closed_for_whole_unproved_generation(
+    tmp_path: Path,
+) -> None:
     events: list[tuple] = []
     controller, systemd, authority = _controller(tmp_path, events)
     lanes = tuple(f"voyn-aicc-worker@{number}.service" for number in range(1, 11))
@@ -1337,7 +1339,9 @@ def test_rotation_helper_resolves_exact_systemctl_argv() -> None:
     assert helper.resolve_many("reload", lanes, lanes) == ["reload", *lanes]
 
 
-def test_rotation_helper_batch_refuses_transaction_if_any_lane_is_unauthorized() -> None:
+def test_rotation_helper_batch_refuses_transaction_if_any_lane_is_unauthorized() -> (
+    None
+):
     helper = _helper_module()
     with pytest.raises(ValueError, match="not in the lane registry"):
         helper.resolve_many(

@@ -126,9 +126,12 @@ def prepare_password_update(
     # The secret must be inside the READER's accepted grammar, or the
     # mismatch is discovered only by the post-commit digest check -- after
     # the database has already changed (review note on 13b7738).
-    if parse_environment_text(f"AICC_PG_PASSWORD={new_password}").get(
-        "AICC_PG_PASSWORD"
-    ) != new_password:
+    if (
+        parse_environment_text(f"AICC_PG_PASSWORD={new_password}").get(
+            "AICC_PG_PASSWORD"
+        )
+        != new_password
+    ):
         raise CredentialFileError("new password is outside the reader grammar")
     values = read_environment_file(target)
     if "AICC_PG_PASSWORD" not in values:
