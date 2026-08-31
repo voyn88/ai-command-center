@@ -956,6 +956,32 @@ def _units_restored_by(manifest: Path) -> frozenset[str]:
     return frozenset(units)
 
 
+#: Pre-template worker units the staged rollout retires as a normal part of
+#: installing. `retire_legacy_units` stops and *disables* each one, and
+#: disabling a unit whose fragment is a symlink in /etc/systemd/system removes
+#: that symlink -- so after a rollout these units are legitimately gone, while
+#: the snapshot taken before it still records them as present.
+#:
+#: Quiesce must therefore tolerate their absence. Without that, each install
+#: attempt retired one more of them and the next attempt died on it: four
+#: consecutive attempts on worker-01 failed on `voyn-aicc-worker-2.service`,
+#: then `voyn-aicc-worker.service`, with nothing wrong except this
+#: bookkeeping (2026-08-31).
+#:
+#: Duplicated from `LEGACY_WORKER_UNITS` in ops/aicc_staged_worker_rollout.py
+#: and from the `--include-unit` arguments in
+#: deploy/install-agent-principal-isolation.sh -- this module is imported by
+#: the bootstrap before the rollout module exists on disk, so it cannot import
+#: it. The three lists are held in lockstep by a fitness test.
+RETIRED_LEGACY_UNITS = frozenset(
+    {
+        "voyn-aicc-worker.service",
+        "voyn-aicc-worker-2.service",
+        "aicc-worker.service",
+    }
+)
+
+
 def quiesce_service_snapshot(
     path: Path, *, run=subprocess.run, restorable_units: frozenset[str] = frozenset()
 ) -> None:
@@ -1038,6 +1064,10 @@ def quiesce_service_snapshot(
             if unit in restorable_units:
                 # Nothing to stop, and the file is coming back in this same
                 # rollback. See `restorable_units` in the docstring.
+                continue
+            if unit in RETIRED_LEGACY_UNITS:
+                # Retired on purpose by the rollout that preceded this
+                # rollback. See RETIRED_LEGACY_UNITS.
                 continue
             raise RuntimeError(f"expected unit disappeared before quiesce: {unit}")
         if load.returncode or not load_state:

@@ -2135,9 +2135,9 @@ def test_quiesce_proceeds_for_a_unit_this_rollback_will_restore(tmp_path):
 def test_quiesce_still_refuses_a_unit_that_vanished_unexplained(tmp_path):
     """A missing unit nobody intends to restore is real divergence: mutating a
     host whose state cannot be accounted for is exactly what this refusal is
-    for."""
+    for. Deliberately not a legacy unit — those are retired on purpose."""
     module = _module()
-    snapshot = _quiesce_snapshot(tmp_path, "voyn-aicc-worker.service")
+    snapshot = _quiesce_snapshot(tmp_path, "aicc-agent-launcher.socket")
 
     with pytest.raises(RuntimeError, match="expected unit disappeared before quiesce"):
         module.quiesce_service_snapshot(snapshot, run=_not_found_runner())
@@ -2162,3 +2162,45 @@ def test_restorable_units_are_read_from_the_journal_not_the_disk(tmp_path):
     units = module._units_restored_by(manifest)
 
     assert units == frozenset({"voyn-aicc-worker.service"})
+
+
+def test_quiesce_tolerates_a_legacy_unit_the_rollout_retired(tmp_path):
+    """Retiring the pre-template workers is part of installing, and disabling
+    a unit whose fragment is a symlink removes that symlink. So after a
+    rollout these units are legitimately gone while the snapshot taken before
+    it still records them present. Without this, each attempt retired one more
+    and the next died on it — four consecutive attempts on worker-01 failed
+    this way, on `voyn-aicc-worker-2.service` and then
+    `voyn-aicc-worker.service`, with nothing actually wrong.
+    """
+    module = _module()
+    snapshot = _quiesce_snapshot(tmp_path, "voyn-aicc-worker-2.service")
+
+    module.quiesce_service_snapshot(snapshot, run=_not_found_runner())
+
+
+def test_the_retired_legacy_set_matches_the_rollout_and_the_installer():
+    """Three copies of one list: this module (imported by the bootstrap before
+    the rollout module exists on disk), the rollout, and the installer's
+    `--include-unit` arguments. A unit added to one and forgotten in another
+    reintroduces exactly the deadlock this closes."""
+    module = _module()
+    root = Path(__file__).parents[2]
+
+    rollout_src = (root / "ops" / "aicc_staged_worker_rollout.py").read_text(
+        encoding="utf-8"
+    )
+    block = rollout_src.split("LEGACY_WORKER_UNITS = (", 1)[1].split(")", 1)[0]
+    rollout_units = {line.strip().strip('",') for line in block.splitlines() if line.strip()}
+
+    installer = (
+        root / "deploy" / "install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+    included = {
+        line.split("--include-unit", 1)[1].strip().rstrip("\\").strip()
+        for line in installer.splitlines()
+        if "--include-unit" in line
+    }
+
+    assert module.RETIRED_LEGACY_UNITS == rollout_units
+    assert module.RETIRED_LEGACY_UNITS <= included
