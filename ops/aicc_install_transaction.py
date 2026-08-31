@@ -735,6 +735,46 @@ def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bo
 _RUNTIME_COMMAND_FIELDS = ("start_time", "stop_time", "pid", "code", "status")
 
 
+#: Drop-in directories systemd *generates* at boot. `aicc-principal-recovery`
+#: writes its drop-in into `/run/systemd/generator.early/`, which is tmpfs:
+#: it exists only while the generator's output from this boot is live, and is
+#: absent after `/run` is cleared or before the generator has run again.
+#:
+#: Requiring it to match a snapshot therefore demands a value that by
+#: construction does not persist -- the restore refused with
+#: `refusing unsafe snapshot restart: voyn-aicc-worker.service DropInPaths`
+#: on a host where nothing was wrong (worker-01, 2026-08-31). Drop-ins from
+#: any other location are compared exactly, because those are administrator
+#: configuration and a silently added one can weaken the very isolation this
+#: snapshot exists to preserve.
+_GENERATED_DROPIN_PREFIXES = ("/run/systemd/generator",)
+
+
+def _properties_match(name: str, actual: str, expected: str) -> bool:
+    """Whether a restored property equals its snapshot, comparing what the
+    property actually asserts rather than its rendered text.
+
+    Two properties render values that change without the configuration
+    changing: a command carries its last invocation's pid and timestamps, and
+    `DropInPaths` carries boot-generated entries from tmpfs. Everything else
+    is compared verbatim.
+    """
+    if name == "DropInPaths":
+        return _persistent_dropins(actual) == _persistent_dropins(expected)
+    return _normalise_property(actual) == _normalise_property(expected)
+
+
+def _persistent_dropins(value: str) -> tuple[str, ...]:
+    """DropInPaths with the boot-generated ones removed, order-independent."""
+    return tuple(
+        sorted(
+            path
+            for path in value.split()
+            if not path.startswith(_GENERATED_DROPIN_PREFIXES)
+        )
+    )
+
+
 def _normalise_property(value: str) -> str:
     """A property with its last-invocation fields dropped.
 
@@ -913,7 +953,7 @@ def restore_service_snapshot(
                 property_rc, actual = probe(
                     "show", unit, f"--property={name}", "--value"
                 )
-                if property_rc or actual != expected:
+                if property_rc or not _properties_match(name, actual, expected):
                     raise RuntimeError(
                         f"refusing unsafe snapshot restart: {unit} {name}"
                     )
