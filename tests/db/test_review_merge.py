@@ -15,6 +15,7 @@ from command_center.orchestrator.review_merge import (
     merge_once,
     publish_review_verdicts,
     reconcile_merge_evidence,
+    reconcile_pr_evidence,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -2697,3 +2698,170 @@ def test_targeted_invocations_leave_the_shared_cursor_alone(rig, monkeypatch):  
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT count(*) FROM backlog_scan_cursor")
         assert cur.fetchone()[0] == 0  # no cursor row was even created
+
+
+# ---------------------------------------------------------------------------
+# reconcile_pr_evidence: a pull request that exists but was never recorded.
+#
+# Every gate downstream finds a task's PR through backlog_evidence(kind='pr'),
+# and only `publish_run` ever wrote there — so a PR opened any other way is
+# invisible to the whole control plane no matter how green it is. Measured
+# live 2026-08-31: two PRs with every required check passing were never picked
+# up, because `publish_run` cannot run on this fleet at all.
+# ---------------------------------------------------------------------------
+
+
+def _ready_without_pr(store, factory, task_id, repo="repo-d2"):
+    """READY_TO_REVIEW with no `pr` evidence — the state a hand-opened pull
+    request leaves the store in."""
+    from tests.db.test_backlog_planner import _task
+
+    assert store.upsert_task(_task(task_id, repo=repo, status="OPEN"))[0]
+    with factory() as c, c.cursor() as cur:
+        def _rev():
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            return cur.fetchone()[0]
+        cur.execute("SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)", (task_id, _rev()))
+        cur.execute("SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)", (task_id, _rev()))
+        c.commit()
+
+
+def _pr_rows(factory, task_id):
+    with factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='pr'",
+            (task_id,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def _fake_pr_list(entries, *, returncode=0, stdout=None):
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "list"]:
+            body = json.dumps(entries) if stdout is None else stdout
+            return sp.CompletedProcess(argv, returncode, body, "")
+        return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
+
+    return fake_gh
+
+
+def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE1"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/900"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list([{"url": url, "headRefName": f"backlog/{task_id}"}]),
+    )
+
+    report = reconcile_pr_evidence(app_factory)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """`backlog/X` must not adopt `backlog/X-REM`'s pull request. `gh --head`
+    is a filter, not a guarantee of exact equality, so the name is compared
+    here too."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/901",
+              "headRefName": f"backlog/{task_id}-REM"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+
+
+def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE3"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/902", "headRefName": branch},
+             {"url": "https://github.com/x/repo-d2/pull/903", "headRefName": branch}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "ambiguous_open_prs_on_branch") in report.skipped
+
+
+def test_an_existing_pr_evidence_row_is_never_touched(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Whatever `publish_run` recorded stays authoritative; this can neither
+    overwrite it nor add a competing row."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE4"
+    recorded = "https://github.com/x/repo-d2/pull/904"
+    _ready(store, app_factory, task_id, recorded)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/905",
+              "headRefName": f"backlog/{task_id}"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory)
+
+    assert _pr_rows(app_factory, task_id) == [recorded]
+    assert all(entry[0] != task_id for entry in report.recorded)
+
+
+def test_a_failed_or_undecodable_lookup_records_nothing(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    failed, garbage = "VOYN-W0-PRE5", "VOYN-W0-PRE6"
+    _ready_without_pr(store, app_factory, failed)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([], returncode=1))
+    assert (failed, "pr_list_failed") in reconcile_pr_evidence(app_factory).skipped
+
+    _ready_without_pr(store, app_factory, garbage)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([], stdout="{not json"))
+    report = reconcile_pr_evidence(app_factory)
+
+    assert (garbage, "pr_list_undecodable") in report.skipped
+    assert _pr_rows(app_factory, failed) == []
+    assert _pr_rows(app_factory, garbage) == []
+
+
+def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """This records evidence; it never promotes anything. A task that is not
+    yet ready stays untouched even when its branch already has a PR."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE7"
+    from tests.db.test_backlog_planner import _task
+
+    assert store.upsert_task(_task(task_id, repo="repo-d2", status="OPEN"))[0]
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/906",
+              "headRefName": f"backlog/{task_id}"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert all(entry[0] != task_id for entry in report.recorded)
