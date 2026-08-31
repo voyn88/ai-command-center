@@ -2247,3 +2247,89 @@ def test_a_command_property_still_ignores_only_its_invocation_fields():
 
     assert module._properties_match("ExecStart", after_run, snapshot)
     assert not module._properties_match("ExecStart", replaced, snapshot)
+
+
+def test_restore_does_not_revive_a_legacy_unit_the_rollout_retired(tmp_path):
+    """Retiring the pre-template workers is what installing *does*, and
+    `disable` removes the symlink that was their fragment. The snapshot still
+    describes the configuration from before that, so restoring it would revive
+    a unit the rollout just took out of service — and, the unit being gone,
+    every property it recorded now reads empty and the comparison refuses.
+
+    That is exactly what the live host produced, one property at a time:
+    `DropInPaths`, then `EnvironmentFiles`, each on a unit that was correctly
+    absent (worker-01, 2026-08-31).
+    """
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "units": {
+                    "voyn-aicc-worker.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                        "properties": dict.fromkeys(_module().SNAPSHOT_PROPERTIES, ""),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    mutations: list[tuple[str, ...]] = []
+
+    def run(command, **kwargs):
+        action = command[1]
+        if action in {"enable", "disable", "start", "stop", "daemon-reload"}:
+            mutations.append(tuple(command[1:]))
+        if action == "show" and "LoadState" in " ".join(command):
+            return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        if action == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if action == "is-active":
+            return SimpleNamespace(returncode=0, stderr="", stdout="inactive\n")
+        if action == "is-enabled":
+            return SimpleNamespace(returncode=0, stderr="", stdout="disabled\n")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    module.restore_service_snapshot(snapshot, run=run)
+
+    assert not any(m[0] in {"enable", "start"} for m in mutations)
+
+
+def test_restore_still_refuses_a_non_legacy_unit_that_lost_its_properties(tmp_path):
+    """The exemption is for units the installer retires on purpose. Anything
+    else whose recorded configuration no longer matches is still a refusal."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "units": {
+                    "aicc-agent-launcher.socket": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                        "properties": {
+                            **dict.fromkeys(_module().SNAPSHOT_PROPERTIES, ""),
+                            "DropInPaths": "/etc/systemd/system/x.d/a.conf",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(command, **kwargs):
+        if command[1] == "show" and "LoadState" in " ".join(command):
+            return SimpleNamespace(returncode=0, stderr="", stdout="loaded\n")
+        if command[1] == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    with pytest.raises(RuntimeError, match="refusing unsafe snapshot restart"):
+        module.restore_service_snapshot(snapshot, run=run)

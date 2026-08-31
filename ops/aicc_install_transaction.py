@@ -948,6 +948,26 @@ def restore_service_snapshot(
             probe("disable", unit)
             assert_restored(unit, state)
             continue
+        load_rc, load_state = probe("show", unit, "--property=LoadState", "--value")
+        if (
+            not load_rc
+            and load_state == "not-found"
+            and unit in RETIRED_LEGACY_UNITS
+        ):
+            # Retiring the pre-template workers is what installing DOES, and
+            # `disable` removes the symlink that was their fragment. Their
+            # snapshot still describes the running configuration from before
+            # that, so restoring it would revive a unit the rollout just
+            # deliberately took out of service -- and, because the unit is
+            # gone, every property it recorded now reads empty and the
+            # comparison refuses.
+            #
+            # That refusal is what the live host produced, one property at a
+            # time: DropInPaths, then EnvironmentFiles, each on a unit that
+            # was correctly absent (worker-01, 2026-08-31). The snapshot is
+            # not wrong; it simply predates a removal the installer intended.
+            # Nothing to restore, so nothing is attempted.
+            continue
         if version == 3 and not self_recovery:
             for name, expected in state["properties"].items():
                 property_rc, actual = probe(
