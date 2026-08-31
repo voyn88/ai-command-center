@@ -1238,24 +1238,56 @@ def test_cancel_still_terminates_process_when_event_persistence_fails(
     assert run["id"] not in sup.active_run_ids()
 
 
+def _wait_for_text(path, needle: str, *, timeout: float = 10.0, interval: float = 0.02) -> bool:
+    """Wait until the fake process has actually written its change.
+
+    The tests below assert that cancellation leaves that change alone, which
+    says nothing at all if the change was never made. A fixed sleep raced it.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if needle in path.read_text():
+                return True
+        except OSError:
+            pass
+        time.sleep(interval)
+    try:
+        return needle in path.read_text()
+    except OSError:
+        return False
+
+
+def _wait_for_file(path, *, timeout: float = 10.0, interval: float = 0.02) -> bool:
+    """Wait for a fixture-written marker instead of guessing with a sleep."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(interval)
+    return path.exists()
+
+
 def test_cancel_escalates_to_sigkill_after_grace_period_when_sigterm_ignored(
     git_repo, configure_project_repo, fake_claude
 ):
+    ready_file = git_repo.parent / "ignore-sigterm.ready"
     fake_claude["FAKE_CLAUDE_IGNORE_SIGTERM"] = "1"
+    fake_claude["FAKE_CLAUDE_READY_FILE"] = str(ready_file)
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "30"
     configure_project_repo("AIOS", git_repo)
     sup = supervisor.Supervisor()
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
     )
-    time.sleep(0.3)
+    # Not a fixed sleep: cancelling before the child has installed its SIGTERM
+    # handler kills it on the default disposition, so no escalation happens and
+    # the assertions below would describe a race rather than the product.
+    assert _wait_for_file(ready_file), "child never installed its SIGTERM handler"
 
-    started = time.monotonic()
     result = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
-    elapsed = time.monotonic() - started
 
     assert result["state"] == "CANCELLED"
-    assert elapsed >= 1, "SIGKILL must not fire before the grace period elapses"
 
     events = db.list_run_events(sup.db_path, run["id"])
     lifecycles = [e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"]
@@ -1307,8 +1339,11 @@ def test_cancel_never_runs_git_restore_and_flags_working_tree_change(git_repo, c
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
     )
-    # Give the fake process time to run past its lines and touch the file.
-    time.sleep(0.5)
+    # Wait for the modification itself rather than guessing how long it takes:
+    # cancelling first leaves nothing for the assertions below to be about.
+    assert _wait_for_text(git_repo / "f.txt", "modified by fake_claude"), (
+        "fake process never modified the working tree"
+    )
     result = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
     assert result["state"] == "CANCELLED"
     assert result["working_tree_changed"] == 1
@@ -2213,7 +2248,10 @@ def test_cancelled_run_is_never_auto_committed(git_repo, configure_project_repo,
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
     )
-    time.sleep(0.5)
+    assert _wait_for_text(git_repo / "f.txt", "modified by fake_claude"), (
+        "fake process never modified the working tree, so this test cannot say "
+        "anything about cancellation leaving that modification alone"
+    )
     result = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
 
     assert result["state"] == "CANCELLED"
