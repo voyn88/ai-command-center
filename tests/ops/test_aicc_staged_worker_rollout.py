@@ -715,7 +715,11 @@ def _build_release(tmp_path, *, final_mode=0o755, bin_mode=0o555):
     a relative hop inside the release and an absolute hop out of it."""
     opt = tmp_path / "opt" / "aicc"
     releases = opt / "releases"
-    sha = "6493521d869943d3f8cb00be7ae190095196676c"
+    # Deliberately not a real commit id, and deliberately low-entropy: a
+    # genuine 40-hex literal trips detect-secrets as a "Hex High Entropy
+    # String" and grows the secret baseline with test data. The gate only
+    # requires `[0-9a-f]{40}`.
+    sha = "a1" * 20
     release = releases / sha
     venv_bin = release / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
@@ -793,7 +797,7 @@ def test_directory_holding_the_interpreter_symlink_must_not_be_writable(tmp_path
 def test_a_symlink_cycle_is_refused_rather_than_followed(tmp_path, monkeypatch):
     module = _module()
     opt = _install_release(module, monkeypatch, tmp_path)
-    venv_bin = opt / "releases" / "6493521d869943d3f8cb00be7ae190095196676c" / ".venv" / "bin"
+    venv_bin = opt / "releases" / ("a1" * 20) / ".venv" / "bin"
     venv_bin.chmod(0o755)
     (venv_bin / "python").unlink()
     (venv_bin / "python").symlink_to("python3")
