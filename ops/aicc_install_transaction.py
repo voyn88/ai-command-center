@@ -75,6 +75,12 @@ class BackupRecord:
     install_mode: int
     install_uid: int
     install_gid: int
+    # Set when the target was a SYMLINK that this generation replaced with a
+    # real file: the link's literal target, so rollback restores the link
+    # rather than leaving a file where one never was. Appended last to keep the
+    # positional constructor contract of every existing record, and defaulted
+    # so a journal written by an earlier generation still loads.
+    original_symlink: str | None = None
 
 
 @dataclass(frozen=True)
@@ -649,6 +655,67 @@ def _read_regular(path: Path, *, max_bytes: int = 128 * 1024 * 1024) -> FileStat
         os.close(descriptor)
 
 
+def _digest_regular(
+    path: Path, *, max_bytes: int = 8 * 1024 * 1024 * 1024
+) -> tuple[str, int, int, int, int]:
+    """`_read_regular`'s guarantees for a file too large to hold in memory.
+
+    Returns `(sha256, size, mode, uid, gid)` and never materialises the
+    content. The release manifest needs a digest of every file in a tree that
+    includes ~300 MB native binaries -- `_read_regular` would read each one
+    whole, which is why its 128 MB bound refused them outright (found on the
+    first live install: the copilot binary is 180 MB, claude 311 MB).
+
+    The safety properties are identical and deliberately kept in lockstep:
+    O_NOFOLLOW so a symlink cannot be followed, a single link so no other name
+    aliases the inode, a regular file only, and an fstat before and after that
+    must agree on device, inode, size, both timestamps, ownership and mode --
+    so a file rewritten while it was being hashed is refused rather than
+    recorded. The bound stays, just at a size an artifact can actually be.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_size > max_bytes
+        ):
+            raise RuntimeError(f"protected file shape is unsafe: {path}")
+        digest = hashlib.sha256()
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 4 * 1024 * 1024))
+            if not chunk:
+                raise RuntimeError(f"protected file was truncated: {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        final = os.fstat(descriptor)
+        if (
+            final.st_dev != info.st_dev
+            or final.st_ino != info.st_ino
+            or final.st_size != info.st_size
+            or final.st_mtime_ns != info.st_mtime_ns
+            or final.st_ctime_ns != info.st_ctime_ns
+            or final.st_uid != info.st_uid
+            or final.st_gid != info.st_gid
+            or stat.S_IMODE(final.st_mode) != stat.S_IMODE(info.st_mode)
+        ):
+            raise RuntimeError(f"protected file changed while being read: {path}")
+        return (
+            digest.hexdigest(),
+            info.st_size,
+            stat.S_IMODE(info.st_mode),
+            info.st_uid,
+            info.st_gid,
+        )
+    finally:
+        os.close(descriptor)
+
+
 def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bool:
     return (
         state.sha256 == sha256
@@ -1073,7 +1140,17 @@ class FileTransaction:
                 continue
             if spec.if_missing:
                 continue
-            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            if stat.S_ISLNK(info.st_mode):
+                # A symlink is the shape every legacy unit still has on these
+                # hosts: /etc/systemd/system/<unit> pointing into the operator's
+                # home. Replacing it with the repository's own root-owned file
+                # is the entire point of taking these units under repository
+                # ownership, so it is recorded and replaced rather than
+                # refused. Nothing follows the link: the backup stores the
+                # link's literal target, and the install renames a staged file
+                # over the link itself. Found live on the first worker install.
+                continue
+            if not stat.S_ISREG(info.st_mode):
                 raise ValueError(f"existing target is not a regular file: {target}")
         self._prepare_state_dir()
         if _path_present(self.pending) or _path_present(self.pending_release):
@@ -1134,7 +1211,26 @@ class FileTransaction:
                         )
                     )
                     continue
-                if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                if stat.S_ISLNK(info.st_mode):
+                    records.append(
+                        BackupRecord(
+                            spec.target,
+                            True,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            str(staged_path),
+                            source_states[spec.target].sha256,
+                            spec.mode,
+                            spec.uid,
+                            spec.gid,
+                            os.readlink(target),
+                        )
+                    )
+                    continue
+                if not stat.S_ISREG(info.st_mode):
                     raise ValueError(f"existing target is not a regular file: {target}")
                 original = _read_regular(target)
                 backup = backups / f"{index:03d}.bin"
@@ -1559,6 +1655,65 @@ class FileTransaction:
                 # durably gone; without it a reboot could bypass recovery.
                 continue
             target = self._target(record.target)
+            if record.existed and record.original_symlink is not None:
+                # The target was a symlink this generation replaced. Restore the
+                # link, not a file: leaving a regular file where a link belonged
+                # would silently change what the unit resolves to.
+                #
+                # Handled BEFORE `_read_regular`: that call opens with
+                # O_NOFOLLOW, so on a target that is still (or already again) a
+                # symlink it raises, and the generic branch below would abort
+                # recovery with "target shape changed" on a generation that is
+                # simply not applied yet, or already rolled back. Recovery has
+                # to be idempotent -- it runs at boot and can itself be
+                # interrupted (independent review on 2b8826a).
+                if target.is_symlink():
+                    if os.readlink(target) == record.original_symlink:
+                        continue
+                    raise RuntimeError(
+                        f"generation target is a different symlink before restore: "
+                        f"{target}"
+                    )
+                try:
+                    current = _read_regular(target)
+                except FileNotFoundError as exc:
+                    # Neither the installed file nor the link is there. Something
+                    # outside this transaction removed it; recreating the link
+                    # would paper over that, exactly as the regular-file branch
+                    # refuses to (independent review on 2b8826a).
+                    raise RuntimeError(
+                        f"generation target disappeared: {target}"
+                    ) from exc
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"generation target shape changed before restore: {target}"
+                    ) from exc
+                if not _matches(
+                    current,
+                    record.install_sha256,
+                    record.install_mode,
+                    record.install_uid,
+                    record.install_gid,
+                ):
+                    raise RuntimeError(
+                        f"generation target changed before compare-and-restore: {target}"
+                    )
+                parent_fd = _open_directory_chain(target.parent, create=False)
+                try:
+                    temporary = f".{target.name}.restore.{secrets.token_hex(8)}"
+                    os.symlink(record.original_symlink, temporary, dir_fd=parent_fd)
+                    try:
+                        os.rename(
+                            temporary, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+                        )
+                    except OSError:
+                        os.unlink(temporary, dir_fd=parent_fd)
+                        raise
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+                continue
+            # Every other record: read the target as the generic branches expect.
             try:
                 current = _read_regular(target)
             except FileNotFoundError:
@@ -1767,6 +1922,15 @@ def _git_safe_environment() -> dict[str, str]:
 
 RELEASE_MANIFEST_VERSION = 1
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
+# A content-addressed artifact identifies itself by its own sha256 rather than
+# by a Git commit. The publication machinery is otherwise identical -- same
+# ownership, mode, digest and symlink-target proof, same atomic rename, same
+# crash reconciliation -- so it takes the identity pattern as a parameter
+# instead of growing a second copy of itself
+# (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED). Widening RELEASE_ID_RE itself
+# would weaken the Git path, which must keep refusing a 64-hex value that is
+# not a commit.
+ARTIFACT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_TREE_ENTRY_RE = re.compile(
     rb"([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t(.+)", re.DOTALL
 )
@@ -1837,15 +2001,18 @@ def _release_entry(
         # A hardlink lets a writer of any other directory keep a mutable alias
         # to release content that `chmod -R a-w` appears to have frozen.
         raise ReleaseRefused(f"release file is hardlinked: {relative}")
-    state = _read_regular(path)
-    if state.uid != trusted_uid or state.gid != trusted_gid:
+    # Streamed rather than read whole: a release tree carries native binaries
+    # of a few hundred megabytes, and holding each one in memory to hash it is
+    # both wasteful and, at `_read_regular`'s 128 MB bound, a hard refusal.
+    digest, size, mode, uid, gid = _digest_regular(path)
+    if uid != trusted_uid or gid != trusted_gid:
         raise ReleaseRefused(f"release file ownership changed while read: {relative}")
     return {
         "path": relative,
         "kind": "file",
-        "mode": state.mode,
-        "sha256": state.sha256,
-        "size": len(state.payload),
+        "mode": mode,
+        "sha256": digest,
+        "size": size,
     }
 
 
@@ -1984,14 +2151,17 @@ def record_release_manifest(
     *,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> list[dict[str, object]]:
     """Write the root-owned content manifest for a freshly staged release.
 
     Recorded before the staging tree is renamed into place, so a release
     directory never exists without the manifest that authorises its reuse.
     """
-    if RELEASE_ID_RE.fullmatch(release_id) is None:
-        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if id_pattern.fullmatch(release_id) is None:
+        raise ReleaseRefused(
+            f"release id does not match its identity pattern {id_pattern.pattern}"
+        )
     entries = release_entries(
         release_tree, trusted_uid=trusted_uid, trusted_gid=trusted_gid
     )
@@ -2042,10 +2212,13 @@ def publish_release_tree(
     *,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> Path:
     """Verify and publish one release atomically without replacing a name."""
-    if RELEASE_ID_RE.fullmatch(release_id) is None:
-        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if id_pattern.fullmatch(release_id) is None:
+        raise ReleaseRefused(
+            f"release id does not match its identity pattern {id_pattern.pattern}"
+        )
     if staging.parent != release_root or staging.name == release_id:
         raise ReleaseRefused("release staging path is outside the release root")
     # The publication primitive itself proves the authority it was given.
@@ -2056,6 +2229,7 @@ def publish_release_tree(
         release_id,
         trusted_uid=trusted_uid,
         trusted_gid=trusted_gid,
+        id_pattern=id_pattern,
     )
     root_fd = _open_directory_chain(release_root, create=False)
     try:
@@ -2114,6 +2288,7 @@ def reconcile_release_publication(
     state_dir: Path = Path("/var/lib/aicc-principal-isolation"),
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> Path | None:
     """Recover every crash point around manifest + directory publication.
 
@@ -2123,8 +2298,10 @@ def reconcile_release_publication(
     safely discarded; an incomplete stage without a manifest is discarded and
     rebuilt. Ambiguous or untrusted state fails closed.
     """
-    if RELEASE_ID_RE.fullmatch(release_id) is None:
-        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if id_pattern.fullmatch(release_id) is None:
+        raise ReleaseRefused(
+            f"release id does not match its identity pattern {id_pattern.pattern}"
+        )
     if manifest.parent != state_dir / "releases":
         raise ReleaseRefused("release manifest path is outside trusted state")
     if manifest.name != f"{release_id}.json":
@@ -2155,6 +2332,7 @@ def reconcile_release_publication(
                 release_id,
                 trusted_uid=trusted_uid,
                 trusted_gid=trusted_gid,
+                id_pattern=id_pattern,
             )
             return destination
         if manifest.exists():
@@ -2168,6 +2346,7 @@ def reconcile_release_publication(
                     release_id,
                     trusted_uid=trusted_uid,
                     trusted_gid=trusted_gid,
+                    id_pattern=id_pattern,
                 )
             recorded = _read_regular(manifest, max_bytes=64 * 1024 * 1024)
             if (
@@ -2206,6 +2385,7 @@ def verify_release_manifest(
     repo_root: Path | None = None,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> list[dict[str, object]]:
     """Prove a pre-existing release directory before it may be selected.
 
@@ -2213,8 +2393,10 @@ def verify_release_manifest(
     is exactly the case this gate exists for, and rebuilding trust from the
     directory itself would only re-record whatever an attacker left there.
     """
-    if RELEASE_ID_RE.fullmatch(release_id) is None:
-        raise ReleaseRefused("release id must be exactly 40 lowercase hex characters")
+    if id_pattern.fullmatch(release_id) is None:
+        raise ReleaseRefused(
+            f"release id does not match its identity pattern {id_pattern.pattern}"
+        )
     try:
         recorded = _read_regular(manifest)
     except (OSError, RuntimeError) as exc:

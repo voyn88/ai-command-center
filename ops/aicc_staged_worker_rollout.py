@@ -72,6 +72,98 @@ class RolloutError(RuntimeError):
 # module (which leaked suite-wide; review on 7d4391c). Production == os.fstat.
 _registry_fstat = os.fstat
 
+# Test seam: the uid every release path must belong to. Production == 0 (root).
+# Tests patch it per-module to the running user so a real symlink chain can be
+# built in a temp directory without privileges -- the shape being verified is
+# the chain, and it cannot be built root-owned without root. Never read from
+# configuration, an environment variable or a file: this is the authority the
+# whole check rests on.
+_REQUIRED_OWNER_UID = 0
+
+#: Bound on symlink hops while resolving the interpreter. A cycle (or a chain
+#: deep enough to look like one) is refused rather than followed forever.
+_MAX_SYMLINK_HOPS = 8
+
+# Test seam: where the ancestor walk stops. Production == the filesystem root,
+# because a writable directory ANYWHERE above the interpreter can have the
+# whole subtree renamed out from under it. Tests point it at their own temp
+# tree, whose ancestors (`/tmp` is world-writable and sticky) cannot be made
+# to pass and are not what is under test. Never read from configuration.
+_TRUSTED_ROOT = Path("/")
+
+
+def _verify_immutable_object(path: Path) -> os.stat_result:
+    """Refuse `path` unless root owns it and nobody else can rewrite it.
+
+    Symlinks are exempted from the mode check, and that is not a relaxation.
+    Linux ignores a symlink's permission bits entirely -- every symlink is
+    created `lrwxrwxrwx` and cannot be chmod'ed -- so `st_mode & 0o022` is
+    true for *every* symlink that has ever existed. Applying it here meant the
+    check could never pass: `.venv/bin/python` is a symlink in every virtual
+    environment Python builds, so the gate refused its own release on every
+    host, always (found by the first live install that reached it, 2026-08-31).
+    What actually protects a symlink from being swapped is write permission on
+    the directory holding it, and that directory is verified as its own entry
+    in the chain below.
+    """
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise RolloutError(f"AICC release path is unavailable: {path}") from exc
+    if info.st_uid != _REQUIRED_OWNER_UID:
+        raise RolloutError(f"AICC release path is mutable: {path}")
+    if not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
+        raise RolloutError(f"AICC release path is mutable: {path}")
+    return info
+
+
+def _ancestors_of(path: Path) -> tuple[Path, ...]:
+    """Every directory between `path` and `_TRUSTED_ROOT`, inclusive.
+
+    Terminates at the trusted root, and also when a parent stops changing, so
+    a path outside the trusted root still ends rather than looping at `/`.
+    """
+    ancestors: list[Path] = []
+    current = path.parent
+    while True:
+        ancestors.append(current)
+        if current == _TRUSTED_ROOT or current == current.parent:
+            return tuple(ancestors)
+        current = current.parent
+
+
+def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
+    """Every path the kernel touches to reach the real interpreter, plus the
+    directory each one lives in.
+
+    A virtualenv interpreter is a symlink chain that leaves the release:
+    `.venv/bin/python -> python3 -> /usr/bin/python3 -> python3.12`. Verifying
+    only the paths inside the release therefore proves nothing about the binary
+    that actually runs -- the last two hops are system paths this function is
+    the only thing that looks at.
+
+    Every ancestor of every hop is included, not just its immediate parent.
+    Write permission on any directory above the interpreter is enough to
+    rename the subtree out and drop a replacement in its place, so checking
+    `/usr/bin` while ignoring `/usr` would leave the binary swappable by
+    anyone who can write to `/usr` (independent review of `ab887b2` caught
+    exactly that: only the hop and its immediate parent were checked).
+    """
+    chain: list[Path] = []
+    current = executable
+    for _ in range(_MAX_SYMLINK_HOPS + 1):
+        chain.append(current)
+        chain.extend(_ancestors_of(current))
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise RolloutError(f"AICC release path is unavailable: {current}") from exc
+        if not stat.S_ISLNK(info.st_mode):
+            return tuple(chain)
+        target = os.readlink(current)
+        current = Path(target) if os.path.isabs(target) else current.parent / target
+    raise RolloutError(f"AICC release interpreter symlink chain is too deep: {executable}")
+
 
 def verify_immutable_release() -> None:
     """Prove the selected worker executable belongs to one immutable commit release."""
@@ -83,7 +175,7 @@ def verify_immutable_release() -> None:
         raise RolloutError("current AICC release is unavailable") from exc
     if (
         not CURRENT_RELEASE.is_symlink()
-        or link.st_uid != 0
+        or link.st_uid != _REQUIRED_OWNER_UID
         or target.parent != RELEASE_ROOT
         or not re.fullmatch(r"[0-9a-f]{40}", target.name)
         or target_text != f"releases/{target.name}"
@@ -95,21 +187,19 @@ def verify_immutable_release() -> None:
     # interpreter out and drop a replacement, independent of the file's own
     # mode (review on 52ced1f). Endpoints-only validation missed exactly
     # those two directories.
-    chain = (
+    ancestors = (
         CURRENT_RELEASE.parent,
         RELEASE_ROOT,
         target,
         target / ".venv",
         target / ".venv/bin",
-        executable,
     )
-    for path in chain:
-        try:
-            info = path.lstat()
-        except OSError as exc:
-            raise RolloutError(f"AICC release path is unavailable: {path}") from exc
-        if info.st_uid != 0 or info.st_mode & 0o022:
-            raise RolloutError(f"AICC release path is mutable: {path}")
+    seen: set[Path] = set()
+    for path in ancestors + _interpreter_resolution_chain(executable):
+        if path in seen:
+            continue
+        seen.add(path)
+        _verify_immutable_object(path)
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise RolloutError("AICC release interpreter is not executable")
 
