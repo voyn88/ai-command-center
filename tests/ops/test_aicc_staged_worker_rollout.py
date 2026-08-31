@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -691,3 +692,139 @@ def test_verifier_rejects_execstart_path_decoupled_from_argv():
     )
     with pytest.raises(module.RolloutError, match="path="):
         module.verify_unit_configuration(systemd, unit)
+
+
+# ---------------------------------------------------------------------------
+# verify_immutable_release: the gate that refused every real release.
+#
+# A virtualenv interpreter is never a regular file at `.venv/bin/python` --
+# it is a symlink chain that leaves the release entirely:
+#
+#     .venv/bin/python -> python3 -> /usr/bin/python3 -> python3.12
+#
+# The chain below is built to that exact shape, because the shape is what the
+# defect turned on: Linux gives every symlink mode `lrwxrwxrwx` and ignores it,
+# so a `st_mode & 0o022` test applied to the symlink itself is true for every
+# release that has ever existed. This function had no coverage at all, which is
+# why the gate reached production able to refuse only itself.
+# ---------------------------------------------------------------------------
+
+
+def _build_release(tmp_path, *, final_mode=0o755, bin_mode=0o555):
+    """A release laid out like a real one, with the interpreter reached through
+    a relative hop inside the release and an absolute hop out of it."""
+    opt = tmp_path / "opt" / "aicc"
+    releases = opt / "releases"
+    # Deliberately not a real commit id, and deliberately low-entropy: a
+    # genuine 40-hex literal trips detect-secrets as a "Hex High Entropy
+    # String" and grows the secret baseline with test data. The gate only
+    # requires `[0-9a-f]{40}`.
+    sha = "a1" * 20
+    release = releases / sha
+    venv_bin = release / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+
+    system_bin = tmp_path / "usr" / "bin"
+    system_bin.mkdir(parents=True)
+    real = system_bin / "python3.12"
+    real.write_text("#!/bin/true\n", encoding="utf-8")
+    real.chmod(final_mode)
+
+    # Hop 2 leaves the release, exactly as a real venv does.
+    (venv_bin / "python3").symlink_to(real)
+    # Hop 1 is relative and stays inside it.
+    (venv_bin / "python").symlink_to("python3")
+    # Linux creates every symlink `lrwxrwxrwx` and cannot chmod it; macOS
+    # creates them 0o755. Pin both to the Linux value, or this test silently
+    # stops exercising the defect on a developer machine -- which is precisely
+    # how a gate that could never pass on Linux shipped without anyone noticing.
+    for link in (venv_bin / "python3", venv_bin / "python"):
+        if hasattr(os, "lchmod"):
+            try:
+                os.lchmod(link, 0o777)
+            except (OSError, NotImplementedError):
+                pass
+
+    current = opt / "current"
+    current.symlink_to(Path("releases") / sha)
+
+    for path in (venv_bin, release / ".venv"):
+        path.chmod(bin_mode)
+    release.chmod(0o555)
+    releases.chmod(0o755)
+    opt.chmod(0o755)
+    return opt, releases, current
+
+
+def _install_release(module, monkeypatch, tmp_path, **kwargs):
+    opt, releases, current = _build_release(tmp_path, **kwargs)
+    monkeypatch.setattr(module, "CURRENT_RELEASE", current)
+    monkeypatch.setattr(module, "RELEASE_ROOT", releases)
+    # The chain cannot be built root-owned without root; assert against the
+    # user that actually owns it, so every other property stays under test.
+    monkeypatch.setattr(module, "_REQUIRED_OWNER_UID", os.getuid())
+    # The ancestor walk runs to the filesystem root in production. A temp tree
+    # cannot satisfy that -- `/tmp` is world-writable and sticky by design --
+    # and those directories are not what these tests examine, so the walk is
+    # bounded at the tree the fixture actually built.
+    monkeypatch.setattr(module, "_TRUSTED_ROOT", tmp_path)
+    return opt
+
+
+def test_a_release_whose_interpreter_is_a_symlink_is_accepted(tmp_path, monkeypatch):
+    """The regression itself: this is what every real release looks like."""
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+
+    module.verify_immutable_release()
+
+
+def test_interpreter_target_outside_the_release_is_still_verified(tmp_path, monkeypatch):
+    """The binary that actually runs lives in a system path. Verifying only
+    what is inside the release proves nothing about it."""
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path, final_mode=0o757)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
+def test_directory_holding_the_interpreter_symlink_must_not_be_writable(tmp_path, monkeypatch):
+    """A symlink's own mode is meaningless; its directory's is what protects
+    it from being repointed."""
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path, bin_mode=0o775)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
+def test_a_symlink_cycle_is_refused_rather_than_followed(tmp_path, monkeypatch):
+    module = _module()
+    opt = _install_release(module, monkeypatch, tmp_path)
+    venv_bin = opt / "releases" / ("a1" * 20) / ".venv" / "bin"
+    venv_bin.chmod(0o755)
+    (venv_bin / "python").unlink()
+    (venv_bin / "python").symlink_to("python3")
+    (venv_bin / "python3").unlink()
+    (venv_bin / "python3").symlink_to("python")
+    venv_bin.chmod(0o555)
+
+    with pytest.raises(module.RolloutError, match="too deep"):
+        module.verify_immutable_release()
+
+
+def test_a_writable_directory_far_above_the_interpreter_is_refused(tmp_path, monkeypatch):
+    """Not just the immediate parent. Write permission on any directory above
+    the interpreter is enough to rename the whole subtree out and drop a
+    replacement -- so checking `/usr/bin` while ignoring `/usr` would leave the
+    binary swappable by anyone who can write to `/usr`.
+    """
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    # Two levels above the real interpreter: `usr/bin/python3.12` lives under
+    # `usr/`, which nothing but the ancestor walk looks at.
+    (tmp_path / "usr").chmod(0o777)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
