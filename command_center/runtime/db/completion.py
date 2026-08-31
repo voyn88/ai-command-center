@@ -366,18 +366,22 @@ def append_completion_event(
     return seq
 
 
-def list_completion_events_stored(db_path: Path, run_id: str) -> list[dict]:
-    """Every completion event for one run in the shape SQLite **stores**.
+def list_completion_events_stored(db_path: Path) -> list[dict]:
+    """Every completion event across every run, in the shape SQLite
+    **stores**, for whole-table reconciliation.
 
     :func:`list_completion_events` does both things that hide a column from
     reconciliation: it selects an explicit column list without `id`, and it
     pops `metadata_json` in favour of a decoded `metadata`. Fed those rows the
     reconciliation pairs on `None` and compares a column that is not there.
+    It is also scoped to one `run_id`, which reconciliation cannot afford: a
+    row whose `run_id` was dropped or corrupted on write would never surface
+    to a caller that only ever asks about the run it expects to find it
+    under. No `WHERE` clause, same as `list_audit_runs_stored` and
+    `list_decisions_stored`.
     """
     with db.connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT * FROM completion_event WHERE run_id = ? ORDER BY seq ASC", (run_id,)
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM completion_event ORDER BY id ASC").fetchall()
         return [dict(row) for row in rows]
 
 

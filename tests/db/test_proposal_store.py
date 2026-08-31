@@ -68,6 +68,14 @@ def _create(db_path: Path, **overrides) -> dict:
 def test_the_proposal_family_reconciles_after_every_write(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
+    """Two proposals, not one — a reader that only ever returned its caller's
+    own proposal's rows would still pass a single-proposal version of this
+    test. The second proposal's evidence and events are interleaved with the
+    first's whole lifecycle, and every stage reconciles the combined
+    `proposal_event`/`proposal_evidence` tables via the whole-table
+    `list_proposal_events_stored(db_path)` and
+    `list_proposal_evidence_stored(db_path)`, with no `proposal_id` in sight
+    (SRV-07f)."""
     _patch(monkeypatch, pg_connection_factory)
     proposals = PostgresProposalMirror(connection_factory=pg_connection_factory)
     events = PostgresProposalEventMirror(connection_factory=pg_connection_factory)
@@ -76,24 +84,33 @@ def test_the_proposal_family_reconciles_after_every_write(
     db_path = tmp_path / "runtime.db"
     proposal_db.db.migrate(db_path)
 
-    def reconciled(stage: str, proposal_id: str) -> None:
-        stored = proposal_db.get_proposal(db_path, proposal_id)
-        assert proposal_divergence([stored] if stored else [], proposals) == [], stage
+    def reconciled(stage: str, *proposal_ids: str) -> None:
+        stored = [
+            p for p in (proposal_db.get_proposal(db_path, pid) for pid in proposal_ids) if p
+        ]
+        assert proposal_divergence(stored, proposals) == [], stage
+        assert proposal_event_divergence(proposal_db.list_proposal_events_stored(db_path), events) == [], (
+            stage
+        )
         assert (
-            proposal_event_divergence(
-                proposal_db.list_proposal_events_stored(db_path, proposal_id), events
-            )
-            == []
-        ), stage
-        assert (
-            proposal_evidence_divergence(
-                proposal_db.list_proposal_evidence_stored(db_path, proposal_id), evidence
-            )
+            proposal_evidence_divergence(proposal_db.list_proposal_evidence_stored(db_path), evidence)
             == []
         ), stage
 
     created = _create(db_path)
-    reconciled("proposal created", created["id"])
+    other = _create(db_path, title="other")
+    reconciled("both proposals created", created["id"], other["id"])
+
+    proposal_db.append_proposal_evidence(
+        db_path,
+        other["id"],
+        kind="observation",
+        source="ci",
+        summary="the other proposal's evidence, appended first",
+        observed_at=SAMPLE_AT,
+        data={"owner": "other"},
+    )
+    reconciled("other proposal's evidence appended", created["id"], other["id"])
 
     proposal_db.append_proposal_evidence(
         db_path,
@@ -104,12 +121,17 @@ def test_the_proposal_family_reconciles_after_every_write(
         observed_at=SAMPLE_AT,
         data={"b": 1, "a": 2},
     )
-    reconciled("evidence appended", created["id"])
+    reconciled("evidence appended", created["id"], other["id"])
+
+    proposal_db.append_proposal_event(
+        db_path, other["id"], "noted", message="the other proposal's own journal line"
+    )
+    reconciled("other proposal's event appended", created["id"], other["id"])
 
     proposal_db.append_proposal_event(
         db_path, created["id"], "noted", message="an ordinary journal line"
     )
-    reconciled("event appended", created["id"])
+    reconciled("event appended", created["id"], other["id"])
 
     # The whole-row rewrite that would repair anything dropped above.
     proposal_db.update_proposal(
@@ -118,7 +140,7 @@ def test_the_proposal_family_reconciles_after_every_write(
         expected_version=proposal_db.get_proposal(db_path, created["id"])["version"],
         fields={"title": "t2"},
     )
-    reconciled("proposal updated", created["id"])
+    reconciled("proposal updated", created["id"], other["id"])
 
     # The two atomic lifecycle paths. They were the four call sites the first
     # version of this test left unmeasured — a sweep found them by dropping
@@ -130,7 +152,7 @@ def test_the_proposal_family_reconciles_after_every_write(
         new_state="PROPOSED",
         event={"event_type": "proposed", "to_state": "PROPOSED", "message": "raised"},
     )
-    reconciled("transitioned atomically", created["id"])
+    reconciled("transitioned atomically", created["id"], other["id"])
 
     proposal_db.apply_assessment_atomic(
         db_path,
@@ -145,7 +167,15 @@ def test_the_proposal_family_reconciles_after_every_write(
             }
         ],
     )
-    reconciled("assessment applied atomically", created["id"])
+    reconciled("assessment applied atomically", created["id"], other["id"])
+
+    # Not vacuous: both proposals' rows are actually in the combined tables,
+    # so an implementation that silently dropped one owner would have been
+    # caught above rather than agreeing by omission.
+    all_events = proposal_db.list_proposal_events_stored(db_path)
+    all_evidence = proposal_db.list_proposal_evidence_stored(db_path)
+    assert {e["proposal_id"] for e in all_events} == {created["id"], other["id"]}
+    assert {e["proposal_id"] for e in all_evidence} == {created["id"], other["id"]}
 
 
 def test_the_atomic_path_mirrors_the_parent_before_its_children(
@@ -159,6 +189,11 @@ def test_the_atomic_path_mirrors_the_parent_before_its_children(
     hook that mirrored children first would lose them all without raising,
     because the dual-write swallows. Reconciling the children is what makes
     that visible: they can only be there if the parent went first.
+
+    Run twice, for two distinct proposals, and reconciled against the
+    combined table each reader now returns with no `proposal_id` (SRV-07f) —
+    a reader that only ever returned the first proposal's children would still
+    pass a single-proposal version of this test.
     """
     _patch(monkeypatch, pg_connection_factory)
     proposals = PostgresProposalMirror(connection_factory=pg_connection_factory)
@@ -168,11 +203,11 @@ def test_the_atomic_path_mirrors_the_parent_before_its_children(
     db_path = tmp_path / "runtime.db"
     proposal_db.db.migrate(db_path)
 
-    stored = proposal_db.create_proposal_atomic(
+    stored_a = proposal_db.create_proposal_atomic(
         db_path,
         kind="code_change",
         project="AICC",
-        title="atomic",
+        title="atomic a",
         rationale="parent and children in one transaction",
         state="DRAFT",
         risk_level="low",
@@ -186,24 +221,37 @@ def test_the_atomic_path_mirrors_the_parent_before_its_children(
         ],
         created_event={"event_type": "created", "message": "opened"},
     )
+    stored_b = proposal_db.create_proposal_atomic(
+        db_path,
+        kind="code_change",
+        project="AICC",
+        title="atomic b",
+        rationale="a second parent and its own children in one transaction",
+        state="DRAFT",
+        risk_level="low",
+        evidence=[
+            {
+                "kind": "observation",
+                "source": "ci",
+                "summary": "second proposal's evidence",
+                "observed_at": SAMPLE_AT,
+            }
+        ],
+        created_event={"event_type": "created", "message": "also opened"},
+    )
 
-    assert proposal_divergence([stored], proposals) == []
-    assert (
-        proposal_evidence_divergence(
-            proposal_db.list_proposal_evidence_stored(db_path, stored["id"]), evidence
-        )
-        == []
-    )
-    assert (
-        proposal_event_divergence(
-            proposal_db.list_proposal_events_stored(db_path, stored["id"]), events
-        )
-        == []
-    )
-    # Not vacuous: both children exist on the authority side, so an empty
-    # mirror would have been reported above rather than silently agreeing.
-    assert len(proposal_db.list_proposal_evidence_stored(db_path, stored["id"])) == 1
-    assert len(proposal_db.list_proposal_events_stored(db_path, stored["id"])) == 1
+    assert proposal_divergence([stored_a, stored_b], proposals) == []
+    assert proposal_evidence_divergence(proposal_db.list_proposal_evidence_stored(db_path), evidence) == []
+    assert proposal_event_divergence(proposal_db.list_proposal_events_stored(db_path), events) == []
+    # Not vacuous: both proposals' children exist on the authority side, so an
+    # implementation that returned only one owner's rows would have been
+    # caught above rather than agreeing by omission.
+    all_evidence = proposal_db.list_proposal_evidence_stored(db_path)
+    all_events = proposal_db.list_proposal_events_stored(db_path)
+    assert {e["proposal_id"] for e in all_evidence} == {stored_a["id"], stored_b["id"]}
+    assert {e["proposal_id"] for e in all_events} == {stored_a["id"], stored_b["id"]}
+    assert len(all_evidence) == 2
+    assert len(all_events) == 2
 
 
 def test_a_mirror_failure_cannot_break_a_proposal_write(tmp_path, monkeypatch) -> None:

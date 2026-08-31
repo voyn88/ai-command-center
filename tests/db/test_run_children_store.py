@@ -58,27 +58,45 @@ def _launch(db_path: Path) -> dict:
 def test_the_journal_and_the_report_reconcile_after_every_write(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
+    """Two runs, not one — a reader that only ever returned its caller's own
+    run's rows would still pass a single-run version of this test. Both runs
+    get events interleaved with each other, and every stage reconciles the
+    combined table via the whole-table `list_run_events_stored(db_path)`,
+    with no `run_id` in sight (SRV-07f)."""
     _patch(monkeypatch, pg_connection_factory)
     events = PostgresRunEventMirror(connection_factory=pg_connection_factory)
     reports = PostgresReportMirror(connection_factory=pg_connection_factory)
 
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
-    run = _launch(db_path)
+    run_a = _launch(db_path)
+    run_b = _launch(db_path)
 
     def reconciled(stage: str) -> None:
-        assert run_event_divergence(exec_db.list_run_events_stored(db_path, run["id"]), events) == [], (
-            stage
-        )
-        stored_report = exec_db.get_report(db_path, run["id"])
-        assert report_divergence([stored_report] if stored_report else [], reports) == [], stage
+        assert run_event_divergence(exec_db.list_run_events_stored(db_path), events) == [], stage
+        stored_reports = [
+            r for r in (exec_db.get_report(db_path, run_a["id"]), exec_db.get_report(db_path, run_b["id"]))
+            if r
+        ]
+        assert report_divergence(stored_reports, reports) == [], stage
 
-    exec_db.append_run_event(db_path, run["id"], "stdout", {"line": "hello"})
-    reconciled("first event")
-    exec_db.append_run_event(db_path, run["id"], "stderr", {"line": "oops"})
-    reconciled("second event")
-    exec_db.create_report(db_path, run["id"], "/reports/AICC/run.md")
-    reconciled("report written")
+    exec_db.append_run_event(db_path, run_a["id"], "stdout", {"line": "hello"})
+    reconciled("first run's first event")
+    exec_db.append_run_event(db_path, run_b["id"], "stdout", {"line": "from b"})
+    reconciled("second run's first event")
+    exec_db.append_run_event(db_path, run_a["id"], "stderr", {"line": "oops"})
+    reconciled("first run's second event")
+    exec_db.create_report(db_path, run_a["id"], "/reports/AICC/run-a.md")
+    reconciled("first run's report written")
+    exec_db.create_report(db_path, run_b["id"], "/reports/AICC/run-b.md")
+    reconciled("second run's report written")
+
+    # Not vacuous: both runs' rows are actually in the combined table, so an
+    # implementation that silently dropped one owner would have been caught
+    # above rather than agreeing by omission.
+    all_events = exec_db.list_run_events_stored(db_path)
+    assert {e["run_id"] for e in all_events} == {run_a["id"], run_b["id"]}
+    assert len(all_events) == 3
 
 
 def test_the_hook_assembles_the_stored_event_because_the_writer_returns_a_number(

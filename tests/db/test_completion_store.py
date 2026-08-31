@@ -78,6 +78,12 @@ def _launch(db_path: Path) -> dict:
 def test_the_completion_family_reconciles_after_every_write(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
+    """Two runs, not one — a reader that only ever returned its caller's own
+    run's rows would still pass a single-run version of this test. Both runs
+    get completions and events interleaved with each other, and every stage
+    reconciles the combined `completion_event` table via the whole-table
+    `list_completion_events_stored(db_path)`, with no `run_id` in sight
+    (SRV-07f)."""
     _patch(monkeypatch, pg_connection_factory)
     completions = PostgresCompletionMirror(connection_factory=pg_connection_factory)
     events = PostgresCompletionEventMirror(connection_factory=pg_connection_factory)
@@ -85,43 +91,63 @@ def test_the_completion_family_reconciles_after_every_write(
 
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
-    run = _launch(db_path)
+    run_a = _launch(db_path)
+    run_b = _launch(db_path)
 
     def reconciled(stage: str) -> None:
-        stored = completion_db.get_completion(db_path, run["id"])
-        assert completion_divergence([stored] if stored else [], completions) == [], stage
-        assert (
-            completion_event_divergence(
-                completion_db.list_completion_events_stored(db_path, run["id"]), events
+        stored = [
+            c for c in (
+                completion_db.get_completion(db_path, run_a["id"]),
+                completion_db.get_completion(db_path, run_b["id"]),
             )
-            == []
-        ), stage
+            if c
+        ]
+        assert completion_divergence(stored, completions) == [], stage
+        assert completion_event_divergence(completion_db.list_completion_events_stored(db_path), events) == [], (
+            stage
+        )
         assert (
             completion_validation_divergence(
-                completion_db.list_validation_results(db_path, run["id"]), validations
+                completion_db.list_validation_results(db_path, run_a["id"]), validations
             )
             == []
         ), stage
 
-    created = completion_db.create_completion(
+    created_a = completion_db.create_completion(
         db_path,
-        run_id=run["id"],
-        task_id=run["task_id"],
+        run_id=run_a["id"],
+        task_id=run_a["task_id"],
         project="AICC",
         repository_path="/tmp/repo",
         completion_state="EXECUTION_FINISHED",
         branch="feat/x",
     )
-    reconciled("completion created")
+    reconciled("first run's completion created")
+
+    completion_db.create_completion(
+        db_path,
+        run_id=run_b["id"],
+        task_id=run_b["task_id"],
+        project="AICC",
+        repository_path="/tmp/repo",
+        completion_state="EXECUTION_FINISHED",
+        branch="feat/y",
+    )
+    reconciled("second run's completion created")
 
     completion_db.append_completion_event(
-        db_path, run["id"], "validation_started", message="running"
+        db_path, run_a["id"], "validation_started", message="running"
     )
-    reconciled("first event")
+    reconciled("first run's first event")
+
+    completion_db.append_completion_event(
+        db_path, run_b["id"], "validation_started", message="also running"
+    )
+    reconciled("second run's first event")
 
     completion_db.record_validation_result(
         db_path,
-        run["id"],
+        run_a["id"],
         attempt=1,
         command="pytest -q",
         exit_code=0,
@@ -137,14 +163,21 @@ def test_the_completion_family_reconciles_after_every_write(
     # is why the check runs per write.
     completion_db.update_completion(
         db_path,
-        run["id"],
-        expected_version=created["version"],
+        run_a["id"],
+        expected_version=created_a["version"],
         fields={"completion_state": "VALIDATING_RESULT"},
     )
-    reconciled("completion updated")
+    reconciled("first run's completion updated")
 
-    completion_db.append_completion_event(db_path, run["id"], "validated", message="done")
-    reconciled("second event")
+    completion_db.append_completion_event(db_path, run_a["id"], "validated", message="done")
+    reconciled("first run's second event")
+
+    # Not vacuous: both runs' events are actually in the combined table, so an
+    # implementation that silently dropped one owner would have been caught
+    # above rather than agreeing by omission.
+    all_events = completion_db.list_completion_events_stored(db_path)
+    assert {e["run_id"] for e in all_events} == {run_a["id"], run_b["id"]}
+    assert len(all_events) == 3
 
 
 def test_a_mirror_failure_cannot_break_a_completion_write(tmp_path, monkeypatch) -> None:

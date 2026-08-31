@@ -117,6 +117,12 @@ proposal_event_divergence = divergence_against(
     **Takes rows in the shape SQLite stores** — `runtime/db/proposal.py`'s
     `list_proposal_events_stored`, not `list_proposal_events`, which hands out
     the caller-facing shape. Fed that, this reports every event divergent.
+
+    `list_proposal_events_stored` takes no `proposal_id` (SRV-07f): a
+    whole-table reader, not one scoped to a single owner, because
+    reconciliation has to see every proposal's events to catch one whose
+    `proposal_id` was itself dropped or corrupted on write — a scoped read
+    never would.
     """,
 )
 proposal_evidence_divergence = divergence_against(
@@ -126,5 +132,9 @@ proposal_evidence_divergence = divergence_against(
     "    the public reader pops `data_json` and returns a parsed `data` key, so\n"
     "    reconciliation fed its rows reports every one of them divergent while\n"
     "    agreeing about a column PostgreSQL does not have. See\n"
-    "    `mirror_support.divergence` for what each reported shape means.",
+    "    `mirror_support.divergence` for what each reported shape means.\n\n"
+    "    `list_proposal_evidence_stored` takes no `proposal_id` (SRV-07f): a\n"
+    "    whole-table reader, not one scoped to a single owner, for the same\n"
+    "    reason `list_proposal_events_stored` is — a scoped read cannot catch a\n"
+    "    row whose `proposal_id` was itself dropped or corrupted on write.",
 )

@@ -1022,8 +1022,9 @@ def _mirror_report(record: dict) -> None:
 
 
 
-def list_run_events_stored(db_path: Path, run_id: str) -> list[dict]:
-    """Every journal row for one run in the shape SQLite **stores**.
+def list_run_events_stored(db_path: Path) -> list[dict]:
+    """Every journal row across every run, in the shape SQLite **stores**,
+    for whole-table reconciliation.
 
     :func:`list_run_events` selects an explicit column list that omits `id` —
     reasonably, since callers address the journal by `(run_id, seq)`. But
@@ -1034,11 +1035,17 @@ def list_run_events_stored(db_path: Path, run_id: str) -> list[dict]:
     *decode* a column away, and this one *projects* it away. The fitness gate
     was extended in the same slice to catch the second variant, because the
     first one taught that memory is not a mechanism.
+
+    Also unscoped by `run_id`: reconciliation walking one run at a time would
+    never notice a row whose `run_id` was dropped or corrupted on write. No
+    `WHERE` clause, same as `list_audit_runs_stored` and `list_decisions_stored`
+    — reconciling `run_event`, the highest-volume table in the schema, means
+    materialising the whole journal, which is exactly what
+    `VOYN-W0-AICC-MIRROR-RECONCILE-STREAMING` says the entry point has to page
+    through rather than the mirror changing shape to avoid it.
     """
     with db.connect(db_path) as conn:
-        rows = conn.execute(
-            "SELECT * FROM run_event WHERE run_id = ? ORDER BY seq ASC", (run_id,)
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM run_event ORDER BY id ASC").fetchall()
         return [dict(row) for row in rows]
 
 

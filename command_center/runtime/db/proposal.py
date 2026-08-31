@@ -550,13 +550,20 @@ def list_proposal_evidence(db_path: Path, proposal_id: str) -> list[dict]:
         return events
 
 
-def list_proposal_evidence_stored(db_path: Path, proposal_id: str) -> list[dict]:
-    """Evidence rows in the shape SQLite **stores**, for reconciliation.
+def list_proposal_evidence_stored(db_path: Path) -> list[dict]:
+    """Every evidence row across every proposal, in the shape SQLite
+    **stores**, for whole-table reconciliation.
 
     :func:`list_proposal_evidence` pops `data_json` and returns a parsed `data`
     key instead, which is right for its callers and wrong for reconciliation:
     fed those rows it reports every evidence row divergent on `data_json` and
-    agrees about a `data` column the target does not have.
+    agrees about a `data` column the target does not have. And it takes a
+    `proposal_id`, which is right for a single owner and wrong for
+    reconciliation too: a sweep that checked one proposal at a time would never
+    notice a row whose `proposal_id` was dropped or corrupted on write. This
+    reader has no `WHERE` clause for the same reason `list_audit_runs_stored`
+    and `list_decisions_stored` don't — reconciliation has to see the whole
+    table to catch what a scoped read can't.
 
     The decoding here is written inline rather than in a `_decode_*` helper,
     which is how it got past the fitness gate until that gate learned to treat
@@ -564,8 +571,7 @@ def list_proposal_evidence_stored(db_path: Path, proposal_id: str) -> list[dict]
     """
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM proposal_evidence WHERE proposal_id = ? ORDER BY seq ASC",
-            (proposal_id,),
+            "SELECT * FROM proposal_evidence ORDER BY id ASC",
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -597,19 +603,23 @@ def append_proposal_event(
     return event_record["seq"]
 
 
-def list_proposal_events_stored(db_path: Path, proposal_id: str) -> list[dict]:
-    """Every proposal event in the shape SQLite **stores**, for reconciliation.
+def list_proposal_events_stored(db_path: Path) -> list[dict]:
+    """Every proposal event across every proposal, in the shape SQLite
+    **stores**, for whole-table reconciliation.
 
     :func:`list_proposal_events` hands out the shape callers want, which is not
     the shape the mirror holds — the same split `digest_item`, `model_event`,
     `audit_run`, `run_event`, `council_event` and `completion_event` all have.
     Six tables into that pattern, the gate that requires this reader is worth
-    more than the memory that used to.
+    more than the memory that used to. It is also scoped to one `proposal_id`,
+    which reconciliation cannot afford: a row whose `proposal_id` was dropped
+    or overwritten on write would never surface to a caller that only ever
+    asks about the proposal it expects to find it under. No `WHERE` clause,
+    same as `list_audit_runs_stored` and `list_decisions_stored`.
     """
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM proposal_event WHERE proposal_id = ? ORDER BY seq ASC",
-            (proposal_id,),
+            "SELECT * FROM proposal_event ORDER BY id ASC",
         ).fetchall()
         return [dict(row) for row in rows]
 

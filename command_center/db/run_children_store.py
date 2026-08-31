@@ -85,6 +85,11 @@ run_event_divergence = divergence_against(
     fed the projected rows it sees `None` on every one and reports the whole
     journal divergent. A third variant of slice 4's trap: that one decoded a
     column away, this one projects it away.
+
+    `list_run_events_stored` takes no `run_id` (SRV-07f): a whole-table
+    reader, not one scoped to a single owner, because reconciliation has to
+    see every run's rows to catch one whose `run_id` was itself dropped or
+    corrupted on write — a scoped read never would.
     """,
 )
 
