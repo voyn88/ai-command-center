@@ -15,6 +15,7 @@ CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 
 EXPECTED_CONTEXTS = {
+    "prepare": "Prepare CI shared inputs",
     "quality-gates": "Linux quality shard ${{ matrix.shard }} of 4",
     "manifest-gate": "Linux manifest gate (exactly once)",
     "coverage-gate": "Main coverage aggregation",
@@ -35,13 +36,17 @@ EXPECTED_STEPS = {
     # owns each non-parallel partition. The manifest gate proves the nodeid
     # union is non-empty and exactly-once before Final can pass.
     "quality-gates": {
-        "Build exactly-once test manifest",
         "Pytest core shard",
         "Pytest (serial tail)",
         "Real-browser E2E",
-        "Publish exact test manifest",
+        "Publish actual test collection receipt",
     },
-    "manifest-gate": {"Verify four identical non-empty manifests"},
+    "prepare": {
+        "Fetch and verify exact accepted AIOS SDK and DB artifacts",
+        "Build exactly-once test manifest",
+        "Publish prepared SDK, DB, and test manifest",
+    },
+    "manifest-gate": {"Verify actual collections equal planned partition"},
     "coverage-gate": {"PR and merge-group coverage policy"},
     "impact-fast-check": {
         "Select impacted tests",
@@ -93,6 +98,11 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
     assert set(ci["jobs"]) == set(EXPECTED_CONTEXTS) - {"boundary-fitness"}
     assert set(boundary["jobs"]) == {"boundary-fitness"}
     assert {job_id: job["name"] for job_id, job in jobs.items()} == EXPECTED_CONTEXTS
+    assert ci["jobs"]["quality-gates"]["needs"] == "prepare"
+    assert set(ci["jobs"]["manifest-gate"]["needs"]) == {
+        "prepare",
+        "quality-gates",
+    }
 
     # The exact trigger set, and it is a security statement rather than
     # bookkeeping: every entry here is a context in which these gates run with
