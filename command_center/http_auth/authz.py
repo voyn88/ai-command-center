@@ -113,6 +113,9 @@ OPERATIONS: frozenset[str] = frozenset(
         # command_center/dispatch/api.py
         "dispatch:assign",
         "dispatch:policy:update",
+        # command_center/api/backlog_intake_routes.py (VOYN-W0-APP-CONTROL-S6a)
+        "backlog:intake:draft",
+        "backlog:intake:confirm",
     }
 )
 

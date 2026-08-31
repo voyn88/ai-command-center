@@ -195,6 +195,16 @@ section below for why it exists at all):
   cascade. Every atomic decision is a SQL function of the store; the package
   owns candidate iteration, the static routing matrix and the plan report,
   and adds no engine capability of its own.
+  `command_center/db/backlog_intake.py` + `command_center/api/backlog_intake_routes.py`
+  (VOYN-W0-APP-CONTROL-S6a) are a third client of the same backlog-store
+  authority, not a second one: a model turns free text into one line of the
+  existing Markdown grammar, `parse_backlog` is still the sole judge of
+  whether that line is a task, and `confirm` still writes only through
+  `backlog_upsert_task` (0005) — guarded so it can only insert, never
+  reach the update branch that authority reserves for Markdown
+  reconciliation. The model call itself reuses the frozen engine
+  (`agent_runner.run_claude_code`, read-only `review` profile) rather than
+  adding a second one.
 
 ### `command_center/http_auth/` — why it was added to a frozen category
 

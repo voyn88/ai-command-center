@@ -26,7 +26,8 @@ from command_center.webapi.app import create_app as create_webapi_app
 #: The premise this task started from was "two endpoints"; the inventory found
 #: 29. Pinning the number means growing the surface is a deliberate edit here
 #: rather than a silent drift back towards an uncounted one.
-EXPECTED_MUTATING_ROUTES = 30  # 29 from AUTH-HTTP-01 + queue:audit:enqueue (APP-CONTROL-S1/S4)
+EXPECTED_MUTATING_ROUTES = 32  # 29 from AUTH-HTTP-01 + queue:audit:enqueue (APP-CONTROL-S1/S4)
+# + backlog:intake:draft/confirm (APP-CONTROL-S6a)
 
 
 def _apps():

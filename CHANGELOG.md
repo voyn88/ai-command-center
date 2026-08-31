@@ -8,6 +8,26 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — chat-text backlog intake (`VOYN-W0-APP-CONTROL-S6a`)
+
+- `command_center/db/backlog_intake.py`: turns a free-text owner request into
+  one canonical backlog-Markdown line via a model prompt, then runs that line
+  back through the existing deterministic grammar
+  (`command_center.db.backlog_parser.parse_backlog`) — the model only
+  proposes text, the closed-vocabulary parser is the sole authority on
+  whether it is a task. Status is always forced to `UNTRIAGED`, the same
+  raw-finding discipline `backlog_triage` (0008) already enforces for the
+  Markdown importer.
+- `command_center/api/backlog_intake_routes.py`: `POST /api/v1/backlog/intake/draft`
+  (model call + parse, never writes) and `POST /api/v1/backlog/intake/confirm`
+  (re-parses the possibly hand-edited line from scratch, then inserts through
+  `BacklogStore.upsert_task`). `confirm` refuses with 409 when the task id
+  already names an existing record — `backlog_upsert_task` can also overwrite
+  an existing row directly (the Markdown-reconciliation path), and chat
+  intake must never reach into that shortcut. Both routes are on the
+  `http_auth` boundary (`backlog:intake:draft`/`backlog:intake:confirm`,
+  `EXPECTED_MUTATING_ROUTES` now 32).
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
