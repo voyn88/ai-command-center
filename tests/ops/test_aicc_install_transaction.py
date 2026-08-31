@@ -822,7 +822,7 @@ def test_boot_recovery_completes_armed_uninstall_from_capsule(
         "verify_service_snapshot_closure",
         lambda path: closure_checks.append(path),
     )
-    monkeypatch.setattr(module, "quiesce_service_snapshot", lambda path: None)
+    monkeypatch.setattr(module, "quiesce_service_snapshot", lambda path, **_kw: None)
     monkeypatch.setattr(
         module,
         "restore_service_snapshot",
@@ -907,7 +907,7 @@ def test_armed_uninstall_recovery_refuses_late_lane_before_mutation(
     )
     quiesced = []
     monkeypatch.setattr(
-        module, "quiesce_service_snapshot", lambda path: quiesced.append(path)
+        module, "quiesce_service_snapshot", lambda path, **_kw: quiesced.append(path)
     )
 
     with pytest.raises(RuntimeError, match="outside service snapshot"):
@@ -961,7 +961,7 @@ def test_install_recovery_rechecks_closure_after_quiesce_before_mutation(
     quiesced = []
     monkeypatch.setattr(module, "verify_service_snapshot_closure", closure)
     monkeypatch.setattr(
-        module, "quiesce_service_snapshot", lambda path: quiesced.append(path)
+        module, "quiesce_service_snapshot", lambda path, **_kw: quiesced.append(path)
     )
 
     with pytest.raises(RuntimeError, match="outside service snapshot"):
@@ -1312,7 +1312,7 @@ def test_failed_boot_service_restore_keeps_journal_for_retry(monkeypatch, tmp_pa
         transaction.recover()
 
     assert transaction.pending.exists()
-    monkeypatch.setattr(module, "restore_service_snapshot", lambda path: None)
+    monkeypatch.setattr(module, "restore_service_snapshot", lambda path, **_kw: None)
     transaction.recover()
     assert not (root / "etc/new").exists()
     assert not transaction.pending.exists()
@@ -1766,7 +1766,7 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
     order: list[str] = []
     original_selector_restore = module.FileTransaction._restore_release_selector
 
-    def recording_quiesce(path):
+    def recording_quiesce(path, **_kw):
         assert path == state / "attempt-units.json"
         order.append("quiesce")
 
@@ -2091,3 +2091,74 @@ def test_a_service_that_exists_must_still_report_a_mainpid(tmp_path):
 
     with pytest.raises(RuntimeError, match="cannot prove restored service state"):
         module.restore_service_snapshot(snapshot, run=run)
+
+
+def _quiesce_snapshot(tmp_path, unit: str):
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {unit: {"exists": True, "enabled": True, "active": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return snapshot
+
+
+def _not_found_runner():
+    def run(command, **kwargs):
+        if command[1] == "show" and "LoadState" in " ".join(command):
+            return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    return run
+
+
+def test_quiesce_proceeds_for_a_unit_this_rollback_will_restore(tmp_path):
+    """The deadlock this closes: unit files are restored by `restore()`, which
+    runs *after* quiesce. A rollback interrupted between removing a unit file
+    and restoring it could never be resumed — every later attempt died here,
+    on the unit the previous attempt was replacing. Four consecutive install
+    attempts on worker-01 each stopped on the next such unit.
+    """
+    module = _module()
+    unit = "voyn-aicc-worker.service"
+    snapshot = _quiesce_snapshot(tmp_path, unit)
+
+    module.quiesce_service_snapshot(
+        snapshot, run=_not_found_runner(), restorable_units=frozenset({unit})
+    )
+
+
+def test_quiesce_still_refuses_a_unit_that_vanished_unexplained(tmp_path):
+    """A missing unit nobody intends to restore is real divergence: mutating a
+    host whose state cannot be accounted for is exactly what this refusal is
+    for."""
+    module = _module()
+    snapshot = _quiesce_snapshot(tmp_path, "voyn-aicc-worker.service")
+
+    with pytest.raises(RuntimeError, match="expected unit disappeared before quiesce"):
+        module.quiesce_service_snapshot(snapshot, run=_not_found_runner())
+
+
+def test_restorable_units_are_read_from_the_journal_not_the_disk(tmp_path):
+    module = _module()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"target": "/etc/systemd/system/voyn-aicc-worker.service"},
+                    {"target": "/etc/systemd/system/sub/dir/not-a-unit.conf"},
+                    {"target": "/etc/aicc/worker-lanes"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    units = module._units_restored_by(manifest)
+
+    assert units == frozenset({"voyn-aicc-worker.service"})

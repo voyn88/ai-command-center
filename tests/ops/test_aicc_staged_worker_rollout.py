@@ -32,6 +32,10 @@ def _module():
             return getattr(self._value, name)
 
     module._registry_fstat = lambda fd: RootRegistryStat(real_fstat(fd))
+    # Rollout tests drive a fake systemd against paths that do not exist on
+    # the machine running them; the property under test is ordering, not this
+    # host's /etc. Dedicated tests below set the seam back to the real check.
+    module._environment_file_exists = lambda _path: True
     return module
 
 
@@ -828,3 +832,98 @@ def test_a_writable_directory_far_above_the_interpreter_is_refused(tmp_path, mon
 
     with pytest.raises(module.RolloutError, match="mutable"):
         module.verify_immutable_release()
+
+
+# ---------------------------------------------------------------------------
+# A rollout must not retire the old fleet and then discover the new one cannot
+# start. worker-01, 2026-08-31: every configuration check passed, the legacy
+# lanes were retired, and `voyn-aicc-worker@1.service` then failed with
+# `result 'resources'` because `/etc/aicc/lease.env` had never been placed on
+# the host — leaving the machine between two configurations.
+# ---------------------------------------------------------------------------
+
+
+class _EnvSystemd:
+    def __init__(self, files: str) -> None:
+        self._files = files
+
+    def property(self, _unit: str, name: str) -> str:
+        assert name == "EnvironmentFiles"
+        return self._files
+
+
+def _entry(path: str, *, optional: bool) -> str:
+    return f"{path} (ignore_errors={'yes' if optional else 'no'})"
+
+
+def test_a_missing_required_environment_file_is_refused_before_any_mutation(tmp_path):
+    module = _module()
+    present = tmp_path / "present.env"
+    present.write_text("A=1\n", encoding="utf-8")
+    module._environment_file_exists = os.path.exists
+    systemd = _EnvSystemd(
+        "\n".join(
+            [
+                _entry(str(present), optional=False),
+                _entry(str(tmp_path / "absent.env"), optional=False),
+            ]
+        )
+    )
+
+    with pytest.raises(module.RolloutError, match="required environment files are absent"):
+        module.verify_required_environment_files(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_an_absent_optional_environment_file_is_not_a_refusal(tmp_path):
+    """`EnvironmentFile=-` means systemd itself tolerates absence; refusing
+    here would block a rollout on a file the unit is designed to run without."""
+    module = _module()
+    module._environment_file_exists = os.path.exists
+    systemd = _EnvSystemd(_entry(str(tmp_path / "optional.env"), optional=True))
+
+    module.verify_required_environment_files(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_every_required_file_is_named_at_once(tmp_path):
+    """One refusal listing everything that is missing, so the operator places
+    them in one pass instead of learning about them one rollout at a time."""
+    module = _module()
+    module._environment_file_exists = os.path.exists
+    first, second = tmp_path / "a.env", tmp_path / "b.env"
+    systemd = _EnvSystemd(
+        "\n".join([_entry(str(first), optional=False), _entry(str(second), optional=False)])
+    )
+
+    with pytest.raises(module.RolloutError) as refusal:
+        module.verify_required_environment_files(systemd, ("voyn-aicc-worker@1.service",))
+
+    assert str(first) in str(refusal.value)
+    assert str(second) in str(refusal.value)
+
+
+def test_rollout_checks_required_files_before_retiring_anything():
+    """Ordering is the whole point. A rollout that retires the legacy fleet
+    and *then* finds `/etc/aicc/lease.env` missing leaves the host between two
+    configurations — with the old lanes gone and the new ones unable to start.
+    That is exactly what happened on worker-01, 2026-08-31.
+    """
+    module = _module()
+    units = ("voyn-aicc-worker@1.service",)
+    # The seam back to a real check, for one specific absent path.
+    module._environment_file_exists = lambda path: path != "/etc/aicc/lease.env"
+    systemd = FakeSystemd(units)
+    before = {name: dict(state) for name, state in systemd.states.items()}
+
+    with pytest.raises(module.RolloutError, match="/etc/aicc/lease.env"):
+        module.rollout(
+            systemd,
+            units,
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+        )
+
+    # Nothing was retired, enabled, started or stopped: the refusal came first.
+    assert systemd.states == before

@@ -927,8 +927,54 @@ def restore_service_snapshot(
         assert_restored(unit, state, queued_start=queued_start)
 
 
-def quiesce_service_snapshot(path: Path, *, run=subprocess.run) -> None:
-    """Stop snapshotted admission/worker units before rollback mutation."""
+#: Where systemd reads administrator-installed units. Unit files the journal
+#: restores live here; a target anywhere else is not a unit.
+_SYSTEMD_UNIT_DIR = "/etc/systemd/system/"
+
+
+def _units_restored_by(manifest: Path) -> frozenset[str]:
+    """Unit names whose files this rollback's journal will put back.
+
+    Read from the generation manifest rather than from the filesystem: what
+    matters is what `restore()` is going to do, not what happens to be on disk
+    at this instant.
+    """
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        records = payload["records"]
+    except (OSError, ValueError, KeyError):
+        # An unreadable journal is not a licence to skip refusals; the caller
+        # fails on it a moment later, with a better message than this one.
+        return frozenset()
+    units = set()
+    for record in records:
+        target = str(record.get("target", ""))
+        if target.startswith(_SYSTEMD_UNIT_DIR):
+            name = target[len(_SYSTEMD_UNIT_DIR) :].lstrip("/")
+            if name and "/" not in name:
+                units.add(name)
+    return frozenset(units)
+
+
+def quiesce_service_snapshot(
+    path: Path, *, run=subprocess.run, restorable_units: frozenset[str] = frozenset()
+) -> None:
+    """Stop snapshotted admission/worker units before rollback mutation.
+
+    `restorable_units` names the units this same rollback is about to put back
+    on disk. A unit whose file is currently missing has nothing to stop, and
+    refusing to proceed on that ground creates a deadlock the operator cannot
+    escape from: the file is restored by `restore()`, which runs *after* this
+    function, so a rollback interrupted between removing a unit file and
+    restoring it can never be resumed — every later attempt dies here, on the
+    unit the previous attempt was in the middle of replacing. Observed live on
+    worker-01 across four install attempts, each stopping on the next such
+    unit (2026-08-31).
+
+    A missing unit that this rollback does NOT intend to restore is still a
+    refusal: that is genuinely unexplained divergence, and proceeding would
+    mutate a host whose state nobody can account for.
+    """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         version = payload["version"]
@@ -988,6 +1034,10 @@ def quiesce_service_snapshot(path: Path, *, run=subprocess.run) -> None:
                 and expected["active"] is False
                 and expected["enabled"] is False
             ):
+                continue
+            if unit in restorable_units:
+                # Nothing to stop, and the file is coming back in this same
+                # rollback. See `restorable_units` in the docstring.
                 continue
             raise RuntimeError(f"expected unit disappeared before quiesce: {unit}")
         if load.returncode or not load_state:
@@ -1640,7 +1690,9 @@ class FileTransaction:
         snapshot_present = _path_present(snapshot)
         if snapshot_present:
             verify_service_snapshot_closure(snapshot)
-            quiesce_service_snapshot(snapshot)
+            quiesce_service_snapshot(
+                snapshot, restorable_units=_units_restored_by(manifest)
+            )
             verify_service_snapshot_closure(snapshot)
         elif self.root == Path("/"):
             raise RuntimeError("production recovery requires a service snapshot")
