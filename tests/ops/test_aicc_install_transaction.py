@@ -2204,3 +2204,46 @@ def test_the_retired_legacy_set_matches_the_rollout_and_the_installer():
 
     assert module.RETIRED_LEGACY_UNITS == rollout_units
     assert module.RETIRED_LEGACY_UNITS <= included
+
+
+def test_a_boot_generated_dropin_is_not_required_to_match():
+    """`aicc-principal-recovery` writes its drop-in into
+    `/run/systemd/generator.early/`, which is tmpfs — it exists only while
+    this boot's generator output is live. Requiring it to match a snapshot
+    demands a value that by construction does not persist, and refused the
+    restore on a host where nothing was wrong (worker-01, 2026-08-31).
+    """
+    module = _module()
+    snapshotted = "/run/systemd/generator.early/voyn-aicc-worker.service.d/10-aicc-recovery.conf"
+
+    assert module._properties_match("DropInPaths", "", snapshotted)
+
+
+def test_an_administrator_dropin_must_still_match():
+    """The check exists because a silently added drop-in can weaken the
+    isolation the snapshot preserves. Only the generated ones are exempt."""
+    module = _module()
+    expected = "/etc/systemd/system/voyn-aicc-worker.service.d/20-principal-isolation.conf"
+
+    assert not module._properties_match("DropInPaths", "", expected)
+    assert module._properties_match("DropInPaths", expected, expected)
+
+
+def test_dropin_comparison_ignores_order():
+    module = _module()
+    a = "/etc/systemd/system/x.d/10-a.conf /etc/systemd/system/x.d/20-b.conf"
+    b = "/etc/systemd/system/x.d/20-b.conf /etc/systemd/system/x.d/10-a.conf"
+
+    assert module._properties_match("DropInPaths", a, b)
+
+
+def test_a_command_property_still_ignores_only_its_invocation_fields():
+    """The other renderer whose text moves without the configuration moving.
+    Routed through the same matcher, so both stay in one place."""
+    module = _module()
+    snapshot = "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m w ; pid=0 }"
+    after_run = "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m w ; pid=76841 }"
+    replaced = "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m attacker ; pid=0 }"
+
+    assert module._properties_match("ExecStart", after_run, snapshot)
+    assert not module._properties_match("ExecStart", replaced, snapshot)
