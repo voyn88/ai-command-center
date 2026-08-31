@@ -1093,6 +1093,23 @@ def review_once(
             report.skipped.append((task_id, f"review_prompt_budget_invalid: {exc}"))
             continue
 
+        # A succeeded review whose output failed the verdict/head contract
+        # must not end the story: re-enqueue under a retry-suffixed key, up to
+        # MAX_MALFORMED_REVIEW_RETRIES. Single-chunk reviews only -- a chunked
+        # review's aggregation reads exact per-chunk keys, and widening those
+        # to families is a separate change; its malformed aggregate already
+        # routes through _aggregate_chunk_verdict's own WAIT/REMEDIATE legs.
+        retry_suffix = ""
+        if len(chunks) == 1:
+            latest, attempts = _latest_family_review_result(factory, task_id, key)
+            if latest is not None and _parse_verdict(latest.get("result_text") or "") is None:
+                if attempts > MAX_MALFORMED_REVIEW_RETRIES:
+                    report.skipped.append(
+                        (task_id, f"review_result_malformed_exhausted:{attempts}")
+                    )
+                    continue
+                retry_suffix = f":mr{attempts}"
+
         prepared: list[tuple[str, dict[str, Any]]] = []
         for chunk in chunks:
             prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
@@ -1109,7 +1126,7 @@ def review_once(
                 "cascade": cascade,
             }
             if chunk.count == 1:
-                prepared.append((key, payload))
+                prepared.append((key + retry_suffix, payload))
             else:
                 chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
                 if chunk_key is None:
@@ -1198,6 +1215,57 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
         return None
     payload = rows[0][0]
     return json.loads(payload) if isinstance(payload, str) else payload
+
+
+#: How many times a review whose SUCCEEDED result failed the verdict/head
+#: contract may be re-run before the task stops spending on it.
+#:
+#: The queue's idempotency is what created the stall this bounds: a repeated
+#: key means "already ran, return the existing item", so one malformed-but-
+#: succeeded result blocked every future review of that exact head forever --
+#: the tick logged `verdict_or_head_sha_missing_in_review_result` for the same
+#: tasks day after day (live, 2026-08-31). The defect is the reviewer's, not
+#: the PR's, so a bounded retry is the correct spend; unbounded would recreate
+#: the remediation-chain mistake with a different actor.
+MAX_MALFORMED_REVIEW_RETRIES = 2
+
+
+def _latest_family_review_result(
+    factory: Any, task_id: str, key: str
+) -> tuple[dict[str, Any] | None, int]:
+    """Latest succeeded result across the key's retry family, and how many
+    succeeded results the family holds.
+
+    The family is the base review-cycle key plus its `:mrN` malformed-retry
+    variants. Reading the whole family keeps the retry mechanism invisible to
+    verdict consumers: a clean verdict from any attempt is THE verdict for this
+    head, and the count is what bounds further retries. Keys are colon-joined
+    hex and digits, so the LIKE pattern needs no escaping.
+    """
+    rows = _rows(
+        factory,
+        "SELECT wr.payload FROM work_item i "
+        "JOIN work_result wr ON wr.result_id = i.result_id "
+        "WHERE i.task_id = %s "
+        "AND (i.idempotency_key = %s OR i.idempotency_key LIKE %s) "
+        "AND i.state = 'succeeded' "
+        "ORDER BY wr.created_at DESC",
+        (task_id, key, key + ":mr%"),
+    )
+    if not rows:
+        return None, 0
+    payload = rows[0][0]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = None
+    if not isinstance(payload, dict):
+        # A result row whose payload cannot even be read IS a malformed
+        # result -- the caller's retry/exhaustion accounting must see it,
+        # not a crashed tick.
+        payload = {}
+    return payload, len(rows)
 
 
 def _json_object(value: Any) -> dict[str, Any] | None:
@@ -1910,14 +1978,26 @@ def publish_review_verdicts(
                 continue
             sha = current_head
         else:
-            result = _latest_review_result(factory, task_id, key)
+            result, attempts = _latest_family_review_result(factory, task_id, key)
             if result is None:
                 report.skipped.append((task_id, "no_review_result_yet"))
                 continue
             text = result.get("result_text") or ""
             parsed = _parse_verdict(text)
             if parsed is None:
-                report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
+                # The reviewer, not the PR, failed its output contract. The
+                # retry is review_once's job (bounded, retry-suffixed keys);
+                # this side only has to say which state the family is in, so
+                # an operator reading the tick log can tell "another attempt
+                # is coming" from "spending on this reviewer has stopped".
+                if attempts > MAX_MALFORMED_REVIEW_RETRIES:
+                    report.skipped.append(
+                        (task_id, f"review_result_malformed_exhausted:{attempts}")
+                    )
+                else:
+                    report.skipped.append(
+                        (task_id, f"review_result_malformed_retry_pending:{attempts}")
+                    )
                 continue
             verdict, sha = parsed
             if sha != current_head:

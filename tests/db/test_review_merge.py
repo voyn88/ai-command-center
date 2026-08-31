@@ -863,8 +863,138 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert ("VOYN-W0-P7", "verdict_or_head_sha_missing_in_review_result") in report.skipped
+    # One malformed result on record: a bounded retry is still owed, and the
+    # reason says so -- the old flat reason could not tell "another attempt is
+    # coming" from "spending has stopped", which is exactly what an operator
+    # reading the tick log needs to know.
+    assert ("VOYN-W0-P7", "review_result_malformed_retry_pending:1") in report.skipped
     assert not any(a[:2] == ["pr", "review"] for a in posted)
+
+
+def _complete_review_with_key_suffix(
+    app_factory, worker, task_id, pr_url, result_text, suffix
+):
+    """Like `_complete_review`, but under a retry-suffixed key -- the shape
+    review_once's bounded malformed-result retry enqueues."""
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    head_sha = "d" * 40
+    SNAPSHOTS[pr_url] = _snapshot(head_sha)
+    store = WorkQueueStore(app_factory)
+    payload = {
+        "kind": "agent_run", "v": 1, "project_id": task_id,
+        "repository_path": "", "task_type": "review",
+        "prompt": "review it", "timeout_seconds": 900, "untrusted": False,
+    }
+    key = review_merge._review_key(task_id, pr_url, _snapshot(head_sha)) + suffix
+    store.enqueue("execution", idempotency_key=key, payload=payload, task_id=task_id)
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert worker.complete(claimed, {"status": "completed", "result_text": result_text})
+
+
+def test_a_malformed_review_result_is_retried_under_a_new_key(rig, monkeypatch):  # noqa: F811
+    """The stall this bounds: the queue's idempotency treats a repeated key as
+    "already ran", so one malformed-but-succeeded result blocked every future
+    review of that head forever -- the tick logged the same skip for the same
+    tasks day after day (live, 2026-08-31). The reviewer failed, not the PR,
+    so the retry must target the reviewer: same head, fresh key."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    head = "d" * 40
+    pr_url = "https://github.com/x/y/pull/71"
+    _ready(store, app_factory, "VOYN-W0-MR1", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-MR1", pr_url, head, "gibberish, no verdict\n"
+    )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    enqueued = []
+
+    def enqueue(queue, key, payload, task_id, max_attempts):
+        enqueued.append(key)
+
+    report = review_once(app_factory, enqueue, "/tmp")
+    assert any(k.endswith(":mr1") for k in enqueued), enqueued
+    assert ("VOYN-W0-MR1", pr_url) in report.reviewed
+
+
+def test_malformed_retries_stop_at_the_cap(rig, monkeypatch):  # noqa: F811
+    """Bounded, or this recreates the remediation-chain mistake with a
+    different actor: each retry is a real agent run with a real cost."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    head = "d" * 40
+    pr_url = "https://github.com/x/y/pull/72"
+    _ready(store, app_factory, "VOYN-W0-MR2", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-MR2", pr_url, head, "still no verdict\n"
+    )
+    for n in (1, 2):
+        _complete_review_with_key_suffix(
+            app_factory, worker, "VOYN-W0-MR2", pr_url,
+            "still no verdict\n", f":mr{n}",
+        )
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    enqueued = []
+    report = review_once(
+        app_factory, lambda q, k, p, t, m: enqueued.append(k), "/tmp"
+    )
+    assert not enqueued, "past the cap no further review may be enqueued"
+    assert any(
+        task == "VOYN-W0-MR2" and reason.startswith("review_result_malformed_exhausted:")
+        for task, reason in report.skipped
+    ), report.skipped
+
+    publish = publish_review_verdicts(app_factory, "/tmp")
+    assert any(
+        task == "VOYN-W0-MR2" and reason.startswith("review_result_malformed_exhausted:")
+        for task, reason in publish.skipped
+    ), publish.skipped
+
+
+def test_a_clean_verdict_from_a_retry_is_read_as_the_verdict(rig, monkeypatch):  # noqa: F811
+    """The retry mechanism must be invisible to verdict consumers: a clean
+    verdict from attempt :mr1 is THE verdict for this head, and the marker is
+    posted from it exactly as if the first attempt had produced it."""
+    import subprocess as sp
+
+    app_factory, store, worker = rig
+    head = "d" * 40
+    pr_url = "https://github.com/x/y/pull/73"
+    _ready(store, app_factory, "VOYN-W0-MR3", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-MR3", pr_url, head, "no verdict\n"
+    )
+    _complete_review_with_key_suffix(
+        app_factory, worker, "VOYN-W0-MR3", pr_url,
+        f"Looks correct.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n", ":mr1",
+    )
+
+    posted = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        posted.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-MR3", pr_url) in report.reviewed
+    assert any(a[:2] == ["pr", "review"] for a in posted)
 
 
 def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):  # noqa: F811
