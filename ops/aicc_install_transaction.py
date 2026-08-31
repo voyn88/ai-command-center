@@ -2454,6 +2454,35 @@ def verify_release_manifest(
     return observed
 
 
+#: Targets that exist only because a host runs untrusted coding agents: the
+#: launcher and its socket, the agent principal's sysusers/tmpfiles and env,
+#: the worker lanes and units, the staged-rollout tool, and the agent model
+#: credentials. A control-plane host runs none of them, and must not hold the
+#: credentials in particular -- one secret on two hosts destroys exactly the
+#: principal isolation this installer exists to create.
+WORKER_ONLY_TARGETS = frozenset(
+    {
+        "/usr/lib/sysusers.d/aicc-agent.conf",
+        "/usr/lib/tmpfiles.d/aicc-agent.conf",
+        "/usr/libexec/aicc-agent-launcher",
+        "/usr/libexec/aicc-staged-worker-rollout",
+        "/etc/systemd/system/aicc-principal-recovery.service",
+        "/etc/systemd/system/aicc-agent-launcher.socket",
+        "/etc/systemd/system/aicc-agent-launcher@.service",
+        "/etc/aicc/agent-workspace-roots",
+        "/etc/aicc/worker-lanes",
+        "/etc/aicc/agent.env",
+        "/etc/systemd/system/voyn-aicc-worker@.service",
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf",
+        "/etc/systemd/system/aicc-worker.service.d/20-principal-isolation.conf",
+        "/var/lib/aicc-agent/claude/.claude/.credentials.json",
+        "/var/lib/aicc-agent/codex/.codex/auth.json",
+    }
+)
+
+PROFILES = ("worker", "control")
+
+
 def default_specs(
     repo_root: Path,
     *,
@@ -2461,11 +2490,33 @@ def default_specs(
     claude_auth: Path,
     codex_auth: Path,
     resolve_identities: bool = True,
+    profile: str = "worker",
 ) -> tuple[FileSpec, ...]:
+    """The files one host role installs.
+
+    `worker` is every spec, unchanged -- the default, so an existing caller
+    that knows nothing about profiles installs exactly what it always did.
+
+    `control` drops `WORKER_ONLY_TARGETS`. Before this existed there was one
+    profile for every host, and it demanded the agent's Claude and Codex
+    credentials unconditionally: installing the control plane meant either
+    placing agent secrets on a host that must never hold them, or not
+    installing it at all. The live attempt on control-01 took the second
+    branch and stopped at `source is not a safe regular file:
+    /home/voynadmin/.claude/.credentials.json` -- a file whose *absence* was
+    correct (2026-08-31).
+
+    The control-plane's own units (planner, review, merge, reaper, rotation)
+    are not added here: they are still symlinks into the operator's home and
+    become repo-owned under VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. This
+    profile makes that installation possible; it does not pre-empt it.
+    """
+    if profile not in PROFILES:
+        raise ValueError(f"unknown installation profile: {profile!r}")
     root_uid, root_gid = 0, 0
     agent_gid = grp.getgrnam("aicc-agent").gr_gid if resolve_identities else 0
     publisher_gid = grp.getgrnam("aicc-publisher").gr_gid if resolve_identities else 0
-    return (
+    specs = (
         # The recovery generator is a permanent bootstrap anchor installed
         # atomically before prepare(), not part of reversible generations.
         FileSpec(
@@ -2615,6 +2666,9 @@ def default_specs(
             root_gid,
         ),
     )
+    if profile == "control":
+        return tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
+    return specs
 
 
 def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -2747,6 +2801,7 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             claude_auth=args.claude_auth,
             codex_auth=args.codex_auth,
             resolve_identities=args.action != "validate",
+            profile=args.profile,
         )
     if args.action == "validate":
         transaction.validate_sources(specs)
@@ -2806,6 +2861,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--authority-env", type=Path, default=Path("/etc/aicc/workspace-authority.env")
+    )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILES,
+        default="worker",
+        help=(
+            "Which host role to install. 'worker' is every spec and stays the "
+            "default, so an existing caller installs exactly what it always "
+            "did. 'control' omits the agent launcher, worker units and agent "
+            "model credentials -- a control-plane host must not hold them."
+        ),
     )
     parser.add_argument(
         "--claude-auth",

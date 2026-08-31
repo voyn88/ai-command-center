@@ -69,6 +69,16 @@ git_trusted() {
     "$@"
 }
 
+# Which host role is being installed. The bootstrap sets it; an unset value
+# means "worker", so a caller that predates profiles installs what it always
+# did. Anything else is refused here rather than passed down, so a typo can
+# never silently install a narrower set of files than intended.
+install_profile="${AICC_INSTALL_PROFILE:-worker}"
+case "$install_profile" in
+  worker|control) ;;
+  *) echo "unknown AICC_INSTALL_PROFILE: $install_profile" >&2; exit 1 ;;
+esac
+
 run_transaction() {
   action=$1
   shift
@@ -77,6 +87,7 @@ run_transaction() {
     --state-dir "$state_dir" \
     --authority-env "$workspace_authority_env" \
     --lock-fd "$AICC_INSTALL_LOCK_FD" \
+    --profile "$install_profile" \
     "$@"
 }
 

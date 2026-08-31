@@ -1066,3 +1066,92 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "st_gid != 0" in verifier
     assert "st_ino" in verifier
     assert "changed while being read" in verifier
+
+
+# ---------------------------------------------------------------------------
+# Installation profiles. Before these existed there was one profile for every
+# host, and it demanded the agent's Claude and Codex credentials
+# unconditionally -- so installing the control plane meant either putting
+# agent secrets on a host that must never hold them, or not installing it at
+# all. The live attempt on control-01 took the second branch and stopped at
+# `source is not a safe regular file: /home/voynadmin/.claude/.credentials.json`,
+# on a file whose absence was correct.
+# ---------------------------------------------------------------------------
+
+
+def _specs(profile, tmp_path):
+    import importlib
+
+    root = Path(__file__).parents[2]
+    sys.path.insert(0, str(root / "ops"))
+    tx = importlib.import_module("aicc_install_transaction")
+    return tx, {
+        spec.target
+        for spec in tx.default_specs(
+            root,
+            authority_env=tmp_path / "authority.env",
+            claude_auth=tmp_path / "claude.json",
+            codex_auth=tmp_path / "codex.json",
+            resolve_identities=False,
+            profile=profile,
+        )
+    }
+
+
+def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
+    """An existing caller that knows nothing about profiles must install
+    exactly what it always installed."""
+    tx, explicit = _specs("worker", tmp_path)
+    default = {
+        spec.target
+        for spec in tx.default_specs(
+            Path(__file__).parents[2],
+            authority_env=tmp_path / "authority.env",
+            claude_auth=tmp_path / "claude.json",
+            codex_auth=tmp_path / "codex.json",
+            resolve_identities=False,
+        )
+    }
+    assert explicit == default
+    assert tx.WORKER_ONLY_TARGETS <= explicit
+
+
+def test_control_profile_installs_no_agent_credentials(tmp_path):
+    """The specific failure that stopped control-01: the profile must not ask
+    for credentials a control-plane host is right not to have."""
+    _tx, targets = _specs("control", tmp_path)
+
+    assert "/var/lib/aicc-agent/claude/.claude/.credentials.json" not in targets
+    assert "/var/lib/aicc-agent/codex/.codex/auth.json" not in targets
+
+
+def test_control_profile_drops_every_worker_only_target_and_nothing_else(tmp_path):
+    tx, control = _specs("control", tmp_path)
+    _tx, worker = _specs("worker", tmp_path)
+
+    assert worker - control == tx.WORKER_ONLY_TARGETS
+
+
+def test_control_profile_keeps_the_recovery_anchor_and_the_transaction_tool(tmp_path):
+    """Dropping the agent layer must not drop the machinery that installs and
+    recovers anything at all."""
+    _tx, targets = _specs("control", tmp_path)
+
+    assert "/usr/local/sbin/voyn-aicc-bootstrap" in targets
+    assert "/usr/libexec/aicc-install-transaction" in targets
+    assert "/etc/aicc/workspace-authority.env" in targets
+
+
+def test_an_unknown_profile_is_refused_rather_than_treated_as_worker(tmp_path):
+    tx, _targets = _specs("worker", tmp_path)
+    root = Path(__file__).parents[2]
+
+    with pytest.raises(ValueError, match="unknown installation profile"):
+        tx.default_specs(
+            root,
+            authority_env=tmp_path / "authority.env",
+            claude_auth=tmp_path / "claude.json",
+            codex_auth=tmp_path / "codex.json",
+            resolve_identities=False,
+            profile="controlplane",
+        )
