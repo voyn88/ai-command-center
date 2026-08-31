@@ -135,6 +135,12 @@
     "command_center/orchestrator/__init__.py": [
       "orchestration"
     ],
+    "command_center/orchestrator/acceptance_policy.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/merge_gateway.py": [
+      "orchestration"
+    ],
     "command_center/orchestrator/planner.py": [
       "orchestration"
     ],

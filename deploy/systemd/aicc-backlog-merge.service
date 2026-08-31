@@ -1,9 +1,44 @@
+# The backlog merge tick (BO-S3b, VOYN-W0-AICC-PRIVILEGED-MERGE-GATEWAY):
+# the only process that runs command_center.orchestrator.merge_gateway, the
+# only code in this codebase allowed to call `gh pr merge`.
+#
+# Runs as its own dedicated user, `aicc-merge-gateway` — deliberately NOT
+# `aicc-worker`, which aicc-worker.service and aicc-backlog-review.service
+# use. Before this task, this unit ran as `aicc-worker` too, sharing that
+# user's `gh` session with the worker daemon that pushes branches and opens
+# pull requests (publish.py) — one identity doing all three of open, accept
+# and merge, the exact bypass this task exists to close. `aicc-merge-gateway`
+# has its own `gh` credential, provisioned only in this user's env file
+# (/etc/aicc/merge-gateway.env, carrying VOYN_MERGE_GATEWAY_TOKEN — see
+# merge_gateway.py's GATEWAY_TOKEN_ENV): a fine-grained token or GitHub App
+# installation token belonging to a service identity distinct from both the
+# worker's ambient `gh auth` and the independent acceptance reviewer's
+# credential. Neither aicc-worker's nor aicc-app's (the planner's) env files
+# may reference that variable — enforced by
+# tests/architecture/test_merge_gateway_boundary.py, which reads these unit
+# files directly rather than trusting application code not to reach for it.
+#
+# Install (control-plane host):
+#   useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin aicc-merge-gateway
+#   install -o aicc-merge-gateway -g aicc-merge-gateway -m 0600 /dev/null /etc/aicc/merge-gateway.env
+#   # populate /etc/aicc/merge-gateway.env with VOYN_MERGE_GATEWAY_TOKEN=...
+#   cp deploy/systemd/aicc-backlog-merge.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-backlog-merge.timer
+
 [Unit]
-Description=AICC backlog merge tick (BO-S3b)
+Description=AICC backlog merge tick (BO-S3b) — privileged merge gateway
 After=postgresql.service
 
 [Service]
 Type=oneshot
-User=aicc-worker
-EnvironmentFile=-/etc/ai-command-center.env
+User=aicc-merge-gateway
+Group=aicc-merge-gateway
+EnvironmentFile=-/etc/aicc/merge-gateway.env
 ExecStart=/usr/bin/python -m command_center.db backlog-merge --repo-path /srv/ai-command-center
+
+# Containment matching aicc-worker.service: this process reads Postgres and
+# calls `gh`, nothing here needs privileges, a home, or a writable system.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

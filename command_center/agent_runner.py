@@ -237,6 +237,15 @@ _VCS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "GITHUB_ACCESS_TOKEN",
         "GIT_ASKPASS",
         "SSH_ASKPASS",
+        # The privileged merge gateway's own credential
+        # (command_center.orchestrator.merge_gateway.GATEWAY_TOKEN_ENV). It
+        # should never reach this process's environment in the first place —
+        # deploy/systemd/aicc-backlog-merge.service runs under a dedicated
+        # user this daemon's unit never shares — but a spawned agent is the
+        # last line, not the only one: belt-and-suspenders against a
+        # misconfigured host handing the worker a merge credential it has no
+        # business holding.
+        "VOYN_MERGE_GATEWAY_TOKEN",
     }
 )
 

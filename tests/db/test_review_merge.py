@@ -1,6 +1,9 @@
 """review_once / merge_once (BO-S3b 2/3, 3/3) on live PostgreSQL: the store
-side is real (READY_TO_REVIEW tasks with pr evidence), gh is faked in-process
-by patching the module's _gh, and enqueue is a recording stub."""
+side is real (READY_TO_REVIEW tasks with pr evidence), enqueue is a recording
+stub, and merge_once's gh calls are faked in-process by patching
+merge_gateway's _gh — merge_once itself no longer talks to gh at all, it only
+calls into the gateway (see tests/orchestrator/test_merge_gateway.py for the
+gateway's own fail-closed coverage)."""
 
 from __future__ import annotations
 
@@ -8,10 +11,12 @@ import json
 
 
 from tests.db.test_backlog_planner import _test_repo_routes, rig  # noqa: F401 — pytest fixtures
-from command_center.orchestrator import review_merge
+from command_center.orchestrator import merge_gateway
 from command_center.orchestrator.review_merge import (
     merge_once, review_once,
 )
+
+_TOKEN_ENV = merge_gateway.GATEWAY_TOKEN_ENV
 
 
 
@@ -50,21 +55,26 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
     head = "a" * 40
+    monkeypatch.setenv(_TOKEN_ENV, "test-gateway-token")
 
-    def fake_gh(argv, repo):
+    def fake_gh(argv, repo, token):
         import subprocess
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "author": {"login": "server-worker"},
+                "reviews": [{
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "user": {"login": "voyn-acceptance[bot]"}, "state": "COMMENTED",
+                }],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
+        if argv[:1] == ["api"]:
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(merge_gateway, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1", head) in report.merged
     with app_factory() as c, c.cursor() as cur:
@@ -76,18 +86,22 @@ def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M2", "https://github.com/x/y/pull/9")
+    monkeypatch.setenv(_TOKEN_ENV, "test-gateway-token")
 
-    def fake_gh(argv, repo):
+    def fake_gh(argv, repo, token):
         import subprocess
         body = json.dumps({
-            "state": "OPEN", "headRefOid": "b" * 40, "reviews": [],
+            "state": "OPEN", "headRefOid": "b" * 40,
+            "author": {"login": "server-worker"}, "reviews": [],
             "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(merge_gateway, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M2", "no_accept_marker_on_head") in report.skipped
+    assert any(
+        t == "VOYN-W0-M2" and r.startswith("acceptance_refused") for t, r in report.skipped
+    )
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M2",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"  # untouched
@@ -98,16 +112,45 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/10")
     head = "c" * 40
+    monkeypatch.setenv(_TOKEN_ENV, "test-gateway-token")
 
-    def fake_gh(argv, repo):
+    def fake_gh(argv, repo, token):
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "author": {"login": "server-worker"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "user": {"login": "voyn-acceptance[bot]"}, "state": "COMMENTED",
+            }],
             "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(merge_gateway, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert any(t == "VOYN-W0-M3" and "checks_not_green" in r for t, r in report.skipped)
+    assert any(t == "VOYN-W0-M3" and "checks_not_terminal_success" in r for t, r in report.skipped)
+
+
+def test_merge_refuses_without_a_gateway_credential_even_with_a_perfect_pr(rig, monkeypatch):  # noqa: F811
+    """A process running merge_once with no VOYN_MERGE_GATEWAY_TOKEN in its
+    environment (a worker or planner host, by construction) cannot merge a
+    single PR no matter how clean that PR is — the credential check inside
+    the gateway runs before any network call, and this test never even wires
+    up a fake gh to make sure of it."""
+
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M4", "https://github.com/x/y/pull/11")
+    monkeypatch.delenv(_TOKEN_ENV, raising=False)
+
+    def unreachable(argv, repo, token):
+        raise AssertionError("merge_once must not touch gh without a gateway credential")
+
+    monkeypatch.setattr(merge_gateway, "_gh", unreachable)
+    report = merge_once(app_factory, "/tmp")
+    assert any(
+        t == "VOYN-W0-M4" and "gateway_credential_missing" in r for t, r in report.skipped
+    )
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M4",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"  # untouched
