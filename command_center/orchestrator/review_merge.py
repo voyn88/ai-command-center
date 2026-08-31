@@ -135,6 +135,142 @@ class ReconcileReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class PrEvidenceReport:
+    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+
+    #: (task_id, pr_url) newly recorded from the task's own branch.
+    recorded: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) examined and deliberately left alone.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+#: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
+#: else does, so the branch name is a derivable fact about a task rather than a
+#: convention this function invents.
+def _task_branch(task_id: str) -> str:
+    return f"backlog/{task_id}"
+
+
+def reconcile_pr_evidence(
+    factory: Any,
+    *,
+    task_id: str | None = None,
+    limit: int = 25,
+) -> PrEvidenceReport:
+    """Record the PR a READY_TO_REVIEW task already has, when only the branch
+    proves it.
+
+    Every gate downstream -- review, the acceptance marker, the merge train --
+    finds a task's pull request through `backlog_evidence(kind='pr')`, and
+    exactly one writer ever filled that table: `publish_run`. So a pull request
+    opened any other way is invisible to the entire control plane, no matter
+    how green it is. Measured live 2026-08-31: two PRs sat with every required
+    check passing and were never once picked up, because `publish_run` cannot
+    run at all on this fleet (it requires a `voyn-lease` binary that is not
+    installed anywhere). The evidence had to be inserted by hand to move them.
+
+    This closes the hole by deriving what was already true rather than by
+    trusting a claim. The task's branch name is fixed by the same contract
+    `publish_run` follows, so an open pull request whose head is exactly that
+    branch is that task's PR -- a fact GitHub is asked for directly:
+
+    * the head branch must equal `backlog/<task id>` exactly (never a prefix
+      match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
+    * exactly one open PR may match, because two would make the choice a guess;
+    * a task that already has any `pr` evidence is left alone, so this can
+      never overwrite or compete with what `publish_run` recorded.
+
+    Reporting only: no status is changed here. A task becomes reviewable
+    because it is `READY_TO_REVIEW` and now has evidence, through the same
+    path it always did.
+    """
+    # Imported here, as  does, so this module keeps its
+    # import-time independence from the planner.
+    from command_center.orchestrator.planner import repo_route
+
+    report = PrEvidenceReport()
+    if task_id is not None:
+        rows = _rows(
+            factory,
+            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+            "WHERE e.task_id = t.task_id AND e.kind = 'pr')",
+            (task_id,),
+        )
+    else:
+        rows = _rows(
+            factory,
+            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "WHERE t.status = 'READY_TO_REVIEW' "
+            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+            "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
+            "ORDER BY t.task_id LIMIT %s",
+            (limit,),
+        )
+    for row_task_id, repo in rows:
+        if not repo:
+            report.skipped.append((row_task_id, "no_repo_on_task"))
+            continue
+        route = repo_route(repo)
+        if route is None:
+            report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
+            continue
+        _project_id, repository_path = route
+        branch = _task_branch(row_task_id)
+        listed = _gh(
+            [
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "url,headRefName",
+            ],
+            repository_path,
+        )
+        if listed.returncode != 0:
+            report.skipped.append((row_task_id, "pr_list_failed"))
+            continue
+        try:
+            decoded = json.loads(listed.stdout or "[]")
+        except ValueError:
+            report.skipped.append((row_task_id, "pr_list_undecodable"))
+            continue
+        if not isinstance(decoded, list):
+            report.skipped.append((row_task_id, "pr_list_wrong_shape"))
+            continue
+        # `--head` is a filter, not a guarantee of exact equality, so the
+        # branch is compared here as well: a prefix match would let a task
+        # adopt its own remediation task's pull request.
+        matches = [
+            entry
+            for entry in decoded
+            if isinstance(entry, dict)
+            and entry.get("headRefName") == branch
+            and isinstance(entry.get("url"), str)
+            and entry["url"]
+        ]
+        if not matches:
+            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            continue
+        if len(matches) > 1:
+            report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
+            continue
+        pr_url = matches[0]["url"]
+        with factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO backlog_evidence (task_id, kind, value) "
+                "VALUES (%s, 'pr', %s) ON CONFLICT DO NOTHING",
+                (row_task_id, pr_url),
+            )
+        report.recorded.append((row_task_id, pr_url))
+    return report
+
+
 def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["gh", *argv], cwd=repo_path, capture_output=True, text=True,
