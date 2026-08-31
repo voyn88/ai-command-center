@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -553,14 +554,70 @@ def test_run_claude_code_cancel_event_sigterms_a_running_process(monkeypatch, tm
     assert elapsed < 8
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32", reason="SIGTERM/killpg semantics are POSIX-specific"
-)
-def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(
+def test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored(
     monkeypatch, tmp_path
 ):
-    """A process that ignores SIGTERM is SIGKILL'd once the grace period
-    elapses, and the run is still reported (never hangs forever)."""
+    """Escalation is proven by the signals actually delivered, not by elapsed
+    wall clock.
+
+    The readiness marker is what makes this deterministic. A child that has not
+    yet reached `signal.signal(...)` still carries the *default* SIGTERM
+    disposition, so an early SIGTERM simply kills it, no escalation is needed,
+    and an `elapsed >= grace` assertion then fails — on exactly the slow,
+    loaded runners the test exists to protect. Waiting for the handler to be
+    installed removes that race, and asserting on the signal sequence removes
+    the dependency on how fast the machine happens to be.
+    """
+    ready = tmp_path / "sigterm-handler-installed"
+    proc = subprocess.Popen(
+        _fake_command(
+            "import signal, sys, time, pathlib; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "pathlib.Path(sys.argv[1]).write_text('ready'); "
+            "time.sleep(60)",
+            str(ready),
+        ),
+        **agent_runner._popen_new_process_group_kwargs(),
+    )
+    # Captured before the patch and outside `try`, so the cleanup below can
+    # always reach the real one even if the body fails early.
+    unpatched_killpg = os.killpg
+    try:
+        assert _wait_until(ready.exists), "child never installed its SIGTERM handler"
+
+        delivered: list[int] = []
+
+        def recording_killpg(pgid, sig):
+            delivered.append(sig)
+            return unpatched_killpg(pgid, sig)
+
+        monkeypatch.setattr(agent_runner.os, "killpg", recording_killpg)
+        agent_runner._terminate_process_group(proc, grace_seconds=0.1)
+
+        assert delivered == [signal.SIGTERM, signal.SIGKILL]
+        assert proc.poll() is not None
+    finally:
+        # Never route this through `os.killpg`: inside the test it is still the
+        # recording wrapper, and rebinding the name it closes over would make
+        # the wrapper call itself.
+        if proc.poll() is None:
+            try:
+                unpatched_killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=10)
+
+
+def test_run_claude_code_cancel_event_reports_cancelled_and_never_hangs(
+    monkeypatch, tmp_path
+):
+    """A process that ignores SIGTERM is still reported (never hangs forever).
+
+    This is the integration half of the contract above; the escalation
+    mechanics themselves are asserted deterministically in
+    `test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored`,
+    so nothing here depends on the child winning a race against our signal.
+    """
     monkeypatch.setattr(
         agent_runner,
         "build_command",
@@ -586,10 +643,7 @@ def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(
     )
     elapsed = time.monotonic() - started
     assert result.status == "cancelled"
-    # Had to wait out the (short, test-scoped) grace period before SIGKILL —
-    # proves escalation actually happened, not just an early SIGTERM success.
-    assert elapsed >= 1.0
-    assert elapsed < 10
+    assert elapsed < 30
 
 
 @pytest.mark.skipif(
