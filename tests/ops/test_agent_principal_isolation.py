@@ -1155,3 +1155,53 @@ def test_an_unknown_profile_is_refused_rather_than_treated_as_worker(tmp_path):
             resolve_identities=False,
             profile="controlplane",
         )
+
+
+def _installer_text() -> str:
+    return (
+        Path(__file__).parents[2] / "deploy" / "install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+
+
+def test_control_profile_refuses_a_host_that_still_carries_worker_artefacts():
+    """Excluding a target from the transaction does not delete what is already
+    on disk. A worker→control install that just skipped those specs would
+    leave agent credentials and the launcher socket live on the control plane
+    — the precise boundary this installer exists to create (independent review
+    of `090afcf`). It must refuse and name them instead.
+    """
+    text = _installer_text()
+
+    assert 'if [ "$install_profile" = "control" ]; then' in text
+    assert "control profile refuses: worker artefacts present:" in text
+    for candidate in (
+        "/var/lib/aicc-agent",
+        "/etc/aicc/worker-lanes",
+        "/etc/systemd/system/aicc-agent-launcher.socket",
+        "/etc/systemd/system/voyn-aicc-worker@.service",
+    ):
+        assert candidate in text
+    # Removal is the transactional uninstall's job, never a side effect here.
+    assert "this run will not remove them" in text
+
+
+def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
+    """The launcher socket brokers agent principals, the rollout drives worker
+    lanes, and the boundary verifier asserts a separation a control host has
+    no parties for. None may run unconditionally."""
+    text = _installer_text()
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+
+    for line in (
+        "systemctl enable --now aicc-agent-launcher.socket",
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes",
+        '"$repo_root/ops/verify-agent-principal-boundary.sh"',
+    ):
+        assert line in text
+        # The last occurrence: the boundary verifier is also named earlier,
+        # where it is only being checked for existence.
+        before = text[: text.rindex(line)]
+        assert guard in before, f"{line} is not behind the worker-profile guard"
+        # The guard must still be open where the line sits: no `fi` may close
+        # it between the two, or the line runs unconditionally after all.
+        assert "\nfi\n" not in before[before.rindex(guard):]

@@ -79,6 +79,31 @@ case "$install_profile" in
   *) echo "unknown AICC_INSTALL_PROFILE: $install_profile" >&2; exit 1 ;;
 esac
 
+# A control host must not carry the agent layer at all -- and excluding those
+# targets from this transaction does not remove what a previous worker
+# installation already put on disk. Installing "around" them would leave agent
+# credentials and the launcher socket live on the control plane, which is the
+# exact boundary this installer exists to create (independent review of
+# 090afcf caught precisely that). So refuse, and name what has to go: removal
+# belongs to the transactional uninstall, not to a side effect of this run.
+if [ "$install_profile" = "control" ]; then
+  leftovers=""
+  for candidate in \
+    /var/lib/aicc-agent \
+    /etc/aicc/worker-lanes \
+    /etc/aicc/agent.env \
+    /etc/systemd/system/aicc-agent-launcher.socket \
+    /etc/systemd/system/voyn-aicc-worker@.service
+  do
+    if [ -e "$candidate" ]; then leftovers="$leftovers $candidate"; fi
+  done
+  if [ -n "$leftovers" ]; then
+    echo "control profile refuses: worker artefacts present:$leftovers" >&2
+    echo "uninstall the worker profile first; this run will not remove them" >&2
+    exit 1
+  fi
+fi
+
 run_transaction() {
   action=$1
   shift
@@ -384,7 +409,12 @@ run_transaction apply
 stage_immutable_release
 
 systemctl daemon-reload
-systemctl enable --now aicc-agent-launcher.socket
+# The agent layer belongs to the worker profile only: the socket brokers agent
+# principals, the rollout drives worker lanes, and the boundary verifier
+# asserts an agent/publisher separation a control host has no parties for.
+if [ "$install_profile" = "worker" ]; then
+  systemctl enable --now aicc-agent-launcher.socket
+fi
 
 # The orchestrator discovers configured plus already-instantiated lanes, then
 # drains, starts and proves each lane before advancing. Any failure restores
@@ -392,8 +422,10 @@ systemctl enable --now aicc-agent-launcher.socket
 # /etc/aicc/worker-lanes is installed by the transaction itself (default_specs
 # maps deploy/aicc/worker-lanes onto it) before this rollout runs on
 # a fresh host and matches the snapshot origin (reviewed on 8a881d3).
-run_rollout rollout --lanes /etc/aicc/worker-lanes
-"$repo_root/ops/verify-agent-principal-boundary.sh"
+if [ "$install_profile" = "worker" ]; then
+  run_rollout rollout --lanes /etc/aicc/worker-lanes
+  "$repo_root/ops/verify-agent-principal-boundary.sh"
+fi
 
 run_transaction commit
 transaction_active=0
