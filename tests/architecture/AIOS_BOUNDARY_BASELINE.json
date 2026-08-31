@@ -315,9 +315,6 @@
     "command_center/task_pipeline.py": [
       "orchestration"
     ],
-    "command_center/tasks_repository.py": [
-      "memory"
-    ],
     "command_center/webapi/queue_routes.py": [
       "queue"
     ],
