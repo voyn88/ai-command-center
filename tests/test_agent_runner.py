@@ -583,21 +583,42 @@ def test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored(
         **agent_runner._popen_new_process_group_kwargs(),
     )
     # Captured before the patch and outside `try`, so the cleanup below can
-    # always reach the real one even if the body fails early.
+    # always reach the real operations even if the body fails early.
     unpatched_killpg = os.killpg
+    unpatched_wait = proc.wait
     try:
         assert _wait_until(ready.exists), "child never installed its SIGTERM handler"
 
-        delivered: list[int] = []
+        trace: list[tuple[str, object]] = []
+        wait_calls = 0
 
         def recording_killpg(pgid, sig):
-            delivered.append(sig)
-            return unpatched_killpg(pgid, sig)
+            result = unpatched_killpg(pgid, sig)
+            trace.append(("signal", sig))
+            return result
+
+        def controlled_wait(timeout=None):
+            nonlocal wait_calls
+            wait_calls += 1
+            trace.append(("wait", timeout))
+            if wait_calls == 1:
+                # Deterministically model a process that outlives the complete
+                # grace wait.  This proves the wait happens between the two
+                # signals without making the test spend that wall-clock time.
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            return unpatched_wait(timeout=timeout)
 
         monkeypatch.setattr(agent_runner.os, "killpg", recording_killpg)
-        agent_runner._terminate_process_group(proc, grace_seconds=0.1)
+        monkeypatch.setattr(proc, "wait", controlled_wait)
+        grace_seconds = 37.25
+        agent_runner._terminate_process_group(proc, grace_seconds=grace_seconds)
 
-        assert delivered == [signal.SIGTERM, signal.SIGKILL]
+        assert trace == [
+            ("signal", signal.SIGTERM),
+            ("wait", grace_seconds),
+            ("signal", signal.SIGKILL),
+            ("wait", grace_seconds),
+        ]
         assert proc.poll() is not None
     finally:
         # Never route this through `os.killpg`: inside the test it is still the
@@ -608,7 +629,7 @@ def test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored(
                 unpatched_killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            proc.wait(timeout=10)
+            unpatched_wait(timeout=10)
 
 
 def test_run_claude_code_cancel_event_reports_cancelled_and_never_hangs(
