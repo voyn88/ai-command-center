@@ -14,8 +14,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 MAP_PATH = REPO_ROOT / "docs/AUTHORITY_MAP.md"
 
 # Operator-local noise that is not a store: logs, locks the map covers by
-# family, example templates, and macOS metadata.
-_IGNORED_SUFFIXES = (".log", ".lock", ".stderr.log", ".stdout.log")
+# family, example templates, macOS metadata, and SQLite's own WAL-mode
+# sidecar files. The sidecars are mechanical artifacts of whichever `.db`
+# file is already documented, not stores of their own, but they only exist
+# once a developer has actually run the app locally — a fresh checkout never
+# has them. Without ignoring them, this test passed or failed depending on
+# which machine ran it rather than on what the tree actually ships, exactly
+# the class of bug `docs/AUTHORITY_MAP.md` exists to make checkable.
+_IGNORED_SUFFIXES = (
+    ".log",
+    ".lock",
+    ".stderr.log",
+    ".stdout.log",
+    ".db-wal",
+    ".db-shm",
+    ".db-journal",
+)
 _IGNORED_NAMES = frozenset({".DS_Store", ".gitkeep"})
 _IGNORED_PREFIXES = ("bench-",)
 
@@ -28,6 +42,18 @@ def _is_ignorable(path: Path) -> bool:
     if any(path.name.startswith(prefix) for prefix in _IGNORED_PREFIXES):
         return True
     return ".example." in path.name
+
+
+def test_sqlite_wal_sidecars_are_not_treated_as_undocumented_stores(tmp_path):
+    """A developer who has actually run the app has `runtime.db-wal`/`-shm`
+    on disk; a fresh checkout never does. These are mechanical WAL-mode
+    sidecars of the already-documented `runtime.db`, not stores of their
+    own, and must not make this gate's verdict depend on which machine
+    happens to run it — the exact failure reproduced by creating them here
+    before this test existed.
+    """
+    for name in ("runtime.db-wal", "runtime.db-shm", "runtime.db-journal"):
+        assert _is_ignorable(tmp_path / name), name
 
 
 def test_every_data_store_is_documented_in_the_authority_map():
