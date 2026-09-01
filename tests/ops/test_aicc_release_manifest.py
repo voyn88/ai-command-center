@@ -798,8 +798,11 @@ def test_rollback_and_uninstall_prove_the_release_they_restore():
     ).read_text(encoding="utf-8")
     assert "run_transaction recover" in rollback
     assert "self.verify_release_selection(selector)" in transaction
-    uninstall = installer[installer.index('if [ "${1:-}" = "--uninstall" ]') :]
-    uninstall = uninstall.split("# Validate the stable authority")[0]
+    # The teardown lives in `perform_uninstall`, shared by the `--uninstall`
+    # dispatch and the control-profile purge -- not inlined at the dispatch
+    # site, so this scopes to the function body.
+    uninstall = installer[installer.index("perform_uninstall() {") :]
+    uninstall = uninstall.split("\n}\n", 1)[0]
     # Compare COMMANDS, not prose: the comments explaining this ordering name
     # the very commands being ordered.
     commands = [

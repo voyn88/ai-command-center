@@ -1036,8 +1036,11 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
         'run_rollout snapshot --lanes "$repo_root/deploy/aicc/worker-lanes"'
         in installer
     )
-    uninstall = installer[installer.index('if [ "${1:-}" = "--uninstall" ]') :]
-    uninstall = uninstall.split("# Validate the stable authority")[0]
+    # The teardown lives in `perform_uninstall`, shared by the `--uninstall`
+    # dispatch and the control-profile purge -- not inlined at the dispatch
+    # site, so the assertions below scope to the function body.
+    uninstall = installer[installer.index("perform_uninstall() {") :]
+    uninstall = uninstall.split("\n}\n", 1)[0]
     assert "run_rollout snapshot --lanes /etc/aicc/worker-lanes" in uninstall
     assert "run_transaction uninstall-begin" in uninstall
     assert "run_transaction uninstall-arm" in uninstall
@@ -1163,17 +1166,19 @@ def _installer_text() -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_control_profile_refuses_a_host_that_still_carries_worker_artefacts():
+def test_control_profile_purges_worker_artefacts_transactionally_before_install():
     """Excluding a target from the transaction does not delete what is already
     on disk. A worker→control install that just skipped those specs would
     leave agent credentials and the launcher socket live on the control plane
     — the precise boundary this installer exists to create (independent review
-    of `090afcf`). It must refuse and name them instead.
+    of `090afcf`). Rather than refuse and hand the operator a manual two-step
+    dance, it must purge them through the exact same transactional teardown
+    `--uninstall` runs -- service stop/disable included -- before installing.
     """
     text = _installer_text()
 
+    assert "perform_uninstall() {" in text
     assert 'if [ "$install_profile" = "control" ]; then' in text
-    assert "control profile refuses: worker artefacts present:" in text
     for candidate in (
         "/var/lib/aicc-agent",
         "/etc/aicc/worker-lanes",
@@ -1181,8 +1186,43 @@ def test_control_profile_refuses_a_host_that_still_carries_worker_artefacts():
         "/etc/systemd/system/voyn-aicc-worker@.service",
     ):
         assert candidate in text
-    # Removal is the transactional uninstall's job, never a side effect here.
-    assert "this run will not remove them" in text
+    # The purge calls the one reviewed teardown path, not a second deletion
+    # routine invented for this case.
+    purge_block = text[text.index('if [ "$install_profile" = "control" ]; then') :]
+    assert "perform_uninstall" in purge_block
+    # `perform_uninstall` itself must still run the full quiesce/disable
+    # sequence a plain `--uninstall` runs -- these lines live in the shared
+    # function body, not duplicated per call site.
+    body_start = text.index("perform_uninstall() {")
+    body_end = text.index("\n}\n", body_start)
+    body = text[body_start:body_end]
+    for line in (
+        "run_transaction quiesce --service-snapshot",
+        "systemctl disable --now aicc-agent-launcher.socket",
+        "run_transaction uninstall\n",
+    ):
+        assert line in body
+
+
+def test_control_profile_purge_runs_after_the_uninstall_dispatch():
+    """The leftover check must never gate `--uninstall` itself: that action is
+    the one thing capable of removing the artefacts it would be refusing over,
+    and the operator has no other way to clear them if it does. Ordering, not
+    wording, is what review on 090afcf's follow-up would have caught here.
+    """
+    text = _installer_text()
+    uninstall_dispatch = text.index('if [ "${1:-}" = "--uninstall" ]; then')
+    control_purge_check = text.index('if [ "$install_profile" = "control" ]; then')
+    assert uninstall_dispatch < control_purge_check
+
+
+def test_uninstall_dispatch_calls_the_shared_uninstall_function():
+    text = _installer_text()
+    start = text.index('if [ "${1:-}" = "--uninstall" ]; then')
+    end = text.index("\nfi\n", start)
+    block = text[start:end]
+    assert "perform_uninstall" in block
+    assert "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED" in block
 
 
 def test_the_agent_layer_is_only_enabled_for_the_worker_profile():

@@ -79,31 +79,6 @@ case "$install_profile" in
   *) echo "unknown AICC_INSTALL_PROFILE: $install_profile" >&2; exit 1 ;;
 esac
 
-# A control host must not carry the agent layer at all -- and excluding those
-# targets from this transaction does not remove what a previous worker
-# installation already put on disk. Installing "around" them would leave agent
-# credentials and the launcher socket live on the control plane, which is the
-# exact boundary this installer exists to create (independent review of
-# 090afcf caught precisely that). So refuse, and name what has to go: removal
-# belongs to the transactional uninstall, not to a side effect of this run.
-if [ "$install_profile" = "control" ]; then
-  leftovers=""
-  for candidate in \
-    /var/lib/aicc-agent \
-    /etc/aicc/worker-lanes \
-    /etc/aicc/agent.env \
-    /etc/systemd/system/aicc-agent-launcher.socket \
-    /etc/systemd/system/voyn-aicc-worker@.service
-  do
-    if [ -e "$candidate" ]; then leftovers="$leftovers $candidate"; fi
-  done
-  if [ -n "$leftovers" ]; then
-    echo "control profile refuses: worker artefacts present:$leftovers" >&2
-    echo "uninstall the worker profile first; this run will not remove them" >&2
-    exit 1
-  fi
-fi
-
 run_transaction() {
   action=$1
   shift
@@ -199,27 +174,19 @@ PY
     --repo-root "$repo_root"
 }
 
-# The permanent boot-recovery anchor must precede both a fresh install WAL and
-# a fresh uninstall WAL. An already-journalled uninstall is resumed only by
-# its digest-bound capsule, so it cannot swap recovery code mid-transaction.
-if ! path_present "$state_dir/uninstall.json"; then
-  run_transaction recovery-anchor-install
-  # Resolve any earlier install WAL under the already-held OFD, then load and
-  # activate the permanent no-op barrier while NO journal exists. If activation
-  # waited until after prepare(), its ExecStart capsule would contend on this
-  # same host lock and make first install fail deterministically.
-  run_transaction recover
-  systemctl daemon-reload
-  systemctl start aicc-principal-recovery.service
-fi
-
-if [ "${1:-}" = "--uninstall" ]; then
+# The full transactional teardown: every generation this host has ever had
+# installed, unwound back to the pre-install baseline, service stop/disable
+# included. Extracted into a function so both the `--uninstall` entry point
+# below AND the control-profile purge further down call the exact same,
+# already-journalled path -- there is no second, less-reviewed way to remove
+# these files. Idempotent: a stale uninstall.json from an interrupted prior
+# attempt is resumed or safely aborted-and-redone rather than assumed done.
+perform_uninstall() {
   if path_present "$state_dir/uninstall.json"; then
     uninstall_phase=$(run_transaction uninstall-status)
     run_transaction recover-uninstall-safe
     if [ "$uninstall_phase" != INTENT ]; then
-      echo "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED"
-      exit 0
+      return 0
     fi
     # INTENT precedes every uninstall mutation, so recovery safely aborted it.
     # Reactivate the no-op barrier before creating the replacement WAL.
@@ -238,7 +205,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   fi
   # Prove the baseline release BEFORE any privileged mutation. Uninstall is
   # not a weaker moment than install -- the baseline is still code every
-  # worker ExecStart will run -- and this branch has no rollback trap, so a
+  # worker ExecStart will run -- and this function has no rollback trap, so a
   # check that runs after `run_transaction uninstall` and the service disables
   # can only report a partial uninstall it cannot undo (independent review on
   # 25eb0a0c). No Git cross-check here: uninstall must work without a
@@ -277,8 +244,61 @@ if [ "${1:-}" = "--uninstall" ]; then
   run_rollout restore --state "$baseline_units"
   run_rollout verify-snapshot-closure --state "$uninstall_units"
   run_transaction uninstall-complete --service-snapshot "$uninstall_units"
+  return 0
+}
+
+# The permanent boot-recovery anchor must precede both a fresh install WAL and
+# a fresh uninstall WAL. An already-journalled uninstall is resumed only by
+# its digest-bound capsule, so it cannot swap recovery code mid-transaction.
+if ! path_present "$state_dir/uninstall.json"; then
+  run_transaction recovery-anchor-install
+  # Resolve any earlier install WAL under the already-held OFD, then load and
+  # activate the permanent no-op barrier while NO journal exists. If activation
+  # waited until after prepare(), its ExecStart capsule would contend on this
+  # same host lock and make first install fail deterministically.
+  run_transaction recover
+  systemctl daemon-reload
+  systemctl start aicc-principal-recovery.service
+fi
+
+if [ "${1:-}" = "--uninstall" ]; then
+  perform_uninstall
   echo "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED"
   exit 0
+fi
+
+# A control host must not carry the agent layer at all -- and excluding those
+# targets from this transaction does not remove what a previous worker
+# installation already put on disk. Installing "around" them would leave agent
+# credentials and the launcher socket live on the control plane, which is the
+# exact boundary this installer exists to create (independent review of
+# 090afcf: excluding a target from the transaction does not delete what is
+# already on disk, so a worker-to-control install that just skipped those
+# specs would report success with the agent layer still live).
+#
+# So purge it -- transactionally, service stop/disable included -- through
+# the exact same teardown `--uninstall` runs, rather than refusing and
+# handing the operator a manual two-step dance. Placed after the `--uninstall`
+# dispatch above (never before it): if this check ran first, a control-profile
+# `--uninstall` invocation on a host with worker leftovers would trigger a
+# purge instead of the uninstall it was asked to do, and worse, one with no
+# `--uninstall` semantics (no final "UNINSTALLED" line, and it would fall
+# through into a fresh install afterwards).
+if [ "$install_profile" = "control" ]; then
+  leftovers=""
+  for candidate in \
+    /var/lib/aicc-agent \
+    /etc/aicc/worker-lanes \
+    /etc/aicc/agent.env \
+    /etc/systemd/system/aicc-agent-launcher.socket \
+    /etc/systemd/system/voyn-aicc-worker@.service
+  do
+    if [ -e "$candidate" ]; then leftovers="$leftovers $candidate"; fi
+  done
+  if [ -n "$leftovers" ]; then
+    echo "control profile: purging pre-existing worker artefacts before install:$leftovers" >&2
+    perform_uninstall
+  fi
 fi
 
 # Validate the stable authority using the exact runtime decoder before any

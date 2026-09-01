@@ -123,6 +123,48 @@ def test_two_generations_uninstall_to_preinstall_state_without_orphans(tmp_path)
     assert not list(state.glob("generation-*"))
 
 
+def test_uninstall_removes_a_target_a_narrower_later_generation_stopped_managing(
+    tmp_path,
+):
+    """A `control`-profile install runs as a narrower generation on top of an
+    existing `worker` generation: it must not resurrect or touch a target it
+    excludes, but a full uninstall must still reach back through the
+    generation chain and remove it -- that reach-back is what a worker→control
+    purge relies on to make the transition transactional rather than a side
+    effect of the narrower install itself (independent review on 090afcf).
+    """
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    credential_source = tmp_path / "credential"
+    shared_source = tmp_path / "shared"
+    credential_source.write_bytes(b"agent-credential")
+    shared_source.write_bytes(b"shared")
+    transaction = module.FileTransaction(root, state)
+
+    transaction.install(
+        (
+            _spec(module, credential_source, "/var/agent-credential"),
+            _spec(module, shared_source, "/etc/shared"),
+        )
+    )
+    assert (root / "var/agent-credential").read_bytes() == b"agent-credential"
+
+    shared_source.write_bytes(b"shared-two")
+    transaction.install((_spec(module, shared_source, "/etc/shared"),))
+
+    # The narrower generation neither removed nor re-managed the excluded
+    # target -- it is simply untouched, exactly the gap review flagged.
+    assert (root / "var/agent-credential").read_bytes() == b"agent-credential"
+
+    transaction.uninstall_all()
+
+    assert not (root / "var/agent-credential").exists()
+    assert not (root / "etc/shared").exists()
+    assert not transaction.current.exists()
+    assert not list(state.glob("generation-*"))
+
+
 def test_sigkill_mid_apply_is_recovered_from_write_ahead_journal(tmp_path):
     module = _module()
     root = tmp_path / "root"
