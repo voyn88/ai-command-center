@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import runpy
+import shutil
 import stat
 import subprocess
 import sys
@@ -1201,6 +1202,8 @@ def test_recovery_generator_is_a_permanent_pretransaction_anchor(tmp_path):
     assert installer.index("run_transaction recovery-anchor-install") < installer.index(
         "run_transaction prepare"
     )
+    old_capsule = installer.index('"$installed_anchor" --recover "$state_dir"')
+    assert old_capsule < installer.index("run_transaction recovery-anchor-install")
     by_target = {spec.target: spec for spec in specs}
     for target in (
         "/var/lib/aicc-agent/claude/.claude/.credentials.json",
@@ -4914,6 +4917,52 @@ def test_historical_manifest_cannot_retire_an_external_file(tmp_path):
     assert transaction.pending.exists()
 
 
+def test_historical_staged_directory_symlink_cannot_retire_external_blob(tmp_path):
+    module = _module()
+    transaction, _root, state = _worker_host_with_credentials(module, tmp_path)
+    worker_manifest = Path(
+        json.loads(transaction.current.read_text(encoding="utf-8"))["manifest"]
+    )
+    original = worker_manifest.parent / "staged"
+    external = tmp_path / "external-staged"
+    external.mkdir(mode=0o700)
+    victims = []
+    for blob in sorted(original.glob("*.bin")):
+        victim = external / blob.name
+        victim.write_bytes(blob.read_bytes())
+        victim.chmod(0o600)
+        victims.append((victim, victim.read_bytes()))
+    shutil.rmtree(original)
+    original.symlink_to(external, target_is_directory=True)
+
+    transaction.prepare(_control_transition_specs(module, tmp_path))
+    transaction.apply()
+    with pytest.raises((RuntimeError, ValueError), match="directory|generation"):
+        transaction.commit()
+
+    assert [(path, path.read_bytes()) for path, _ in victims] == victims
+    assert transaction.pending.exists()
+
+
+def test_historical_sensitive_blob_digest_must_match_manifest(tmp_path):
+    module = _module()
+    transaction, _root, state = _worker_host_with_credentials(module, tmp_path)
+    worker_manifest = Path(
+        json.loads(transaction.current.read_text(encoding="utf-8"))["manifest"]
+    )
+    blob = worker_manifest.parent / "staged/000.bin"
+    blob.write_bytes(b"same-name-different-secret")
+    blob.chmod(0o600)
+
+    transaction.prepare(_control_transition_specs(module, tmp_path))
+    transaction.apply()
+    with pytest.raises(RuntimeError, match="sensitive blob drifted"):
+        transaction.commit()
+
+    assert blob.read_bytes() == b"same-name-different-secret"
+    assert transaction.pending.exists()
+
+
 def test_legacy_v1_retirement_is_bound_and_completed(monkeypatch, tmp_path):
     module = _module()
     transaction, _root, state = _worker_host_with_credentials(module, tmp_path)
@@ -4981,6 +5030,70 @@ def test_generator_dispatches_auxiliary_only_retirement(monkeypatch, tmp_path):
 
     assert called[0][1][1] == str(recovery)
     assert called[0][1][2] == "recover-boot"
+
+
+def test_generator_rejects_symlinked_auxiliary_generation(monkeypatch, tmp_path):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    external = tmp_path / "external-generation"
+    external.mkdir(mode=0o700)
+    manifest = external / "manifest.json"
+    manifest.write_text(json.dumps({"version": 3, "records": []}), encoding="utf-8")
+    manifest.chmod(0o600)
+    recovery = external / "recovery.py"
+    recovery.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+    recovery.chmod(0o700)
+    generation = state / "generation-0123456789abcdef"
+    generation.symlink_to(external, target_is_directory=True)
+    lexical_manifest = generation / "manifest.json"
+    current = state / "current.json"
+    current.write_text(
+        json.dumps({"manifest": str(lexical_manifest)}), encoding="utf-8"
+    )
+    current.chmod(0o600)
+    retirement = state / "sensitive-retirement.json"
+    retirement.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "generation": generation.name,
+                "targets": [CLAUDE_CREDENTIAL],
+            }
+        ),
+        encoding="utf-8",
+    )
+    retirement.chmod(0o600)
+    called = []
+    monkeypatch.setattr(generator.os, "execv", lambda *args: called.append(args))
+
+    with pytest.raises(RuntimeError, match="generation directory|generation"):
+        generator.recover(state, expected_uid=os.getuid())
+    assert called == []
+
+
+def test_control_generation_authority_check_is_intrinsic_to_apply(
+    monkeypatch, tmp_path
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare(
+        tuple(module.removal_spec(target) for target in module.WORKER_ONLY_TARGETS)
+    )
+    calls = []
+
+    def refuse(state_dir, candidate):
+        calls.append((state_dir, candidate))
+        raise RuntimeError("control authority changed")
+
+    monkeypatch.setattr(module, "verify_control_authority_precondition", refuse)
+    with pytest.raises(RuntimeError, match="control authority changed"):
+        transaction.apply()
+
+    assert calls == [(state, manifest)]
+    assert json.loads(transaction.pending.read_text(encoding="utf-8"))["phase"] == "PREPARED"
 
 
 def test_control_authority_group_refuses_a_live_numeric_gid(tmp_path):
@@ -5208,7 +5321,9 @@ def test_a_worker_only_directory_target_that_is_a_symlink_is_refused(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_a_real_control_install_leaves_no_worker_artefact_or_secret_tree(tmp_path):
+def test_a_real_control_install_leaves_no_worker_artefact_or_secret_tree(
+    monkeypatch, tmp_path
+):
     """A host that ran the worker profile, converted by the real
     `default_specs(profile="control")`: every worker-only file gone, every
     worker-only directory gone, and no credential byte anywhere on the host
@@ -5255,6 +5370,10 @@ def test_a_real_control_install_leaves_no_worker_artefact_or_secret_tree(tmp_pat
             profile="control",
         )
     )
+    monkeypatch.setattr(
+        module, "_assert_fresh_control_authority_group", lambda: os.getegid()
+    )
+    module.record_control_authority_precondition(state)
 
     module.FileTransaction(root, state).install(specs)
 

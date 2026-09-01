@@ -178,6 +178,20 @@ PY
 # a fresh uninstall WAL. An already-journalled uninstall is resumed only by
 # its digest-bound capsule, so it cannot swap recovery code mid-transaction.
 if ! path_present "$state_dir/uninstall.json"; then
+  # Recover an existing install WAL with the exact anchor/capsule that wrote
+  # it before replacing that anchor with code from this release.
+  if path_present "$state_dir/pending.json"; then
+    installed_anchor=/usr/lib/systemd/system-generators/aicc-principal-recovery
+    [ -f "$installed_anchor" ] && [ -x "$installed_anchor" ] || {
+      echo "unfinished install journal has no installed recovery anchor" >&2
+      exit 1
+    }
+    "$installed_anchor" --recover "$state_dir"
+    ! path_present "$state_dir/pending.json" || {
+      echo "installed recovery anchor left the install journal unresolved" >&2
+      exit 1
+    }
+  fi
   run_transaction recovery-anchor-install
   # Resolve any earlier install WAL under the already-held OFD, then load and
   # activate the permanent no-op barrier while NO journal exists. If activation

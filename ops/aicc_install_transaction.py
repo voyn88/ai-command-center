@@ -995,7 +995,79 @@ def _digest_regular(
         os.close(descriptor)
 
 
-def _destroy_blob(path: Path) -> None:
+def _sensitive_blob_directory(generation: Path, directory: str) -> int:
+    """Open a generation blob directory with every parent pinned/no-follow."""
+    generation_fd = _open_directory_chain(generation, create=False)
+    try:
+        generation_info = os.fstat(generation_fd)
+        if (
+            stat.S_IMODE(generation_info.st_mode) != 0o700
+            or generation_info.st_uid not in {0, os.geteuid()}
+            or generation_info.st_gid not in {0, os.getegid()}
+        ):
+            raise RuntimeError(
+                f"sensitive generation directory is untrusted: {generation}"
+            )
+        try:
+            blob_fd = os.open(directory, _DIR_OPEN_FLAGS, dir_fd=generation_fd)
+        except OSError as exc:
+            raise RuntimeError(
+                f"sensitive blob directory is untrusted: {generation / directory}"
+            ) from exc
+        try:
+            blob_info = os.fstat(blob_fd)
+            if (
+                stat.S_IMODE(blob_info.st_mode) != 0o700
+                or blob_info.st_uid not in {0, os.geteuid()}
+                or blob_info.st_gid not in {0, os.getegid()}
+            ):
+                raise RuntimeError(
+                    "sensitive blob directory is untrusted: "
+                    f"{generation / directory}"
+                )
+            return blob_fd
+        except BaseException:
+            os.close(blob_fd)
+            raise
+    finally:
+        os.close(generation_fd)
+
+
+def _validate_sensitive_blob(
+    generation: Path,
+    directory: str,
+    name: str,
+    expected_sha256: str,
+) -> bool:
+    """Validate one blob through a pinned parent; False means retired already."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise RuntimeError("sensitive blob has no valid manifest digest")
+    parent_fd = _sensitive_blob_directory(generation, directory)
+    try:
+        try:
+            blob = _read_regular(name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return False
+        if (
+            blob.sha256 != expected_sha256
+            or blob.mode != 0o600
+            or blob.uid not in {0, os.geteuid()}
+            or blob.gid not in {0, os.getegid()}
+        ):
+            raise RuntimeError(
+                f"sensitive blob drifted: {generation / directory / name}"
+            )
+        return True
+    finally:
+        os.close(parent_fd)
+
+
+def _destroy_blob(
+    generation: Path,
+    directory: str,
+    name: str,
+    expected_sha256: str,
+) -> None:
     """Overwrite a credential backup in place, then unlink it.
 
     The unlink is the guarantee -- after it, no name in this state directory
@@ -1005,27 +1077,66 @@ def _destroy_blob(path: Path) -> None:
     is done anyway because on the ext4/xfs hosts this installs on it does
     take the plaintext out of the block that held it.
     """
+    path = generation / directory / name
+    parent_fd = _sensitive_blob_directory(generation, directory)
     try:
-        descriptor = os.open(
-            path, os.O_WRONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        )
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise RuntimeError(f"cannot retire sensitive backup: {path}") from exc
-    try:
-        remaining = os.fstat(descriptor).st_size
-        offset = 0
-        while remaining:
-            chunk = min(remaining, 1024 * 1024)
-            os.pwrite(descriptor, b"\0" * chunk, offset)
-            offset += chunk
-            remaining -= chunk
-        os.fsync(descriptor)
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot retire sensitive backup: {path}"
+                ) from exc
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_uid not in {0, os.geteuid()}
+                or before.st_gid not in {0, os.getegid()}
+            ):
+                raise RuntimeError(f"sensitive blob shape drifted: {path}")
+            digest = hashlib.sha256()
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise RuntimeError(f"sensitive blob was truncated: {path}")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if digest.hexdigest() != expected_sha256:
+                raise RuntimeError(f"sensitive blob digest drifted: {path}")
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeError(f"sensitive blob name changed: {path}")
+            # Unlink and durably fsync the pinned directory before the
+            # best-effort overwrite.  A crash can now occur only while the
+            # inode is already unreachable; retry observes the exact name as
+            # absent and can redact the manifest idempotently.  Overwriting
+            # first left a half-zeroed, digest-mismatching named blob after a
+            # power loss and made recovery permanently fail closed.
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            remaining = before.st_size
+            offset = 0
+            while remaining:
+                chunk = min(remaining, 1024 * 1024)
+                os.pwrite(descriptor, b"\0" * chunk, offset)
+                offset += chunk
+                remaining -= chunk
+            os.fsync(descriptor)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
     finally:
-        os.close(descriptor)
-    path.unlink(missing_ok=True)
-    _fsync_dir(path.parent)
+        os.close(parent_fd)
 
 
 def _group_snapshot(
@@ -1150,6 +1261,19 @@ def verify_control_authority_precondition(
         if len(authority) != 1 or authority[0].install_gid != gid:
             raise RuntimeError("control authority gid is not bound to generation")
     return gid
+
+
+def _is_control_generation(manifest: Path) -> bool:
+    """Identify a control cutover from durable records, not caller flags."""
+    records = _generation_records(_trusted_journal(manifest))
+    removals = {record.target for record in records if record.remove}
+    return WORKER_ONLY_TARGETS <= removals
+
+
+def _verify_generation_control_authority(state_dir: Path, manifest: Path) -> None:
+    """Make the authority boundary intrinsic to every control generation."""
+    if _is_control_generation(manifest):
+        verify_control_authority_precondition(state_dir, manifest)
 
 
 def _authority_membership_journal(state_dir: Path) -> dict[str, object]:
@@ -1429,14 +1553,27 @@ def _redact_sensitive_records(manifest: Path, retired: frozenset[str]) -> bool:
     if not isinstance(records, list):
         raise RuntimeError(f"generation manifest has no records: {manifest}")
     changed = False
-    for record in records:
+    for index, record in enumerate(records):
         if not isinstance(record, dict) or record.get("target") not in retired:
             continue
         destroyed = False
-        for key in ("backup", "staged"):
+        for key, directory, digest_key in (
+            ("backup", "backups", "original_sha256"),
+            ("staged", "staged", "install_sha256"),
+        ):
             blob = record.get(key)
             if isinstance(blob, str) and blob:
-                _destroy_blob(Path(blob))
+                digest = record.get(digest_key)
+                if not isinstance(digest, str):
+                    raise RuntimeError(
+                        f"sensitive {key} has no bound digest: {manifest}"
+                    )
+                _destroy_blob(
+                    manifest.parent,
+                    directory,
+                    f"{index:03d}.bin",
+                    digest,
+                )
                 destroyed = True
         if not destroyed:
             # This record held no copy of the secret -- a removal of a target
@@ -1497,7 +1634,10 @@ def _preflight_sensitive_records(
     for index, record in enumerate(_generation_records(payload)):
         if record.target not in retired:
             continue
-        for field, directory in (("backup", "backups"), ("staged", "staged")):
+        for field, directory, digest in (
+            ("backup", "backups", record.original_sha256),
+            ("staged", "staged", record.install_sha256),
+        ):
             value = getattr(record, field)
             if not value:
                 continue
@@ -1506,22 +1646,18 @@ def _preflight_sensitive_records(
                 raise RuntimeError(
                     f"sensitive {field} escaped its generation: {value}"
                 )
-            try:
-                blob = _read_regular(expected)
-            except FileNotFoundError:
+            if not isinstance(digest, str):
+                raise RuntimeError(
+                    f"sensitive {field} has no bound digest: {manifest}"
+                )
+            if not _validate_sensitive_blob(
+                generation, directory, expected.name, digest
+            ):
                 # A prior retirement attempt may have durably unlinked this
                 # exact generation-local blob before crashing ahead of the
                 # manifest redaction. The retry remains bound to the same
                 # name and completes the redaction idempotently.
                 continue
-            if (
-                blob.mode != 0o600
-                or blob.uid not in {0, os.geteuid()}
-                or blob.gid not in {0, os.getegid()}
-            ):
-                raise RuntimeError(
-                    f"sensitive {field} is not a trusted generation blob: {value}"
-                )
 
 
 def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bool:
@@ -3044,6 +3180,7 @@ class FileTransaction:
     def apply(self) -> None:
         """Apply one prepared generation; recovery stays armed until commit."""
         manifest = self._pending_manifest()
+        _verify_generation_control_authority(self.state_dir, manifest)
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         records = _generation_records(payload)
         # Prove every purge target still matches its snapshot before the first
@@ -3086,6 +3223,7 @@ class FileTransaction:
     def commit(self) -> None:
         """Publish an applied generation only after service rollout succeeds."""
         manifest = self._pending_manifest()
+        _verify_generation_control_authority(self.state_dir, manifest)
         journal = _trusted_journal(self.pending)
         if journal.get("phase") != "APPLIED":
             raise RuntimeError("only a fully applied generation can be committed")
@@ -3256,6 +3394,27 @@ class FileTransaction:
         (self.state_dir / SENSITIVE_RETIREMENT_JOURNAL).unlink()
         _fsync_dir(self.state_dir)
 
+    def _preflight_sensitive_retirement(
+        self,
+    ) -> tuple[frozenset[str], list[Path]] | None:
+        """Validate the complete retirement set without mutating any state."""
+        intent = self._sensitive_retirement_intent()
+        if intent is None:
+            return None
+        committed = None
+        if _path_present(self.current):
+            committed = _trusted_journal(self.current).get("manifest")
+        if intent["manifest"] != committed:
+            raise RuntimeError(
+                "sensitive retirement journal is not bound to the committed "
+                f"generation: {intent['generation']}"
+            )
+        retired = frozenset(intent["targets"])
+        manifests = sorted(self.state_dir.glob("generation-*/manifest.json"))
+        for manifest in manifests:
+            _preflight_sensitive_records(self.state_dir, manifest, retired)
+        return retired, manifests
+
     def _run_sensitive_retirement(self) -> None:
         """Destroy every reachable copy of a credential this host purged.
 
@@ -3291,25 +3450,10 @@ class FileTransaction:
         as part of the rollback; reaching here with one still bound to a
         generation that is not live is unexplained, and refused.
         """
-        intent = self._sensitive_retirement_intent()
-        if intent is None:
+        plan = self._preflight_sensitive_retirement()
+        if plan is None:
             return
-        committed = None
-        if _path_present(self.current):
-            committed = json.loads(self.current.read_text(encoding="utf-8")).get(
-                "manifest"
-            )
-        if intent["manifest"] != committed:
-            raise RuntimeError(
-                "sensitive retirement journal is not bound to the committed "
-                f"generation: {intent['generation']}"
-            )
-        retired = frozenset(intent["targets"])
-        manifests = sorted(self.state_dir.glob("generation-*/manifest.json"))
-        # Global preflight: a malformed later generation must be discovered
-        # before any earlier secret is overwritten or unlinked.
-        for manifest in manifests:
-            _preflight_sensitive_records(self.state_dir, manifest, retired)
+        retired, manifests = plan
         for manifest in manifests:
             _redact_sensitive_records(manifest, retired)
         (self.state_dir / SENSITIVE_RETIREMENT_JOURNAL).unlink()
@@ -3527,6 +3671,10 @@ class FileTransaction:
                     )
                 if membership is not None and membership["manifest"] != retirement["manifest"]:
                     raise RuntimeError("auxiliary journals disagree on generation")
+            # Prove every historical secret path before even inert cleanup.
+            # In particular, orphan removal must never delete a generation
+            # whose retained secret journal has not passed global preflight.
+            self._preflight_sensitive_retirement()
             # A crash after a completed recovery can leave only the inert
             # fixed-name snapshot. With no governing WAL it has no authority
             # and must not bleed into the next transaction.
@@ -3535,13 +3683,13 @@ class FileTransaction:
                 _read_regular(snapshot, max_bytes=4 * 1024 * 1024)
                 snapshot.unlink()
                 _fsync_dir(self.state_dir)
-            self._remove_orphan_generations()
             # A crash between commit()'s last unlink and its retirement call
             # leaves the armed journal and nothing else; there is no pending
             # generation to roll back, so the only thing outstanding is
             # finishing that destruction.
             self._resolve_authority_membership()
             self._run_sensitive_retirement()
+            self._remove_orphan_generations()
             return
         manifest = self._pending_manifest()
         transaction = manifest.parent
@@ -3560,6 +3708,7 @@ class FileTransaction:
                 "manifest"
             )
         if journal.get("phase") == "COMMITTING" or current_manifest == str(manifest):
+            _verify_generation_control_authority(self.state_dir, manifest)
             # commit() already durably published current.json but crashed
             # before unlinking pending.json. Restoring here would silently
             # revert a completed, live installation on the next boot

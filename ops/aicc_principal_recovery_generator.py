@@ -190,15 +190,30 @@ def _auxiliary_capsule(state_dir: Path, *, expected_uid: int) -> Path:
         raise RuntimeError("auxiliary recovery journals disagree on generation")
     manifest = manifests.pop()
     generation = manifest.parent
-    expected = state_dir.resolve() / generation.name / "manifest.json"
+    state_root = state_dir.resolve(strict=True)
+    expected_generation = state_root / generation.name
+    expected = expected_generation / "manifest.json"
     if (
         manifest != expected
         or not re.fullmatch(r"generation-[0-9a-f]{16}", generation.name)
         or current["manifest"] != str(manifest)
     ):
         raise RuntimeError("auxiliary recovery generation is not live")
-    _trusted_regular(manifest, mode=0o600, expected_uid=expected_uid)
-    recovery = generation / "recovery.py"
+    generation_info = expected_generation.lstat()
+    if (
+        not stat.S_ISDIR(generation_info.st_mode)
+        or stat.S_ISLNK(generation_info.st_mode)
+        or generation_info.st_uid != expected_uid
+        or stat.S_IMODE(generation_info.st_mode) != 0o700
+        or expected_generation.resolve(strict=True) != expected_generation
+    ):
+        raise RuntimeError("auxiliary recovery generation directory is untrusted")
+    if manifest.resolve(strict=True) != expected:
+        raise RuntimeError("auxiliary recovery manifest escaped its generation")
+    _trusted_regular(expected, mode=0o600, expected_uid=expected_uid)
+    recovery = expected_generation / "recovery.py"
+    if recovery.resolve(strict=True) != recovery:
+        raise RuntimeError("auxiliary recovery capsule escaped its generation")
     _trusted_regular(recovery, mode=0o700, expected_uid=expected_uid)
     return recovery
 
