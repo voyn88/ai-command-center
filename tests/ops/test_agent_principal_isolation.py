@@ -1207,6 +1207,68 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
         assert "\nfi\n" not in before[before.rindex(guard):]
 
 
+def _occurrence_indices(text: str, needle: str) -> list[int]:
+    indices = []
+    start = 0
+    while True:
+        found = text.find(needle, start)
+        if found == -1:
+            return indices
+        indices.append(found)
+        start = found + 1
+
+
+def _is_behind_worker_guard(text: str, line: str, guard: str) -> bool:
+    """True only if EVERY occurrence of `line` sits behind an open `guard`.
+
+    Checking just the last occurrence (`text.rindex(line)`) let an earlier,
+    unconditional occurrence of the same line hide behind a later, correctly
+    guarded one -- both recovery-start assertions passed a diff that left the
+    fresh-install `systemctl start` unconditional, because that call is not
+    the last one in the file (adversarial review of PR #536, fad91f4)."""
+    positions = _occurrence_indices(text, line)
+    assert positions, f"{line!r} does not appear in the installer"
+    for position in positions:
+        before = text[:position]
+        if guard not in before:
+            return False
+        if "\nfi\n" in before[before.rindex(guard):]:
+            return False
+    return True
+
+
+def test_the_tmpfiles_target_is_only_created_for_the_worker_profile():
+    """`deploy/tmpfiles.d/aicc-agent.conf` creates /var/lib/aicc-agent -- a
+    WORKER_ONLY_TARGETS path. Running `systemd-tmpfiles --create` for it
+    unconditionally is what manufactured that artefact on a control install
+    and made the next control install refuse on its own prior work
+    (control-01, 2026-08-31)."""
+    text = _installer_text()
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+    line = 'systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"'
+
+    assert line in text
+    assert _is_behind_worker_guard(
+        text, line, guard
+    ), f"{line} is not behind the worker-profile guard"
+
+
+def test_the_recovery_unit_is_only_started_for_the_worker_profile():
+    """aicc-principal-recovery.service is a WORKER_ONLY_TARGETS unit: a
+    control host never gets the persistent copy the transaction installs.
+    The installer starts it twice -- once ahead of a fresh install, once
+    reactivating it before a resumed uninstall -- and EVERY occurrence must
+    be gated, not just whichever one a naive check happens to find last."""
+    text = _installer_text()
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+    line = "systemctl start aicc-principal-recovery.service"
+
+    assert text.count(line) == 2
+    assert _is_behind_worker_guard(
+        text, line, guard
+    ), f"{line} is not behind the worker-profile guard at every occurrence"
+
+
 # ---------------------------------------------------------------------------
 # The two comparisons that blocked installation on both hosts, 2026-08-31.
 # ---------------------------------------------------------------------------

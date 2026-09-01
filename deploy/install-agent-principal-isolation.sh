@@ -210,7 +210,13 @@ if ! path_present "$state_dir/uninstall.json"; then
   # same host lock and make first install fail deterministically.
   run_transaction recover
   systemctl daemon-reload
-  systemctl start aicc-principal-recovery.service
+  # aicc-principal-recovery.service is a WORKER_ONLY_TARGETS unit: a control
+  # host never gets the persistent copy the transaction installs, so starting
+  # it unconditionally here is exactly the worker-only side effect a control
+  # install must not perform.
+  if [ "$install_profile" = "worker" ]; then
+    systemctl start aicc-principal-recovery.service
+  fi
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -224,7 +230,9 @@ if [ "${1:-}" = "--uninstall" ]; then
     # INTENT precedes every uninstall mutation, so recovery safely aborted it.
     # Reactivate the no-op barrier before creating the replacement WAL.
     systemctl reset-failed aicc-principal-recovery.service >/dev/null 2>&1 || true
-    systemctl start aicc-principal-recovery.service
+    if [ "$install_profile" = "worker" ]; then
+      systemctl start aicc-principal-recovery.service
+    fi
   fi
   [ -f "$baseline_units" ] && [ -f "$baseline_release" ] || {
     echo "principal-isolation baseline state is missing" >&2
@@ -400,7 +408,14 @@ trap rollback EXIT HUP INT TERM
 # Identity and directory creation are additive/idempotent prerequisites. Every
 # other replaceable file belongs to the versioned transaction below.
 systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
-systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+# The tmpfiles target creates /var/lib/aicc-agent -- a WORKER_ONLY_TARGETS
+# path the control profile refuses to find already present. Running it
+# unconditionally is exactly what manufactured that artefact on a control
+# host and made the next control install refuse on its own prior work
+# (control-01, 2026-08-31).
+if [ "$install_profile" = "worker" ]; then
+  systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+fi
 run_transaction prepare
 transaction_active=1
 run_transaction apply
