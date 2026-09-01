@@ -2626,6 +2626,7 @@ def _purge_runner(
     late_after=1,
     busy=(),
     inactive_busy=(),
+    launcher_jobs=(),
     disable_fails=(),
     calls=None,
 ):
@@ -2660,6 +2661,15 @@ def _purge_runner(
                 returncode=0,
                 stderr="",
                 stdout="".join(f"{name} loaded active running\n" for name in names),
+            )
+        if verb == "list-jobs":
+            return SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout="".join(
+                    f"{index} {name} start running\n"
+                    for index, name in enumerate(launcher_jobs, start=1)
+                ),
             )
         if verb == "show" and command[3] == "--property=LoadState":
             state = "loaded" if command[2] in known else "not-found"
@@ -2726,6 +2736,8 @@ def test_quiesce_worker_only_units_tolerates_a_host_that_never_ran_the_worker_pr
         if command[1] == "list-unit-files":
             return SimpleNamespace(returncode=1, stderr="", stdout="")
         if command[1] == "list-units":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if command[1] == "list-jobs":
             return SimpleNamespace(returncode=0, stderr="", stdout="")
         if command[1] == "show":
             return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
@@ -2808,18 +2820,22 @@ def test_the_control_purge_drains_the_workers_before_it_closes_the_socket(tmp_pa
     assert disabled.index("aicc-worker.service") < disabled.index(
         "aicc-agent-launcher.socket"
     )
-    assert disabled.index("aicc-agent-launcher.socket") < disabled.index(
-        "aicc-agent-launcher@7.service"
-    ), "admission closes before the final launcher enumeration"
+    assert "aicc-agent-launcher@7.service" not in disabled
+    assert any(
+        call[1] == "show"
+        and call[2] == "aicc-agent-launcher@7.service"
+        and "--property=ControlGroup" in call
+        for call in calls
+    ), "accepted sessions are observed to natural completion, never stopped"
 
 
-def test_a_session_opened_during_the_drain_is_stopped_before_the_socket_closes(
+def test_a_session_opened_during_the_drain_is_observed_after_admission_closes(
     tmp_path,
 ):
     """A worker's last request can instantiate one more session after the
-    enumeration this purge started from. The closing enumeration -- taken
-    once every client is stopped -- is what catches it; without it the socket
-    would close on a live session running off a unit file apply() removes."""
+    drain began. The post-close enumeration catches it, and the purge waits
+    for natural completion instead of killing an accepted descriptor that
+    rollback cannot recreate."""
     module = _module()
     calls = []
     run = _purge_runner(
@@ -2837,9 +2853,12 @@ def test_a_session_opened_during_the_drain_is_stopped_before_the_socket_closes(
     module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
 
     disabled = _disabled(calls)
-    assert "aicc-agent-launcher@8.service" in disabled
-    assert disabled.index("aicc-agent-launcher.socket") < disabled.index(
-        "aicc-agent-launcher@8.service"
+    assert "aicc-agent-launcher@8.service" not in disabled
+    assert any(
+        call[1] == "show"
+        and call[2] == "aicc-agent-launcher@8.service"
+        and "--property=ControlGroup" in call
+        for call in calls
     )
 
 
@@ -2878,12 +2897,11 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
         for index, call in enumerate(calls)
         if call[1] == "disable" and call[3] == "aicc-agent-launcher.socket"
     ]
-    launcher_stop = next(
-        index
-        for index, call in enumerate(calls)
-        if call[1] == "disable" and call[3] == "aicc-agent-launcher@7.service"
+    assert closed
+    assert not any(
+        call[1] == "disable" and call[3] == "aicc-agent-launcher@7.service"
+        for call in calls
     )
-    assert closed and closed[0] < launcher_stop
     assert max(drain_probes) > closed[0]
 
 
@@ -3386,6 +3404,7 @@ def test_initial_quarantine_collision_is_retried_without_replacement(
     transaction._apply_removal(record)
 
     assert collision.read_bytes() == b"must-survive"
+    assert set(worker_only.parent.glob(".agent.env.aicc-purge-*")) == {collision}
     assert not worker_only.exists()
 
 
@@ -3661,6 +3680,52 @@ def test_a_crash_between_commit_and_retirement_is_finished_by_recover(
         assert _byte_search(state, secret) == []
 
 
+def test_auxiliary_only_retirement_refuses_targets_not_bound_by_its_manifest(
+    monkeypatch, tmp_path
+):
+    """A fixed-name auxiliary WAL is not authority to destroy arbitrary blobs.
+
+    This is the recovery path with no primary pending.json. A corrupted v2
+    journal used to feed its targets directly to historical-manifest
+    redaction, so naming an ordinary target destroyed valid rollback material.
+    Validation must fail before any journal, manifest or blob changes.
+    """
+    module = _module()
+    transaction, root, state = _worker_host_with_credentials(module, tmp_path)
+    ordinary_source = tmp_path / "ordinary-source"
+    ordinary_source.write_bytes(b"ordinary-rollback-material")
+    transaction.install((_spec(module, ordinary_source, "/etc/ordinary"),))
+
+    monkeypatch.setattr(
+        module.FileTransaction,
+        "_run_sensitive_retirement",
+        lambda _self, **_kwargs: None,
+    )
+    transaction.install(_control_transition_specs(module, tmp_path))
+    journal = state / module.SENSITIVE_RETIREMENT_JOURNAL
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    payload["targets"].append("/etc/ordinary")
+    journal.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    journal.chmod(0o600)
+    before = {
+        path: path.read_bytes()
+        for path in state.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.undo()
+
+    with pytest.raises(RuntimeError, match="sensitive retirement targets drifted"):
+        module.FileTransaction(root, state).recover()
+
+    after = {
+        path: path.read_bytes()
+        for path in state.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert (root / "etc/ordinary").read_bytes() == b"ordinary-rollback-material"
+
+
 def test_retirement_intent_outlives_primary_wal_until_redaction_is_durable(
     monkeypatch, tmp_path
 ):
@@ -3919,7 +3984,10 @@ def test_a_committing_recovery_refuses_an_intent_from_another_generation(tmp_pat
     )
     journal.chmod(0o600)
 
-    with pytest.raises(RuntimeError, match="bound to another generation"):
+    with pytest.raises(
+        RuntimeError,
+        match="sensitive retirement (journal is invalid|targets drifted)",
+    ):
         module.FileTransaction(root, state).recover()
 
     assert journal.exists()
@@ -4564,9 +4632,8 @@ def _listing_runner(*, workers=(), launchers=(), loaded=()):
     return run
 
 
-def test_the_control_purge_stops_every_live_broker_instance(tmp_path):
-    """Naming only `aicc-agent-launcher.socket` left every accepted session
-    running as its own unit, off a fragment apply() was about to delete."""
+def test_the_control_purge_waits_for_every_live_broker_instance(tmp_path):
+    """Accepted sessions are proof-drained, never killed or fake-restored."""
     module = _module()
     calls = []
     run = _purge_runner(
@@ -4586,10 +4653,18 @@ def test_the_control_purge_stops_every_live_broker_instance(tmp_path):
     disabled = _disabled(calls)
     assert set(disabled) == {
         "aicc-agent-launcher.socket",
-        "aicc-agent-launcher@7.service",
-        "aicc-agent-launcher@9.service",
         "voyn-aicc-worker@1.service",
     }
+    for unit in (
+        "aicc-agent-launcher@7.service",
+        "aicc-agent-launcher@9.service",
+    ):
+        assert any(
+            call[1] == "show"
+            and call[2] == unit
+            and "--property=ControlGroup" in call
+            for call in calls
+        )
 
 
 def test_a_broker_instance_outside_the_snapshot_fails_closure(tmp_path):
@@ -4794,7 +4869,12 @@ def _older_reader(fields):
     that is on the host and cannot be changed.
     """
 
-    def read(records):
+    def read(payload):
+        # Frozen pre-v3 readers did not inspect the top-level version. They
+        # indexed payload["records"] and constructed their old dataclass;
+        # model that exact deployed behaviour rather than a hypothetical
+        # reader that rejects version 3 before looking at record fields.
+        records = payload["records"]
         loaded = []
         for value in records:
             unexpected = sorted(set(value) - set(fields))
@@ -4903,7 +4983,7 @@ def test_a_generation_with_nothing_version_three_still_loads_in_an_older_reader(
     payload = json.loads(manifest.read_text(encoding="utf-8"))
 
     assert payload["version"] == module.MANIFEST_VERSION
-    _older_reader(VERSION_TWO_RECORD_FIELDS)(payload["records"])
+    _older_reader(VERSION_TWO_RECORD_FIELDS)(payload)
 
 
 def test_an_older_reader_refuses_a_version_three_record_deterministically(tmp_path):
@@ -4932,7 +5012,7 @@ def test_an_older_reader_refuses_a_version_three_record_deterministically(tmp_pa
     payload = json.loads(manifest.read_text(encoding="utf-8"))
 
     with pytest.raises(TypeError, match="unexpected keyword argument"):
-        _older_reader(VERSION_TWO_RECORD_FIELDS)(payload["records"])
+        _older_reader(VERSION_TWO_RECORD_FIELDS)(payload)
 
     assert credential.read_bytes() == CLAUDE_BYTES, "prepare() mutates no target"
 
@@ -5109,9 +5189,26 @@ def test_launcher_appearing_after_first_post_close_scan_is_caught():
     module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
 
     disabled = _disabled(calls)
-    assert disabled.index("aicc-agent-launcher.socket") < disabled.index(
-        "aicc-agent-launcher@8.service"
+    assert "aicc-agent-launcher@8.service" not in disabled
+    assert any(
+        call[1] == "show"
+        and call[2] == "aicc-agent-launcher@8.service"
+        and "--property=ControlGroup" in call
+        for call in calls
     )
+
+
+def test_pending_launcher_activation_job_blocks_control_purge():
+    module = _module()
+    run = _purge_runner(
+        loaded={"aicc-agent-launcher.socket"},
+        launcher_jobs={"aicc-agent-launcher@queued.service"},
+    )
+
+    with pytest.raises(
+        RuntimeError, match="launcher instances did not reach stable closure"
+    ):
+        module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
 
 
 def test_partial_membership_revocation_is_retried_from_its_wal(tmp_path):

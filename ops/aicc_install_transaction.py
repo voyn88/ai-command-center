@@ -2346,14 +2346,15 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
     Tolerates a unit that was never loaded -- a control host that never ran
     the worker profile has none of these.
 
-    Ordered as a drain (`_control_purge_order`): the worker lanes that hold
-    the connections go first, then the launcher instances those connections
-    instantiated, and the listening socket closes last. Between the two, the
-    launcher instances are waited for -- inactive, no main process, cgroup
-    released -- and the template families are enumerated again, because a
-    worker's final request can instantiate one more session after the
-    enumeration this call started from. The socket is closed only when that
-    second enumeration finds nothing left to drain.
+    Ordered as a drain (`_control_purge_order`): the worker lanes that create
+    connections go first, then admission closes. Already accepted launcher
+    instances are NEVER stopped: their socket descriptors cannot be recreated
+    by rollback. The listener unit therefore must not carry Requires= from an
+    instance back to the socket. Once admission is proven closed, wait for
+    every accepted instance to finish naturally and bracket discovery with
+    systemd's activation-job list. No jobs plus no live cgroup is the barrier
+    that makes removal of the launcher template safe; a timeout fails the
+    transaction and rollback reopens admission without killing a session.
     """
 
     def systemctl(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -2405,6 +2406,21 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
             key=_control_purge_order,
         )
 
+    def launcher_jobs() -> frozenset[str]:
+        result = systemctl("list-jobs", "--no-legend", "--no-pager")
+        if result.returncode:
+            raise RuntimeError(
+                "cannot prove launcher activation queue before control purge"
+            )
+        jobs: set[str] = set()
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            # systemctl list-jobs: JOB UNIT TYPE STATE. Ignore its optional
+            # footer and unrelated units, but never a launcher activation.
+            if len(fields) >= 2 and TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(fields[1]):
+                jobs.add(fields[1])
+        return frozenset(jobs)
+
     def wait_drained(units: set[str], *, message: str) -> None:
         for attempt in range(DRAIN_ATTEMPTS):
             outstanding = [
@@ -2445,28 +2461,35 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
     launchers: set[str] = set()
     stable_passes = 0
     for attempt in range(DRAIN_ATTEMPTS):
+        jobs_before = launcher_jobs()
         discovered = {
             unit
             for unit in enumerate_units()
             if TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit)
         }
         new = discovered - launchers
-        for unit in sorted(new):
-            if stop(unit):
-                launchers.add(unit)
+        launchers.update(discovered)
         outstanding = [
             reason
             for unit in sorted(launchers)
             for is_drained, reason in (_unit_drained(unit, run=run),)
             if not is_drained
         ]
+        jobs_after = launcher_jobs()
         closing = {
             unit
             for unit in enumerate_units()
             if TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit)
         }
         unseen = closing - launchers
-        if not outstanding and not unseen and not new:
+        launchers.update(closing)
+        if (
+            not outstanding
+            and not unseen
+            and not new
+            and not jobs_before
+            and not jobs_after
+        ):
             stable_passes += 1
             if stable_passes == 2:
                 return
@@ -2475,7 +2498,9 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
         if attempt == DRAIN_ATTEMPTS - 1:
             raise RuntimeError(
                 "launcher instances did not reach stable closure before "
-                f"control purge: outstanding={outstanding}, unseen={sorted(unseen)}"
+                "control purge: "
+                f"outstanding={outstanding}, unseen={sorted(unseen)}, "
+                f"jobs={sorted(jobs_before | jobs_after)}"
             )
         sleep(DRAIN_INTERVAL_SECONDS)
 
@@ -3404,16 +3429,36 @@ class FileTransaction:
             }
         if (
             payload.get("version") != SENSITIVE_RETIREMENT_VERSION
+            or set(payload) != {"version", "generation", "manifest", "targets"}
             or not isinstance(payload.get("generation"), str)
+            or not re.fullmatch(
+                r"generation-[0-9a-f]{16}", str(payload.get("generation"))
+            )
             or not isinstance(payload.get("manifest"), str)
             or not isinstance(targets, list)
             or not targets
             or any(not isinstance(target, str) for target in targets)
-            or Path(str(payload["manifest"])).parent.name
-            != payload["generation"]
         ):
             raise RuntimeError("sensitive retirement journal is invalid")
-        return payload
+        generation = str(payload["generation"])
+        manifest = self.state_dir / generation / "manifest.json"
+        if payload["manifest"] != str(manifest):
+            raise RuntimeError("sensitive retirement journal is invalid")
+        _trusted_journal(manifest)
+        expected = _sensitive_removal_targets(manifest)
+        supplied = frozenset(targets)
+        if (
+            len(supplied) != len(targets)
+            or not supplied <= SENSITIVE_TARGETS
+            or supplied != expected
+        ):
+            raise RuntimeError("sensitive retirement targets drifted")
+        return {
+            "version": SENSITIVE_RETIREMENT_VERSION,
+            "generation": generation,
+            "manifest": str(manifest),
+            "targets": sorted(expected),
+        }
 
     def _require_sensitive_retirement_intent(self, manifest: Path) -> None:
         """Refuse to finish a control-sensitive commit without its intent.

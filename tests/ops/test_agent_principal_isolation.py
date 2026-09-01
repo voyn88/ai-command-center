@@ -1002,6 +1002,7 @@ def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
     assert "SocketMode=0660" in socket_unit
     assert "User=root" in launcher_unit
     assert "ExecStart=/usr/libexec/aicc-agent-launcher --serve-socket" in launcher_unit
+    assert "Requires=aicc-agent-launcher.socket" not in launcher_unit
     # The rendered-command assertion above (--property=DynamicUser=yes in the
     # built argv) is the real control; a raw-source substring is satisfied by
     # a comment (review note on c00fc46).
