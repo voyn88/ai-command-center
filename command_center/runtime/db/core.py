@@ -747,3 +747,18 @@ def current_schema_version(db_path: Path) -> int:
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
+
+
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    """Whether `table_name` is present in the currently opened SQLite database.
+
+    Uses `pragma_table_info` as a table-valued function so callers can pass the
+    name as a bound parameter instead of inlining it into SQL text.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM pragma_table_info(?) LIMIT 1",
+            (table_name,),
+        ).fetchone()
+        is not None
+    )

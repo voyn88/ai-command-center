@@ -40,10 +40,7 @@ def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
         return 0
     now = db.iso_now()
     with db.connect(db_path) as conn:
-        table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provenance'"
-        ).fetchone()
-        if table is None:
+        if not db.table_exists(conn, "run_provenance"):
             return 0
         with db.transaction(conn):
             cursor = conn.execute(

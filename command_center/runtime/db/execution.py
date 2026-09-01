@@ -416,10 +416,8 @@ def create_run(
                         now,
                     ),
                 )
-            provenance_table = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provenance'"
-            ).fetchone()
-            if provenance_table is not None:
+            has_run_provenance = db.table_exists(conn, "run_provenance")
+            if has_run_provenance:
                 conn.execute(
                     """INSERT INTO run_provenance (
                            run_id, task_id, repository_path, worktree_path, branch,
@@ -438,10 +436,8 @@ def create_run(
                         now,
                     ),
                 )
-            provider_route_table = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provider_route'"
-            ).fetchone()
-            if provider_route_table is not None and provider_route is not None:
+            has_run_provider_route = db.table_exists(conn, "run_provider_route")
+            if has_run_provider_route and provider_route is not None:
                 conn.execute(
                     """INSERT INTO run_provider_route (
                            run_id, providers_json, max_attempts, selection_reason,
@@ -462,7 +458,7 @@ def create_run(
             # mirror's correctness a property of this function's parameter
             # list rather than of the table.
             #
-            # Guarded by the same `sqlite_master` results as the inserts above,
+            # Guarded by the same existence checks as the inserts above,
             # and for the same reason. On a database migrated only part-way —
             # what the historical-schema tests build — these tables do not
             # exist, and an unguarded `SELECT` raises *inside* the
@@ -475,14 +471,14 @@ def create_run(
                 conn.execute(
                     "SELECT * FROM run_provenance WHERE run_id = ?", (record["id"],)
                 ).fetchone()
-                if provenance_table is not None
+                if has_run_provenance
                 else None
             )
             stored_route = (
                 conn.execute(
                     "SELECT * FROM run_provider_route WHERE run_id = ?", (record["id"],)
                 ).fetchone()
-                if provider_route_table is not None
+                if has_run_provider_route
                 else None
             )
     # Parent first: the target refuses a child whose run is not mirrored.
@@ -620,7 +616,7 @@ def list_runs(
             clauses.append(f"state IN ({placeholders})")
             params.extend(states_list)
         else:
-            clauses.append("0")
+            clauses.append("1=0")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     limit_clause = " LIMIT ?" if limit is not None else ""
     if limit is not None:
@@ -653,7 +649,7 @@ def count_runs(
             clauses.append(f"state IN ({placeholders})")
             params.extend(states_list)
         else:
-            clauses.append("0")
+            clauses.append("1=0")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.connect(db_path) as conn:
         (n,) = conn.execute(f"SELECT COUNT(*) FROM run {where}", params).fetchone()

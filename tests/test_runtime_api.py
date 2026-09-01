@@ -130,6 +130,25 @@ def test_list_runs_state_and_states_together_raises_value_error(tmp_path):
         api.list_runs(state="RUNNING", states=["RUNNING"])
 
 
+def test_list_and_count_runs_empty_states_return_empty_without_error(tmp_path):
+    api = ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+    task = db.create_task(api.db_path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(api.db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    db.create_run(
+        api.db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        task_type="implementation",
+        repository_path="/tmp/x",
+        prompt="p",
+        is_resume=False,
+    )
+
+    assert api.list_runs(states=[]) == []
+    assert api.count_runs(states=[]) == 0
+
+
 def test_request_cancel_requires_confirmation(git_repo, configure_project_repo, fake_claude):
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
     configure_project_repo("AIOS", git_repo)

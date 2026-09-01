@@ -1601,6 +1601,12 @@ def test_list_runs_states_empty_iterable_matches_nothing(tmp_path):
     assert db.list_runs(path, states=[]) == []
 
 
+def test_count_runs_states_empty_iterable_matches_nothing(tmp_path):
+    path = _fresh_db(tmp_path)
+    _make_run(path)
+    assert db.count_runs(path, states=[]) == 0
+
+
 def test_list_runs_limit_bounds_result_set_and_preserves_order(tmp_path, monkeypatch):
     path = _fresh_db(tmp_path)
 
