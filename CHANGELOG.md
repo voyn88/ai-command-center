@@ -8,6 +8,43 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed (`VOYN-W0-AICC-SRV-07`)
+- `docs/srv01b-schema-map.md` now records that the migration volume figures
+  («≈1.22 млн строк» and the «бэкфилл ≈6.5 минут» window derived from it) are an
+  **extrapolation from one table of a synthetic ≈35 MB fixture** (200 000
+  messages, 50 contacts), not a measurement of production. The one snapshot ever
+  taken of the live database found the opposite: its domain tables empty, 137
+  rows in the whole file. Neither file is in the repo or in CI, so the number
+  cannot be re-measured here — and unlike every other section of that map, this
+  one says that about itself instead of inheriting the credibility of the
+  machine-taken measurements around it. The map's other unverified section,
+  `Reconciliation`, is labelled the same way and now cross-references the
+  volume section, since its "row counts match" step passes identically on an
+  empty table.
+- The correction carries two obligations for SRV-07/SRV-09. The importer
+  measures its own source (`count(*)` in wave order, before the first insert)
+  and carries that count into the transfer report, because a planning estimate
+  is not an input to the backfill window. And because "row counts match" passes
+  identically on an empty table, an importer that read nothing is
+  indistinguishable from one that moved everything unless the measured source
+  count travels beside the reconciliation verdict.
+- `tests/architecture/test_migration_volume_claims_fitness.py` keeps this from
+  rotting back: a volume figure in the migration docs without the word
+  «экстраполяция» fails the gate, as does that specific hearsay pair anywhere in
+  the repo's Markdown, since an unlabelled number reads as a measurement — which
+  is exactly how the original error was made. The file scan is
+  `git ls-files --cached --others --exclude-standard`, the same primitive
+  `tests/http_auth/negative_control.py` uses to materialise a mutation tree, so
+  a gitignored `generated/`/`reports/` artifact or another branch's
+  `.worktrees/` checkout of this map is never in scope. The transfer-window
+  context requires the word "backfill" itself, not the generic
+  "window"/"transfer", so a genuine future measurement of some other duration
+  (a queue's visibility window) is never forced to call itself an estimate. The
+  checker is a pure function over text and its negative controls assert that it
+  can fail — including that reformatting a labelled list with blank lines
+  (cosmetic; near-identical rendering) does not flip the verdict — rather than
+  trusting a green run over today's docs.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
