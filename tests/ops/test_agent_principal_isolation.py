@@ -907,7 +907,13 @@ def test_worker_runtime_sends_secrets_neither_in_argv_nor_env(monkeypatch, tmp_p
     assert result.status == "completed"
     observed = json.loads(capture.read_text(encoding="utf-8"))
     assert observed["argv"] == [str(fake_launcher), "--client"]
-    assert observed["manifest"]["workspace"] == str(tmp_path)
+    # `build_principal_isolation_manifest` sends `repository_path.resolve(strict=True)`,
+    # not the raw path. On macOS, pytest's `tmp_path` lives under `/var/folders/...`
+    # and `/var` is a symlink to `/private/var`, so the resolved workspace the
+    # launcher actually receives never string-equals the unresolved `tmp_path` —
+    # this assertion passed on Linux (where the temp root is rarely a symlink) and
+    # failed on macOS for a reason unrelated to the isolation guarantee under test.
+    assert observed["manifest"]["workspace"] == str(tmp_path.resolve(strict=True))
     assert observed["manifest"]["profile"] == "trusted_development"
     serialized = json.dumps(observed)
     for secret in ("publisher-secret", "lease-secret", "hmac-secret"):
