@@ -53,8 +53,8 @@ Engine signatures (deliberately structural, never a grep over comments):
   docstring-only ``__init__.py`` and a module that renders SQL text were
   violations, which made it impossible for the control plane to keep any
   database-adjacent module at all -- a gate policing names rather than
-  behaviour. Every other category still classifies on the name alone: nothing
-  loosened for queue, orchestration, authz or audit.
+  behaviour. ``orchestration`` and ``authz`` still classify on the name alone:
+  nothing loosened for them.
 
   Strictness is not reduced for a real engine. A file that owns persistence
   imports a driver (statically, aliased, or via ``importlib`` with a literal
@@ -67,6 +67,20 @@ Engine signatures (deliberately structural, never a grep over comments):
   a *non-literal* dynamic import (``__import__(name_from_config)``) is beyond
   static analysis and is not detected. Literal ``importlib``/``__import__`` and
   aliases are.
+
+  The ``audit`` name tokens (``audit``, ``provenance``) are corroborated too,
+  by a different substitute: a table-mirror module -- one that declares
+  ``MirroredTable``/``PostgresTableMirror`` subclasses over tables that already
+  exist and nothing else -- adds no capability of its own, the same
+  repository-vs-engine distinction the ``queue`` rule already draws (see
+  :func:`_behaves_like_an_audit_engine`). Two such modules
+  (``command_center/db/audit_store.py``, ``command_center/db/provenance_store.py``)
+  were carried in the baseline with a signed false-positive justification
+  before this corroboration existed; both drop out once it does, and pick the
+  category back up the moment either gains a function or a class of its own --
+  the growth direction stays covered. ``orchestration`` and ``authz`` remain
+  name-alone: no equivalent substitute has been demonstrated for them, and
+  corroborating a name without one is a straight loss of coverage.
 
 Baseline maintenance (a reviewed change, never a casual one — see
 ``docs/AIOS_BOUNDARY.md``):
@@ -241,11 +255,15 @@ NAME_SUBSTRING_SIGNATURES: dict[str, tuple[str, ...]] = {
 #: `memory` and `queue` qualify because their tokens (`db`, `store`,
 #: `repository`, `queue`, ...) name what a file is *about* as readily as what
 #: it *is* — a directory called `db/` says nothing about whether the code
-#: inside owns an engine — *and* because each has a behavioural substitute that
-#: keeps a home-grown engine detected. `orchestration`, `authz` and `audit` are
+#: inside owns an engine. `audit` qualifies for a different reason: a
+#: declarative table-mirror module (`MirroredTable`/`PostgresTableMirror`
+#: subclasses over a table that already exists, nothing else) adds no
+#: capability, and two such modules sat in the baseline as signed false
+#: positives before this corroboration existed (see
+#: `_behaves_like_an_audit_engine`). `orchestration` and `authz` are
 #: deliberately absent: no equivalent substitute has been demonstrated for
 #: them, and corroborating a name without one is a straight loss of coverage.
-CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue"})
+CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue", "audit"})
 
 # --- queue-engine behaviour (corroboration for the `queue` name signature) ---
 
@@ -680,10 +698,68 @@ def _corroborates_queue_name(tree: ast.AST) -> bool:
     )
 
 
+# --- audit-engine behaviour (corroboration for the `audit` name signature) --
+
+#: The one base class every declarative table-mirror module builds on
+#: (`command_center/db/table_mirror.py`). A class that names it and adds
+#: nothing else is a table declaration, not an engine.
+_MIRROR_BASE_CLASS = "PostgresTableMirror"
+
+
+def _defines_a_function(tree: ast.AST) -> bool:
+    """Whether this file defines any function or method of its own.
+
+    Every real audit-engine file matched by the name signature — the checks,
+    the runner, the registry, the Wave-2 write service, the runtime tables —
+    defines at least one. A pure table-mirror module defines none: its
+    `MirroredTable` instances, `PostgresTableMirror` subclasses and
+    `divergence_against(...)` calls are all assignments and class bodies of one
+    line, never a `def`.
+    """
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in ast.walk(tree)
+    )
+
+
+def _defines_a_non_mirror_class(tree: ast.AST) -> bool:
+    """Whether this file defines a class that is not a bare mirror declaration.
+
+    `class PostgresAuditRunMirror(PostgresTableMirror): spec = AUDIT_RUN` is
+    one class-level assignment naming a table that already exists — the same
+    repository shape `test_a_plain_repository_adapter_passes` already accepts
+    for `queue`. Any other class — a Pydantic schema, a value object, a class
+    with no base at all — is not that shape, whatever the file is named.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        base_names = {
+            base.id if isinstance(base, ast.Name) else getattr(base, "attr", None)
+            for base in node.bases
+        }
+        if _MIRROR_BASE_CLASS not in base_names:
+            return True
+    return False
+
+
+def _behaves_like_an_audit_engine(tree: ast.AST) -> bool:
+    """The corroboration the `audit` name signature needs (see module docstring).
+
+    Two positive shapes, either enough on its own: a defined function, or a
+    class that is not a trivial `PostgresTableMirror` declaration. A module
+    with neither — only table declarations and reconciliation wiring over data
+    that already exists — adds no behaviour of its own, so the name alone does
+    not make it an engine.
+    """
+    return _defines_a_function(tree) or _defines_a_non_mirror_class(tree)
+
+
 #: Category -> the behaviour that has to corroborate its name signature.
 _CORROBORATION: dict[str, Callable[[ast.AST], bool]] = {
     "memory": _persists_data,
     "queue": _corroborates_queue_name,
+    "audit": _behaves_like_an_audit_engine,
 }
 
 

@@ -27,12 +27,6 @@
     "command_center/api/audit_service.py": [
       "audit"
     ],
-    "command_center/audit/__init__.py": [
-      "audit"
-    ],
-    "command_center/audit/checks/__init__.py": [
-      "audit"
-    ],
     "command_center/audit/checks/_ruff.py": [
       "audit"
     ],
@@ -83,12 +77,6 @@
     "command_center/daily_audit_backend.py": [
       "audit",
       "orchestration"
-    ],
-    "command_center/db/audit_store.py": [
-      "audit"
-    ],
-    "command_center/db/provenance_store.py": [
-      "audit"
     ],
     "command_center/db/work_queue_store.py": [
       "queue"

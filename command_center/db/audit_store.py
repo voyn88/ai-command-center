@@ -19,18 +19,18 @@ nothing extra. Two tables in one family with different answers to the same
 question is exactly why "does this table have a runnable reconciliation entry
 point?" is a per-table check rather than a per-slice one.
 
-**Why this file is in the AIOS boundary baseline.** The frozen-engine detector
-classifies it under `audit`, and it does so on the **name alone**: `audit` is
-deliberately absent from `CORROBORATED_NAME_CATEGORIES`, because unlike
-`memory`/`queue` it has no behavioural substitute, and the module states that
-corroborating a name without one is a straight loss of coverage. This module
-adds no audit capability — it declares two `MirroredTable`s and two mirror
-classes over tables that already exist, with no statement of its own — so the
-match is the false positive `docs/AIOS_BOUNDARY.md` calls Direction 2. Its
-preferred remedy, renaming, is unavailable: any name keeping the token still
-trips, and a name without it would be wrong for a module about `audit_run` and
-`audit_finding`. So the baseline carries the entry, justified here and in the
-PR that added it, per the documented procedure.
+**Why this file is no longer in the AIOS boundary baseline.** The frozen-engine
+detector used to classify it under `audit` on the **name alone**, which made it
+a signed false positive (`docs/AIOS_BOUNDARY.md` Direction 2): this module adds
+no audit capability, only two `MirroredTable`s and two mirror classes over
+tables that already exist. `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION` closed
+that gap by giving `audit` the same kind of behavioural substitute `memory` and
+`queue` already had — `tests/architecture/aios_boundary.py`'s
+`_behaves_like_an_audit_engine` — so a module that defines no function and no
+class beyond a bare `PostgresTableMirror` declaration no longer classifies at
+all. The moment this file gains logic of its own, it reclassifies and the
+anti-growth gate catches it as new, which is the coverage the baseline entry
+used to provide by cruder means.
 
 The first version of this slice withdrew these two tables instead, on the
 belief that a baseline edit needed a separate architectural decision. It does

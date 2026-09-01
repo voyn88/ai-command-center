@@ -199,16 +199,15 @@ def test_a_file_backed_store_is_an_engine_even_with_no_driver():
 def test_corroboration_leaves_the_uncorroborated_categories_alone():
     """Two signatures are corroborated, not the gate.
 
-    `orchestration`, `authz` and `audit` names still classify on the name
-    alone: those tokens name what a module *is*, and unlike `memory` and
-    `queue` they have no behavioural substitute that could replace the name
-    without losing a home-grown engine.
+    `orchestration` and `authz` names still classify on the name alone: those
+    tokens name what a module *is*, and unlike `memory`, `queue` and `audit`
+    they have no behavioural substitute that could replace the name without
+    losing a home-grown engine.
     """
     empty = ast.parse("")
     for path, category in (
         ("command_center/task_scheduler.py", "orchestration"),
         ("command_center/rbac_rules.py", "authz"),
-        ("command_center/audit_trail.py", "audit"),
     ):
         assert category in boundary.classify_engine_categories(path, empty), path
 
@@ -448,3 +447,89 @@ def test_the_mainstream_queue_verbs_are_covered():
     # and must not classify a module that is not named like a queue.
     for path in ("command_center/report_builder.py", "command_center/web_client.py"):
         assert "queue" not in boundary.classify_engine_categories(path, polling), path
+
+
+def test_an_audit_name_alone_is_not_an_engine_signature():
+    """A docstring-only `audit`-named module is not, by itself, an engine.
+
+    `command_center/audit/__init__.py` and `command_center/audit/checks/__init__.py`
+    are exactly this shape in the real tree: a package docstring and nothing
+    else. Requiring the same corroboration `memory` requires stops the name
+    token alone from freezing a file that owns no behaviour.
+    """
+    docstring_only = ast.parse('"""Audit checks — the pluggable signal sources."""\n')
+    assert boundary.classify_engine_categories(
+        "command_center/audit/checks/__init__.py", docstring_only
+    ) == set()
+
+
+def test_a_plain_table_mirror_module_does_not_trip_the_audit_gate():
+    """The regression this corroboration exists to fix.
+
+    `command_center/db/audit_store.py` and `command_center/db/provenance_store.py`
+    sat in the baseline as signed false positives — `docs/AIOS_BOUNDARY.md`'s
+    Direction 2 — purely because `audit`/`provenance` matched their path. This
+    is that shape reduced to its essentials: two `MirroredTable` instances, two
+    trivial `PostgresTableMirror` subclasses, and a `divergence_against(...)`
+    call. None of it is a function, and neither subclass adds anything beyond
+    `spec`.
+    """
+    mirror_module = ast.parse(
+        "from command_center.db.table_mirror import MirroredTable, PostgresTableMirror, divergence_against\n"
+        "AUDIT_RUN = MirroredTable(table='audit_run', columns=('id',))\n"
+        "class PostgresAuditRunMirror(PostgresTableMirror):\n"
+        "    spec = AUDIT_RUN\n"
+        "audit_run_divergence = divergence_against(AUDIT_RUN)\n"
+    )
+    assert boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", mirror_module
+    ) == set()
+
+
+def test_an_audit_module_with_its_own_behaviour_still_classifies():
+    """Corroboration is a substitute for the name signature, not a loosening.
+
+    A function of its own, or a class that is not a bare `PostgresTableMirror`
+    declaration, is exactly the audit package's real shape — checks, the
+    runner, the registry, the Wave-2 write service, API schema models — and
+    both must still classify regardless of which one is present.
+    """
+    has_a_function = ast.parse(
+        "from command_center.db.table_mirror import PostgresTableMirror\n"
+        "class PostgresAuditRunMirror(PostgresTableMirror):\n"
+        "    def resync(self):\n"
+        "        ...\n"
+    )
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", has_a_function
+    )
+
+    has_a_non_mirror_class = ast.parse(
+        "from pydantic import BaseModel\n"
+        "class AuditRunRequest(BaseModel):\n"
+        "    project: str\n"
+    )
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/api/audit_schemas.py", has_a_non_mirror_class
+    )
+
+
+def test_the_known_audit_false_positives_left_the_frozen_baseline():
+    """Ties the corroboration to the real files it was written to fix.
+
+    A unit test against synthetic ASTs proves the rule; this proves the rule
+    actually changed the two files `docs/AIOS_BOUNDARY.md` names. If either
+    regains a category here without the baseline being regenerated, the
+    anti-growth gate — not this test — is what will fail next.
+    """
+    for rel_path in (
+        "command_center/db/audit_store.py",
+        "command_center/db/provenance_store.py",
+    ):
+        source = (boundary.REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=rel_path)
+        assert boundary.classify_engine_categories(rel_path, tree) == set(), rel_path
+
+    baseline = boundary.load_baseline()
+    assert "command_center/db/audit_store.py" not in baseline
+    assert "command_center/db/provenance_store.py" not in baseline

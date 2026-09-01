@@ -95,7 +95,7 @@ signatures:
 | path segment named like an engine (`queue`, `scheduler`, `supervisor`, `executor`, `launcher`, `autonomy`, `audit`, ...) | per token | catches home-grown engines that use no framework at all |
 | path segment named like a store (`db`, `database`, `store`, `storage`, `repository`, `persistence`, `memory`) **and** the file persists data | `memory` | see *Corroborated names* below |
 
-### Corroborated names (`memory` only)
+### Corroborated names (`memory`, `queue`, `audit`)
 
 The `memory` tokens are the one group where a name is a question rather than a
 verdict. They name what a file is *about* as readily as what it *is*: a package
@@ -121,11 +121,31 @@ caller opened. That is delegation, not ownership — the engine is wherever the
 driver is — and counting it would flag SQL-rendering and grant modules while
 catching no engine the driver rule misses.
 
-Nothing loosened for `queue`, `orchestration`, `authz` or `audit`: those names
-still classify on their own. And one signature was **tightened** at the same
-time: `psycopg_pool` is a separate distribution from `psycopg` and was missing
-from the driver list, so a file could open a PostgreSQL connection pool without
-the gate seeing a driver at all.
+`queue` is corroborated the same way, by a different substitute: storing and
+listing rows is a repository, not an engine, so a `queue`-named file classifies
+only when it also hands work out — a defined function with a handout verb
+(`dequeue`, `claim`, `poll`, `checkout`, ...) or SQL carrying `SKIP LOCKED`/`FOR
+UPDATE`. See `_runs_queue_operations` / `QUEUE_CORROBORATION_TOKENS` in
+`tests/architecture/aios_boundary.py`.
+
+`audit` is corroborated too (`VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION`), by a
+third substitute: a declarative table-mirror module —
+`MirroredTable`/`PostgresTableMirror` subclasses over a table that already
+exists, and nothing else — adds no capability of its own, so an `audit`-named
+file classifies only when it defines a function of its own or a class that is
+not a bare `PostgresTableMirror` declaration. `command_center/db/audit_store.py`
+and `command_center/db/provenance_store.py` were the two false positives this
+closed: both were carried in the baseline with a signed Direction-2
+justification purely because their table names include `audit`/`provenance`,
+and both left the baseline once the corroboration existed. See
+`_behaves_like_an_audit_engine` in `tests/architecture/aios_boundary.py`.
+
+Nothing loosened for `orchestration` or `authz`: those names still classify on
+their own — no behavioural substitute has been demonstrated for either. And one
+signature was **tightened** at the same time `memory`'s corroboration landed:
+`psycopg_pool` is a separate distribution from `psycopg` and was missing from
+the driver list, so a file could open a PostgreSQL connection pool without the
+gate seeing a driver at all.
 
 Acknowledged limit, stated rather than papered over: a driver reached through a
 *non-literal* dynamic import (`__import__(name_from_config)`) is beyond static

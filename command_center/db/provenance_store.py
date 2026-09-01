@@ -22,24 +22,24 @@ Three of the four are keyed by `run_id` alone, which makes them one-to-one with
 a run; `provenance_evidence` is the exception, keyed by its own
 `integrity_id`. Five `jsonb` columns between them and nothing else new.
 
-**Why this file is in the AIOS boundary baseline.** The frozen-engine detector
-classifies it under `audit`, because that category's tokens include
-`provenance` — and `audit` is deliberately matched on the name alone, with no
-behavioural corroboration. This module declares four `MirroredTable`s and four
-mirror classes over tables that already exist; it contains no function, no SQL
-and no connection handling, so it adds no audit capability. That makes it the
-false positive `docs/AIOS_BOUNDARY.md` calls Direction 2, whose preferred
-remedy — renaming — is unavailable: a module about `run_provenance` and
-`provenance_evidence` cannot honestly drop the token, and choosing a name to
-slip past a name-based detector is evasion rather than remedy.
+**Why this file is no longer in the AIOS boundary baseline.** The frozen-engine
+detector used to classify it under `audit`, because that category's tokens
+include `provenance`, matched on the name alone with no behavioural
+corroboration. This module declares four `MirroredTable`s and four mirror
+classes over tables that already exist; it contains no function, no SQL and no
+connection handling, so it added no audit capability — the false positive
+`docs/AIOS_BOUNDARY.md` calls Direction 2.
 
-This is the **second** such entry, after `audit_store.py` in slice 8, and two
-is where a pattern starts. The structural fix is not more entries: it is to
-give the `audit` category a behavioural corroboration the way `queue` has one,
-after which both entries retire in the shrink direction the policy actually
-wants. Recorded as `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION`; until it
-closes, any further table of this family should be declared **inside** one of
-the two already-baselined modules rather than in a third file.
+This was the **second** such entry, after `audit_store.py` in slice 8, and two
+was where the pattern started. `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION`
+gave `audit` the behavioural corroboration `queue` already had
+(`_behaves_like_an_audit_engine` in `tests/architecture/aios_boundary.py`): a
+module with no function and no class beyond a bare `PostgresTableMirror`
+declaration no longer classifies, so both entries retired in the shrink
+direction the policy actually wants. A further table of this family can now be
+declared in a file of its own without tripping the gate at all, as long as it
+stays this shape — a `MirroredTable` and a trivial mirror subclass, nothing
+that behaves.
 """
 
 from __future__ import annotations

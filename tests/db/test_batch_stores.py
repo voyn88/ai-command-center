@@ -11,14 +11,16 @@ no table here introduces a conversion the shared machinery has not already been
 proved against. The council family keeps its own slice because `council_event`
 carries an identity column and its own event ordering.
 
-`audit_run`/`audit_finding` trip the AIOS boundary gate on their **file name**:
-`audit` is matched without behavioural corroboration by design. The first
+`audit_run`/`audit_finding` used to trip the AIOS boundary gate on their **file
+name**: `audit` was matched without behavioural corroboration. The first
 version of this slice withdrew them, on the belief that a baseline edit needed
-a separate architectural decision. `docs/AIOS_BOUNDARY.md` says otherwise —
-this is its Direction 2 (reclassify a detector false positive), whose remedy is
-an ordinary reviewed PR with the justification in its description, which is the
-process that was already running. The tables are back, the baseline carries the
-entry, and the reasoning lives in `command_center/db/audit_store.py`.
+a separate architectural decision. `docs/AIOS_BOUNDARY.md` said otherwise —
+this was its Direction 2 (reclassify a detector false positive), whose remedy
+is an ordinary reviewed PR with the justification in its description, which is
+the process that was already running. The tables came back with a signed
+baseline entry, and `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION` later gave
+`audit` the behavioural corroboration that made the entry unnecessary — see
+`command_center/db/audit_store.py`.
 
 What still gets per-table attention, because it is per-table by nature:
 
