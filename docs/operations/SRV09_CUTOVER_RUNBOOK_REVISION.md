@@ -449,8 +449,13 @@ This revision was itself checked out at `67a996b`. Five days later,
 (installer control profiles, systemd unit handling, CI build changes, a
 publish-window scheduler) and does not appear below — this is not a full
 51-reference re-audit, only the commits that touch something this document
-makes a claim about. One did: `VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY`
-(#473). A second, unrelated commit
+makes a claim about. Two did, not the one originally checked: `VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY`
+(#473), and `VOYN-W0-AICC-GUARDED-LOCAL-PREFLIGHT` (#519), missed on the
+first sweep of this pass despite touching row 45 directly — found only when
+row 45's own claim was re-checked against `main` while verifying everything
+else below, which is the same lesson §"the lesson this second pass adds"
+draws at the bottom of this appendix, just caught a paragraph too late to
+be smug about it. A third, unrelated commit
 (`VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION`, #443) also lands one of the two
 new PostgreSQL tables cited below, incidentally.
 
@@ -461,6 +466,7 @@ new PostgreSQL tables cited below, incidentally.
 | 54 | PostgreSQL migrations (`command_center/db/sql/`) | `0001`–`0014` | **`0001`–`0016`** — `0015_backlog_scan_cursor` (PG-native tick-scheduler state, unrelated to the 33-table map), `0016_run_finalization_claim` (PG target for migration 25's table, deliberately not dual-written) |
 | 55 | `command_center/db/roles.py` `PRIVILEGES` | no finalization-claim entry | gained `_FINALIZATION_CLAIM_TABLES`, granted to `aicc_app`, `aicc_worker`, and the operator enrolment role |
 | 56 | `tests/db/test_mirror_coverage.py` `UNMIRRORED_SCHEMA_TABLES` | did not name either table | both `run_finalization_claim` and `backlog_scan_cursor` now carry signed exclusions with reason and owning task |
+| 57 | `scripts/preflight.sh` (row 45 above) | 4-stage — whitespace / ruff / byte-compile / leak guard | **6-stage** — `VOYN-W0-AICC-GUARDED-LOCAL-PREFLIGHT` (#519) inserted a pinned `detect-secrets` baseline-diff stage before the test stage and moved impact-selected tests to its own numbered stage; still not a cutover gate (§4 A0 does not invoke this script), but row 45 was itself a stale claim inside a document about staleness |
 
 The lesson this second pass adds to the one A0b already teaches: **a
 revision's own baseline commit is a claim with a shelf life, not a fact.**
