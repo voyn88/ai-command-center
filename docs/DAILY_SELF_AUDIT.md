@@ -73,6 +73,54 @@ the application UI. The
 process is kept alive, while the SQLite due time and lease ensure that only one
 campaign is dispatched per day and that another host cannot duplicate it.
 
+### Install as a system daemon, not a GUI agent
+
+The same plist must be bootstrapped into the **system** launchd domain, not a
+per-user `gui/<uid>` domain. A `gui/<uid>` LaunchAgent only runs while that
+user is logged into a graphical session -- on a headless host, or a laptop
+that is closed or logged out, the campaign silently stops being scheduled.
+The system domain has no such dependency:
+
+```text
+sudo cp com.ai-command-center.daily-audit.plist /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.ai-command-center.daily-audit.plist
+sudo launchctl enable system/com.ai-command-center.daily-audit
+```
+
+Check it with `launchctl print system/com.ai-command-center.daily-audit`, or
+from the Streamlit panel, which probes the system domain directly.
+
+### Migrating from a GUI-domain LaunchAgent
+
+Installations from before this change used a `gui/<uid>` LaunchAgent. That
+agent does **not** stop on its own when the system daemon above is installed:
+both can end up loaded at once, each independently dispatching the daily
+campaign against the same lease -- unlikely to duplicate work outright, since
+the lease still serializes dispatch, but two live schedulers is one more
+failure mode than zero, and it defeats the point of moving to the system
+domain. Before or immediately after installing the system daemon, remove the
+old agent:
+
+```text
+launchctl bootout gui/$(id -u)/com.ai-command-center.daily-audit
+rm -f ~/Library/LaunchAgents/com.ai-command-center.daily-audit.plist
+```
+
+Note the target form: `gui/$(id -u)/com.ai-command-center.daily-audit` is one
+argument -- domain and service label joined by `/` -- not two separate
+arguments. `launchctl bootout gui/$(id -u) com.ai-command-center.daily-audit`
+(a space instead of the slash) is parsed as removing a *plist file* named
+`com.ai-command-center.daily-audit` from the `gui/$(id -u)` domain, which is
+not what is loaded, and the legacy agent is left running.
+
+The Streamlit panel reports a legacy agent it detects as loaded (running or
+not) with the exact `bootout` command to run. Coverage of other logged-in
+accounts on the same host is best-effort: a normal user's launchd session
+cannot inspect another user's, so a scope this process could not verify is
+reported as unverified, not as clear. Do not read "no warning shown" as proof
+that no legacy agent remains under an account other than the one running the
+UI; check other accounts directly if this host is shared.
+
 ## Safety and recovery contract
 
 - The active scheduler renews its lease throughout the campaign. A replacement
