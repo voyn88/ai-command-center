@@ -64,7 +64,6 @@ No new task store, no new queue, no second completion state machine.
 from __future__ import annotations
 
 import contextlib
-import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -91,8 +90,6 @@ from command_center.runtime import db as runtime_db
 from command_center.runtime import reports
 from command_center.runtime import scheduler, task_sync
 from command_center.runtime.completion import CompletionPolicy
-
-_LOG = logging.getLogger(__name__)
 
 PIPELINE_LOCK_FILE_NAME = "task_pipeline.lock"
 
@@ -171,6 +168,11 @@ TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
 LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
+# Distinct from LAUNCH_BUDGET_EXHAUSTED: the trailing-24h spend could not be
+# *read* at all (corrupt cost data, an unreachable db, ...) rather than
+# genuinely being at/over the cap. Conflating the two used to report "budget
+# exhausted" for a condition that has nothing to do with the budget.
+LAUNCH_SPEND_UNKNOWN = "daily_spend_unknown"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -2228,22 +2230,30 @@ def _locked_tick(
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
     spend_budget_exhausted = False
+    spend_unknown = False
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
         try:
             spend_budget_exhausted = (
                 daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
             )
-        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+        except SpendUnknownError as exc:
+            # Fail closed: no launch — but say *why*. The trailing-24h spend
+            # could not be trusted, which is not the same claim as "at/over
+            # the cap"; reporting it as budget-exhausted would tell an
+            # operator the wrong thing to go fix.
             _record(exc, "daily_spend_budget")
-            spend_budget_exhausted = True
-    if settings.auto_launch_active and not spend_budget_exhausted:
+            spend_unknown = True
+    if settings.auto_launch_active and not spend_budget_exhausted and not spend_unknown:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
     else:
-        launch_status = (
-            LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
-        )
+        if spend_unknown:
+            launch_status = LAUNCH_SPEND_UNKNOWN
+        elif spend_budget_exhausted:
+            launch_status = LAUNCH_BUDGET_EXHAUSTED
+        else:
+            launch_status = LAUNCH_DISABLED
 
     # 9b. Nothing silently stuck: compute, from the post-dispatch state, every
     #     task that has stopped without reaching Done. Read-only.
@@ -2404,6 +2414,23 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     }
 
 
+class SpendUnknownError(Exception):
+    """Raised by `daily_spend_usd` instead of returning a number that cannot
+    be trusted. The contract this function upholds is "a trustworthy float or
+    an exception" — never a number that looks plausible but silently drops or
+    misrepresents real spend, because every caller uses the return value to
+    decide whether it is safe to launch paid work."""
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+
+
+# `SpendUnknownError.reason` values.
+CORRUPT_COST_EVENT = "corrupt_cost_event"
+SPEND_DATA_UNAVAILABLE = "spend_data_unavailable"
+
+
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
@@ -2411,49 +2438,98 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
 
+    Returns a trustworthy float or raises `SpendUnknownError` — never a
+    number a caller could mistake for the real trailing-24h spend. That
+    covers, deliberately:
+
+    * the database being unreachable (busy/locked/missing) — `SPEND_DATA_UNAVAILABLE`;
+    * a selected row's `payload_json` failing to parse. The `LIKE
+      '%total_cost_usd%'` filter below only selects rows whose raw text
+      claims to carry a cost, so a row that matches but cannot be parsed may
+      be concealing real spend rather than being unrelated noise —
+      `CORRUPT_COST_EVENT`;
+    * a selected row whose parsed payload is not an object, or whose
+      top-level `total_cost_usd` is present but not a finite, non-negative
+      number (a string, `null`, a bool, `NaN`/`Infinity`, a negative value,
+      or a magnitude so large `float()` overflows) — `CORRUPT_COST_EVENT`;
+    * the running total itself overflowing to a non-finite value once
+      individually-finite costs are summed — `CORRUPT_COST_EVENT`.
+
+    A selected row whose parsed payload is a well-formed object but has *no*
+    top-level `total_cost_usd` key is not corrupt — the `LIKE` filter is a
+    textual pre-filter and can match the substring appearing anywhere in the
+    JSON (nested, in a message string, ...) without this event reporting a
+    cost at all. That row contributes 0, exactly like a genuinely cost-free
+    event.
+
     `payload` may already be a `dict` rather than JSON text — a `jsonb`-backed
     read (the PostgreSQL mirror this table has, VOYN-W0-AICC-SRV-01B) hands
-    back a decoded object, not a string, and `json.loads` on a `dict` raises
-    `TypeError`. A prior version caught `TypeError` alongside `ValueError` and
-    silently `continue`d past every row, which zeroes the whole sum with no
-    error and no log line — a spend cap that reads 0 stops gating without
-    ever saying so. Only malformed JSON *text* is tolerated (and logged); a
-    row of an unexpected shape is now visible instead of silently dropped.
+    back a decoded object, not a string.
     """
     import json as _json
+    import math as _math
+    import sqlite3 as _sqlite3
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
     cutoff = (anchor - _td(hours=24)).isoformat(timespec="seconds")
+    try:
+        with runtime_db.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT run_event.payload_json AS payload FROM run_event
+                  JOIN run ON run.id = run_event.run_id
+                   AND run_event.payload_json LIKE '%total_cost_usd%'
+                   AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
+                """,
+                (cutoff, cutoff),
+            ).fetchall()
+    except (_sqlite3.Error, runtime_db.DatabaseBusyTimeoutError, OSError) as exc:
+        raise SpendUnknownError(SPEND_DATA_UNAVAILABLE, str(exc)) from exc
+
     total = 0.0
-    with runtime_db.connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT run_event.payload_json AS payload FROM run_event
-              JOIN run ON run.id = run_event.run_id
-               AND run_event.payload_json LIKE '%total_cost_usd%'
-               AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
-            """,
-            (cutoff, cutoff),
-        ).fetchall()
     for row in rows:
         payload = row["payload"]
         if isinstance(payload, (str, bytes, bytearray)):
             try:
                 payload = _json.loads(payload)
-            except ValueError:
-                _LOG.warning(
-                    "daily_spend_usd: skipping run_event with unparseable payload_json: %r",
-                    payload[:200] if isinstance(payload, str) else payload,
-                )
-                continue
+            except ValueError as exc:
+                raise SpendUnknownError(
+                    CORRUPT_COST_EVENT,
+                    "run_event.payload_json matched the cost filter but is "
+                    f"not valid JSON: {exc}",
+                ) from exc
         if not isinstance(payload, dict):
-            _LOG.warning(
-                "daily_spend_usd: skipping run_event whose payload is a %s, not an object",
-                type(payload).__name__,
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                "run_event.payload_json matched the cost filter but decoded "
+                f"to a {type(payload).__name__}, not an object",
             )
+        if "total_cost_usd" not in payload:
+            # False-positive textual match (see docstring) — not this
+            # event's cost, so it contributes nothing rather than erroring.
             continue
-        cost = payload.get("total_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total += float(cost)
+        cost = payload["total_cost_usd"]
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                f"total_cost_usd is a {type(cost).__name__}, not a number",
+            )
+        try:
+            cost = float(cost)
+        except OverflowError as exc:
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT, f"total_cost_usd overflows float: {cost!r}"
+            ) from exc
+        if not _math.isfinite(cost) or cost < 0:
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                f"total_cost_usd is not a finite, non-negative number: {cost!r}",
+            )
+        total += cost
+        if not _math.isfinite(total):
+            raise SpendUnknownError(
+                CORRUPT_COST_EVENT,
+                "accumulated daily spend overflowed to a non-finite value",
+            )
     return total

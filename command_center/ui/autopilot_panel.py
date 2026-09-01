@@ -352,6 +352,12 @@ def render_autopilot_wave(result=None, *, live_running: int | None = None) -> No
 
     if result.launch_status == task_pipeline.LAUNCH_DISABLED and result.ran:
         st.caption("Автозапуск выключен — волна показана, но ничего не запускалось.")
+    elif result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN:
+        st.error(
+            "Расход за 24 часа не удалось достоверно прочитать — запуск "
+            "приостановлен (это не то же самое, что исчерпанный бюджет).",
+            icon=":material/error:",
+        )
     elif result.launch_status.startswith(task_pipeline.LAUNCH_BATCH_FAILED):
         st.error(f"Пакет запуска не выполнен: {result.launch_status}", icon=":material/error:")
 

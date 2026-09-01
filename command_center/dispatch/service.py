@@ -177,7 +177,11 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     budget_unknown = False
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
+    except task_pipeline.SpendUnknownError:
+        # The one exception `daily_spend_usd` raises for every way it cannot
+        # produce a trustworthy figure (corrupt cost data, an unreachable
+        # db, ...) — fail closed: block dispatch rather than simulate a
+        # spend number a caller might trust.
         spend = 0.0
         budget_unknown = True
 

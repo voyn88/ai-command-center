@@ -59,7 +59,9 @@ def _spend(monkeypatch, value: float):
 
 def _spend_unavailable(monkeypatch):
     def _raise(*_a, **_k):
-        raise RuntimeError("db unreachable")
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SPEND_DATA_UNAVAILABLE, "db unreachable"
+        )
 
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
 
