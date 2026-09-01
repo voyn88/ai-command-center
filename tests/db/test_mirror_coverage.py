@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 from command_center.db import roles
+from command_center.db.queue_store import PostgresQueueMirror
 
 from tests.db.mirror_discovery import mirror_classes
 
@@ -63,6 +64,12 @@ class Exclusion:
 
     reason: str
     task: str
+    #: True for a table mirrored by hand outside `PostgresTableMirror` — Gate A
+    #: would otherwise demand it as if nothing mirrored it at all. A table
+    #: signed this way must also be registered in `BESPOKE_MIRRORS`, and the
+    #: correspondence is checked both directions: see
+    #: `test_every_bespoke_exclusion_matches_a_registered_mirror`.
+    bespoke: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +163,7 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
             "in a hand-written count."
         ),
         task="VOYN-W0-AICC-QUEUE-ENTRY-PARITY",
+        bespoke=True,
     ),
     "work_item": Exclusion(
         reason=(
@@ -457,6 +465,373 @@ def test_the_runtime_gate_fails_on_an_undeclared_ad_hoc_table() -> None:
     assert _uncovered(
         tables, set(roles.ALL_TABLES), RUNTIME_TABLES_WITHOUT_A_TARGET
     ) == ["another_daemon_table"]
+
+
+# ---------------------------------------------------------------------------
+# Gate C — every table signed out of Gate A as "bespoke" really is mirrored
+# ---------------------------------------------------------------------------
+#
+# A `bespoke=True` exclusion is a claim, not a mirror: without something that
+# exercises the class it names, deleting `PostgresQueueMirror`'s body — or
+# swapping in an unrelated class, or one that mirrors a different table, or one
+# whose read and write halves have traded places — would leave `queue_entry`
+# excused from Gate A and checked by nothing at all. That gap survived three
+# review rounds under different shapes: a check that only proved the mapped
+# symbol existed; a check that concatenated the read and mutation SQL before
+# looking for the table, so either path alone could stop touching it
+# unnoticed; a check that matched the table name as a bare substring, so
+# `queue_entry_archive` or a quoted string literal satisfied it without a real
+# reference; and a check that accepted the same `FROM|INTO|UPDATE|JOIN` shape
+# for both methods, so a read that issued `DELETE` or a write reduced to a
+# lone `SELECT` — or a write that kept its `DELETE` half and lost the `INSERT`
+# — still passed.
+#
+# So this gate does not read source text at all. It calls the real methods
+# against a connection that only records what was executed, per method, and
+# checks the *recorded statement* against a verb the method must contain:
+# `SELECT ... FROM <table>` for the read, `INSERT INTO <table>` or
+# `UPDATE <table>` for the mutation. A table reference is required at a word
+# boundary, so `<table>_archive` and `'<table>'` inside an unrelated statement
+# both fail to satisfy it.
+
+
+@dataclass(frozen=True)
+class BespokeMirror:
+    """A table mirrored by hand-written methods, not `PostgresTableMirror`.
+
+    `mutation_args` is a full call, not a placeholder: `replace_entries([])`
+    executes only the `DELETE`, because the `INSERT` is skipped when there are
+    no rows, which would make the write check pass on a method call that never
+    inserted anything. At least one row is required so the recorded statements
+    actually include the write being verified.
+    """
+
+    cls: type
+    table: str
+    read_attr: str
+    mutation_attr: str
+    mutation_args: tuple
+
+
+#: `{table: declaration}` — the bespoke half of the mirror inventory.
+#: `test_every_bespoke_exclusion_matches_a_registered_mirror` ties this to
+#: `UNMIRRORED_SCHEMA_TABLES` in both directions.
+BESPOKE_MIRRORS: dict[str, BespokeMirror] = {
+    "queue_entry": BespokeMirror(
+        cls=PostgresQueueMirror,
+        table="queue_entry",
+        read_attr="list_entries",
+        mutation_attr="replace_entries",
+        mutation_args=(
+            [
+                {
+                    "id": "gate-c-sample",
+                    "task_id": "task-gate-c-sample",
+                    "project": "gate-c",
+                    "state": "queued",
+                    "reason": None,
+                    "run_id": None,
+                    "added_at": "2026-08-13T00:00:00",
+                    "evaluated_at": None,
+                    "launched_at": None,
+                }
+            ],
+        ),
+    ),
+}
+
+
+class _RecordingCursor:
+    """A cursor that records the SQL text of every statement it is given."""
+
+    def __init__(self, log: list[str]) -> None:
+        self._log = log
+
+    def __enter__(self) -> "_RecordingCursor":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def execute(self, sql: str, params: object = None) -> None:
+        self._log.append(sql)
+
+    def executemany(self, sql: str, seq: object) -> None:
+        self._log.append(sql)
+
+    def fetchall(self) -> list:
+        return []
+
+    def fetchone(self) -> None:
+        return None
+
+
+class _RecordingTransaction:
+    def __enter__(self) -> "_RecordingTransaction":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+
+class _RecordingConnection:
+    """A stand-in for `psycopg`'s connection: no PostgreSQL, no side effects.
+
+    Only `cursor()` and `transaction()` are implemented, because those are all
+    `PostgresQueueMirror` — or a bespoke mirror shaped like it — asks of a
+    connection. It never touches a network or a file, so this gate keeps the
+    module's own promise of needing no database.
+    """
+
+    def __init__(self, log: list[str]) -> None:
+        self._log = log
+
+    def __enter__(self) -> "_RecordingConnection":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def cursor(self) -> _RecordingCursor:
+        return _RecordingCursor(self._log)
+
+    def transaction(self) -> _RecordingTransaction:
+        return _RecordingTransaction()
+
+
+def _recorded_statements(cls: type, attr: str, args: tuple) -> list[str]:
+    """Every statement `cls(...).<attr>(*args)` executed, against a recorder."""
+    log: list[str] = []
+    instance = cls(connection_factory=lambda: _RecordingConnection(log))
+    getattr(instance, attr)(*args)
+    return log
+
+
+def _reads_table(statements: list[str], table: str) -> bool:
+    pattern = re.compile(
+        rf"\bSELECT\b.*\bFROM\s+{re.escape(table)}\b", re.IGNORECASE | re.DOTALL
+    )
+    return any(pattern.search(statement) for statement in statements)
+
+
+def _writes_table(statements: list[str], table: str) -> bool:
+    pattern = re.compile(
+        rf"\b(?:INSERT\s+INTO|UPDATE)\s+{re.escape(table)}\b", re.IGNORECASE
+    )
+    return any(pattern.search(statement) for statement in statements)
+
+
+def _bespoke_violations(entry: BespokeMirror) -> list[str]:
+    """What is wrong with `entry`, or `[]` if it is a real mirror.
+
+    The two halves are checked against statements recorded from two separate
+    calls, never pooled — a `list_entries` that stopped reading and a
+    `replace_entries` that still writes must not average out to "fine".
+    """
+    violations: list[str] = []
+
+    read_statements = _recorded_statements(entry.cls, entry.read_attr, ())
+    if not _reads_table(read_statements, entry.table):
+        violations.append(
+            f"{entry.cls.__name__}.{entry.read_attr} recorded no `SELECT ... FROM "
+            f"{entry.table}`: {read_statements!r}"
+        )
+
+    mutation_statements = _recorded_statements(
+        entry.cls, entry.mutation_attr, entry.mutation_args
+    )
+    if not _writes_table(mutation_statements, entry.table):
+        violations.append(
+            f"{entry.cls.__name__}.{entry.mutation_attr} recorded no `INSERT INTO "
+            f"{entry.table}` or `UPDATE {entry.table}`: {mutation_statements!r}"
+        )
+
+    return violations
+
+
+@pytest.mark.parametrize(
+    "table", sorted(BESPOKE_MIRRORS), ids=sorted(BESPOKE_MIRRORS)
+)
+def test_every_bespoke_mirror_is_real(table: str) -> None:
+    assert _bespoke_violations(BESPOKE_MIRRORS[table]) == []
+
+
+def _bespoke_mismatch(
+    bespoke: dict[str, BespokeMirror], exclusions: dict[str, Exclusion]
+) -> tuple[list[str], list[str]]:
+    """`(claimed but unregistered, registered but unclaimed)`.
+
+    Both directions matter: a `bespoke=True` exclusion with no matching entry
+    here is the unverified-prose failure Gate A exists to close, and an entry
+    here with no matching exclusion means Gate A still demands a
+    `PostgresTableMirror` for a table that has a different kind of mirror —
+    the false positive on the other side.
+    """
+    claimed = {table for table, exclusion in exclusions.items() if exclusion.bespoke}
+    registered = set(bespoke)
+    return sorted(claimed - registered), sorted(registered - claimed)
+
+
+def test_every_bespoke_exclusion_matches_a_registered_mirror() -> None:
+    claimed_only, registered_only = _bespoke_mismatch(
+        BESPOKE_MIRRORS, UNMIRRORED_SCHEMA_TABLES
+    )
+    assert claimed_only == [], (
+        f"tables excused from Gate A as bespoke with no BESPOKE_MIRRORS entry: "
+        f"{claimed_only}. Register the mirror, or drop `bespoke=True`."
+    )
+    assert registered_only == [], (
+        f"tables in BESPOKE_MIRRORS with no matching bespoke exclusion: "
+        f"{registered_only}. Add `bespoke=True` to their UNMIRRORED_SCHEMA_TABLES "
+        "entry, or remove the registration."
+    )
+
+
+def test_the_bespoke_registration_gate_fails_when_they_disagree() -> None:
+    """The gate above, shown to bite in both directions, via the function it
+    actually uses — not a hand-rolled restatement of it."""
+    unregistered = dict(BESPOKE_MIRRORS)
+    del unregistered["queue_entry"]
+    assert _bespoke_mismatch(unregistered, UNMIRRORED_SCHEMA_TABLES) == (
+        ["queue_entry"],
+        [],
+    )
+
+    unclaimed = dict(UNMIRRORED_SCHEMA_TABLES)
+    del unclaimed["queue_entry"]
+    assert _bespoke_mismatch(BESPOKE_MIRRORS, unclaimed) == ([], ["queue_entry"])
+
+
+#: A single row, shaped like `PostgresQueueMirror` expects, for the decoys
+#: below — none of which is `queue_entry`'s real mirror.
+_DECOY_ROW = BESPOKE_MIRRORS["queue_entry"].mutation_args[0][0]
+
+
+class _ReadThatDeletesInstead:
+    """`list_entries` issues the mutation's verb, not its own."""
+
+    def __init__(self, connection_factory: object = None) -> None:
+        self._factory = connection_factory or (lambda: None)
+
+    def list_entries(self) -> list:
+        with self._factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM queue_entry")
+        return []
+
+    def replace_entries(self, entries: list) -> None:
+        with self._factory() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM queue_entry")
+                    if entries:
+                        cur.executemany(
+                            "INSERT INTO queue_entry (id) VALUES (%s)",
+                            [(entry["id"],) for entry in entries],
+                        )
+
+
+class _MutationThatOnlyReads:
+    """`replace_entries` reads the table it was supposed to write."""
+
+    def __init__(self, connection_factory: object = None) -> None:
+        self._factory = connection_factory or (lambda: None)
+
+    def list_entries(self) -> list:
+        with self._factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM queue_entry")
+        return []
+
+    def replace_entries(self, entries: list) -> None:
+        with self._factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM queue_entry")
+
+
+class _MutationMissingItsInsert:
+    """The whole-list replace keeps its `DELETE` and silently drops the
+    `INSERT` — the write half of the contract disappears while the method
+    still touches the table."""
+
+    def __init__(self, connection_factory: object = None) -> None:
+        self._factory = connection_factory or (lambda: None)
+
+    def list_entries(self) -> list:
+        with self._factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM queue_entry")
+        return []
+
+    def replace_entries(self, entries: list) -> None:
+        with self._factory() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM queue_entry")
+
+
+class _MirrorForADifferentTable:
+    """Both halves are real, and both name a table that is not `queue_entry` —
+    the substring `queue_entry` still occurs in every statement, which is
+    exactly what a bare-substring check would miss."""
+
+    def __init__(self, connection_factory: object = None) -> None:
+        self._factory = connection_factory or (lambda: None)
+
+    def list_entries(self) -> list:
+        with self._factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM queue_entry_archive")
+        return []
+
+    def replace_entries(self, entries: list) -> None:
+        with self._factory() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM queue_entry_archive")
+                    if entries:
+                        cur.executemany(
+                            "INSERT INTO queue_entry_archive (id) VALUES (%s)",
+                            [(entry["id"],) for entry in entries],
+                        )
+
+
+@pytest.mark.parametrize(
+    "decoy_cls",
+    [_ReadThatDeletesInstead, _MirrorForADifferentTable],
+    ids=["read_issues_delete", "read_names_a_different_table"],
+)
+def test_the_bespoke_gate_fails_when_the_read_method_does_not_read(
+    decoy_cls: type,
+) -> None:
+    entry = BespokeMirror(
+        cls=decoy_cls,
+        table="queue_entry",
+        read_attr="list_entries",
+        mutation_attr="replace_entries",
+        mutation_args=([_DECOY_ROW],),
+    )
+    violations = _bespoke_violations(entry)
+    assert any("list_entries" in violation for violation in violations), violations
+
+
+@pytest.mark.parametrize(
+    "decoy_cls",
+    [_MutationThatOnlyReads, _MutationMissingItsInsert, _MirrorForADifferentTable],
+    ids=["mutation_only_selects", "mutation_loses_its_insert", "mutation_names_a_different_table"],
+)
+def test_the_bespoke_gate_fails_when_the_mutation_method_does_not_write(
+    decoy_cls: type,
+) -> None:
+    entry = BespokeMirror(
+        cls=decoy_cls,
+        table="queue_entry",
+        read_attr="list_entries",
+        mutation_attr="replace_entries",
+        mutation_args=([_DECOY_ROW],),
+    )
+    violations = _bespoke_violations(entry)
+    assert any("replace_entries" in violation for violation in violations), violations
 
 
 # ---------------------------------------------------------------------------
