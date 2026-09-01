@@ -5,6 +5,7 @@ by patching the module's _gh, and enqueue is a recording stub."""
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -15,6 +16,7 @@ from command_center.orchestrator.review_merge import (
     merge_once,
     publish_review_verdicts,
     reconcile_merge_evidence,
+    reconcile_pr_evidence,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -661,6 +663,99 @@ def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):  # 
             ("VOYN-W0-P2B-REM%",),
         )
         assert cur.fetchone()[0] == 1
+
+
+def _chain(store, factory, base, links, pr_url, head_sha):
+    """Build a recorded remediation chain `base -> base-REM -> ...` of `links`
+    links, the way successive rejections would have built it."""
+    from tests.db.test_backlog_planner import _task
+
+    ids = [base]
+    for _ in range(links):
+        ids.append(ids[-1] + "-REM")
+    for task_id in ids[:-1]:
+        assert store.upsert_task(_task(task_id, repo="repo-x", status="OPEN"))[0]
+    # The last link is the one about to be rejected, so it must be in the state
+    # a rejection actually arrives from: READY_TO_REVIEW carrying its PR.
+    _ready(store, factory, ids[-1], pr_url)
+    for parent, child in itertools.pairwise(ids):
+        assert store.record_remediation(child, parent, pr_url, head_sha)[0]
+    return ids
+
+
+def test_remediation_depth_counts_the_recorded_chain_not_the_name(rig):  # noqa: F811
+    """Depth walks the recorded parent links, not the `-REM` suffix. The suffix
+    is a naming convention; a task named by hand would make a string count
+    wrong in the direction that matters -- silently unbounded."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/40"
+    head = "1" * 40
+    ids = _chain(store, app_factory, "VOYN-W0-DEPTHCOUNT", 3, pr_url, head)
+
+    with app_factory() as c, c.cursor() as cur:
+        assert review_merge._remediation_depth(cur, ids[0]) == 0
+        assert review_merge._remediation_depth(cur, ids[1]) == 1
+        assert review_merge._remediation_depth(cur, ids[3]) == 3
+        # A task with no remediation record at all is depth 0, not an error.
+        assert review_merge._remediation_depth(cur, "VOYN-W0-NOT-A-REMEDIATION") == 0
+
+
+def test_a_rejection_below_the_depth_limit_still_spawns_a_remediation(rig):  # noqa: F811
+    """The boundary from below: the limit must not shorten the chain by one."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/41"
+    head = "2" * 40
+    ids = _chain(
+        store, app_factory, "VOYN-W0-DEPTHOK",
+        review_merge.MAX_REMEDIATION_DEPTH - 1, pr_url, head,
+    )
+
+    spawned = review_merge._remediate_rejection(
+        app_factory, ids[-1], pr_url, head, "Still wrong.\nVERDICT: REJECT\n"
+    )
+    assert spawned == ids[-1] + "-REM"
+
+
+def test_the_remediation_chain_stops_at_the_depth_limit(rig):  # noqa: F811
+    """Nothing bounded this chain: each rejected remediation spawned another
+    task, branch, pull request and full CI run, and the live backlog reached
+    158 `-REM` tasks with chains nine links deep. Past a few attempts the
+    evidence is about the task or the reviewer, not the implementation, and a
+    further link fixes neither while still costing a full pipeline."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/42"
+    head = "3" * 40
+    ids = _chain(
+        store, app_factory, "VOYN-W0-DEPTHSTOP",
+        review_merge.MAX_REMEDIATION_DEPTH, pr_url, head,
+    )
+    last = ids[-1]
+
+    assert review_merge._remediate_rejection(
+        app_factory, last, pr_url, head, "Rejected again.\nVERDICT: REJECT\n"
+    ) is None
+
+    with app_factory() as c, c.cursor() as cur:
+        # No further link was created.
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id = %s", (last + "-REM",))
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "SELECT count(*) FROM backlog_task_remediation WHERE parent_task_id = %s",
+            (last,),
+        )
+        assert cur.fetchone()[0] == 0
+
+        # Closed through the state machine, not around it: READY_TO_REVIEW
+        # fans out to DONE and REJECTED only, so a nicer-reading DEFER_TO_USER
+        # would have to be written past `backlog_transition` -- the very rule
+        # this code exists to uphold. The body carries why it stopped.
+        cur.execute("SELECT status, body FROM backlog_task WHERE task_id = %s", (last,))
+        status, body = cur.fetchone()
+        assert status == "REJECTED"
+        assert "Remediation chain stopped" in body
+        assert pr_url in body
+        # And it is not left where the merge tick would reconsider it forever.
+        assert status != "READY_TO_REVIEW"
 
 
 def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):  # noqa: F811
@@ -2697,3 +2792,197 @@ def test_targeted_invocations_leave_the_shared_cursor_alone(rig, monkeypatch):  
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT count(*) FROM backlog_scan_cursor")
         assert cur.fetchone()[0] == 0  # no cursor row was even created
+
+
+# ---------------------------------------------------------------------------
+# reconcile_pr_evidence: a pull request that exists but was never recorded.
+#
+# Every gate downstream finds a task's PR through backlog_evidence(kind='pr'),
+# and only `publish_run` ever wrote there — so a PR opened any other way is
+# invisible to the whole control plane no matter how green it is. Measured
+# live 2026-08-31: two PRs with every required check passing were never picked
+# up, because `publish_run` cannot run on this fleet at all.
+# ---------------------------------------------------------------------------
+
+
+def _ready_without_pr(store, factory, task_id, repo="repo-d2"):
+    """READY_TO_REVIEW with no `pr` evidence — the state a hand-opened pull
+    request leaves the store in."""
+    from tests.db.test_backlog_planner import _task
+
+    assert store.upsert_task(_task(task_id, repo=repo, status="OPEN"))[0]
+    with factory() as c, c.cursor() as cur:
+        def _rev():
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            return cur.fetchone()[0]
+        cur.execute("SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)", (task_id, _rev()))
+        cur.execute("SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)", (task_id, _rev()))
+        c.commit()
+
+
+#: The checkout a tick is given. `gh` runs here, never in the route table's
+#: worker-local path, which need not exist on the host running the tick.
+REPO = "/srv/repo-d2"
+
+
+def _pr_rows(factory, task_id):
+    with factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='pr'",
+            (task_id,),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def _fake_pr_list(entries, *, returncode=0, stdout=None):
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "list"]:
+            body = json.dumps(entries) if stdout is None else stdout
+            return sp.CompletedProcess(argv, returncode, body, "")
+        return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
+
+    return fake_gh
+
+
+def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE1"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/900"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list([{"url": url, "headRefName": f"backlog/{task_id}"}]),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """`backlog/X` must not adopt `backlog/X-REM`'s pull request. `gh --head`
+    is a filter, not a guarantee of exact equality, so the name is compared
+    here too."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/901",
+              "headRefName": f"backlog/{task_id}-REM"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+
+
+def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE3"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/902", "headRefName": branch},
+             {"url": "https://github.com/x/repo-d2/pull/903", "headRefName": branch}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "ambiguous_open_prs_on_branch") in report.skipped
+
+
+def test_an_existing_pr_evidence_row_is_never_touched(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Whatever `publish_run` recorded stays authoritative; this can neither
+    overwrite it nor add a competing row."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE4"
+    recorded = "https://github.com/x/repo-d2/pull/904"
+    _ready(store, app_factory, task_id, recorded)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/905",
+              "headRefName": f"backlog/{task_id}"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == [recorded]
+    assert all(entry[0] != task_id for entry in report.recorded)
+
+
+def test_a_failed_or_undecodable_lookup_records_nothing(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    failed, garbage = "VOYN-W0-PRE5", "VOYN-W0-PRE6"
+    _ready_without_pr(store, app_factory, failed)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([], returncode=1))
+    assert (failed, "pr_list_failed") in reconcile_pr_evidence(app_factory, REPO).skipped
+
+    _ready_without_pr(store, app_factory, garbage)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([], stdout="{not json"))
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (garbage, "pr_list_undecodable") in report.skipped
+    assert _pr_rows(app_factory, failed) == []
+    assert _pr_rows(app_factory, garbage) == []
+
+
+def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """This records evidence; it never promotes anything. A task that is not
+    yet ready stays untouched even when its branch already has a PR."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE7"
+    from tests.db.test_backlog_planner import _task
+
+    assert store.upsert_task(_task(task_id, repo="repo-d2", status="OPEN"))[0]
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/906",
+              "headRefName": f"backlog/{task_id}"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert all(entry[0] != task_id for entry in report.recorded)
+
+
+def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Not the route table's path. That second element is a worker's local
+    directory and need not exist on the host running the tick — using it made
+    the first live run die with `FileNotFoundError` on a path that exists only
+    on another machine."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE8"
+    _ready_without_pr(store, app_factory, task_id)
+    seen: list[str] = []
+
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        seen.append(repo)
+        return sp.CompletedProcess(argv, 0, json.dumps([]), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    reconcile_pr_evidence(app_factory, REPO)
+
+    assert seen == [REPO]

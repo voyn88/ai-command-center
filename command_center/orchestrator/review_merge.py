@@ -135,6 +135,165 @@ class ReconcileReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class PrEvidenceReport:
+    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+
+    #: (task_id, pr_url) newly recorded from the task's own branch.
+    recorded: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) examined and deliberately left alone.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+#: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
+#: else does, so the branch name is a derivable fact about a task rather than a
+#: convention this function invents.
+def _task_branch(task_id: str) -> str:
+    return f"backlog/{task_id}"
+
+
+def reconcile_pr_evidence(
+    factory: Any,
+    repo_path: str,
+    *,
+    task_id: str | None = None,
+    limit: int = 25,
+) -> PrEvidenceReport:
+    """Record the PR a READY_TO_REVIEW task already has, when only the branch
+    proves it.
+
+    Every gate downstream -- review, the acceptance marker, the merge train --
+    finds a task's pull request through `backlog_evidence(kind='pr')`, and
+    exactly one writer ever filled that table: `publish_run`. So a pull request
+    opened any other way is invisible to the entire control plane, no matter
+    how green it is. Measured live 2026-08-31: two PRs sat with every required
+    check passing and were never once picked up, because `publish_run` cannot
+    run at all on this fleet (it requires a `voyn-lease` binary that is not
+    installed anywhere). The evidence had to be inserted by hand to move them.
+
+    This closes the hole by deriving what was already true rather than by
+    trusting a claim. The task's branch name is fixed by the same contract
+    `publish_run` follows, so an open pull request whose head is exactly that
+    branch is that task's PR -- a fact GitHub is asked for directly:
+
+    * the head branch must equal `backlog/<task id>` exactly (never a prefix
+      match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
+    * exactly one open PR may match, because two would make the choice a guess;
+    * a task that already has any `pr` evidence is left alone, so this can
+      never overwrite or compete with what `publish_run` recorded.
+
+    The lookup runs in `repo_path` -- the checkout this tick was given --
+    exactly as `review_once` does for its own `gh` calls. The route table is
+    consulted only to confirm the task belongs to a routed repository at all:
+    its second element is a *worker's* local path, which need not exist on the
+    host running the tick. Using it here made the first live run die with
+    `FileNotFoundError: /home/voynadmin/Projects/ai-command-center`. A task
+    whose repository is not the one `repo_path` points at simply finds no
+    branch and is skipped, which is the safe outcome -- `gh` searches the
+    origin of that checkout and nothing else, so a task can never be attached
+    to a pull request in another repository.
+
+    Reporting only: no status is changed here. A task becomes reviewable
+    because it is `READY_TO_REVIEW` and now has evidence, through the same
+    path it always did.
+    """
+    # Imported here, as  does, so this module keeps its
+    # import-time independence from the planner.
+    from command_center.orchestrator.planner import repo_route
+
+    report = PrEvidenceReport()
+    if task_id is not None:
+        rows = _rows(
+            factory,
+            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+            "WHERE e.task_id = t.task_id AND e.kind = 'pr')",
+            (task_id,),
+        )
+    else:
+        rows = _rows(
+            factory,
+            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "WHERE t.status = 'READY_TO_REVIEW' "
+            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+            "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
+            "ORDER BY t.task_id LIMIT %s",
+            (limit,),
+        )
+    for row_task_id, repo in rows:
+        if not repo:
+            report.skipped.append((row_task_id, "no_repo_on_task"))
+            continue
+        if repo_route(repo) is None:
+            report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
+            continue
+        branch = _task_branch(row_task_id)
+        listed = _gh(
+            [
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "url,headRefName",
+            ],
+            repo_path,
+        )
+        if listed.returncode != 0:
+            report.skipped.append((row_task_id, "pr_list_failed"))
+            continue
+        try:
+            decoded = json.loads(listed.stdout or "[]")
+        except ValueError:
+            report.skipped.append((row_task_id, "pr_list_undecodable"))
+            continue
+        if not isinstance(decoded, list):
+            report.skipped.append((row_task_id, "pr_list_wrong_shape"))
+            continue
+        # `--head` is a filter, not a guarantee of exact equality, so the
+        # branch is compared here as well: a prefix match would let a task
+        # adopt its own remediation task's pull request.
+        matches = [
+            entry
+            for entry in decoded
+            if isinstance(entry, dict)
+            and entry.get("headRefName") == branch
+            and isinstance(entry.get("url"), str)
+            and entry["url"]
+        ]
+        if not matches:
+            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            continue
+        if len(matches) > 1:
+            report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
+            continue
+        pr_url = matches[0]["url"]
+        # Written through `backlog_record_evidence`, never a direct INSERT:
+        # the control plane's role has no write grant on `backlog_evidence`
+        # itself, and every other writer in this codebase goes through the
+        # same SECURITY DEFINER entry point. A direct INSERT passed locally
+        # and failed in CI with `permission denied for table
+        # backlog_evidence` -- which is exactly what it would have done in
+        # production.
+        with factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_record_evidence(%s, 'pr', %s)",
+                (row_task_id, pr_url),
+            )
+            verdict = cur.fetchone()
+        # The function reports a refusal rather than raising, so a refusal
+        # that is not surfaced would look exactly like a successful record.
+        if not verdict or not verdict[0]:
+            reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+            report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
+            continue
+        report.recorded.append((row_task_id, pr_url))
+    return report
+
+
 def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["gh", *argv], cwd=repo_path, capture_output=True, text=True,
@@ -1249,6 +1408,46 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return accept, head
 
 
+#: How many remediation links may stand above a task before the chain stops
+#: producing another one.
+#:
+#: Each rejected remediation spawns its own task, its own branch, its own pull
+#: request and its own full CI run, and nothing bounded the chain: the live
+#: backlog carries 158 `-REM` tasks and chains nine links deep
+#: (`...-REM-REM-REM-REM-REM-REM-REM-REM-REM`). Past a small number of attempts
+#: the evidence stops being "this implementation was wrong" and starts being
+#: "this task cannot be settled by another automatic attempt" -- a
+#: mis-specified task, or a reviewer rejecting for something the writer cannot
+#: act on. A further link does not fix either, and it is not free.
+MAX_REMEDIATION_DEPTH = 3
+
+
+def _remediation_depth(cur: Any, task_id: str) -> int:
+    """How many remediation links already stand above `task_id` (0 if none).
+
+    Walks the recorded parent chain rather than counting `-REM` suffixes: the
+    suffix is a naming convention, and a task named by hand or renamed would
+    make a string count silently wrong in the direction that matters.
+    """
+    cur.execute(
+        """
+        WITH RECURSIVE ancestry(task_id, parent_task_id, depth) AS (
+            SELECT task_id, parent_task_id, 1
+              FROM backlog_task_remediation
+             WHERE task_id = %s
+            UNION ALL
+            SELECT r.task_id, r.parent_task_id, a.depth + 1
+              FROM backlog_task_remediation r
+              JOIN ancestry a ON r.task_id = a.parent_task_id
+        )
+        SELECT COALESCE(MAX(depth), 0) FROM ancestry
+        """,
+        (task_id,),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def _remediate_rejection(
     factory: Any, task_id: str, pr_url: str, head_sha: str, review_text: str
 ) -> str | None:
@@ -1292,6 +1491,8 @@ def _remediate_rejection(
                     conn.rollback()
                     return None
 
+                depth = _remediation_depth(cur, task_id)
+
                 cur.execute(
                     "SELECT wave, priority, title, body, repo, revision "
                     "FROM backlog_task WHERE task_id = %s",
@@ -1302,6 +1503,47 @@ def _remediate_rejection(
                     conn.rollback()
                     return None
                 wave, priority, title, body, repo, revision = row
+
+            if depth + 1 > MAX_REMEDIATION_DEPTH:
+                # Stop the chain rather than extend it, using the state
+                # machine rather than around it. READY_TO_REVIEW fans out to
+                # DONE and REJECTED only -- DEFER_TO_USER would read better
+                # here, but it is not a legal transition from this state, and
+                # writing the status through `upsert_task` to get it would be
+                # exactly the "validate transitions mechanically" rule being
+                # bypassed by the code meant to uphold it. REJECTED is honest:
+                # the task WAS rejected, and this is the last time it will be.
+                # What changes is only that no further attempt is spawned, and
+                # the body says so, so the stop is legible to whoever reads it.
+                store = BacklogStore(lambda: nullcontext(conn))
+                ok, _reason, _revision = store.transition(task_id, "REJECTED", revision)
+                if not ok:
+                    conn.rollback()
+                    return None
+                stopped_body = (
+                    f"{body}\n\n---\n"
+                    f"Remediation chain stopped at depth {depth} "
+                    f"(limit {MAX_REMEDIATION_DEPTH}). The last rejection was on "
+                    f"{pr_url} at {head_sha}:\n\n{review_text}\n\n"
+                    "Automatic remediation will not produce another attempt: this "
+                    "many consecutive rejections is evidence about the task or the "
+                    "review, not about the implementation. Decide whether to "
+                    "respecify it, split it, or accept the reviewer's objection as "
+                    "correct and leave it closed."
+                )
+                # Status is already terminal; this writes the explanation only.
+                ok, _reason, _changed = store.upsert_task(
+                    ParsedTask(
+                        task_id=task_id, wave=wave, priority=priority,
+                        status="REJECTED", kind="task", title=title,
+                        body=stopped_body, repo=repo, line_no=0,
+                    )
+                )
+                if not ok:
+                    conn.rollback()
+                    return None
+                conn.commit()
+                return None
 
             new_task_id = f"{task_id}-REM"
             new_title = f"Remediation: {title}"

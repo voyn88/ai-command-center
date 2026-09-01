@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +32,10 @@ def _module():
             return getattr(self._value, name)
 
     module._registry_fstat = lambda fd: RootRegistryStat(real_fstat(fd))
+    # Rollout tests drive a fake systemd against paths that do not exist on
+    # the machine running them; the property under test is ordering, not this
+    # host's /etc. Dedicated tests below set the seam back to the real check.
+    module._environment_file_exists = lambda _path: True
     return module
 
 
@@ -691,3 +696,234 @@ def test_verifier_rejects_execstart_path_decoupled_from_argv():
     )
     with pytest.raises(module.RolloutError, match="path="):
         module.verify_unit_configuration(systemd, unit)
+
+
+# ---------------------------------------------------------------------------
+# verify_immutable_release: the gate that refused every real release.
+#
+# A virtualenv interpreter is never a regular file at `.venv/bin/python` --
+# it is a symlink chain that leaves the release entirely:
+#
+#     .venv/bin/python -> python3 -> /usr/bin/python3 -> python3.12
+#
+# The chain below is built to that exact shape, because the shape is what the
+# defect turned on: Linux gives every symlink mode `lrwxrwxrwx` and ignores it,
+# so a `st_mode & 0o022` test applied to the symlink itself is true for every
+# release that has ever existed. This function had no coverage at all, which is
+# why the gate reached production able to refuse only itself.
+# ---------------------------------------------------------------------------
+
+
+def _build_release(tmp_path, *, final_mode=0o755, bin_mode=0o555):
+    """A release laid out like a real one, with the interpreter reached through
+    a relative hop inside the release and an absolute hop out of it."""
+    opt = tmp_path / "opt" / "aicc"
+    releases = opt / "releases"
+    # Deliberately not a real commit id, and deliberately low-entropy: a
+    # genuine 40-hex literal trips detect-secrets as a "Hex High Entropy
+    # String" and grows the secret baseline with test data. The gate only
+    # requires `[0-9a-f]{40}`.
+    sha = "a1" * 20
+    release = releases / sha
+    venv_bin = release / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+
+    system_bin = tmp_path / "usr" / "bin"
+    system_bin.mkdir(parents=True)
+    real = system_bin / "python3.12"
+    real.write_text("#!/bin/true\n", encoding="utf-8")
+    real.chmod(final_mode)
+
+    # Hop 2 leaves the release, exactly as a real venv does.
+    (venv_bin / "python3").symlink_to(real)
+    # Hop 1 is relative and stays inside it.
+    (venv_bin / "python").symlink_to("python3")
+    # Linux creates every symlink `lrwxrwxrwx` and cannot chmod it; macOS
+    # creates them 0o755. Pin both to the Linux value, or this test silently
+    # stops exercising the defect on a developer machine -- which is precisely
+    # how a gate that could never pass on Linux shipped without anyone noticing.
+    for link in (venv_bin / "python3", venv_bin / "python"):
+        if hasattr(os, "lchmod"):
+            try:
+                os.lchmod(link, 0o777)
+            except (OSError, NotImplementedError):
+                pass
+
+    current = opt / "current"
+    current.symlink_to(Path("releases") / sha)
+
+    for path in (venv_bin, release / ".venv"):
+        path.chmod(bin_mode)
+    release.chmod(0o555)
+    releases.chmod(0o755)
+    opt.chmod(0o755)
+    return opt, releases, current
+
+
+def _install_release(module, monkeypatch, tmp_path, **kwargs):
+    opt, releases, current = _build_release(tmp_path, **kwargs)
+    monkeypatch.setattr(module, "CURRENT_RELEASE", current)
+    monkeypatch.setattr(module, "RELEASE_ROOT", releases)
+    # The chain cannot be built root-owned without root; assert against the
+    # user that actually owns it, so every other property stays under test.
+    monkeypatch.setattr(module, "_REQUIRED_OWNER_UID", os.getuid())
+    # The ancestor walk runs to the filesystem root in production. A temp tree
+    # cannot satisfy that -- `/tmp` is world-writable and sticky by design --
+    # and those directories are not what these tests examine, so the walk is
+    # bounded at the tree the fixture actually built.
+    monkeypatch.setattr(module, "_TRUSTED_ROOT", tmp_path)
+    return opt
+
+
+def test_a_release_whose_interpreter_is_a_symlink_is_accepted(tmp_path, monkeypatch):
+    """The regression itself: this is what every real release looks like."""
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+
+    module.verify_immutable_release()
+
+
+def test_interpreter_target_outside_the_release_is_still_verified(tmp_path, monkeypatch):
+    """The binary that actually runs lives in a system path. Verifying only
+    what is inside the release proves nothing about it."""
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path, final_mode=0o757)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
+def test_directory_holding_the_interpreter_symlink_must_not_be_writable(tmp_path, monkeypatch):
+    """A symlink's own mode is meaningless; its directory's is what protects
+    it from being repointed."""
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path, bin_mode=0o775)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
+def test_a_symlink_cycle_is_refused_rather_than_followed(tmp_path, monkeypatch):
+    module = _module()
+    opt = _install_release(module, monkeypatch, tmp_path)
+    venv_bin = opt / "releases" / ("a1" * 20) / ".venv" / "bin"
+    venv_bin.chmod(0o755)
+    (venv_bin / "python").unlink()
+    (venv_bin / "python").symlink_to("python3")
+    (venv_bin / "python3").unlink()
+    (venv_bin / "python3").symlink_to("python")
+    venv_bin.chmod(0o555)
+
+    with pytest.raises(module.RolloutError, match="too deep"):
+        module.verify_immutable_release()
+
+
+def test_a_writable_directory_far_above_the_interpreter_is_refused(tmp_path, monkeypatch):
+    """Not just the immediate parent. Write permission on any directory above
+    the interpreter is enough to rename the whole subtree out and drop a
+    replacement -- so checking `/usr/bin` while ignoring `/usr` would leave the
+    binary swappable by anyone who can write to `/usr`.
+    """
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    # Two levels above the real interpreter: `usr/bin/python3.12` lives under
+    # `usr/`, which nothing but the ancestor walk looks at.
+    (tmp_path / "usr").chmod(0o777)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
+# ---------------------------------------------------------------------------
+# A rollout must not retire the old fleet and then discover the new one cannot
+# start. worker-01, 2026-08-31: every configuration check passed, the legacy
+# lanes were retired, and `voyn-aicc-worker@1.service` then failed with
+# `result 'resources'` because `/etc/aicc/lease.env` had never been placed on
+# the host — leaving the machine between two configurations.
+# ---------------------------------------------------------------------------
+
+
+class _EnvSystemd:
+    def __init__(self, files: str) -> None:
+        self._files = files
+
+    def property(self, _unit: str, name: str) -> str:
+        assert name == "EnvironmentFiles"
+        return self._files
+
+
+def _entry(path: str, *, optional: bool) -> str:
+    return f"{path} (ignore_errors={'yes' if optional else 'no'})"
+
+
+def test_a_missing_required_environment_file_is_refused_before_any_mutation(tmp_path):
+    module = _module()
+    present = tmp_path / "present.env"
+    present.write_text("A=1\n", encoding="utf-8")
+    module._environment_file_exists = os.path.exists
+    systemd = _EnvSystemd(
+        "\n".join(
+            [
+                _entry(str(present), optional=False),
+                _entry(str(tmp_path / "absent.env"), optional=False),
+            ]
+        )
+    )
+
+    with pytest.raises(module.RolloutError, match="required environment files are absent"):
+        module.verify_required_environment_files(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_an_absent_optional_environment_file_is_not_a_refusal(tmp_path):
+    """`EnvironmentFile=-` means systemd itself tolerates absence; refusing
+    here would block a rollout on a file the unit is designed to run without."""
+    module = _module()
+    module._environment_file_exists = os.path.exists
+    systemd = _EnvSystemd(_entry(str(tmp_path / "optional.env"), optional=True))
+
+    module.verify_required_environment_files(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_every_required_file_is_named_at_once(tmp_path):
+    """One refusal listing everything that is missing, so the operator places
+    them in one pass instead of learning about them one rollout at a time."""
+    module = _module()
+    module._environment_file_exists = os.path.exists
+    first, second = tmp_path / "a.env", tmp_path / "b.env"
+    systemd = _EnvSystemd(
+        "\n".join([_entry(str(first), optional=False), _entry(str(second), optional=False)])
+    )
+
+    with pytest.raises(module.RolloutError) as refusal:
+        module.verify_required_environment_files(systemd, ("voyn-aicc-worker@1.service",))
+
+    assert str(first) in str(refusal.value)
+    assert str(second) in str(refusal.value)
+
+
+def test_rollout_checks_required_files_before_retiring_anything():
+    """Ordering is the whole point. A rollout that retires the legacy fleet
+    and *then* finds `/etc/aicc/lease.env` missing leaves the host between two
+    configurations — with the old lanes gone and the new ones unable to start.
+    That is exactly what happened on worker-01, 2026-08-31.
+    """
+    module = _module()
+    units = ("voyn-aicc-worker@1.service",)
+    # The seam back to a real check, for one specific absent path.
+    module._environment_file_exists = lambda path: path != "/etc/aicc/lease.env"
+    systemd = FakeSystemd(units)
+    before = {name: dict(state) for name, state in systemd.states.items()}
+
+    with pytest.raises(module.RolloutError, match="/etc/aicc/lease.env"):
+        module.rollout(
+            systemd,
+            units,
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+        )
+
+    # Nothing was retired, enabled, started or stopped: the refusal came first.
+    assert systemd.states == before

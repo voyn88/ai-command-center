@@ -112,17 +112,38 @@ def test_duplicate_or_tampered_manifest_is_rejected() -> None:
         test_shards.validate_manifest(tampered)
 
 
-def test_verify_requires_identical_manifests(tmp_path: Path) -> None:
-    first = _manifest()
-    second = _manifest()
-    second["duration_source"] = "different"
-    unsigned = {key: value for key, value in second.items() if key != "digest"}
-    second["digest"] = test_shards._manifest_digest(unsigned)
-    first_path = tmp_path / "first.json"
-    second_path = tmp_path / "second.json"
-    first_path.write_text(json.dumps(first), encoding="utf-8")
-    second_path.write_text(json.dumps(second), encoding="utf-8")
+def test_verify_rejects_a_receipt_bound_to_a_different_manifest(tmp_path: Path) -> None:
+    """The guarantee moved but did not weaken. Four shards no longer each
+    rebuild the manifest -- the plan is built once -- so identity between
+    copies proves nothing. What must hold instead is that every collection
+    receipt was produced against *this* plan; a receipt carrying another
+    manifest's digest is a shard that ran something else.
+    """
+    manifest = _manifest()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    args = type("Args", (), {"manifests": [first_path, second_path]})()
-    with pytest.raises(ValueError, match="different manifests"):
+    foreign = _manifest()
+    foreign["duration_source"] = "different"
+    unsigned = {key: value for key, value in foreign.items() if key != "digest"}
+    foreign["digest"] = test_shards._manifest_digest(unsigned)
+
+    report = {
+        "schema_version": test_shards.COLLECTION_REPORT_SCHEMA_VERSION,
+        "manifest_digest": foreign["digest"],
+        "collections": [
+            {"partition": "core", "shard": 1, "nodeids": ["tests/test_a.py::test_one"]}
+        ],
+    }
+    unsigned_report = {k: v for k, v in report.items() if k != "digest"}
+    report["digest"] = test_shards._report_digest(unsigned_report)
+    report_path = tmp_path / "collection.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    args = type(
+        "Args",
+        (),
+        {"manifest": manifest_path, "collection_reports": [report_path]},
+    )()
+    with pytest.raises(ValueError, match="binds a different manifest"):
         test_shards._verify_command(args)

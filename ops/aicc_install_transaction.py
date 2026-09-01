@@ -725,6 +725,79 @@ def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bo
     )
 
 
+#: Fields systemd reports inside a command property that describe the *last
+#: invocation*, not the configuration. `ExecStart` is rendered as
+#: `{ path=… ; argv[]=… ; ignore_errors=… ; start_time=… ; stop_time=… ;
+#: pid=… ; code=… ; status=… }`, and the tail of that changes every time the
+#: unit runs. Comparing the whole string therefore fails as soon as the
+#: service has started once since the snapshot -- which is exactly the state a
+#: recovery runs in.
+_RUNTIME_COMMAND_FIELDS = ("start_time", "stop_time", "pid", "code", "status")
+
+
+#: Drop-in directories systemd *generates* at boot. `aicc-principal-recovery`
+#: writes its drop-in into `/run/systemd/generator.early/`, which is tmpfs:
+#: it exists only while the generator's output from this boot is live, and is
+#: absent after `/run` is cleared or before the generator has run again.
+#:
+#: Requiring it to match a snapshot therefore demands a value that by
+#: construction does not persist -- the restore refused with
+#: `refusing unsafe snapshot restart: voyn-aicc-worker.service DropInPaths`
+#: on a host where nothing was wrong (worker-01, 2026-08-31). Drop-ins from
+#: any other location are compared exactly, because those are administrator
+#: configuration and a silently added one can weaken the very isolation this
+#: snapshot exists to preserve.
+_GENERATED_DROPIN_PREFIXES = ("/run/systemd/generator",)
+
+
+def _properties_match(name: str, actual: str, expected: str) -> bool:
+    """Whether a restored property equals its snapshot, comparing what the
+    property actually asserts rather than its rendered text.
+
+    Two properties render values that change without the configuration
+    changing: a command carries its last invocation's pid and timestamps, and
+    `DropInPaths` carries boot-generated entries from tmpfs. Everything else
+    is compared verbatim.
+    """
+    if name == "DropInPaths":
+        return _persistent_dropins(actual) == _persistent_dropins(expected)
+    return _normalise_property(actual) == _normalise_property(expected)
+
+
+def _persistent_dropins(value: str) -> tuple[str, ...]:
+    """DropInPaths with the boot-generated ones removed, order-independent."""
+    return tuple(
+        sorted(
+            path
+            for path in value.split()
+            if not path.startswith(_GENERATED_DROPIN_PREFIXES)
+        )
+    )
+
+
+def _normalise_property(value: str) -> str:
+    """A property with its last-invocation fields dropped.
+
+    Restoration means the unit is configured as it was, not that it has the
+    same process id it had. Keeping the runtime fields in the comparison made
+    a *successful* restore report failure, leave the WAL in place and refuse
+    every later install -- observed live on worker-01, where the correct
+    `ExecStart` was in place and the recovery still raised
+    `service snapshot property did not restore: voyn-aicc-worker.service
+    ExecStart` (2026-08-31).
+    """
+    if "{" not in value or ";" not in value:
+        return value.strip()
+    kept = [
+        part.strip()
+        for part in value.strip().lstrip("{").rstrip("}").split(";")
+        if part.strip()
+        and not part.strip().startswith(_RUNTIME_COMMAND_FIELDS)
+    ]
+    return "{ " + " ; ".join(kept) + " }"
+
+
+
 def restore_service_snapshot(
     path: Path, *, run=subprocess.run, defer_starts: bool = False
 ) -> None:
@@ -793,7 +866,19 @@ def restore_service_snapshot(
         pid_rc, main_pid = probe("show", unit, "--property=MainPID", "--value")
         _active_rc, active = probe("is-active", unit)
         _enabled_rc, enabled = probe("is-enabled", unit)
-        if load_rc or pid_rc or not load_state or not main_pid:
+        # `MainPID` is a service property. A `.socket`, `.timer` or `.path`
+        # unit has none, so systemd returns an empty value and a non-zero
+        # probe -- and a unit the snapshot records as absent has none either,
+        # for the obvious reason. Demanding it unconditionally made recovery
+        # unable to prove the state of `aicc-agent-launcher.socket`, and a
+        # recovery that cannot finish blocks every install behind it
+        # (observed live on worker-01, 2026-08-31).
+        expects_main_pid = unit.endswith(".service") and state["exists"]
+        if (
+            load_rc
+            or not load_state
+            or (expects_main_pid and (pid_rc or not main_pid))
+        ):
             raise RuntimeError(f"cannot prove restored service state: {unit}")
         expected_active = state["active"]
         expected_enabled = state["enabled"]
@@ -836,7 +921,9 @@ def restore_service_snapshot(
                 property_rc, actual = probe(
                     "show", unit, f"--property={name}", "--value"
                 )
-                if property_rc or actual != expected:
+                if property_rc or _normalise_property(actual) != _normalise_property(
+                    expected
+                ):
                     raise RuntimeError(
                         f"service snapshot property did not restore: {unit} {name}"
                     )
@@ -861,12 +948,32 @@ def restore_service_snapshot(
             probe("disable", unit)
             assert_restored(unit, state)
             continue
+        load_rc, load_state = probe("show", unit, "--property=LoadState", "--value")
+        if (
+            not load_rc
+            and load_state == "not-found"
+            and unit in RETIRED_LEGACY_UNITS
+        ):
+            # Retiring the pre-template workers is what installing DOES, and
+            # `disable` removes the symlink that was their fragment. Their
+            # snapshot still describes the running configuration from before
+            # that, so restoring it would revive a unit the rollout just
+            # deliberately took out of service -- and, because the unit is
+            # gone, every property it recorded now reads empty and the
+            # comparison refuses.
+            #
+            # That refusal is what the live host produced, one property at a
+            # time: DropInPaths, then EnvironmentFiles, each on a unit that
+            # was correctly absent (worker-01, 2026-08-31). The snapshot is
+            # not wrong; it simply predates a removal the installer intended.
+            # Nothing to restore, so nothing is attempted.
+            continue
         if version == 3 and not self_recovery:
             for name, expected in state["properties"].items():
                 property_rc, actual = probe(
                     "show", unit, f"--property={name}", "--value"
                 )
-                if property_rc or actual != expected:
+                if property_rc or not _properties_match(name, actual, expected):
                     raise RuntimeError(
                         f"refusing unsafe snapshot restart: {unit} {name}"
                     )
@@ -880,8 +987,80 @@ def restore_service_snapshot(
         assert_restored(unit, state, queued_start=queued_start)
 
 
-def quiesce_service_snapshot(path: Path, *, run=subprocess.run) -> None:
-    """Stop snapshotted admission/worker units before rollback mutation."""
+#: Where systemd reads administrator-installed units. Unit files the journal
+#: restores live here; a target anywhere else is not a unit.
+_SYSTEMD_UNIT_DIR = "/etc/systemd/system/"
+
+
+def _units_restored_by(manifest: Path) -> frozenset[str]:
+    """Unit names whose files this rollback's journal will put back.
+
+    Read from the generation manifest rather than from the filesystem: what
+    matters is what `restore()` is going to do, not what happens to be on disk
+    at this instant.
+    """
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        records = payload["records"]
+    except (OSError, ValueError, KeyError):
+        # An unreadable journal is not a licence to skip refusals; the caller
+        # fails on it a moment later, with a better message than this one.
+        return frozenset()
+    units = set()
+    for record in records:
+        target = str(record.get("target", ""))
+        if target.startswith(_SYSTEMD_UNIT_DIR):
+            name = target[len(_SYSTEMD_UNIT_DIR) :].lstrip("/")
+            if name and "/" not in name:
+                units.add(name)
+    return frozenset(units)
+
+
+#: Pre-template worker units the staged rollout retires as a normal part of
+#: installing. `retire_legacy_units` stops and *disables* each one, and
+#: disabling a unit whose fragment is a symlink in /etc/systemd/system removes
+#: that symlink -- so after a rollout these units are legitimately gone, while
+#: the snapshot taken before it still records them as present.
+#:
+#: Quiesce must therefore tolerate their absence. Without that, each install
+#: attempt retired one more of them and the next attempt died on it: four
+#: consecutive attempts on worker-01 failed on `voyn-aicc-worker-2.service`,
+#: then `voyn-aicc-worker.service`, with nothing wrong except this
+#: bookkeeping (2026-08-31).
+#:
+#: Duplicated from `LEGACY_WORKER_UNITS` in ops/aicc_staged_worker_rollout.py
+#: and from the `--include-unit` arguments in
+#: deploy/install-agent-principal-isolation.sh -- this module is imported by
+#: the bootstrap before the rollout module exists on disk, so it cannot import
+#: it. The three lists are held in lockstep by a fitness test.
+RETIRED_LEGACY_UNITS = frozenset(
+    {
+        "voyn-aicc-worker.service",
+        "voyn-aicc-worker-2.service",
+        "aicc-worker.service",
+    }
+)
+
+
+def quiesce_service_snapshot(
+    path: Path, *, run=subprocess.run, restorable_units: frozenset[str] = frozenset()
+) -> None:
+    """Stop snapshotted admission/worker units before rollback mutation.
+
+    `restorable_units` names the units this same rollback is about to put back
+    on disk. A unit whose file is currently missing has nothing to stop, and
+    refusing to proceed on that ground creates a deadlock the operator cannot
+    escape from: the file is restored by `restore()`, which runs *after* this
+    function, so a rollback interrupted between removing a unit file and
+    restoring it can never be resumed — every later attempt dies here, on the
+    unit the previous attempt was in the middle of replacing. Observed live on
+    worker-01 across four install attempts, each stopping on the next such
+    unit (2026-08-31).
+
+    A missing unit that this rollback does NOT intend to restore is still a
+    refusal: that is genuinely unexplained divergence, and proceeding would
+    mutate a host whose state nobody can account for.
+    """
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         version = payload["version"]
@@ -941,6 +1120,14 @@ def quiesce_service_snapshot(path: Path, *, run=subprocess.run) -> None:
                 and expected["active"] is False
                 and expected["enabled"] is False
             ):
+                continue
+            if unit in restorable_units:
+                # Nothing to stop, and the file is coming back in this same
+                # rollback. See `restorable_units` in the docstring.
+                continue
+            if unit in RETIRED_LEGACY_UNITS:
+                # Retired on purpose by the rollout that preceded this
+                # rollback. See RETIRED_LEGACY_UNITS.
                 continue
             raise RuntimeError(f"expected unit disappeared before quiesce: {unit}")
         if load.returncode or not load_state:
@@ -1015,7 +1202,13 @@ def verify_service_snapshot_closure(
             check=False,
             text=True,
         )
-        if result.returncode:
+        # `list-unit-files` exits 1 when a pattern matches nothing, and on a
+        # control-plane host it matches nothing by design: that profile
+        # installs no worker lanes at all. An empty result is the answer, not
+        # a failure -- treating it as one made the control install die at
+        # `cannot enumerate worker lanes for snapshot closure` (observed live
+        # on control-01, 2026-08-31). A real failure still reports on stderr.
+        if result.returncode and (result.stderr.strip() or result.stdout.strip()):
             raise RuntimeError(
                 result.stderr.strip()
                 or "cannot enumerate worker lanes for snapshot closure"
@@ -1587,7 +1780,9 @@ class FileTransaction:
         snapshot_present = _path_present(snapshot)
         if snapshot_present:
             verify_service_snapshot_closure(snapshot)
-            quiesce_service_snapshot(snapshot)
+            quiesce_service_snapshot(
+                snapshot, restorable_units=_units_restored_by(manifest)
+            )
             verify_service_snapshot_closure(snapshot)
         elif self.root == Path("/"):
             raise RuntimeError("production recovery requires a service snapshot")
@@ -2454,6 +2649,35 @@ def verify_release_manifest(
     return observed
 
 
+#: Targets that exist only because a host runs untrusted coding agents: the
+#: launcher and its socket, the agent principal's sysusers/tmpfiles and env,
+#: the worker lanes and units, the staged-rollout tool, and the agent model
+#: credentials. A control-plane host runs none of them, and must not hold the
+#: credentials in particular -- one secret on two hosts destroys exactly the
+#: principal isolation this installer exists to create.
+WORKER_ONLY_TARGETS = frozenset(
+    {
+        "/usr/lib/sysusers.d/aicc-agent.conf",
+        "/usr/lib/tmpfiles.d/aicc-agent.conf",
+        "/usr/libexec/aicc-agent-launcher",
+        "/usr/libexec/aicc-staged-worker-rollout",
+        "/etc/systemd/system/aicc-principal-recovery.service",
+        "/etc/systemd/system/aicc-agent-launcher.socket",
+        "/etc/systemd/system/aicc-agent-launcher@.service",
+        "/etc/aicc/agent-workspace-roots",
+        "/etc/aicc/worker-lanes",
+        "/etc/aicc/agent.env",
+        "/etc/systemd/system/voyn-aicc-worker@.service",
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf",
+        "/etc/systemd/system/aicc-worker.service.d/20-principal-isolation.conf",
+        "/var/lib/aicc-agent/claude/.claude/.credentials.json",
+        "/var/lib/aicc-agent/codex/.codex/auth.json",
+    }
+)
+
+PROFILES = ("worker", "control")
+
+
 def default_specs(
     repo_root: Path,
     *,
@@ -2461,11 +2685,33 @@ def default_specs(
     claude_auth: Path,
     codex_auth: Path,
     resolve_identities: bool = True,
+    profile: str = "worker",
 ) -> tuple[FileSpec, ...]:
+    """The files one host role installs.
+
+    `worker` is every spec, unchanged -- the default, so an existing caller
+    that knows nothing about profiles installs exactly what it always did.
+
+    `control` drops `WORKER_ONLY_TARGETS`. Before this existed there was one
+    profile for every host, and it demanded the agent's Claude and Codex
+    credentials unconditionally: installing the control plane meant either
+    placing agent secrets on a host that must never hold them, or not
+    installing it at all. The live attempt on control-01 took the second
+    branch and stopped at `source is not a safe regular file:
+    /home/voynadmin/.claude/.credentials.json` -- a file whose *absence* was
+    correct (2026-08-31).
+
+    The control-plane's own units (planner, review, merge, reaper, rotation)
+    are not added here: they are still symlinks into the operator's home and
+    become repo-owned under VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. This
+    profile makes that installation possible; it does not pre-empt it.
+    """
+    if profile not in PROFILES:
+        raise ValueError(f"unknown installation profile: {profile!r}")
     root_uid, root_gid = 0, 0
     agent_gid = grp.getgrnam("aicc-agent").gr_gid if resolve_identities else 0
     publisher_gid = grp.getgrnam("aicc-publisher").gr_gid if resolve_identities else 0
-    return (
+    specs = (
         # The recovery generator is a permanent bootstrap anchor installed
         # atomically before prepare(), not part of reversible generations.
         FileSpec(
@@ -2615,6 +2861,9 @@ def default_specs(
             root_gid,
         ),
     )
+    if profile == "control":
+        return tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
+    return specs
 
 
 def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -2747,6 +2996,7 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             claude_auth=args.claude_auth,
             codex_auth=args.codex_auth,
             resolve_identities=args.action != "validate",
+            profile=args.profile,
         )
     if args.action == "validate":
         transaction.validate_sources(specs)
@@ -2806,6 +3056,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--authority-env", type=Path, default=Path("/etc/aicc/workspace-authority.env")
+    )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILES,
+        default="worker",
+        help=(
+            "Which host role to install. 'worker' is every spec and stays the "
+            "default, so an existing caller installs exactly what it always "
+            "did. 'control' omits the agent launcher, worker units and agent "
+            "model credentials -- a control-plane host must not hold them."
+        ),
     )
     parser.add_argument(
         "--claude-auth",
