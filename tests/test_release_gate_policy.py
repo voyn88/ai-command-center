@@ -488,3 +488,45 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
         for negative_result in ("failure", "cancelled", "skipped"):
             results = success | {job_id: negative_result}
             assert not accepted(results), (job_id, negative_result)
+
+
+FORK_POLICY_ADR = ROOT / "docs/adr/0011-merge-queue-fork-secret-policy.md"
+BRANCH_PROTECTION_SCRIPT = ROOT / "scripts/enable-branch-protection.sh"
+
+
+def test_the_merge_queue_fork_policy_decision_is_recorded() -> None:
+    """The fork-secret question has an accepted, on-disk decision, not just code.
+
+    `VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY`'s acceptance criterion is that a
+    decision was made *and recorded*, distinct from the trust guard's own
+    behavioural tests above. This pins the record itself: it must exist,
+    reference the task, state it is accepted, and name the mechanism it
+    accepted so a future edit cannot quietly reopen the question by deleting
+    the "accepted" line while leaving the file in place.
+    """
+    assert FORK_POLICY_ADR.is_file()
+    text = FORK_POLICY_ADR.read_text(encoding="utf-8")
+    assert "VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY" in text
+    assert "Status: accepted" in text
+    assert "scripts/assert_trusted_head_repository.py" in text
+    assert "merge queue stays **disabled**" in text
+
+
+def test_branch_protection_script_requires_the_actual_final_gate_context() -> None:
+    """The ADR's enablement gate names `final-gate`; the script must match it.
+
+    A merge queue is only as safe as the required status check backing it. If
+    `scripts/enable-branch-protection.sh` names a stale or wrong context, an
+    operator following it would protect `main` on a check that is not the
+    fail-closed aggregator (`test_final_gate_is_fail_closed_for_every_upstream_result`
+    above), silently reopening the gap this policy closes. Compared against
+    the workflow's own job name rather than a second hardcoded literal, so a
+    rename of `final-gate` is caught here instead of drifting unnoticed.
+    """
+    final_gate_name = _workflow(CI_WORKFLOW)["jobs"]["final-gate"]["name"]
+    script = BRANCH_PROTECTION_SCRIPT.read_text(encoding="utf-8")
+    (context_line,) = [
+        line for line in script.splitlines() if line.startswith("CONTEXT=")
+    ]
+    assert context_line == f'CONTEXT="{final_gate_name}"'
+    assert FORK_POLICY_ADR.name in script
