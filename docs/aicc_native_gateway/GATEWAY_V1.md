@@ -56,9 +56,12 @@ Errors: `401` (missing/invalid/disabled token, `WWW-Authenticate: Bearer`),
 ## Authentication
 
 Pre-provisioned per-device bearer tokens: `python -m native_gateway.provision
---registry <file> --device-id <id>` prints the token once and stores only its
-SHA-256 hash (file mode 0600, outside the repository). Constant-time
-comparison; disable-without-delete revocation; v1 issues only scope `read`.
+--registry <file> --device-id <id>` (equivalently, the explicit `mint`
+subcommand) prints the token once and stores only its SHA-256 hash (file mode
+0600, outside the repository). `python -m native_gateway.provision revoke
+--registry <file> --device-id <id>` disables a device (audit trail kept, no
+delete) so it is immediately rejected by `DeviceRegistry.authenticate`.
+Constant-time comparison; v1 issues only scope `read`.
 
 ## Operations
 
