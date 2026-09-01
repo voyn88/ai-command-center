@@ -18,6 +18,17 @@ expects and the schema version the live database is actually running. That
 gap is real, it is large, and closing it has to happen before backfill
 starts, not during it.
 
+**Re-verification pass 2 (2026-09-01, against `f799f78`):** this revision
+itself drifted the same way the draft did, just faster — one relevant commit
+landed within five days of it being written.
+`VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY` (#473) added SQLite
+schema migration 25 and its PostgreSQL counterpart (`0016`), and it breaks
+the assumption A0b was built on: that every migration since 16 is a safe,
+idempotent `ALTER TABLE ... ADD COLUMN`. Migration 25 is not that shape — it
+fails closed against any active or unfinalized run, which means running A0b
+exactly as originally written, before admission freeze, now stops partway.
+See the corrected §4 and §8, and Appendix A's second pass, below.
+
 ## 1. Purpose and scope
 
 Cut the server deployment's runtime store over from SQLite (authority
@@ -42,13 +53,16 @@ this document.** See §13.
   mechanism `READ-POOL` would build on, and it means a credential change no
   longer implies a process restart. The draft's pooling model (one pool,
   opened once, restart to change it) is stale.
-- Migrations applied: `0001_initial` through `0014_backlog_defer_auto_resume`.
-  Migrations `0005`–`0014` add tables (`backlog_store`, the work-queue
-  control plane, credential-expiry tracking, ...) that are **outside** the
-  33-table correspondence map in `docs/srv01b-schema-map.md`. That map is
+- Migrations applied: `0001_initial` through `0016_run_finalization_claim`
+  (was `0014` when this revision was first written — `0015` and `0016`
+  landed after). Migrations `0005`–`0016` add tables (`backlog_store`, the
+  work-queue control plane, credential-expiry tracking, the tick-scheduler
+  scan cursor, the run-finalization claim fence, ...) that are **outside**
+  the 33-table correspondence map in `docs/srv01b-schema-map.md`. That map is
   still accurate for the tables it covers — it just no longer covers the
-  whole schema. A reconciliation plan scoped to "the 33 tables in the map"
-  now undercounts what PostgreSQL actually holds.
+  whole schema, and it covers less of it with every wave. A reconciliation
+  plan scoped to "the 33 tables in the map" now undercounts what PostgreSQL
+  actually holds, by a growing margin.
 - Generic PostgreSQL machinery still lives in `aios-db`, still consumed
   only through `command_center/db/adapter.py` — unchanged.
 - The mutating HTTP surface now requires authentication
@@ -65,17 +79,29 @@ this document.** See §13.
 Unchanged from the draft (§3): 33 domain tables, 1:1, no orphans, 114/395
 columns change type and 105 need value conversion — 75 `TEXT` →
 `timestamptz` (the naive-local-time risk in `iso_now()`), 7 identity
-columns. See caveat in §2 about the 11 tables added since: they are real
-PostgreSQL tables with no SQLite backfill story yet, because they were
-never SQLite tables at all — `command_center/db/work_queue_store.py` and
-the backlog stores write PostgreSQL directly. They do not block this
-cutover (they have no SQLite side to reconcile against) but they must not
-be swept into "the 33 tables" bucket when someone counts what got mirrored.
+columns. See caveat in §2 about the tables added since: they are real
+PostgreSQL tables with no SQLite backfill story, for two different reasons.
+Most (`command_center/db/work_queue_store.py`, the backlog stores) were
+never SQLite tables at all — PostgreSQL is native authority for them from
+birth. `run_finalization_claim` (`0016`) is different again: it has a SQLite
+counterpart (migration 25, see §4), but the two are deliberately *not*
+mirrored to each other, because the claim's `owner_pid` / process-identity
+fields are only meaningful on the host that took the claim — a best-effort
+cross-engine mirror cannot preserve that compare-and-swap semantics.
+`tests/db/test_mirror_coverage.py`'s `UNMIRRORED_SCHEMA_TABLES` carries a
+signed exclusion, with reason and owning task, for every one of these —
+that is the authoritative list, not this paragraph's count. None of them
+block this cutover (none have a SQLite side to reconcile against) but they
+must not be swept into "the 33 tables" bucket when someone counts what got
+mirrored.
 
 ## 4. Preflight (A0)
 
 1. Confirm `python -m command_center.db status` reports every PostgreSQL
-   migration applied through `0014` and its checksum verified.
+   migration applied through `0016` (was `0014` at this revision's first
+   pass — re-check the current highest-numbered file in
+   `command_center/db/sql/` before relying on this digit) and its checksum
+   verified.
 2. Confirm `GET /readyz` is `200`.
 3. Confirm the three-role grant matrix with
    `tests/db/test_postgres_integration.py` — now also covering the
@@ -101,20 +127,57 @@ python -c "from command_center.runtime.db.core import current_schema_version; \
 The draft observed this returning **16** against a codebase whose
 `SCHEMA_VERSION` was **23** at the time, named the seven-version gap, and
 then never scheduled a step to close it (draft §2, §4 — no such step
-exists). Left alone, that gap only grows: `SCHEMA_VERSION` is **24** as of
-this revision (migration 24, `VOYN-W0-AICC-SRV-09-FINALIZED-AT`, added
-`run.finalized_at` — see §9). If A0b is not run, the backfill importer
-reads a live schema that is now **eight** migrations behind the code doing
-the reading, not seven, and every migration since 16 that is idempotent
-`ALTER TABLE ... ADD COLUMN` (the shape used by migrations 2, 3, 4, 9, 11,
-and now 24) is safe to apply — but the importer's column list is generated
+exists). Left alone, that gap only grows: `SCHEMA_VERSION` is **25** as of
+this revision's second pass (migration 24, `VOYN-W0-AICC-SRV-09-FINALIZED-AT`,
+added `run.finalized_at` — see §9; migration 25,
+`VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY`, added
+`run_finalization_claim` — see below). If A0b is not run, the backfill
+importer reads a live schema that is now **nine** migrations behind the code
+doing the reading, not seven, and the importer's column list is generated
 from the *code's* schema, not the live one, so a live database still on 16
 is missing columns the importer will try to read.
 
-Run `python -m command_center.runtime.db migrate` against production,
-confirm `current_schema_version()` now reads the code's `SCHEMA_VERSION`
-(24 today — re-check this number at execution time; it moves), and only
-then proceed to A0.1.
+**Everything up through migration 24 is still the idempotent
+`ALTER TABLE ... ADD COLUMN` shape (2, 3, 4, 9, 11, 24 are named examples)
+and is safe to run against a live production database with in-flight work —
+that part of A0b is unchanged. Migration 25 breaks the pattern: running
+plain `migrate()` against a live database will now stop at 24→25.**
+`_migration_25_add_finalization_claim`
+(`command_center/runtime/db/schema.py`) fails closed — raises
+`FinalizationClaimCutoverRequired` — against *any* row that is not both in a
+terminal state and already finalized, i.e. against any active run at all.
+That is deliberate: version-24 writers cannot honor the new claim table, so
+a rolling upgrade could let v25 code mistake a legacy in-flight row's
+missing claim for an abandoned one. There is no bypass in the ordinary
+migration path — only an explicit, separately-invoked offline procedure
+(below) is allowed to cross this specific version boundary.
+
+So A0b now runs in two parts:
+
+1. Before A0.1–A0.4, as originally written: run
+   `python -m command_center.runtime.db migrate` against production. This
+   carries the live database from whatever it is on up through **24** —
+   still safe with production live and admission open — and will stop
+   there with `FinalizationClaimCutoverRequired` if it tries to cross into
+   25 while runs are active. That refusal is expected at this point in the
+   sequence, not a bug to route around.
+2. **The 24→25 leg moves into the cutover sequence, at §8, step 4** (new —
+   see below): only after admission is frozen (§8.2) and
+   `count_unfinalized_runs()` has reached zero (§8.3), run
+   `python scripts/execution_center_debug.py offline-finalization-cutover
+   --confirm-offline`
+   (`command_center/runtime/db/schema.py`'s
+   `bootstrap_finalization_claim_cutover`, invoked from
+   `scripts/execution_center_debug.py`). It re-checks the same
+   zero-active/zero-unfinalized precondition itself — the drain in §8.3 is
+   necessary for it to succeed, but the command does not trust the operator
+   to have verified that, it verifies again. Confirm
+   `current_schema_version()` reads **25** before proceeding to step 8.5
+   (the backfill importer's final pass).
+
+Re-check `SCHEMA_VERSION` at execution time regardless — 25 is today's
+number and it moves, same caveat as the draft's 23 and this revision's
+original 24.
 
 Do not confuse this with the "16 domain tables" figure in
 `docs/srv01b-schema-map.md` — that is an unrelated, already-retired
@@ -145,7 +208,12 @@ Unchanged automated gates: `tests/db/test_schema_correspondence.py` and
 `tests/db/test_mirror_coverage.py` (`UNMIRRORED_SCHEMA_TABLES`). Both must
 be green on the commit being cut over. They cover the 33-table
 correspondence map only (§3) — they do not, and are not meant to, cover
-the 11 PostgreSQL-only tables added since the draft.
+the PostgreSQL-only tables added since the draft, each of which instead
+carries its own signed `UNMIRRORED_SCHEMA_TABLES` exclusion (reason +
+owning task) — `run_finalization_claim` and `backlog_scan_cursor` are the
+two newest, both landing after this revision's first pass. Grep that dict
+for the current count; do not copy a number from this paragraph into an
+operator checklist, it will already be stale by the time it's read.
 
 ## 7. Read path
 
@@ -158,19 +226,23 @@ sufficient.
 
 ## 8. Cutover sequence
 
-1. Complete A0b, then A0.1–A0.4.
+1. Complete A0b part 1 (through schema **24**), then A0.1–A0.4.
 2. Freeze new work admission (stop the dispatcher / queue enqueue) through
    the now-authenticated mutating surface (§2).
 3. Wait for `count_unfinalized_runs()` — not `run.state` — to reach zero
    for every in-flight run. See §9 for why this replaces the draft's
    state-polling step.
-4. Run the backfill importer's final incremental pass.
-5. Flip the application's write authority flag to PostgreSQL.
-6. Resume admission.
+4. **(new)** Complete A0b part 2: run `offline-finalization-cutover
+   --confirm-offline` to cross schema **24→25**. Zero-unfinalized from step
+   3 is what makes this succeed instead of refusing — do not reorder it
+   ahead of step 3.
+5. Run the backfill importer's final incremental pass.
+6. Flip the application's write authority flag to PostgreSQL.
+7. Resume admission.
 
 ## 9. Point of no return
 
-**The point of no return is not the flag flip in step 8.5, not a service
+**The point of no return is not the flag flip in step 8.6, not a service
 restart, and not a gate turning green.** It is the first write that lands
 in PostgreSQL as authority and is *not* also mirrored back into SQLite.
 
@@ -277,7 +349,9 @@ this document (§13).
 ## 13. Phase B authorization status
 
 **Not authorized.** The mechanisms Phase B depends on are designed and
-prototyped, not built, in this codebase as of `67a996b`:
+prototyped, not built, in this codebase as of `67a996b` — still true as of
+the second pass's `f799f78`; none of the six items below were touched by
+the drift documented in Appendix A's second pass:
 
 - `READ-SWITCH-MISSING` — no read-path selector exists (§7).
 - `REVERSE-MIRROR` — no PostgreSQL → SQLite mirror exists (§9); this is
@@ -367,3 +441,29 @@ held, 12 changed, 3 disappeared.**
 | 49 | "the mutating surface is two routes" | `VOYN-W0-AICC-AUTH-HTTP-01`'s own merge description retracts this: "the surface was 29 mutating routes, not the two that were assumed." Not drift — the assumption was already wrong when the draft's checkout was cut, the codebase just hadn't said so yet. |
 | 50 | "16 domain tables" (as a table-count baseline, distinct from the A0b schema-version reading of the same digit) | `docs/srv01b-schema-map.md` — unchanged since the draft — already calls this figure obsolete in its own text: taken before waves W1–W3, and understated by more than half. Citing it for anything is citing a number the codebase disowns. |
 | 51 | "`run.state == 'COMPLETED'` tells another process a run is done" | Migration 24's own docstring retracts this for the cutover use case specifically: the window between the terminal-state commit and the report/auto-commit finishing is real and measured (§9), and `finalized_at` exists because state alone was an insufficient signal for exactly this operator. |
+
+### Second pass (2026-09-01, against `f799f78`) — this revision re-verified
+
+This revision was itself checked out at `67a996b`. Five days later,
+`f799f78` is 28 commits ahead. Most of that drift is unrelated to cutover
+(installer control profiles, systemd unit handling, CI build changes, a
+publish-window scheduler) and does not appear below — this is not a full
+51-reference re-audit, only the commits that touch something this document
+makes a claim about. One did: `VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY`
+(#473). A second, unrelated commit
+(`VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION`, #443) also lands one of the two
+new PostgreSQL tables cited below, incidentally.
+
+| # | Reference | First-pass claim | Now |
+| --- | --- | --- | --- |
+| 52 | `command_center/runtime/db/schema.py` `SCHEMA_VERSION` | 24 | **25** — migration 25 adds `run_finalization_claim` |
+| 53 | A0b's "every migration since 16 is a safe idempotent `ADD COLUMN`" | true of 17–24 | **false of 25** — `_migration_25_add_finalization_claim` fails closed against any active/unfinalized run; requires the separate `offline-finalization-cutover` procedure, which only succeeds after admission freeze + drain (§8.2–8.3), not during preflight |
+| 54 | PostgreSQL migrations (`command_center/db/sql/`) | `0001`–`0014` | **`0001`–`0016`** — `0015_backlog_scan_cursor` (PG-native tick-scheduler state, unrelated to the 33-table map), `0016_run_finalization_claim` (PG target for migration 25's table, deliberately not dual-written) |
+| 55 | `command_center/db/roles.py` `PRIVILEGES` | no finalization-claim entry | gained `_FINALIZATION_CLAIM_TABLES`, granted to `aicc_app`, `aicc_worker`, and the operator enrolment role |
+| 56 | `tests/db/test_mirror_coverage.py` `UNMIRRORED_SCHEMA_TABLES` | did not name either table | both `run_finalization_claim` and `backlog_scan_cursor` now carry signed exclusions with reason and owning task |
+
+The lesson this second pass adds to the one A0b already teaches: **a
+revision's own baseline commit is a claim with a shelf life, not a fact.**
+Treat the `f799f78` baseline above the same way this document treats
+`67a996b` — re-run this check against current `main` before executing this
+runbook, don't trust either date.
