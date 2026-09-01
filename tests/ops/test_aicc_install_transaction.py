@@ -822,7 +822,7 @@ def test_boot_recovery_completes_armed_uninstall_from_capsule(
         "verify_service_snapshot_closure",
         lambda path: closure_checks.append(path),
     )
-    monkeypatch.setattr(module, "quiesce_service_snapshot", lambda path: None)
+    monkeypatch.setattr(module, "quiesce_service_snapshot", lambda path, **_kw: None)
     monkeypatch.setattr(
         module,
         "restore_service_snapshot",
@@ -907,7 +907,7 @@ def test_armed_uninstall_recovery_refuses_late_lane_before_mutation(
     )
     quiesced = []
     monkeypatch.setattr(
-        module, "quiesce_service_snapshot", lambda path: quiesced.append(path)
+        module, "quiesce_service_snapshot", lambda path, **_kw: quiesced.append(path)
     )
 
     with pytest.raises(RuntimeError, match="outside service snapshot"):
@@ -961,7 +961,7 @@ def test_install_recovery_rechecks_closure_after_quiesce_before_mutation(
     quiesced = []
     monkeypatch.setattr(module, "verify_service_snapshot_closure", closure)
     monkeypatch.setattr(
-        module, "quiesce_service_snapshot", lambda path: quiesced.append(path)
+        module, "quiesce_service_snapshot", lambda path, **_kw: quiesced.append(path)
     )
 
     with pytest.raises(RuntimeError, match="outside service snapshot"):
@@ -1312,7 +1312,7 @@ def test_failed_boot_service_restore_keeps_journal_for_retry(monkeypatch, tmp_pa
         transaction.recover()
 
     assert transaction.pending.exists()
-    monkeypatch.setattr(module, "restore_service_snapshot", lambda path: None)
+    monkeypatch.setattr(module, "restore_service_snapshot", lambda path, **_kw: None)
     transaction.recover()
     assert not (root / "etc/new").exists()
     assert not transaction.pending.exists()
@@ -1766,7 +1766,7 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
     order: list[str] = []
     original_selector_restore = module.FileTransaction._restore_release_selector
 
-    def recording_quiesce(path):
+    def recording_quiesce(path, **_kw):
         assert path == state / "attempt-units.json"
         order.append("quiesce")
 
@@ -2090,4 +2090,246 @@ def test_a_service_that_exists_must_still_report_a_mainpid(tmp_path):
         return SimpleNamespace(returncode=0, stderr="", stdout=stdout)
 
     with pytest.raises(RuntimeError, match="cannot prove restored service state"):
+        module.restore_service_snapshot(snapshot, run=run)
+
+
+def _quiesce_snapshot(tmp_path, unit: str):
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {unit: {"exists": True, "enabled": True, "active": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return snapshot
+
+
+def _not_found_runner():
+    def run(command, **kwargs):
+        if command[1] == "show" and "LoadState" in " ".join(command):
+            return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    return run
+
+
+def test_quiesce_proceeds_for_a_unit_this_rollback_will_restore(tmp_path):
+    """The deadlock this closes: unit files are restored by `restore()`, which
+    runs *after* quiesce. A rollback interrupted between removing a unit file
+    and restoring it could never be resumed — every later attempt died here,
+    on the unit the previous attempt was replacing. Four consecutive install
+    attempts on worker-01 each stopped on the next such unit.
+    """
+    module = _module()
+    unit = "voyn-aicc-worker.service"
+    snapshot = _quiesce_snapshot(tmp_path, unit)
+
+    module.quiesce_service_snapshot(
+        snapshot, run=_not_found_runner(), restorable_units=frozenset({unit})
+    )
+
+
+def test_quiesce_still_refuses_a_unit_that_vanished_unexplained(tmp_path):
+    """A missing unit nobody intends to restore is real divergence: mutating a
+    host whose state cannot be accounted for is exactly what this refusal is
+    for. Deliberately not a legacy unit — those are retired on purpose."""
+    module = _module()
+    snapshot = _quiesce_snapshot(tmp_path, "aicc-agent-launcher.socket")
+
+    with pytest.raises(RuntimeError, match="expected unit disappeared before quiesce"):
+        module.quiesce_service_snapshot(snapshot, run=_not_found_runner())
+
+
+def test_restorable_units_are_read_from_the_journal_not_the_disk(tmp_path):
+    module = _module()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "records": [
+                    {"target": "/etc/systemd/system/voyn-aicc-worker.service"},
+                    {"target": "/etc/systemd/system/sub/dir/not-a-unit.conf"},
+                    {"target": "/etc/aicc/worker-lanes"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    units = module._units_restored_by(manifest)
+
+    assert units == frozenset({"voyn-aicc-worker.service"})
+
+
+def test_quiesce_tolerates_a_legacy_unit_the_rollout_retired(tmp_path):
+    """Retiring the pre-template workers is part of installing, and disabling
+    a unit whose fragment is a symlink removes that symlink. So after a
+    rollout these units are legitimately gone while the snapshot taken before
+    it still records them present. Without this, each attempt retired one more
+    and the next died on it — four consecutive attempts on worker-01 failed
+    this way, on `voyn-aicc-worker-2.service` and then
+    `voyn-aicc-worker.service`, with nothing actually wrong.
+    """
+    module = _module()
+    snapshot = _quiesce_snapshot(tmp_path, "voyn-aicc-worker-2.service")
+
+    module.quiesce_service_snapshot(snapshot, run=_not_found_runner())
+
+
+def test_the_retired_legacy_set_matches_the_rollout_and_the_installer():
+    """Three copies of one list: this module (imported by the bootstrap before
+    the rollout module exists on disk), the rollout, and the installer's
+    `--include-unit` arguments. A unit added to one and forgotten in another
+    reintroduces exactly the deadlock this closes."""
+    module = _module()
+    root = Path(__file__).parents[2]
+
+    rollout_src = (root / "ops" / "aicc_staged_worker_rollout.py").read_text(
+        encoding="utf-8"
+    )
+    block = rollout_src.split("LEGACY_WORKER_UNITS = (", 1)[1].split(")", 1)[0]
+    rollout_units = {line.strip().strip('",') for line in block.splitlines() if line.strip()}
+
+    installer = (
+        root / "deploy" / "install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+    included = {
+        line.split("--include-unit", 1)[1].strip().rstrip("\\").strip()
+        for line in installer.splitlines()
+        if "--include-unit" in line
+    }
+
+    assert module.RETIRED_LEGACY_UNITS == rollout_units
+    assert module.RETIRED_LEGACY_UNITS <= included
+
+
+def test_a_boot_generated_dropin_is_not_required_to_match():
+    """`aicc-principal-recovery` writes its drop-in into
+    `/run/systemd/generator.early/`, which is tmpfs — it exists only while
+    this boot's generator output is live. Requiring it to match a snapshot
+    demands a value that by construction does not persist, and refused the
+    restore on a host where nothing was wrong (worker-01, 2026-08-31).
+    """
+    module = _module()
+    snapshotted = "/run/systemd/generator.early/voyn-aicc-worker.service.d/10-aicc-recovery.conf"
+
+    assert module._properties_match("DropInPaths", "", snapshotted)
+
+
+def test_an_administrator_dropin_must_still_match():
+    """The check exists because a silently added drop-in can weaken the
+    isolation the snapshot preserves. Only the generated ones are exempt."""
+    module = _module()
+    expected = "/etc/systemd/system/voyn-aicc-worker.service.d/20-principal-isolation.conf"
+
+    assert not module._properties_match("DropInPaths", "", expected)
+    assert module._properties_match("DropInPaths", expected, expected)
+
+
+def test_dropin_comparison_ignores_order():
+    module = _module()
+    a = "/etc/systemd/system/x.d/10-a.conf /etc/systemd/system/x.d/20-b.conf"
+    b = "/etc/systemd/system/x.d/20-b.conf /etc/systemd/system/x.d/10-a.conf"
+
+    assert module._properties_match("DropInPaths", a, b)
+
+
+def test_a_command_property_still_ignores_only_its_invocation_fields():
+    """The other renderer whose text moves without the configuration moving.
+    Routed through the same matcher, so both stay in one place."""
+    module = _module()
+    snapshot = "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m w ; pid=0 }"
+    after_run = "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m w ; pid=76841 }"
+    replaced = "{ path=/usr/bin/python ; argv[]=/usr/bin/python -m attacker ; pid=0 }"
+
+    assert module._properties_match("ExecStart", after_run, snapshot)
+    assert not module._properties_match("ExecStart", replaced, snapshot)
+
+
+def test_restore_does_not_revive_a_legacy_unit_the_rollout_retired(tmp_path):
+    """Retiring the pre-template workers is what installing *does*, and
+    `disable` removes the symlink that was their fragment. The snapshot still
+    describes the configuration from before that, so restoring it would revive
+    a unit the rollout just took out of service — and, the unit being gone,
+    every property it recorded now reads empty and the comparison refuses.
+
+    That is exactly what the live host produced, one property at a time:
+    `DropInPaths`, then `EnvironmentFiles`, each on a unit that was correctly
+    absent (worker-01, 2026-08-31).
+    """
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "units": {
+                    "voyn-aicc-worker.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                        "properties": dict.fromkeys(_module().SNAPSHOT_PROPERTIES, ""),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    mutations: list[tuple[str, ...]] = []
+
+    def run(command, **kwargs):
+        action = command[1]
+        if action in {"enable", "disable", "start", "stop", "daemon-reload"}:
+            mutations.append(tuple(command[1:]))
+        if action == "show" and "LoadState" in " ".join(command):
+            return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        if action == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if action == "is-active":
+            return SimpleNamespace(returncode=0, stderr="", stdout="inactive\n")
+        if action == "is-enabled":
+            return SimpleNamespace(returncode=0, stderr="", stdout="disabled\n")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    module.restore_service_snapshot(snapshot, run=run)
+
+    assert not any(m[0] in {"enable", "start"} for m in mutations)
+
+
+def test_restore_still_refuses_a_non_legacy_unit_that_lost_its_properties(tmp_path):
+    """The exemption is for units the installer retires on purpose. Anything
+    else whose recorded configuration no longer matches is still a refusal."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "units": {
+                    "aicc-agent-launcher.socket": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                        "properties": {
+                            **dict.fromkeys(_module().SNAPSHOT_PROPERTIES, ""),
+                            "DropInPaths": "/etc/systemd/system/x.d/a.conf",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(command, **kwargs):
+        if command[1] == "show" and "LoadState" in " ".join(command):
+            return SimpleNamespace(returncode=0, stderr="", stdout="loaded\n")
+        if command[1] == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    with pytest.raises(RuntimeError, match="refusing unsafe snapshot restart"):
         module.restore_service_snapshot(snapshot, run=run)
