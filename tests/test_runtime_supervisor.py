@@ -1547,6 +1547,9 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
     snapshot_calls = {"count": 0}
     finalization_entered = threading.Event()
     release_finalization = threading.Event()
+    watchdog_started = threading.Event()
+    watchdog_clock: dict[str, float] = {}
+    real_timeout_watchdog = supervisor.Supervisor._timeout_watchdog
 
     def block_post_run_snapshot(path):
         snapshot_calls["count"] += 1
@@ -1555,7 +1558,15 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
             assert release_finalization.wait(timeout=5)
         return real_snapshot(path)
 
+    def observe_timeout_watchdog(self, run_id, active, timeout_seconds):
+        # This is the clock origin the product actually uses: immediately
+        # before `_timeout_watchdog` begins its timeout-sized event wait.
+        watchdog_clock["started"] = time.monotonic()
+        watchdog_started.set()
+        return real_timeout_watchdog(self, run_id, active, timeout_seconds)
+
     monkeypatch.setattr(supervisor.agent_runner, "git_snapshot", block_post_run_snapshot)
+    monkeypatch.setattr(supervisor.Supervisor, "_timeout_watchdog", observe_timeout_watchdog)
 
     # The watchdog's deadline starts when the process is spawned, so this
     # budget has to clear interpreter startup with room to spare. At 0.5s it
@@ -1565,7 +1576,6 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
     # a runner slow enough to invalidate the test's own premise. That premise
     # is now asserted explicitly instead of assumed.
     timeout_seconds = 2.0
-    started = time.monotonic()
     sup = supervisor.Supervisor()
     run = sup.start_raw(
         project="AIOS",
@@ -1575,13 +1585,14 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
         confirmed=True,
         timeout_seconds=timeout_seconds,
     )
+    assert watchdog_started.wait(timeout=10), "timeout watchdog never started"
     with sup._active_lock:
         active = sup._active[run["id"]]
 
     try:
         assert finalization_entered.wait(timeout=10)
         assert active.process_exited_event.is_set()
-        exited_after = time.monotonic() - started
+        exited_after = time.monotonic() - watchdog_clock["started"]
         assert exited_after < timeout_seconds, (
             "premise not met: the process took "
             f"{exited_after:.3f}s to exit, past its own {timeout_seconds}s "
@@ -1592,7 +1603,7 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
         # Wait past the deadline while finalization is still blocked: this is
         # the whole scenario — the run is finished, the bookkeeping is not, and
         # the watchdog must stay out of it.
-        remaining = (started + timeout_seconds + 0.5) - time.monotonic()
+        remaining = (watchdog_clock["started"] + timeout_seconds + 0.5) - time.monotonic()
         if remaining > 0:
             time.sleep(remaining)
 
