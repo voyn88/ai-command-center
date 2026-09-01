@@ -292,9 +292,13 @@ class DispatchPlan:
 
     decisions: tuple[DispatchDecision, ...]
     kill_switch_engaged: bool
-    daily_spend_usd: float
+    # None exactly when `budget_unknown` is True: the trailing-24h spend could
+    # not be read, so there is no real figure to report. A caller that reads
+    # this field without checking `budget_unknown` must see "no data" (None),
+    # never a fabricated `0.0` that reads as "nothing spent today".
+    daily_spend_usd: float | None
     max_daily_spend_usd: float
-    projected_spend_usd: float
+    projected_spend_usd: float | None
     # True when the trailing-24h spend could not be read (e.g. a DB outage):
     # dispatch is refused wholesale rather than guessing a spend figure that a
     # zero/unset daily cap or a free executor could silently sail past.
@@ -309,7 +313,9 @@ class DispatchPlan:
         return tuple(d for d in self.decisions if not d.assigned)
 
     @property
-    def budget_remaining_usd(self) -> float:
+    def budget_remaining_usd(self) -> float | None:
+        if self.projected_spend_usd is None:
+            return None
         if self.max_daily_spend_usd <= 0:
             return float("inf")
         return self.max_daily_spend_usd - self.projected_spend_usd
@@ -322,7 +328,9 @@ class DispatchPlan:
             "daily_spend_usd": self.daily_spend_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,
-            "budget_remaining_usd": (None if remaining == float("inf") else remaining),
+            "budget_remaining_usd": (
+                None if remaining is None or remaining == float("inf") else remaining
+            ),
             "assignment_count": len(self.assignments),
             "deferred_count": len(self.deferred),
             "decisions": [d.as_dict() for d in self.decisions],

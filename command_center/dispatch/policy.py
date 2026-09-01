@@ -108,7 +108,7 @@ def plan_dispatch(
     executors: list[ExecutorProfile],
     policy: DispatchPolicy,
     *,
-    daily_spend_usd: float,
+    daily_spend_usd: float | None,
     max_daily_spend_usd: float,
     kill_switch_engaged: bool,
     budget_unknown: bool = False,
@@ -144,6 +144,10 @@ def plan_dispatch(
             max_daily_spend_usd=max_daily_spend_usd,
             projected_spend_usd=daily_spend_usd,
         )
+
+    # `budget_unknown` was False to reach here, so the caller supplied a real
+    # trailing-24h figure rather than the `None` it sends when the read fails.
+    assert daily_spend_usd is not None
 
     # (3) SLA/priority order.
     ordered = sorted(tasks, key=lambda t: _task_sort_key(t, policy))
