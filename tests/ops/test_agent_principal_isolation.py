@@ -1298,7 +1298,15 @@ def _assert_command_inside_shell_if(text: str, command: str, guard: str) -> None
     ]
     assert guards, f"{command} has no preceding {guard}"
     assert not any(
-        line == "fi" or line.startswith("fi ") or line.startswith("fi;")
+        line == "fi"
+        or line.startswith("fi ")
+        or line.startswith("fi;")
+        or line == "else"
+        or line.startswith("else ")
+        or line.startswith("else;")
+        or line == "elif"
+        or line.startswith("elif ")
+        or line.startswith("elif;")
         for line in lines[guards[-1] + 1 : command_index]
     ), (
         f"{command} escaped {guard}"
@@ -1608,17 +1616,15 @@ def test_the_control_profile_does_not_claim_to_remove_the_unix_principals(tmp_pa
     assert "premise is that the agent principal does not exist" not in body
 
 
-def test_the_rollback_and_the_uninstall_stop_the_broker_sessions_too():
-    """`disable --now` on the socket stops it listening. The sessions it has
-    already accepted are separate units running off the same template, and
-    they outlive it -- so both paths that take the launcher out stop them as
-    well, before the snapshot-closure check that refuses to mutate while any
-    unit is live outside the snapshot."""
+def test_only_uninstall_stops_broker_sessions_not_transaction_rollback():
+    """A rollback cannot recreate accepted descriptors, so it must preserve
+    existing sessions.  Uninstall is terminal and still stops them after
+    admission closes."""
     text = _installer_text()
     stop_instances = "systemctl stop 'aicc-agent-launcher@*.service'"
     disable_socket = "systemctl disable --now aicc-agent-launcher.socket"
 
-    assert text.count(stop_instances) == 2
+    assert text.count(stop_instances) == 1
     for segment in text.split(stop_instances)[:-1]:
         assert disable_socket in segment
         commands = [
@@ -1630,8 +1636,7 @@ def test_the_rollback_and_the_uninstall_stop_the_broker_sessions_too():
             "the socket must stop listening before its sessions are stopped"
         )
     rollback = text.split("rollback() {", 1)[1].split("\ntrap rollback", 1)[0]
-    assert stop_instances in rollback
-    assert rollback.index(stop_instances) < rollback.index("run_transaction recover")
+    assert stop_instances not in rollback
 
 
 def test_control_authority_is_proven_before_prepare():

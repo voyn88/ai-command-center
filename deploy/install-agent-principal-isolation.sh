@@ -361,12 +361,10 @@ rollback() {
   rollback_complete=1
   if [ "$transaction_active" -eq 1 ] && path_present "$state_dir/pending.json"; then
     systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
-    # Disabling the socket stops it listening; it does nothing to the
-    # `aicc-agent-launcher@<connection>.service` instances it already spawned,
-    # which keep running off the same template. Best effort here -- the
-    # authoritative statement is the snapshot-closure check inside `recover`,
-    # which refuses to mutate while any of them is still outside the snapshot.
-    systemctl stop 'aicc-agent-launcher@*.service' >/dev/null 2>&1 || true
+    # Never kill accepted launcher sessions from the outer trap.  They carry
+    # live client file descriptors which cannot be recreated by rollback.
+    # `recover` restores the socket and workers; the transaction layer skips
+    # these per-connection instances while restoring their on-disk template.
     if ! run_transaction recover; then
       # Keep pending.json, its generation, and attempt-units.json intact.
       # The boot recovery unit retries the same compare-and-restore plus

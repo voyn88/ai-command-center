@@ -549,6 +549,34 @@ def test_quiesce_accepts_a_proven_not_found_unit_without_extra_probes(tmp_path):
     ]
 
 
+def test_quiesce_preserves_accepted_launcher_sessions(tmp_path):
+    """An Accept=yes instance owns a descriptor rollback cannot recreate."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-agent-launcher@7.service": {
+                        "exists": True,
+                        "enabled": False,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    module.quiesce_service_snapshot(
+        snapshot, run=lambda *args, **kwargs: calls.append(args)
+    )
+
+    assert calls == []
+
+
 def test_quiesce_refuses_when_an_expected_active_unit_disappeared(tmp_path):
     module = _module()
     snapshot = tmp_path / "attempt-units.json"
@@ -2725,6 +2753,20 @@ def test_template_discovery_refuses_every_other_silent_systemctl_failure(
         module.discover_template_instances(run=run, message="cannot enumerate")
 
 
+def test_template_discovery_refuses_silent_rc1_when_manager_probe_fails():
+    module = _module()
+
+    def run(command, **kwargs):
+        if command[1] == "list-unit-files":
+            return SimpleNamespace(returncode=1, stderr="", stdout="")
+        if command[1] == "show":
+            return SimpleNamespace(returncode=1, stderr="", stdout="")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    with pytest.raises(RuntimeError, match="cannot enumerate"):
+        module.discover_template_instances(run=run, message="cannot enumerate")
+
+
 def test_quiesce_worker_only_units_refuses_when_stopping_a_loaded_unit_fails(
     tmp_path,
 ):
@@ -3328,6 +3370,25 @@ def test_a_swap_after_the_final_compare_cannot_redirect_the_destruction(
     assert installed.exists() is False
 
 
+def test_initial_quarantine_collision_is_retried_without_replacement(
+    monkeypatch, tmp_path
+):
+    module = _module()
+    transaction, manifest, worker_only, _installed = _control_shaped_generation(
+        module, tmp_path
+    )
+    record = _purge_record(module, manifest, "/etc/aicc/agent.env")
+    collision = worker_only.parent / ".agent.env.aicc-purge-collision"
+    collision.write_bytes(b"must-survive")
+    tokens = iter(("collision", "fresh"))
+    monkeypatch.setattr(module.secrets, "token_hex", lambda _size: next(tokens))
+
+    transaction._apply_removal(record)
+
+    assert collision.read_bytes() == b"must-survive"
+    assert not worker_only.exists()
+
+
 def test_a_swap_before_the_quarantine_compare_is_put_back_without_data_loss(
     monkeypatch, tmp_path
 ):
@@ -3578,10 +3639,10 @@ def test_a_crash_between_commit_and_retirement_is_finished_by_recover(
     crashed = {"active": True}
     real_retirement = module.FileTransaction._run_sensitive_retirement
 
-    def crash_before_retiring(this):
+    def crash_before_retiring(this, **kwargs):
         if crashed["active"]:
             return
-        return real_retirement(this)
+        return real_retirement(this, **kwargs)
 
     monkeypatch.setattr(
         module.FileTransaction, "_run_sensitive_retirement", crash_before_retiring
@@ -3598,6 +3659,35 @@ def test_a_crash_between_commit_and_retirement_is_finished_by_recover(
     assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
     for secret in (CLAUDE_BYTES, CODEX_BYTES):
         assert _byte_search(state, secret) == []
+
+
+def test_retirement_intent_outlives_primary_wal_until_redaction_is_durable(
+    monkeypatch, tmp_path
+):
+    module = _module()
+    transaction, _root, state = _worker_host_with_credentials(module, tmp_path)
+    real_retirement = module.FileTransaction._run_sensitive_retirement
+    observed = []
+
+    def watch(this, *, consume_intent=True):
+        observed.append(
+            (
+                consume_intent,
+                this.pending.exists(),
+                (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists(),
+            )
+        )
+        return real_retirement(this, consume_intent=consume_intent)
+
+    monkeypatch.setattr(module.FileTransaction, "_run_sensitive_retirement", watch)
+
+    transaction.install(_control_transition_specs(module, tmp_path))
+
+    assert observed[:2] == [
+        (False, True, True),
+        (True, False, True),
+    ]
+    assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
 
 
 def test_a_retired_generation_refuses_rollback_by_name(tmp_path):

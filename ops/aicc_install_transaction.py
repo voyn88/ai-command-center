@@ -598,7 +598,7 @@ def _print_uninstall_phase(phase: str) -> None:
 def _rename_noreplace(
     source_fd: int, source: str, destination_fd: int, destination: str
 ) -> None:
-    """`renameat2(RENAME_NOREPLACE)`: a rename that never replaces a name.
+    """A native atomic rename that never replaces an existing name.
 
     Plain `rename` silently destroys whatever is already at the destination,
     which is exactly wrong for the two places this is used -- publishing a
@@ -606,26 +606,34 @@ def _rename_noreplace(
     need "claim this name only if nobody else has". EEXIST is therefore an
     outcome the caller acts on, not a failure to paper over.
 
-    Raises OSError; ENOSYS means the C library has no such symbol at all.
+    Linux exposes ``renameat2(RENAME_NOREPLACE)``; Darwin exposes the same
+    guarantee as ``renameatx_np(RENAME_EXCL)``.  There is deliberately no
+    check-then-rename fallback because that would recreate the race this
+    helper closes.  ENOSYS means the platform has neither primitive.
     """
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise OSError(errno.ENOSYS, "renameat2 is unavailable")
-    renameat2.argtypes = [
+    flags = 1  # Linux RENAME_NOREPLACE
+    rename = renameat2
+    if rename is None:
+        rename = getattr(libc, "renameatx_np", None)
+        flags = 0x00000004  # Darwin RENAME_EXCL
+    if rename is None:
+        raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable")
+    rename.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_uint,
     ]
-    renameat2.restype = ctypes.c_int
-    if renameat2(
+    rename.restype = ctypes.c_int
+    if rename(
         source_fd,
         os.fsencode(source),
         destination_fd,
         os.fsencode(destination),
-        1,  # RENAME_NOREPLACE
+        flags,
     ) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
@@ -2079,6 +2087,13 @@ def quiesce_service_snapshot(
         )
 
     for unit, expected in validated:
+        if TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit):
+            # An Accept=yes instance owns a live client descriptor.  Stopping
+            # it is irreversible: restore_service_snapshot deliberately does
+            # not restart such instances because a new process cannot regain
+            # the accepted connection.  Restore the template on disk and let
+            # existing sessions finish naturally.
+            continue
         load = command("show", unit, "--property=LoadState", "--value")
         load_state = load.stdout.strip()
         if load_state == "not-found":
@@ -2152,6 +2167,24 @@ def discover_template_instances(*, run=subprocess.run, message: str) -> set[str]
                 and not result.stderr.strip()
                 and not result.stdout.strip()
             )
+            if expected_empty_no_match:
+                # rc=1 + empty output is also how a broken manager transport
+                # can present.  Accept it as "no matches" only after an
+                # independent manager query proves systemd is reachable.
+                manager = run(
+                    [
+                        "/usr/bin/systemctl",
+                        "show",
+                        "--property=Version",
+                        "--value",
+                    ],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                )
+                expected_empty_no_match = (
+                    manager.returncode == 0 and bool(manager.stdout.strip())
+                )
             if result.returncode and not expected_empty_no_match:
                 raise RuntimeError(result.stderr.strip() or message)
             for line in result.stdout.splitlines():
@@ -3032,18 +3065,23 @@ class FileTransaction:
             # it is what produces the precise drift message, and it means the
             # quarantine below almost never has to be undone.
             self._assert_removal_at(record, parent_fd, target.name, target)
-            quarantine = f".{target.name}.aicc-purge-{secrets.token_hex(8)}"
-            try:
-                os.rename(
-                    target.name,
-                    quarantine,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                )
-            except FileNotFoundError as exc:
+            for _attempt in range(16):
+                quarantine = f".{target.name}.aicc-purge-{secrets.token_hex(8)}"
+                try:
+                    _rename_noreplace(
+                        parent_fd, target.name, parent_fd, quarantine
+                    )
+                    break
+                except FileExistsError:
+                    continue
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"purge target disappeared before removal: {target}"
+                    ) from exc
+            else:
                 raise RuntimeError(
-                    f"purge target disappeared before removal: {target}"
-                ) from exc
+                    f"cannot allocate collision-free purge quarantine: {target}"
+                )
             os.fsync(parent_fd)
             try:
                 self._assert_removal_at(record, parent_fd, quarantine, target)
@@ -3151,18 +3189,23 @@ class FileTransaction:
                     f"purge directory disappeared before removal: {target}"
                 ) from exc
             self._assert_directory_state(record, info, target)
-            quarantine = f".{target.name}.aicc-purge-{secrets.token_hex(8)}"
-            try:
-                os.rename(
-                    target.name,
-                    quarantine,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                )
-            except OSError as exc:
+            for _attempt in range(16):
+                quarantine = f".{target.name}.aicc-purge-{secrets.token_hex(8)}"
+                try:
+                    _rename_noreplace(
+                        parent_fd, target.name, parent_fd, quarantine
+                    )
+                    break
+                except FileExistsError:
+                    continue
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"purge directory disappeared before removal: {target}"
+                    ) from exc
+            else:
                 raise RuntimeError(
-                    f"purge directory disappeared before removal: {target}"
-                ) from exc
+                    f"cannot allocate collision-free purge quarantine: {target}"
+                )
             os.fsync(parent_fd)
             try:
                 held = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
@@ -3280,8 +3323,13 @@ class FileTransaction:
         # Keep the primary WAL until every auxiliary forward action is
         # terminal. A crash during retirement must still boot the exact
         # generation capsule rather than leave an auxiliary-only journal.
-        self._run_sensitive_retirement()
+        # Keep the auxiliary intent until the primary pending WAL is gone.
+        # If we crash after redaction, COMMITTING recovery still has the
+        # durable authority it requires and can repeat the idempotent work.
+        self._run_sensitive_retirement(consume_intent=False)
         self.pending.unlink()
+        _fsync_dir(self.state_dir)
+        self._run_sensitive_retirement()
         # The snapshot is spent once committed; leaving it at the fixed path
         # lets a later recover() apply a stale snapshot against a different
         # generation (review on d8920b6).
@@ -3439,7 +3487,7 @@ class FileTransaction:
             _preflight_sensitive_records(self.state_dir, manifest, retired)
         return retired, manifests
 
-    def _run_sensitive_retirement(self) -> None:
+    def _run_sensitive_retirement(self, *, consume_intent: bool = True) -> None:
         """Destroy every reachable copy of a credential this host purged.
 
         A removal is reversible only because `prepare()` copied the target
@@ -3480,8 +3528,9 @@ class FileTransaction:
         retired, manifests = plan
         for manifest in manifests:
             _redact_sensitive_records(manifest, retired)
-        (self.state_dir / SENSITIVE_RETIREMENT_JOURNAL).unlink()
-        _fsync_dir(self.state_dir)
+        if consume_intent:
+            (self.state_dir / SENSITIVE_RETIREMENT_JOURNAL).unlink()
+            _fsync_dir(self.state_dir)
 
     def _restore_release_selector(self, *, clear_pending: bool = True) -> None:
         if not _path_present(self.pending_release):
@@ -3757,8 +3806,13 @@ class FileTransaction:
             # The generation is live, so the revocation it made is terminal
             # and the secrets it purged must not survive in its backups.
             finalize_authority_membership(self.state_dir, manifest)
-            self._run_sensitive_retirement()
+            # Do not consume the intent while pending.json still says that
+            # recovery owns this COMMITTING generation.  A crash between the
+            # two unlinks must retain enough authority for the next boot.
+            self._run_sensitive_retirement(consume_intent=False)
             self.pending.unlink()
+            _fsync_dir(self.state_dir)
+            self._run_sensitive_retirement()
             # The interrupted commit's service snapshot is spent: leaving it
             # at the fixed path lets a LATER recover() apply it against a
             # different generation (review on 0f4d77e).
