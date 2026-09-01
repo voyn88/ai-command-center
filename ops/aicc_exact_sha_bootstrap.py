@@ -567,6 +567,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "action", nargs="?", choices=("install", "uninstall"), default="install"
     )
     parser.add_argument("--expected-sha", required=True)
+    parser.add_argument(
+        "--profile",
+        choices=("worker", "control"),
+        default="worker",
+        help=(
+            "Host role to install. 'control' omits the agent launcher, worker "
+            "units and agent model credentials, which a control-plane host "
+            "must not hold. Default 'worker' keeps every existing invocation "
+            "installing exactly what it already installed."
+        ),
+    )
     parser.add_argument("--state-root", type=Path, default=DEFAULT_STATE_ROOT)
     parser.add_argument("--authority-env", type=Path, default=DEFAULT_AUTHORITY_ENV)
     parser.add_argument("--verify-attestation", type=Path)
@@ -688,6 +699,7 @@ def main(
             "AICC_BOOTSTRAP_ATTESTATION": str(attestation_path),
             "AICC_EXPECTED_RELEASE_SHA": args.expected_sha,
             "AICC_INSTALL_LOCK_FD": str(lock_fd),
+            "AICC_INSTALL_PROFILE": args.profile,
         }
         if args.action == "install":
             _refuse_unfinished_uninstall()
