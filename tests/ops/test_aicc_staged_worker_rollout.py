@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pytest
 
+# The rollout reads root-owned registries and release trees, so its fixtures
+# are built host-shaped and the suite runs under the permissive 0o002 umask.
+# See tests/ops/conftest.py.
+pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
+
 
 def _module():
     path = Path(__file__).parents[2] / "ops" / "aicc_staged_worker_rollout.py"
@@ -927,3 +932,127 @@ def test_rollout_checks_required_files_before_retiring_anything():
 
     # Nothing was retired, enabled, started or stopped: the refusal came first.
     assert systemd.states == before
+
+
+def _launcher_state(unit: str, *, active: bool = True) -> dict[str, str]:
+    return {
+        "enabled": False,
+        "LoadState": "loaded",
+        "FragmentPath": "/etc/systemd/system/aicc-agent-launcher@.service",
+        "DropInPaths": "",
+        "ActiveState": "active" if active else "inactive",
+        "SubState": "running" if active else "dead",
+        "NoNewPrivileges": "yes",
+        "ProtectSystem": "strict",
+        "ProtectHome": "yes",
+        "ProtectControlGroups": "yes",
+        "SupplementaryGroups": "aicc-publisher",
+        "User": "aicc-agent",
+        "Group": "aicc-agent",
+        "ExecStart": "/usr/libexec/aicc-agent-launcher",
+        "WorkingDirectory": "/var/lib/aicc-agent",
+        "EnvironmentFiles": "",
+        "MainPID": "4100" if active else "0",
+    }
+
+
+def test_broker_instances_are_discovered_for_the_snapshot_not_for_the_rollout(
+    tmp_path,
+):
+    """A `aicc-agent-launcher@<connection>.service` runs off a template the
+    control generation deletes, so it belongs in the snapshot a rollback
+    restores. It is not a worker lane, so it must not reach the rollout that
+    drains, starts and verifies lanes."""
+    module = _module()
+    lanes = tmp_path / "lanes"
+    lanes.write_text("1\n", encoding="utf-8")
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["aicc-agent-launcher@7.service"] = _launcher_state(
+        "aicc-agent-launcher@7.service"
+    )
+
+    assert module.discover_launcher_units(systemd) == (
+        "aicc-agent-launcher@7.service",
+    )
+    assert module.discover_units(systemd, lanes) == ("voyn-aicc-worker@1.service",)
+
+
+def test_snapshot_closure_refuses_a_broker_instance_outside_the_snapshot():
+    """The snapshot is what a rollback restores; a live unit absent from it is
+    a unit no rollback can put back."""
+    module = _module()
+    systemd = FakeSystemd(("voyn-aicc-worker@blue.service",))
+    systemd.states["aicc-agent-launcher@7.service"] = _launcher_state(
+        "aicc-agent-launcher@7.service"
+    )
+    state = {
+        "version": 3,
+        "units": {
+            "voyn-aicc-worker@blue.service": {
+                "exists": True,
+                "enabled": True,
+                "active": True,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="outside service snapshot"):
+        module.verify_snapshot_closure(systemd, state)
+
+
+def test_a_snapshot_covering_the_broker_instances_passes_closure():
+    module = _module()
+    systemd = FakeSystemd(("voyn-aicc-worker@blue.service",))
+    systemd.states["aicc-agent-launcher@7.service"] = _launcher_state(
+        "aicc-agent-launcher@7.service"
+    )
+    state = {
+        "version": 3,
+        "units": {
+            unit: {"exists": True, "enabled": True, "active": True, "properties": {}}
+            for unit in (
+                "voyn-aicc-worker@blue.service",
+                "aicc-agent-launcher@7.service",
+            )
+        },
+    }
+
+    module.verify_snapshot_closure(systemd, state)
+
+
+def test_a_broker_instance_the_snapshot_records_as_absent_is_stopped_and_disabled():
+    """Rollback of a control transition: the snapshot says the instance did
+    not exist, so restoring it means proving it is stopped, disabled and
+    unloaded -- which the restorable-unit pattern has to accept before any of
+    that can even be attempted."""
+    module = _module()
+
+    class HostWhereTheInstanceIsGone(FakeSystemd):
+        """Real systemctl stops/disables a not-found unit without error; the
+        strict fake refuses undeclared names to catch typo'd rollout targets,
+        which is not what an already-absent instance is."""
+
+        def run(self, *args: str, check: bool = True) -> str:
+            if args[0] in {"stop", "disable"} and args[-1] not in self.states:
+                self.calls.append(args)
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = HostWhereTheInstanceIsGone(())
+    state = {
+        "version": 3,
+        "units": {
+            "aicc-agent-launcher@7.service": {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    module.restore(systemd, state)
+
+    assert ("stop", "aicc-agent-launcher@7.service") in systemd.calls
+    assert ("disable", "aicc-agent-launcher@7.service") in systemd.calls

@@ -245,6 +245,9 @@ if [ "${1:-}" = "--uninstall" ]; then
   run_transaction quiesce --service-snapshot "$uninstall_units"
   run_rollout verify-snapshot-closure --state "$uninstall_units"
   systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  # See the rollback trap: the socket's already-accepted sessions are separate
+  # units and outlive it.
+  systemctl stop 'aicc-agent-launcher@*.service' >/dev/null 2>&1 || true
   run_transaction uninstall
   systemctl daemon-reload
   run_transaction uninstall-select-baseline \
@@ -344,6 +347,12 @@ rollback() {
   rollback_complete=1
   if [ "$transaction_active" -eq 1 ] && path_present "$state_dir/pending.json"; then
     systemctl disable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
+    # Disabling the socket stops it listening; it does nothing to the
+    # `aicc-agent-launcher@<connection>.service` instances it already spawned,
+    # which keep running off the same template. Best effort here -- the
+    # authoritative statement is the snapshot-closure check inside `recover`,
+    # which refuses to mutate while any of them is still outside the snapshot.
+    systemctl stop 'aicc-agent-launcher@*.service' >/dev/null 2>&1 || true
     if ! run_transaction recover; then
       # Keep pending.json, its generation, and attempt-units.json intact.
       # The boot recovery unit retries the same compare-and-restore plus
@@ -404,6 +413,15 @@ transaction_active=1
 # above calls `recover`, and no target has been mutated yet.
 if [ "$install_profile" = "control" ]; then
   run_transaction quiesce-worker-only
+  # /etc/aicc/workspace-authority.env is 0640 root:aicc-publisher on every
+  # profile, and deploy/sysusers.d/aicc-agent.conf put `aicc-worker` and
+  # `voynadmin` in that group on this host when it was a worker. sysusers
+  # never removes a membership, so without this the control plane's authority
+  # key stays readable by two worker-era principals -- the boundary this
+  # profile exists to draw, left open. Journalled before it mutates anything
+  # and undone by the same `recover` the trap above runs, so a failure
+  # anywhere before commit puts the memberships back.
+  run_transaction revoke-worker-authority
 fi
 run_transaction apply
 # Build and atomically select the committed, immutable tree + virtualenv only

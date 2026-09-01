@@ -14,6 +14,11 @@ from types import SimpleNamespace
 
 import pytest
 
+# Every test here drives the privileged installer, so every test builds its
+# fixture paths the way a host has them and runs under the permissive 0o002
+# umask an operator may well have. See tests/ops/conftest.py.
+pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
+
 
 def _module():
     path = Path(__file__).parents[2] / "ops" / "aicc_install_transaction.py"
@@ -2946,5 +2951,1371 @@ def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):
     validated = module.FileTransaction.validate_sources(specs)
 
     assert len(validated) == len(specs)
-    assert {spec.target for spec in specs if spec.remove} == module.WORKER_ONLY_TARGETS
+    assert {
+        spec.target for spec in specs if spec.remove and not spec.directory
+    } == module.WORKER_ONLY_TARGETS
+    assert [
+        spec.target for spec in specs if spec.remove and spec.directory
+    ] == list(module.WORKER_ONLY_DIRECTORIES)
     assert not (tmp_path / "absent-claude.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Compare-and-destroy without a second name resolution.
+#
+# Comparing a path and then unlinking the same path resolves that name twice,
+# and an untrusted writer of the directory only has to win the gap between the
+# two to have a root-run installer destroy a file it never examined. The
+# object is therefore renamed into an unpredictable quarantine entry under a
+# pinned parent descriptor FIRST; the comparison that authorises destruction
+# and the unlink that performs it both address that entry, and nothing that
+# happens to the pathname afterwards reaches it.
+# ---------------------------------------------------------------------------
+
+
+def _purge_record(module, manifest, target: str):
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    return next(
+        record
+        for record in module._generation_records(payload)
+        if record.target == target
+    )
+
+
+def test_a_swap_after_the_final_compare_cannot_redirect_the_destruction(
+    monkeypatch, tmp_path
+):
+    """The exact interposition the pathname version could not survive.
+
+    The comparison passes, and *then* -- before the destruction -- a decoy
+    lands at the pathname. Under compare-then-unlink-the-path, root deletes
+    the decoy: a file this generation never read, never backed up and cannot
+    put back. Here the comparison already ran against the quarantined inode,
+    so the unlink takes that inode and the decoy is untouched.
+    """
+    module = _module()
+    transaction, manifest, worker_only, installed = _control_shaped_generation(
+        module, tmp_path
+    )
+    record = _purge_record(module, manifest, "/etc/aicc/agent.env")
+    real_assert = module.FileTransaction._assert_removal_at
+    interposed = {"done": False}
+
+    def swap_after_the_authorising_compare(this, held, parent_fd, name, target):
+        real_assert(this, held, parent_fd, name, target)
+        if name == target.name:
+            # The cheap pathname pre-check. The compare that authorises the
+            # unlink is the one below, against the quarantine entry.
+            return
+        decoy = tmp_path / "decoy"
+        decoy.write_bytes(b"someone-elses-file")
+        decoy.chmod(0o600)
+        os.replace(decoy, target)
+        interposed["done"] = True
+
+    monkeypatch.setattr(
+        module.FileTransaction, "_assert_removal_at", swap_after_the_authorising_compare
+    )
+
+    transaction._apply_removal(record)
+
+    assert interposed["done"], "the interposition never fired"
+    assert worker_only.read_bytes() == b"someone-elses-file"
+    assert stat.S_IMODE(worker_only.stat().st_mode) == 0o600
+    assert not list(worker_only.parent.glob(".agent.env.aicc-purge-*")), (
+        "the quarantined snapshot was not destroyed"
+    )
+    assert installed.exists() is False
+
+
+def test_a_swap_before_the_quarantine_compare_is_put_back_without_data_loss(
+    monkeypatch, tmp_path
+):
+    """The other side of the same window: the swap lands before the rename,
+    so the decoy -- not the snapshotted file -- is what gets quarantined. The
+    comparison refuses it, and the decoy goes back under its own name intact.
+    A refused removal must never cost anyone a file."""
+    module = _module()
+    transaction, manifest, worker_only, _installed = _control_shaped_generation(
+        module, tmp_path
+    )
+    record = _purge_record(module, manifest, "/etc/aicc/agent.env")
+    real_assert = module.FileTransaction._assert_removal_at
+
+    def swap_between_the_pre_check_and_the_rename(this, held, parent_fd, name, target):
+        real_assert(this, held, parent_fd, name, target)
+        if name != target.name:
+            return
+        decoy = tmp_path / "decoy"
+        decoy.write_bytes(b"someone-elses-file")
+        decoy.chmod(0o600)
+        os.replace(decoy, target)
+
+    monkeypatch.setattr(
+        module.FileTransaction,
+        "_assert_removal_at",
+        swap_between_the_pre_check_and_the_rename,
+    )
+
+    with pytest.raises(RuntimeError, match="changed before compare-and-remove"):
+        transaction._apply_removal(record)
+
+    assert worker_only.read_bytes() == b"someone-elses-file"
+    assert stat.S_IMODE(worker_only.stat().st_mode) == 0o600
+    assert not list(worker_only.parent.glob(".agent.env.aicc-purge-*")), (
+        "a refused removal left the object stranded under its quarantine name"
+    )
+
+
+def test_the_whole_generation_fails_closed_on_a_late_purge_swap(monkeypatch, tmp_path):
+    """Through the real apply(), not one record: the refusal above must fail
+    the generation, keep the durable WAL, and leave the interposed file
+    exactly where its author put it."""
+    module = _module()
+    transaction, _manifest, worker_only, _installed = _control_shaped_generation(
+        module, tmp_path
+    )
+    real_assert = module.FileTransaction._assert_removal_at
+    pathname_compares = {"count": 0}
+
+    def swap_on_the_second_pathname_compare(this, held, parent_fd, name, target):
+        real_assert(this, held, parent_fd, name, target)
+        if name != target.name:
+            return
+        pathname_compares["count"] += 1
+        # 1 = apply()'s pre-mutation sweep, 2 = _apply_removal's pre-check.
+        if pathname_compares["count"] != 2:
+            return
+        decoy = tmp_path / "decoy"
+        decoy.write_bytes(b"someone-elses-file")
+        decoy.chmod(0o600)
+        os.replace(decoy, target)
+
+    monkeypatch.setattr(
+        module.FileTransaction,
+        "_assert_removal_at",
+        swap_on_the_second_pathname_compare,
+    )
+
+    with pytest.raises(RuntimeError):
+        transaction.apply()
+
+    assert pathname_compares["count"] == 2
+    assert worker_only.read_bytes() == b"someone-elses-file"
+    assert transaction.pending.exists(), "a refused generation keeps its durable WAL"
+
+
+def test_a_quarantine_that_cannot_be_put_back_reports_where_it_is(
+    monkeypatch, tmp_path
+):
+    """`link` and not `rename`, so a name someone else has claimed since is
+    not silently overwritten. Both objects survive and the error names the
+    quarantine entry the operator has to deal with."""
+    module = _module()
+    transaction, manifest, worker_only, _installed = _control_shaped_generation(
+        module, tmp_path
+    )
+    record = _purge_record(module, manifest, "/etc/aicc/agent.env")
+    real_assert = module.FileTransaction._assert_removal_at
+
+    def refuse_the_quarantine_and_reclaim_the_name(this, held, parent_fd, name, target):
+        if name == target.name:
+            return real_assert(this, held, parent_fd, name, target)
+        target.write_bytes(b"claimed-in-the-window")
+        raise RuntimeError("purge target changed before compare-and-remove")
+
+    monkeypatch.setattr(
+        module.FileTransaction,
+        "_assert_removal_at",
+        refuse_the_quarantine_and_reclaim_the_name,
+    )
+
+    with pytest.raises(RuntimeError, match="could not be put back and is retained at"):
+        transaction._apply_removal(record)
+
+    assert worker_only.read_bytes() == b"claimed-in-the-window"
+    quarantined = list(worker_only.parent.glob(".agent.env.aicc-purge-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b"agent-secret", (
+        "the snapshotted file must still exist under some name"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sensitive-removal retirement.
+#
+# A removal is reversible only because prepare() copied the target into the
+# generation's backups first. For the two model credentials that copy is the
+# same secret in a second place, on the host whose entire premise is that it
+# does not hold them -- so a committed control generation destroys it, and
+# every older copy of the same target in the state directory, in an explicit
+# finalisation phase driven by its own durable journal.
+# ---------------------------------------------------------------------------
+
+CLAUDE_CREDENTIAL = "/var/lib/aicc-agent/claude/.claude/.credentials.json"
+CODEX_CREDENTIAL = "/var/lib/aicc-agent/codex/.codex/auth.json"
+CLAUDE_BYTES = b"CLAUDE-OAUTH-REFRESH-TOKEN-0001"
+CODEX_BYTES = b"CODEX-OAUTH-REFRESH-TOKEN-0002"
+
+
+def _byte_search(root: Path, needle: bytes) -> list[Path]:
+    """Every regular file under `root` whose bytes contain `needle`."""
+    hits = []
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if needle in path.read_bytes():
+            hits.append(path)
+    return hits
+
+
+def _worker_host_with_credentials(module, tmp_path):
+    """A host that ran the worker profile: both credentials installed by a
+    committed generation, so the state directory holds a staged copy and the
+    targets hold the live ones."""
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    claude_source = tmp_path / "claude.json"
+    claude_source.write_bytes(CLAUDE_BYTES)
+    codex_source = tmp_path / "codex.json"
+    codex_source.write_bytes(CODEX_BYTES)
+    transaction = module.FileTransaction(root, state)
+    transaction.install(
+        (
+            _spec(module, claude_source, CLAUDE_CREDENTIAL, 0o600),
+            _spec(module, codex_source, CODEX_CREDENTIAL, 0o600),
+        )
+    )
+    assert _byte_search(state, CLAUDE_BYTES), "the worker generation staged the secret"
+    return transaction, root, state
+
+
+def _control_transition_specs(module, tmp_path):
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    return (
+        _spec(module, control_source, "/etc/control-file"),
+        module.removal_spec(CLAUDE_CREDENTIAL, sensitive=True),
+        module.removal_spec(CODEX_CREDENTIAL, sensitive=True),
+    )
+
+
+def test_a_committed_control_generation_retains_no_credential_byte(tmp_path):
+    """The whole claim, asserted by searching every byte the host still has:
+    not in the targets, not in this generation's backups, and not in the
+    previous worker generation that is still reachable through the chain."""
+    module = _module()
+    transaction, root, state = _worker_host_with_credentials(module, tmp_path)
+
+    transaction.install(_control_transition_specs(module, tmp_path))
+
+    assert not (root / CLAUDE_CREDENTIAL.lstrip("/")).exists()
+    assert not (root / CODEX_CREDENTIAL.lstrip("/")).exists()
+    for secret in (CLAUDE_BYTES, CODEX_BYTES):
+        assert _byte_search(state, secret) == [], "a credential survived in state"
+        assert _byte_search(root, secret) == [], "a credential survived on the host"
+    assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
+    assert (root / "etc/control-file").read_bytes() == b"control-only"
+    # More than one generation is still on disk: the retirement redacts, it
+    # does not blow the chain away.
+    assert len(list(state.glob("generation-*"))) == 2
+
+
+def test_a_failure_before_commit_still_restores_both_credentials(
+    monkeypatch, tmp_path
+):
+    """The retirement is armed inside commit(), so everything before commit
+    keeps the ordinary rollback guarantee: a control transition that purges
+    the credentials and then fails puts them back byte-for-byte."""
+    module = _module()
+    transaction, root, state = _worker_host_with_credentials(module, tmp_path)
+    specs = _control_transition_specs(module, tmp_path)
+    transaction.prepare(
+        (specs[1], specs[2], specs[0])  # purge first, then the install that fails
+    )
+    real_atomic = module._atomic_bytes
+
+    def fail_the_control_install(path, *args, **kwargs):
+        if path == root / "etc/control-file":
+            raise OSError("injected post-purge failure")
+        return real_atomic(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_atomic_bytes", fail_the_control_install)
+
+    with pytest.raises(OSError, match="injected post-purge failure"):
+        transaction.apply()
+
+    for target, payload in (
+        (CLAUDE_CREDENTIAL, CLAUDE_BYTES),
+        (CODEX_CREDENTIAL, CODEX_BYTES),
+    ):
+        restored = root / target.lstrip("/")
+        assert restored.read_bytes() == payload
+        assert stat.S_IMODE(restored.stat().st_mode) == 0o600
+    assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
+
+
+def test_a_crash_between_commit_and_retirement_is_finished_by_recover(
+    monkeypatch, tmp_path
+):
+    """The journal is armed while the generation is still governed by a
+    COMMITTING WAL, so a crash anywhere after it leaves an outstanding
+    destruction that recover() completes -- not a committed control host with
+    the credentials still in its backups."""
+    module = _module()
+    transaction, root, state = _worker_host_with_credentials(module, tmp_path)
+    crashed = {"active": True}
+    real_retirement = module.FileTransaction._run_sensitive_retirement
+
+    def crash_before_retiring(this):
+        if crashed["active"]:
+            return
+        return real_retirement(this)
+
+    monkeypatch.setattr(
+        module.FileTransaction, "_run_sensitive_retirement", crash_before_retiring
+    )
+
+    transaction.install(_control_transition_specs(module, tmp_path))
+
+    assert (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
+    assert _byte_search(state, CLAUDE_BYTES), "the crash is not being simulated"
+
+    crashed["active"] = False
+    module.FileTransaction(root, state).recover()
+
+    assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
+    for secret in (CLAUDE_BYTES, CODEX_BYTES):
+        assert _byte_search(state, secret) == []
+
+
+def test_a_retired_generation_refuses_rollback_by_name(tmp_path):
+    """Not silently impossible: the record survives saying a secret was here
+    and was destroyed on purpose, and restore() refuses it by target rather
+    than skipping it or failing with a shape error nobody can act on."""
+    module = _module()
+    transaction, root, state = _worker_host_with_credentials(module, tmp_path)
+    transaction.install(_control_transition_specs(module, tmp_path))
+    manifest = Path(
+        json.loads(transaction.current.read_text(encoding="utf-8"))["manifest"]
+    )
+    records = module._generation_records(
+        json.loads(manifest.read_text(encoding="utf-8"))
+    )
+    retired = [record for record in records if record.sensitive_retired]
+
+    assert {record.target for record in retired} == {
+        CLAUDE_CREDENTIAL,
+        CODEX_CREDENTIAL,
+    }
+    assert all(record.backup is None and record.staged == "" for record in retired)
+    with pytest.raises(RuntimeError, match="retired at commit"):
+        transaction.restore(manifest)
+
+
+def test_uninstalling_a_retired_control_host_completes_without_resurrection(tmp_path):
+    """The one caller that accepts it. Unwinding an installation means leaving
+    the host without AICC state, and a credential the control profile removed
+    on purpose is exactly that -- so uninstall finishes, and does not put the
+    secret back."""
+    module = _module()
+    transaction, root, state = _worker_host_with_credentials(module, tmp_path)
+    transaction.install(_control_transition_specs(module, tmp_path))
+
+    transaction.uninstall_all()
+
+    assert not (root / CLAUDE_CREDENTIAL.lstrip("/")).exists()
+    assert not (root / CODEX_CREDENTIAL.lstrip("/")).exists()
+    assert not (root / "etc/control-file").exists()
+    assert not transaction.current.exists()
+    for secret in (CLAUDE_BYTES, CODEX_BYTES):
+        assert _byte_search(root, secret) == []
+        assert _byte_search(state, secret) == []
+
+
+def test_retiring_a_target_this_generation_never_held_arms_nothing(tmp_path):
+    """A control host that never ran the worker profile has no credential to
+    purge, so there is no finalisation phase and no journal to consume."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+
+    transaction.install(
+        (
+            _spec(module, control_source, "/etc/control-file"),
+            module.removal_spec(CLAUDE_CREDENTIAL, sensitive=True),
+        )
+    )
+
+    assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
+    manifest = Path(
+        json.loads(transaction.current.read_text(encoding="utf-8"))["manifest"]
+    )
+    records = module._generation_records(
+        json.loads(manifest.read_text(encoding="utf-8"))
+    )
+    assert not any(record.sensitive_retired for record in records)
+    # And it is still rollbackable, unlike a generation that really did
+    # destroy a backup.
+    transaction.restore(manifest)
+
+
+# ---------------------------------------------------------------------------
+# Publisher-group membership.
+#
+# /etc/aicc/workspace-authority.env is 0640 root:aicc-publisher on every
+# profile, and deploy/sysusers.d/aicc-agent.conf puts `aicc-worker` and
+# `voynadmin` in that group. sysusers never removes a membership, so a host
+# converted from worker to control kept two worker-era principals able to
+# read the control plane's authority key. The group IS the boundary, so the
+# membership is what has to go -- dropping the file's group bits instead
+# would move the boundary rather than enforce it.
+# ---------------------------------------------------------------------------
+
+
+def _publisher_group(module, tmp_path, members):
+    """A state directory plus an injectable publisher group and gpasswd."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    os.chmod(state, 0o700)
+    live = set(members)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        assert command[0] == module.GPASSWD
+        assert command[3] == module.AUTHORITY_GROUP
+        if command[1] == "-d":
+            live.discard(command[2])
+        else:
+            live.add(command[2])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def getgrnam(name):
+        assert name == module.AUTHORITY_GROUP
+        return SimpleNamespace(gr_gid=4242, gr_mem=sorted(live))
+
+    return state, live, calls, run, getgrnam
+
+
+def test_the_control_transition_revokes_the_legacy_publisher_membership(tmp_path):
+    module = _module()
+    state, live, calls, run, getgrnam = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin", "aicc-control-plane"}
+    )
+
+    revoked = module.revoke_legacy_authority_membership(
+        state, run=run, getgrnam=getgrnam
+    )
+
+    assert set(revoked) == {"aicc-worker", "voynadmin"}
+    assert live == {"aicc-control-plane"}, "a member nobody named was disturbed"
+    assert [call[1] for call in calls] == ["-d", "-d"]
+    journal = json.loads(
+        (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).read_text(encoding="utf-8")
+    )
+    assert journal["members_before"] == [
+        "aicc-control-plane",
+        "aicc-worker",
+        "voynadmin",
+    ]
+
+
+def test_the_revocation_is_undone_exactly_by_the_rollback(tmp_path):
+    module = _module()
+    state, live, _calls, run, getgrnam = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin", "aicc-control-plane"}
+    )
+    module.revoke_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+
+    module.restore_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+
+    assert live == {"aicc-worker", "voynadmin", "aicc-control-plane"}
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+
+def test_a_revocation_that_cannot_be_proven_fails_closed_with_its_journal(tmp_path):
+    """Root-mediated and fail-closed in both directions: an unproven removal
+    raises rather than letting the install continue believing the boundary
+    holds, and the durable journal stays so the rollback can still undo the
+    members that did come out."""
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    os.chmod(state, 0o700)
+    live = {"aicc-worker", "voynadmin"}
+
+    def run(command, **kwargs):
+        if command[2] == "voynadmin":
+            return SimpleNamespace(returncode=1, stdout="", stderr="denied")
+        live.discard(command[2])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def getgrnam(name):
+        return SimpleNamespace(gr_gid=4242, gr_mem=sorted(live))
+
+    with pytest.raises(RuntimeError, match="cannot revoke legacy authority membership"):
+        module.revoke_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+
+    assert live == {"voynadmin"}
+    assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+
+def test_a_restore_that_cannot_be_proven_keeps_the_journal_for_the_next_attempt(
+    tmp_path,
+):
+    module = _module()
+    state, live, _calls, run, getgrnam = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    module.revoke_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+
+    def refuse(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="denied")
+
+    with pytest.raises(
+        RuntimeError, match="cannot restore legacy authority membership"
+    ):
+        module.restore_legacy_authority_membership(
+            state, run=refuse, getgrnam=getgrnam
+        )
+
+    assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+
+def test_a_revocation_is_idempotent_across_a_retried_install(tmp_path):
+    module = _module()
+    state, live, calls, run, getgrnam = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    module.revoke_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+
+    module.revoke_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+
+    assert live == set()
+    journal = json.loads(
+        (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).read_text(encoding="utf-8")
+    )
+    assert journal["revoked"] == ["aicc-worker", "voynadmin"], (
+        "a retry must not overwrite the pre-state with the already-revoked one"
+    )
+
+
+def _restoring_recover(module, monkeypatch, run, getgrnam):
+    real_restore = module.restore_legacy_authority_membership
+    monkeypatch.setattr(
+        module,
+        "restore_legacy_authority_membership",
+        lambda state_dir: real_restore(state_dir, run=run, getgrnam=getgrnam),
+    )
+
+
+def test_recover_restores_the_membership_a_rolled_back_generation_revoked(
+    monkeypatch, tmp_path
+):
+    """One rollback boundary: the operator runs the same `recover` the
+    installer's trap runs, and the files and the authority come back
+    together."""
+    module = _module()
+    root = tmp_path / "root"
+    state, live, _calls, run, getgrnam = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    worker_only = root / "etc/aicc/agent.env"
+    worker_only.parent.mkdir(parents=True)
+    worker_only.write_bytes(b"agent-secret")
+    worker_only.chmod(0o640)
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((module.removal_spec("/etc/aicc/agent.env"),))
+    module.revoke_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+    assert live == set()
+    _restoring_recover(module, monkeypatch, run, getgrnam)
+
+    transaction.recover()
+
+    assert worker_only.read_bytes() == b"agent-secret"
+    assert live == {"aicc-worker", "voynadmin"}
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+
+def test_commit_makes_the_revocation_terminal(monkeypatch, tmp_path):
+    """A committed control host must not have its worker-era memberships put
+    back by the next recover(): the generation is live, so the revocation it
+    made is part of what is live."""
+    module = _module()
+    root = tmp_path / "root"
+    state, live, _calls, run, getgrnam = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    source = tmp_path / "control-file"
+    source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/control-file"),))
+    module.revoke_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+    transaction.apply()
+
+    transaction.commit()
+
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+    _restoring_recover(module, monkeypatch, run, getgrnam)
+    module.FileTransaction(root, state).recover()
+    assert live == set(), "a committed revocation was undone by a later recover"
+
+
+def test_an_interrupted_commit_finalises_the_membership_it_did_not_reach(
+    monkeypatch, tmp_path
+):
+    """recover() resolves the auxiliary journal in the same direction as the
+    generation it belongs to: a COMMITTING journal is finished, so the
+    membership is finalised rather than restored."""
+    module = _module()
+    root = tmp_path / "root"
+    state, live, _calls, run, getgrnam = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    source = tmp_path / "control-file"
+    source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare((_spec(module, source, "/etc/control-file"),))
+    module.revoke_legacy_authority_membership(state, run=run, getgrnam=getgrnam)
+    transaction.apply()
+    transaction._write_journal(manifest, "COMMITTING", 1)
+    _restoring_recover(module, monkeypatch, run, getgrnam)
+
+    module.FileTransaction(root, state).recover()
+
+    assert (root / "etc/control-file").read_bytes() == b"control-only"
+    assert live == set()
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+
+def test_revoke_worker_authority_is_refused_outside_the_control_profile(tmp_path):
+    """Under any other profile it would strip the publisher group of the very
+    members that profile installs against."""
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    args = SimpleNamespace(
+        action="revoke-worker-authority",
+        state_dir=state,
+        repo_root=tmp_path,
+        root=tmp_path / "root",
+        profile="worker",
+    )
+
+    with pytest.raises(RuntimeError, match="requires the control profile"):
+        module._dispatch(args, argparse.ArgumentParser())
+
+
+def test_the_authority_journal_refuses_a_member_outside_the_legacy_set(tmp_path):
+    """A journal claiming to have revoked something else would make the
+    rollback add a membership no install ever took away."""
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    os.chmod(state, 0o700)
+    journal = state / module.AUTHORITY_MEMBERSHIP_JOURNAL
+    journal.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "group": "aicc-publisher",
+                "members_before": ["root"],
+                "revoked": ["root"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="authority membership journal is invalid"):
+        module.restore_legacy_authority_membership(state)
+
+
+# ---------------------------------------------------------------------------
+# Template instances: worker lanes AND broker sessions.
+#
+# Neither `voyn-aicc-worker@<lane>` nor `aicc-agent-launcher@<connection>` has
+# a unit file of its own. Both run off a template the control generation
+# removes, so both have to be discovered from systemd, snapshotted, stopped
+# and recognised as restorable by the template the journal actually names.
+# ---------------------------------------------------------------------------
+
+
+def _listing_runner(*, workers=(), launchers=(), loaded=()):
+    def run(command, **kwargs):
+        if command[1] == "list-unit-files":
+            return SimpleNamespace(returncode=1, stderr="", stdout="")
+        if command[1] == "list-units":
+            names = (
+                launchers
+                if command[2] == "aicc-agent-launcher@*.service"
+                else workers
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout="".join(f"{name} loaded active running\n" for name in names),
+            )
+        if command[1] == "show":
+            state = "loaded" if command[2] in loaded else "not-found"
+            return SimpleNamespace(returncode=0, stderr="", stdout=f"{state}\n")
+        if command[1] == "disable":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        raise AssertionError(f"unexpected systemctl call: {command}")
+
+    return run
+
+
+def test_the_control_purge_stops_every_live_broker_instance(tmp_path):
+    """Naming only `aicc-agent-launcher.socket` left every accepted session
+    running as its own unit, off a fragment apply() was about to delete."""
+    module = _module()
+    calls = []
+    listing = _listing_runner(
+        workers=("voyn-aicc-worker@1.service",),
+        launchers=("● aicc-agent-launcher@7.service", "aicc-agent-launcher@9.service"),
+        loaded={
+            "aicc-agent-launcher.socket",
+            "aicc-agent-launcher@7.service",
+            "aicc-agent-launcher@9.service",
+            "voyn-aicc-worker@1.service",
+        },
+    )
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        return listing(command, **kwargs)
+
+    module.quiesce_worker_only_units(run=run)
+
+    disabled = [call[3] for call in calls if call[1] == "disable"]
+    assert set(disabled) == {
+        "aicc-agent-launcher.socket",
+        "aicc-agent-launcher@7.service",
+        "aicc-agent-launcher@9.service",
+        "voyn-aicc-worker@1.service",
+    }
+    assert disabled[0] == "aicc-agent-launcher.socket", (
+        "stopping an instance while its socket still listens only frees the name"
+    )
+
+
+def test_a_broker_instance_outside_the_snapshot_fails_closure(tmp_path):
+    """The snapshot is what a rollback restores. A running unit absent from
+    it is a unit no rollback can put back."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-agent-launcher.socket": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="outside service snapshot"):
+        module.verify_service_snapshot_closure(
+            snapshot,
+            run=_listing_runner(launchers=("aicc-agent-launcher@7.service",)),
+        )
+
+
+def test_a_snapshot_that_covers_the_broker_instances_passes_closure(tmp_path):
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-agent-launcher@7.service": {
+                        "exists": True,
+                        "enabled": False,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    module.verify_service_snapshot_closure(
+        snapshot, run=_listing_runner(launchers=("aicc-agent-launcher@7.service",))
+    )
+
+
+def test_a_concrete_instance_is_restorable_by_the_template_the_journal_names(
+    tmp_path,
+):
+    """`voyn-aicc-worker@1.service` has no unit file, so no manifest can name
+    it: the journal names `voyn-aicc-worker@.service`. Matching restorable
+    units by exact name therefore never recognised a single running lane, and
+    a rollback interrupted between removing the template and restoring it
+    deadlocked on the first instance."""
+    module = _module()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "records": [
+                    {"target": "/etc/systemd/system/voyn-aicc-worker@.service"},
+                    {"target": "/etc/systemd/system/aicc-agent-launcher@.service"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    restorable = module._units_restored_by(manifest)
+
+    assert module._is_restorable_unit("voyn-aicc-worker@1.service", restorable)
+    assert module._is_restorable_unit("aicc-agent-launcher@7.service", restorable)
+    assert not module._is_restorable_unit("voyn-aicc-worker.service", restorable)
+    assert not module._is_restorable_unit("aicc-agent-launcher.socket", restorable)
+
+
+@pytest.mark.parametrize(
+    "unit, template",
+    [
+        ("voyn-aicc-worker@1.service", "voyn-aicc-worker@.service"),
+        ("aicc-agent-launcher@7.service", "aicc-agent-launcher@.service"),
+    ],
+)
+def test_quiesce_proceeds_for_an_instance_of_a_template_this_rollback_restores(
+    tmp_path, unit, template
+):
+    module = _module()
+    snapshot = _quiesce_snapshot(tmp_path, unit)
+
+    module.quiesce_service_snapshot(
+        snapshot,
+        run=_not_found_runner(),
+        restorable_units=frozenset({template}),
+    )
+
+
+def test_quiesce_still_refuses_an_instance_of_a_template_nobody_restores(tmp_path):
+    module = _module()
+    snapshot = _quiesce_snapshot(tmp_path, "voyn-aicc-worker@1.service")
+
+    with pytest.raises(RuntimeError, match="expected unit disappeared before quiesce"):
+        module.quiesce_service_snapshot(
+            snapshot,
+            run=_not_found_runner(),
+            restorable_units=frozenset({"aicc-agent-launcher@.service"}),
+        )
+
+
+def test_every_restorable_unit_shape_is_accepted_by_both_modules():
+    """The rollout writes the snapshot and the transaction restores it; a
+    name one accepts and the other rejects is a snapshot that can be taken
+    and never applied."""
+    module = _module()
+    sys.path.insert(0, str(Path(__file__).parents[2] / "ops"))
+    import importlib
+
+    rollout = importlib.import_module("aicc_staged_worker_rollout")
+
+    assert module.RESTORABLE_UNIT_RE.pattern == rollout.RESTORABLE_UNIT_RE.pattern
+    for unit in (
+        "voyn-aicc-worker@1.service",
+        "aicc-agent-launcher@7.service",
+        "aicc-agent-launcher.socket",
+        "aicc-principal-recovery.service",
+    ):
+        assert module.RESTORABLE_UNIT_RE.fullmatch(unit)
+
+
+# ---------------------------------------------------------------------------
+# The caller's umask is not part of the installer's security posture.
+# ---------------------------------------------------------------------------
+
+
+def test_generation_directories_are_private_under_a_permissive_umask(tmp_path):
+    """`Path.mkdir(parents=True, mode=0o700)` gives the mode to the LAST
+    component only -- pathlib creates the intermediate ones with the default
+    0o777 masked by the caller's umask. The generation directory is an
+    intermediate one, and it holds the backups, so under a 0o002 umask the
+    credential copies sat in a group-writable directory and under 0o000 in a
+    world-writable one. Every directory this transaction owns is therefore
+    created and chmod'ed explicitly."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    previous = os.umask(0o000)
+    try:
+        transaction = module.FileTransaction(root, state)
+        transaction.prepare((_spec(module, source, "/etc/installed"),))
+    finally:
+        os.umask(previous)
+
+    generation = next(state.glob("generation-*"))
+    for directory in (state, generation, generation / "backups", generation / "staged"):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+
+
+# ---------------------------------------------------------------------------
+# Generation-manifest schema compatibility.
+#
+# New code reads old journals; an older exact-SHA reader refuses a record it
+# predates deterministically, before any mutation, and keeps working on the
+# generations that do not concern it.
+# ---------------------------------------------------------------------------
+
+
+VERSION_TWO_RECORD_FIELDS = (
+    "target",
+    "existed",
+    "backup",
+    "original_mode",
+    "original_uid",
+    "original_gid",
+    "original_sha256",
+    "staged",
+    "install_sha256",
+    "install_mode",
+    "install_uid",
+    "install_gid",
+    "original_symlink",
+    "remove",
+)
+VERSION_ONE_RECORD_FIELDS = VERSION_TWO_RECORD_FIELDS[:-2]
+
+
+def _older_reader(fields):
+    """What an already-deployed reader does with a manifest.
+
+    It builds `BackupRecord(**value)` from each record dict, so a key its
+    dataclass predates is a `TypeError` from `__init__` -- reproduced here
+    rather than imported, because the whole point is the behaviour of a build
+    that is on the host and cannot be changed.
+    """
+
+    def read(records):
+        loaded = []
+        for value in records:
+            unexpected = sorted(set(value) - set(fields))
+            if unexpected:
+                raise TypeError(
+                    "__init__() got an unexpected keyword argument "
+                    f"{unexpected[0]!r}"
+                )
+            loaded.append({name: value[name] for name in fields if name in value})
+        return loaded
+
+    return read
+
+
+def _one_generation(module, tmp_path, specs):
+    transaction = module.FileTransaction(tmp_path / "root", tmp_path / "state")
+    manifest = transaction.prepare(specs)
+    return transaction, manifest
+
+
+def test_new_code_restores_a_version_one_journal(tmp_path):
+    """A generation written before `original_symlink` and `remove` existed
+    still loads: every field added since carries the default that reproduces
+    the older semantics exactly."""
+    module = _module()
+    root = tmp_path / "root"
+    existing = root / "etc/existing"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"before")
+    existing.chmod(0o600)
+    source = tmp_path / "source"
+    source.write_bytes(b"after")
+    transaction, manifest = _one_generation(
+        module, tmp_path, (_spec(module, source, "/etc/existing", 0o600),)
+    )
+    transaction.apply()
+    transaction.commit()
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["version"] = 1
+    payload["records"] = [
+        {name: record[name] for name in VERSION_ONE_RECORD_FIELDS}
+        for record in payload["records"]
+    ]
+    manifest.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    manifest.chmod(0o600)
+
+    transaction.restore(manifest)
+
+    assert existing.read_bytes() == b"before"
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o600
+
+
+def test_an_unsupported_manifest_version_is_refused_before_any_mutation(tmp_path):
+    """The direction this build CAN fail safely in: a manifest from a format
+    it does not know is refused outright rather than read with the wrong
+    field meanings."""
+    module = _module()
+    root = tmp_path / "root"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction, manifest = _one_generation(
+        module, tmp_path, (_spec(module, source, "/etc/installed"),)
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["version"] = module.MANIFEST_VERSION + 1
+    manifest.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    manifest.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="unsupported generation manifest version"):
+        transaction.apply()
+
+    assert not (root / "etc/installed").exists()
+
+
+def test_a_record_field_this_build_does_not_know_is_refused(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction, manifest = _one_generation(
+        module, tmp_path, (_spec(module, source, "/etc/installed"),)
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["records"][0]["invented_later"] = True
+    manifest.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    manifest.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="unsupported fields"):
+        transaction.apply()
+
+    assert not (root / "etc/installed").exists()
+
+
+def test_a_generation_with_nothing_version_three_still_loads_in_an_older_reader(
+    tmp_path,
+):
+    """The version-3 fields are emitted only on the records that use them, so
+    an ordinary install generation is still exactly what an already-deployed
+    exact-SHA reader expects."""
+    module = _module()
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    _transaction, manifest = _one_generation(
+        module, tmp_path, (_spec(module, source, "/etc/installed"),)
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+
+    assert payload["version"] == module.MANIFEST_VERSION
+    _older_reader(VERSION_TWO_RECORD_FIELDS)(payload["records"])
+
+
+def test_an_older_reader_refuses_a_version_three_record_deterministically(tmp_path):
+    """The refusal an already-deployed reader gives, and the only one it can
+    give: it builds `BackupRecord(**value)` from each dict while assembling
+    the record list, so a field it predates raises TypeError strictly before
+    the first mutation. Not a graceful message, but total, deterministic and
+    fail-closed -- and it cannot be improved in code that is already on the
+    host. What this build controls is that it only happens on generations
+    that really do carry the new semantics."""
+    module = _module()
+    root = tmp_path / "root"
+    home = root / "var/lib/aicc-agent/claude/.claude"
+    home.mkdir(parents=True)
+    credential = home / ".credentials.json"
+    credential.write_bytes(CLAUDE_BYTES)
+    credential.chmod(0o600)
+    _transaction, manifest = _one_generation(
+        module,
+        tmp_path,
+        (
+            module.removal_spec(CLAUDE_CREDENTIAL, sensitive=True),
+            module.directory_removal_spec("/var/lib/aicc-agent/claude/.claude"),
+        ),
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        _older_reader(VERSION_TWO_RECORD_FIELDS)(payload["records"])
+
+    assert credential.read_bytes() == CLAUDE_BYTES, "prepare() mutates no target"
+
+
+# ---------------------------------------------------------------------------
+# Worker-only directories.
+#
+# Removing the files and leaving the tree is a residual artefact tree: an
+# empty /var/lib/aicc-agent/claude/.claude still names the secret that used to
+# be in it, and /run/aicc-agent-homes is where the launcher materialised
+# ephemeral copies of both credentials. The directories go in the same
+# generation -- but only if everything in them is something this generation is
+# itself removing.
+# ---------------------------------------------------------------------------
+
+
+def _agent_credential_tree(tmp_path):
+    root = tmp_path / "root"
+    home = root / "var/lib/aicc-agent/claude/.claude"
+    home.mkdir(parents=True)
+    credential = home / ".credentials.json"
+    credential.write_bytes(CLAUDE_BYTES)
+    credential.chmod(0o600)
+    for directory in (
+        root / "var/lib/aicc-agent",
+        root / "var/lib/aicc-agent/claude",
+        home,
+    ):
+        os.chmod(directory, 0o700)
+    return root, credential
+
+
+def _credential_tree_specs(module):
+    return (
+        module.removal_spec(CLAUDE_CREDENTIAL, sensitive=True),
+        module.directory_removal_spec("/var/lib/aicc-agent/claude/.claude"),
+        module.directory_removal_spec("/var/lib/aicc-agent/claude"),
+        module.directory_removal_spec("/var/lib/aicc-agent"),
+    )
+
+
+def test_worker_only_directories_are_removed_after_the_files_they_held(tmp_path):
+    module = _module()
+    root, _credential = _agent_credential_tree(tmp_path)
+    transaction = module.FileTransaction(root, tmp_path / "state")
+
+    transaction.install(_credential_tree_specs(module))
+
+    assert not (root / "var/lib/aicc-agent").exists()
+    assert (root / "var/lib").is_dir(), "only the declared tree is removed"
+
+
+def test_unexpected_content_under_a_worker_only_directory_fails_closed(tmp_path):
+    """A directory removal is reversible only as "recreate an empty directory
+    with this mode and owner", so the only content it may find is content
+    this same generation removes. Anything else -- an operator's file, a
+    session the quiesce step failed to stop, a provider cache nobody declared
+    -- fails the generation before prepare() has touched a target."""
+    module = _module()
+    root, credential = _agent_credential_tree(tmp_path)
+    intruder = credential.parent / "settings.json"
+    intruder.write_bytes(b"nobody-declared-this")
+    transaction = module.FileTransaction(root, tmp_path / "state")
+
+    with pytest.raises(RuntimeError, match="unexpected content under worker-only"):
+        transaction.prepare(_credential_tree_specs(module))
+
+    assert credential.read_bytes() == CLAUDE_BYTES
+    assert intruder.read_bytes() == b"nobody-declared-this"
+    assert not transaction.pending.exists()
+    assert not list((tmp_path / "state").glob("generation-*"))
+
+
+def test_a_worker_only_directory_that_refilled_after_prepare_is_not_removed(tmp_path):
+    """rmdir is itself the compare: it removes a directory only while that
+    directory is empty. Something that appeared since prepare() proved the
+    tree accounted-for stops the removal atomically, in the kernel."""
+    module = _module()
+    root, credential = _agent_credential_tree(tmp_path)
+    transaction = module.FileTransaction(root, tmp_path / "state")
+    transaction.prepare(_credential_tree_specs(module))
+    intruder = credential.parent / "arrived-late.json"
+    intruder.write_bytes(b"arrived-after-prepare")
+
+    with pytest.raises(RuntimeError, match="not empty at removal"):
+        transaction.apply()
+
+    assert intruder.read_bytes() == b"arrived-after-prepare"
+    assert credential.read_bytes() == CLAUDE_BYTES, "the purge was rolled back"
+    assert not transaction.pending.exists()
+
+
+def test_a_rolled_back_generation_puts_every_directory_back_exactly(
+    monkeypatch, tmp_path
+):
+    """Reversed record order, so the directories come back before the files
+    that belonged in them -- with the mode and owner the snapshot recorded,
+    not whatever the caller's umask would have produced."""
+    module = _module()
+    root, credential = _agent_credential_tree(tmp_path)
+    source = tmp_path / "control-file"
+    source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, tmp_path / "state")
+    transaction.prepare(
+        (*_credential_tree_specs(module), _spec(module, source, "/etc/control-file"))
+    )
+    real_atomic = module._atomic_bytes
+
+    def fail_the_control_install(path, *args, **kwargs):
+        if path == root / "etc/control-file":
+            raise OSError("injected post-purge failure")
+        return real_atomic(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_atomic_bytes", fail_the_control_install)
+    previous = os.umask(0o077)
+    try:
+        with pytest.raises(OSError, match="injected post-purge failure"):
+            transaction.apply()
+    finally:
+        os.umask(previous)
+
+    assert credential.read_bytes() == CLAUDE_BYTES
+    assert stat.S_IMODE(credential.stat().st_mode) == 0o600
+    for directory in (
+        root / "var/lib/aicc-agent",
+        root / "var/lib/aicc-agent/claude",
+        root / "var/lib/aicc-agent/claude/.claude",
+    ):
+        assert directory.is_dir()
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+
+
+def test_a_directory_purge_is_idempotent_on_an_already_converted_host(tmp_path):
+    module = _module()
+    root, _credential = _agent_credential_tree(tmp_path)
+    transaction = module.FileTransaction(root, tmp_path / "state")
+    specs = _credential_tree_specs(module)
+    transaction.install(specs)
+
+    transaction.install(specs)
+
+    assert not (root / "var/lib/aicc-agent").exists()
+
+
+def test_a_worker_only_directory_target_that_is_a_symlink_is_refused(tmp_path):
+    """rmdir on a symlink would remove the link and leave whatever it pointed
+    at, and recreating a directory in its place would be a different object
+    entirely."""
+    module = _module()
+    root = tmp_path / "root"
+    (root / "var/lib").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "var/lib/aicc-agent").symlink_to(elsewhere)
+    transaction = module.FileTransaction(root, tmp_path / "state")
+
+    with pytest.raises(RuntimeError, match="is not a directory"):
+        transaction.prepare((module.directory_removal_spec("/var/lib/aicc-agent"),))
+
+    assert (root / "var/lib/aicc-agent").is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# The whole control profile, end to end, on the real spec list.
+# ---------------------------------------------------------------------------
+
+
+def test_a_real_control_install_leaves_no_worker_artefact_or_secret_tree(tmp_path):
+    """A host that ran the worker profile, converted by the real
+    `default_specs(profile="control")`: every worker-only file gone, every
+    worker-only directory gone, and no credential byte anywhere on the host
+    or in the transaction state that recorded the conversion."""
+    import dataclasses
+
+    module = _module()
+    repo = Path(__file__).parents[2]
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    authority = tmp_path / "authority.env"
+    authority.write_text(
+        "AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n", encoding="utf-8"
+    )
+    for target, payload in (
+        (CLAUDE_CREDENTIAL, CLAUDE_BYTES),
+        (CODEX_CREDENTIAL, CODEX_BYTES),
+        ("/etc/aicc/agent.env", b"AICC_AGENT_ENV=1"),
+        ("/usr/libexec/aicc-agent-launcher", b"#!/usr/bin/python3\n"),
+        ("/etc/systemd/system/aicc-agent-launcher.socket", b"[Socket]\n"),
+        (
+            "/etc/systemd/system/voyn-aicc-worker@.service.d/"
+            "20-principal-isolation.conf",
+            b"[Service]\n",
+        ),
+    ):
+        path = root / target.lstrip("/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        path.chmod(0o600)
+    for volatile in ("/run/aicc-agent-homes", "/run/aicc-agent-launcher/active"):
+        (root / volatile.lstrip("/")).mkdir(parents=True)
+    # Unprivileged: the real specs install as root:root, which this process
+    # cannot chown to. Only the identities are rewritten -- the target set,
+    # the removals and the directory purges are exactly what a host gets.
+    specs = tuple(
+        dataclasses.replace(spec, uid=os.geteuid(), gid=os.getegid())
+        for spec in module.default_specs(
+            repo,
+            authority_env=authority,
+            claude_auth=tmp_path / "absent-claude.json",
+            codex_auth=tmp_path / "absent-codex.json",
+            resolve_identities=False,
+            profile="control",
+        )
+    )
+
+    module.FileTransaction(root, state).install(specs)
+
+    for gone in (
+        *module.WORKER_ONLY_TARGETS,
+        *module.WORKER_ONLY_DIRECTORIES,
+    ):
+        assert not (root / gone.lstrip("/")).exists(), gone
+    assert (root / "etc/aicc/workspace-authority.env").exists()
+    assert (root / "usr/libexec/aicc-install-transaction").exists()
+    for secret in (CLAUDE_BYTES, CODEX_BYTES):
+        assert _byte_search(root, secret) == []
+        assert _byte_search(state, secret) == []
+    assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
+
+
+def test_a_quarantined_symlink_is_put_back_as_a_symlink(monkeypatch, tmp_path):
+    """The legacy shape every unit on these hosts still has. Quarantining a
+    link and putting it back must restore the LINK, not a copy of what it
+    resolved to -- `linkat` without AT_SYMLINK_FOLLOW, so the entry that
+    reappears is the same symlink inode with the same literal target."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    elsewhere = tmp_path / "operator-home/unit.service"
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_bytes(b"legacy")
+    link = root / "etc/systemd/system/legacy.service"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(elsewhere)
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare(
+        (module.removal_spec("/etc/systemd/system/legacy.service"),)
+    )
+    record = _purge_record(module, manifest, "/etc/systemd/system/legacy.service")
+    real_assert = module.FileTransaction._assert_removal_at
+
+    def retarget_between_the_pre_check_and_the_rename(
+        this, held, parent_fd, name, target
+    ):
+        real_assert(this, held, parent_fd, name, target)
+        if name != target.name:
+            return
+        decoy = tmp_path / "decoy-link"
+        decoy.symlink_to(tmp_path / "somewhere-else")
+        os.replace(decoy, target)
+
+    monkeypatch.setattr(
+        module.FileTransaction,
+        "_assert_removal_at",
+        retarget_between_the_pre_check_and_the_rename,
+    )
+
+    with pytest.raises(RuntimeError, match="symlink changed before removal"):
+        transaction._apply_removal(record)
+
+    assert link.is_symlink()
+    assert os.readlink(link) == str(tmp_path / "somewhere-else")
+    assert not list(link.parent.glob(".legacy.service.aicc-purge-*"))
+    assert elsewhere.read_bytes() == b"legacy", "nothing followed the link"

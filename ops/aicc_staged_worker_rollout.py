@@ -26,11 +26,17 @@ from aicc_install_transaction import SNAPSHOT_PROPERTIES
 
 LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 UNIT_RE = re.compile(r"voyn-aicc-worker@([A-Za-z0-9][A-Za-z0-9_-]{0,62})\.service")
+# One instance per accepted broker connection. These have no unit file of
+# their own -- they run off /etc/systemd/system/aicc-agent-launcher@.service,
+# which the control generation removes -- so they must be discovered,
+# snapshotted and restored exactly like the worker lanes.
+LAUNCHER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/@\s]+\.service")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 RESTORABLE_UNIT_RE = re.compile(
     r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
     r"voyn-aicc-worker(?:-2)?\.service|"
     r"aicc-worker\.service|"
+    r"aicc-agent-launcher@[^/@\s]+\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
 )
 LEGACY_WORKER_UNITS = (
@@ -338,26 +344,47 @@ def _configured_users(path: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(users))
 
 
-def _listed_template_units(systemd: Systemd, *, check: bool) -> frozenset[str]:
+def _listed_instances(
+    systemd: Systemd, pattern: str, accepts: re.Pattern[str], *, check: bool
+) -> frozenset[str]:
     units: set[str] = set()
     for command in (
-        ("list-unit-files", "voyn-aicc-worker@*.service", "--no-legend", "--no-pager"),
-        (
-            "list-units",
-            "voyn-aicc-worker@*.service",
-            "--all",
-            "--no-legend",
-            "--no-pager",
-        ),
+        ("list-unit-files", pattern, "--no-legend", "--no-pager"),
+        ("list-units", pattern, "--all", "--no-legend", "--no-pager"),
     ):
         for line in systemd.run(*command, check=check).splitlines():
             fields = line.split()
             if fields and fields[0] == "●":
                 fields = fields[1:]
             candidate = fields[0] if fields else ""
-            if UNIT_RE.fullmatch(candidate):
+            if accepts.fullmatch(candidate):
                 units.add(candidate)
     return frozenset(units)
+
+
+def _listed_template_units(systemd: Systemd, *, check: bool) -> frozenset[str]:
+    return _listed_instances(
+        systemd, "voyn-aicc-worker@*.service", UNIT_RE, check=check
+    )
+
+
+def _listed_launcher_units(systemd: Systemd, *, check: bool) -> frozenset[str]:
+    return _listed_instances(
+        systemd, "aicc-agent-launcher@*.service", LAUNCHER_UNIT_RE, check=check
+    )
+
+
+def discover_launcher_units(systemd: Systemd) -> tuple[str, ...]:
+    """Every live broker instance, for the snapshot only.
+
+    Deliberately not part of `discover_units`: that set is what `rollout()`
+    drains, starts and verifies as worker lanes, and a launcher instance is
+    neither. What it is, is a running unit whose fragment the control
+    generation deletes -- so it belongs in the snapshot that rollback
+    restores, and in the closure check that refuses to proceed while one
+    exists outside it.
+    """
+    return tuple(sorted(_listed_launcher_units(systemd, check=False)))
 
 
 def discover_units(
@@ -381,9 +408,14 @@ def verify_snapshot_closure(systemd: Systemd, state: dict[str, object]) -> None:
         for unit in expected
     ):
         raise RolloutError("invalid service snapshot unit")
-    extras = sorted(_listed_template_units(systemd, check=True) - expected)
+    discovered = _listed_template_units(systemd, check=True) | _listed_launcher_units(
+        systemd, check=True
+    )
+    extras = sorted(discovered - expected)
     if extras:
-        raise RolloutError(f"worker lanes exist outside service snapshot: {extras}")
+        raise RolloutError(
+            f"template units exist outside service snapshot: {extras}"
+        )
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
@@ -968,7 +1000,13 @@ def main() -> int:
         if any(not RESTORABLE_UNIT_RE.fullmatch(unit) for unit in included):
             parser.error("--include-unit is not allowlisted")
         payload = json.dumps(
-            snapshot(systemd, (*units, *included)), sort_keys=True
+            snapshot(
+                systemd,
+                tuple(
+                    sorted({*units, *included, *discover_launcher_units(systemd)})
+                ),
+            ),
+            sort_keys=True,
         ).encode()
         temporary = args.state.with_name(f".{args.state.name}.{os.getpid()}")
         temporary.write_bytes(payload)

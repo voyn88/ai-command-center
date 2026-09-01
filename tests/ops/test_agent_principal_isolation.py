@@ -16,6 +16,11 @@ import pytest
 from command_center import agent_runner
 from command_center.worker import handlers as worker_handlers
 
+# Every test here drives the privileged installer, so every test builds its
+# fixture paths the way a host has them and runs under the permissive 0o002
+# umask an operator may well have. See tests/ops/conftest.py.
+pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
+
 
 def _launcher_module():
     path = Path(__file__).parents[2] / "ops" / "aicc_agent_launcher.py"
@@ -1107,9 +1112,15 @@ def _specs(profile, tmp_path):
 
 
 def _purged(profile, tmp_path):
-    """The targets a profile REMOVES in the same generation it installs."""
+    """The FILE targets a profile removes in the same generation it installs."""
     _tx, specs = _profile_specs(profile, tmp_path)
-    return {spec.target for spec in specs if spec.remove}
+    return {spec.target for spec in specs if spec.remove and not spec.directory}
+
+
+def _purged_directories(profile, tmp_path):
+    """The DIRECTORY targets a profile removes, in removal order."""
+    _tx, specs = _profile_specs(profile, tmp_path)
+    return [spec.target for spec in specs if spec.remove and spec.directory]
 
 
 def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
@@ -1162,12 +1173,42 @@ def test_control_profile_purges_exactly_what_it_drops(tmp_path):
 
     assert _purged("control", tmp_path) == tx.WORKER_ONLY_TARGETS
     assert _purged("worker", tmp_path) == set()
+    assert _purged_directories("worker", tmp_path) == []
+
+
+def test_control_purges_the_worker_only_directories_child_before_parent(tmp_path):
+    """Removing the files and leaving the tree is a residual artefact tree:
+    an empty /var/lib/aicc-agent/claude/.claude still names the secret that
+    used to be in it, and /run/aicc-agent-homes is where the launcher
+    materialised ephemeral copies of both credentials. The directories are
+    removed in the same generation, after the files that empty them, and
+    every directory strictly before its own parent -- rmdir cannot do it in
+    any other order."""
+    tx, _control = _specs("control", tmp_path)
+    _tx, specs = _profile_specs("control", tmp_path)
+    directories = _purged_directories("control", tmp_path)
+
+    assert directories == list(tx.WORKER_ONLY_DIRECTORIES)
+    for index, directory in enumerate(directories):
+        for other in directories[index + 1 :]:
+            assert not other.startswith(directory + "/"), (
+                f"{other} is removed after its own parent {directory}"
+            )
+    ordered = [spec.target for spec in specs if spec.remove]
+    assert ordered[: len(ordered) - len(directories)] == sorted(
+        tx.WORKER_ONLY_TARGETS
+    ), "a directory is removed before the files this generation takes out of it"
+
+    # Operator data created by the agent layer is not an artefact of it.
+    for kept in ("/srv/aicc-workspaces", "/srv/aicc-quarantine"):
+        assert kept not in directories
 
 
 def test_control_profile_needs_no_agent_identity_to_resolve_its_specs(tmp_path):
     """The agent group is created by the worker-only sysusers config, which a
-    control host never runs. Resolving it unconditionally would fail the one
-    profile whose premise is that the agent principal does not exist."""
+    control host never runs. Resolving it unconditionally would fail a
+    profile that installs nothing against it, on a host that never carried
+    the agent layer and so does not have the group at all."""
     import importlib
 
     root = Path(__file__).parents[2]
@@ -1399,3 +1440,109 @@ def test_a_plain_property_value_is_compared_unchanged():
         "/etc/systemd/system/x.service"
     )
     assert tx._normalise_property("") == ""
+
+
+def test_the_control_transition_revokes_the_authority_before_it_mutates_files():
+    """The publisher group is the boundary on
+    /etc/aicc/workspace-authority.env, and a converted host still had
+    `aicc-worker` and `voynadmin` in it -- sysusers adds a membership and
+    never takes one away. The revocation runs inside the same prepared
+    generation, between prepare() and apply(), so its journal exists while
+    the generation is still fully rollbackable and the same `recover` the
+    trap runs undoes both together."""
+    text = _installer_text()
+    install_path = text.split('if [ "${1:-}" = "--uninstall" ]; then', 1)[1].split(
+        "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED\"\n  exit 0\nfi\n", 1
+    )[1]
+    commands = [line.strip() for line in install_path.splitlines()]
+    prepare = commands.index("run_transaction prepare")
+    quiesce = commands.index("run_transaction quiesce-worker-only")
+    revoke = commands.index("run_transaction revoke-worker-authority")
+    apply_index = commands.index("run_transaction apply")
+
+    assert commands.count("run_transaction revoke-worker-authority") == 1
+    assert prepare < quiesce < revoke < apply_index
+    guard = 'if [ "$install_profile" = "control" ]; then'
+    before = install_path[: install_path.index("run_transaction revoke-worker-authority")]
+    assert guard in before
+    assert "\nfi\n" not in before[before.rindex(guard) :]
+    # No chmod workaround: the file keeps its group ownership and mode, and
+    # the membership is what changes.
+    assert "chmod" not in install_path.split(
+        "run_transaction revoke-worker-authority", 1
+    )[0].rsplit(guard, 1)[1]
+
+
+def test_the_authority_file_keeps_its_publisher_group_on_the_control_profile(tmp_path):
+    """The boundary is not moved, it is enforced: the control profile still
+    installs the authority key 0640 root:aicc-publisher, and the group is
+    empty because deploy/sysusers.d/aicc-control.conf declares no members and
+    the transition revokes the legacy ones."""
+    tx, _targets = _specs("control", tmp_path)
+    _tx, specs = _profile_specs("control", tmp_path)
+    authority = next(
+        spec for spec in specs if spec.target == "/etc/aicc/workspace-authority.env"
+    )
+
+    assert authority.mode == 0o640
+    assert tx.AUTHORITY_GROUP == "aicc-publisher"
+    assert set(tx.LEGACY_AUTHORITY_MEMBERS) == {"aicc-worker", "voynadmin"}
+    agent_conf = (
+        Path(__file__).parents[2] / "deploy/sysusers.d/aicc-agent.conf"
+    ).read_text(encoding="utf-8")
+    declared = {
+        line.split()[1]
+        for line in agent_conf.splitlines()
+        if line.startswith("m ") and line.split()[2] == "aicc-publisher"
+    }
+    assert declared == set(tx.LEGACY_AUTHORITY_MEMBERS), (
+        "a membership the worker profile grants and the transition forgets to "
+        "revoke leaves the authority key readable by a worker-era principal"
+    )
+
+
+def test_the_control_profile_does_not_claim_to_remove_the_unix_principals(tmp_path):
+    """sysusers has no removal verb and deleting a system account whose uid
+    may still own inodes elsewhere is not an installer's call. What the
+    profile actually takes away is files, directories and authority; the
+    accounts are left inert and the docstring says so rather than claiming
+    the agent principal is absent."""
+    import inspect
+
+    tx, _targets = _specs("control", tmp_path)
+    documentation = tx.default_specs.__doc__
+    body = inspect.getsource(tx.default_specs).replace(documentation, "")
+
+    assert "NOT removed" in documentation
+    assert "userdel" in documentation
+    assert "inert" in documentation
+    # The claim the docstring now disclaims must not survive anywhere else in
+    # the function as an unqualified statement of fact.
+    assert "whose whole point is that the agent" not in body
+    assert "premise is that the agent principal does not exist" not in body
+
+
+def test_the_rollback_and_the_uninstall_stop_the_broker_sessions_too():
+    """`disable --now` on the socket stops it listening. The sessions it has
+    already accepted are separate units running off the same template, and
+    they outlive it -- so both paths that take the launcher out stop them as
+    well, before the snapshot-closure check that refuses to mutate while any
+    unit is live outside the snapshot."""
+    text = _installer_text()
+    stop_instances = "systemctl stop 'aicc-agent-launcher@*.service'"
+    disable_socket = "systemctl disable --now aicc-agent-launcher.socket"
+
+    assert text.count(stop_instances) == 2
+    for segment in text.split(stop_instances)[:-1]:
+        assert disable_socket in segment
+        commands = [
+            line.strip()
+            for line in segment.splitlines()
+            if line.strip().startswith("systemctl ")
+        ]
+        assert commands[-1].startswith(disable_socket), (
+            "the socket must stop listening before its sessions are stopped"
+        )
+    rollback = text.split("rollback() {", 1)[1].split("\ntrap rollback", 1)[0]
+    assert stop_instances in rollback
+    assert rollback.index(stop_instances) < rollback.index("run_transaction recover")

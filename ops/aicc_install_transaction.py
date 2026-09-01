@@ -17,17 +17,38 @@ import shutil
 import stat
 import subprocess
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path, PurePosixPath
 
 RESTORABLE_UNIT_RE = re.compile(
     r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
     r"voyn-aicc-worker(?:-2)?\.service|"
     r"aicc-worker\.service|"
+    r"aicc-agent-launcher@[^/@\s]+\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
 )
 TEMPLATE_WORKER_UNIT_RE = re.compile(
     r"voyn-aicc-worker@[^/@\s]+\.service"
+)
+# The broker socket spawns one `aicc-agent-launcher@<connection>.service` per
+# accepted connection. Those instances run the agent launcher off
+# `/etc/systemd/system/aicc-agent-launcher@.service` -- a unit file the
+# control generation removes -- so they have to be discovered, snapshotted,
+# stopped and rolled back exactly like the worker lanes are. Naming only the
+# socket left every live instance running on a fragment that was about to be
+# deleted (independent review on 9eb07f8).
+TEMPLATE_LAUNCHER_UNIT_RE = re.compile(
+    r"aicc-agent-launcher@[^/@\s]+\.service"
+)
+#: `(systemctl glob, accepting pattern)` for every template family whose
+#: concrete instances are discovered from systemd rather than from a file.
+TEMPLATE_INSTANCE_FAMILIES = (
+    ("voyn-aicc-worker@*.service", TEMPLATE_WORKER_UNIT_RE),
+    ("aicc-agent-launcher@*.service", TEMPLATE_LAUNCHER_UNIT_RE),
+)
+#: `prefix@instance.suffix`, the systemd spelling of a template instance.
+_UNIT_INSTANCE_RE = re.compile(
+    r"(?P<prefix>[^@\s/]+)@(?P<instance>[^/@\s]+)(?P<suffix>\.[a-z]+)"
 )
 # Ordered: aicc_staged_worker_rollout imports this and iterates it; every
 # set-equality check wraps it in set(...). One definition, no drift.
@@ -51,6 +72,32 @@ RECOVERY_ANCHOR_TARGET = (
 )
 
 
+def _template_unit_of(unit: str) -> str | None:
+    """The template unit file `unit` is an instance of, or None."""
+    match = _UNIT_INSTANCE_RE.fullmatch(unit)
+    if match is None:
+        return None
+    return f"{match['prefix']}@{match['suffix']}"
+
+
+def _is_restorable_unit(unit: str, restorable: frozenset[str]) -> bool:
+    """True when this rollback's journal puts `unit`'s fragment back.
+
+    A concrete lane such as `voyn-aicc-worker@1.service` has no unit file of
+    its own: systemd instantiates it from `voyn-aicc-worker@.service`, and
+    that template is the only name a generation manifest can carry. Matching
+    the journal's targets by exact name therefore never recognised a single
+    running lane as restorable, so a rollback interrupted between removing
+    the template and restoring it deadlocked on the first instance --
+    the same trap `restorable_units` exists to prevent, one level down
+    (independent review on 9eb07f8).
+    """
+    if unit in restorable:
+        return True
+    template = _template_unit_of(unit)
+    return template is not None and template in restorable
+
+
 @dataclass(frozen=True)
 class FileSpec:
     source: Path
@@ -66,6 +113,20 @@ class FileSpec:
     # install, so a profile transition gets a single rollback boundary instead
     # of an uninstall that commits before the install it precedes is proven.
     remove: bool = False
+    # Only meaningful with `remove`: the target is a DIRECTORY the generation
+    # must leave absent. Removing the files under a worker-only tree without
+    # removing the tree leaves an empty `/var/lib/aicc-agent/claude/.claude`
+    # advertising exactly which secret used to live there, and a directory
+    # systemd/tmpfiles would repopulate. A directory removal is snapshotted as
+    # mode/uid/gid only: `prepare()` refuses outright if it holds anything
+    # this same generation is not already removing, so the removal is
+    # reversible by recreating an empty directory and nothing else.
+    directory: bool = False
+    # The target holds model credentials. A committed removal of one is
+    # finalised: its backup is destroyed rather than retained, because a
+    # retained backup is the same secret in a different place.
+    # See `SENSITIVE_TARGETS` and `FileTransaction._run_sensitive_retirement`.
+    sensitive: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,15 +153,40 @@ class BackupRecord:
     # `target` is its removal, not a write. Defaulted for the same reason as
     # `original_symlink` -- a historical journal predates this field.
     remove: bool = False
+    # Mirrors FileSpec.directory. With `remove`, the recorded mode/uid/gid
+    # describe a directory that was empty of everything this generation did
+    # not itself remove; `backup`, `staged` and both digests are unused.
+    directory: bool = False
+    # Mirrors FileSpec.sensitive.
+    sensitive: bool = False
+    # Set by the post-commit retirement phase: this record's backup held
+    # credential bytes and was destroyed once the generation became terminal.
+    # The record deliberately survives saying so -- an absent field would make
+    # an unrecoverable rollback look like an ordinary one.
+    sensitive_retired: bool = False
 
 
-def removal_spec(target: str) -> FileSpec:
+def removal_spec(target: str, *, sensitive: bool = False) -> FileSpec:
     """A spec that removes `target` instead of installing anything.
 
     `source` is a dummy: `remove=True` short-circuits every codepath that
     would otherwise read it.
     """
-    return FileSpec(Path(os.devnull), target, 0, 0, 0, remove=True)
+    return FileSpec(
+        Path(os.devnull), target, 0, 0, 0, remove=True, sensitive=sensitive
+    )
+
+
+def directory_removal_spec(target: str) -> FileSpec:
+    """A spec that leaves the DIRECTORY `target` absent after this generation.
+
+    Ordered deepest-first by its caller and always after the file removals
+    that empty it, so `apply()` reaches a directory only once everything this
+    generation removes from it is gone.
+    """
+    return FileSpec(
+        Path(os.devnull), target, 0, 0, 0, remove=True, directory=True
+    )
 
 
 @dataclass(frozen=True)
@@ -113,6 +199,107 @@ class FileState:
 
 
 UNINSTALL_JOURNAL_VERSION = 2
+
+#: Generation-manifest format this build WRITES.
+#:
+#: 1 -- the original twelve positional `BackupRecord` fields.
+#: 2 -- adds `original_symlink` and `remove`.
+#: 3 -- adds `directory`, `sensitive` and `sensitive_retired`.
+#:
+#: Compatibility is deliberately asymmetric, in both directions:
+#:
+#: *New code reads old journals.* Every field added after version 1 carries a
+#: default that reproduces the older semantics exactly, so a version-1 or
+#: version-2 record loads unchanged. `SUPPORTED_MANIFEST_VERSIONS` is what
+#: this build accepts; a manifest declaring anything else -- a FUTURE format
+#: whose records this build would silently misread -- is refused by
+#: `_generation_records` before a single target is touched, as is a record
+#: carrying a field this build does not know.
+#:
+#: *Old readers refuse deterministically.* An older exact-SHA reader builds
+#: `BackupRecord(**value)` from the same dicts, so a record carrying a field
+#: it predates raises `TypeError` on construction -- in `apply()` and
+#: `restore()` alike, that happens while assembling the record list, strictly
+#: before the first mutation, so the refusal is total and leaves the host
+#: untouched. It is not a graceful message, but it is deterministic and fails
+#: closed, and it cannot be improved retroactively in code already deployed.
+#: What this build controls is the trigger: the three version-3 fields are
+#: emitted only on the records that actually use them, so a generation with
+#: no directory purge and no sensitive removal still loads in an older
+#: reader, and one that has them refuses there rather than being half
+#: understood. Each generation additionally carries its own `recovery.py`
+#: capsule, so its own recovery path always runs the build that wrote it.
+MANIFEST_VERSION = 3
+SUPPORTED_MANIFEST_VERSIONS = frozenset({1, 2, 3})
+_BACKUP_RECORD_FIELDS = frozenset(field.name for field in fields(BackupRecord))
+#: Record fields introduced by version 3, defaulted to the version-2 meaning.
+_MANIFEST_V3_DEFAULTS = {
+    "directory": False,
+    "sensitive": False,
+    "sensitive_retired": False,
+}
+
+
+def _record_document(record: BackupRecord) -> dict[str, object]:
+    """Serialise one record, omitting version-3 fields it does not use."""
+    document = asdict(record)
+    for name, default in _MANIFEST_V3_DEFAULTS.items():
+        if document[name] == default:
+            del document[name]
+    return document
+
+
+def _record_from_document(value: object) -> BackupRecord:
+    if not isinstance(value, dict):
+        raise RuntimeError("generation manifest record is malformed")
+    unsupported = sorted(set(value) - _BACKUP_RECORD_FIELDS)
+    if unsupported:
+        raise RuntimeError(
+            f"generation manifest record has unsupported fields: {unsupported}"
+        )
+    return BackupRecord(**value)
+
+
+def _generation_records(payload: object) -> list[BackupRecord]:
+    """Every record of one generation, or a refusal before any mutation."""
+    if not isinstance(payload, dict):
+        raise RuntimeError("generation manifest is malformed")
+    version = payload.get("version")
+    if version not in SUPPORTED_MANIFEST_VERSIONS:
+        raise RuntimeError(f"unsupported generation manifest version: {version!r}")
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise RuntimeError("generation manifest has no records")
+    return [_record_from_document(value) for value in records]
+
+
+#: Targets whose bytes are model credentials. A generation that REMOVES one
+#: has to back it up to stay reversible, and that backup is the same secret
+#: in a second place -- so a control commit is not finished until the backup,
+#: and every reachable older copy of the same target in this state directory,
+#: is destroyed. See `FileTransaction._run_sensitive_retirement`.
+SENSITIVE_TARGETS = frozenset(
+    {
+        "/var/lib/aicc-agent/claude/.claude/.credentials.json",
+        "/var/lib/aicc-agent/codex/.codex/auth.json",
+    }
+)
+SENSITIVE_RETIREMENT_VERSION = 1
+SENSITIVE_RETIREMENT_JOURNAL = "sensitive-retirement.json"
+
+#: The publisher group owns `/etc/aicc/workspace-authority.env` (0640
+#: root:aicc-publisher) on every profile. `deploy/sysusers.d/aicc-agent.conf`
+#: puts `aicc-worker` and `voynadmin` in it, and sysusers never takes a
+#: membership away -- so a host converted from worker to control kept two
+#: principals able to read the authority key that the control profile is
+#: supposed to hold alone. Dropping the file's group bits instead would be a
+#: workaround, not a fix: the group is the authority boundary, so the
+#: membership is what has to go.
+AUTHORITY_GROUP = "aicc-publisher"
+LEGACY_AUTHORITY_MEMBERS = ("aicc-worker", "voynadmin")
+AUTHORITY_MEMBERSHIP_VERSION = 1
+AUTHORITY_MEMBERSHIP_JOURNAL = "authority-membership.json"
+GPASSWD = "/usr/sbin/gpasswd"
 
 
 def _path_present(path: Path) -> bool:
@@ -630,11 +817,24 @@ def install_recovery_anchor(source: Path, target: Path) -> None:
         raise RuntimeError("recovery anchor installation could not be proven")
 
 
-def _read_regular(path: Path, *, max_bytes: int = 128 * 1024 * 1024) -> FileState:
+def _read_regular(
+    path: Path | str,
+    *,
+    max_bytes: int = 128 * 1024 * 1024,
+    dir_fd: int | None = None,
+) -> FileState:
+    """Read a regular file whole, proving it did not change underneath.
+
+    `dir_fd` makes `path` a single name resolved against an already-pinned
+    directory descriptor instead of a pathname walked from the root. That is
+    what lets the purge compare a file it has just moved to a quarantine name
+    nothing else knows: no component of the walk can be swapped, because
+    there is no walk.
+    """
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, flags, dir_fd=dir_fd)
     try:
         info = os.fstat(descriptor)
         if (
@@ -734,6 +934,217 @@ def _digest_regular(
         )
     finally:
         os.close(descriptor)
+
+
+def _destroy_blob(path: Path) -> None:
+    """Overwrite a credential backup in place, then unlink it.
+
+    The unlink is the guarantee -- after it, no name in this state directory
+    reaches those bytes. The overwrite is a best effort on top of it: on a
+    copy-on-write or log-structured filesystem the old blocks may survive
+    until they are reused, and nothing this process can do changes that. It
+    is done anyway because on the ext4/xfs hosts this installs on it does
+    take the plaintext out of the block that held it.
+    """
+    try:
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        )
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError(f"cannot retire sensitive backup: {path}") from exc
+    try:
+        remaining = os.fstat(descriptor).st_size
+        offset = 0
+        while remaining:
+            chunk = min(remaining, 1024 * 1024)
+            os.pwrite(descriptor, b"\0" * chunk, offset)
+            offset += chunk
+            remaining -= chunk
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    path.unlink(missing_ok=True)
+    _fsync_dir(path.parent)
+
+
+def _group_members(group: str, *, getgrnam=grp.getgrnam) -> frozenset[str]:
+    try:
+        entry = getgrnam(group)
+    except KeyError as exc:
+        raise RuntimeError(f"authority group is missing: {group}") from exc
+    return frozenset(entry.gr_mem)
+
+
+def _authority_membership_journal(state_dir: Path) -> dict[str, object]:
+    payload = _trusted_journal(state_dir / AUTHORITY_MEMBERSHIP_JOURNAL)
+    revoked = payload.get("revoked")
+    members_before = payload.get("members_before")
+    if (
+        payload.get("version") != AUTHORITY_MEMBERSHIP_VERSION
+        or payload.get("group") != AUTHORITY_GROUP
+        or not isinstance(revoked, list)
+        or not isinstance(members_before, list)
+        or any(not isinstance(member, str) for member in revoked)
+        or any(not isinstance(member, str) for member in members_before)
+        or not set(revoked) <= set(LEGACY_AUTHORITY_MEMBERS)
+        or not set(revoked) <= set(members_before)
+    ):
+        raise RuntimeError("authority membership journal is invalid")
+    return payload
+
+
+def revoke_legacy_authority_membership(
+    state_dir: Path, *, run=subprocess.run, getgrnam=grp.getgrnam
+) -> tuple[str, ...]:
+    """Take the worker-era principals out of the publisher group.
+
+    `/etc/aicc/workspace-authority.env` is 0640 root:aicc-publisher on every
+    profile, and on a converted host `aicc-worker` and `voynadmin` are still
+    in that group: the control plane's authority key stayed readable by two
+    principals whose whole layer this generation is removing. sysusers can
+    add a membership and never removes one, so the conversion has to.
+
+    Reversible, and journalled before the first mutation: the pre-state is
+    written durably to `authority-membership.json`, so a failure here -- or a
+    crash, or a later failure anywhere before commit -- is undone by
+    `restore_legacy_authority_membership`, which the same `recover` the
+    installer's rollback trap runs calls. `commit()` consumes the journal,
+    which is what makes the revocation terminal. Both directions need root
+    (`gpasswd`) and both fail closed: a revocation that cannot be proven
+    raises, and so does a restore that cannot be proven, leaving the durable
+    journal for the next attempt rather than reporting a rollback that did
+    not happen.
+
+    Returns the members actually revoked.
+    """
+    journal = state_dir / AUTHORITY_MEMBERSHIP_JOURNAL
+    if _path_present(journal):
+        payload = _authority_membership_journal(state_dir)
+    else:
+        members = _group_members(AUTHORITY_GROUP, getgrnam=getgrnam)
+        payload = {
+            "version": AUTHORITY_MEMBERSHIP_VERSION,
+            "group": AUTHORITY_GROUP,
+            "members_before": sorted(members),
+            "revoked": [
+                member for member in LEGACY_AUTHORITY_MEMBERS if member in members
+            ],
+        }
+        _atomic_bytes(
+            journal,
+            (json.dumps(payload, sort_keys=True) + "\n").encode(),
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
+        _fsync_dir(state_dir)
+    revoked = tuple(payload["revoked"])
+    for member in revoked:
+        result = run(
+            [GPASSWD, "-d", member, AUTHORITY_GROUP],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode and member in _group_members(
+            AUTHORITY_GROUP, getgrnam=getgrnam
+        ):
+            raise RuntimeError(
+                f"cannot revoke legacy authority membership: {member}"
+            )
+    surviving = sorted(
+        _group_members(AUTHORITY_GROUP, getgrnam=getgrnam).intersection(
+            LEGACY_AUTHORITY_MEMBERS
+        )
+    )
+    if surviving:
+        raise RuntimeError(
+            f"legacy authority membership survived revocation: {surviving}"
+        )
+    return revoked
+
+
+def restore_legacy_authority_membership(
+    state_dir: Path, *, run=subprocess.run, getgrnam=grp.getgrnam
+) -> None:
+    """Put back exactly the memberships this transaction revoked."""
+    if not _path_present(state_dir / AUTHORITY_MEMBERSHIP_JOURNAL):
+        return
+    payload = _authority_membership_journal(state_dir)
+    revoked = list(payload["revoked"])
+    for member in revoked:
+        if member in _group_members(AUTHORITY_GROUP, getgrnam=getgrnam):
+            continue
+        result = run(
+            [GPASSWD, "-a", member, AUTHORITY_GROUP],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f"cannot restore legacy authority membership: {member}"
+            )
+    missing = sorted(
+        set(revoked) - _group_members(AUTHORITY_GROUP, getgrnam=getgrnam)
+    )
+    if missing:
+        raise RuntimeError(f"legacy authority membership did not restore: {missing}")
+    (state_dir / AUTHORITY_MEMBERSHIP_JOURNAL).unlink()
+    _fsync_dir(state_dir)
+
+
+def finalize_authority_membership(state_dir: Path) -> None:
+    """Consume the membership journal: the revocation is now terminal."""
+    journal = state_dir / AUTHORITY_MEMBERSHIP_JOURNAL
+    if not _path_present(journal):
+        return
+    _authority_membership_journal(state_dir)
+    journal.unlink()
+    _fsync_dir(state_dir)
+
+
+def _redact_sensitive_records(manifest: Path, retired: frozenset[str]) -> bool:
+    """Destroy one generation's copies of `retired`, and say so in its journal.
+
+    Both blob kinds are taken: `backup` is the copy a removal made to stay
+    reversible, and `staged` is the copy an earlier worker generation wrote
+    on its way to installing the same credential. Either one is the secret.
+    """
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise RuntimeError(f"generation manifest has no records: {manifest}")
+    changed = False
+    for record in records:
+        if not isinstance(record, dict) or record.get("target") not in retired:
+            continue
+        for key in ("backup", "staged"):
+            blob = record.get(key)
+            if isinstance(blob, str) and blob:
+                _destroy_blob(Path(blob))
+                changed = True
+        if not record.get("sensitive_retired"):
+            changed = True
+        record["backup"] = None
+        record["original_sha256"] = None
+        record["staged"] = ""
+        record["install_sha256"] = ""
+        record["sensitive"] = True
+        record["sensitive_retired"] = True
+    if not changed:
+        return False
+    payload["version"] = MANIFEST_VERSION
+    _atomic_bytes(
+        manifest,
+        json.dumps(payload, sort_keys=True).encode(),
+        0o600,
+        os.geteuid(),
+        os.getegid(),
+    )
+    return True
 
 
 def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bool:
@@ -1033,6 +1444,10 @@ def _units_restored_by(manifest: Path) -> frozenset[str]:
             name = target[len(_SYSTEMD_UNIT_DIR) :].lstrip("/")
             if name and "/" not in name:
                 units.add(name)
+    # Template unit files are returned under their own name
+    # (`voyn-aicc-worker@.service`). `_is_restorable_unit` resolves a concrete
+    # instance back to it, which is the only way a lane -- which has no unit
+    # file of its own -- can be recognised as restorable.
     return frozenset(units)
 
 
@@ -1068,7 +1483,8 @@ def quiesce_service_snapshot(
     """Stop snapshotted admission/worker units before rollback mutation.
 
     `restorable_units` names the units this same rollback is about to put back
-    on disk. A unit whose file is currently missing has nothing to stop, and
+    on disk, including the templates whose instances it thereby restores. A
+    unit whose file is currently missing has nothing to stop, and
     refusing to proceed on that ground creates a deadlock the operator cannot
     escape from: the file is restored by `restore()`, which runs *after* this
     function, so a rollback interrupted between removing a unit file and
@@ -1141,9 +1557,11 @@ def quiesce_service_snapshot(
                 and expected["enabled"] is False
             ):
                 continue
-            if unit in restorable_units:
+            if _is_restorable_unit(unit, restorable_units):
                 # Nothing to stop, and the file is coming back in this same
-                # rollback. See `restorable_units` in the docstring.
+                # rollback -- either under its own name or, for a concrete
+                # lane, as the template it is an instance of. See
+                # `restorable_units` in the docstring and `_is_restorable_unit`.
                 continue
             if unit in RETIRED_LEGACY_UNITS:
                 # Retired on purpose by the rollout that preceded this
@@ -1164,6 +1582,57 @@ def quiesce_service_snapshot(
             or main_pid.stdout.strip() not in {"", "0"}
         ):
             raise RuntimeError(f"unit did not quiesce exactly: {unit}")
+
+
+def discover_template_instances(*, run=subprocess.run, message: str) -> set[str]:
+    """Every concrete instance of every template family systemd knows about.
+
+    Both template families are discovered the same way and for the same
+    reason: neither `voyn-aicc-worker@<lane>` nor
+    `aicc-agent-launcher@<connection>` has a fixed name, so the only source
+    of truth for which ones exist is systemd itself.
+    """
+    discovered: set[str] = set()
+    for pattern, accepts in TEMPLATE_INSTANCE_FAMILIES:
+        for arguments in (
+            ("list-unit-files", pattern, "--no-legend", "--no-pager"),
+            ("list-units", pattern, "--all", "--no-legend", "--no-pager"),
+        ):
+            result = run(
+                ["/usr/bin/systemctl", *arguments],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            # `list-unit-files` exits 1 when a pattern matches nothing, and on
+            # a control-plane host it matches nothing by design: that profile
+            # installs no worker lanes and no agent launcher at all. An empty
+            # result is the answer, not a failure -- treating it as one made
+            # the control install die at `cannot enumerate worker lanes for
+            # snapshot closure` (observed live on control-01, 2026-08-31). A
+            # real failure still reports on stderr.
+            if result.returncode and (
+                result.stderr.strip() or result.stdout.strip()
+            ):
+                raise RuntimeError(result.stderr.strip() or message)
+            for line in result.stdout.splitlines():
+                fields = line.split()
+                if fields and fields[0] == "●":
+                    fields = fields[1:]
+                candidate = fields[0] if fields else ""
+                if accepts.fullmatch(candidate):
+                    discovered.add(candidate)
+    return discovered
+
+
+def _control_purge_order(unit: str) -> tuple[int, str]:
+    """Disable the broker socket before anything it can spawn.
+
+    Stopping `aicc-agent-launcher@7.service` while its socket is still
+    listening only frees the name: the next connection instantiates another
+    one, on the same unit file `apply()` is about to remove.
+    """
+    return (0 if unit == "aicc-agent-launcher.socket" else 1, unit)
 
 
 def verify_service_snapshot_closure(
@@ -1200,55 +1669,22 @@ def verify_service_snapshot_closure(
     ):
         raise RuntimeError("invalid service snapshot for closure")
 
-    discovered: set[str] = set()
-    for arguments in (
-        (
-            "list-unit-files",
-            "voyn-aicc-worker@*.service",
-            "--no-legend",
-            "--no-pager",
-        ),
-        (
-            "list-units",
-            "voyn-aicc-worker@*.service",
-            "--all",
-            "--no-legend",
-            "--no-pager",
-        ),
-    ):
-        result = run(
-            ["/usr/bin/systemctl", *arguments],
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-        # `list-unit-files` exits 1 when a pattern matches nothing, and on a
-        # control-plane host it matches nothing by design: that profile
-        # installs no worker lanes at all. An empty result is the answer, not
-        # a failure -- treating it as one made the control install die at
-        # `cannot enumerate worker lanes for snapshot closure` (observed live
-        # on control-01, 2026-08-31). A real failure still reports on stderr.
-        if result.returncode and (result.stderr.strip() or result.stdout.strip()):
-            raise RuntimeError(
-                result.stderr.strip()
-                or "cannot enumerate worker lanes for snapshot closure"
-            )
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            if fields and fields[0] == "●":
-                fields = fields[1:]
-            candidate = fields[0] if fields else ""
-            if TEMPLATE_WORKER_UNIT_RE.fullmatch(candidate):
-                discovered.add(candidate)
+    discovered = discover_template_instances(
+        run=run, message="cannot enumerate template units for snapshot closure"
+    )
 
     extras = sorted(discovered - set(units))
     if extras:
-        raise RuntimeError(f"worker lanes exist outside service snapshot: {extras}")
+        raise RuntimeError(
+            f"template units exist outside service snapshot: {extras}"
+        )
 
 
-#: Statically-named units a control-profile host must not run. The
-#: `voyn-aicc-worker@<lane>` template has no fixed name -- discovered the
-#: same way `verify_service_snapshot_closure` proves lane closure, below.
+#: Statically-named units a control-profile host must not run. Neither the
+#: `voyn-aicc-worker@<lane>` nor the `aicc-agent-launcher@<connection>`
+#: template has a fixed name -- both are discovered from systemd by
+#: `discover_template_instances`, the same enumeration
+#: `verify_service_snapshot_closure` proves closure against.
 #: `aicc-principal-recovery.service` is deliberately absent: it is the boot
 #: recovery capsule, kept running through every transaction the same way
 #: `quiesce_service_snapshot` already exempts it from being stopped.
@@ -1277,39 +1713,11 @@ def quiesce_worker_only_units(*, run=subprocess.run) -> None:
             text=True,
         )
 
-    discovered: set[str] = set(CONTROL_PURGE_UNITS)
-    for arguments in (
-        (
-            "list-unit-files",
-            "voyn-aicc-worker@*.service",
-            "--no-legend",
-            "--no-pager",
-        ),
-        (
-            "list-units",
-            "voyn-aicc-worker@*.service",
-            "--all",
-            "--no-legend",
-            "--no-pager",
-        ),
-    ):
-        result = systemctl(*arguments)
-        # See verify_service_snapshot_closure: an empty match is a return
-        # code of 1 with nothing on either stream, not a failure.
-        if result.returncode and (result.stderr.strip() or result.stdout.strip()):
-            raise RuntimeError(
-                result.stderr.strip()
-                or "cannot enumerate worker lanes before control purge"
-            )
-        for line in result.stdout.splitlines():
-            fields = line.split()
-            if fields and fields[0] == "●":
-                fields = fields[1:]
-            candidate = fields[0] if fields else ""
-            if TEMPLATE_WORKER_UNIT_RE.fullmatch(candidate):
-                discovered.add(candidate)
+    discovered = set(CONTROL_PURGE_UNITS) | discover_template_instances(
+        run=run, message="cannot enumerate template units before control purge"
+    )
 
-    for unit in sorted(discovered):
+    for unit in sorted(discovered, key=_control_purge_order):
         load = systemctl("show", unit, "--property=LoadState", "--value")
         if load.returncode or load.stdout.strip() == "not-found":
             continue
@@ -1380,6 +1788,9 @@ class FileTransaction:
             info = self.state_dir.lstat()
         except FileNotFoundError:
             self.state_dir.mkdir(parents=True, mode=0o700)
+            # mkdir's mode is masked by the caller's umask; the state
+            # directory's privacy must not be.
+            os.chmod(self.state_dir, 0o700)
             info = self.state_dir.lstat()
         if (
             not stat.S_ISDIR(info.st_mode)
@@ -1418,6 +1829,7 @@ class FileTransaction:
             for spec in validated
             if not spec.remove
         }
+        removed = frozenset(spec.target for spec in validated if spec.remove)
         previous_current = (
             self.current.read_text(encoding="utf-8") if self.current.exists() else None
         )
@@ -1429,6 +1841,11 @@ class FileTransaction:
             try:
                 info = target.lstat()
             except FileNotFoundError:
+                continue
+            if spec.remove and spec.directory:
+                # Shape and emptiness are proven together in
+                # `_snapshot_directory_removal`, which needs the full removal
+                # set this preflight does not carry.
                 continue
             if spec.if_missing:
                 continue
@@ -1458,8 +1875,16 @@ class FileTransaction:
         transaction = self.state_dir / f"generation-{secrets.token_hex(8)}"
         backups = transaction / "backups"
         staged = transaction / "staged"
-        backups.mkdir(parents=True, mode=0o700)
-        staged.mkdir(mode=0o700)
+        # Created and chmod'ed explicitly, never with `parents=True`: pathlib
+        # creates an intermediate parent with the default 0o777 masked by the
+        # CALLER's umask, so under the common 0o002 the generation directory
+        # -- which holds the credential backups -- came out group-writable,
+        # and under 0o000 world-writable. mkdir's own mode argument is masked
+        # too, so the chmod after it is what makes the result independent of
+        # the umask the installer happened to inherit.
+        for directory in (transaction, backups, staged):
+            directory.mkdir(mode=0o700)
+            os.chmod(directory, 0o700)
         records: list[BackupRecord] = []
 
         # Snapshot every target before the first mutation.
@@ -1473,6 +1898,11 @@ class FileTransaction:
             )
             for index, spec in enumerate(validated):
                 target = self._target(spec.target)
+                if spec.remove and spec.directory:
+                    records.append(
+                        self._snapshot_directory_removal(spec, target, removed)
+                    )
+                    continue
                 if spec.remove:
                     try:
                         info = target.lstat()
@@ -1629,9 +2059,11 @@ class FileTransaction:
                 manifest,
                 json.dumps(
                     {
-                        "version": 2,
+                        "version": MANIFEST_VERSION,
                         "generation": transaction.name,
-                        "records": [asdict(record) for record in records],
+                        "records": [
+                            _record_document(record) for record in records
+                        ],
                         "previous_current": previous_current,
                     },
                     sort_keys=True,
@@ -1648,6 +2080,77 @@ class FileTransaction:
             _fsync_dir(self.state_dir)
             raise
         return manifest
+
+    def _snapshot_directory_removal(
+        self, spec: FileSpec, target: Path, removed: frozenset[str]
+    ) -> BackupRecord:
+        """Record a worker-only directory, refusing anything unaccounted for.
+
+        The control transition must not leave a residual agent tree behind --
+        an empty `/var/lib/aicc-agent/claude/.claude` still names the secret
+        that used to be in it, and `/run/aicc-agent-homes` is where the
+        launcher materialises ephemeral copies of both credentials. So the
+        directories go too.
+
+        What it must not do is delete a file it never examined. A directory
+        removal is reversible only as "recreate an empty directory with this
+        mode and owner", so the only content this generation may find here is
+        content it is itself removing in the same generation. Anything else
+        -- an operator's file, a session the quiesce step failed to stop, a
+        provider cache nobody declared -- fails the generation closed, before
+        `prepare()` has touched a single target, and the operator decides
+        what it was.
+        """
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            return BackupRecord(
+                spec.target,
+                False,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "",
+                "",
+                0,
+                0,
+                0,
+                remove=True,
+                directory=True,
+            )
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(
+                f"worker-only directory target is not a directory: {target}"
+            )
+        expected = {
+            PurePosixPath(other).name
+            for other in removed
+            if str(PurePosixPath(other).parent) == spec.target
+        }
+        unexpected = sorted(set(os.listdir(target)) - expected)
+        if unexpected:
+            raise RuntimeError(
+                f"unexpected content under worker-only directory {target}: "
+                f"{unexpected}"
+            )
+        return BackupRecord(
+            spec.target,
+            True,
+            None,
+            stat.S_IMODE(info.st_mode),
+            info.st_uid,
+            info.st_gid,
+            None,
+            "",
+            "",
+            0,
+            0,
+            0,
+            remove=True,
+            directory=True,
+        )
 
     def _pending_manifest(self) -> Path:
         value = _trusted_journal(self.pending)
@@ -1678,24 +2181,52 @@ class FileTransaction:
             if _path_present(target):
                 raise RuntimeError(f"purge target appeared after prepare: {target}")
             return target
-        if not _path_present(target):
-            raise RuntimeError(f"purge target disappeared before removal: {target}")
+        try:
+            parent_fd = _open_directory_chain(target.parent, create=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"purge target disappeared before removal: {target}"
+            ) from exc
+        try:
+            self._assert_removal_at(record, parent_fd, target.name, target)
+        finally:
+            os.close(parent_fd)
+        return target
+
+    def _assert_removal_at(
+        self, record: BackupRecord, parent_fd: int, name: str, target: Path
+    ) -> None:
+        """`_assert_removal_snapshot`'s comparison, bound to a pinned parent.
+
+        `name` is resolved against `parent_fd` alone -- no path is walked, so
+        no component of one can be swapped between this check and whatever
+        the caller does next. `target` is carried only to name the real path
+        in an error; the object compared is whatever `name` denotes.
+        """
+        try:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"purge target disappeared before removal: {target}"
+            ) from exc
         if record.original_symlink is not None:
             # Compared against the link itself, never what it resolves to:
             # `_read_regular` opens O_NOFOLLOW and would reject the link.
-            if not target.is_symlink():
+            if not stat.S_ISLNK(info.st_mode):
                 raise RuntimeError(f"purge target is no longer a symlink: {target}")
-            if os.readlink(target) != record.original_symlink:
+            if os.readlink(name, dir_fd=parent_fd) != record.original_symlink:
                 raise RuntimeError(
                     f"purge target symlink changed before removal: {target}"
                 )
-            return target
+            return
         assert record.original_sha256 is not None
         assert record.original_mode is not None
         assert record.original_uid is not None
         assert record.original_gid is not None
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"purge target shape changed before removal: {target}")
         try:
-            current = _read_regular(target)
+            current = _read_regular(name, dir_fd=parent_fd)
         except OSError as exc:
             raise RuntimeError(
                 f"purge target shape changed before removal: {target}"
@@ -1710,34 +2241,194 @@ class FileTransaction:
             raise RuntimeError(
                 f"purge target changed before compare-and-remove: {target}"
             )
-        return target
+
+    @staticmethod
+    def _release_quarantine(parent_fd: int, quarantine: str, target: Path) -> None:
+        """Put a quarantined object back under its own name, replacing nothing.
+
+        `link` rather than `rename`: this process emptied the original name,
+        so it is empty unless something else has since claimed it -- and that
+        something belongs to whoever created it. EEXIST therefore keeps both
+        objects, leaving the quarantine entry in place and naming it in the
+        error, instead of silently destroying one of them. Either way the
+        purge target's bytes still exist under some name in its own
+        directory: refusing a removal never costs data.
+        """
+        try:
+            os.link(
+                quarantine,
+                target.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"purge target could not be put back and is retained at "
+                f"{target.parent / quarantine}: {target}"
+            ) from exc
+        os.unlink(quarantine, dir_fd=parent_fd)
+        os.fsync(parent_fd)
 
     def _apply_removal(self, record: BackupRecord) -> None:
-        """Remove one purge target, compare-and-remove immediately before the
-        unlink so nothing can drift in between."""
-        target = self._assert_removal_snapshot(record)
+        """Destroy one purge target, with nothing between compare and destroy.
+
+        Comparing the path and then unlinking the path are two resolutions of
+        the same name, and an untrusted writer of the directory only has to
+        win the gap between them to have the installer -- running as root --
+        destroy a file it never examined. No ordering of those two operations
+        closes that: the second one always resolves the name again
+        (independent review on 9eb07f8).
+
+        So the name is resolved exactly once, and by a rename: the object is
+        moved to a quarantine entry in its own directory whose name is
+        unpredictable and whose parent is a descriptor pinned before the
+        rename. From that point the pathname is out of the picture. The
+        comparison that authorises destruction runs against the quarantined
+        object, and the unlink destroys that same entry -- there is no name
+        left for anyone to interpose on.
+
+        If the object that lands in quarantine is NOT what `prepare()`
+        snapshotted -- because the swap happened before the rename rather than
+        after it -- the comparison fails and `_release_quarantine` puts it
+        back under its own name without replacing anything. The generation
+        fails closed, and nothing was destroyed.
+        """
+        target = self._target(record.target)
         if not record.existed:
+            if _path_present(target):
+                raise RuntimeError(f"purge target appeared after prepare: {target}")
             return
-        target.unlink()
-        _fsync_dir(target.parent)
+        try:
+            parent_fd = _open_directory_chain(target.parent, create=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"purge target disappeared before removal: {target}"
+            ) from exc
+        try:
+            # A pathname-shaped pre-check first: in every non-adversarial run
+            # it is what produces the precise drift message, and it means the
+            # quarantine below almost never has to be undone.
+            self._assert_removal_at(record, parent_fd, target.name, target)
+            quarantine = f".{target.name}.aicc-purge-{secrets.token_hex(8)}"
+            try:
+                os.rename(
+                    target.name,
+                    quarantine,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"purge target disappeared before removal: {target}"
+                ) from exc
+            os.fsync(parent_fd)
+            try:
+                self._assert_removal_at(record, parent_fd, quarantine, target)
+            except BaseException:
+                self._release_quarantine(parent_fd, quarantine, target)
+                raise
+            os.unlink(quarantine, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    def _assert_directory_removal_snapshot(self, record: BackupRecord) -> None:
+        """Prove a purge directory is still the one `prepare()` recorded."""
+        target = self._target(record.target)
+        if not record.existed:
+            if _path_present(target):
+                raise RuntimeError(
+                    f"purge directory appeared after prepare: {target}"
+                )
+            return
+        try:
+            info = target.lstat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"purge directory disappeared before removal: {target}"
+            ) from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != record.original_mode
+            or info.st_uid != record.original_uid
+            or info.st_gid != record.original_gid
+        ):
+            raise RuntimeError(
+                f"purge directory changed before compare-and-remove: {target}"
+            )
+
+    def _apply_directory_removal(self, record: BackupRecord) -> None:
+        """Remove one worker-only directory once this generation emptied it.
+
+        No quarantine here, and none needed: `rmdir` is itself the compare.
+        It removes a directory only while that directory is empty, refusing
+        with ENOTEMPTY otherwise -- so anything that appeared under it since
+        `prepare()` proved it accounted-for stops the removal atomically, in
+        the kernel, and nothing that is not a directory can be removed by it
+        at all.
+        """
+        target = self._target(record.target)
+        if not record.existed:
+            if _path_present(target):
+                raise RuntimeError(
+                    f"purge directory appeared after prepare: {target}"
+                )
+            return
+        try:
+            parent_fd = _open_directory_chain(target.parent, create=False)
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"purge directory disappeared before removal: {target}"
+            ) from exc
+        try:
+            try:
+                info = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"purge directory disappeared before removal: {target}"
+                ) from exc
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != record.original_mode
+                or info.st_uid != record.original_uid
+                or info.st_gid != record.original_gid
+            ):
+                raise RuntimeError(
+                    f"purge directory changed before compare-and-remove: {target}"
+                )
+            try:
+                os.rmdir(target.name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"worker-only directory is not empty at removal: {target}"
+                ) from exc
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
 
     def apply(self) -> None:
         """Apply one prepared generation; recovery stays armed until commit."""
         manifest = self._pending_manifest()
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-        records = [BackupRecord(**value) for value in payload["records"]]
+        records = _generation_records(payload)
         # Prove every purge target still matches its snapshot before the first
         # mutation of any record. The per-record check below is the one that
         # governs the unlink, but refusing here means a drifted target fails
         # the generation with the host bit-for-bit untouched, instead of after
         # half the installs have been written and must be rolled back.
         for record in records:
-            if record.remove:
+            if record.remove and record.directory:
+                self._assert_directory_removal_snapshot(record)
+            elif record.remove:
                 self._assert_removal_snapshot(record)
         try:
             for index, record in enumerate(records):
                 # Write-ahead index makes every destination mutation recoverable.
                 self._write_journal(manifest, "APPLYING", index)
+                if record.remove and record.directory:
+                    self._apply_directory_removal(record)
+                    continue
                 if record.remove:
                     self._apply_removal(record)
                     continue
@@ -1771,6 +2462,11 @@ class FileTransaction:
         if journal.get("phase") != "APPLIED":
             raise RuntimeError("only a fully applied generation can be committed")
         self._write_journal(manifest, "COMMITTING", journal.get("next_index", 0))
+        # Armed while the generation is still governed by a COMMITTING
+        # journal, so every way out of here -- return, crash, reboot -- ends
+        # in the retirement phase rather than in a committed control host
+        # with the agent's credentials still sitting in its backups.
+        self._arm_sensitive_retirement(manifest)
         _atomic_bytes(
             self.current,
             json.dumps({"manifest": str(manifest)}, sort_keys=True).encode(),
@@ -1778,6 +2474,11 @@ class FileTransaction:
             os.geteuid(),
             os.getegid(),
         )
+        # The revocation becomes terminal here, one step BEFORE pending.json
+        # is consumed: while that journal exists `recover()` is still the
+        # authority on this generation, and it finalises or restores the
+        # membership to match whichever way it resolves the generation.
+        finalize_authority_membership(self.state_dir)
         self.pending_release.unlink(missing_ok=True)
         _fsync_dir(self.state_dir)
         self.pending.unlink()
@@ -1785,6 +2486,85 @@ class FileTransaction:
         # lets a later recover() apply a stale snapshot against a different
         # generation (review on d8920b6).
         (self.state_dir / "attempt-units.json").unlink(missing_ok=True)
+        _fsync_dir(self.state_dir)
+        self._run_sensitive_retirement()
+
+    def _arm_sensitive_retirement(self, manifest: Path) -> None:
+        """Journal the intent to destroy this generation's secret backups."""
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        targets = sorted(
+            {
+                record.target
+                for record in _generation_records(payload)
+                if record.remove
+                and record.existed
+                and (record.sensitive or record.target in SENSITIVE_TARGETS)
+            }
+        )
+        if not targets:
+            return
+        _atomic_bytes(
+            self.state_dir / SENSITIVE_RETIREMENT_JOURNAL,
+            (
+                json.dumps(
+                    {
+                        "version": SENSITIVE_RETIREMENT_VERSION,
+                        "generation": manifest.parent.name,
+                        "targets": targets,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode(),
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
+        _fsync_dir(self.state_dir)
+
+    def _run_sensitive_retirement(self) -> None:
+        """Destroy every reachable copy of a credential this host purged.
+
+        A removal is reversible only because `prepare()` copied the target
+        into the generation's backups first -- which means that for the two
+        model credentials, the price of a rollback boundary is a second copy
+        of the secret, in a root-owned directory, on the host that exists to
+        not hold it. Keeping it after the control generation commits would
+        make "the control plane holds no agent credentials" false in the one
+        place nobody looks.
+
+        So the removal of a sensitive target is finalised rather than merely
+        committed. Once the generation is terminal this destroys the backup
+        blob, and every older copy of the same target anywhere in this state
+        directory -- a previous worker generation staged those bytes as well
+        as backing them up -- and redacts the records that pointed at them.
+
+        The redaction is explicit, not silent. `sensitive_retired` stays on
+        the record, so the journal still says a secret was here and was
+        deliberately destroyed, and `restore()` refuses that record by name
+        instead of quietly doing nothing. `uninstall_all` is the one caller
+        that accepts it, because unwinding an installation cannot mean
+        resurrecting a credential the operator had removed on purpose.
+
+        Idempotent, and driven by a durable journal: a crash at any point
+        re-runs it from `recover()`.
+        """
+        journal = self.state_dir / SENSITIVE_RETIREMENT_JOURNAL
+        if not _path_present(journal):
+            return
+        payload = _trusted_journal(journal)
+        targets = payload.get("targets")
+        if (
+            payload.get("version") != SENSITIVE_RETIREMENT_VERSION
+            or not isinstance(targets, list)
+            or not targets
+            or any(not isinstance(target, str) for target in targets)
+        ):
+            raise RuntimeError("sensitive retirement journal is invalid")
+        retired = frozenset(targets)
+        for manifest in sorted(self.state_dir.glob("generation-*/manifest.json")):
+            _redact_sensitive_records(manifest, retired)
+        journal.unlink()
         _fsync_dir(self.state_dir)
 
     def _restore_release_selector(self, *, clear_pending: bool = True) -> None:
@@ -1962,7 +2742,16 @@ class FileTransaction:
         self.commit()
 
     def recover(self, *, boot: bool = False) -> None:
-        """Idempotently roll back an interrupted prepared/applying generation."""
+        """Idempotently roll back an interrupted prepared/applying generation.
+
+        Also the single place the two auxiliary journals are resolved, in the
+        same direction as the generation they belong to. A rollback restores
+        the publisher-group memberships the control transition revoked; a
+        finished commit finalises them and runs the sensitive-removal
+        retirement it armed. Neither is a separate transaction the operator
+        has to know about: the installer's rollback trap already calls this,
+        and so does the boot recovery capsule.
+        """
         if not _path_present(self.pending):
             if _path_present(self.pending_release):
                 raise RuntimeError(
@@ -1977,6 +2766,12 @@ class FileTransaction:
                 snapshot.unlink()
                 _fsync_dir(self.state_dir)
             self._remove_orphan_generations()
+            # A crash between commit()'s last unlink and its retirement call
+            # leaves the armed journal and nothing else; there is no pending
+            # generation to roll back, so the only thing outstanding is
+            # finishing that destruction.
+            self._run_sensitive_retirement()
+            restore_legacy_authority_membership(self.state_dir)
             return
         manifest = self._pending_manifest()
         transaction = manifest.parent
@@ -2016,6 +2811,10 @@ class FileTransaction:
             (self.state_dir / "attempt-units.json").unlink(missing_ok=True)
             self._remove_orphan_generations()
             _fsync_dir(self.state_dir)
+            # The generation is live, so the revocation it made is terminal
+            # and the secrets it purged must not survive in its backups.
+            finalize_authority_membership(self.state_dir)
+            self._run_sensitive_retirement()
             return
         snapshot = self.state_dir / "attempt-units.json"
         snapshot_present = _path_present(snapshot)
@@ -2042,6 +2841,11 @@ class FileTransaction:
         shutil.rmtree(transaction)
         self._remove_orphan_generations()
         _fsync_dir(self.state_dir)
+        # Strictly last: the file generation is back, so the authority the
+        # same transaction took away goes back too. A failure here keeps the
+        # durable journal and reports an incomplete rollback rather than
+        # leaving two principals silently locked out of a group they were in.
+        restore_legacy_authority_membership(self.state_dir)
 
     def _current_generation_manifests(self) -> set[Path]:
         manifests: set[Path] = set()
@@ -2074,14 +2878,39 @@ class FileTransaction:
             _fsync_dir(self.state_dir)
 
     def restore(
-        self, manifest: Path | None = None, *, clear_pending: bool = True
+        self,
+        manifest: Path | None = None,
+        *,
+        clear_pending: bool = True,
+        allow_retired_sensitive: bool = False,
     ) -> None:
+        """Undo one generation, or refuse where undoing it is not possible.
+
+        `allow_retired_sensitive` is the caller stating that a credential
+        whose backup the commit destroyed is not expected back. Only
+        `uninstall_all` says it: unwinding an installation means leaving the
+        host without AICC state, and a credential the control profile removed
+        on purpose is exactly that. Every other caller -- above all
+        `recover()`, which rolls back generations that have NOT committed and
+        therefore still have their backups -- leaves it false and gets a named
+        refusal rather than a rollback that silently skipped a record.
+        """
         if manifest is None:
             current = json.loads(self.current.read_text(encoding="utf-8"))
             manifest = Path(current["manifest"])
         payload = json.loads(manifest.read_text(encoding="utf-8"))
-        records = [BackupRecord(**value) for value in payload["records"]]
+        records = _generation_records(payload)
         for record in reversed(records):
+            if record.sensitive_retired:
+                # The backup this record would restore from was destroyed
+                # when the generation committed. See
+                # `_run_sensitive_retirement`.
+                if allow_retired_sensitive:
+                    continue
+                raise RuntimeError(
+                    "sensitive backup was retired at commit and this "
+                    f"generation cannot be rolled back: {record.target}"
+                )
             if (
                 record.target == RECOVERY_ANCHOR_TARGET
                 and _path_present(self.state_dir / "uninstall.json")
@@ -2091,6 +2920,9 @@ class FileTransaction:
                 # durably gone; without it a reboot could bypass recovery.
                 continue
             target = self._target(record.target)
+            if record.remove and record.directory:
+                self._restore_removed_directory(record, target)
+                continue
             if record.remove:
                 self._restore_removed(record, target)
                 continue
@@ -2235,6 +3067,58 @@ class FileTransaction:
         if clear_pending:
             self._clear_pending(manifest)
 
+    def _restore_removed_directory(
+        self, record: BackupRecord, target: Path
+    ) -> None:
+        """Recreate a purged worker-only directory, empty and exactly as it was.
+
+        Empty is the whole reason this is reversible: `prepare()` refused the
+        generation unless the directory held nothing but the entries this
+        same generation removes, and `restore()` walks the records in reverse,
+        so the directory is back before the files that belonged in it are.
+        """
+        if not record.existed:
+            if _path_present(target):
+                raise RuntimeError(
+                    f"generation target appeared where absence was recorded: {target}"
+                )
+            return
+        assert record.original_mode is not None
+        assert record.original_uid is not None
+        assert record.original_gid is not None
+        parent_fd = _open_directory_chain(target.parent, create=False)
+        try:
+            try:
+                info = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.mkdir(target.name, record.original_mode, dir_fd=parent_fd)
+                # mkdir's mode is masked by the caller's umask; the restored
+                # directory must be what the snapshot recorded, not what the
+                # process happened to inherit.
+                os.chmod(target.name, record.original_mode, dir_fd=parent_fd)
+                os.chown(
+                    target.name,
+                    record.original_uid,
+                    record.original_gid,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                os.fsync(parent_fd)
+                return
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != record.original_mode
+                or info.st_uid != record.original_uid
+                or info.st_gid != record.original_gid
+            ):
+                raise RuntimeError(
+                    f"generation target directory changed before restore: {target}"
+                )
+            # Unchanged: apply() has not reached this record, or a previous
+            # restore already put it back. Either way there is nothing to do.
+        finally:
+            os.close(parent_fd)
+
     def _restore_removed(self, record: BackupRecord, target: Path) -> None:
         """Undo a removal record: put back exactly what a purge took away.
 
@@ -2316,13 +3200,21 @@ class FileTransaction:
         )
 
     def uninstall_all(self, *, boot: bool = False) -> None:
-        """Unwind every installed generation to the original pre-install state."""
+        """Unwind every installed generation to the original pre-install state.
+
+        The one thing it cannot unwind is a credential removal the control
+        profile finalised: those bytes were destroyed deliberately and are
+        not recoverable from anything this host still holds. Uninstalling
+        therefore leaves those targets absent -- which is also what
+        uninstalling is for -- rather than wedging on a restore no host
+        could perform.
+        """
         self.recover(boot=boot)
         while self.current.exists():
             value = json.loads(self.current.read_text(encoding="utf-8"))
             manifest = Path(value["manifest"]).resolve(strict=True)
             transaction = manifest.parent
-            self.restore(manifest)
+            self.restore(manifest, allow_retired_sensitive=True)
             shutil.rmtree(transaction)
             _fsync_dir(self.state_dir)
         self._remove_orphan_generations()
@@ -2999,6 +3891,27 @@ WORKER_ONLY_TARGETS = frozenset(
     }
 )
 
+#: Directories that exist only because the agent layer was installed, in the
+#: order `apply()` removes them: every child before its parent, and all of
+#: them after the file removals that empty them.
+#:
+#: Deliberately NOT here: `/srv/aicc-workspaces` and `/srv/aicc-quarantine`.
+#: Those hold task working trees and quarantined output -- operator data that
+#: happens to have been created by the agent layer, not artefacts of it. A
+#: profile change is not a licence to delete work.
+WORKER_ONLY_DIRECTORIES = (
+    "/var/lib/aicc-agent/claude/.claude",
+    "/var/lib/aicc-agent/claude",
+    "/var/lib/aicc-agent/codex/.codex",
+    "/var/lib/aicc-agent/codex",
+    "/var/lib/aicc-agent",
+    "/run/aicc-agent-homes",
+    "/run/aicc-agent-launcher/active",
+    "/run/aicc-agent-launcher",
+    "/etc/systemd/system/voyn-aicc-worker@.service.d",
+    "/etc/systemd/system/aicc-worker.service.d",
+)
+
 PROFILES = ("worker", "control")
 
 
@@ -3038,6 +3951,23 @@ def default_specs(
     are not added here: they are still symlinks into the operator's home and
     become repo-owned under VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. This
     profile makes that installation possible; it does not pre-empt it.
+
+    What the transition does and does not remove, stated exactly, because
+    "the agent principal is absent" is a claim this cannot make:
+
+    * Files, and the worker-only directories that held them
+      (`WORKER_ONLY_DIRECTORIES`) -- removed, in this generation.
+    * Authority: `aicc-worker` and `voynadmin` are removed from the
+      `aicc-publisher` group, so the authority key stops being readable by
+      the worker-era principals (`revoke_legacy_authority_membership`).
+    * Unix principals -- the `aicc-agent` and `aicc-worker` users and the
+      `aicc-workspace`/`aicc-agent-auth` groups -- are NOT removed. sysusers
+      has no removal verb, and deleting a system account whose uid may still
+      own inodes elsewhere on the host is not something an installer should
+      do behind an operator's back. They are left inert: no files, no
+      credentials, no group conferring access to anything this profile
+      installs, and the `nologin` shells they were created with. An operator
+      who wants the accounts gone removes them deliberately, with `userdel`.
     """
     if profile not in PROFILES:
         raise ValueError(f"unknown installation profile: {profile!r}")
@@ -3045,11 +3975,14 @@ def default_specs(
     # `aicc-agent` is resolved only where the agent layer is installed. That
     # identity comes from deploy/sysusers.d/aicc-agent.conf, which a control
     # host deliberately never runs (see the installer): demanding the group
-    # here would fail the one profile whose whole point is that the agent
-    # principal is absent, and it is used by exactly one spec -- the
-    # worker-only /etc/aicc/agent.env. `aicc-publisher` is required by both
-    # profiles: /etc/aicc/workspace-authority.env is group-owned by it on
-    # every host, so the control profile provisions that group of its own.
+    # here would fail a profile that installs nothing against it on a host
+    # that was never a worker and therefore does not have it. It is used by
+    # exactly one spec -- the worker-only /etc/aicc/agent.env. On a CONVERTED
+    # host the group does still exist, inert, and is not resolved either; see
+    # the docstring on what this profile does and does not remove.
+    # `aicc-publisher` is required by both profiles:
+    # /etc/aicc/workspace-authority.env is group-owned by it on every host, so
+    # the control profile provisions that group of its own.
     agent_gid = (
         grp.getgrnam("aicc-agent").gr_gid
         if resolve_identities and profile != "control"
@@ -3220,8 +4153,17 @@ def default_specs(
         # predecessor). A host that never carried the worker profile simply
         # removes nothing -- every one of these targets is already absent.
         kept = tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
-        purge = tuple(removal_spec(target) for target in sorted(WORKER_ONLY_TARGETS))
-        return kept + purge
+        purge = tuple(
+            removal_spec(target, sensitive=target in SENSITIVE_TARGETS)
+            for target in sorted(WORKER_ONLY_TARGETS)
+        )
+        # Strictly after the file purges, deepest first: a directory is only
+        # removable once this same generation has emptied it, and only if
+        # what it held was nothing but those files.
+        purge_directories = tuple(
+            directory_removal_spec(target) for target in WORKER_ONLY_DIRECTORIES
+        )
+        return kept + purge + purge_directories
     return specs
 
 
@@ -3346,6 +4288,7 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         "commit",
         "install",
         "quiesce-worker-only",
+        "revoke-worker-authority",
     }:
         raise RuntimeError("unfinished uninstall journal blocks installation")
     transaction = FileTransaction(args.root, args.state_dir)
@@ -3377,6 +4320,15 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         if args.profile != "control":
             raise RuntimeError("quiesce-worker-only requires the control profile")
         quiesce_worker_only_units()
+    elif args.action == "revoke-worker-authority":
+        # Same shape as quiesce-worker-only: a control-profile step, run
+        # between prepare() and apply() so its journal is created while the
+        # generation is still fully rollbackable. Under any other profile it
+        # would strip the publisher group of the very members that profile
+        # installs against.
+        if args.profile != "control":
+            raise RuntimeError("revoke-worker-authority requires the control profile")
+        revoke_legacy_authority_membership(args.state_dir)
     elif args.action == "install":
         transaction.install(specs)
     elif args.action in {"recover", "rollback", "recover-boot"}:
@@ -3397,6 +4349,7 @@ def main() -> int:
             "commit",
             "quiesce",
             "quiesce-worker-only",
+            "revoke-worker-authority",
             "install",
             "recover",
             "recover-boot",
