@@ -109,7 +109,14 @@ def _review_head_checkout(
     detached worktree, and verifies the worktree's HEAD is the exact sha --
     fail closed on any mismatch. Read-only-ness is enforced by the runner's
     capability profile, not by this checkout. Returns ``(path, None)`` or
-    ``(None, retryable_reason)``."""
+    ``(None, retryable_reason)``.
+
+    Under principal isolation this delegates to
+    `_review_head_checkout_isolated` -- see its docstring for why a `git
+    fetch`/`git worktree add` straight against `repository` (this
+    function's own path, below) cannot run there at all."""
+    if agent_runner.principal_isolation_required():
+        return _review_head_checkout_isolated(repository, pr_number, head_sha)
     fetch = agent_runner._run_git(
         ["fetch", "origin", f"refs/pull/{pr_number}/head"], repository, timeout=120
     )
@@ -153,7 +160,111 @@ def _review_head_checkout(
     return target, None
 
 
+def _review_head_checkout_isolated(
+    repository: Path, pr_number: str, head_sha: str
+) -> tuple[Path | None, str | None]:
+    """Principal-isolation variant of `_review_head_checkout`
+    (VOYN-W0-AICC-SRV-05-C): a `git fetch` against `repository` writes new
+    objects and ref/lock files into its `.git`, and a linked `git worktree
+    add` additionally writes the worktree's admin metadata into
+    `repository/.git/worktrees/<name>/` -- the exact write
+    `task_local_git_metadata=True` already exists to avoid for the mutating
+    path (`workspace_provisioning._provision_task_local_clone`,
+    `WorkspaceSpec.task_local_git_metadata`'s own docstring). `repository` is
+    the read-only bind-mounted source under `ProtectSystem=strict`, so
+    neither write can land there once isolation is required -- verified
+    (task_type is never mutating here; see the `review_head pin` gate above)
+    or not, both would fail closed on the read-only filesystem before
+    reaching the worktree at all.
+
+    Reproduces the same contract without ever writing to `repository`: reads
+    its origin URL (a read-only `git remote get-url`), then clones straight
+    from that URL into an independent, task-clone-root-scoped directory
+    (`workspace_provisioning.task_workspace_path`, the same root the mutating
+    path's isolated clones use) and fetches/checks out the pinned sha there.
+    """
+    try:
+        root = agent_runner.principal_workspace_root()
+    except (OSError, agent_runner.RunnerError) as exc:
+        return None, f"review_head isolated workspace root unavailable: {exc}"
+    remote = agent_runner._run_git(["remote", "get-url", "origin"], repository)
+    if remote is None or remote.returncode != 0 or not remote.stdout.strip():
+        detail = remote.stderr.strip() if remote is not None else "git unavailable"
+        return None, f"review_head: cannot resolve origin remote url: {detail}"
+    remote_url = remote.stdout.strip()
+    if remote_url.startswith("-"):
+        # A positional git argument beginning with '-' is parsed as an
+        # option, not a repository -- refuse rather than let a crafted
+        # `origin` achieve option injection into `git clone` (mirrors
+        # `workspace_provisioning._source_remote_url`'s identical refusal).
+        return None, "review_head: origin url is option-like, refused"
+    try:
+        target = workspace_provisioning.task_workspace_path(
+            repository, f"review-{pr_number}-{head_sha}", clone_root=root
+        )
+    except workspace_provisioning.WorkspaceVerificationError as exc:
+        return None, f"review_head isolated workspace root unavailable: {exc}"
+    with _provision_lock(str(target)):
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        cloned = agent_runner._run_git(
+            ["clone", "--no-checkout", "--origin", "origin", remote_url, str(target)],
+            target.parent,
+            timeout=180,
+        )
+        if cloned is None or cloned.returncode != 0:
+            detail = cloned.stderr.strip() if cloned is not None else "git unavailable"
+            return None, f"review_head isolated clone failed: {detail}"
+        fetch = agent_runner._run_git(
+            ["fetch", "origin", f"refs/pull/{pr_number}/head"], target, timeout=120
+        )
+        present = agent_runner._run_git(
+            ["cat-file", "-e", f"{head_sha}^{{commit}}"], target
+        )
+        if present is None or present.returncode != 0:
+            agent_runner._run_git(["fetch", "origin", head_sha], target, timeout=120)
+            present = agent_runner._run_git(
+                ["cat-file", "-e", f"{head_sha}^{{commit}}"], target
+            )
+        if present is None or present.returncode != 0:
+            detail = fetch.stderr.strip() if fetch is not None else "git unavailable"
+            shutil.rmtree(target, ignore_errors=True)
+            return None, (
+                f"review_head {head_sha} unreachable after fetching "
+                f"refs/pull/{pr_number}/head: {detail}"
+            )
+        checked_out = agent_runner._run_git(
+            ["checkout", "--detach", head_sha], target, timeout=60
+        )
+        if checked_out is None or checked_out.returncode != 0:
+            detail = (
+                checked_out.stderr.strip()
+                if checked_out is not None
+                else "git unavailable"
+            )
+            shutil.rmtree(target, ignore_errors=True)
+            return None, f"review_head checkout failed: {detail}"
+    at = agent_runner._run_git(["rev-parse", "HEAD"], target)
+    if at is None or at.stdout.strip() != head_sha:
+        shutil.rmtree(target, ignore_errors=True)
+        observed = at.stdout.strip() if at is not None else "unknown"
+        return None, (
+            f"review_head checkout verification failed: HEAD is {observed}, "
+            f"expected {head_sha}"
+        )
+    return target, None
+
+
 def _remove_review_head_checkout(repository: Path, target: Path) -> None:
+    if agent_runner.principal_isolation_required():
+        # `_review_head_checkout_isolated`'s target is a standalone clone,
+        # never registered as a linked worktree of `repository` -- `git
+        # worktree remove` against `repository` would be both the wrong
+        # operation and, under isolation, a write `repository`'s read-only
+        # mount refuses.
+        shutil.rmtree(target, ignore_errors=True)
+        return
     removed = agent_runner._run_git(
         ["worktree", "remove", "--force", str(target)], repository, timeout=60
     )

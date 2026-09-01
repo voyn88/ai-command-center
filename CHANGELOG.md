@@ -8,6 +8,30 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the worker admitted review-verification runs it could not execute under isolation (`VOYN-W0-AICC-SRV-05-C`)
+
+`ProtectSystem=strict` + `ReadWritePaths=/srv/aicc-workspaces` already closed the
+original SRV-05 gap for the *mutating* dispatch path (added alongside
+principal isolation, `VOYN-W0-AICC-AGENT-PUBLISHER-PRINCIPAL-ISOLATION`), but
+`_review_head_checkout` (`VOYN-W0-AICC-REVIEW-AUTO-ACCEPT`, landed after that
+fix) reintroduced the same class of bug for a non-mutating task_type: it ran
+`git fetch`/`git worktree add` directly against the shared `repository` —
+the read-only bind-mounted source under isolation — writing both new objects
+and `.git/worktrees/<name>/` admin metadata into a filesystem the worker
+cannot write to. The bridge admitted `review_head_sha` requests (never
+gated as mutating, so never refused) that its own checkout mechanism could
+not execute once isolation was on; the failure was honest (a retryable
+`HandlerOutcome`), not a security hole, but the class of task the bridge
+now admits was unexecutable as deployed — the same shape PR #323's
+acceptance review already named for the mutating path.
+
+- `command_center/worker/handlers.py` — under principal isolation, the
+  review-verification checkout is now a standalone clone from the source
+  repository's own origin URL into the same isolated clone root
+  (`principal_workspace_root()`) the mutating path already uses, instead of
+  a linked worktree against `repository`. Never touches `repository`'s
+  `.git`.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

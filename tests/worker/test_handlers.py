@@ -1612,3 +1612,112 @@ def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
 
     missing, failure = _review_head_checkout(clone, "7", "f" * 40)
     assert missing is None and "unreachable" in failure
+
+
+def test_review_head_checkout_under_isolation_never_writes_to_the_source(
+    tmp_path, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-SRV-05-C: under principal isolation `repository` is the
+    read-only bind-mounted source (`ProtectSystem=strict` +
+    `BindReadOnlyPaths=`) -- the shared-repo path above (`git fetch`/`git
+    worktree add` run with `cwd=repository`) writes into its `.git` and
+    fails closed there. Proven directly: make `clone/.git` genuinely
+    unwritable on disk and confirm the isolated checkout still succeeds,
+    landing under the configured clone root rather than beside `repository`."""
+    import stat
+    import subprocess
+
+    from command_center.worker.handlers import (
+        _remove_review_head_checkout,
+        _review_head_checkout,
+    )
+
+    def git(cwd, *args):
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git(tmp_path, "init", "-q", str(origin))
+    git(
+        origin,
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "base",
+    )
+    git(
+        origin,
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "pr head",
+    )
+    head_sha = git(origin, "rev-parse", "HEAD")
+    git(origin, "update-ref", "refs/pull/9/head", head_sha)
+    git(origin, "reset", "-q", "--hard", "HEAD~1")
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    clone_root = tmp_path / "clone-root"
+    clone_root.mkdir()
+    monkeypatch.setenv("AICC_AGENT_PRINCIPAL_ISOLATION", "required")
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: clone_root)
+
+    git_dir = clone / ".git"
+    read_only_dirs = [git_dir, *[p for p in git_dir.rglob("*") if p.is_dir()]]
+    for path in read_only_dirs:
+        path.chmod(stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP)
+    try:
+        checkout, failure = _review_head_checkout(clone, "9", head_sha)
+        assert failure is None, failure
+        assert checkout is not None and checkout.is_dir()
+        assert clone_root in checkout.parents
+        assert git(checkout, "rev-parse", "HEAD") == head_sha
+
+        _remove_review_head_checkout(clone, checkout)
+        assert not checkout.exists()
+
+        missing, failure = _review_head_checkout(clone, "9", "f" * 40)
+        assert missing is None and "unreachable" in failure
+    finally:
+        for path in read_only_dirs:
+            path.chmod(stat.S_IRWXU | stat.S_IRWXG)
+
+
+def test_review_head_checkout_isolation_root_failure_is_retryable(
+    tmp_path, monkeypatch
+) -> None:
+    """A missing/unmounted clone root under isolation is host state a later
+    delivery can find fixed -- retryable, not a payload defect."""
+    from command_center.worker.handlers import _review_head_checkout
+
+    monkeypatch.setenv("AICC_AGENT_PRINCIPAL_ISOLATION", "required")
+
+    def _missing_root():
+        raise agent_runner.RunnerError("principal workspace-root config is missing")
+
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", _missing_root)
+    checkout, failure = _review_head_checkout(tmp_path, "9", "a" * 40)
+    assert checkout is None
+    assert "isolated workspace root unavailable" in failure
