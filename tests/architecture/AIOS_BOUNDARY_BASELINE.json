@@ -138,6 +138,9 @@
     "command_center/orchestrator/__init__.py": [
       "orchestration"
     ],
+    "command_center/orchestrator/authority_preflight.py": [
+      "orchestration"
+    ],
     "command_center/orchestrator/github_app_auth.py": [
       "authz",
       "orchestration"

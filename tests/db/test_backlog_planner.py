@@ -854,3 +854,121 @@ def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
                 ("VOYN-W0-RSS",),
             )
             assert cur.fetchone()[0] == 1
+
+
+# -- authority preflight (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-
+#    EXECUTOR) --------------------------------------------------------------
+
+
+def test_backlog_park_requires_authority_moves_open_to_defer_to_user(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-PA"))[0]
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ok, reason FROM backlog_park_requires_authority(%s, %s)",
+                ("VOYN-W0-PA", "requires_privileged_authority: root"),
+            )
+            ok, reason = cur.fetchone()
+    assert (ok, reason) == (True, "DEFER_TO_USER")
+    assert store.get_task("VOYN-W0-PA")["status"] == "DEFER_TO_USER"
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT outcome, reason FROM backlog_event WHERE task_id = %s "
+                "AND event = 'authority_preflight' ORDER BY event_id DESC LIMIT 1",
+                ("VOYN-W0-PA",),
+            )
+            outcome, audited_reason = cur.fetchone()
+    assert outcome == "granted"
+    assert audited_reason == "requires_privileged_authority: root"
+
+
+def test_backlog_park_requires_authority_refuses_a_dispatched_task(rig) -> None:
+    """Deliberately narrower than `backlog_transition`: only an OPEN task may
+    be parked here -- a task already IN_PROGRESS is mid-cascade and belongs
+    to `backlog_return_to_pool` instead."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-PB"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-PB")[0]
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ok, reason FROM backlog_park_requires_authority(%s, %s)",
+                ("VOYN-W0-PB", "requires_privileged_authority: root"),
+            )
+            ok, reason = cur.fetchone()
+    assert (ok, reason) == (False, "not_open")
+    assert store.get_task("VOYN-W0-PB")["status"] == "IN_PROGRESS"
+
+
+def test_backlog_park_requires_authority_refuses_everything_else(rig) -> None:
+    app_factory, store, _worker = rig
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ok, reason FROM backlog_park_requires_authority(%s, %s)",
+                ("VOYN-W0-NOPE", "requires_privileged_authority: root"),
+            )
+            assert cur.fetchone() == (False, "unknown_task")
+
+    assert store.upsert_task(_task("VOYN-W0-PG", kind="gate"))[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ok, reason FROM backlog_park_requires_authority(%s, %s)",
+                ("VOYN-W0-PG", "requires_privileged_authority: root"),
+            )
+            assert cur.fetchone() == (False, "gate_is_control_record")
+
+
+def test_plan_once_blocks_a_task_that_requires_authority_the_fleet_lacks(rig) -> None:
+    """The live incident this closes: a task whose body demanded `sudo -u
+    postgres` reached the model cascade, honestly failed, and the queue
+    looped it forever as `cascade_exhausted: task_status_failed`. The
+    planner must now park it straight to DEFER_TO_USER and never call
+    `backlog_dispatch` -- no WIP slot claimed, no work_item row, no model
+    call spent -- while a benign task in the SAME tick dispatches normally."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(
+        _task(
+            "VOYN-W0-PC",
+            title="control plane resilience",
+            body=(
+                "Verify resilience: run `sudo /usr/bin/true` and "
+                "`sudo -u postgres /usr/bin/psql -c 'select 1'` to confirm access."
+            ),
+        )
+    )[0]
+    assert store.upsert_task(_task("VOYN-W0-PD", body="Fix the bug and add tests."))[0]
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+    assert not report.planner_busy
+    blocked_ids = [task_id for task_id, _reason in report.blocked_authority]
+    assert blocked_ids == ["VOYN-W0-PC"]
+    reason = dict(report.blocked_authority)["VOYN-W0-PC"]
+    assert reason.startswith("requires_privileged_authority:")
+    assert "root" in reason
+    assert not reason.startswith("cascade_exhausted:")  # never auto-resumed
+    assert "VOYN-W0-PC" not in [task_id for task_id, _ in report.dispatched]
+    assert "VOYN-W0-PD" in [task_id for task_id, _ in report.dispatched]
+
+    assert store.get_task("VOYN-W0-PC")["status"] == "DEFER_TO_USER"
+    assert store.get_task("VOYN-W0-PD")["status"] == "IN_PROGRESS"
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM work_item_public WHERE task_id = %s",
+                ("VOYN-W0-PC",),
+            )
+            assert cur.fetchone()[0] == 0, "zero model calls: no work item was ever enqueued"
+
+    # A subsequent tick must not resurface it: the reconcile query only
+    # matches `cascade_exhausted:%`, and this park reason never does.
+    report2 = plan_once(app_factory, PlanLimits(wip_limit=4))
+    assert "VOYN-W0-PC" not in [task_id for task_id, _ in report2.resumed]
+    assert store.get_task("VOYN-W0-PC")["status"] == "DEFER_TO_USER"
