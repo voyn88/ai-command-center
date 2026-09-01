@@ -3121,7 +3121,7 @@ def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):
     module = _module()
     repo = Path(__file__).parents[2]
     authority = tmp_path / "authority.env"
-    authority.write_text("AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n", encoding="utf-8")
+    authority.write_text("AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n", encoding="utf-8")  # pragma: allowlist secret
     specs = module.default_specs(
         repo,
         authority_env=authority,
