@@ -402,6 +402,10 @@ if [ "$install_profile" = "worker" ]; then
   systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
 else
   systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"
+  # A name alone is not an authority boundary: a deleted/recreated group can
+  # reuse a numeric gid still held by a worker process. Prove this control-only
+  # group is empty, distinct and not held live before any generation is staged.
+  run_transaction validate-control-authority
 fi
 run_transaction prepare
 transaction_active=1

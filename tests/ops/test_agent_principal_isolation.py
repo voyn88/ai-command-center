@@ -1023,7 +1023,7 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "/etc/aicc/workspace-authority.env" in installer
     assert "voyn-aicc-worker@.service.d/20-principal-isolation.conf" in transaction
     assert "_atomic_bytes" in transaction
-    assert "self.restore(manifest)" in transaction
+    assert "self.restore(manifest, clear_pending=False)" in transaction
     assert '"PREPARED"' in transaction
     assert '"APPLIED"' in transaction
     assert "run_transaction commit" in installer
@@ -1216,9 +1216,12 @@ def test_control_profile_needs_no_agent_identity_to_resolve_its_specs(tmp_path):
     tx = importlib.import_module("aicc_install_transaction")
 
     def only_control_identities(name):
-        if name != tx.CONTROL_AUTHORITY_GROUP:
+        if name == tx.CONTROL_AUTHORITY_GROUP:
+            return SimpleNamespace(gr_gid=4242, gr_mem=[])
+        if name == tx.AUTHORITY_GROUP:
+            return SimpleNamespace(gr_gid=4241, gr_mem=[])
+        else:
             raise KeyError(f"getgrnam(): name not found: {name}")
-        return SimpleNamespace(gr_gid=4242)
 
     original = tx.grp.getgrnam
     tx.grp.getgrnam = only_control_identities
@@ -1491,7 +1494,7 @@ def test_the_authority_file_moves_to_a_group_no_worker_process_can_hold(tmp_path
     gids = {"aicc-agent": 100, "aicc-publisher": 200, "aicc-control-authority": 300}
 
     def resolved(name):
-        return SimpleNamespace(gr_gid=gids[name])
+        return SimpleNamespace(gr_gid=gids[name], gr_mem=[])
 
     original = tx.grp.getgrnam
     tx.grp.getgrnam = resolved
@@ -1595,3 +1598,13 @@ def test_the_rollback_and_the_uninstall_stop_the_broker_sessions_too():
     rollback = text.split("rollback() {", 1)[1].split("\ntrap rollback", 1)[0]
     assert stop_instances in rollback
     assert rollback.index(stop_instances) < rollback.index("run_transaction recover")
+
+
+def test_control_authority_is_proven_before_prepare():
+    installer = _installer_text()
+    sysusers = installer.index(
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"'
+    )
+    validation = installer.index("run_transaction validate-control-authority")
+    prepare = installer.index("run_transaction prepare")
+    assert sysusers < validation < prepare

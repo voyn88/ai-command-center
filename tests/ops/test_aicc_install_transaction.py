@@ -79,6 +79,9 @@ def test_mid_install_failure_restores_every_pretransaction_target(
     with pytest.raises(OSError, match="injected"):
         transaction.apply()
 
+    assert transaction.pending.exists()
+    transaction.recover()
+
     assert existing.read_bytes() == b"before"
     assert stat.S_IMODE(existing.stat().st_mode) == 0o600
     assert not (root / "etc/new").exists()
@@ -2448,6 +2451,9 @@ def test_a_failure_after_the_purge_rolls_the_purge_back_too(monkeypatch, tmp_pat
     with pytest.raises(OSError, match="injected post-purge failure"):
         transaction.apply()
 
+    assert transaction.pending.exists()
+    transaction.recover()
+
     assert worker_only.read_bytes() == b"codex-secret"
     assert stat.S_IMODE(worker_only.stat().st_mode) == 0o600
     assert not (root / "etc/control-file").exists()
@@ -2557,6 +2563,7 @@ def _purge_runner(
     launchers=(),
     loaded=(),
     late=(),
+    late_after=1,
     busy=(),
     disable_fails=(),
     calls=None,
@@ -2583,7 +2590,7 @@ def _purge_runner(
             if command[2].startswith("aicc-agent-launcher@"):
                 listings["launcher"] += 1
                 names = tuple(launchers) + (
-                    tuple(late) if listings["launcher"] > 1 else ()
+                    tuple(late) if listings["launcher"] > late_after else ()
                 )
             else:
                 names = tuple(workers)
@@ -2690,15 +2697,15 @@ def test_the_control_purge_drains_the_workers_before_it_closes_the_socket(tmp_pa
     module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
 
     disabled = _disabled(calls)
-    assert disabled[-1] == "aicc-agent-launcher.socket", (
-        "the listening socket is what the workers connect to; it closes last"
-    )
     assert disabled.index("voyn-aicc-worker@1.service") < disabled.index(
-        "aicc-agent-launcher@7.service"
-    ), "a session is drained after the worker that opened it, not before"
-    assert disabled.index("aicc-worker.service") < disabled.index(
-        "aicc-agent-launcher@7.service"
+        "aicc-agent-launcher.socket"
     )
+    assert disabled.index("aicc-worker.service") < disabled.index(
+        "aicc-agent-launcher.socket"
+    )
+    assert disabled.index("aicc-agent-launcher.socket") < disabled.index(
+        "aicc-agent-launcher@7.service"
+    ), "admission closes before the final launcher enumeration"
 
 
 def test_a_session_opened_during_the_drain_is_stopped_before_the_socket_closes(
@@ -2726,8 +2733,8 @@ def test_a_session_opened_during_the_drain_is_stopped_before_the_socket_closes(
 
     disabled = _disabled(calls)
     assert "aicc-agent-launcher@8.service" in disabled
-    assert disabled.index("aicc-agent-launcher@8.service") < disabled.index(
-        "aicc-agent-launcher.socket"
+    assert disabled.index("aicc-agent-launcher.socket") < disabled.index(
+        "aicc-agent-launcher@8.service"
     )
 
 
@@ -2753,7 +2760,9 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
 
     module.quiesce_worker_only_units(run=run, sleep=slept.append)
 
-    assert slept == [module.DRAIN_INTERVAL_SECONDS] * 3
+    # Three busy probes plus one second stable-zero pass after admission is
+    # closed; the second stable pass is the bounded queued-instance barrier.
+    assert slept == [module.DRAIN_INTERVAL_SECONDS] * 4
     drain_probes = [
         index
         for index, call in enumerate(calls)
@@ -2764,9 +2773,13 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
         for index, call in enumerate(calls)
         if call[1] == "disable" and call[3] == "aicc-agent-launcher.socket"
     ]
-    assert closed and max(drain_probes) < closed[0], (
-        "the socket closed while a session still held its cgroup"
+    launcher_stop = next(
+        index
+        for index, call in enumerate(calls)
+        if call[1] == "disable" and call[3] == "aicc-agent-launcher@7.service"
     )
+    assert closed and closed[0] < launcher_stop
+    assert max(drain_probes) > closed[0]
 
 
 def test_a_session_that_never_drains_fails_the_purge_with_the_socket_open(tmp_path):
@@ -2783,10 +2796,10 @@ def test_a_session_that_never_drains_fails_the_purge_with_the_socket_open(tmp_pa
         calls=calls,
     )
 
-    with pytest.raises(RuntimeError, match="did not drain before control purge"):
+    with pytest.raises(RuntimeError, match="did not reach stable closure"):
         module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
 
-    assert "aicc-agent-launcher.socket" not in _disabled(calls)
+    assert "aicc-agent-launcher.socket" in _disabled(calls)
 
 
 # ---------------------------------------------------------------------------
@@ -3419,6 +3432,9 @@ def test_a_failure_before_commit_still_restores_both_credentials(
 
     with pytest.raises(OSError, match="injected post-purge failure"):
         transaction.apply()
+
+    assert transaction.pending.exists()
+    transaction.recover()
 
     for target, payload in (
         (CLAUDE_CREDENTIAL, CLAUDE_BYTES),
@@ -4063,6 +4079,14 @@ def test_commit_makes_the_revocation_terminal(monkeypatch, tmp_path):
         state, manifest, run=run, getgrnam=getgrnam
     )
     transaction.apply()
+    real_finalize = module.finalize_authority_membership
+    monkeypatch.setattr(
+        module,
+        "finalize_authority_membership",
+        lambda state_dir, manifest=None: real_finalize(
+            state_dir, manifest, getgrnam=getgrnam
+        ),
+    )
 
     transaction.commit()
 
@@ -4720,6 +4744,9 @@ def test_a_worker_only_directory_that_refilled_after_prepare_is_not_removed(tmp_
     with pytest.raises(RuntimeError, match="not empty at removal"):
         transaction.apply()
 
+    assert transaction.pending.exists()
+    transaction.recover()
+
     assert intruder.read_bytes() == b"arrived-after-prepare"
     assert credential.read_bytes() == CLAUDE_BYTES, "the purge was rolled back"
     assert not transaction.pending.exists()
@@ -4754,6 +4781,9 @@ def test_a_rolled_back_generation_puts_every_directory_back_exactly(
     finally:
         os.umask(previous)
 
+    assert transaction.pending.exists()
+    transaction.recover()
+
     assert credential.read_bytes() == CLAUDE_BYTES
     assert stat.S_IMODE(credential.stat().st_mode) == 0o600
     for directory in (
@@ -4763,6 +4793,211 @@ def test_a_rolled_back_generation_puts_every_directory_back_exactly(
     ):
         assert directory.is_dir()
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+
+
+def test_systemctl_load_probe_failure_is_not_treated_as_absent():
+    module = _module()
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        if command[1] in {"list-unit-files", "list-units"}:
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if command[1] == "show":
+            return SimpleNamespace(returncode=1, stderr="dbus failure", stdout="")
+        raise AssertionError(command)
+
+    with pytest.raises(RuntimeError, match="cannot prove worker-only unit load state"):
+        module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+    assert not any(call[1] == "disable" for call in calls)
+
+
+def test_launcher_appearing_after_first_post_close_scan_is_caught():
+    module = _module()
+    calls = []
+    run = _purge_runner(
+        workers=("voyn-aicc-worker@1.service",),
+        launchers=("aicc-agent-launcher@7.service",),
+        late=("aicc-agent-launcher@8.service",),
+        late_after=2,
+        loaded={
+            "voyn-aicc-worker@1.service",
+            "aicc-agent-launcher.socket",
+            "aicc-agent-launcher@7.service",
+            "aicc-agent-launcher@8.service",
+        },
+        calls=calls,
+    )
+
+    module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+
+    disabled = _disabled(calls)
+    assert disabled.index("aicc-agent-launcher.socket") < disabled.index(
+        "aicc-agent-launcher@8.service"
+    )
+
+
+def test_partial_membership_revocation_is_retried_from_its_wal(tmp_path):
+    module = _module()
+    state, live, _calls, normal_run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin", "fixed"}
+    )
+    attempts = {"count": 0}
+
+    def crash_midway(command, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 2:
+            return SimpleNamespace(returncode=1, stdout="", stderr="crash")
+        return normal_run(command, **kwargs)
+
+    with pytest.raises(RuntimeError, match="cannot revoke"):
+        module.revoke_legacy_authority_membership(
+            state, manifest, run=crash_midway, getgrnam=getgrnam
+        )
+    assert live == {"voynadmin", "fixed"}
+    assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=normal_run, getgrnam=getgrnam
+    )
+    assert live == {"fixed"}
+
+
+def test_membership_wal_refuses_same_name_with_a_new_gid(tmp_path):
+    module = _module()
+    state, live, _calls, _run, _getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker"}
+    )
+    gid = {"value": 4242}
+
+    def getgrnam(name):
+        assert name == module.AUTHORITY_GROUP
+        return SimpleNamespace(gr_gid=gid["value"], gr_mem=sorted(live))
+
+    def refuse(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="blocked")
+
+    with pytest.raises(RuntimeError, match="cannot revoke"):
+        module.revoke_legacy_authority_membership(
+            state, manifest, run=refuse, getgrnam=getgrnam
+        )
+    gid["value"] = 4343
+    with pytest.raises(RuntimeError, match="numeric gid changed"):
+        module.revoke_legacy_authority_membership(
+            state, manifest, run=refuse, getgrnam=getgrnam
+        )
+
+
+def test_historical_manifest_cannot_retire_an_external_file(tmp_path):
+    module = _module()
+    transaction, _root, state = _worker_host_with_credentials(module, tmp_path)
+    worker_manifest = Path(
+        json.loads(transaction.current.read_text(encoding="utf-8"))["manifest"]
+    )
+    payload = json.loads(worker_manifest.read_text(encoding="utf-8"))
+    victim = tmp_path / "outside-important"
+    victim.write_bytes(b"must-survive")
+    victim.chmod(0o600)
+    for record in payload["records"]:
+        if record["target"] == CLAUDE_CREDENTIAL:
+            record["staged"] = str(victim)
+            break
+    worker_manifest.write_text(json.dumps(payload), encoding="utf-8")
+    worker_manifest.chmod(0o600)
+
+    transaction.prepare(_control_transition_specs(module, tmp_path))
+    transaction.apply()
+    with pytest.raises(RuntimeError, match="escaped its generation"):
+        transaction.commit()
+
+    assert victim.read_bytes() == b"must-survive"
+    assert transaction.pending.exists()
+
+
+def test_legacy_v1_retirement_is_bound_and_completed(monkeypatch, tmp_path):
+    module = _module()
+    transaction, _root, state = _worker_host_with_credentials(module, tmp_path)
+
+    def arm_v1(this, manifest):
+        targets = sorted(module._sensitive_removal_targets(manifest))
+        module._atomic_bytes(
+            state / module.SENSITIVE_RETIREMENT_JOURNAL,
+            (
+                json.dumps(
+                    {
+                        "version": 1,
+                        "generation": manifest.parent.name,
+                        "targets": targets,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode(),
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
+
+    monkeypatch.setattr(module.FileTransaction, "_arm_sensitive_retirement", arm_v1)
+    transaction.install(_control_transition_specs(module, tmp_path))
+
+    assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
+    for secret in (CLAUDE_BYTES, CODEX_BYTES):
+        assert _byte_search(state, secret) == []
+
+
+def test_generator_dispatches_auxiliary_only_retirement(monkeypatch, tmp_path):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    generation = state / "generation-0123456789abcdef"
+    generation.mkdir(parents=True)
+    generation.chmod(0o700)
+    manifest = generation / "manifest.json"
+    manifest.write_text(json.dumps({"version": 3, "records": []}), encoding="utf-8")
+    manifest.chmod(0o600)
+    recovery = generation / "recovery.py"
+    recovery.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+    recovery.chmod(0o700)
+    current = state / "current.json"
+    current.write_text(json.dumps({"manifest": str(manifest)}), encoding="utf-8")
+    current.chmod(0o600)
+    retirement = state / "sensitive-retirement.json"
+    retirement.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "generation": generation.name,
+                "targets": [CLAUDE_CREDENTIAL],
+            }
+        ),
+        encoding="utf-8",
+    )
+    retirement.chmod(0o600)
+    called = []
+    monkeypatch.setattr(generator.os, "execv", lambda *args: called.append(args))
+
+    with pytest.raises(AssertionError, match="unreachable"):
+        generator.recover(state, expected_uid=os.getuid())
+
+    assert called[0][1][1] == str(recovery)
+    assert called[0][1][2] == "recover-boot"
+
+
+def test_control_authority_group_refuses_a_live_numeric_gid(tmp_path):
+    module = _module()
+    proc = tmp_path / "proc"
+    status = proc / "123/status"
+    status.parent.mkdir(parents=True)
+    status.write_text("Gid:\t0\t0\t0\t0\nGroups:\t300 999\n", encoding="utf-8")
+
+    def getgrnam(name):
+        gids = {module.CONTROL_AUTHORITY_GROUP: 300, module.AUTHORITY_GROUP: 200}
+        return SimpleNamespace(gr_gid=gids[name], gr_mem=[])
+
+    with pytest.raises(RuntimeError, match="retained by a live process"):
+        module._assert_fresh_control_authority_group(
+            getgrnam=getgrnam, getpwall=lambda: [], proc_root=proc
+        )
 
 
 def test_a_rollback_does_not_restart_an_accepted_launcher_session(tmp_path):

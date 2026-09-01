@@ -11,6 +11,7 @@ import grp
 import hashlib
 import json
 import os
+import pwd
 import re
 import secrets
 import shutil
@@ -318,8 +319,9 @@ AUTHORITY_GROUP = "aicc-publisher"
 #: again.
 CONTROL_AUTHORITY_GROUP = "aicc-control-authority"
 LEGACY_AUTHORITY_MEMBERS = ("aicc-worker", "voynadmin")
-AUTHORITY_MEMBERSHIP_VERSION = 2
+AUTHORITY_MEMBERSHIP_VERSION = 3
 AUTHORITY_MEMBERSHIP_JOURNAL = "authority-membership.json"
+CONTROL_AUTHORITY_PRECONDITION = "control-authority.json"
 GPASSWD = "/usr/sbin/gpasswd"
 
 
@@ -1026,12 +1028,128 @@ def _destroy_blob(path: Path) -> None:
     _fsync_dir(path.parent)
 
 
-def _group_members(group: str, *, getgrnam=grp.getgrnam) -> frozenset[str]:
+def _group_snapshot(
+    group: str,
+    *,
+    getgrnam=grp.getgrnam,
+    getpwall=pwd.getpwall,
+) -> tuple[int, frozenset[str], frozenset[str]]:
     try:
         entry = getgrnam(group)
     except KeyError as exc:
         raise RuntimeError(f"authority group is missing: {group}") from exc
-    return frozenset(entry.gr_mem)
+    primary = frozenset(
+        account.pw_name for account in getpwall() if account.pw_gid == entry.gr_gid
+    )
+    return entry.gr_gid, frozenset(entry.gr_mem), primary
+
+
+def _group_members(group: str, *, getgrnam=grp.getgrnam) -> frozenset[str]:
+    return _group_snapshot(group, getgrnam=getgrnam)[1]
+
+
+def _assert_fresh_control_authority_group(
+    *,
+    getgrnam=None,
+    getpwall=None,
+    proc_root: Path = Path("/proc"),
+) -> int:
+    """Prove the control-only authority gid has never been delegated.
+
+    A group name is not an authority boundary: processes retain numeric gids
+    after `/etc/group` changes.  The control profile therefore accepts its
+    fresh group only when it is distinct from the publisher gid, has no
+    supplementary or primary members, and no live process already holds it.
+    """
+    group_lookup = grp.getgrnam if getgrnam is None else getgrnam
+    passwd_entries = pwd.getpwall if getpwall is None else getpwall
+    control = group_lookup(CONTROL_AUTHORITY_GROUP)
+    publisher = group_lookup(AUTHORITY_GROUP)
+    if control.gr_gid == publisher.gr_gid:
+        raise RuntimeError("control authority group reuses publisher gid")
+    if control.gr_mem:
+        raise RuntimeError("control authority group has supplementary members")
+    primary = [
+        account.pw_name
+        for account in passwd_entries()
+        if account.pw_gid == control.gr_gid
+    ]
+    if primary:
+        raise RuntimeError(
+            f"control authority group has primary members: {sorted(primary)}"
+        )
+    if proc_root.is_dir():
+        for process in proc_root.iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                status = (process / "status").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except FileNotFoundError:
+                continue
+            held: set[int] = set()
+            for line in status.splitlines():
+                if line.startswith("Gid:") or line.startswith("Groups:"):
+                    held.update(
+                        int(value) for value in line.split()[1:] if value.isdigit()
+                    )
+            if control.gr_gid in held:
+                raise RuntimeError(
+                    "control authority gid is retained by a live process"
+                )
+    return control.gr_gid
+
+
+def record_control_authority_precondition(state_dir: Path) -> int:
+    gid = _assert_fresh_control_authority_group()
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(state_dir, 0o700)
+    _atomic_bytes(
+        state_dir / CONTROL_AUTHORITY_PRECONDITION,
+        (
+            json.dumps(
+                {
+                    "version": 1,
+                    "group": CONTROL_AUTHORITY_GROUP,
+                    "gid": gid,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+        0o600,
+        os.geteuid(),
+        os.getegid(),
+    )
+    return gid
+
+
+def verify_control_authority_precondition(
+    state_dir: Path, manifest: Path | None = None
+) -> int:
+    payload = _trusted_journal(state_dir / CONTROL_AUTHORITY_PRECONDITION)
+    if (
+        set(payload) != {"version", "group", "gid"}
+        or payload.get("version") != 1
+        or payload.get("group") != CONTROL_AUTHORITY_GROUP
+        or not isinstance(payload.get("gid"), int)
+    ):
+        raise RuntimeError("control authority precondition is invalid")
+    gid = _assert_fresh_control_authority_group()
+    if gid != payload["gid"]:
+        raise RuntimeError("control authority gid changed after validation")
+    if manifest is not None:
+        records = _generation_records(_trusted_journal(manifest))
+        authority = [
+            record
+            for record in records
+            if record.target == "/etc/aicc/workspace-authority.env"
+            and not record.remove
+        ]
+        if len(authority) != 1 or authority[0].install_gid != gid:
+            raise RuntimeError("control authority gid is not bound to generation")
+    return gid
 
 
 def _authority_membership_journal(state_dir: Path) -> dict[str, object]:
@@ -1048,19 +1166,24 @@ def _authority_membership_journal(state_dir: Path) -> dict[str, object]:
     revoked = payload.get("revoked")
     members_before = payload.get("members_before")
     members_after = payload.get("members_after")
+    primary_members = payload.get("primary_members")
     manifest = payload.get("manifest")
     if (
         payload.get("version") != AUTHORITY_MEMBERSHIP_VERSION
         or payload.get("group") != AUTHORITY_GROUP
+        or not isinstance(payload.get("group_gid"), int)
+        or payload["group_gid"] < 0
         or not isinstance(manifest, str)
         or not isinstance(payload.get("generation"), str)
         or Path(manifest).parent.name != payload["generation"]
         or not isinstance(revoked, list)
         or not isinstance(members_before, list)
         or not isinstance(members_after, list)
+        or not isinstance(primary_members, list)
         or any(not isinstance(member, str) for member in revoked)
         or any(not isinstance(member, str) for member in members_before)
         or any(not isinstance(member, str) for member in members_after)
+        or any(not isinstance(member, str) for member in primary_members)
         or not set(revoked) <= set(LEGACY_AUTHORITY_MEMBERS)
         or not set(revoked) <= set(members_before)
         or sorted(set(members_before) - set(revoked)) != sorted(members_after)
@@ -1082,7 +1205,7 @@ def _authority_membership_bound(
 
 
 def _authority_membership_state(
-    payload: dict[str, object], *, getgrnam=grp.getgrnam
+    payload: dict[str, object], *, getgrnam=grp.getgrnam, getpwall=pwd.getpwall
 ) -> str:
     """Where the group is now: exactly `before`, exactly `after`, or refused.
 
@@ -1095,16 +1218,25 @@ def _authority_membership_state(
     transaction has seen (review on 0a205a0). Refuse before mutating, with
     the journal retained.
     """
-    current = _group_members(AUTHORITY_GROUP, getgrnam=getgrnam)
+    gid, current, primary = _group_snapshot(
+        AUTHORITY_GROUP, getgrnam=getgrnam, getpwall=getpwall
+    )
+    if gid != payload["group_gid"]:
+        raise RuntimeError("authority group numeric gid changed during transaction")
+    if primary != frozenset(payload["primary_members"]):
+        raise RuntimeError("authority group primary membership drifted")
     before = frozenset(payload["members_before"])
     after = frozenset(payload["members_after"])
+    revoked = frozenset(payload["revoked"])
+    if current - revoked != after:
+        raise RuntimeError(
+            f"authority group drifted outside this transaction: {sorted(current)}"
+        )
     if current == after:
         return "after"
     if current == before:
         return "before"
-    raise RuntimeError(
-        f"authority group drifted outside this transaction: {sorted(current)}"
-    )
+    return "partial"
 
 
 def revoke_legacy_authority_membership(
@@ -1144,18 +1276,26 @@ def revoke_legacy_authority_membership(
             _authority_membership_journal(state_dir), manifest
         )
     else:
-        members = _group_members(AUTHORITY_GROUP, getgrnam=getgrnam)
+        group_gid, members, primary_members = _group_snapshot(
+            AUTHORITY_GROUP, getgrnam=getgrnam
+        )
+        if set(LEGACY_AUTHORITY_MEMBERS) & set(primary_members):
+            raise RuntimeError(
+                "legacy authority principal uses publisher as its primary group"
+            )
         revoked_members = [
             member for member in LEGACY_AUTHORITY_MEMBERS if member in members
         ]
         payload = {
             "version": AUTHORITY_MEMBERSHIP_VERSION,
             "group": AUTHORITY_GROUP,
+            "group_gid": group_gid,
             "generation": manifest.parent.name,
             "manifest": str(manifest),
             "members_before": sorted(members),
             "members_after": sorted(members - set(revoked_members)),
             "revoked": revoked_members,
+            "primary_members": sorted(primary_members),
         }
         _atomic_bytes(
             journal,
@@ -1168,6 +1308,8 @@ def revoke_legacy_authority_membership(
     _authority_membership_state(payload, getgrnam=getgrnam)
     revoked = tuple(payload["revoked"])
     for member in revoked:
+        if member not in _group_members(AUTHORITY_GROUP, getgrnam=getgrnam):
+            continue
         result = run(
             [GPASSWD, "-d", member, AUTHORITY_GROUP],
             capture_output=True,
@@ -1180,6 +1322,7 @@ def revoke_legacy_authority_membership(
             raise RuntimeError(
                 f"cannot revoke legacy authority membership: {member}"
             )
+        _authority_membership_state(payload, getgrnam=getgrnam)
     if _authority_membership_state(payload, getgrnam=getgrnam) != "after":
         raise RuntimeError(
             "legacy authority membership survived revocation: "
@@ -1208,6 +1351,8 @@ def restore_legacy_authority_membership(
         _fsync_dir(state_dir)
         return
     for member in payload["revoked"]:
+        if member in _group_members(AUTHORITY_GROUP, getgrnam=getgrnam):
+            continue
         result = run(
             [GPASSWD, "-a", member, AUTHORITY_GROUP],
             capture_output=True,
@@ -1218,6 +1363,7 @@ def restore_legacy_authority_membership(
             raise RuntimeError(
                 f"cannot restore legacy authority membership: {member}"
             )
+        _authority_membership_state(payload, getgrnam=getgrnam)
     if _authority_membership_state(payload, getgrnam=getgrnam) != "before":
         raise RuntimeError(
             "legacy authority membership did not restore: "
@@ -1242,7 +1388,8 @@ def finalize_authority_membership(
     # declared terminal. A third state means the membership list changed
     # under a transaction that is still holding the only record of what it
     # was, and consuming the record would destroy the evidence.
-    _authority_membership_state(payload, getgrnam=getgrnam)
+    if _authority_membership_state(payload, getgrnam=getgrnam) != "after":
+        raise RuntimeError("authority membership revocation is incomplete")
     journal.unlink()
     _fsync_dir(state_dir)
 
@@ -1316,6 +1463,65 @@ def _redact_sensitive_records(manifest: Path, retired: frozenset[str]) -> bool:
         os.getegid(),
     )
     return True
+
+
+def _preflight_sensitive_records(
+    state_dir: Path, manifest: Path, retired: frozenset[str]
+) -> None:
+    """Bind every destroyable blob to its exact generation-local name.
+
+    Historical manifests are durable data, not executable authority.  A
+    forged absolute `staged` path must never turn credential retirement into
+    an arbitrary root unlink.  Validate every manifest and blob before the
+    first generation is mutated so a bad later record leaves earlier secrets
+    untouched for fail-closed recovery.
+    """
+    generation = manifest.parent
+    if (
+        not re.fullmatch(r"generation-[0-9a-f]{16}", generation.name)
+        or generation.parent.resolve() != state_dir.resolve()
+        or generation.resolve() != generation
+        or manifest != generation / "manifest.json"
+    ):
+        raise RuntimeError(f"sensitive generation path is invalid: {generation}")
+    info = generation.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_uid not in {0, os.geteuid()}
+        or info.st_gid not in {0, os.getegid()}
+    ):
+        raise RuntimeError(f"sensitive generation directory is untrusted: {generation}")
+    payload = _trusted_journal(manifest)
+    for index, record in enumerate(_generation_records(payload)):
+        if record.target not in retired:
+            continue
+        for field, directory in (("backup", "backups"), ("staged", "staged")):
+            value = getattr(record, field)
+            if not value:
+                continue
+            expected = generation / directory / f"{index:03d}.bin"
+            if Path(value) != expected:
+                raise RuntimeError(
+                    f"sensitive {field} escaped its generation: {value}"
+                )
+            try:
+                blob = _read_regular(expected)
+            except FileNotFoundError:
+                # A prior retirement attempt may have durably unlinked this
+                # exact generation-local blob before crashing ahead of the
+                # manifest redaction. The retry remains bound to the same
+                # name and completes the redaction idempotently.
+                continue
+            if (
+                blob.mode != 0o600
+                or blob.uid not in {0, os.geteuid()}
+                or blob.gid not in {0, os.getegid()}
+            ):
+                raise RuntimeError(
+                    f"sensitive {field} is not a trusted generation blob: {value}"
+                )
 
 
 def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bool:
@@ -1984,8 +2190,27 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
     def stop(unit: str) -> bool:
         """Stop and disable `unit`; False when there was nothing loaded."""
         load = systemctl("show", unit, "--property=LoadState", "--value")
-        if load.returncode or load.stdout.strip() == "not-found":
+        if load.returncode:
+            raise RuntimeError(
+                f"cannot prove worker-only unit load state: {unit}"
+            )
+        load_state = load.stdout.strip()
+        if load_state == "not-found":
             return False
+        if load_state not in {
+            "loaded",
+            "masked",
+            "error",
+            "bad-setting",
+            "stub",
+            "merged",
+            "alias",
+            "generated",
+            "transient",
+        }:
+            raise RuntimeError(
+                f"cannot prove worker-only unit load state: {unit}"
+            )
         stopped = systemctl("disable", "--now", unit)
         if stopped.returncode:
             raise RuntimeError(
@@ -2003,38 +2228,79 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
             key=_control_purge_order,
         )
 
-    seen: set[str] = set()
-    stopped: set[str] = set()
-    # Two passes. The first stops the clients; the second is the closing
-    # enumeration -- with every worker gone, anything new it finds was
-    # instantiated by a request that was already in flight, and nothing can
-    # arrive after it while the socket is still the only way in.
-    for _pass in (0, 1):
-        for unit in enumerate_units():
-            if unit == LAUNCHER_SOCKET_UNIT or unit in seen:
-                continue
-            seen.add(unit)
-            if stop(unit):
-                stopped.add(unit)
+    def wait_drained(units: set[str], *, message: str) -> None:
+        for attempt in range(DRAIN_ATTEMPTS):
+            outstanding = [
+                reason
+                for unit in sorted(units)
+                for is_drained, reason in (_unit_drained(unit, run=run),)
+                if not is_drained
+            ]
+            if not outstanding:
+                return
+            if attempt == DRAIN_ATTEMPTS - 1:
+                raise RuntimeError(f"{message}: {outstanding}")
+            sleep(DRAIN_INTERVAL_SECONDS)
+
+    # First stop the clients. Launcher instances are deliberately excluded:
+    # they may still be serving the workers' final accepted requests.
+    clients: set[str] = set()
+    for unit in enumerate_units():
+        if unit == LAUNCHER_SOCKET_UNIT or TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit):
+            continue
+        if stop(unit):
+            clients.add(unit)
+    wait_drained(
+        clients,
+        message="worker-only clients did not drain before control purge",
+    )
+
+    # Close admission before the final launcher enumeration. Enumerating
+    # while Accept=yes is still listening always leaves a gap in which a new
+    # instance can appear after the last snapshot.
+    socket_loaded = stop(LAUNCHER_SOCKET_UNIT)
+    if socket_loaded:
+        wait_drained(
+            {LAUNCHER_SOCKET_UNIT},
+            message="launcher socket did not close before control purge",
+        )
+
+    launchers: set[str] = set()
+    stable_passes = 0
     for attempt in range(DRAIN_ATTEMPTS):
+        discovered = {
+            unit
+            for unit in enumerate_units()
+            if TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit)
+        }
+        new = discovered - launchers
+        for unit in sorted(new):
+            if stop(unit):
+                launchers.add(unit)
         outstanding = [
             reason
-            for unit in sorted(stopped)
+            for unit in sorted(launchers)
             for is_drained, reason in (_unit_drained(unit, run=run),)
             if not is_drained
         ]
-        if not outstanding:
-            break
+        closing = {
+            unit
+            for unit in enumerate_units()
+            if TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit)
+        }
+        unseen = closing - launchers
+        if not outstanding and not unseen and not new:
+            stable_passes += 1
+            if stable_passes == 2:
+                return
+        else:
+            stable_passes = 0
         if attempt == DRAIN_ATTEMPTS - 1:
             raise RuntimeError(
-                f"worker-only units did not drain before control purge: "
-                f"{outstanding}"
+                "launcher instances did not reach stable closure before "
+                f"control purge: outstanding={outstanding}, unseen={sorted(unseen)}"
             )
         sleep(DRAIN_INTERVAL_SECONDS)
-    # Only now: no client is left to connect, and no accepted connection is
-    # still being served, so closing the socket ends the layer instead of
-    # interrupting it.
-    stop(LAUNCHER_SOCKET_UNIT)
 
 
 class FileTransaction:
@@ -2790,38 +3056,32 @@ class FileTransaction:
                 self._assert_directory_removal_snapshot(record)
             elif record.remove:
                 self._assert_removal_snapshot(record)
-        try:
-            for index, record in enumerate(records):
-                # Write-ahead index makes every destination mutation recoverable.
-                self._write_journal(manifest, "APPLYING", index)
-                if record.remove and record.directory:
-                    self._apply_directory_removal(record)
-                    continue
-                if record.remove:
-                    self._apply_removal(record)
-                    continue
-                staged = _read_regular(Path(record.staged))
-                if not _matches(
-                    staged,
-                    record.install_sha256,
-                    0o600,
-                    os.geteuid(),
-                    os.getegid(),
-                ):
-                    raise RuntimeError("staged generation payload SHA drifted")
-                _atomic_bytes(
-                    self._target(record.target),
-                    staged.payload,
-                    record.install_mode,
-                    record.install_uid,
-                    record.install_gid,
-                )
-            self._write_journal(manifest, "APPLIED", len(records))
-        except BaseException:
-            self.restore(manifest)
-            shutil.rmtree(manifest.parent)
-            _fsync_dir(self.state_dir)
-            raise
+        for index, record in enumerate(records):
+            # Write-ahead index makes every destination mutation recoverable.
+            self._write_journal(manifest, "APPLYING", index)
+            if record.remove and record.directory:
+                self._apply_directory_removal(record)
+                continue
+            if record.remove:
+                self._apply_removal(record)
+                continue
+            staged = _read_regular(Path(record.staged))
+            if not _matches(
+                staged,
+                record.install_sha256,
+                0o600,
+                os.geteuid(),
+                os.getegid(),
+            ):
+                raise RuntimeError("staged generation payload SHA drifted")
+            _atomic_bytes(
+                self._target(record.target),
+                staged.payload,
+                record.install_mode,
+                record.install_uid,
+                record.install_gid,
+            )
+        self._write_journal(manifest, "APPLIED", len(records))
 
     def commit(self) -> None:
         """Publish an applied generation only after service rollout succeeds."""
@@ -2855,13 +3115,16 @@ class FileTransaction:
         finalize_authority_membership(self.state_dir, manifest)
         self.pending_release.unlink(missing_ok=True)
         _fsync_dir(self.state_dir)
+        # Keep the primary WAL until every auxiliary forward action is
+        # terminal. A crash during retirement must still boot the exact
+        # generation capsule rather than leave an auxiliary-only journal.
+        self._run_sensitive_retirement()
         self.pending.unlink()
         # The snapshot is spent once committed; leaving it at the fixed path
         # lets a later recover() apply a stale snapshot against a different
         # generation (review on d8920b6).
         (self.state_dir / "attempt-units.json").unlink(missing_ok=True)
         _fsync_dir(self.state_dir)
-        self._run_sensitive_retirement()
 
     def _arm_sensitive_retirement(self, manifest: Path) -> None:
         """Journal the intent to destroy this generation's secret copies."""
@@ -2895,6 +3158,40 @@ class FileTransaction:
             return None
         payload = _trusted_journal(journal)
         targets = payload.get("targets")
+        if payload.get("version") == 1:
+            generation = payload.get("generation")
+            if (
+                set(payload) != {"version", "generation", "targets"}
+                or not isinstance(generation, str)
+                or not re.fullmatch(r"generation-[0-9a-f]{16}", generation)
+                or not isinstance(targets, list)
+                or not targets
+                or any(not isinstance(target, str) for target in targets)
+                or not set(targets) <= SENSITIVE_TARGETS
+            ):
+                raise RuntimeError("sensitive retirement journal is invalid")
+            manifest = self.state_dir / generation / "manifest.json"
+            _trusted_journal(manifest)
+            expected = _sensitive_removal_targets(manifest)
+            if not set(targets) <= expected:
+                raise RuntimeError("legacy sensitive retirement targets drifted")
+            bound: set[str] = set()
+            if _path_present(self.pending):
+                bound.add(str(self._pending_manifest()))
+            if _path_present(self.current):
+                current = _trusted_journal(self.current).get("manifest")
+                if isinstance(current, str):
+                    bound.add(current)
+            if str(manifest) not in bound:
+                raise RuntimeError(
+                    "legacy sensitive retirement journal is not bound to a live generation"
+                )
+            return {
+                "version": SENSITIVE_RETIREMENT_VERSION,
+                "generation": generation,
+                "manifest": str(manifest),
+                "targets": sorted(expected),
+            }
         if (
             payload.get("version") != SENSITIVE_RETIREMENT_VERSION
             or not isinstance(payload.get("generation"), str)
@@ -3008,7 +3305,12 @@ class FileTransaction:
                 f"generation: {intent['generation']}"
             )
         retired = frozenset(intent["targets"])
-        for manifest in sorted(self.state_dir.glob("generation-*/manifest.json")):
+        manifests = sorted(self.state_dir.glob("generation-*/manifest.json"))
+        # Global preflight: a malformed later generation must be discovered
+        # before any earlier secret is overwritten or unlinked.
+        for manifest in manifests:
+            _preflight_sensitive_records(self.state_dir, manifest, retired)
+        for manifest in manifests:
             _redact_sensitive_records(manifest, retired)
         (self.state_dir / SENSITIVE_RETIREMENT_JOURNAL).unlink()
         _fsync_dir(self.state_dir)
@@ -3203,6 +3505,28 @@ class FileTransaction:
                 raise RuntimeError(
                     "pending release selector exists without install journal"
                 )
+            # Prevalidate every auxiliary WAL and bind them to the same live
+            # generation before the first cleanup or secret mutation.
+            current_manifest: Path | None = None
+            if _path_present(self.current):
+                value = _trusted_journal(self.current).get("manifest")
+                if not isinstance(value, str):
+                    raise RuntimeError("current generation pointer is invalid")
+                current_manifest = Path(value)
+            retirement = self._sensitive_retirement_intent()
+            membership: dict[str, object] | None = None
+            if _path_present(self.state_dir / AUTHORITY_MEMBERSHIP_JOURNAL):
+                membership = _authority_membership_journal(self.state_dir)
+                _authority_membership_bound(membership, current_manifest)
+            if retirement is not None:
+                if current_manifest is None or retirement["manifest"] != str(
+                    current_manifest
+                ):
+                    raise RuntimeError(
+                        "sensitive retirement journal is not bound to current generation"
+                    )
+                if membership is not None and membership["manifest"] != retirement["manifest"]:
+                    raise RuntimeError("auxiliary journals disagree on generation")
             # A crash after a completed recovery can leave only the inert
             # fixed-name snapshot. With no governing WAL it has no authority
             # and must not bleed into the next transaction.
@@ -3216,8 +3540,8 @@ class FileTransaction:
             # leaves the armed journal and nothing else; there is no pending
             # generation to roll back, so the only thing outstanding is
             # finishing that destruction.
-            self._run_sensitive_retirement()
             self._resolve_authority_membership()
+            self._run_sensitive_retirement()
             return
         manifest = self._pending_manifest()
         transaction = manifest.parent
@@ -3257,6 +3581,10 @@ class FileTransaction:
             )
             self.pending_release.unlink(missing_ok=True)
             _fsync_dir(self.state_dir)
+            # The generation is live, so the revocation it made is terminal
+            # and the secrets it purged must not survive in its backups.
+            finalize_authority_membership(self.state_dir, manifest)
+            self._run_sensitive_retirement()
             self.pending.unlink()
             # The interrupted commit's service snapshot is spent: leaving it
             # at the fixed path lets a LATER recover() apply it against a
@@ -3264,10 +3592,6 @@ class FileTransaction:
             (self.state_dir / "attempt-units.json").unlink(missing_ok=True)
             self._remove_orphan_generations()
             _fsync_dir(self.state_dir)
-            # The generation is live, so the revocation it made is terminal
-            # and the secrets it purged must not survive in its backups.
-            finalize_authority_membership(self.state_dir, manifest)
-            self._run_sensitive_retirement()
             return
         snapshot = self.state_dir / "attempt-units.json"
         snapshot_present = _path_present(snapshot)
@@ -4792,10 +5116,18 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         "commit",
         "install",
         "quiesce-worker-only",
+        "validate-control-authority",
         "revoke-worker-authority",
     }:
         raise RuntimeError("unfinished uninstall journal blocks installation")
     transaction = FileTransaction(args.root, args.state_dir)
+    if args.action == "validate-control-authority":
+        if args.profile != "control":
+            raise RuntimeError(
+                "validate-control-authority requires the control profile"
+            )
+        record_control_authority_precondition(args.state_dir)
+        return 0
     if args.action in {"validate", "prepare", "install"}:
         specs = default_specs(
             args.repo_root,
@@ -4808,10 +5140,20 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.action == "validate":
         transaction.validate_sources(specs)
     elif args.action == "prepare":
+        if args.profile == "control":
+            verify_control_authority_precondition(args.state_dir)
         transaction.prepare(specs)
     elif args.action == "apply":
+        if args.profile == "control":
+            verify_control_authority_precondition(
+                args.state_dir, transaction._pending_manifest()
+            )
         transaction.apply()
     elif args.action == "commit":
+        if args.profile == "control":
+            verify_control_authority_precondition(
+                args.state_dir, transaction._pending_manifest()
+            )
         transaction.commit()
     elif args.action == "quiesce":
         quiesce_service_snapshot(
@@ -4839,6 +5181,8 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             args.state_dir, transaction._pending_manifest()
         )
     elif args.action == "install":
+        if args.profile == "control":
+            verify_control_authority_precondition(args.state_dir)
         transaction.install(specs)
     elif args.action in {"recover", "rollback", "recover-boot"}:
         transaction.recover(boot=args.action == "recover-boot")
@@ -4858,6 +5202,7 @@ def main() -> int:
             "commit",
             "quiesce",
             "quiesce-worker-only",
+            "validate-control-authority",
             "revoke-worker-authority",
             "install",
             "recover",
