@@ -195,6 +195,22 @@ section below for why it exists at all):
   cascade. Every atomic decision is a SQL function of the store; the package
   owns candidate iteration, the static routing matrix and the plan report,
   and adds no engine capability of its own.
+  `command_center/db/roles.py`'s `principal`/`principal_credential`/
+  `principal_event` tables (VOYN-W0-AICC-SRV-03, `0003_worker_enrollment.up.sql`)
+  are SRV-02's identity registry, finally placed (VOYN-W0-AICC-SRV-02-PLACEMENT).
+  `0002_queue_claim.up.sql` had recorded it as "a design proposal, not a
+  deployed table" precisely to avoid landing an AICC-local registry that
+  duplicates AIOS's own tenant-scoped one (`principals`, `auth_principals`,
+  `credentials`) before a placement decision was made. Landing it here is not
+  that duplication: `principal.db_role` binds each row to a PostgreSQL SCRAM
+  identity — `identity_assert()` checks it against `session_user`, the same
+  local, unforgeable fact 0002 already keys queue claims on — never to a
+  platform tenant or HTTP credential. Its three `kind`s (`operator`,
+  `control_plane`, `worker_host`) answer "which AICC-side database role is
+  this queue attempt running as", a question AIOS's registry has no
+  vocabulary for and never governed. It has no relationship to the actual
+  seam to the platform's identity, `http_auth/` below, and grants no HTTP
+  capability there or anywhere else.
 
 ### `command_center/http_auth/` — why it was added to a frozen category
 
