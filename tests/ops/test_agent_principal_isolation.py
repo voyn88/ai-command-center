@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import stat
 import struct
@@ -31,9 +32,62 @@ def _launcher_module():
     return module
 
 
+def _transaction_module():
+    path = Path(__file__).parents[2] / "ops" / "aicc_install_transaction.py"
+    spec = importlib.util.spec_from_file_location("aicc_install_transaction", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.fixture
 def launcher():
     return _launcher_module()
+
+
+def test_launcher_admission_and_natural_drain_share_one_task_deadline(
+    launcher, monkeypatch, tmp_path
+):
+    transaction = _transaction_module()
+
+    assert (
+        launcher.MAX_TASK_TIMEOUT_SECONDS
+        == transaction.MAX_ACCEPTED_LAUNCHER_SECONDS
+    )
+    assert transaction.LAUNCHER_DRAIN_GRACE_SECONDS >= (
+        launcher.TRANSIENT_RUNTIME_GRACE_SECONDS
+        + launcher.TRANSIENT_STOP_TIMEOUT_SECONDS
+        + transaction.DRAIN_INTERVAL_SECONDS
+    )
+    assert transaction.LAUNCHER_DRAIN_ATTEMPTS == math.ceil(
+        (
+            transaction.MAX_ACCEPTED_LAUNCHER_SECONDS
+            + transaction.LAUNCHER_DRAIN_GRACE_SECONDS
+        )
+        / transaction.DRAIN_INTERVAL_SECONDS
+    ) + 2
+    monkeypatch.setattr(
+        launcher, "_validate_environment_file", lambda *args, **kwargs: False
+    )
+    command = launcher._systemd_command(
+        _manifest(tmp_path, timeout_seconds=launcher.MAX_TASK_TIMEOUT_SECONDS),
+        Path("/run/aicc-agent-homes/deadline"),
+        "aicc-agent-deadline.service",
+        "aicc-agent-launcher@deadline.service",
+        tmp_path.parent,
+        tmp_path,
+    )
+    assert (
+        "--property=RuntimeMaxSec="
+        f"{launcher.MAX_TASK_TIMEOUT_SECONDS + launcher.TRANSIENT_RUNTIME_GRACE_SECONDS}"
+        in command
+    )
+    assert (
+        f"--property=TimeoutStopSec={launcher.TRANSIENT_STOP_TIMEOUT_SECONDS}"
+        in command
+    )
 
 
 def _manifest(tmp_path: Path, **updates):

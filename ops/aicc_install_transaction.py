@@ -10,6 +10,7 @@ import fcntl
 import grp
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
@@ -2287,12 +2288,23 @@ def verify_service_snapshot_closure(
 CONTROL_PURGE_UNITS = frozenset({"aicc-agent-launcher.socket"}) | RETIRED_LEGACY_UNITS
 
 
-#: How long the drain waits for the launcher instances the last worker
-#: connections produced to exit and release their cgroups. Each instance runs
-#: one agent session under `TimeoutStopSec=30s`, so this is that bound plus
-#: the margin systemd needs to reap the cgroup, checked once a second.
+#: Ordinary worker clients and the admission socket should stop promptly.
 DRAIN_ATTEMPTS = 60
 DRAIN_INTERVAL_SECONDS = 1.0
+#: Accepted launcher instances are different: they are never stopped because
+#: rollback cannot recreate their accepted socket descriptors. Wait for the
+#: longest task the broker can admit, then allow systemd time to reap the
+#: released cgroup. A cross-module fitness test keeps the admission and drain
+#: limits equal.
+# Keep this value in lockstep with aicc_agent_launcher.MAX_TASK_TIMEOUT_SECONDS.
+# The transaction recovery capsule is intentionally self-contained and cannot
+# import the separately installed broker, so a fitness test enforces equality.
+MAX_ACCEPTED_LAUNCHER_SECONDS = 3600
+LAUNCHER_DRAIN_GRACE_SECONDS = 60
+LAUNCHER_DRAIN_ATTEMPTS = math.ceil(
+    (MAX_ACCEPTED_LAUNCHER_SECONDS + LAUNCHER_DRAIN_GRACE_SECONDS)
+    / DRAIN_INTERVAL_SECONDS
+) + 2
 #: An inactive unit whose cgroup is gone. `ControlGroup` empties only once
 #: systemd has released it, and `TasksCurrent` counts every process still in
 #: it -- a `KillMode=mixed` service can have left children behind after its
@@ -2460,7 +2472,7 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
 
     launchers: set[str] = set()
     stable_passes = 0
-    for attempt in range(DRAIN_ATTEMPTS):
+    for attempt in range(LAUNCHER_DRAIN_ATTEMPTS):
         jobs_before = launcher_jobs()
         discovered = {
             unit
@@ -2495,7 +2507,7 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
                 return
         else:
             stable_passes = 0
-        if attempt == DRAIN_ATTEMPTS - 1:
+        if attempt == LAUNCHER_DRAIN_ATTEMPTS - 1:
             raise RuntimeError(
                 "launcher instances did not reach stable closure before "
                 "control purge: "

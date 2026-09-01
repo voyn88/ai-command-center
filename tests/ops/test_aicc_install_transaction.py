@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import runpy
 import shutil
@@ -2905,6 +2906,35 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
     assert max(drain_probes) > closed[0]
 
 
+def test_an_accepted_session_can_outlive_the_short_client_drain(tmp_path):
+    """The launcher admits tasks up to one hour. Closing admission must not
+    turn the worker/client 60-second stop budget into an accidental task
+    deadline: a valid accepted session is observed until natural completion
+    and is never disabled or killed."""
+    module = _module()
+    calls = []
+    slept = []
+    launcher = "aicc-agent-launcher@long-running.service"
+    budget = math.ceil(
+        (
+            module.MAX_ACCEPTED_LAUNCHER_SECONDS
+            + module.LAUNCHER_DRAIN_GRACE_SECONDS
+        )
+        / module.DRAIN_INTERVAL_SECONDS
+    )
+    run = _purge_runner(
+        launchers=(launcher,),
+        loaded={"aicc-agent-launcher.socket", launcher},
+        busy={launcher: budget},
+        calls=calls,
+    )
+
+    module.quiesce_worker_only_units(run=run, sleep=slept.append)
+
+    assert len(slept) == budget + 1
+    assert launcher not in _disabled(calls)
+
+
 def test_inactive_socket_with_process_and_cgroup_is_not_yet_drained(tmp_path):
     """Inactive alone cannot prove the Accept=yes listener is quiescent."""
     module = _module()
@@ -2972,7 +3002,9 @@ def test_a_session_that_never_drains_closes_admission_for_outer_recovery(tmp_pat
     run = _purge_runner(
         launchers=("aicc-agent-launcher@7.service",),
         loaded={"aicc-agent-launcher.socket", "aicc-agent-launcher@7.service"},
-        busy={"aicc-agent-launcher@7.service": module.DRAIN_ATTEMPTS + 1},
+        busy={
+            "aicc-agent-launcher@7.service": module.LAUNCHER_DRAIN_ATTEMPTS
+        },
         calls=calls,
     )
 
@@ -3969,7 +4001,12 @@ def test_a_committing_recovery_refuses_an_intent_from_another_generation(tmp_pat
     manifest = transaction.prepare(_control_transition_specs(module, tmp_path))
     transaction.apply()
     transaction._write_journal(manifest, "COMMITTING", 3)
-    other = state / "generation-9999" / "manifest.json"
+    other_generation = state / "generation-ffffffffffffffff"
+    assert other_generation != manifest.parent
+    other_generation.mkdir(mode=0o700)
+    other = other_generation / "manifest.json"
+    shutil.copyfile(manifest, other)
+    other.chmod(0o600)
     journal = state / module.SENSITIVE_RETIREMENT_JOURNAL
     journal.write_text(
         json.dumps(
@@ -3977,20 +4014,28 @@ def test_a_committing_recovery_refuses_an_intent_from_another_generation(tmp_pat
                 "version": module.SENSITIVE_RETIREMENT_VERSION,
                 "generation": other.parent.name,
                 "manifest": str(other),
-                "targets": [CLAUDE_CREDENTIAL, CODEX_CREDENTIAL],
+                "targets": sorted(module._sensitive_removal_targets(other)),
             }
         ),
         encoding="utf-8",
     )
     journal.chmod(0o600)
 
-    with pytest.raises(
-        RuntimeError,
-        match="sensitive retirement (journal is invalid|targets drifted)",
-    ):
+    before = {
+        path.relative_to(state): path.read_bytes()
+        for path in state.rglob("*")
+        if path.is_file()
+    }
+
+    with pytest.raises(RuntimeError, match="bound to another generation"):
         module.FileTransaction(root, state).recover()
 
-    assert journal.exists()
+    after = {
+        path.relative_to(state): path.read_bytes()
+        for path in state.rglob("*")
+        if path.is_file()
+    }
+    assert after == before, "a cross-generation refusal mutated transaction state"
 
 
 def test_a_credential_this_host_no_longer_has_is_still_retired(tmp_path):
