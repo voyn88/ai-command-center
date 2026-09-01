@@ -13,11 +13,16 @@ reports it, and every later write still succeeds. Here a failed `contact` write
 makes every subsequent `message` write for that contact fail too — the target
 refuses the child because the parent it references is not there — and both
 failures are swallowed by the dual-write hooks, exactly as designed. So one
-dropped parent silently becomes a growing hole, and the only thing that shows
-it is the reconciliation nobody has run yet. That is not a defect introduced
-here; it is `VOYN-W0-AICC-MIRROR-SILENT-DROP` acquiring a multiplier, and it is
-measured rather than asserted — `tests/db/test_networking_store.py` reproduces
-the cascade against a real PostgreSQL.
+dropped parent becomes a growing hole, and reconciliation — run by an operator,
+not on a schedule — is still the only thing that *resolves* it. That is not a
+defect introduced here; it is `VOYN-W0-AICC-MIRROR-SILENT-DROP` acquiring a
+multiplier, and it is measured rather than asserted —
+`tests/db/test_networking_store.py` reproduces the cascade against a real
+PostgreSQL. What the multiplier no longer costs is *visibility*: both hooks
+now log at WARNING, so a `contact` write that never reaches PostgreSQL — and
+every `message` it then drags down with it — appears in a default-level log
+the moment it happens rather than only when someone thinks to run
+`divergence`.
 
 **Ordering.** The authority writes the parent first because its own foreign key
 requires it, and the mirror hooks run in that same order, so the mirror needs

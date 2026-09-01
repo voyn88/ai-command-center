@@ -212,7 +212,7 @@ def test_the_authoritative_write_happens_before_the_mirror(tmp_path, monkeypatch
         def upsert(self, record: dict) -> None:
             # Recorded, not asserted. `_mirror_owner_item` swallows every
             # `Exception`, and `AssertionError` is one — an assertion in here
-            # is caught, logged at DEBUG and lost, so the test would pass
+            # is caught, logged at WARNING and lost, so the test would pass
             # whatever it claimed. Independent review proved that by inverting
             # this condition and watching the test still pass. The observation
             # has to escape the swallowing frame to mean anything.

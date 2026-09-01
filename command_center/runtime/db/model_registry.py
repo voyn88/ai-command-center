@@ -197,7 +197,7 @@ def _mirror_model_entry(record: dict) -> None:
 
         PostgresModelEntryMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror model_entry into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror model_entry into PostgreSQL", exc_info=True)
 
 
 def _mirror_model_event(record: dict) -> None:
@@ -213,7 +213,7 @@ def _mirror_model_event(record: dict) -> None:
 
         PostgresModelEventMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror model_event into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror model_event into PostgreSQL", exc_info=True)
 
 
 def get_model_entry(db_path: Path, model_id: str) -> dict | None:

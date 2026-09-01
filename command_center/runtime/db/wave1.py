@@ -162,7 +162,7 @@ def _mirror_advisor_proposal(record: dict) -> None:
 
         PostgresAdvisorProposalMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror advisor_proposal into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror advisor_proposal into PostgreSQL", exc_info=True)
 
 
 
@@ -399,7 +399,7 @@ def _mirror_owner_item(record: dict) -> None:
 
         PostgresOwnerItemMirror().upsert(record)
     except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        _LOG.debug("Could not mirror owner_item into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror owner_item into PostgreSQL", exc_info=True)
 
 
 def get_owner_item(db_path: Path, item_id: str) -> dict | None:
@@ -567,7 +567,7 @@ def _mirror_digest_item(record: dict) -> None:
 
         PostgresDigestItemMirror().upsert(record)
     except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        _LOG.debug("Could not mirror digest_item into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror digest_item into PostgreSQL", exc_info=True)
 
 
 def _mirror_digest_day_deletion(day: str) -> None:
@@ -585,7 +585,7 @@ def _mirror_digest_day_deletion(day: str) -> None:
 
         PostgresDigestItemMirror().delete_day(day)
     except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        _LOG.debug("Could not mirror digest_item day deletion into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror digest_item day deletion into PostgreSQL", exc_info=True)
 
 
 def delete_digest_items_for_day(db_path: Path, day: str) -> int:

@@ -186,7 +186,13 @@ def _mirror_conflict(record: dict) -> None:
     mirror has no other source for the rest.
 
     The mirror's health is reported by `conflict_store.divergence`, not by
-    exceptions raised here. Imported lazily so the desktop and CLI entry points
+    exceptions raised here — but a failure here also logs at WARNING (not
+    DEBUG) with the traceback attached, so it survives at an application's
+    default log level instead of requiring `divergence` to be run before it is
+    known at all. `VOYN-W0-AICC-MIRROR-SILENT-DROP` found that a DEBUG-level
+    record is indistinguishable from no record on every entry point in this
+    package, all of which default to INFO — the swallow was real, but so was
+    the silence around it. Imported lazily so the desktop and CLI entry points
     keep working on a machine with no PostgreSQL client library.
     """
     try:
@@ -194,7 +200,7 @@ def _mirror_conflict(record: dict) -> None:
 
         PostgresConflictMirror().upsert(record)
     except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        _LOG.debug("Could not mirror conflict into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror conflict into PostgreSQL", exc_info=True)
 
 
 def get_conflict(db_path: Path, conflict_id: str) -> dict | None:
