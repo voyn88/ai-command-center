@@ -17,10 +17,15 @@
 --   * `repo_lease` is in the AIOS PLATFORM database
 --     (`aios/migrations/versions/0010_repo_lease.py`). `grep -rn repo_lease`
 --     over both AICC checkouts returns nothing.
---   * `principal` exists in NO database today. `grep -rn principal
---     --include=*.sql command_center/` returns 0. AIOS has its own
---     tenant-scoped registry (`principals`, `auth_principals`, `credentials`);
---     AICC's SRV-02 `principal` is a design proposal, not a deployed table.
+--   * `principal` now exists in the AICC database too, created by
+--     `0003_worker_enrollment.up.sql` (SRV-02 landed after this file). That
+--     does not reopen this file's independence: `grep -rn principal
+--     command_center/db/sql/0002_queue_claim.up.sql` still returns 0 outside
+--     this comment, and `work_attempt.claimed_by_role` (the join point named
+--     below) has no join to `principal` anywhere in the codebase today
+--     (verified for `VOYN-W0-AICC-SRV-04b-DEPENDENCY-FIRST`). AIOS separately
+--     has its own tenant-scoped registry (`principals`, `auth_principals`,
+--     `credentials`), unrelated to either.
 --
 -- The queue is AICC execution work, so it belongs in the AICC database — the
 -- same database as `queue_entry`, `run` and `task`, which is what lets a claim
