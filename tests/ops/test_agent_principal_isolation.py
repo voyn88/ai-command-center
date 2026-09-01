@@ -1215,13 +1215,13 @@ def test_control_profile_needs_no_agent_identity_to_resolve_its_specs(tmp_path):
     sys.path.insert(0, str(root / "ops"))
     tx = importlib.import_module("aicc_install_transaction")
 
-    def only_publisher(name):
-        if name != "aicc-publisher":
+    def only_control_identities(name):
+        if name != tx.CONTROL_AUTHORITY_GROUP:
             raise KeyError(f"getgrnam(): name not found: {name}")
         return SimpleNamespace(gr_gid=4242)
 
     original = tx.grp.getgrnam
-    tx.grp.getgrnam = only_publisher
+    tx.grp.getgrnam = only_control_identities
     try:
         specs = tx.default_specs(
             root,
@@ -1235,7 +1235,9 @@ def test_control_profile_needs_no_agent_identity_to_resolve_its_specs(tmp_path):
             for spec in specs
             if spec.target == "/etc/aicc/workspace-authority.env"
         )
-        assert authority.gid == 4242, "the publisher group is required on every host"
+        assert authority.gid == 4242, (
+            "the control profile resolves its own authority group and nothing else"
+        )
         with pytest.raises(KeyError, match="aicc-agent"):
             tx.default_specs(
                 root,
@@ -1356,7 +1358,7 @@ def test_the_agent_sysusers_and_tmpfiles_side_effects_are_worker_only():
     declarations = [
         line for line in control.splitlines() if line and not line.startswith("#")
     ]
-    assert declarations == ["g aicc-publisher -"]
+    assert declarations == ["g aicc-control-authority -", "g aicc-publisher -"]
     assert "systemd-tmpfiles" not in text.split(
         'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"', 1
     )[1]
@@ -1473,18 +1475,65 @@ def test_the_control_transition_revokes_the_authority_before_it_mutates_files():
     )[0].rsplit(guard, 1)[1]
 
 
-def test_the_authority_file_keeps_its_publisher_group_on_the_control_profile(tmp_path):
-    """The boundary is not moved, it is enforced: the control profile still
-    installs the authority key 0640 root:aicc-publisher, and the group is
-    empty because deploy/sysusers.d/aicc-control.conf declares no members and
-    the transition revokes the legacy ones."""
-    tx, _targets = _specs("control", tmp_path)
-    _tx, specs = _profile_specs("control", tmp_path)
-    authority = next(
-        spec for spec in specs if spec.target == "/etc/aicc/workspace-authority.env"
-    )
+def test_the_authority_file_moves_to_a_group_no_worker_process_can_hold(tmp_path):
+    """A membership removal is not a revocation of a credential already held.
+    A process gets its supplementary groups when it starts and keeps the
+    numeric gids until it exits, so a worker-era daemon goes on reading a
+    0640 root:aicc-publisher file however thoroughly `gpasswd -d` empties the
+    group. What actually takes the key away from what is running is the file
+    moving to a group those processes cannot be holding, because it did not
+    exist when they started."""
+    import importlib
 
-    assert authority.mode == 0o640
+    repo = Path(__file__).parents[2]
+    sys.path.insert(0, str(repo / "ops"))
+    tx = importlib.import_module("aicc_install_transaction")
+    gids = {"aicc-agent": 100, "aicc-publisher": 200, "aicc-control-authority": 300}
+
+    def resolved(name):
+        return SimpleNamespace(gr_gid=gids[name])
+
+    original = tx.grp.getgrnam
+    tx.grp.getgrnam = resolved
+    try:
+        by_profile = {
+            profile: next(
+                spec
+                for spec in tx.default_specs(
+                    repo,
+                    authority_env=tmp_path / "authority.env",
+                    claude_auth=tmp_path / "claude.json",
+                    codex_auth=tmp_path / "codex.json",
+                    profile=profile,
+                )
+                if spec.target == "/etc/aicc/workspace-authority.env"
+            )
+            for profile in ("worker", "control")
+        }
+    finally:
+        tx.grp.getgrnam = original
+    control, worker = by_profile["control"], by_profile["worker"]
+
+    assert control.mode == 0o640 and worker.mode == 0o640
+    assert tx.CONTROL_AUTHORITY_GROUP == "aicc-control-authority"
+    assert worker.gid == gids["aicc-publisher"]
+    assert control.gid == gids["aicc-control-authority"]
+    assert control.gid != worker.gid, (
+        "the control profile installs the authority key to the same group its "
+        "worker-era processes are still holding"
+    )
+    control_conf = (
+        Path(__file__).parents[2] / "deploy/sysusers.d/aicc-control.conf"
+    ).read_text(encoding="utf-8")
+    assert f"g {tx.CONTROL_AUTHORITY_GROUP} -" in control_conf
+    assert not [
+        line
+        for line in control_conf.splitlines()
+        if line.startswith("m ")
+    ], "the control authority group is declared with no members on purpose"
+
+    # And the membership revocation stays, for the principals that are not
+    # running yet: without it sysusers would hand the group straight back.
     assert tx.AUTHORITY_GROUP == "aicc-publisher"
     assert set(tx.LEGACY_AUTHORITY_MEMBERS) == {"aicc-worker", "voynadmin"}
     agent_conf = (

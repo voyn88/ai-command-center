@@ -392,9 +392,11 @@ trap rollback EXIT HUP INT TERM
 # would build the agent layer this profile exists to keep off the control
 # plane -- and would recreate, as an untracked side effect outside the
 # transaction, the very directories the generation below is removing. The
-# control host provisions only the one identity its own specs install
-# against: /etc/aicc/workspace-authority.env is root:aicc-publisher on every
-# profile. No tmpfiles entry is control-plane state, so none runs here.
+# control host provisions only the identities its own specs install against:
+# aicc-control-authority, which owns /etc/aicc/workspace-authority.env on this
+# profile, and aicc-publisher, which the conversion below has to be able to
+# take the worker-era principals out of. No tmpfiles entry is control-plane
+# state, so none runs here.
 if [ "$install_profile" = "worker" ]; then
   systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
   systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
@@ -413,14 +415,17 @@ transaction_active=1
 # above calls `recover`, and no target has been mutated yet.
 if [ "$install_profile" = "control" ]; then
   run_transaction quiesce-worker-only
-  # /etc/aicc/workspace-authority.env is 0640 root:aicc-publisher on every
-  # profile, and deploy/sysusers.d/aicc-agent.conf put `aicc-worker` and
-  # `voynadmin` in that group on this host when it was a worker. sysusers
-  # never removes a membership, so without this the control plane's authority
-  # key stays readable by two worker-era principals -- the boundary this
-  # profile exists to draw, left open. Journalled before it mutates anything
-  # and undone by the same `recover` the trap above runs, so a failure
-  # anywhere before commit puts the memberships back.
+  # deploy/sysusers.d/aicc-agent.conf put `aicc-worker` and `voynadmin` in
+  # the publisher group on this host when it was a worker, and sysusers never
+  # removes a membership, so without this those principals acquire it again
+  # the next time they start. It is deliberately NOT the whole revocation:
+  # a process that is already running holds the numeric gid until it exits,
+  # so what takes the key away from the worker layer that is running right
+  # now is the generation above installing /etc/aicc/workspace-authority.env
+  # owned by aicc-control-authority instead. Journalled before it mutates
+  # anything, bound to the generation prepare() just wrote, and undone by the
+  # same `recover` the trap above runs, so a failure anywhere before commit
+  # puts the memberships back.
   run_transaction revoke-worker-authority
 fi
 run_transaction apply
