@@ -4899,7 +4899,7 @@ def default_specs(
     control plane meant either placing agent secrets on a host that must
     never hold them, or not installing it at all. The live attempt on
     control-01 took the second branch and stopped at `source is not a safe
-    regular file: /home/voynadmin/.claude/.credentials.json` -- a file whose
+    regular file: <legacy-home>/.claude/.credentials.json` -- a file whose
     *absence* was correct (2026-08-31). Dropping a target from the spec list
     only stops this transaction from writing it; it does nothing about a
     worker-only file a previous worker (or default) install already left on
