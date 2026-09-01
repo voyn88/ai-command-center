@@ -177,6 +177,9 @@ class FakeSystemd:
             state["MainPID"] = "3000"
         return ""
 
+    def probe(self, *args: str) -> tuple[int, str, str]:
+        return 0, self.run(*args, check=False), ""
+
     def property(self, unit: str, name: str) -> str:
         return str(self.states[unit][name])
 
@@ -361,7 +364,12 @@ def test_snapshot_and_restore_tolerate_unit_absent_on_clean_host():
     unit = "aicc-principal-recovery.service"
     systemd = FakeSystemd((unit,))
     systemd.states[unit].update(
-        {"LoadState": "not-found", "enabled": False, "ActiveState": "inactive"}
+        {
+            "LoadState": "not-found",
+            "enabled": False,
+            "ActiveState": "inactive",
+            "MainPID": "0",
+        }
     )
 
     state = module.snapshot(systemd, (unit,))
@@ -373,8 +381,8 @@ def test_snapshot_and_restore_tolerate_unit_absent_on_clean_host():
         "properties": {},
     }
     module.restore(systemd, state)
-    assert ("stop", unit) in systemd.calls
-    assert ("disable", unit) in systemd.calls
+    assert ("stop", unit) not in systemd.calls
+    assert ("disable", unit) not in systemd.calls
 
 
 def test_absent_baseline_unit_restore_fails_if_unit_remains_active():
@@ -1021,25 +1029,17 @@ def test_a_snapshot_covering_the_broker_instances_passes_closure():
     module.verify_snapshot_closure(systemd, state)
 
 
-def test_a_broker_instance_the_snapshot_records_as_absent_is_stopped_and_disabled():
+def test_a_broker_instance_already_gone_is_verified_without_mutating_it():
     """Rollback of a control transition: the snapshot says the instance did
     not exist, so restoring it means proving it is stopped, disabled and
-    unloaded -- which the restorable-unit pattern has to accept before any of
-    that can even be attempted."""
+    unloaded without issuing operations that fail for a vanished transient
+    instance."""
     module = _module()
 
-    class HostWhereTheInstanceIsGone(FakeSystemd):
-        """Real systemctl stops/disables a not-found unit without error; the
-        strict fake refuses undeclared names to catch typo'd rollout targets,
-        which is not what an already-absent instance is."""
-
-        def run(self, *args: str, check: bool = True) -> str:
-            if args[0] in {"stop", "disable"} and args[-1] not in self.states:
-                self.calls.append(args)
-                return ""
-            return super().run(*args, check=check)
-
-    systemd = HostWhereTheInstanceIsGone(())
+    # The strict fake models real non-zero stop/disable for a vanished unit by
+    # raising on mutation.  Production must first prove LoadState=not-found
+    # and avoid those operations, not teach the fake an impossible success.
+    systemd = FakeSystemd(())
     state = {
         "version": 3,
         "units": {
@@ -1054,5 +1054,127 @@ def test_a_broker_instance_the_snapshot_records_as_absent_is_stopped_and_disable
 
     module.restore(systemd, state)
 
-    assert ("stop", "aicc-agent-launcher@7.service") in systemd.calls
-    assert ("disable", "aicc-agent-launcher@7.service") in systemd.calls
+    assert ("stop", "aicc-agent-launcher@7.service") not in systemd.calls
+    assert ("disable", "aicc-agent-launcher@7.service") not in systemd.calls
+    assert (
+        "show",
+        "aicc-agent-launcher@7.service",
+        "--property=LoadState",
+        "--value",
+    ) in systemd.calls
+
+
+def test_absent_broker_with_empty_load_state_is_not_treated_as_verified_gone():
+    module = _module()
+
+    class SilentLoadState(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            self.calls.append(args)
+            return 1, "", ""
+
+    systemd = SilentLoadState(())
+    state = {
+        "version": 3,
+        "units": {
+            "aicc-agent-launcher@7.service": {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="cannot prove absent service"):
+        module.restore(systemd, state)
+
+    assert not any(call[0] in {"stop", "disable"} for call in systemd.calls)
+
+
+def test_nonzero_load_probe_cannot_forge_a_verified_not_found_result():
+    module = _module()
+
+    class FailedButPrintedNotFound(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            self.calls.append(args)
+            return 1, "not-found", "transport failed"
+
+    systemd = FailedButPrintedNotFound(())
+    state = {
+        "version": 3,
+        "units": {
+            "aicc-agent-launcher@7.service": {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="cannot prove absent service"):
+        module.restore(systemd, state)
+
+    assert not any(call[0] in {"stop", "disable"} for call in systemd.calls)
+
+
+def test_not_found_fragment_with_stale_enablement_is_not_exact_absence():
+    module = _module()
+
+    class DanglingEnablement(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            if args[0] == "is-enabled":
+                self.calls.append(args)
+                return 0, "enabled", ""
+            return super().probe(*args)
+
+    systemd = DanglingEnablement(())
+    unit = "aicc-agent-launcher@7.service"
+    state = {
+        "version": 3,
+        "units": {
+            unit: {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="did not restore exactly"):
+        module.restore(systemd, state)
+
+    assert ("stop", unit) not in systemd.calls
+    assert ("disable", unit) not in systemd.calls
+
+
+def test_silent_post_stop_probe_cannot_confirm_an_absent_service():
+    module = _module()
+    unit = "aicc-principal-recovery.service"
+
+    class PostStopTransportFailure(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            if args[0] == "show" and "--property=LoadState" in args:
+                # The first probe sees a loaded unit.  After stop, the
+                # transport dies silently instead of proving not-found.
+                if any(call[0] == "stop" for call in self.calls):
+                    self.calls.append(args)
+                    return 1, "", ""
+            return super().probe(*args)
+
+    systemd = PostStopTransportFailure((unit,))
+    state = {
+        "version": 3,
+        "units": {
+            unit: {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="cannot prove absent service"):
+        module.restore(systemd, state)

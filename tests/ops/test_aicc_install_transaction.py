@@ -2597,6 +2597,7 @@ def _purge_runner(
     late=(),
     late_after=1,
     busy=(),
+    inactive_busy=(),
     disable_fails=(),
     calls=None,
 ):
@@ -2610,6 +2611,7 @@ def _purge_runner(
     """
     listings = {"launcher": 0}
     remaining = dict(busy)
+    inactive_remaining = dict(inactive_busy)
     known = set(loaded) | set(late)
 
     def run(command, **kwargs):
@@ -2636,6 +2638,14 @@ def _purge_runner(
             return SimpleNamespace(returncode=0, stderr="", stdout=f"{state}\n")
         if verb == "show":
             unit = command[2]
+            inactive_left = inactive_remaining.get(unit, 0)
+            if inactive_left:
+                inactive_remaining[unit] = inactive_left - 1
+                body = (
+                    "ActiveState=inactive\nMainPID=4242\n"
+                    f"ControlGroup=/system.slice/{unit}\nTasksCurrent=2\n"
+                )
+                return SimpleNamespace(returncode=0, stderr="", stdout=body)
             left = remaining.get(unit, 0)
             if left:
                 remaining[unit] = left - 1
@@ -2685,13 +2695,34 @@ def test_quiesce_worker_only_units_tolerates_a_host_that_never_ran_the_worker_pr
     module = _module()
 
     def run(command, **kwargs):
-        if command[1] in {"list-unit-files", "list-units"}:
+        if command[1] == "list-unit-files":
             return SimpleNamespace(returncode=1, stderr="", stdout="")
+        if command[1] == "list-units":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
         if command[1] == "show":
             return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
         raise AssertionError(f"unexpected systemctl call: {command}")
 
     module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+
+
+@pytest.mark.parametrize(
+    "verb, returncode",
+    [("list-unit-files", 2), ("list-units", 1)],
+)
+def test_template_discovery_refuses_every_other_silent_systemctl_failure(
+    verb, returncode
+):
+    """Only list-unit-files rc=1 is its documented empty no-match result."""
+    module = _module()
+
+    def run(command, **kwargs):
+        if command[1] == verb:
+            return SimpleNamespace(returncode=returncode, stderr="", stdout="")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    with pytest.raises(RuntimeError, match="cannot enumerate"):
+        module.discover_template_instances(run=run, message="cannot enumerate")
 
 
 def test_quiesce_worker_only_units_refuses_when_stopping_a_loaded_unit_fails(
@@ -2812,6 +2843,63 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
     )
     assert closed and closed[0] < launcher_stop
     assert max(drain_probes) > closed[0]
+
+
+def test_inactive_socket_with_process_and_cgroup_is_not_yet_drained(tmp_path):
+    """Inactive alone cannot prove the Accept=yes listener is quiescent."""
+    module = _module()
+    calls = []
+    slept = []
+    run = _purge_runner(
+        loaded={"aicc-agent-launcher.socket"},
+        inactive_busy={"aicc-agent-launcher.socket": 2},
+        calls=calls,
+    )
+
+    module.quiesce_worker_only_units(run=run, sleep=slept.append)
+
+    assert slept == [module.DRAIN_INTERVAL_SECONDS] * 3
+    socket_probes = [
+        call
+        for call in calls
+        if call[1] == "show"
+        and call[2] == "aicc-agent-launcher.socket"
+        and "--property=TasksCurrent" in call
+    ]
+    assert len(socket_probes) >= 3
+
+
+@pytest.mark.parametrize(
+    "main_pid, control_group, tasks_current, reason",
+    [
+        ("4242", "", "0", "main process"),
+        ("0", "/system.slice/aicc-agent-launcher.socket", "0", "control group"),
+        ("0", "", "2", "tasks in its cgroup"),
+    ],
+)
+def test_each_inactive_socket_residue_independently_prevents_drain(
+    main_pid, control_group, tasks_current, reason
+):
+    module = _module()
+
+    def run(command, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stderr="",
+            stdout=(
+                "ActiveState=inactive\n"
+                f"MainPID={main_pid}\n"
+                f"ControlGroup={control_group}\n"
+                f"TasksCurrent={tasks_current}\n"
+            ),
+        )
+
+    drained, why = module._unit_drained(
+        "aicc-agent-launcher.socket", run=run
+    )
+
+    assert not drained
+    assert reason in why
 
 
 def test_a_session_that_never_drains_closes_admission_for_outer_recovery(tmp_path):
@@ -3556,6 +3644,49 @@ def test_uninstalling_a_retired_control_host_completes_without_resurrection(tmp_
         assert _byte_search(state, secret) == []
 
 
+def test_uninstall_refuses_a_recreated_retired_credential(tmp_path):
+    """Retired means provably absent, not permission to skip new state."""
+    module = _module()
+    transaction, root, _state = _worker_host_with_credentials(module, tmp_path)
+    transaction.install(_control_transition_specs(module, tmp_path))
+    recreated = root / CLAUDE_CREDENTIAL.lstrip("/")
+    recreated.parent.mkdir(parents=True, exist_ok=True)
+    recreated.write_bytes(b"new-untracked-credential")
+    recreated.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="retired sensitive target reappeared"):
+        transaction.uninstall_all()
+
+    assert recreated.read_bytes() == b"new-untracked-credential"
+    assert transaction.current.exists(), "the conflicting generation was forgotten"
+
+
+def test_uninstall_preflights_the_whole_chain_before_unwinding_a_newer_generation(
+    tmp_path,
+):
+    module = _module()
+    transaction, root, state = _worker_host_with_credentials(module, tmp_path)
+    transaction.install(_control_transition_specs(module, tmp_path))
+    later_source = tmp_path / "later-source"
+    later_source.write_bytes(b"later-generation")
+    transaction.install((_spec(module, later_source, "/etc/later-file"),))
+    current_before = transaction.current.read_bytes()
+    generations_before = sorted(path.name for path in state.glob("generation-*"))
+    later = root / "etc/later-file"
+    recreated = root / CLAUDE_CREDENTIAL.lstrip("/")
+    recreated.parent.mkdir(parents=True, exist_ok=True)
+    recreated.write_bytes(b"new-untracked-credential")
+    recreated.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="retired sensitive target reappeared"):
+        transaction.uninstall_all()
+
+    assert later.read_bytes() == b"later-generation"
+    assert recreated.read_bytes() == b"new-untracked-credential"
+    assert transaction.current.read_bytes() == current_before
+    assert sorted(path.name for path in state.glob("generation-*")) == generations_before
+
+
 def test_the_retirement_intent_is_armed_while_the_wal_still_says_applied(
     monkeypatch, tmp_path
 ):
@@ -3788,12 +3919,16 @@ def _publisher_group(module, tmp_path, members, generation="generation-0001"):
 
     def run(command, **kwargs):
         calls.append(tuple(command))
+        assert len(command) == 4
         assert command[0] == module.GPASSWD
+        assert command[1] in {"-a", "-d"}
         assert command[3] == module.AUTHORITY_GROUP
         if command[1] == "-d":
             live.discard(command[2])
-        else:
+        elif command[1] == "-a":
             live.add(command[2])
+        else:
+            raise AssertionError(f"unexpected gpasswd action: {command[1]}")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def getgrnam(name):
@@ -3801,6 +3936,25 @@ def _publisher_group(module, tmp_path, members, generation="generation-0001"):
         return SimpleNamespace(gr_gid=4242, gr_mem=sorted(live))
 
     return state, live, calls, run, getgrnam, manifest
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["--pretend-add", "voynadmin", "aicc-publisher"],
+        ["-a", "voynadmin", "aicc-publisher", "extra"],
+    ],
+)
+def test_publisher_group_fake_rejects_a_malformed_action(tmp_path, command):
+    module = _module()
+    _state, live, _calls, run, _getgrnam, _manifest = _publisher_group(
+        module, tmp_path, {"aicc-control-plane"}
+    )
+
+    with pytest.raises(AssertionError):
+        run([module.GPASSWD, *command])
+
+    assert live == {"aicc-control-plane"}
 
 
 def test_the_control_transition_revokes_the_legacy_publisher_membership(tmp_path):

@@ -2141,10 +2141,18 @@ def discover_template_instances(*, run=subprocess.run, message: str) -> set[str]
             # result is the answer, not a failure -- treating it as one made
             # the control install die at `cannot enumerate worker lanes for
             # snapshot closure` (observed live on control-01, 2026-08-31). A
-            # real failure still reports on stderr.
-            if result.returncode and (
-                result.stderr.strip() or result.stdout.strip()
-            ):
+            # real failure must not be inferred from output: systemctl can
+            # fail silently (for example when its transport dies).  The only
+            # non-zero result documented by this caller as an empty answer is
+            # rc=1 from list-unit-files with no output at all.  In particular,
+            # list-units and every other status remain fail-closed.
+            expected_empty_no_match = (
+                arguments[0] == "list-unit-files"
+                and result.returncode == 1
+                and not result.stderr.strip()
+                and not result.stdout.strip()
+            )
+            if result.returncode and not expected_empty_no_match:
                 raise RuntimeError(result.stderr.strip() or message)
             for line in result.stdout.splitlines():
                 fields = line.split()
@@ -3880,6 +3888,11 @@ class FileTransaction:
             manifest = Path(current["manifest"])
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         records = _generation_records(payload)
+        if allow_retired_sensitive:
+            # This is a preflight, deliberately before the reversed restore
+            # loop: discovering a recreated credential after restoring another
+            # record would make a fail-closed refusal partially destructive.
+            self._assert_retired_sensitive_targets_absent(records)
         removed_targets = [
             PurePosixPath(record.target) for record in records if record.remove
         ]
@@ -3893,6 +3906,7 @@ class FileTransaction:
             if record.remove and record.directory
         }
         for record in reversed(records):
+            target = self._target(record.target)
             if record.sensitive_retired:
                 # The backup this record would restore from was destroyed
                 # when the generation committed. See
@@ -3911,7 +3925,6 @@ class FileTransaction:
                 # Preserve the permanent anchor until the uninstall WAL is
                 # durably gone; without it a reboot could bypass recovery.
                 continue
-            target = self._target(record.target)
             if record.remove and record.directory:
                 self._restore_removed_directory(
                     record,
@@ -4062,6 +4075,29 @@ class FileTransaction:
             )
         if clear_pending:
             self._clear_pending(manifest)
+
+    def _assert_retired_sensitive_targets_absent(
+        self, records: list[BackupRecord]
+    ) -> None:
+        """Preflight the one irreversible exception accepted by uninstall."""
+        for record in records:
+            if record.sensitive_retired and _path_present(
+                self._target(record.target)
+            ):
+                raise RuntimeError(
+                    "retired sensitive target reappeared before uninstall: "
+                    f"{record.target}"
+                )
+
+    def _assert_uninstall_chain_retired_targets_absent(self) -> None:
+        """Walk every committed generation before unwinding the first one."""
+        # Reuse the canonical traversal: it proves containment in state_dir
+        # and rejects cycles before this security preflight reads manifests.
+        for manifest in self._current_generation_manifests():
+            payload = _trusted_journal(manifest)
+            self._assert_retired_sensitive_targets_absent(
+                _generation_records(payload)
+            )
 
     def _restore_removed_directory(
         self,
@@ -4228,6 +4264,10 @@ class FileTransaction:
         could perform.
         """
         self.recover(boot=boot)
+        if self.current.exists():
+            # Do not unwind or delete a newer generation before discovering a
+            # recreated retired credential in an older one.
+            self._assert_uninstall_chain_retired_targets_absent()
         while self.current.exists():
             value = json.loads(self.current.read_text(encoding="utf-8"))
             manifest = Path(value["manifest"]).resolve(strict=True)

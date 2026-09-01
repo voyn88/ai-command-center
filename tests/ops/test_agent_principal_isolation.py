@@ -1286,6 +1286,25 @@ def _installer_text() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _assert_command_inside_shell_if(text: str, command: str, guard: str) -> None:
+    """Prove the command is reached while the exact shell guard is open."""
+    lines = [line.strip() for line in text.splitlines()]
+    assert lines.count(command) == 1, (
+        f"expected one {command}, found {lines.count(command)}"
+    )
+    command_index = lines.index(command)
+    guards = [
+        index for index, line in enumerate(lines[:command_index]) if line == guard
+    ]
+    assert guards, f"{command} has no preceding {guard}"
+    assert not any(
+        line == "fi" or line.startswith("fi ") or line.startswith("fi;")
+        for line in lines[guards[-1] + 1 : command_index]
+    ), (
+        f"{command} escaped {guard}"
+    )
+
+
 def test_worker_to_control_is_one_generation_with_one_rollback_boundary():
     """Excluding a target from the transaction does not delete what is already
     on disk: a worker→control install that only skipped those specs left agent
@@ -1332,7 +1351,20 @@ def test_worker_to_control_is_one_generation_with_one_rollback_boundary():
     # point is still a recoverable pending generation.
     assert prepare < quiesce < apply_index < commit
     guard = 'if [ "$install_profile" = "control" ]; then'
-    assert guard in install_path[: install_path.index("run_transaction quiesce-worker-only")]
+    _assert_command_inside_shell_if(
+        install_path, "run_transaction quiesce-worker-only", guard
+    )
+
+
+def test_worker_to_control_guard_check_rejects_an_intervening_fi():
+    """A nearby guard is not proof if it closes before quiesce."""
+    guard = 'if [ "$install_profile" = "control" ]; then'
+    broken = f'{guard}\nfi\nrun_transaction quiesce-worker-only'
+
+    with pytest.raises(AssertionError, match="escaped"):
+        _assert_command_inside_shell_if(
+            broken, "run_transaction quiesce-worker-only", guard
+        )
 
 
 def test_the_agent_sysusers_and_tmpfiles_side_effects_are_worker_only():
@@ -1470,9 +1502,9 @@ def test_the_control_transition_revokes_the_authority_before_it_mutates_files():
     assert commands.count("run_transaction revoke-worker-authority") == 1
     assert prepare < quiesce < revoke < apply_index
     guard = 'if [ "$install_profile" = "control" ]; then'
-    before = install_path[: install_path.index("run_transaction revoke-worker-authority")]
-    assert guard in before
-    assert "\nfi\n" not in before[before.rindex(guard) :]
+    _assert_command_inside_shell_if(
+        install_path, "run_transaction revoke-worker-authority", guard
+    )
     # No chmod workaround: the file keeps its group ownership and mode, and
     # the membership is what changes.
     assert "chmod" not in install_path.split(

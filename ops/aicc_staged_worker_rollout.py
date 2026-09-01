@@ -217,18 +217,22 @@ class UnitState:
 
 
 class Systemd:
-    def run(self, *args: str, check: bool = True) -> str:
+    def probe(self, *args: str) -> tuple[int, str, str]:
         result = subprocess.run(
             ["/usr/bin/systemctl", *args],
             capture_output=True,
             check=False,
             text=True,
         )
-        if check and result.returncode:
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+    def run(self, *args: str, check: bool = True) -> str:
+        returncode, stdout, stderr = self.probe(*args)
+        if check and returncode:
             raise RolloutError(
-                result.stderr.strip() or f"systemctl {' '.join(args)} failed"
+                stderr or f"systemctl {' '.join(args)} failed"
             )
-        return result.stdout.strip()
+        return stdout
 
     def property(self, unit: str, name: str) -> str:
         return self.run("show", unit, f"--property={name}", "--value")
@@ -491,27 +495,57 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
         ):
             raise RolloutError("invalid service snapshot unit")
         if raw["exists"] is False:
-            systemd.run("stop", unit, check=False)
-            systemd.run("disable", unit, check=False)
-            active = systemd.run("is-active", unit, check=False)
-            enabled = systemd.run("is-enabled", unit, check=False)
-            load_state = systemd.run(
-                "show", unit, "--property=LoadState", "--value", check=False
+            # A template instance can disappear after its connection closes.
+            # `stop`/`disable` then return non-zero on real systemd; treating
+            # that as success in a fake hid the mismatch.  Prove absence first
+            # and avoid mutating an object that no longer exists.  A loaded
+            # unit is still driven to the snapshotted absent state below.
+            load_returncode, load_before, _load_stderr = systemd.probe(
+                "show", unit, "--property=LoadState", "--value"
             )
-            main_pid = systemd.run(
-                "show", unit, "--property=MainPID", "--value", check=False
+            if load_returncode or not load_before:
+                raise RolloutError(
+                    f"cannot prove absent service load state: {unit}"
+                )
+            initially_not_found = load_before == "not-found"
+            if not initially_not_found:
+                systemd.run("stop", unit, check=False)
+                systemd.run("disable", unit, check=False)
+            active_rc, active, _active_stderr = systemd.probe("is-active", unit)
+            enabled_rc, enabled, _enabled_stderr = systemd.probe(
+                "is-enabled", unit
             )
+            load_rc, load_state, _post_load_stderr = systemd.probe(
+                "show", unit, "--property=LoadState", "--value"
+            )
+            pid_rc, main_pid, _pid_stderr = systemd.probe(
+                "show", unit, "--property=MainPID", "--value"
+            )
+            if (
+                active_rc not in {0, 3, 4}
+                or enabled_rc not in {0, 1, 4}
+                or load_rc
+                or pid_rc
+                or not active
+                or not enabled
+                or not load_state
+                or not main_pid
+            ):
+                raise RolloutError(
+                    f"cannot prove absent service state after restore: {unit}"
+                )
             self_recovery = (
                 unit == "aicc-principal-recovery.service"
                 and active == "active"
                 and main_pid == str(os.getpid())
             )
-            if (
-                enabled == "enabled"
-                or (active == "active" and not self_recovery)
-                or (load_state not in {"", "not-found"} and not self_recovery)
-                or (active != "active" and main_pid not in {"", "0"})
-            ):
+            absent_exactly = (
+                active == "inactive"
+                and enabled in {"disabled", "not-found"}
+                and load_state == "not-found"
+                and main_pid == "0"
+            )
+            if not absent_exactly and not self_recovery:
                 raise RolloutError(f"service snapshot did not restore exactly: {unit}")
             continue
         if version == 3:
