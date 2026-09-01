@@ -405,6 +405,30 @@ def test_absent_baseline_unit_restore_fails_if_unit_remains_active():
         module.restore(systemd, state)
 
 
+def test_self_recovery_exception_never_allows_enabled_absent_baseline_unit():
+    module = _module()
+    unit = "aicc-principal-recovery.service"
+
+    class EnabledSelfRecovery(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args[0] in {"stop", "disable"} and args[-1] == unit:
+                self.calls.append(args)
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = EnabledSelfRecovery((unit,))
+    systemd.states[unit]["MainPID"] = str(os.getpid())
+    state = {
+        "version": 2,
+        "units": {unit: {"exists": False, "enabled": False, "active": False}},
+    }
+
+    with pytest.raises(module.RolloutError, match="did not restore exactly"):
+        module.restore(systemd, state)
+
+    assert systemd.states[unit]["enabled"] is True
+
+
 def test_versioned_restore_refuses_property_drift_before_restart():
     module = _module()
     unit = "voyn-aicc-worker@1.service"

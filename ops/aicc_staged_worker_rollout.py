@@ -539,13 +539,17 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
                 and active == "active"
                 and main_pid == str(os.getpid())
             )
-            absent_exactly = (
+            enablement_absent = enabled in {"disabled", "not-found"}
+            runtime_absent = (
                 active == "inactive"
-                and enabled in {"disabled", "not-found"}
                 and load_state == "not-found"
                 and main_pid == "0"
             )
-            if not absent_exactly and not self_recovery:
+            # The generator may be executing inside its own recovery service,
+            # so it cannot prove that service inactive/unloaded until it exits.
+            # That exception never covers enablement: leaving the absent-
+            # baseline unit enabled would revive it at the next boot.
+            if not enablement_absent or (not runtime_absent and not self_recovery):
                 raise RolloutError(f"service snapshot did not restore exactly: {unit}")
             continue
         if version == 3:
