@@ -988,8 +988,9 @@ def test_install_recovery_rechecks_closure_after_quiesce_before_mutation(
     )
     checks = 0
 
-    def closure(path):
+    def closure(path, *, preserve_unsnapshotted_launchers=False):
         nonlocal checks
+        assert preserve_unsnapshotted_launchers
         checks += 1
         if checks == 2:
             raise RuntimeError("worker lanes exist outside service snapshot: late")
@@ -1338,7 +1339,7 @@ def test_failed_boot_service_restore_keeps_journal_for_retry(monkeypatch, tmp_pa
         json.dumps({"version": 2, "units": {}}), encoding="utf-8"
     )
     monkeypatch.setattr(
-        module, "verify_service_snapshot_closure", lambda path: None
+        module, "verify_service_snapshot_closure", lambda path, **kwargs: None
     )
     monkeypatch.setattr(
         module,
@@ -1812,8 +1813,9 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
         order.append("selector")
         return original_selector_restore(self, **kwargs)
 
-    def recording_closure(path):
+    def recording_closure(path, *, preserve_unsnapshotted_launchers=False):
         assert path == state / "attempt-units.json"
+        assert preserve_unsnapshotted_launchers
         order.append("closure")
 
     def recording_service_restore(path):
@@ -1904,7 +1906,7 @@ def test_recovery_itself_refuses_an_unattested_pending_release(monkeypatch, tmp_
         json.dumps({"version": 2, "units": {}}), encoding="utf-8"
     )
     monkeypatch.setattr(
-        module, "verify_service_snapshot_closure", lambda path: None
+        module, "verify_service_snapshot_closure", lambda path, **kwargs: None
     )
     monkeypatch.setattr(module, "restore_service_snapshot", lambda *a, **k: None)
 
@@ -2796,8 +2798,8 @@ def test_the_control_purge_drains_the_workers_before_it_closes_the_socket(tmp_pa
     """The workers are the clients. Closing the socket first removed it
     (`RemoveOnStop=yes`) under a layer that was still running and still
     restarting, so every in-flight agent session died as a connection error
-    instead of draining. Order: lanes, then the sessions their last
-    connections produced, then the socket."""
+    instead of draining. Order: lanes, close admission, then preserve and
+    observe the sessions those lanes already produced."""
     module = _module()
     calls = []
     run = _purge_runner(
@@ -3307,6 +3309,27 @@ def test_quiesce_worker_only_is_refused_outside_the_control_profile(tmp_path):
 
     with pytest.raises(RuntimeError, match="requires the control profile"):
         module._dispatch(args, argparse.ArgumentParser())
+
+
+def test_control_profile_refuses_the_unstaged_install_shortcut(tmp_path):
+    """The privileged shortcut is only safe for the worker profile. A control
+    conversion must pass through prepare -> quiesce -> revoke -> apply ->
+    commit; collapsing it to FileTransaction.install would skip both authority
+    boundaries."""
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    args = SimpleNamespace(
+        action="install",
+        state_dir=state,
+        root=tmp_path / "root",
+        profile="control",
+    )
+
+    with pytest.raises(RuntimeError, match="requires the staged"):
+        module._dispatch(args, argparse.ArgumentParser())
+
+    assert not (state / "pending.json").exists()
 
 
 def test_the_control_purge_covers_every_retired_worker_unit():
@@ -4737,6 +4760,53 @@ def test_a_broker_instance_outside_the_snapshot_fails_closure(tmp_path):
         module.verify_service_snapshot_closure(
             snapshot,
             run=_listing_runner(launchers=("aicc-agent-launcher@7.service",)),
+        )
+
+
+def test_normal_install_recovery_preserves_a_late_accepted_broker(tmp_path):
+    """A session accepted after the point-in-time snapshot is preserve-only:
+    normal rollback restores its template but cannot recreate its descriptor.
+    The explicit recovery policy permits that one transient family while the
+    default closure used by terminal uninstall remains strict."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "aicc-agent-launcher.socket": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    module.verify_service_snapshot_closure(
+        snapshot,
+        run=_listing_runner(launchers=("aicc-agent-launcher@late.service",)),
+        preserve_unsnapshotted_launchers=True,
+    )
+
+
+def test_normal_install_recovery_still_refuses_a_late_worker_lane(tmp_path):
+    """Worker lanes are restartable state governed by the snapshot; the
+    preserve-only launcher exception must never weaken their closure."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="outside service snapshot"):
+        module.verify_service_snapshot_closure(
+            snapshot,
+            run=_listing_runner(workers=("voyn-aicc-worker@late.service",)),
+            preserve_unsnapshotted_launchers=True,
         )
 
 

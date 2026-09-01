@@ -2205,7 +2205,7 @@ LAUNCHER_SOCKET_UNIT = "aicc-agent-launcher.socket"
 
 
 def _control_purge_order(unit: str) -> tuple[int, str]:
-    """Drain from the clients inwards, and close the socket last.
+    """Drain clients first; launcher instances are handled after admission.
 
     The workers are what connect to `/run/aicc-agent-launcher/control.sock`.
     Closing the socket first leaves every running worker making requests into
@@ -2215,12 +2215,10 @@ def _control_purge_order(unit: str) -> tuple[int, str]:
     the in-flight agent sessions die as connection errors rather than as a
     drain (independent review on 0a205a0).
 
-    So: workers first, then whatever launcher instances their last
-    connections produced, and only once those are inactive and their cgroups
-    are released does the socket close. Nothing new can be instantiated after
-    the workers are gone, because the workers are the only clients -- and
-    `quiesce_worker_only_units` re-enumerates after the drain rather than
-    trusting that.
+    So the static ordering places workers before the socket. The caller then
+    closes and proves the socket before waiting for every already-accepted
+    launcher instance to finish naturally. Waiting for instances while the
+    socket is still accepting would leave an unbounded admission race.
     """
     if unit == LAUNCHER_SOCKET_UNIT:
         return (2, unit)
@@ -2230,7 +2228,10 @@ def _control_purge_order(unit: str) -> tuple[int, str]:
 
 
 def verify_service_snapshot_closure(
-    path: Path, *, run=subprocess.run
+    path: Path,
+    *,
+    run=subprocess.run,
+    preserve_unsnapshotted_launchers: bool = False,
 ) -> None:
     """Prove every installed or loaded template lane is in the bound snapshot.
 
@@ -2267,7 +2268,21 @@ def verify_service_snapshot_closure(
         run=run, message="cannot enumerate template units for snapshot closure"
     )
 
-    extras = sorted(discovered - set(units))
+    extras = discovered - set(units)
+    if preserve_unsnapshotted_launchers:
+        # A launcher accepted after the point-in-time snapshot owns a live
+        # client descriptor which rollback cannot recreate. Normal install
+        # recovery neither stops nor restarts these preserve-only transient
+        # units; it restores their template and lets them finish. Worker lanes
+        # remain restore-managed and therefore strict. Terminal uninstall does
+        # stop launcher sessions and calls this function with the default
+        # strict policy.
+        extras = {
+            unit
+            for unit in extras
+            if not TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit)
+        }
+    extras = sorted(extras)
     if extras:
         raise RuntimeError(
             f"template units exist outside service snapshot: {extras}"
@@ -3880,11 +3895,15 @@ class FileTransaction:
         snapshot = self.state_dir / "attempt-units.json"
         snapshot_present = _path_present(snapshot)
         if snapshot_present:
-            verify_service_snapshot_closure(snapshot)
+            verify_service_snapshot_closure(
+                snapshot, preserve_unsnapshotted_launchers=True
+            )
             quiesce_service_snapshot(
                 snapshot, restorable_units=_units_restored_by(manifest)
             )
-            verify_service_snapshot_closure(snapshot)
+            verify_service_snapshot_closure(
+                snapshot, preserve_unsnapshotted_launchers=True
+            )
         elif self.root == Path("/"):
             raise RuntimeError("production recovery requires a service snapshot")
         # The rollback puts every purged credential back from the very
@@ -3910,7 +3929,9 @@ class FileTransaction:
                 restore_service_snapshot(snapshot, defer_starts=True)
             else:
                 restore_service_snapshot(snapshot)
-            verify_service_snapshot_closure(snapshot)
+            verify_service_snapshot_closure(
+                snapshot, preserve_unsnapshotted_launchers=True
+            )
         self._clear_pending(manifest)
         if snapshot_present:
             snapshot.unlink()
@@ -5474,6 +5495,11 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         "revoke-worker-authority",
     }:
         raise RuntimeError("unfinished uninstall journal blocks installation")
+    if args.action == "install" and args.profile == "control":
+        raise RuntimeError(
+            "control profile requires the staged prepare, quiesce-worker-only, "
+            "revoke-worker-authority, apply and commit path"
+        )
     transaction = FileTransaction(args.root, args.state_dir)
     if args.action == "validate-control-authority":
         if args.profile != "control":
@@ -5535,8 +5561,6 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             args.state_dir, transaction._pending_manifest()
         )
     elif args.action == "install":
-        if args.profile == "control":
-            verify_control_authority_precondition(args.state_dir)
         transaction.install(specs)
     elif args.action in {"recover", "rollback", "recover-boot"}:
         transaction.recover(boot=args.action == "recover-boot")
