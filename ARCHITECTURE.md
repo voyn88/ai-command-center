@@ -451,8 +451,11 @@ and MyPy type-check steps alongside — for pull requests into `main`, pushes to
 dispatches on Python 3.14. It uses a read-only token, SHA-pinned actions, and cancels superseded runs for the same
 ref.
 
-The workflow does not configure GitHub branch protection. Whether its result is a required merge
-gate remains a repository-setting concern outside this codebase.
+The workflow does not configure GitHub branch protection; that is a repository-setting concern
+outside this codebase. On `main`, that setting requires this workflow's `Final merge gate` job and
+the acceptance workflow's job to pass, verified live 2026-09-01 — see
+`docs/operations/GITHUB_BRANCH_PROTECTION_TIER_AUDIT.md` for the exact endpoints queried and what
+remains unverified (required review count, admin-bypass scope).
 
 ## 13. Current risks and boundaries
 
@@ -462,8 +465,11 @@ gate remains a repository-setting concern outside this codebase.
 - Live Supervisor ownership is confined to one Python process.
 - `app.py` and several runtime and Portfolio modules are large, concentrated change surfaces.
 - The MyPy type check is informational and non-blocking: it does not gate merges, and the codebase is not yet fully typed.
-- CI runs automatically, but required-check/branch-protection enforcement is not configured by
-  repository code and cannot be inferred from the workflow alone.
+- CI runs automatically; required-check/branch-protection enforcement is a repository setting, not
+  repository code, and is not fully inferable from the workflow files alone. `main` has
+  `required_status_checks` live (two named contexts, `non_admins` enforcement level) plus an active
+  merge queue, verified 2026-09-01; required review count and full admin-bypass scope are not — see
+  `docs/operations/GITHUB_BRANCH_PROTECTION_TIER_AUDIT.md`.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
   it, and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and

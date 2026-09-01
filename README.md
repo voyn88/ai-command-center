@@ -467,7 +467,11 @@ compilation, and pytest for pull requests into `main`, pushes to `main`, and man
 Python 3.14, plus a `windows-latest` job covering the automated half of the desktop leg. The workflow
 uses a read-only token, pins actions to commit SHAs, and cancels superseded runs for the same ref. It
 does not itself configure branch protection; repository settings must separately require the check if
-merges are to be blocked on it.
+merges are to be blocked on it. That separate configuration exists on `main`: GitHub branch
+protection there requires this workflow's `final-gate` job ("Final merge gate") and the acceptance
+workflow's job, verified live 2026-09-01 (not by reading this workflow file) — see
+`docs/operations/GITHUB_BRANCH_PROTECTION_TIER_AUDIT.md` for the exact evidence and what it does not
+yet confirm (required review count, admin-bypass scope).
 
 ## Current limitations and risks
 
@@ -483,8 +487,13 @@ merges are to be blocked on it.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
 - A static type checker is configured (permissive, non-strict) via `pyproject.toml` and surfaced as a
   non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
-- The checked-in CI workflow does not itself enforce branch protection. Enable "Require status checks
-  to pass before merging" on `main` with the `Quality gates` check to make it a real gate.
+- The checked-in CI workflow does not itself enforce branch protection — that is a repository setting,
+  not something a workflow file can grant itself. `main` already has "Require status checks to pass
+  before merging" enabled with the `Final merge gate` and `Acceptance gate (independent verdict on
+  exact SHA)` contexts (verified live 2026-09-01, not inferred from this file — see
+  `docs/operations/GITHUB_BRANCH_PROTECTION_TIER_AUDIT.md`). Required review count and whether
+  repository admins (including the autonomous publisher's own merge identity) are exempt are not yet
+  independently confirmed.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass it,
   and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and

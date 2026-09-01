@@ -119,8 +119,14 @@ Current boundaries:
   only exact-workspace exclusion is enforced transactionally by the runtime launch path.
 - Fail-closed workspace verification is scoped to normal task-v2 callers that supply
   `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
-- The current private-repository plan does not expose branch protection/rulesets, so CI is
-  automatic but required-check enforcement remains an operator merge discipline.
+- The repository is public and `main` carries live GitHub branch protection with
+  `required_status_checks` (contexts `Final merge gate`, `Acceptance gate (independent verdict on
+  exact SHA)`, enforcement level `non_admins`) plus an active merge queue — verified 2026-09-01 via
+  unauthenticated API calls, not assumed. Required-approval count, admin-bypass scope, and whether
+  the autonomous publisher's own merge identity is admin-exempt remain unverified (that data needs
+  an authenticated `branches/main/protection` call this environment cannot make). See
+  `docs/operations/GITHUB_BRANCH_PROTECTION_TIER_AUDIT.md` for the full evidence and the accepted
+  2-agent concurrency ceiling that stands until the open question there is resolved.
 - Git worktree creation, push, pull-request creation and merge are privileged capabilities with
   confirmation or policy safeguards.
 - The native PySide6 desktop client remains documentation and design work only.
