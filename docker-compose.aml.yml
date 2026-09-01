@@ -12,9 +12,18 @@ services:
       # writes that rule below a host firewall, so the exposure would not show
       # up in the firewall's own configuration. This service has no
       # authentication and performs privileged git/gh and subprocess
-      # operations, so reaching it off-host must be a deliberate act:
-      # set AML_BIND_HOST to widen it, in front of a reviewed authenticating
-      # proxy.
+      # operations, so reaching it off-host must be a deliberate act.
+      #
+      # docs/adr/0011-streamlit-console-no-remote-reachability.md records that
+      # no authenticating proxy is planned for this console — four attempts to
+      # build one were rejected by review, each for a distinct credential- or
+      # session-handling hazard. AML_BIND_HOST still exists for an operator's
+      # own already-trusted network topology (e.g. a private management
+      # segment), entirely at that operator's own risk and with no
+      # AICC-provided authentication in front of it. Remote, authenticated
+      # access instead goes through command_center.webapi (the web client), or
+      # an SSH port-forward onto this loopback publication for the console
+      # itself.
       - "${AML_BIND_HOST:-127.0.0.1}:${AML_PORT:-8501}:8501"
     volumes:
       - aml-data:/data

@@ -53,8 +53,14 @@ keep it off-host unless the operator deliberately opts out:
 | `docker compose` | the port is published on `${AML_BIND_HOST:-127.0.0.1}` |
 
 `tests/test_deployment_exposure.py` is the gate for all four. Not being exposed is not the same as
-being authenticated: HTTP authentication is a separate, still-open piece of work, so widening any of
-these controls means putting an unauthenticated privileged console on the network.
+being authenticated, and per
+[ADR-0011](docs/adr/0011-streamlit-console-no-remote-reachability.md) that gap is not closed by
+putting an authenticating proxy in front of Streamlit — four attempts were reviewed and rejected, each
+for a distinct credential- or session-handling hazard inherent to the console's own WebSocket
+protocol. Widening any of these controls therefore means putting an unauthenticated privileged
+console on the network, on the operator's own judgment of their network topology; remote,
+authenticated access instead goes through `command_center.webapi` (the web client) or an SSH
+port-forward onto the loopback publication.
 
 ## 2. UI and service boundaries
 
