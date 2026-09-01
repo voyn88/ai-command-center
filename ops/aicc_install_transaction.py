@@ -3193,32 +3193,48 @@ class FileTransaction:
                 self._assert_directory_removal_snapshot(record)
             elif record.remove:
                 self._assert_removal_snapshot(record)
-        for index, record in enumerate(records):
-            # Write-ahead index makes every destination mutation recoverable.
-            self._write_journal(manifest, "APPLYING", index)
-            if record.remove and record.directory:
-                self._apply_directory_removal(record)
-                continue
-            if record.remove:
-                self._apply_removal(record)
-                continue
-            staged = _read_regular(Path(record.staged))
-            if not _matches(
-                staged,
-                record.install_sha256,
-                0o600,
-                os.geteuid(),
-                os.getegid(),
-            ):
-                raise RuntimeError("staged generation payload SHA drifted")
-            _atomic_bytes(
-                self._target(record.target),
-                staged.payload,
-                record.install_mode,
-                record.install_uid,
-                record.install_gid,
-            )
-        self._write_journal(manifest, "APPLIED", len(records))
+        try:
+            for index, record in enumerate(records):
+                # Write-ahead index makes every destination mutation recoverable.
+                self._write_journal(manifest, "APPLYING", index)
+                if record.remove and record.directory:
+                    self._apply_directory_removal(record)
+                    continue
+                if record.remove:
+                    self._apply_removal(record)
+                    continue
+                staged = _read_regular(Path(record.staged))
+                if not _matches(
+                    staged,
+                    record.install_sha256,
+                    0o600,
+                    os.geteuid(),
+                    os.getegid(),
+                ):
+                    raise RuntimeError("staged generation payload SHA drifted")
+                _atomic_bytes(
+                    self._target(record.target),
+                    staged.payload,
+                    record.install_mode,
+                    record.install_uid,
+                    record.install_gid,
+                )
+            self._write_journal(manifest, "APPLIED", len(records))
+        except BaseException:
+            # A synchronous apply failure has the same durability guarantee as
+            # a later `recover()` after SIGKILL, but it must not leave a host in
+            # a known half-applied state merely because the caller is still
+            # alive. Undo immediately. If comparison proves rollback unsafe,
+            # `restore()` leaves pending.json armed for boot/operator recovery.
+            try:
+                self.restore(manifest)
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    "generation apply failed and immediate rollback failed; "
+                    "durable recovery remains armed"
+                ) from rollback_error
+            self._remove_orphan_generations()
+            raise
 
     def commit(self) -> None:
         """Publish an applied generation only after service rollout succeeds."""
@@ -3864,6 +3880,18 @@ class FileTransaction:
             manifest = Path(current["manifest"])
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         records = _generation_records(payload)
+        removed_targets = [
+            PurePosixPath(record.target) for record in records if record.remove
+        ]
+        removed_children = {
+            record.target: frozenset(
+                target.name
+                for target in removed_targets
+                if str(target.parent) == record.target
+            )
+            for record in records
+            if record.remove and record.directory
+        }
         for record in reversed(records):
             if record.sensitive_retired:
                 # The backup this record would restore from was destroyed
@@ -3885,7 +3913,11 @@ class FileTransaction:
                 continue
             target = self._target(record.target)
             if record.remove and record.directory:
-                self._restore_removed_directory(record, target)
+                self._restore_removed_directory(
+                    record,
+                    target,
+                    expected_entries=removed_children[record.target],
+                )
                 continue
             if record.remove:
                 self._restore_removed(record, target)
@@ -4032,7 +4064,11 @@ class FileTransaction:
             self._clear_pending(manifest)
 
     def _restore_removed_directory(
-        self, record: BackupRecord, target: Path
+        self,
+        record: BackupRecord,
+        target: Path,
+        *,
+        expected_entries: frozenset[str],
     ) -> None:
         """Recreate a purged worker-only directory, empty and exactly as it was.
 
@@ -4078,8 +4114,26 @@ class FileTransaction:
                 raise RuntimeError(
                     f"generation target directory changed before restore: {target}"
                 )
-            # Unchanged: apply() has not reached this record, or a previous
-            # restore already put it back. Either way there is nothing to do.
+            directory_fd = os.open(target.name, _DIR_OPEN_FLAGS, dir_fd=parent_fd)
+            try:
+                opened = os.fstat(directory_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise RuntimeError(
+                        f"generation target directory changed before restore: {target}"
+                    )
+                unexpected = sorted(
+                    set(os.listdir(directory_fd)) - expected_entries
+                )
+                if unexpected:
+                    raise RuntimeError(
+                        "generation target directory gained unexpected content "
+                        f"before restore: {target}: {unexpected}"
+                    )
+            finally:
+                os.close(directory_fd)
+            # Unchanged and still containing only names this generation owns:
+            # apply() has not reached this record, or a previous restore put
+            # it back. Missing expected names are restored by their own records.
         finally:
             os.close(parent_fd)
 

@@ -80,13 +80,11 @@ def test_mid_install_failure_restores_every_pretransaction_target(
     with pytest.raises(OSError, match="injected"):
         transaction.apply()
 
-    assert transaction.pending.exists()
-    transaction.recover()
-
     assert existing.read_bytes() == b"before"
     assert stat.S_IMODE(existing.stat().st_mode) == 0o600
     assert not (root / "etc/new").exists()
     assert not transaction.pending.exists()
+    assert not list(state.glob("generation-*"))
 
 
 def test_two_generations_uninstall_to_preinstall_state_without_orphans(tmp_path):
@@ -2420,9 +2418,9 @@ def test_a_failure_after_the_purge_rolls_the_purge_back_too(monkeypatch, tmp_pat
     """The exact regression an earlier attempt shipped: a worker-to-control
     transition that purges worker artefacts and then fails installing the
     control specs must not leave a host with neither generation. The purge
-    is a record in this same generation, so `apply()`'s existing failure path
-    -- restore every record, including ones already applied -- undoes it
-    like any other mutation, and the pre-transaction file is exactly back."""
+    is a record in this same generation, so `apply()` immediately restores
+    every record, including ones already applied, and returns only once the
+    pre-transaction file is exactly back."""
     module = _module()
     root = tmp_path / "root"
     state = tmp_path / "state"
@@ -2454,14 +2452,45 @@ def test_a_failure_after_the_purge_rolls_the_purge_back_too(monkeypatch, tmp_pat
     with pytest.raises(OSError, match="injected post-purge failure"):
         transaction.apply()
 
-    assert transaction.pending.exists()
-    transaction.recover()
-
     assert worker_only.read_bytes() == b"codex-secret"
     assert stat.S_IMODE(worker_only.stat().st_mode) == 0o600
     assert not (root / "etc/control-file").exists()
     assert not transaction.pending.exists()
     assert not list(state.glob("generation-*"))
+
+
+def test_immediate_rollback_refuses_a_refilled_removed_directory(
+    monkeypatch, tmp_path
+):
+    """An external writer can recreate a purged directory before synchronous
+    rollback begins. Matching mode/owner is not enough: accepting an unknown
+    entry would silently preserve state the generation never snapshotted."""
+    module = _module()
+    root, _credential = _agent_credential_tree(tmp_path)
+    state = tmp_path / "state"
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare(_credential_tree_specs(module))
+    refilled = root / "var/lib/aicc-agent/claude/.claude"
+    real_remove = module.FileTransaction._apply_directory_removal
+
+    def remove_then_refill(this, record):
+        real_remove(this, record)
+        if record.target == "/var/lib/aicc-agent/claude/.claude":
+            refilled.mkdir()
+            (refilled / "unexpected.json").write_bytes(b"external-state")
+            raise OSError("injected failure after directory removal")
+
+    monkeypatch.setattr(
+        module.FileTransaction,
+        "_apply_directory_removal",
+        remove_then_refill,
+    )
+
+    with pytest.raises(RuntimeError, match="immediate rollback failed"):
+        transaction.apply()
+
+    assert (refilled / "unexpected.json").read_bytes() == b"external-state"
+    assert transaction.pending.exists(), "unsafe rollback must remain armed"
 
 
 def test_removal_record_recovers_from_a_crash_between_purge_and_install(tmp_path):
@@ -2785,11 +2814,11 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
     assert max(drain_probes) > closed[0]
 
 
-def test_a_session_that_never_drains_fails_the_purge_with_the_socket_open(tmp_path):
-    """Fail closed, and closed means the layer is left exactly as it was
-    running: the generation has mutated nothing, the recovery trap unwinds
-    it, and the operator still has a listening socket to serve whatever
-    would not let go."""
+def test_a_session_that_never_drains_closes_admission_for_outer_recovery(tmp_path):
+    """The low-level quiesce helper closes admission before it can prove the
+    final launcher set stable. The installer transaction's outer recovery
+    boundary restores the socket and workers from its service snapshot; this
+    helper must not reopen admission inside the unsafe enumeration window."""
     module = _module()
     calls = []
     run = _purge_runner(
@@ -3420,6 +3449,7 @@ def test_a_failure_before_commit_still_restores_both_credentials(
     the credentials and then fails puts them back byte-for-byte."""
     module = _module()
     transaction, root, state = _worker_host_with_credentials(module, tmp_path)
+    generations_before = set(state.glob("generation-*"))
     specs = _control_transition_specs(module, tmp_path)
     transaction.prepare(
         (specs[1], specs[2], specs[0])  # purge first, then the install that fails
@@ -3436,9 +3466,6 @@ def test_a_failure_before_commit_still_restores_both_credentials(
     with pytest.raises(OSError, match="injected post-purge failure"):
         transaction.apply()
 
-    assert transaction.pending.exists()
-    transaction.recover()
-
     for target, payload in (
         (CLAUDE_CREDENTIAL, CLAUDE_BYTES),
         (CODEX_CREDENTIAL, CODEX_BYTES),
@@ -3446,6 +3473,8 @@ def test_a_failure_before_commit_still_restores_both_credentials(
         restored = root / target.lstrip("/")
         assert restored.read_bytes() == payload
         assert stat.S_IMODE(restored.stat().st_mode) == 0o600
+    assert not transaction.pending.exists()
+    assert set(state.glob("generation-*")) == generations_before
     assert not (state / module.SENSITIVE_RETIREMENT_JOURNAL).exists()
 
 
@@ -4744,13 +4773,15 @@ def test_a_worker_only_directory_that_refilled_after_prepare_is_not_removed(tmp_
     intruder = credential.parent / "arrived-late.json"
     intruder.write_bytes(b"arrived-after-prepare")
 
-    with pytest.raises(RuntimeError, match="not empty at removal"):
+    with pytest.raises(RuntimeError, match="immediate rollback failed"):
         transaction.apply()
 
     assert transaction.pending.exists()
+    assert intruder.read_bytes() == b"arrived-after-prepare"
+    intruder.unlink()
     transaction.recover()
 
-    assert intruder.read_bytes() == b"arrived-after-prepare"
+    assert not intruder.exists(), "operator removed the unowned blocker"
     assert credential.read_bytes() == CLAUDE_BYTES, "the purge was rolled back"
     assert not transaction.pending.exists()
 
@@ -4784,9 +4815,6 @@ def test_a_rolled_back_generation_puts_every_directory_back_exactly(
     finally:
         os.umask(previous)
 
-    assert transaction.pending.exists()
-    transaction.recover()
-
     assert credential.read_bytes() == CLAUDE_BYTES
     assert stat.S_IMODE(credential.stat().st_mode) == 0o600
     for directory in (
@@ -4796,6 +4824,8 @@ def test_a_rolled_back_generation_puts_every_directory_back_exactly(
     ):
         assert directory.is_dir()
         assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+    assert not transaction.pending.exists()
+    assert not list((tmp_path / "state").glob("generation-*"))
 
 
 def test_systemctl_load_probe_failure_is_not_treated_as_absent():
@@ -5113,8 +5143,11 @@ def test_control_authority_group_refuses_a_live_numeric_gid(tmp_path):
         )
 
 
-def test_a_rollback_does_not_restart_an_accepted_launcher_session(tmp_path):
-    """`aicc-agent-launcher.socket` is `Accept=yes`: an instance exists only
+def test_failed_control_quiesce_recovery_restores_socket_not_accepted_session(
+    tmp_path,
+):
+    """The outer rollback after a failed control quiesce restores admission.
+    `aicc-agent-launcher.socket` is `Accept=yes`: an instance exists only
     because systemd accepted one connection and handed it in as stdin. That
     descriptor cannot be recreated, so `systemctl start` on the instance
     would not restore a session -- it would start a connectionless launcher
@@ -5184,6 +5217,16 @@ def test_a_rollback_does_not_restart_an_accepted_launcher_session(tmp_path):
         "voyn-aicc-worker@blue.service",
         "aicc-agent-launcher.socket",
     }
+    assert [
+        "/usr/bin/systemctl",
+        "enable",
+        "aicc-agent-launcher.socket",
+    ] in calls
+    assert [
+        "/usr/bin/systemctl",
+        "start",
+        "aicc-agent-launcher.socket",
+    ] in calls
 
 
 def test_a_directory_swapped_after_the_compare_is_not_the_one_removed(
@@ -5381,7 +5424,7 @@ def test_a_real_control_install_leaves_no_worker_artefact_or_secret_tree(
         *module.WORKER_ONLY_TARGETS,
         *module.WORKER_ONLY_DIRECTORIES,
     ):
-        assert not (root / gone.lstrip("/")).exists(), gone
+        assert not os.path.lexists(root / gone.lstrip("/")), gone
     assert (root / "etc/aicc/workspace-authority.env").exists()
     assert (root / "usr/libexec/aicc-install-transaction").exists()
     for secret in (CLAUDE_BYTES, CODEX_BYTES):

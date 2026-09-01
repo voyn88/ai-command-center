@@ -945,9 +945,11 @@ def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
     assert "/usr/sbin/nologin" in sysusers
     assert "u aicc-worker " in sysusers
     assert "u aicc-agent " in sysusers
+    assert "u aicc-rotator " in sysusers
     assert "m aicc-agent aicc-workspace" in sysusers
     assert "m aicc-worker aicc-workspace" in sysusers
     assert "m aicc-worker aicc-publisher" in sysusers
+    assert "m aicc-rotator aicc-worker" in sysusers
     assert "m voynadmin aicc-publisher" in sysusers
     assert "User=aicc-worker" in worker
     # The rollout runbook forbids shipping the fail-closed flag inside the
