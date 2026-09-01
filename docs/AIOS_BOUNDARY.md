@@ -276,22 +276,49 @@ prohibited, and convergence into AIOS Core remains this subsystem's stated
 end state once the core's dispatch contract (aios ADR-0022) is accepted and
 covers it.
 
-### SRV-02 `principal` — recorded as not placed here (2026-08-27)
+### SRV-02 `principal` — recorded as not placed here (2026-08-27, corrected 2026-09-01)
 
 `VOYN-W0-AICC-SRV-02` proposed an AICC-local `principal` table as the identity
-registry backing the SRV lane. It is not placed in this repository, and this is
-the decision record, not a deferral.
+registry backing the SRV lane's HTTP/API surface — the thing `whoami` answers
+for a caller. That registry is not placed in this repository, and this is the
+decision record, not a deferral.
 
-AIOS already runs a tenant-scoped identity registry — `principals`,
-`auth_principals`, `credentials` — as verified in
-`command_center/db/sql/0002_queue_claim.up.sql` (`grep -rn principal
---include=*.sql command_center/` returns 0; the table exists in no AICC
-database today). A second, AICC-local `principal` table would be exactly the
-"second principal registry" the `http_auth/identity.py` section above already
-names as the one thing that would turn this repository's authentication seam
-into a genuine violation. The registry belongs where it already lives; SRV-02
-should consume it through a versioned contract when one is needed, the same
-shape `identity.py` already uses for `whoami` — not grow a duplicate here.
+AIOS already runs a tenant-scoped identity registry for that purpose —
+`principals`, `auth_principals`, `credentials` — consumed exactly once, from
+`http_auth/identity.py`'s `whoami` call. A second, AICC-local copy of *that*
+registry would be the "second principal registry" the `http_auth/identity.py`
+section above names as the one thing that would turn this repository's
+authentication seam into a genuine violation. The registry belongs where it
+already lives; SRV-02 should consume it through a versioned contract when one
+is needed, the same shape `identity.py` already uses for `whoami` — not grow a
+duplicate here.
+
+Correction to the 2026-08-27 record: it cited `grep -rn principal
+--include=*.sql command_center/` as returning 0 and concluded no AICC database
+holds a `principal` table. That was wrong even on 2026-08-27 — the grep
+returns matches, and has since `VOYN-W0-AICC-SRV-03` (#313, merged
+2026-08-15) added `CREATE TABLE principal` in
+`command_center/db/sql/0003_worker_enrollment.up.sql`, predating this record
+by twelve days. The claim was copied from a comment in
+`command_center/db/sql/0002_queue_claim.up.sql` that was accurate when *that*
+migration was written (0002 predates 0003) but was stale by the time this
+section quoted it, and nobody re-ran the grep.
+
+That table is not the registry this decision is about. Its `principal` rows
+are `operator` / `control_plane` / `worker_host`, each bound 1:1 to a
+PostgreSQL `db_role` (`principal.db_role NOT NULL UNIQUE`), and it exists to
+answer "which SCRAM-authenticated Postgres connection is this" for
+`identity_assert()` and worker-host enrollment — a database-connection
+identity, scoped to this repository's own execution infrastructure. AIOS's
+registry answers a different question: "which platform credential did this
+HTTP caller present." Neither table's rows correspond to the other's; nothing
+here joins `principal.principal_id` to AIOS's `principal_id`. SRV-03 is
+already-accepted, in-repo, and out of scope for this decision — this record
+neither blesses nor revisits it, and does not retroactively fold it into "the
+identity registry backing the SRV lane" SRV-02 proposed. It does mean the bare
+word "principal" now names two unrelated things in this codebase (one AICC
+table, one AIOS table); a reader who greps for `principal` should expect both
+and not assume a hit answers the HTTP-identity question.
 
 This placement decision neither blocks nor is predetermined by
 `VOYN-W0-AICC-SRV-04b` (the queue claim protocol, accepted and merged above).
