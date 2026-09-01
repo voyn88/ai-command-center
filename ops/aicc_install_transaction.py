@@ -59,6 +59,13 @@ class FileSpec:
     uid: int
     gid: int
     if_missing: bool = False
+    # True means: after this generation, `target` must not exist. `source`,
+    # `mode`, `uid` and `gid` describe nothing installed and are never read --
+    # see `removal_spec`. Folding removal into the same spec list as ordinary
+    # installs lets one generation (one prepare/apply/commit) both purge and
+    # install, so a profile transition gets a single rollback boundary instead
+    # of an uninstall that commits before the install it precedes is proven.
+    remove: bool = False
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,19 @@ class BackupRecord:
     # positional constructor contract of every existing record, and defaulted
     # so a journal written by an earlier generation still loads.
     original_symlink: str | None = None
+    # Mirrors FileSpec.remove: True means this generation's "install" of
+    # `target` is its removal, not a write. Defaulted for the same reason as
+    # `original_symlink` -- a historical journal predates this field.
+    remove: bool = False
+
+
+def removal_spec(target: str) -> FileSpec:
+    """A spec that removes `target` instead of installing anything.
+
+    `source` is a dummy: `remove=True` short-circuits every codepath that
+    would otherwise read it.
+    """
+    return FileSpec(Path(os.devnull), target, 0, 0, 0, remove=True)
 
 
 @dataclass(frozen=True)
@@ -1226,6 +1246,80 @@ def verify_service_snapshot_closure(
         raise RuntimeError(f"worker lanes exist outside service snapshot: {extras}")
 
 
+#: Statically-named units a control-profile host must not run. The
+#: `voyn-aicc-worker@<lane>` template has no fixed name -- discovered the
+#: same way `verify_service_snapshot_closure` proves lane closure, below.
+#: `aicc-principal-recovery.service` is deliberately absent: it is the boot
+#: recovery capsule, kept running through every transaction the same way
+#: `quiesce_service_snapshot` already exempts it from being stopped.
+#: The legacy worker units are taken from `RETIRED_LEGACY_UNITS` rather than
+#: relisted: a name that drifts between the two would leave a worker unit
+#: running on a control host whose unit file this generation just removed.
+CONTROL_PURGE_UNITS = frozenset({"aicc-agent-launcher.socket"}) | RETIRED_LEGACY_UNITS
+
+
+def quiesce_worker_only_units(*, run=subprocess.run) -> None:
+    """Stop and disable every unit a control-profile host must not run.
+
+    Call once `prepare()` has validated and staged the control generation
+    but before `apply()` removes the underlying unit files, so a failure
+    here still leaves an intact, recoverable pending generation rather than
+    unit files gone out from under a service still running on them.
+    Tolerates a unit that was never loaded -- a control host that never ran
+    the worker profile has none of these.
+    """
+
+    def systemctl(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return run(
+            ["/usr/bin/systemctl", *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+    discovered: set[str] = set(CONTROL_PURGE_UNITS)
+    for arguments in (
+        (
+            "list-unit-files",
+            "voyn-aicc-worker@*.service",
+            "--no-legend",
+            "--no-pager",
+        ),
+        (
+            "list-units",
+            "voyn-aicc-worker@*.service",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+        ),
+    ):
+        result = systemctl(*arguments)
+        # See verify_service_snapshot_closure: an empty match is a return
+        # code of 1 with nothing on either stream, not a failure.
+        if result.returncode and (result.stderr.strip() or result.stdout.strip()):
+            raise RuntimeError(
+                result.stderr.strip()
+                or "cannot enumerate worker lanes before control purge"
+            )
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if fields and fields[0] == "●":
+                fields = fields[1:]
+            candidate = fields[0] if fields else ""
+            if TEMPLATE_WORKER_UNIT_RE.fullmatch(candidate):
+                discovered.add(candidate)
+
+    for unit in sorted(discovered):
+        load = systemctl("show", unit, "--property=LoadState", "--value")
+        if load.returncode or load.stdout.strip() == "not-found":
+            continue
+        stopped = systemctl("disable", "--now", unit)
+        if stopped.returncode:
+            raise RuntimeError(
+                f"cannot stop worker-only unit before control purge: {unit}"
+            )
+
+
 class FileTransaction:
     """Install a complete file set or restore its exact pre-install state."""
 
@@ -1300,12 +1394,13 @@ class FileTransaction:
         validated = tuple(specs)
         targets: set[str] = set()
         for spec in validated:
-            try:
-                _read_regular(spec.source)
-            except (OSError, RuntimeError) as exc:
-                raise ValueError(
-                    f"source is not a safe regular file: {spec.source}"
-                ) from exc
+            if not spec.remove:
+                try:
+                    _read_regular(spec.source)
+                except (OSError, RuntimeError) as exc:
+                    raise ValueError(
+                        f"source is not a safe regular file: {spec.source}"
+                    ) from exc
             if spec.target in targets:
                 raise ValueError(f"duplicate installation target: {spec.target}")
             targets.add(spec.target)
@@ -1318,7 +1413,11 @@ class FileTransaction:
             raise RuntimeError(
                 "pending release selector blocks a new install transaction"
             )
-        source_states = {spec.target: _read_regular(spec.source) for spec in validated}
+        source_states = {
+            spec.target: _read_regular(spec.source)
+            for spec in validated
+            if not spec.remove
+        }
         previous_current = (
             self.current.read_text(encoding="utf-8") if self.current.exists() else None
         )
@@ -1374,6 +1473,75 @@ class FileTransaction:
             )
             for index, spec in enumerate(validated):
                 target = self._target(spec.target)
+                if spec.remove:
+                    try:
+                        info = target.lstat()
+                    except FileNotFoundError:
+                        records.append(
+                            BackupRecord(
+                                spec.target,
+                                False,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                "",
+                                "",
+                                0,
+                                0,
+                                0,
+                                remove=True,
+                            )
+                        )
+                        continue
+                    if stat.S_ISLNK(info.st_mode):
+                        records.append(
+                            BackupRecord(
+                                spec.target,
+                                True,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                "",
+                                "",
+                                0,
+                                0,
+                                0,
+                                os.readlink(target),
+                                remove=True,
+                            )
+                        )
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        raise ValueError(
+                            f"existing target is not a regular file: {target}"
+                        )
+                    original = _read_regular(target)
+                    backup = backups / f"{index:03d}.bin"
+                    _atomic_bytes(
+                        backup, original.payload, 0o600, os.geteuid(), os.getegid()
+                    )
+                    records.append(
+                        BackupRecord(
+                            spec.target,
+                            True,
+                            str(backup),
+                            original.mode,
+                            original.uid,
+                            original.gid,
+                            original.sha256,
+                            "",
+                            "",
+                            0,
+                            0,
+                            0,
+                            remove=True,
+                        )
+                    )
+                    continue
                 if spec.if_missing and target.exists():
                     continue
                 staged_path = staged / f"{index:03d}.bin"
@@ -1491,15 +1659,88 @@ class FileTransaction:
             raise RuntimeError("pending transaction manifest escaped state directory")
         return manifest
 
+    def _assert_removal_snapshot(self, record: BackupRecord) -> Path:
+        """Refuse unless the purge target is still exactly what prepare() saw.
+
+        A removal is undoable only through the snapshot this generation took,
+        and that snapshot describes one specific file: content, mode, owning
+        uid and gid, or -- for a link -- its literal target. Unlinking
+        anything else would destroy a file this transaction never examined
+        and could not put back, which is the one mutation no rollback here
+        can honour. So drift between prepare() and apply() is refused rather
+        than absorbed: the generation fails closed with the target intact.
+        """
+        target = self._target(record.target)
+        if not record.existed:
+            # prepare() recorded absence, so there is no backup to restore. A
+            # file that appeared since belongs to something other than this
+            # transaction and is not ours to delete.
+            if _path_present(target):
+                raise RuntimeError(f"purge target appeared after prepare: {target}")
+            return target
+        if not _path_present(target):
+            raise RuntimeError(f"purge target disappeared before removal: {target}")
+        if record.original_symlink is not None:
+            # Compared against the link itself, never what it resolves to:
+            # `_read_regular` opens O_NOFOLLOW and would reject the link.
+            if not target.is_symlink():
+                raise RuntimeError(f"purge target is no longer a symlink: {target}")
+            if os.readlink(target) != record.original_symlink:
+                raise RuntimeError(
+                    f"purge target symlink changed before removal: {target}"
+                )
+            return target
+        assert record.original_sha256 is not None
+        assert record.original_mode is not None
+        assert record.original_uid is not None
+        assert record.original_gid is not None
+        try:
+            current = _read_regular(target)
+        except OSError as exc:
+            raise RuntimeError(
+                f"purge target shape changed before removal: {target}"
+            ) from exc
+        if not _matches(
+            current,
+            record.original_sha256,
+            record.original_mode,
+            record.original_uid,
+            record.original_gid,
+        ):
+            raise RuntimeError(
+                f"purge target changed before compare-and-remove: {target}"
+            )
+        return target
+
+    def _apply_removal(self, record: BackupRecord) -> None:
+        """Remove one purge target, compare-and-remove immediately before the
+        unlink so nothing can drift in between."""
+        target = self._assert_removal_snapshot(record)
+        if not record.existed:
+            return
+        target.unlink()
+        _fsync_dir(target.parent)
+
     def apply(self) -> None:
         """Apply one prepared generation; recovery stays armed until commit."""
         manifest = self._pending_manifest()
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         records = [BackupRecord(**value) for value in payload["records"]]
+        # Prove every purge target still matches its snapshot before the first
+        # mutation of any record. The per-record check below is the one that
+        # governs the unlink, but refusing here means a drifted target fails
+        # the generation with the host bit-for-bit untouched, instead of after
+        # half the installs have been written and must be rolled back.
+        for record in records:
+            if record.remove:
+                self._assert_removal_snapshot(record)
         try:
             for index, record in enumerate(records):
                 # Write-ahead index makes every destination mutation recoverable.
                 self._write_journal(manifest, "APPLYING", index)
+                if record.remove:
+                    self._apply_removal(record)
+                    continue
                 staged = _read_regular(Path(record.staged))
                 if not _matches(
                     staged,
@@ -1850,6 +2091,9 @@ class FileTransaction:
                 # durably gone; without it a reboot could bypass recovery.
                 continue
             target = self._target(record.target)
+            if record.remove:
+                self._restore_removed(record, target)
+                continue
             if record.existed and record.original_symlink is not None:
                 # The target was a symlink this generation replaced. Restore the
                 # link, not a file: leaving a regular file where a link belonged
@@ -1990,6 +2234,86 @@ class FileTransaction:
             )
         if clear_pending:
             self._clear_pending(manifest)
+
+    def _restore_removed(self, record: BackupRecord, target: Path) -> None:
+        """Undo a removal record: put back exactly what a purge took away.
+
+        The mirror image of the two branches above it: an ordinary record's
+        "installed" state is specific content, so restore proceeds once the
+        target no longer matches it. A removal record's installed state is
+        *absence*, so every check here runs in the opposite direction.
+        """
+        if not record.existed:
+            # Nothing existed before this generation touched the target, so
+            # absence -- whether apply() ran or not -- is already correct.
+            if _path_present(target):
+                raise RuntimeError(
+                    f"generation target appeared where absence was recorded: {target}"
+                )
+            return
+        if record.original_symlink is not None:
+            if target.is_symlink():
+                if os.readlink(target) == record.original_symlink:
+                    return  # apply() has not run yet
+                raise RuntimeError(
+                    f"generation target is a different symlink before restore: {target}"
+                )
+            if _path_present(target):
+                raise RuntimeError(
+                    f"generation target reappeared before restore: {target}"
+                )
+            parent_fd = _open_directory_chain(target.parent, create=False)
+            try:
+                temporary = f".{target.name}.restore.{secrets.token_hex(8)}"
+                os.symlink(record.original_symlink, temporary, dir_fd=parent_fd)
+                try:
+                    os.rename(
+                        temporary, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+                    )
+                except OSError:
+                    os.unlink(temporary, dir_fd=parent_fd)
+                    raise
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            return
+        assert record.backup is not None
+        assert record.original_mode is not None
+        assert record.original_uid is not None
+        assert record.original_gid is not None
+        assert record.original_sha256 is not None
+        try:
+            current = _read_regular(target)
+        except FileNotFoundError:
+            current = None
+        except OSError as exc:
+            raise RuntimeError(
+                f"generation target shape changed before restore: {target}"
+            ) from exc
+        if current is not None:
+            if _matches(
+                current,
+                record.original_sha256,
+                record.original_mode,
+                record.original_uid,
+                record.original_gid,
+            ):
+                return  # apply() has not run yet
+            raise RuntimeError(
+                f"generation target changed before compare-and-restore: {target}"
+            )
+        backup = _read_regular(Path(record.backup))
+        if not _matches(
+            backup, record.original_sha256, 0o600, os.geteuid(), os.getegid()
+        ):
+            raise RuntimeError(f"generation backup SHA drifted: {target}")
+        _atomic_bytes(
+            target,
+            backup.payload,
+            record.original_mode,
+            record.original_uid,
+            record.original_gid,
+        )
 
     def uninstall_all(self, *, boot: bool = False) -> None:
         """Unwind every installed generation to the original pre-install state."""
@@ -2692,14 +3016,23 @@ def default_specs(
     `worker` is every spec, unchanged -- the default, so an existing caller
     that knows nothing about profiles installs exactly what it always did.
 
-    `control` drops `WORKER_ONLY_TARGETS`. Before this existed there was one
-    profile for every host, and it demanded the agent's Claude and Codex
-    credentials unconditionally: installing the control plane meant either
-    placing agent secrets on a host that must never hold them, or not
-    installing it at all. The live attempt on control-01 took the second
-    branch and stopped at `source is not a safe regular file:
-    /home/voynadmin/.claude/.credentials.json` -- a file whose *absence* was
-    correct (2026-08-31).
+    `control` neither installs nor writes `WORKER_ONLY_TARGETS`, and also
+    purges each one with an explicit `removal_spec` in this same generation.
+    Before this existed there was one profile for every host, and it demanded
+    the agent's Claude and Codex credentials unconditionally: installing the
+    control plane meant either placing agent secrets on a host that must
+    never hold them, or not installing it at all. The live attempt on
+    control-01 took the second branch and stopped at `source is not a safe
+    regular file: /home/voynadmin/.claude/.credentials.json` -- a file whose
+    *absence* was correct (2026-08-31). Dropping a target from the spec list
+    only stops this transaction from writing it; it does nothing about a
+    worker-only file a previous worker (or default) install already left on
+    disk, which is exactly what independent review caught next -- so control
+    always pairs the drop with a removal, whether or not the target
+    currently exists. A host that never ran the worker profile purges
+    nothing; a host that did gets its worker artefacts (including both agent
+    credential files) removed atomically with the control install itself,
+    not as a separate step that could commit while the other fails.
 
     The control-plane's own units (planner, review, merge, reaper, rotation)
     are not added here: they are still symlinks into the operator's home and
@@ -2709,7 +3042,19 @@ def default_specs(
     if profile not in PROFILES:
         raise ValueError(f"unknown installation profile: {profile!r}")
     root_uid, root_gid = 0, 0
-    agent_gid = grp.getgrnam("aicc-agent").gr_gid if resolve_identities else 0
+    # `aicc-agent` is resolved only where the agent layer is installed. That
+    # identity comes from deploy/sysusers.d/aicc-agent.conf, which a control
+    # host deliberately never runs (see the installer): demanding the group
+    # here would fail the one profile whose whole point is that the agent
+    # principal is absent, and it is used by exactly one spec -- the
+    # worker-only /etc/aicc/agent.env. `aicc-publisher` is required by both
+    # profiles: /etc/aicc/workspace-authority.env is group-owned by it on
+    # every host, so the control profile provisions that group of its own.
+    agent_gid = (
+        grp.getgrnam("aicc-agent").gr_gid
+        if resolve_identities and profile != "control"
+        else 0
+    )
     publisher_gid = grp.getgrnam("aicc-publisher").gr_gid if resolve_identities else 0
     specs = (
         # The recovery generator is a permanent bootstrap anchor installed
@@ -2862,7 +3207,21 @@ def default_specs(
         ),
     )
     if profile == "control":
-        return tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
+        # Dropping a target from the spec list only stops this transaction
+        # from *writing* it -- it does nothing about a worker-only file a
+        # previous worker (or default) install already put on disk. Pairing
+        # the drop with an explicit removal spec for the same target folds
+        # the purge into this same generation, so `prepare()`/`apply()`/
+        # `commit()` gives it the identical atomicity and crash-recovery
+        # guarantees as every ordinary install: nothing is removed unless
+        # the whole control generation is proven and committed, and a
+        # mid-transaction failure rolls the purge back exactly like any
+        # other mutation (independent review on 5e50711 and its
+        # predecessor). A host that never carried the worker profile simply
+        # removes nothing -- every one of these targets is already absent.
+        kept = tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
+        purge = tuple(removal_spec(target) for target in sorted(WORKER_ONLY_TARGETS))
+        return kept + purge
     return specs
 
 
@@ -2986,6 +3345,7 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         "apply",
         "commit",
         "install",
+        "quiesce-worker-only",
     }:
         raise RuntimeError("unfinished uninstall journal blocks installation")
     transaction = FileTransaction(args.root, args.state_dir)
@@ -3010,6 +3370,13 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         quiesce_service_snapshot(
             args.service_snapshot or args.state_dir / "attempt-units.json"
         )
+    elif args.action == "quiesce-worker-only":
+        # Stopping the agent layer is a control-profile step, paired with the
+        # removal specs that same generation stages. Invoked under any other
+        # profile it would disable units the transaction is installing.
+        if args.profile != "control":
+            raise RuntimeError("quiesce-worker-only requires the control profile")
+        quiesce_worker_only_units()
     elif args.action == "install":
         transaction.install(specs)
     elif args.action in {"recover", "rollback", "recover-boot"}:
@@ -3029,6 +3396,7 @@ def main() -> int:
             "apply",
             "commit",
             "quiesce",
+            "quiesce-worker-only",
             "install",
             "recover",
             "recover-boot",

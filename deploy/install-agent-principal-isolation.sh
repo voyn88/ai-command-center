@@ -79,31 +79,6 @@ case "$install_profile" in
   *) echo "unknown AICC_INSTALL_PROFILE: $install_profile" >&2; exit 1 ;;
 esac
 
-# A control host must not carry the agent layer at all -- and excluding those
-# targets from this transaction does not remove what a previous worker
-# installation already put on disk. Installing "around" them would leave agent
-# credentials and the launcher socket live on the control plane, which is the
-# exact boundary this installer exists to create (independent review of
-# 090afcf caught precisely that). So refuse, and name what has to go: removal
-# belongs to the transactional uninstall, not to a side effect of this run.
-if [ "$install_profile" = "control" ]; then
-  leftovers=""
-  for candidate in \
-    /var/lib/aicc-agent \
-    /etc/aicc/worker-lanes \
-    /etc/aicc/agent.env \
-    /etc/systemd/system/aicc-agent-launcher.socket \
-    /etc/systemd/system/voyn-aicc-worker@.service
-  do
-    if [ -e "$candidate" ]; then leftovers="$leftovers $candidate"; fi
-  done
-  if [ -n "$leftovers" ]; then
-    echo "control profile refuses: worker artefacts present:$leftovers" >&2
-    echo "uninstall the worker profile first; this run will not remove them" >&2
-    exit 1
-  fi
-fi
-
 run_transaction() {
   action=$1
   shift
@@ -399,10 +374,37 @@ trap rollback EXIT HUP INT TERM
 
 # Identity and directory creation are additive/idempotent prerequisites. Every
 # other replaceable file belongs to the versioned transaction below.
-systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
-systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+#
+# Both agent configs are worker-only: sysusers.d/aicc-agent.conf creates the
+# `aicc-agent` execution principal and the workspace/credential groups, and
+# tmpfiles.d/aicc-agent.conf creates /var/lib/aicc-agent (including the two
+# credential homes this transaction purges on a control host), the launcher
+# runtime directory and the workspace roots. Running either on a control host
+# would build the agent layer this profile exists to keep off the control
+# plane -- and would recreate, as an untracked side effect outside the
+# transaction, the very directories the generation below is removing. The
+# control host provisions only the one identity its own specs install
+# against: /etc/aicc/workspace-authority.env is root:aicc-publisher on every
+# profile. No tmpfiles entry is control-plane state, so none runs here.
+if [ "$install_profile" = "worker" ]; then
+  systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
+  systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+else
+  systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"
+fi
 run_transaction prepare
 transaction_active=1
+# A control host must not run the agent layer at all, and prepare() has just
+# staged its removal as part of this same generation (default_specs pairs
+# every WORKER_ONLY_TARGETS drop with an explicit removal spec). Stop and
+# disable whatever the worker profile left running before apply() removes
+# the unit files underneath it -- a host that never ran the worker profile
+# has nothing loaded here and this is a no-op. A failure at this point still
+# leaves an intact, recoverable pending generation: the rollback trap armed
+# above calls `recover`, and no target has been mutated yet.
+if [ "$install_profile" = "control" ]; then
+  run_transaction quiesce-worker-only
+fi
 run_transaction apply
 # Build and atomically select the committed, immutable tree + virtualenv only
 # after boot recovery itself is installed, but before any new unit can start.

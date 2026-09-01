@@ -1079,23 +1079,37 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
 # ---------------------------------------------------------------------------
 
 
-def _specs(profile, tmp_path):
+def _profile_specs(profile, tmp_path):
     import importlib
 
     root = Path(__file__).parents[2]
     sys.path.insert(0, str(root / "ops"))
     tx = importlib.import_module("aicc_install_transaction")
-    return tx, {
-        spec.target
-        for spec in tx.default_specs(
-            root,
-            authority_env=tmp_path / "authority.env",
-            claude_auth=tmp_path / "claude.json",
-            codex_auth=tmp_path / "codex.json",
-            resolve_identities=False,
-            profile=profile,
-        )
-    }
+    return tx, tx.default_specs(
+        root,
+        authority_env=tmp_path / "authority.env",
+        claude_auth=tmp_path / "claude.json",
+        codex_auth=tmp_path / "codex.json",
+        resolve_identities=False,
+        profile=profile,
+    )
+
+
+def _specs(profile, tmp_path):
+    """The targets a profile INSTALLS.
+
+    A removal spec also names a target, but asserts the opposite thing about
+    it -- that the generation leaves it absent -- so it must never be counted
+    as installed. `_purged` returns those.
+    """
+    tx, specs = _profile_specs(profile, tmp_path)
+    return tx, {spec.target for spec in specs if not spec.remove}
+
+
+def _purged(profile, tmp_path):
+    """The targets a profile REMOVES in the same generation it installs."""
+    _tx, specs = _profile_specs(profile, tmp_path)
+    return {spec.target for spec in specs if spec.remove}
 
 
 def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
@@ -1118,11 +1132,18 @@ def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
 
 def test_control_profile_installs_no_agent_credentials(tmp_path):
     """The specific failure that stopped control-01: the profile must not ask
-    for credentials a control-plane host is right not to have."""
+    for credentials a control-plane host is right not to have -- and, on a
+    host that already ran the worker profile, must take the ones already
+    there away rather than install "around" them."""
     _tx, targets = _specs("control", tmp_path)
+    purged = _purged("control", tmp_path)
 
-    assert "/var/lib/aicc-agent/claude/.claude/.credentials.json" not in targets
-    assert "/var/lib/aicc-agent/codex/.codex/auth.json" not in targets
+    for credential in (
+        "/var/lib/aicc-agent/claude/.claude/.credentials.json",
+        "/var/lib/aicc-agent/codex/.codex/auth.json",
+    ):
+        assert credential not in targets
+        assert credential in purged
 
 
 def test_control_profile_drops_every_worker_only_target_and_nothing_else(tmp_path):
@@ -1130,6 +1151,60 @@ def test_control_profile_drops_every_worker_only_target_and_nothing_else(tmp_pat
     _tx, worker = _specs("worker", tmp_path)
 
     assert worker - control == tx.WORKER_ONLY_TARGETS
+
+
+def test_control_profile_purges_exactly_what_it_drops(tmp_path):
+    """Every dropped target is paired with a removal in the same generation,
+    and nothing else is removed. A drop alone only stops this transaction
+    from writing the file; the file an earlier worker install left on disk
+    stays live without the paired removal."""
+    tx, _control = _specs("control", tmp_path)
+
+    assert _purged("control", tmp_path) == tx.WORKER_ONLY_TARGETS
+    assert _purged("worker", tmp_path) == set()
+
+
+def test_control_profile_needs_no_agent_identity_to_resolve_its_specs(tmp_path):
+    """The agent group is created by the worker-only sysusers config, which a
+    control host never runs. Resolving it unconditionally would fail the one
+    profile whose premise is that the agent principal does not exist."""
+    import importlib
+
+    root = Path(__file__).parents[2]
+    sys.path.insert(0, str(root / "ops"))
+    tx = importlib.import_module("aicc_install_transaction")
+
+    def only_publisher(name):
+        if name != "aicc-publisher":
+            raise KeyError(f"getgrnam(): name not found: {name}")
+        return SimpleNamespace(gr_gid=4242)
+
+    original = tx.grp.getgrnam
+    tx.grp.getgrnam = only_publisher
+    try:
+        specs = tx.default_specs(
+            root,
+            authority_env=tmp_path / "authority.env",
+            claude_auth=tmp_path / "claude.json",
+            codex_auth=tmp_path / "codex.json",
+            profile="control",
+        )
+        authority = next(
+            spec
+            for spec in specs
+            if spec.target == "/etc/aicc/workspace-authority.env"
+        )
+        assert authority.gid == 4242, "the publisher group is required on every host"
+        with pytest.raises(KeyError, match="aicc-agent"):
+            tx.default_specs(
+                root,
+                authority_env=tmp_path / "authority.env",
+                claude_auth=tmp_path / "claude.json",
+                codex_auth=tmp_path / "codex.json",
+                profile="worker",
+            )
+    finally:
+        tx.grp.getgrnam = original
 
 
 def test_control_profile_keeps_the_recovery_anchor_and_the_transaction_tool(tmp_path):
@@ -1163,26 +1238,87 @@ def _installer_text() -> str:
     ).read_text(encoding="utf-8")
 
 
-def test_control_profile_refuses_a_host_that_still_carries_worker_artefacts():
+def test_worker_to_control_is_one_generation_with_one_rollback_boundary():
     """Excluding a target from the transaction does not delete what is already
-    on disk. A worker→control install that just skipped those specs would
-    leave agent credentials and the launcher socket live on the control plane
-    — the precise boundary this installer exists to create (independent review
-    of `090afcf`). It must refuse and name them instead.
+    on disk: a worker→control install that only skipped those specs left agent
+    credentials and the launcher socket live on the control plane -- the
+    precise boundary this installer exists to create (independent review of
+    `090afcf`).
+
+    Refusing the install and telling the operator to uninstall the worker
+    profile first was the earlier answer, and it is worse than the disease:
+    two transactions, each committing on its own, so a failure of the second
+    leaves a host with the worker layer already gone and no control plane
+    installed, and nothing to roll back to. The purge is therefore part of
+    the control generation itself -- one prepare, one apply, one commit, one
+    rollback boundary -- so no uninstall may commit ahead of it.
     """
     text = _installer_text()
+    # Everything after the `--uninstall` branch exits: the install path
+    # proper, where a control host's worker artefacts are now dealt with.
+    install_path = text.split('if [ "${1:-}" = "--uninstall" ]; then', 1)[1].split(
+        "AICC_AGENT_PRINCIPAL_ISOLATION_UNINSTALLED\"\n  exit 0\nfi\n", 1
+    )[1]
 
-    assert 'if [ "$install_profile" = "control" ]; then' in text
-    assert "control profile refuses: worker artefacts present:" in text
-    for candidate in (
-        "/var/lib/aicc-agent",
-        "/etc/aicc/worker-lanes",
-        "/etc/systemd/system/aicc-agent-launcher.socket",
-        "/etc/systemd/system/voyn-aicc-worker@.service",
+    assert "control profile refuses: worker artefacts present:" not in text
+    assert "uninstall the worker profile first" not in text
+    for action in (
+        "run_transaction uninstall",
+        "run_transaction uninstall-begin",
+        "run_transaction uninstall-arm",
+        "run_transaction uninstall-complete",
     ):
-        assert candidate in text
-    # Removal is the transactional uninstall's job, never a side effect here.
-    assert "this run will not remove them" in text
+        assert action not in install_path, f"{action} runs before the control install"
+    commands = [line.strip() for line in install_path.splitlines()]
+    prepare = commands.index("run_transaction prepare")
+    quiesce = commands.index("run_transaction quiesce-worker-only")
+    apply_index = commands.index("run_transaction apply")
+    commit = commands.index("run_transaction commit")
+
+    # Exactly one of each: a second prepare/apply/commit anywhere on the
+    # install path would be a second generation, and a second boundary.
+    for action in ("prepare", "apply", "commit"):
+        assert commands.count(f"run_transaction {action}") == 1
+    # The worker units are stopped after their removal is staged and before
+    # apply() takes the unit files away underneath them, so a failure at any
+    # point is still a recoverable pending generation.
+    assert prepare < quiesce < apply_index < commit
+    guard = 'if [ "$install_profile" = "control" ]; then'
+    assert guard in install_path[: install_path.index("run_transaction quiesce-worker-only")]
+
+
+def test_the_agent_sysusers_and_tmpfiles_side_effects_are_worker_only():
+    """Both configs build the agent layer outside the transaction:
+    sysusers.d/aicc-agent.conf creates the `aicc-agent` principal, and
+    tmpfiles.d/aicc-agent.conf creates /var/lib/aicc-agent -- including the
+    two credential homes the control generation is purging. Running them on a
+    control host would put back, as an untracked side effect, part of exactly
+    what this profile removes."""
+    text = _installer_text()
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+    root = Path(__file__).parents[2]
+
+    for line in (
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"',
+        'systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"',
+    ):
+        assert line in text
+        before = text[: text.rindex(line)]
+        assert guard in before, f"{line} is not behind the worker-profile guard"
+        assert "\nfi\n" not in before[before.rindex(guard):]
+
+    # The control host still provisions the one identity its own specs
+    # install against, and nothing else: no agent user, no workspace group,
+    # and no tmpfiles directories at all.
+    assert 'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"' in text
+    control = (root / "deploy/sysusers.d/aicc-control.conf").read_text(encoding="utf-8")
+    declarations = [
+        line for line in control.splitlines() if line and not line.startswith("#")
+    ]
+    assert declarations == ["g aicc-publisher -"]
+    assert "systemd-tmpfiles" not in text.split(
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"', 1
+    )[1]
 
 
 def test_the_agent_layer_is_only_enabled_for_the_worker_profile():

@@ -2333,3 +2333,618 @@ def test_restore_still_refuses_a_non_legacy_unit_that_lost_its_properties(tmp_pa
 
     with pytest.raises(RuntimeError, match="refusing unsafe snapshot restart"):
         module.restore_service_snapshot(snapshot, run=run)
+
+
+# ---------------------------------------------------------------------------
+# Removal specs: `removal_spec()` folds "this target must not exist" into the
+# same generation as ordinary installs. Built for the control profile's
+# worker-only purge (VOYN-W0-AICC-INSTALLER-HAS-NO-CONTROL-PROFILE): dropping
+# a target from the spec list only stops a transaction from *writing* it, it
+# does nothing about what an earlier worker install already left on disk, and
+# a later "uninstall the worker profile, then install control" split leaves a
+# host with neither installation if the second half fails. One generation,
+# one prepare/apply/commit, one rollback boundary for both directions.
+# ---------------------------------------------------------------------------
+
+
+def test_removal_spec_purges_a_preexisting_target_atomically_with_an_install(
+    tmp_path,
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    worker_only = root / "var/lib/aicc-agent/claude/.claude/.credentials.json"
+    worker_only.parent.mkdir(parents=True)
+    worker_only.write_bytes(b"agent-secret")
+    worker_only.chmod(0o600)
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+
+    transaction.install(
+        (
+            module.removal_spec("/var/lib/aicc-agent/claude/.claude/.credentials.json"),
+            _spec(module, control_source, "/etc/control-file"),
+        )
+    )
+
+    assert not worker_only.exists()
+    assert (root / "etc/control-file").read_bytes() == b"control-only"
+
+
+def test_removal_spec_is_a_noop_when_the_target_never_existed(tmp_path):
+    """A host that never ran the worker profile has nothing to purge -- the
+    purge must not invent the target just to delete it."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+
+    transaction.install(
+        (
+            module.removal_spec("/etc/aicc/agent.env"),
+            _spec(module, control_source, "/etc/control-file"),
+        )
+    )
+
+    assert not (root / "etc/aicc/agent.env").exists()
+    assert (root / "etc/control-file").read_bytes() == b"control-only"
+
+    # Idempotent: running it again against an already-purged host is still a
+    # no-op, not a refusal.
+    control_source.write_bytes(b"control-only-two")
+    transaction.install(
+        (
+            module.removal_spec("/etc/aicc/agent.env"),
+            _spec(module, control_source, "/etc/control-file"),
+        )
+    )
+    assert not (root / "etc/aicc/agent.env").exists()
+    assert (root / "etc/control-file").read_bytes() == b"control-only-two"
+
+
+def test_a_failure_after_the_purge_rolls_the_purge_back_too(monkeypatch, tmp_path):
+    """The exact regression an earlier attempt shipped: a worker-to-control
+    transition that purges worker artefacts and then fails installing the
+    control specs must not leave a host with neither generation. The purge
+    is a record in this same generation, so `apply()`'s existing failure path
+    -- restore every record, including ones already applied -- undoes it
+    like any other mutation, and the pre-transaction file is exactly back."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    worker_only = root / "var/lib/aicc-agent/codex/.codex/auth.json"
+    worker_only.parent.mkdir(parents=True)
+    worker_only.write_bytes(b"codex-secret")
+    worker_only.chmod(0o600)
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare(
+        (
+            # Purge record first: apply() removes it before the injected
+            # failure below, so the rollback has to undo a completed removal,
+            # not merely skip one that never ran.
+            module.removal_spec("/var/lib/aicc-agent/codex/.codex/auth.json"),
+            _spec(module, control_source, "/etc/control-file"),
+        )
+    )
+    real_atomic = module._atomic_bytes
+
+    def fail_the_control_install(path, *args, **kwargs):
+        if path == root / "etc/control-file":
+            raise OSError("injected post-purge failure")
+        return real_atomic(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_atomic_bytes", fail_the_control_install)
+
+    with pytest.raises(OSError, match="injected post-purge failure"):
+        transaction.apply()
+
+    assert worker_only.read_bytes() == b"codex-secret"
+    assert stat.S_IMODE(worker_only.stat().st_mode) == 0o600
+    assert not (root / "etc/control-file").exists()
+    assert not transaction.pending.exists()
+    assert not list(state.glob("generation-*"))
+
+
+def test_removal_record_recovers_from_a_crash_between_purge_and_install(tmp_path):
+    """The write-ahead index makes every mutation recoverable one record at a
+    time. A crash after the purge applied but before the next record starts
+    must resume to the identical pre-transaction state as a synchronous
+    failure at the same point."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    worker_only = root / "etc/aicc/worker-lanes"
+    worker_only.parent.mkdir(parents=True)
+    worker_only.write_bytes(b"lane-registry")
+    worker_only.chmod(0o644)
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare(
+        (
+            module.removal_spec("/etc/aicc/worker-lanes"),
+            _spec(module, control_source, "/etc/control-file"),
+        )
+    )
+
+    # Simulate apply() having durably logged and completed only the first
+    # (removal) record before the process died.
+    transaction._write_journal(manifest, "APPLYING", 0)
+    worker_only.unlink()
+
+    module.FileTransaction(root, state).recover()
+
+    assert worker_only.read_bytes() == b"lane-registry"
+    assert not (root / "etc/control-file").exists()
+    assert not (state / "pending.json").exists()
+    assert not list(state.glob("generation-*"))
+
+
+def test_uninstall_all_restores_a_purged_target_through_the_generation_chain(
+    tmp_path,
+):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    worker_only = root / "etc/aicc/agent.env"
+    worker_only.parent.mkdir(parents=True)
+    worker_only.write_bytes(b"agent-env")
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+
+    transaction.install(
+        (
+            module.removal_spec("/etc/aicc/agent.env"),
+            _spec(module, control_source, "/etc/control-file"),
+        )
+    )
+    assert not worker_only.exists()
+
+    transaction.uninstall_all()
+
+    assert worker_only.read_bytes() == b"agent-env"
+    assert not (root / "etc/control-file").exists()
+    assert not transaction.current.exists()
+    assert not transaction.pending.exists()
+    assert not list(state.glob("generation-*"))
+
+
+def test_removal_spec_restores_a_legacy_symlink_it_replaced(monkeypatch, tmp_path):
+    """A worker-only target can itself be one of the still-live legacy
+    symlinks (see `test_a_legacy_symlink_target_is_replaced_and_restored`).
+    Purging it must record and restore the link, not treat it as a regular
+    file that happens to be gone."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    elsewhere = tmp_path / "home" / "aicc-worker.service"
+    elsewhere.parent.mkdir(parents=True)
+    elsewhere.write_text("legacy unit\n", encoding="utf-8")
+    target_dir = root / "etc/systemd/system"
+    target_dir.mkdir(parents=True)
+    (target_dir / "aicc-worker.service").symlink_to(elsewhere)
+
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((module.removal_spec("/etc/systemd/system/aicc-worker.service"),))
+    transaction.apply()
+
+    installed = target_dir / "aicc-worker.service"
+    assert not installed.exists() and not installed.is_symlink()
+    # The link's own target is untouched -- removal drops the link, not what
+    # it pointed at.
+    assert elsewhere.read_text(encoding="utf-8") == "legacy unit\n"
+
+    transaction.recover()
+
+    assert installed.is_symlink(), "rollback must restore the link, not a file"
+    assert os.readlink(installed) == str(elsewhere)
+
+
+def test_quiesce_worker_only_units_stops_and_disables_what_is_loaded(tmp_path):
+    module = _module()
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(tuple(command))
+        if command[1] == "list-unit-files":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if command[1] == "list-units":
+            return SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout="voyn-aicc-worker@a.service loaded active running\n",
+            )
+        if command[1] == "show" and command[2] == "aicc-agent-launcher.socket":
+            return SimpleNamespace(returncode=0, stderr="", stdout="loaded\n")
+        if command[1] == "show" and command[2] == "voyn-aicc-worker@a.service":
+            return SimpleNamespace(returncode=0, stderr="", stdout="loaded\n")
+        if command[1] == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        if command[1] == "disable":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        raise AssertionError(f"unexpected systemctl call: {command}")
+
+    module.quiesce_worker_only_units(run=run)
+
+    stopped = {c[3] for c in calls if c[1] == "disable"}
+    assert stopped == {"aicc-agent-launcher.socket", "voyn-aicc-worker@a.service"}
+
+
+def test_quiesce_worker_only_units_tolerates_a_host_that_never_ran_the_worker_profile(
+    tmp_path,
+):
+    module = _module()
+
+    def run(command, **kwargs):
+        if command[1] in {"list-unit-files", "list-units"}:
+            return SimpleNamespace(returncode=1, stderr="", stdout="")
+        if command[1] == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        raise AssertionError(f"unexpected systemctl call: {command}")
+
+    module.quiesce_worker_only_units(run=run)
+
+
+def test_quiesce_worker_only_units_refuses_when_stopping_a_loaded_unit_fails(
+    tmp_path,
+):
+    module = _module()
+
+    def run(command, **kwargs):
+        if command[1] in {"list-unit-files", "list-units"}:
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if command[1] == "show" and command[2] == "aicc-agent-launcher.socket":
+            return SimpleNamespace(returncode=0, stderr="", stdout="loaded\n")
+        if command[1] == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        if command[1] == "disable":
+            return SimpleNamespace(returncode=1, stderr="denied", stdout="")
+        raise AssertionError(f"unexpected systemctl call: {command}")
+
+    with pytest.raises(RuntimeError, match="cannot stop worker-only unit"):
+        module.quiesce_worker_only_units(run=run)
+
+
+# ---------------------------------------------------------------------------
+# Compare-and-remove. A removal is the one mutation this transaction cannot
+# reconstruct from anything but its own snapshot, so apply() unlinks only a
+# target that is still byte-for-byte (or link-for-link) what prepare() saw.
+# Drift means some other writer owns that file now; deleting it would destroy
+# state this generation never examined and its backup does not describe.
+# ---------------------------------------------------------------------------
+
+
+def _control_shaped_generation(module, tmp_path, *, payload=b"agent-secret"):
+    """A prepared generation shaped like a worker→control transition: one
+    purge of a pre-existing worker artefact, one ordinary control install."""
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    worker_only = root / "etc/aicc/agent.env"
+    worker_only.parent.mkdir(parents=True)
+    worker_only.write_bytes(payload)
+    worker_only.chmod(0o640)
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare(
+        (
+            _spec(module, control_source, "/etc/control-file"),
+            module.removal_spec("/etc/aicc/agent.env"),
+        )
+    )
+    return transaction, manifest, worker_only, root / "etc/control-file"
+
+
+def _assert_nothing_was_mutated(transaction, installed):
+    """Every refusal below must fail the generation with the host untouched:
+    the purge is refused *and* the install that precedes it in spec order has
+    not been written, because the check runs before the first mutation."""
+    assert not installed.exists(), "a refused purge must not half-apply the generation"
+    assert transaction.pending.exists(), "the pending WAL stays for recovery"
+
+
+def test_apply_refuses_to_remove_a_target_whose_content_drifted(tmp_path):
+    module = _module()
+    transaction, _manifest, worker_only, installed = _control_shaped_generation(
+        module, tmp_path
+    )
+
+    worker_only.write_bytes(b"rewritten by something else")
+    worker_only.chmod(0o640)
+
+    with pytest.raises(RuntimeError, match="purge target changed before compare"):
+        transaction.apply()
+
+    assert worker_only.read_bytes() == b"rewritten by something else"
+    _assert_nothing_was_mutated(transaction, installed)
+
+
+def test_apply_refuses_to_remove_a_target_whose_mode_drifted(tmp_path):
+    """Same bytes, wider permissions: the snapshot records mode, so a file
+    that is no longer the one prepare() approved is not removed."""
+    module = _module()
+    transaction, _manifest, worker_only, installed = _control_shaped_generation(
+        module, tmp_path
+    )
+
+    worker_only.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="purge target changed before compare"):
+        transaction.apply()
+
+    assert worker_only.exists()
+    _assert_nothing_was_mutated(transaction, installed)
+
+
+def test_apply_refuses_to_remove_a_target_whose_owner_drifted(tmp_path):
+    """uid and gid drift cannot be produced without privilege, so the
+    recorded expectation is moved instead -- indistinguishable to apply()
+    from a chown between prepare() and apply()."""
+    module = _module()
+    transaction, manifest, worker_only, installed = _control_shaped_generation(
+        module, tmp_path
+    )
+
+    for field in ("original_uid", "original_gid"):
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        for record in payload["records"]:
+            if record["remove"] and record["existed"]:
+                record[field] = record[field] + 1
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="purge target changed before compare"):
+            transaction.apply()
+
+        assert worker_only.exists()
+        _assert_nothing_was_mutated(transaction, installed)
+
+
+def test_apply_refuses_to_remove_a_symlink_that_now_points_elsewhere(tmp_path):
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    legacy = tmp_path / "home" / "aicc-worker.service"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("legacy unit\n", encoding="utf-8")
+    target_dir = root / "etc/systemd/system"
+    target_dir.mkdir(parents=True)
+    link = target_dir / "aicc-worker.service"
+    link.symlink_to(legacy)
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare(
+        (module.removal_spec("/etc/systemd/system/aicc-worker.service"),)
+    )
+
+    elsewhere = tmp_path / "home" / "someone-elses.service"
+    elsewhere.write_text("not ours\n", encoding="utf-8")
+    link.unlink()
+    link.symlink_to(elsewhere)
+
+    with pytest.raises(RuntimeError, match="purge target symlink changed"):
+        transaction.apply()
+
+    assert os.readlink(link) == str(elsewhere), "the foreign link is left alone"
+
+
+def test_apply_refuses_to_remove_a_symlink_that_became_a_regular_file(tmp_path):
+    """The snapshot is a link's literal target; a regular file at the same
+    path is a different object with content no backup here holds."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    legacy = tmp_path / "home" / "aicc-worker.service"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("legacy unit\n", encoding="utf-8")
+    target_dir = root / "etc/systemd/system"
+    target_dir.mkdir(parents=True)
+    link = target_dir / "aicc-worker.service"
+    link.symlink_to(legacy)
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare(
+        (module.removal_spec("/etc/systemd/system/aicc-worker.service"),)
+    )
+
+    link.unlink()
+    link.write_text("a real file now\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="purge target is no longer a symlink"):
+        transaction.apply()
+
+    assert link.read_text(encoding="utf-8") == "a real file now\n"
+
+
+def test_apply_refuses_to_remove_a_target_that_appeared_after_prepare(tmp_path):
+    """prepare() recorded absence, so this generation holds no backup for the
+    file that appeared since. Removing it would be an unrecoverable delete of
+    something the transaction never saw."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare(
+        (
+            _spec(module, control_source, "/etc/control-file"),
+            module.removal_spec("/etc/aicc/agent.env"),
+        )
+    )
+
+    appeared = root / "etc/aicc/agent.env"
+    appeared.parent.mkdir(parents=True)
+    appeared.write_bytes(b"written after prepare")
+
+    with pytest.raises(RuntimeError, match="purge target appeared after prepare"):
+        transaction.apply()
+
+    assert appeared.read_bytes() == b"written after prepare"
+    _assert_nothing_was_mutated(transaction, root / "etc/control-file")
+
+
+def test_apply_refuses_when_the_purge_target_vanished_after_prepare(tmp_path):
+    """Absence is the intended end state, but reaching it by someone else's
+    hand means the backup no longer describes what is (not) there. The
+    generation fails closed rather than commit a purge it did not perform."""
+    module = _module()
+    transaction, _manifest, worker_only, installed = _control_shaped_generation(
+        module, tmp_path
+    )
+
+    worker_only.unlink()
+
+    with pytest.raises(RuntimeError, match="purge target disappeared before removal"):
+        transaction.apply()
+
+    _assert_nothing_was_mutated(transaction, installed)
+
+
+def test_a_refused_purge_leaves_a_generation_recover_puts_back(tmp_path):
+    """The refusal is not the end of the story: the durable WAL is retained,
+    and once the drift is resolved recovery returns the host to its exact
+    pre-transaction state."""
+    module = _module()
+    transaction, _manifest, worker_only, installed = _control_shaped_generation(
+        module, tmp_path
+    )
+    original = worker_only.read_bytes()
+    worker_only.write_bytes(b"drifted")
+    worker_only.chmod(0o640)
+
+    with pytest.raises(RuntimeError, match="purge target changed before compare"):
+        transaction.apply()
+
+    # The operator restores what drifted; recovery then unwinds the untouched
+    # generation cleanly.
+    worker_only.write_bytes(original)
+    worker_only.chmod(0o640)
+    module.FileTransaction(transaction.root, transaction.state_dir).recover()
+
+    assert worker_only.read_bytes() == original
+    assert not installed.exists()
+    assert not transaction.pending.exists()
+    assert not list(transaction.state_dir.glob("generation-*"))
+
+
+def test_a_quiesce_failure_rolls_the_prepared_generation_back_untouched(tmp_path):
+    """The installer's order for a control host is prepare -> stop the
+    worker-only units -> apply. A failure at the middle step must leave a
+    generation that has mutated nothing and recovers completely: the worker
+    artefacts are still on disk, still running for the operator to retry, and
+    no half-installed control plane exists."""
+    module = _module()
+    transaction, _manifest, worker_only, installed = _control_shaped_generation(
+        module, tmp_path
+    )
+
+    def run(command, **kwargs):
+        if command[1] in {"list-unit-files", "list-units"}:
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if command[1] == "show" and command[2] == "aicc-agent-launcher.socket":
+            return SimpleNamespace(returncode=0, stderr="", stdout="loaded\n")
+        if command[1] == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        if command[1] == "disable":
+            return SimpleNamespace(returncode=1, stderr="job failed", stdout="")
+        raise AssertionError(f"unexpected systemctl call: {command}")
+
+    with pytest.raises(RuntimeError, match="cannot stop worker-only unit"):
+        module.quiesce_worker_only_units(run=run)
+
+    # What the installer's trap does next.
+    module.FileTransaction(transaction.root, transaction.state_dir).recover()
+
+    assert worker_only.read_bytes() == b"agent-secret"
+    assert stat.S_IMODE(worker_only.stat().st_mode) == 0o640
+    assert not installed.exists()
+    assert not transaction.pending.exists()
+    assert not list(transaction.state_dir.glob("generation-*"))
+
+
+def test_a_second_control_install_purges_nothing_and_still_succeeds(tmp_path):
+    """Idempotence across runs: the first install removes the worker
+    artefact, the second finds it already absent and must neither refuse nor
+    resurrect it."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    worker_only = root / "etc/aicc/agent.env"
+    worker_only.parent.mkdir(parents=True)
+    worker_only.write_bytes(b"agent-secret")
+    control_source = tmp_path / "control-file"
+    control_source.write_bytes(b"control-only")
+    transaction = module.FileTransaction(root, state)
+    specs = (
+        _spec(module, control_source, "/etc/control-file"),
+        module.removal_spec("/etc/aicc/agent.env"),
+    )
+
+    transaction.install(specs)
+    assert not worker_only.exists()
+
+    transaction.install(specs)
+
+    assert not worker_only.exists()
+    assert (root / "etc/control-file").read_bytes() == b"control-only"
+    assert not transaction.pending.exists()
+
+
+def test_quiesce_worker_only_is_refused_outside_the_control_profile(tmp_path):
+    """Under any other profile it would stop the very units that profile is
+    installing."""
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir()
+    args = SimpleNamespace(
+        action="quiesce-worker-only",
+        state_dir=state,
+        repo_root=tmp_path,
+        root=tmp_path / "root",
+        profile="worker",
+    )
+
+    with pytest.raises(RuntimeError, match="requires the control profile"):
+        module._dispatch(args, argparse.ArgumentParser())
+
+
+def test_the_control_purge_covers_every_retired_worker_unit():
+    """A worker unit named in one list and forgotten in the other keeps
+    running on a control host whose unit file the same generation removes."""
+    module = _module()
+
+    assert module.RETIRED_LEGACY_UNITS < module.CONTROL_PURGE_UNITS
+    assert "aicc-agent-launcher.socket" in module.CONTROL_PURGE_UNITS
+    # The boot recovery capsule is the one agent-adjacent unit that must keep
+    # running: it is what retries an interrupted rollback.
+    assert "aicc-principal-recovery.service" not in module.CONTROL_PURGE_UNITS
+
+
+def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):
+    """End to end on the real spec list: the control profile's installs and
+    its purges are one set that `validate_sources` accepts. Absent agent
+    credentials -- the file whose absence stopped control-01 -- are no longer
+    read as sources, and no purge collides with a target the same generation
+    installs (which `validate_sources` would refuse as a duplicate)."""
+    module = _module()
+    repo = Path(__file__).parents[2]
+    authority = tmp_path / "authority.env"
+    authority.write_text("AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n", encoding="utf-8")
+    specs = module.default_specs(
+        repo,
+        authority_env=authority,
+        claude_auth=tmp_path / "absent-claude.json",
+        codex_auth=tmp_path / "absent-codex.json",
+        resolve_identities=False,
+        profile="control",
+    )
+
+    validated = module.FileTransaction.validate_sources(specs)
+
+    assert len(validated) == len(specs)
+    assert {spec.target for spec in specs if spec.remove} == module.WORKER_ONLY_TARGETS
+    assert not (tmp_path / "absent-claude.json").exists()
