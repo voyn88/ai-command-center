@@ -466,8 +466,10 @@ CI's required gate is unaffected either way — it always runs the full suite.
 compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
 Python 3.14, plus a `windows-latest` job covering the automated half of the desktop leg. The workflow
 uses a read-only token, pins actions to commit SHAs, and cancels superseded runs for the same ref. It
-does not itself configure branch protection; repository settings must separately require the check if
-merges are to be blocked on it.
+does not itself configure branch protection. The current private-repository plan does not expose
+branch protection/rulesets at all (confirmed via `gh api repos/<owner>/<repo>/branches/main/protection`);
+see [`docs/AUTHORITY_MAP.md`](docs/AUTHORITY_MAP.md#merge-enforcement-authority-voyn-w0-aicc-branch-protection-limit)
+for the evidence and the actual (application-level, not GitHub-level) enforcement point.
 
 ## Current limitations and risks
 
@@ -483,8 +485,10 @@ merges are to be blocked on it.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
 - A static type checker is configured (permissive, non-strict) via `pyproject.toml` and surfaced as a
   non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
-- The checked-in CI workflow does not itself enforce branch protection. Enable "Require status checks
-  to pass before merging" on `main` with the `Quality gates` check to make it a real gate.
+- The checked-in CI workflow does not itself enforce branch protection, and the current
+  private-repository plan does not expose branch protection/rulesets to enable one; see
+  [`docs/AUTHORITY_MAP.md`](docs/AUTHORITY_MAP.md#merge-enforcement-authority-voyn-w0-aicc-branch-protection-limit)
+  for the actual (application-level) enforcement point.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass it,
   and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
