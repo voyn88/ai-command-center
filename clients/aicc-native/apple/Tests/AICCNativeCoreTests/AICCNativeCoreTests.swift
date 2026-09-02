@@ -86,6 +86,29 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+@Test func attentionStaysEngagedUntilIdleThreshold() {
+    #expect(AttentionEvaluator.evaluate(AttentionSignals(isForeground: true, idleSeconds: 0)) == .engaged)
+    #expect(AttentionEvaluator.evaluate(AttentionSignals(isForeground: true, idleSeconds: 19)) == .engaged)
+}
+
+@Test func attentionReducesAfterSustainedIdleInForeground() {
+    #expect(AttentionEvaluator.evaluate(AttentionSignals(isForeground: true, idleSeconds: 20)) == .reduced)
+    #expect(AttentionEvaluator.evaluate(AttentionSignals(isForeground: true, idleSeconds: 59)) == .reduced)
+}
+
+@Test func attentionFallsToMinimalWhenBackgroundedOrLongIdle() {
+    #expect(AttentionEvaluator.evaluate(AttentionSignals(isForeground: true, idleSeconds: 60)) == .minimal)
+    #expect(AttentionEvaluator.evaluate(AttentionSignals(isForeground: false, idleSeconds: 0)) == .minimal)
+    // Backgrounded outranks any idle reading, even a fresh one.
+    #expect(AttentionEvaluator.evaluate(AttentionSignals(isForeground: false, idleSeconds: 500)) == .minimal)
+}
+
+@Test func onlyFullEngagementSkipsSafeMode() {
+    #expect(!AttentionLevel.engaged.requiresSafeMode)
+    #expect(AttentionLevel.reduced.requiresSafeMode)
+    #expect(AttentionLevel.minimal.requiresSafeMode)
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}

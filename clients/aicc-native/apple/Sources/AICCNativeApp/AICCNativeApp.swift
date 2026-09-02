@@ -34,19 +34,35 @@ private enum AppTab: String, CaseIterable, Identifiable {
 
 struct AICCNativeShell: View {
     @ObservedObject var model: AICCAppModel
+    @StateObject private var attention = AttentionMonitor()
+    @Environment(\.scenePhase) private var scenePhase
     @State private var tab: AppTab = .overview
     @State private var showPairing = false
 
     var body: some View {
-        content
-            .onChange(of: model.connection) { _, newValue in
-                if newValue == .unauthorized { showPairing = true }
-                if newValue == .live { showPairing = false }
+        Group {
+            if attention.requiresSafeMode {
+                // Exits only through the explicit resume action below, not
+                // through an incidental tap — a reduced-attention owner
+                // should not be startled back into the full interface.
+                SafeMinimalModeView(needsAttention: model.snapshot.overview.needsAttention) {
+                    attention.recordInteraction()
+                }
+            } else {
+                content
+                    .simultaneousGesture(TapGesture().onEnded { attention.recordInteraction() })
+                    .onChange(of: tab) { _, _ in attention.recordInteraction() }
             }
-            .task { if !model.hasCredential { showPairing = true } }
-            .sheet(isPresented: $showPairing) {
-                PairingView { token in await model.pair(token: token) }
-            }
+        }
+        .onChange(of: scenePhase) { _, phase in attention.setForeground(phase == .active) }
+        .onChange(of: model.connection) { _, newValue in
+            if newValue == .unauthorized { showPairing = true }
+            if newValue == .live { showPairing = false }
+        }
+        .task { if !model.hasCredential { showPairing = true } }
+        .sheet(isPresented: $showPairing) {
+            PairingView { token in await model.pair(token: token) }
+        }
     }
 
     private var content: some View {
@@ -99,6 +115,46 @@ private struct PairingView: View {
             .padding(24)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Позже") { dismiss() } } }
         }
+    }
+}
+
+/// The safe minimal layout: one calm status line, no tabs, no lists, no
+/// navigation — just what is safe to know right now and a deliberate way
+/// back to the full interface.
+private struct SafeMinimalModeView: View {
+    let needsAttention: Int
+    let onResume: () -> Void
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Spacer()
+            Image(systemName: needsAttention == 0 ? "checkmark.circle" : "eye.circle")
+                .font(.system(size: 54))
+                .foregroundStyle(needsAttention == 0 ? AICCTheme.forest : .orange)
+            Text(needsAttention == 0 ? "Всё спокойно." : "Есть один вопрос на будущее.")
+                .font(.system(.title, design: .serif, weight: .medium))
+                .multilineTextAlignment(.center)
+            Text("Интерфейс упростился — вы давно не взаимодействовали с ним. Ничего срочного нет.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            Button("Вернуться к обзору", action: onResume)
+                .buttonStyle(.borderedProminent)
+                .tint(AICCTheme.plum)
+                .controlSize(.large)
+            Spacer()
+            Spacer()
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(AICCTheme.lilac.opacity(0.4))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            needsAttention == 0
+                ? "Безопасный минимальный режим. Всё спокойно."
+                : "Безопасный минимальный режим. Есть один вопрос на будущее."
+        )
     }
 }
 
