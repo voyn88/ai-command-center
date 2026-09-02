@@ -16,6 +16,7 @@ import pytest
 from command_center.audit import AuditRunner, CheckContext, Finding, default_registry
 from command_center.audit.checks import _ruff
 from command_center.audit.checks.base import Check
+from command_center.audit.checks.composite_call import CompositeCallCheck
 from command_center.audit.checks.coverage import CoverageCheck
 from command_center.audit.checks.deps import DepsCheck
 from command_center.audit.checks.lint import LintCheck
@@ -127,6 +128,78 @@ def test_ruff_relative_file_never_leaks_absolute_path(tmp_path: Path) -> None:
     assert _ruff.relative_file(outside, tmp_path) == "passwd"  # basename only
 
 
+# --- composite-call check (pure text/AST scan, no subprocess) -------------
+
+
+def test_composite_call_check_flags_sql_file(tmp_path: Path) -> None:
+    (tmp_path / "0009_thing.up.sql").write_text(
+        "SELECT (" + "queue_claim" + "(%s, %s, %s)).*;\n"
+    )
+    findings = CompositeCallCheck().run(_ctx(tmp_path))
+    assert len(findings) == 1
+    assert findings[0].category == "lint"
+    assert findings[0].owner == default_owner_for("lint")
+    assert findings[0].severity == "high"
+    assert findings[0].file_path == "0009_thing.up.sql"
+    assert findings[0].loc == "1"
+
+
+def test_composite_call_check_ignores_sql_comment(tmp_path: Path) -> None:
+    (tmp_path / "commented.sql").write_text(
+        "-- bad form, do not write: SELECT (" + "f" + "(%s)).*;\n"
+        "SELECT * FROM f(%s);\n"
+    )
+    assert CompositeCallCheck().run(_ctx(tmp_path)) == []
+
+
+def test_composite_call_check_flags_sql_shaped_python_string(tmp_path: Path) -> None:
+    (tmp_path / "store.py").write_text(
+        'query = "SELECT (' + "claim_next" + '(%s)).*"\n'
+    )
+    findings = CompositeCallCheck().run(_ctx(tmp_path))
+    assert len(findings) == 1
+    assert findings[0].file_path == "store.py"
+
+
+def test_composite_call_check_ignores_non_sql_method_chaining(tmp_path: Path) -> None:
+    (tmp_path / "util.py").write_text(
+        "text = PhaseJournal(Path(sys.argv[1])).write('gates_closed')\n"
+    )
+    assert CompositeCallCheck().run(_ctx(tmp_path)) == []
+
+
+def test_composite_call_check_ignores_chaining_on_an_unrelated_line_of_a_sql_bearing_string(
+    tmp_path: Path,
+) -> None:
+    """A multi-line literal can carry both a correct SQL statement and unrelated
+    Python (e.g. a child-process script). The whole blob containing "select"
+    must not make every other line in it fair game for the pattern."""
+    (tmp_path / "child_script.py").write_text(
+        "SCRIPT = '''\n"
+        "token_hash = hashlib.sha256(token.encode()).hexdigest()\n"
+        'cur.execute("SELECT * FROM ' + "queue_claim" + '(%s, %s, %s)")\n'
+        "'''\n"
+    )
+    assert CompositeCallCheck().run(_ctx(tmp_path)) == []
+
+
+def test_composite_call_check_ignores_docstring(tmp_path: Path) -> None:
+    (tmp_path / "module.py").write_text(
+        'def f():\n'
+        '    """The bad form looks like SELECT (' + "queue_claim" + '(%s)).*"""\n'
+        '    return 1\n'
+    )
+    assert CompositeCallCheck().run(_ctx(tmp_path)) == []
+
+
+def test_composite_call_check_empty_for_correct_form(tmp_path: Path) -> None:
+    (tmp_path / "ok.sql").write_text("SELECT * FROM " + "queue_claim" + "(%s, %s, %s);\n")
+    (tmp_path / "ok.py").write_text(
+        'q = "SELECT * FROM ' + "queue_claim" + '(%s, %s, %s)"\n'
+    )
+    assert CompositeCallCheck().run(_ctx(tmp_path)) == []
+
+
 # --- lint check over a real tree (ruff subprocess) ------------------------
 
 
@@ -141,9 +214,9 @@ def test_lint_check_flags_unused_import(tmp_path: Path) -> None:
 # --- registry -------------------------------------------------------------
 
 
-def test_default_registry_has_all_five_checks() -> None:
+def test_default_registry_has_all_six_checks() -> None:
     names = set(default_registry().names())
-    assert names == {"security", "lint", "code-quality", "deps", "coverage"}
+    assert names == {"security", "lint", "composite-call", "code-quality", "deps", "coverage"}
 
 
 def test_registry_refuses_duplicate_without_replace() -> None:
