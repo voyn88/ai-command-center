@@ -1634,6 +1634,40 @@ def _rerun_failing_acceptance_gate(repo_path: str, pr_url: str, sha: str) -> Non
             return
 
 
+def publish_out_of_band_acceptance(
+    creds: github_app_auth.GitHubAppCredentials,
+    repo_path: str,
+    pr_url: str,
+    decision: str,
+    sha: str,
+) -> tuple[bool, str]:
+    """Post one out-of-band ACCEPTANCE marker AND drive the gate green.
+
+    `publish_review_verdicts` always pairs `_post_marker_as_bot` with
+    `_rerun_failing_acceptance_gate`, because a marker alone is not enough:
+    branch protection keeps evaluating the pull_request-triggered run that
+    failed before the marker existed, and the PR stays BLOCKED out of the
+    merge queue even though the review-event run passed. Every lane outside
+    the tick -- an operator, a subscription-agent acceptance under the owner
+    directive of 2026-08-26, a recovery script -- that called
+    `_post_marker_as_bot` directly re-created exactly that stall
+    (live-diagnosed on PRs #559/#573/#581/#583/#588, 2026-09-02: five armed
+    auto-merges never entered the queue until the red runs were re-run by
+    hand). This is the ONE entry point such lanes call instead, so the
+    pairing cannot be forgotten: it is the same two primitives the tick
+    uses, composed, nothing else. A REJECT marker gets no rerun -- the red
+    run and the rejecting verdict agree, and re-running it would only spend
+    a runner confirming that.
+    (VOYN-W0-AICC-GATE-RED-SUITE-HOLDS-QUEUE-ENTRY)
+    """
+    ok, reason = _post_marker_as_bot(creds, pr_url, decision, sha)
+    if not ok:
+        return False, reason
+    if decision == "ACCEPT":
+        _rerun_failing_acceptance_gate(repo_path, pr_url, sha)
+    return True, ""
+
+
 def _verified_rejection_outcome(
     factory: Any,
     enqueue: Any,
