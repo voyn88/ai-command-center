@@ -1363,12 +1363,20 @@ def _chunk_payload_matches_envelope(
 def _accept_marker_on_latest_review(
     reviews: list[dict[str, Any]], head: str, pr_author_login: str | None
 ) -> bool:
-    """Whether the marker stands on the MOST RECENT review, not merely
-    somewhere in the array. A superseded/earlier review carrying the marker
-    text must not count once a later review exists -- otherwise a stale
-    ACCEPT from before a rejected re-review (or before a dismissed review)
-    would still authorize merge. `submittedAt` is ISO 8601, so lexical max
-    is chronological max; a missing timestamp sorts first (never wins).
+    """Whether the marker stands on the MOST RECENT *live* review, not
+    merely somewhere in the array. A superseded/earlier review carrying the
+    marker text must not count once a later review exists -- otherwise a
+    stale ACCEPT from before a rejected re-review would still authorize
+    merge. `submittedAt` is ISO 8601, so lexical max is chronological max; a
+    missing timestamp sorts first (never wins).
+
+    DISMISSED reviews are excluded before that ranking, not merely
+    outranked by a newer one: a dismissed review no longer represents its
+    author's position (matching `scripts/assert_independent_acceptance.py`'s
+    `evaluate`, which drops `state == DISMISSED` the same way), so a marker
+    that was posted and then dismissed -- with no later review at all --
+    must not authorize merge just for having no successor to be superseded
+    by.
 
     `pr_author_login` closes VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE
     (found live 2026-08-22: PRs #354/#355 both merged by the same account
@@ -1381,9 +1389,10 @@ def _accept_marker_on_latest_review(
     refusing everything -- callers that cannot supply it keep prior
     behavior; `_pr_is_mergeable` and `_has_accept_marker` below always can
     and always do."""
-    if not reviews:
+    live = [review for review in reviews if review.get("state") != "DISMISSED"]
+    if not live:
         return False
-    latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
+    latest = max(live, key=lambda r: r.get("submittedAt") or "")
     if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
         return False
     if pr_author_login is None:
