@@ -12,6 +12,7 @@ from command_center.dispatch.models import (
     DispatchPolicy,
     ExecutorProfile,
     QueuedTask,
+    TailRiskScenario,
 )
 from command_center.dispatch.policy import plan_dispatch
 
@@ -361,3 +362,145 @@ def test_plan_is_deterministic_for_identical_input():
     assert [d.as_dict() for d in first.decisions] == [
         d.as_dict() for d in second.decisions
     ]
+
+
+# --------------------------------------------------------------------------
+# Tail-risk gate — a breaching scenario blocks its business path before
+# eligibility/budget is even considered, and never touches other paths.
+# --------------------------------------------------------------------------
+
+
+def _scenario(
+    sid: str,
+    *,
+    business_path: str,
+    probability: float,
+    impact_usd: float,
+    limit_usd: float,
+) -> TailRiskScenario:
+    return TailRiskScenario(
+        id=sid,
+        label=sid,
+        business_path=business_path,
+        probability=probability,
+        impact_usd=impact_usd,
+        assumptions="test scenario",
+        limit_usd=limit_usd,
+    )
+
+
+def test_default_policy_ships_five_tail_risk_scenarios_with_assumptions_and_limits():
+    policy = DispatchPolicy()
+
+    assert len(policy.tail_risk_scenarios) == 5
+    for scenario in policy.tail_risk_scenarios.values():
+        assert scenario.business_path
+        assert scenario.assumptions
+        assert scenario.limit_usd > 0
+        # Defaults ship with headroom: the baseline policy stays open.
+        assert not scenario.exceeds_limit()
+
+
+def test_breaching_scenario_blocks_its_business_path_before_budget():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "breach": _scenario(
+                "breach",
+                business_path="AICC",
+                probability=0.5,
+                impact_usd=100.0,
+                limit_usd=10.0,
+            )
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+    assert plan.assignments == ()
+    decision = plan.decisions[0]
+    assert decision.reason == models.DEFER_TAIL_RISK
+    assert decision.blocked_scenario_id == "breach"
+
+
+def test_tail_risk_block_is_scoped_to_its_own_business_path():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "breach": _scenario(
+                "breach",
+                business_path="AML",
+                probability=0.9,
+                impact_usd=100.0,
+                limit_usd=1.0,
+            )
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="OTHER")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_scenario_within_its_limit_does_not_block():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "fine": _scenario(
+                "fine",
+                business_path="AICC",
+                probability=0.01,
+                impact_usd=100.0,
+                limit_usd=1000.0,
+            )
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_zero_limit_means_scenario_never_blocks():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "unset": _scenario(
+                "unset",
+                business_path="AICC",
+                probability=1.0,
+                impact_usd=1_000_000.0,
+                limit_usd=0.0,
+            )
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_multiple_breaching_scenarios_report_the_lowest_id_deterministically():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "zzz-later": _scenario(
+                "zzz-later",
+                business_path="AICC",
+                probability=0.5,
+                impact_usd=100.0,
+                limit_usd=10.0,
+            ),
+            "aaa-first": _scenario(
+                "aaa-first",
+                business_path="AICC",
+                probability=0.5,
+                impact_usd=100.0,
+                limit_usd=10.0,
+            ),
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+    assert plan.deferred[0].blocked_scenario_id == "aaa-first"
