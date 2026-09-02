@@ -2742,11 +2742,41 @@ def test_quiesce_worker_only_units_tolerates_a_host_that_never_ran_the_worker_pr
             return SimpleNamespace(returncode=0, stderr="", stdout="")
         if command[1] == "list-jobs":
             return SimpleNamespace(returncode=0, stderr="", stdout="")
-        if command[1] == "show":
+        if command[1] == "show" and "--value" in command:
             return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        if command[1] == "show":
+            # `stop()` no longer takes `LoadState=not-found` on faith -- it
+            # also proves the unit genuinely drained before skipping it.
+            return SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout=(
+                    "ActiveState=inactive\nMainPID=0\n"
+                    "ControlGroup=\nTasksCurrent=[not set]\n"
+                ),
+            )
         raise AssertionError(f"unexpected systemctl call: {command}")
 
     module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+
+
+def test_quiesce_worker_only_units_refuses_a_not_found_unit_that_is_still_active(
+    tmp_path,
+):
+    """`LoadState=not-found` names the unit file, not the manager's runtime
+    state: systemd can retain a unit it already started active in memory
+    after that file is deleted or made unavailable. `stop()` must prove the
+    unit is actually drained -- inactive, no main process, no tasks in its
+    cgroup -- before treating a not-found load state as nothing to do."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    calls = []
+    run = _purge_runner(workers=(unit,), loaded=set(), busy={unit: 1}, calls=calls)
+
+    with pytest.raises(RuntimeError, match="not proven inactive before control purge"):
+        module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+
+    assert not any(call[1] == "disable" for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -3090,14 +3120,18 @@ def test_apply_refuses_to_remove_a_target_whose_mode_drifted(tmp_path):
 def test_apply_refuses_to_remove_a_target_whose_owner_drifted(tmp_path):
     """uid and gid drift cannot be produced without privilege, so the
     recorded expectation is moved instead -- indistinguishable to apply()
-    from a chown between prepare() and apply()."""
+    from a chown between prepare() and apply(). Each field is tested from
+    the untouched manifest, not cumulatively: reusing the previous field's
+    already-drifted manifest would let an apply() that checks only uid keep
+    passing the gid case purely on the uid drift left over from before it."""
     module = _module()
     transaction, manifest, worker_only, installed = _control_shaped_generation(
         module, tmp_path
     )
+    pristine = json.loads(manifest.read_text(encoding="utf-8"))
 
     for field in ("original_uid", "original_gid"):
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload = json.loads(json.dumps(pristine))
         for record in payload["records"]:
             if record["remove"] and record["existed"]:
                 record[field] = record[field] + 1
@@ -4334,12 +4368,89 @@ def test_a_membership_journal_is_refused_against_another_generation(tmp_path):
     assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
 
 
-def test_a_group_in_neither_recorded_state_refuses_every_direction(tmp_path):
-    """The journal describes exactly two membership lists: the one before the
-    revocation and the one after it. A third -- a member added or removed by
-    something outside this transaction -- means `gpasswd` would be acting on
-    a list nobody here has seen, so both directions stop with the journal
-    retained rather than writing over it."""
+def test_an_unrelated_group_member_does_not_block_any_direction(tmp_path):
+    """This journal manages exactly the two legacy principals. A member
+    added -- or already present -- by something outside this transaction is
+    not a state the journal describes, and must not block restoring,
+    finalizing, or retrying the revocation it does (independent review)."""
+    module = _module()
+
+    state, live, _calls, run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin", "someone-else"}
+    )
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == {"someone-else"}
+    module.finalize_authority_membership(state, manifest, getgrnam=getgrnam)
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+    state, live, _calls, run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}, generation="generation-0002"
+    )
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    live.add("someone-else")
+    module.restore_legacy_authority_membership(
+        state, manifest=manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == {"aicc-worker", "voynadmin", "someone-else"}
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+    state, live, _calls, run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}, generation="generation-0003"
+    )
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    live.add("someone-else")
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == {"someone-else"}
+
+
+def test_a_revoked_principal_readded_outside_the_transaction_blocks_finalize_only(
+    tmp_path,
+):
+    """The journal describes exactly two membership states for the two
+    principals it manages: the one before the revocation and the one after
+    it. A revoked principal readded by something outside this transaction is
+    neither: `finalize_authority_membership` wants exactly "after" and
+    refuses to declare the revocation complete when a live look at the group
+    contradicts that, journal retained. Restoring and retrying the
+    revocation both drive the group toward a state that already includes the
+    externally-readded member, so both still reach their own target and
+    succeed instead -- self-healing past an unrelated change rather than
+    either trusting it silently or refusing forever."""
+    module = _module()
+    state, live, _calls, run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == set()
+
+    live.add("aicc-worker")
+
+    with pytest.raises(RuntimeError, match="revocation is incomplete"):
+        module.finalize_authority_membership(state, manifest, getgrnam=getgrnam)
+    assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+
+    assert live == set()
+    module.finalize_authority_membership(state, manifest, getgrnam=getgrnam)
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+
+def test_a_revoked_principal_readded_outside_the_transaction_does_not_block_restore(
+    tmp_path,
+):
     module = _module()
     state, live, _calls, run, getgrnam, manifest = _publisher_group(
         module, tmp_path, {"aicc-worker", "voynadmin"}
@@ -4348,24 +4459,14 @@ def test_a_group_in_neither_recorded_state_refuses_every_direction(tmp_path):
         state, manifest, run=run, getgrnam=getgrnam
     )
 
-    live.add("someone-else")
+    live.add("aicc-worker")
 
-    for call in (
-        lambda: module.restore_legacy_authority_membership(
-            state, manifest=manifest, run=run, getgrnam=getgrnam
-        ),
-        lambda: module.finalize_authority_membership(
-            state, manifest, getgrnam=getgrnam
-        ),
-        lambda: module.revoke_legacy_authority_membership(
-            state, manifest, run=run, getgrnam=getgrnam
-        ),
-    ):
-        with pytest.raises(RuntimeError, match="drifted outside this transaction"):
-            call()
+    module.restore_legacy_authority_membership(
+        state, manifest=manifest, run=run, getgrnam=getgrnam
+    )
 
-    assert live == {"someone-else"}
-    assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+    assert live == {"aicc-worker", "voynadmin"}
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
 
 
 def _restoring_recover(module, monkeypatch, run, getgrnam):
