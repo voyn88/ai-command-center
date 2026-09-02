@@ -1715,6 +1715,191 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
     assert sum(1 for _, r in report.skipped if r == "branch_behind_update_capped") == 2
 
 
+# --- VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE: skip the re-review a --
+# --- `update-branch` head with an unchanged patch-id does not need -------
+
+# Two unified diffs for the identical content edit at two different hunk
+# offsets and two different blob index hashes -- exactly what an
+# `update-branch` merge from an advanced base produces for a PR diff that
+# never actually changed. `git patch-id --stable` treats them as equal.
+_CARRYOVER_DIFF_A = (
+    "diff --git a/f.txt b/f.txt\n"
+    "index e8823e1..bfbcefc 100644\n"
+    "--- a/f.txt\n"
+    "+++ b/f.txt\n"
+    "@@ -12,7 +12,7 @@\n"
+    " 12\n 13\n 14\n-15\n+CHANGED\n 16\n 17\n 18\n"
+)
+_CARRYOVER_DIFF_B = (
+    "diff --git a/f.txt b/f.txt\n"
+    "index 4ad90ab..7dc7b26 100644\n"
+    "--- a/f.txt\n"
+    "+++ b/f.txt\n"
+    "@@ -15,7 +15,7 @@\n"
+    " 12\n 13\n 14\n-15\n+CHANGED\n 16\n 17\n 18\n"
+)
+_CARRYOVER_DIFF_CHANGED = (
+    "diff --git a/f.txt b/f.txt\n"
+    "index e8823e1..1111111 100644\n"
+    "--- a/f.txt\n"
+    "+++ b/f.txt\n"
+    "@@ -12,7 +12,7 @@\n"
+    " 12\n 13\n 14\n-15\n+SOMETHING ELSE\n 16\n 17\n 18\n"
+)
+
+
+def _carryover_gh(old_head, new_head, base, new_diff, calls, marker_shas):
+    """A stateful fake `_gh`: once `_post_marker_as_bot` (patched separately
+    to append to `marker_shas`) records a new marker, subsequent `pr view`
+    calls report it -- exactly as a real second GitHub lookup would after
+    the first marker post landed."""
+    def fake_gh(argv, repo):
+        import subprocess
+        calls.append(argv[:2])
+        reviews = [{"body": f"ACCEPTANCE: ACCEPT {old_head}",
+                    "author": {"login": "voyn88-acceptance-gate[bot]"},
+                    "submittedAt": "2026-08-27T00:00:00Z"}]
+        if marker_shas:
+            reviews.append({"body": f"ACCEPTANCE: ACCEPT {marker_shas[-1]}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"},
+                             "submittedAt": "2026-08-27T01:00:00Z"})
+        if argv[:2] == ["pr", "view"] and "baseRefOid" in argv[-1]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": new_head, "baseRefOid": base,
+                "author": {"login": "writer-bot"}, "reviews": reviews,
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "view"] and "comments" in argv[-1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"comments": []}), "")
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": new_head, "mergeStateStatus": "CLEAN",
+                "author": {"login": "writer-bot"}, "reviews": reviews,
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[0] == "api":
+            target = argv[1].split("...")[-1]
+            if old_head in target:
+                return subprocess.CompletedProcess(argv, 0, _CARRYOVER_DIFF_A, "")
+            if new_head in target:
+                return subprocess.CompletedProcess(argv, 0, new_diff, "")
+            return subprocess.CompletedProcess(argv, 1, "", "unexpected compare")
+        if argv[:2] == ["pr", "comment"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", f"unexpected: {argv}")
+
+    return fake_gh
+
+
+def test_marker_carries_over_when_patch_id_is_stable_after_update_branch(rig, monkeypatch):  # noqa: F811
+    """A PR that `update-branch` moved off its accepted head is NOT sent back
+    for a full re-review when `git patch-id --stable` proves the PR's own
+    diff did not change: the marker carries over to the new head instead,
+    and the tick proceeds straight to a merge attempt."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-CO1", "https://github.com/x/y/pull/60")
+    old_head, new_head, base = "1" * 40, "2" * 40, "9" * 40
+    calls, marker_shas = [], []
+
+    def fake_post_marker(_creds, _pr, decision, sha):
+        assert decision == "ACCEPT"
+        marker_shas.append(sha)
+        return True, ""
+
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        _carryover_gh(old_head, new_head, base, _CARRYOVER_DIFF_B, calls, marker_shas),
+    )
+    monkeypatch.setattr(review_merge, "_acceptance_app_credentials", lambda: object())
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot", fake_post_marker)
+
+    report = merge_once(app_factory, "/tmp")
+    assert marker_shas == [new_head]
+    assert ["pr", "update-branch"] not in calls
+    assert ["pr", "merge"] in calls
+    assert not any(r == "no_accept_marker_on_head" for _, r in report.skipped)
+
+
+def test_marker_does_not_carry_over_when_patch_id_changed(rig, monkeypatch):  # noqa: F811
+    """A real edit riding in on the `update-branch` merge (a genuine
+    conflict resolution, not just a shifted context) must still force the
+    ordinary full re-review -- no marker is carried over."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-CO2", "https://github.com/x/y/pull/61")
+    old_head, new_head, base = "3" * 40, "4" * 40, "9" * 40
+    calls, marker_shas = [], []
+
+    monkeypatch.setattr(
+        review_merge, "_gh",
+        _carryover_gh(old_head, new_head, base, _CARRYOVER_DIFF_CHANGED, calls, marker_shas),
+    )
+    monkeypatch.setattr(review_merge, "_acceptance_app_credentials", lambda: object())
+    monkeypatch.setattr(
+        review_merge, "_post_marker_as_bot",
+        lambda *_a: (marker_shas.append("SHOULD-NOT-POST") or True, ""),
+    )
+
+    report = merge_once(app_factory, "/tmp")
+    assert marker_shas == []
+    assert ["pr", "merge"] not in calls
+    assert ("VOYN-W0-CO2", "no_accept_marker_on_head") in report.skipped
+
+
+# --- VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE: the churn-breaker ----
+
+def test_branch_update_churn_escalates_instead_of_looping_forever(rig, monkeypatch):  # noqa: F811
+    """A PR that has already accumulated `max_branch_update_churn` ACCEPT
+    markers without ever merging is no longer auto-updated when it falls
+    BEHIND again -- the merge tick escalates instead of spinning another
+    update -> reverdict cycle forever."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-CHURN", "https://github.com/x/y/pull/62")
+    head = "5" * 40
+    calls, comments_posted = [], []
+    reviews = [
+        {"body": f"ACCEPTANCE: ACCEPT {c * 40}",
+         "author": {"login": "voyn88-acceptance-gate[bot]"},
+         "submittedAt": f"2026-08-27T0{i}:00:00Z"}
+        for i, c in enumerate("abcde")
+    ]
+    # The most recent (highest submittedAt) marker must match the CURRENT
+    # head, or readiness fails before the churn/BEHIND path is even reached.
+    reviews[-1] = {"body": f"ACCEPTANCE: ACCEPT {head}",
+                   "author": {"login": "voyn88-acceptance-gate[bot]"},
+                   "submittedAt": "2026-08-27T09:00:00Z"}
+
+    def fake_gh(argv, repo):
+        import subprocess
+        calls.append(argv[:2])
+        if argv[:2] == ["pr", "view"] and "comments" in argv[-1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"comments": comments_posted}), "")
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"}, "reviews": reviews,
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "comment"]:
+            comments_posted.append({"body": argv[argv.index("--body") + 1]})
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", f"unexpected: {argv}")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp", review_merge.ReviewConfig(max_branch_update_churn=5))
+    assert ["pr", "update-branch"] not in calls
+    assert ("VOYN-W0-CHURN", "branch_update_churn_escalated") in report.skipped
+    assert len(comments_posted) == 1
+    assert "BRANCH-UPDATE-CHURN-ESCALATION" in comments_posted[0]["body"]
+
+    # A second tick must not repost the escalation comment.
+    calls.clear()
+    report2 = merge_once(app_factory, "/tmp", review_merge.ReviewConfig(max_branch_update_churn=5))
+    assert ("VOYN-W0-CHURN", "branch_update_churn_escalated") in report2.skipped
+    assert len(comments_posted) == 1
+
+
 def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch):
     """After the marker is posted, the failing pull_request-triggered
     Acceptance-gate run for the exact head is re-run so branch protection stops

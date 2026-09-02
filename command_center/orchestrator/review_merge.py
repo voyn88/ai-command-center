@@ -51,6 +51,15 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
 - ``merge_once``: for each PR that carries an ACCEPT marker AND whose required
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
+  A PR that has merely fallen BEHIND main is brought current with ``gh pr
+  update-branch``; the new head this produces carries no marker of its own,
+  so before falling back to a full re-review this tries to carry the prior
+  verdict forward when ``git patch-id --stable`` proves the PR's own diff
+  did not change (``_carry_over_marker_if_patch_id_stable``, audited with a
+  posted comment) -- and a PR that accumulates too many update→reverdict
+  cycles without ever landing is a churn-breaker escalation
+  (``branch_update_churn_escalated``), not another update
+  (VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE).
 - ``reconcile_merge_evidence``: report-only audit of existing DONE tasks'
   'sha' evidence against the default branch, for rows written before
   VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY (when that evidence was the
@@ -99,6 +108,17 @@ class ReviewConfig:
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
     max_branch_updates_per_tick: int = 3
+    #: Total ACCEPT-marker cycles (the original verdict plus every carry-over
+    #: or re-review a later `update-branch` forces) a single PR may
+    #: accumulate before the merge tick stops auto-updating it and escalates
+    #: instead -- the churn-breaker for VOYN-W0-AICC-MARKER-CARRYOVER-ON-
+    #: BRANCH-UPDATE. If main advances faster than this PR can land,
+    #: update-branch -> re-verdict repeats every tick main moves, and
+    #: without a bound that is forever: carry-over makes each cycle cheap
+    #: rather than a full review, but cheap-and-infinite is still infinite.
+    #: Past this many cycles the evidence is "something other than time is
+    #: blocking this merge," which another update cannot fix.
+    max_branch_update_churn: int = 5
     #: Per-tick cap on tasks EXAMINED (each examination costs gh API calls).
     #: Fairness across ticks comes from the rotating deterministic scan order
     #: below, not from unbounded scanning -- see the window-starvation note
@@ -1392,6 +1412,35 @@ def _accept_marker_on_latest_review(
     return reviewer_login is not None and reviewer_login != pr_author_login
 
 
+_ACCEPTANCE_MARKER_SHA = re.compile(r"ACCEPTANCE: ACCEPT ([0-9a-f]{40})")
+
+
+def _latest_marker_sha(
+    reviews: list[dict[str, Any]], pr_author_login: str | None
+) -> str | None:
+    """The sha the PR's most recent marker was posted for, whatever that sha
+    is -- unlike `_accept_marker_on_latest_review`, this does NOT require it
+    to equal the PR's *current* head. `_carry_over_marker_if_patch_id_
+    stable` needs exactly this: the sha a now-superseded marker stood on
+    before `gh pr update-branch` moved the head out from under it, so it can
+    be compared against the new head instead of discarded outright. Same
+    most-recent-review-only and reviewer-independence rules as
+    `_accept_marker_on_latest_review`, for the same reasons -- a stale
+    ACCEPT sitting under a later REJECT, or a same-author marker, must never
+    carry over either."""
+    if not reviews:
+        return None
+    latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
+    match = _ACCEPTANCE_MARKER_SHA.search(latest.get("body") or "")
+    if match is None:
+        return None
+    if pr_author_login is not None:
+        reviewer_login = (latest.get("author") or {}).get("login")
+        if reviewer_login is None or reviewer_login == pr_author_login:
+            return None
+    return match.group(1)
+
+
 def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
@@ -2244,6 +2293,229 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     return f"flaky_rerun_dispatched:{dispatched}" if dispatched else ""
 
 
+# -- Marker carry-over on branch update (VOYN-W0-AICC-MARKER-CARRYOVER-ON- --
+# -- BRANCH-UPDATE) ------------------------------------------------------
+#
+# Live 2026-08-27: a merge tick brought three BEHIND PRs current with `gh pr
+# update-branch`. Each update produces a new merge commit, whose sha the old
+# ACCEPT marker (posted for the pre-update head) does not name, so
+# `_pr_is_mergeable` reports `no_accept_marker_on_head` on the very next look
+# and the task falls back to a full review of a diff that never changed --
+# ~15-30 minutes of model time to re-approve exactly what was already
+# approved. If main advances faster than review turns around, that repeats
+# without end.
+#
+# `git patch-id --stable` is the fix: it hashes a diff's content (the +/-
+# lines) in a way that ignores hunk line numbers, so a base-merge that moves
+# where the PR's own change lands -- without touching what it says -- still
+# produces the same id. `_PRSnapshot.digest` above (a plain sha256 of the
+# raw diff TEXT) cannot substitute: it moves whenever a hunk's line numbers
+# shift, which `update-branch` does even to a byte-for-byte-unchanged PR
+# diff. Comparing the PR's own diff (base...sha, GitHub's three-dot compare,
+# which diffs from the merge-base regardless of how far the literal `base`
+# argument has since moved) at the prior marker's sha against the same diff
+# at the new head is therefore the correct before/after: identical patch-id
+# means the prior verdict still applies and the marker carries over (posted
+# under the same independent bot identity as any marker, with an audited
+# comment recording the carry-over); a changed patch-id means a real edit
+# rode in on the update and the diff genuinely needs a real re-review, which
+# this leaves to the ordinary review pipeline by doing nothing.
+
+
+def _compare_diff_text(
+    repo_path: str, owner: str, repo: str, base: str, head: str
+) -> str | None:
+    """The PR's own diff at `head` (GitHub's three-dot compare against
+    `base` -- computed from their merge-base, not literally `base`'s tip, so
+    this is exactly the diff `head`'s author actually contributed regardless
+    of how far `base` has advanced since). None on any fetch failure or an
+    oversized diff, exactly like `_pr_diff_and_head`."""
+    result = _gh(
+        ["api", f"repos/{owner}/{repo}/compare/{base}...{head}",
+         "-H", "Accept: application/vnd.github.v3.diff"],
+        repo_path,
+    )
+    if result.returncode != 0:
+        return None
+    text = result.stdout
+    if len(text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
+        return None
+    return text
+
+
+def _run_git_patch_id(diff_text: str) -> str | None:
+    """`git patch-id --stable`'s content hash for a unified diff -- None for
+    an empty diff or any failure of the subprocess itself (missing `git`,
+    timeout), never a hash for text that was never actually run through
+    it."""
+    if not diff_text.strip():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            input=diff_text, capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    first_line = (result.stdout or "").strip().splitlines()
+    if not first_line:
+        return None
+    fields = first_line[0].split()
+    return fields[0] if fields else None
+
+
+def _post_marker_carryover_audit(
+    repo_path: str, pr_url: str, task_id: str, prior_sha: str, new_head: str, patch_id: str
+) -> tuple[bool, bool]:
+    """The audit trail the carried-over marker is conditioned on, posted
+    BEFORE the marker -- if this comment cannot be posted, no marker is
+    posted this tick (fail closed, retried next tick; same contract as
+    `_post_auto_accept_audit`). Idempotent per (prior_sha, new_head): the
+    tag is searched in existing comments first, so a tick that posted the
+    audit but failed on the marker does not stack duplicates. Returns
+    ``(ok, wrote)`` -- ``wrote`` is False only for the idempotent
+    already-posted case, which must not consume the caller's per-tick write
+    budget."""
+    tag = f"MARKER-CARRYOVER {prior_sha}->{new_head}"
+    view = _gh(["pr", "view", pr_url, "--json", "comments"], repo_path)
+    if view.returncode != 0:
+        return False, False
+    try:
+        comments = (json.loads(view.stdout or "{}")).get("comments") or []
+    except json.JSONDecodeError:
+        return False, False
+    if any(tag in ((c or {}).get("body") or "") for c in comments):
+        return True, False
+    body = (
+        f"{tag}\n\n"
+        f"Task: {task_id}\n"
+        f"`gh pr update-branch` moved the head from {prior_sha} to {new_head}. "
+        "`git patch-id --stable` of the PR's own diff (base...head, "
+        f"unaffected by how far the base has moved) is identical before and "
+        f"after: `{patch_id}`. The ACCEPT verdict already standing on "
+        f"{prior_sha} therefore carries over to {new_head} instead of "
+        "triggering a full re-review of an unchanged diff "
+        "(VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE). CI and the "
+        "acceptance gate remain required for merge.\n"
+    )
+    posted = _gh(["pr", "comment", pr_url, "--body", body], repo_path)
+    return posted.returncode == 0, True
+
+
+def _carry_over_marker_if_patch_id_stable(
+    repo_path: str, pr_url: str, task_id: str
+) -> bool:
+    """Called only when the PR's current head has no matching ACCEPT marker
+    -- attempts to carry one over from a prior head that `update-branch`
+    superseded, when the prior head and the current head produce an
+    identical `git patch-id --stable`. Returns whether a marker was posted
+    for the current head this call; False (no write, or none needed) on
+    any failure or mismatch leaves the PR exactly as `no_accept_marker_on_
+    head` already reports it -- the ordinary review pipeline picks it up
+    from there."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return False
+    owner, repo, _number = parsed
+    view = _gh(
+        ["pr", "view", pr_url, "--json",
+         "reviews,headRefOid,baseRefOid,author,state"],
+        repo_path,
+    )
+    if view.returncode != 0:
+        return False
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    if data.get("state") != "OPEN":
+        return False
+    head = data.get("headRefOid", "")
+    base = data.get("baseRefOid", "")
+    if not re.fullmatch(r"[0-9a-f]{40}", head) or not re.fullmatch(r"[0-9a-f]{40}", base):
+        return False
+    author_login = (data.get("author") or {}).get("login")
+    prior_sha = _latest_marker_sha(data.get("reviews", []), author_login)
+    if prior_sha is None or prior_sha == head:
+        return False
+    old_diff = _compare_diff_text(repo_path, owner, repo, base, prior_sha)
+    new_diff = _compare_diff_text(repo_path, owner, repo, base, head)
+    if old_diff is None or new_diff is None:
+        return False
+    old_id = _run_git_patch_id(old_diff)
+    new_id = _run_git_patch_id(new_diff)
+    if old_id is None or new_id is None or old_id != new_id:
+        return False
+    creds = _acceptance_app_credentials()
+    if creds is None:
+        return False
+    audit_ok, _wrote = _post_marker_carryover_audit(
+        repo_path, pr_url, task_id, prior_sha, head, new_id
+    )
+    if not audit_ok:
+        return False
+    ok, _reason = _post_marker_as_bot(creds, pr_url, "ACCEPT", head)
+    return ok
+
+
+def _accept_marker_churn_count(repo_path: str, pr_url: str) -> int:
+    """How many ACCEPT markers this PR has accumulated over its whole
+    lifetime -- the churn-breaker's counter. Every `update-branch` that
+    knocks a marker off the head is followed by exactly one more of these
+    once the task is re-verdicted (whether that verdict comes from
+    `_carry_over_marker_if_patch_id_stable` or a genuine re-review), so this
+    count IS the number of update -> reverdict cycles the PR has already
+    been through -- no separate counter table needed to keep in sync with
+    GitHub's own state."""
+    view = _gh(["pr", "view", pr_url, "--json", "reviews"], repo_path)
+    if view.returncode != 0:
+        return 0
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return 0
+    reviews = data.get("reviews") or []
+    return sum(
+        1 for r in reviews
+        if _ACCEPTANCE_MARKER_SHA.search((r or {}).get("body") or "")
+    )
+
+
+def _post_branch_update_churn_escalation(
+    repo_path: str, pr_url: str, task_id: str, churn: int, limit: int
+) -> tuple[bool, bool]:
+    """Posted once per PR, idempotent on a tag with no sha in it (the point
+    is "this PR itself churns," not any one head) -- a failed post simply
+    retries next tick and a successful one never repeats. Returns ``(ok,
+    wrote)`` on the same contract as `_post_marker_carryover_audit`."""
+    tag = "BRANCH-UPDATE-CHURN-ESCALATION"
+    view = _gh(["pr", "view", pr_url, "--json", "comments"], repo_path)
+    if view.returncode != 0:
+        return False, False
+    try:
+        comments = (json.loads(view.stdout or "{}")).get("comments") or []
+    except json.JSONDecodeError:
+        return False, False
+    if any(tag in ((c or {}).get("body") or "") for c in comments):
+        return True, False
+    body = (
+        f"{tag}\n\n"
+        f"Task: {task_id}\n"
+        f"This PR has accumulated {churn} ACCEPT markers (limit {limit}) "
+        "without ever merging -- the base is moving faster than this PR "
+        "lands, and each `gh pr update-branch` costs another verdict cycle "
+        "(VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE). The merge tick "
+        "has stopped auto-updating this branch so the loop does not spin "
+        "forever; a human needs to land it (rebase and merge by hand, or "
+        "clear whatever is actually blocking it).\n"
+    )
+    posted = _gh(["pr", "comment", pr_url, "--body", body], repo_path)
+    return posted.returncode == 0, True
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
@@ -2302,6 +2574,18 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             continue
         if merge_sha is None:
             ready, detail = _pr_is_mergeable(repo_path, pr_url)
+            if not ready and detail == "no_accept_marker_on_head":
+                # The head has no marker NOW, but may simply be the sha
+                # `update-branch` produced from a head that DID carry one --
+                # try to carry that verdict forward before falling back to a
+                # full re-review of a diff that may never have changed
+                # (VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE). A prior
+                # marker whose patch-id no longer matches is a real edit and
+                # is deliberately left as `no_accept_marker_on_head` below --
+                # the ordinary review pipeline picks it up from there.
+                if _carry_over_marker_if_patch_id_stable(repo_path, pr_url, task_id):
+                    actions += 1
+                    ready, detail = _pr_is_mergeable(repo_path, pr_url)
             if not ready:
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake
@@ -2328,6 +2612,22 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             if state == "BEHIND":
                 if branch_updates >= cfg.max_branch_updates_per_tick:
                     report.skipped.append((task_id, "branch_behind_update_capped"))
+                    continue
+                # Churn-breaker: if main is advancing faster than this PR can
+                # land, update-branch -> re-verdict (carried over or fully
+                # re-reviewed) repeats every tick main moves -- cheap with
+                # carry-over, but cheap-and-infinite is still infinite. Past
+                # `max_branch_update_churn` cycles, stop feeding the loop and
+                # tell a human instead of spinning forever.
+                # (VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE)
+                churn = _accept_marker_churn_count(repo_path, pr_url)
+                if churn >= cfg.max_branch_update_churn:
+                    _ok, wrote = _post_branch_update_churn_escalation(
+                        repo_path, pr_url, task_id, churn, cfg.max_branch_update_churn
+                    )
+                    if wrote:
+                        actions += 1
+                    report.skipped.append((task_id, "branch_update_churn_escalated"))
                     continue
                 branch_updates += 1
                 actions += 1
