@@ -451,8 +451,13 @@ and MyPy type-check steps alongside — for pull requests into `main`, pushes to
 dispatches on Python 3.14. It uses a read-only token, SHA-pinned actions, and cancels superseded runs for the same
 ref.
 
-The workflow does not configure GitHub branch protection. Whether its result is a required merge
-gate remains a repository-setting concern outside this codebase.
+The workflow does not configure GitHub branch protection, and none is currently enabled on
+`main` (0 required reviews, no required status checks, `enforce_admins=false`) — this is an
+unconfigured setting, not a plan limitation. `merge_once`
+(`command_center/orchestrator/review_merge.py`) is the actual, sole enforcement point against
+duplicate/unreviewed merges today; see
+[docs/GOVERNANCE_GITHUB_BRANCH_PROTECTION.md](docs/GOVERNANCE_GITHUB_BRANCH_PROTECTION.md)
+(DR-GITHUB-BRANCH-PROTECTION-001).
 
 ## 13. Current risks and boundaries
 

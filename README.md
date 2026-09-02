@@ -483,8 +483,13 @@ merges are to be blocked on it.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
 - A static type checker is configured (permissive, non-strict) via `pyproject.toml` and surfaced as a
   non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
-- The checked-in CI workflow does not itself enforce branch protection. Enable "Require status checks
-  to pass before merging" on `main` with the `Quality gates` check to make it a real gate.
+- The checked-in CI workflow does not itself enforce branch protection, and none is currently
+  enabled on `main` — not a plan limitation (the repo is public and branch protection is free);
+  it is simply unconfigured. `merge_once` is the sole real merge gate today; running
+  `scripts/enable-branch-protection.sh` (Require status checks to pass with the `Quality gates`
+  check) remains an available, zero-cost hardening step. See
+  [docs/GOVERNANCE_GITHUB_BRANCH_PROTECTION.md](docs/GOVERNANCE_GITHUB_BRANCH_PROTECTION.md)
+  (DR-GITHUB-BRANCH-PROTECTION-001).
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass it,
   and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and

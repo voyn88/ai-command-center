@@ -119,8 +119,12 @@ Current boundaries:
   only exact-workspace exclusion is enforced transactionally by the runtime launch path.
 - Fail-closed workspace verification is scoped to normal task-v2 callers that supply
   `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
-- The current private-repository plan does not expose branch protection/rulesets, so CI is
-  automatic but required-check enforcement remains an operator merge discipline.
+- `voyn88/ai-command-center` is public and GitHub branch protection on `main` is unconfigured
+  (0 required reviews, no required status checks, `enforce_admins=false`) — this is not a plan
+  limitation (branch protection is free on public and private repos alike); it is simply not
+  turned on. `merge_once` (`command_center/orchestrator/review_merge.py`) is the actual, sole
+  enforcement point today; see [DR-GITHUB-BRANCH-PROTECTION-001](DECISIONS.md) /
+  [docs/GOVERNANCE_GITHUB_BRANCH_PROTECTION.md](docs/GOVERNANCE_GITHUB_BRANCH_PROTECTION.md).
 - Git worktree creation, push, pull-request creation and merge are privileged capabilities with
   confirmation or policy safeguards.
 - The native PySide6 desktop client remains documentation and design work only.
