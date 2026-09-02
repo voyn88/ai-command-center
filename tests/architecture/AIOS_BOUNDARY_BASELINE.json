@@ -84,12 +84,6 @@
       "audit",
       "orchestration"
     ],
-    "command_center/db/audit_store.py": [
-      "audit"
-    ],
-    "command_center/db/provenance_store.py": [
-      "audit"
-    ],
     "command_center/db/work_queue_store.py": [
       "queue"
     ],
