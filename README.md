@@ -290,9 +290,23 @@ environment variables, so existing installs and the test suite are unaffected:
 - `AICC_RUNTIME_RETENTION_DAYS=<N>` — on startup (after schema migration), delete `run_event` rows
   for runs terminal longer than `N` days. The terminal run row itself is kept (it stays visible in
   the Execution Center and to reconciliation); only the bulky per-output event history is pruned.
-- `AICC_RUNTIME_VACUUM_ON_START=1` — run `VACUUM` after pruning to reclaim disk. VACUUM rewrites the
-  database under an exclusive lock, so enable it only on a single-host install that can briefly pause
-  other writers.
+- `AICC_RUNTIME_VACUUM_ON_START=1` — run `VACUUM` unconditionally on startup to reclaim disk. VACUUM
+  rewrites the database under an exclusive lock, so enable it only on a single-host install that can
+  briefly pause other writers.
+- `AICC_RUNTIME_VACUUM_FREE_RATIO=<0..1>` — run `VACUUM` on startup only once the freelist share of
+  the file (`PRAGMA freelist_count` / `PRAGMA page_count`) is at or above this fraction, e.g. `0.5`
+  to vacuum once half the file is reclaimable empty space. This is the threshold to reach for over
+  `AICC_RUNTIME_VACUUM_ON_START`: it avoids rewriting the file on every startup when there is nothing
+  to reclaim, and — unlike retention pruning — it also catches bloat left behind by ordinary
+  task-delete cascades, not just expired `run_event` rows.
+
+`DELETE` never shrinks the SQLite file on its own; the freed pages stay allocated until something
+runs `VACUUM`. A `runtime.db` that has pruned or deleted heavily without either VACUUM knob enabled
+can end up mostly empty space on disk — a live 137-row database occupying 346MB, 84,446 of its
+84,527 pages on the freelist, is what that looks like in practice. `maintenance.archive_and_prune`
+(`command_center/runtime/maintenance.py`) is the deliberate, rollback-safe counterpart for an
+operator to run by hand — backup, cold-archive to compressed JSONL, prune, integrity-check, and
+optionally VACUUM — and is not wired into automatic startup.
 
 ## Execution lifecycle
 

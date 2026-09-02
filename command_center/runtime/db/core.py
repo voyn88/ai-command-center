@@ -705,37 +705,89 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     return removed
 
 
-def maybe_apply_runtime_retention(db_path: Path) -> None:
-    """Apply retention iff the operator set `AICC_RUNTIME_RETENTION_DAYS` to a
-    positive integer. Default (unset / <= 0) is a no-op, so this never changes
-    behavior for existing installs or the test suite.
+#: Fraction of freelist pages, at or above which `maybe_apply_runtime_retention`
+#: runs an automatic `VACUUM` (VOYN-W0-AICC-RUNTIME-DB-BLOAT). Unset by default:
+#: an install that never sets it keeps today's behavior (no automatic VACUUM).
+RUNTIME_VACUUM_FREE_RATIO_ENV = "AICC_RUNTIME_VACUUM_FREE_RATIO"
 
-    A companion `AICC_RUNTIME_VACUUM_ON_START=1` runs `VACUUM` after pruning to
-    reclaim disk. VACUUM rewrites the whole database under an exclusive lock, so
-    it is opt-in and should only be enabled on a single-host install that can
-    pause other writers briefly.
+
+def free_page_ratio(db_path: Path) -> float | None:
+    """Share of `db_path`'s pages that are on SQLite's freelist — empty space
+    a prior `DELETE` (event retention, or an ordinary task-delete cascade)
+    left behind because nothing ever ran `VACUUM` to reclaim it. `None` for an
+    empty (zero-page) database, where the ratio is undefined.
+
+    `run_event` deletes without a following `VACUUM` are exactly how a live
+    database can hold 137 rows of real data across 346MB on disk: the pages
+    freed by `DELETE` stay allocated to the file, so `PRAGMA freelist_count`
+    stays high relative to `PRAGMA page_count` until something vacuums.
     """
-    raw = os.environ.get("AICC_RUNTIME_RETENTION_DAYS")
-    if not raw:
-        return
-    try:
-        retention_days = int(raw)
-    except ValueError:
-        return
-    if retention_days <= 0:
-        return
-    try:
-        db.apply_runtime_retention(db_path, retention_days=retention_days)
-    except ValueError:
-        # An unusable `AICC_RUNTIME_TZ`. This path runs inside `migrate()`, on
-        # every service construction, so it must not take the app down — but it
-        # must not delete rows against a guessed clock either. Skipping is the
-        # safe half of that trade; the operator's next deliberate
-        # `apply_runtime_retention` call raises and says why.
-        return
+    with db.connect(db_path) as conn:
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+        freelist_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    if not page_count:
+        return None
+    return freelist_count / page_count
+
+
+def _maybe_vacuum(db_path: Path) -> None:
+    """Reclaim disk with `VACUUM` iff the operator asked for it — either
+    unconditionally (`AICC_RUNTIME_VACUUM_ON_START=1`) or once bloat crosses a
+    declared threshold (`AICC_RUNTIME_VACUUM_FREE_RATIO=<0..1>`, e.g. `0.5` to
+    vacuum once half the file is empty space). VACUUM rewrites the whole
+    database under an exclusive lock, so both knobs are opt-in and should only
+    be enabled on a single-host install that can pause other writers briefly.
+
+    Runs independent of `AICC_RUNTIME_RETENTION_DAYS`: a database bloats from
+    ordinary task-delete cascades too, not only from event retention, so the
+    threshold has to apply even when retention pruning itself is off or found
+    nothing to prune this call (VOYN-W0-AICC-RUNTIME-DB-BLOAT).
+    """
     if os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1":
         with db.connect(db_path) as conn:
             conn.execute("VACUUM")
+        return
+    raw_threshold = os.environ.get(db.RUNTIME_VACUUM_FREE_RATIO_ENV)
+    if not raw_threshold:
+        return
+    try:
+        threshold = float(raw_threshold)
+    except ValueError:
+        return
+    if not (0 < threshold <= 1):
+        return
+    ratio = db.free_page_ratio(db_path)
+    if ratio is not None and ratio >= threshold:
+        with db.connect(db_path) as conn:
+            conn.execute("VACUUM")
+
+
+def maybe_apply_runtime_retention(db_path: Path) -> None:
+    """Apply retention iff the operator set `AICC_RUNTIME_RETENTION_DAYS` to a
+    positive integer. Default (unset / <= 0) is a no-op for pruning, so this
+    never changes behavior for existing installs or the test suite.
+
+    Bloat-threshold `VACUUM` (see `_maybe_vacuum`) always runs after, whether
+    or not retention itself is configured.
+    """
+    raw = os.environ.get("AICC_RUNTIME_RETENTION_DAYS")
+    retention_days = 0
+    if raw:
+        try:
+            retention_days = int(raw)
+        except ValueError:
+            retention_days = 0
+    if retention_days > 0:
+        try:
+            db.apply_runtime_retention(db_path, retention_days=retention_days)
+        except ValueError:
+            # An unusable `AICC_RUNTIME_TZ`. This path runs inside `migrate()`,
+            # on every service construction, so it must not take the app down
+            # — but it must not delete rows against a guessed clock either.
+            # Skipping is the safe half of that trade; the operator's next
+            # deliberate `apply_runtime_retention` call raises and says why.
+            pass
+    db._maybe_vacuum(db_path)
 
 
 def current_schema_version(db_path: Path) -> int:

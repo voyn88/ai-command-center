@@ -47,6 +47,9 @@ Current position:
 - Runtime history retention is **off by default**: `AICC_RUNTIME_RETENTION_DAYS=<N>` prunes
   `run_event` rows for terminal runs older than `N` days on startup, and
   `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
+  `AICC_RUNTIME_VACUUM_FREE_RATIO=<0..1>` VACUUMs automatically once the freelist share of the file
+  crosses that fraction — independent of retention, since ordinary task-delete cascades bloat the
+  file too (VOYN-W0-AICC-RUNTIME-DB-BLOAT).
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
 - Founder Functional Audit `9761459` is **closed** (2026-08-07), merge-verified against
