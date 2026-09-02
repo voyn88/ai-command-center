@@ -719,6 +719,41 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
 #: trusting it to delete for real on a given install.
 RUNTIME_RETENTION_ARCHIVE_DIR_ENV = "AICC_RUNTIME_RETENTION_ARCHIVE_DIR"
 RUNTIME_RETENTION_DRY_RUN_ENV = "AICC_RUNTIME_RETENTION_DRY_RUN"
+RUNTIME_VACUUM_FREE_RATIO_ENV = "AICC_RUNTIME_VACUUM_FREE_RATIO"
+
+
+def free_page_ratio(db_path: Path) -> float | None:
+    """Return the fraction of SQLite pages available for reclamation."""
+    with db.connect(db_path) as conn:
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+        freelist_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
+    if not page_count:
+        return None
+    return freelist_count / page_count
+
+
+def _configured_vacuum_free_ratio() -> float | None:
+    raw = os.environ.get(RUNTIME_VACUUM_FREE_RATIO_ENV)
+    if not raw:
+        return None
+    try:
+        ratio = float(raw)
+    except ValueError:
+        return None
+    return ratio if 0 < ratio <= 1 else None
+
+
+def _maybe_vacuum(db_path: Path) -> None:
+    """VACUUM explicitly or when reclaimable pages cross the threshold."""
+    if os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1":
+        should_vacuum = True
+    else:
+        threshold = _configured_vacuum_free_ratio()
+        ratio = free_page_ratio(db_path) if threshold is not None else None
+        should_vacuum = ratio is not None and ratio >= threshold
+    if should_vacuum:
+        with db.connect(db_path) as conn:
+            conn.execute("VACUUM")
 
 
 def maybe_apply_runtime_retention(db_path: Path) -> None:
@@ -737,19 +772,22 @@ def maybe_apply_runtime_retention(db_path: Path) -> None:
     which raises rather than returns if the original turns out not to be
     byte-identical afterward.
 
-    A companion `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk after a clean
-    prune. VACUUM rewrites the whole database under an exclusive lock, so
-    it is opt-in and should only be enabled on a single-host install that can
-    pause other writers briefly.
+    VACUUM remains opt-in: it runs unconditionally with
+    `AICC_RUNTIME_VACUUM_ON_START=1`, or only when the post-prune freelist
+    fraction reaches `AICC_RUNTIME_VACUUM_FREE_RATIO`. Both controls also work
+    without retention because ordinary task deletion can create bloat.
     """
     raw = os.environ.get("AICC_RUNTIME_RETENTION_DAYS")
     if not raw:
+        _maybe_vacuum(db_path)
         return
     try:
         retention_days = int(raw)
     except ValueError:
+        _maybe_vacuum(db_path)
         return
     if retention_days <= 0:
+        _maybe_vacuum(db_path)
         return
     archive_dir = os.environ.get(RUNTIME_RETENTION_ARCHIVE_DIR_ENV)
     if not archive_dir:
@@ -761,8 +799,10 @@ def maybe_apply_runtime_retention(db_path: Path) -> None:
             raw,
             RUNTIME_RETENTION_ARCHIVE_DIR_ENV,
         )
+        _maybe_vacuum(db_path)
         return
     vacuum = os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1"
+    vacuum_free_ratio = _configured_vacuum_free_ratio()
     dry_run = os.environ.get(RUNTIME_RETENTION_DRY_RUN_ENV) == "1"
 
     # Imported here, not at module scope: `maintenance` imports the `db`
@@ -777,6 +817,7 @@ def maybe_apply_runtime_retention(db_path: Path) -> None:
             retention_days=retention_days,
             archive_dir=Path(archive_dir),
             vacuum=vacuum,
+            vacuum_free_ratio=vacuum_free_ratio,
         )
     except ValueError:
         # An unusable `AICC_RUNTIME_TZ`. This path runs inside `migrate()`, on
