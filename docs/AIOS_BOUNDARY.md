@@ -276,6 +276,22 @@ prohibited, and convergence into AIOS Core remains this subsystem's stated
 end state once the core's dispatch contract (aios ADR-0022) is accepted and
 covers it.
 
+`tests/db/test_queue_claim.py` proves the claim protocol mechanically —
+one process, several roles, real concurrency inside one database. A separate
+acceptance check (`VOYN-W0-AICC-CLAIM-TWO-HOST-ACCEPTED`) additionally
+exercises exclusivity, the stale-owner fence, and claimant identity across two
+independently-authenticated per-host roles — the same identity mechanism
+production uses to tell hosts apart — including refusal of `SET ROLE`
+laundering and of a stolen claim token. It was run against the protocol as
+accepted at `origin/main@f9bb889` (SRV-04b, #311); the relevant SQL
+(`command_center/db/sql/0002_queue_claim.up.sql`) is checked byte-identical
+between that commit and the one this note is attached to, rather than assumed
+to carry forward unchanged. See
+[`docs/srv04b-two-host-acceptance.md`](srv04b-two-host-acceptance.md) for the
+commands, configuration, and committed raw output behind those claims, and for
+what the check does and does not establish (single-server, two-role rig — not
+a literal multi-physical-host network-partition drill).
+
 ## CI wiring
 
 - The required merge gate already runs these tests: `pytest -q` in

@@ -8,6 +8,34 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — SRV-04b two-role acceptance check (`VOYN-W0-AICC-CLAIM-TWO-HOST-ACCEPTED`)
+- `docs/srv04b-two-host-acceptance.md`: a rewritten acceptance record for the
+  `0002_queue_claim` protocol, replacing the previous, rejected version (PR
+  #459) that made specific empirical claims (192 attempts/8 winners, a
+  27.45s expiry, a real network blackhole, 67ms jitter, NAT collapsing
+  client addresses) with no command, config, raw output, or artifact a
+  reviewer could check them against. This version names the tested SHA
+  precisely (`origin/main@f9bb889`, SRV-04b, #311), proves the relevant SQL
+  is byte-identical between that commit and the one this record is attached
+  to rather than assuming it, and backs every remaining claim with a
+  committed, reproducible script and its raw output.
+- `docs/evidence/srv04b-two-host-acceptance/acceptance_check.py`: the
+  reproducible check — two independently-authenticated per-host roles (the
+  production mechanism for distinguishing hosts) against one real
+  PostgreSQL server, proving exclusivity (192 attempts, 8 winners, measured
+  not asserted), the stale-owner fence (timed, not slept-and-guessed),
+  refusal of `SET ROLE` laundering and of a stolen claim token, claimant
+  forgery refusal, and independence from both server-side timestamp
+  parameters and client session time zone. Explicitly scoped: single
+  machine, not physically separate hosts, and says so.
+- `docs/evidence/srv04b-two-host-acceptance/run-2026-09-02.log`: the raw,
+  committed output of one such run (PostgreSQL 16.15, repo commit
+  `c9d2e23d06814e04f8f44217730781f06f1308bf`), the source of every number
+  quoted in the record.
+- `docs/AIOS_BOUNDARY.md`: the SRV-04b exception note's cross-reference is
+  corrected to name the tested SHA instead of claiming coverage of "this
+  exact commit," and now links the evidence backing it.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

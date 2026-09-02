@@ -1,0 +1,63 @@
+=== SRV-04b two-host acceptance check ===
+repo HEAD: c9d2e23d06814e04f8f44217730781f06f1308bf
+0002_queue_claim.up.sql sha256: 4899588ad421ce8cdc7dcccd12fcfa6539be019a1cb667153d344aec1a5ed5b6
+AICC_TEST_PG_ADMIN_DSN (redacted user/host shape only): ['host=/tmp/aicc_pg_evidence', 'port=5544']
+server version: PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+scratch database: aicc_srv04b_27568a8a
+host A role: aicc_wh_srv04b_07230a_0
+host B role: aicc_wh_srv04b_ef383b_1
+
+--- 1. Exclusivity: 8 rounds x 24 concurrent claimers, 2 hosts ---
+  round 0: item=wki_593f59d8b0fd4bdba1f8969b3bb2dc13 attempts=24 winners=1
+  round 1: item=wki_c5825578b94d4b80a8a8d92936695cad attempts=24 winners=1
+  round 2: item=wki_2bc68ebd48e14305a3c9f7ce8102aae3 attempts=24 winners=1
+  round 3: item=wki_ea1851ae1b824455848c41447c8c7abc attempts=24 winners=1
+  round 4: item=wki_bc8fef64a4c24d9e83f6d1e79ff495f7 attempts=24 winners=1
+  round 5: item=wki_abd879ef4bac47fda2a976693d3e0f42 attempts=24 winners=1
+  round 6: item=wki_29fd26be40aa43a3b53656827ff71853 attempts=24 winners=1
+  round 7: item=wki_c4e3e31a418146dc9f6112ab4ec3fde6 attempts=24 winners=1
+TOTAL: attempts=192 winners=8 per_round=[1, 1, 1, 1, 1, 1, 1, 1]
+
+--- 2. Stale-owner fence: measured wall-clock time to attempt_expired ---
+  visibility_seconds=2 measured_elapsed_to_reaped_state('expired')=2.013s owner backend alive throughout: yes
+  stale owner's queue_complete: ok=False reason=attempt_expired
+  item re-delivered to host B: attempt_no=2 (expected 2)
+
+--- 3. session_user vs current_user: SET ROLE laundering ---
+  before SET ROLE: session_user=aicc_wh_srv04b_ef383b_1 current_user=aicc_wh_srv04b_ef383b_1
+  after  SET ROLE: session_user=aicc_wh_srv04b_ef383b_1 current_user=aicc_wh_srv04b_07230a_0 (current_user now equals the victim's role; session_user does not)
+  queue_complete as launderer: ok=False reason=not_claimant
+
+--- 4. Cross-host token theft (no SET ROLE, just a stolen token) ---
+  host B replays host A's token: ok=False reason=not_claimant
+
+--- 5. Claimant forgery is refused even for the table owner ---
+  forged claimant refused: work_attempt: claimant is derived, not declared (aicc_wh_srv04b_07230a_0 <> aicc_migrator)
+
+--- 6. Zero timestamp parameters across the protocol's functions ---
+  _queue_audit(p_work_item_id text, p_attempt_id text, p_event text, p_outcome text, p_reason text, p_detail jsonb DEFAULT NULL::jsonb)
+  _queue_backoff(p_base_seconds integer, p_attempt_no integer)
+  _queue_new_id(p_prefix text)
+  _queue_owns(p_attempt_id text, p_claim_token text, OUT reason text, OUT work_item_id text, OUT attempt_no integer)
+  queue_claim(p_queue text, p_claim_token_hash text, p_visibility_seconds integer DEFAULT 60)
+  queue_complete(p_attempt_id text, p_claim_token text, p_result jsonb)
+  queue_enqueue(p_queue text, p_idempotency_key text, p_payload jsonb, p_task_id text DEFAULT NULL::text, p_repository_id text DEFAULT NULL::text, p_max_attempts integer DEFAULT 3, p_priority integer DEFAULT 0, p_delay_seconds integer DEFAULT 0, p_backoff_seconds integer DEFAULT 2)
+  queue_fail(p_attempt_id text, p_claim_token text, p_reason text, p_retryable boolean DEFAULT true)
+  queue_heartbeat(p_attempt_id text, p_claim_token text)
+  queue_reap()
+  queue_redrive(p_work_item_id text, p_extra_attempts integer DEFAULT 1)
+  functions inspected: 11
+  functions with a timestamp-typed parameter: 0
+
+--- 7. Client session timezone does not affect the claim window ---
+  UTC+14 session visible_until (as UTC): 2026-09-03 06:07:57.467978+14:00
+  UTC-12 session visible_until (as UTC): 2026-09-02 04:07:57.480025-12:00
+  |delta| = 0.012s over a 100s window (both from server now())
+
+--- 8. Address-based attribution collapses; role attribution doesn't ---
+  host A: inet_client_addr=None session_user=aicc_wh_srv04b_07230a_0
+  host B: inet_client_addr=None session_user=aicc_wh_srv04b_ef383b_1
+  addresses equal: True  (true by construction on one machine -- a stronger case than NAT collapse, not a substitute for it) | session_user distinguishes them: True
+
+=== ALL CHECKS PASSED ===
+EXIT: 0
