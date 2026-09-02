@@ -1715,6 +1715,45 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
     assert sum(1 for _, r in report.skipped if r == "branch_behind_update_capped") == 2
 
 
+def test_merge_train_reads_readiness_and_merge_state_from_one_snapshot(rig, monkeypatch):  # noqa: F811
+    """The readiness (accept marker + checks) and BEHIND/DIRTY decisions must
+    come from the SAME `gh pr view` response, not two separate round-trips --
+    a PR that changed in between (a force-push, a base merge landing, a new
+    review) would otherwise have its two decisions made against different
+    moments. Rejected review of 0dcc5788: a two-call version. Exactly one
+    `pr view` call per PR proves the coordinator fetched once and reused it."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MT-SNAP", "https://github.com/x/y/pull/61")
+    head = "9" * 40
+    snapshot_calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            # The merged-target-sha check (a separate, prior concern -- has
+            # its PR already landed?) requests different fields and is not
+            # what this test is about; only count the readiness/merge-state
+            # snapshot fetch this fix consolidated into a single call.
+            if argv[-1] == review_merge._PR_SNAPSHOT_FIELDS:
+                snapshot_calls.append(argv)
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "update-branch"]:
+            return subprocess.CompletedProcess(argv, 0, "updated", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert len(snapshot_calls) == 1
+    assert ("VOYN-W0-MT-SNAP", "branch_updated_behind_main") in report.skipped
+
+
 def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch):
     """After the marker is posted, the failing pull_request-triggered
     Acceptance-gate run for the exact head is re-run so branch protection stops

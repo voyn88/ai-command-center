@@ -2082,10 +2082,28 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
     return list(latest.values())
 
 
-def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
+#: Every field the merge-train coordinator needs off a single PR: acceptance
+#: readiness (reviews/checks/author/head) AND mergeStateStatus, so a caller
+#: that must decide both can fetch once and hand the same dict to both
+#: `_pr_is_mergeable` and `_merge_state` -- see their `data` parameter.
+_PR_SNAPSHOT_FIELDS = "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author"
+
+
+def _pr_is_mergeable(
+    repo_path: str, pr_url: str, data: dict[str, Any] | None = None
+) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
     marker -- from a reviewer login that is NOT the PR's own author -- stands
     on the head. `gh pr view` gives all of it in one call.
+
+    `data`, if given, is an already-fetched `gh pr view` payload (see
+    `_PR_SNAPSHOT_FIELDS`) and no `gh` call is made: the merge-train
+    coordinator also needs `mergeStateStatus` off the same PR, and reading it
+    from a second, separate `gh pr view` let readiness and BEHIND/DIRTY be
+    decided from two different moments in the PR's life (a force-push, a
+    base merge, a new review landing in between) -- rejected review of
+    0dcc5788 on the two-call version. One snapshot, reused for both
+    decisions, means there is nothing to land between them.
 
     The GitHub Actions "Acceptance gate" check (`.github/workflows/
     acceptance-gate.yml`) used to be excluded here by a `"cceptance" not in
@@ -2099,16 +2117,16 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     so that check reflects reality again and is required like any other --
     removing the exclusion is not a relaxation, it is retiring a workaround
     whose reason to exist is gone."""
-    view = _gh(
-        ["pr", "view", pr_url, "--json",
-         "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author"],
-        repo_path,
-    )
-    if view.returncode != 0:
-        return False, f"gh_view_failed: {view.stderr.strip()[:100]}"
-    data = json.loads(view.stdout or "{}")
-    if data.get("state") != "OPEN":
-        return False, f"pr_{str(data.get('state')).lower()}"
+    if data is None:
+        view = _gh(["pr", "view", pr_url, "--json", _PR_SNAPSHOT_FIELDS], repo_path)
+        if view.returncode != 0:
+            return False, f"gh_view_failed: {view.stderr.strip()[:100]}"
+        try:
+            data = json.loads(view.stdout or "{}")
+        except json.JSONDecodeError:
+            return False, "gh_view_malformed"
+    if not isinstance(data, dict) or data.get("state") != "OPEN":
+        return False, f"pr_{str((data or {}).get('state')).lower()}"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
@@ -2121,24 +2139,31 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return True, head
 
 
-def _merge_state(repo_path: str, pr_url: str) -> str:
+def _merge_state(
+    repo_path: str, pr_url: str, data: dict[str, Any] | None = None
+) -> str:
     """The PR's GitHub mergeStateStatus for the merge-train coordinator.
 
     Returns one of BEHIND/DIRTY/BLOCKED/CLEAN/UNKNOWN, or "" for a non-open PR
     or a failed lookup. BEHIND means the base advanced after the PR branched
     and its branch must be updated before it can ever merge; DIRTY means a real
     conflict that only a rebase can resolve.
+
+    `data`, if given, is an already-fetched `gh pr view` payload (see
+    `_pr_is_mergeable`'s `data` parameter for why callers share one snapshot)
+    and no `gh` call is made.
     """
-    view = _gh(["pr", "view", pr_url, "--json", "mergeStateStatus,state"], repo_path)
-    if view.returncode != 0:
-        return ""
-    # A zero exit with malformed/empty output (a transient gh hiccup) is a
-    # failed lookup, not a reason to abort the whole merge tick: treat any
-    # unparseable response as "" exactly as the docstring promises.
-    try:
-        data = json.loads(view.stdout or "{}")
-    except json.JSONDecodeError:
-        return ""
+    if data is None:
+        view = _gh(["pr", "view", pr_url, "--json", "mergeStateStatus,state"], repo_path)
+        if view.returncode != 0:
+            return ""
+        # A zero exit with malformed/empty output (a transient gh hiccup) is a
+        # failed lookup, not a reason to abort the whole merge tick: treat any
+        # unparseable response as "" exactly as the docstring promises.
+        try:
+            data = json.loads(view.stdout or "{}")
+        except json.JSONDecodeError:
+            return ""
     if not isinstance(data, dict) or data.get("state") != "OPEN":
         return ""
     return str(data.get("mergeStateStatus") or "")
@@ -2301,7 +2326,28 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             report.skipped.append((task_id, merge_reason))
             continue
         if merge_sha is None:
-            ready, detail = _pr_is_mergeable(repo_path, pr_url)
+            # One `gh pr view` snapshot backs both the readiness check and the
+            # BEHIND/DIRTY decision below -- a rejected earlier cut of this
+            # coordinator (review of 0dcc5788) fetched them with two separate
+            # calls, so a PR that changed between the two (a force-push, a
+            # base merge, a new review landing in between) could have its
+            # merge-state decision made against a different moment than its
+            # readiness decision. Fetching once and reusing the same dict for
+            # both means there is nothing to change in between.
+            view = _gh(["pr", "view", pr_url, "--json", _PR_SNAPSHOT_FIELDS], repo_path)
+            if view.returncode != 0:
+                report.skipped.append(
+                    (task_id, f"gh_view_failed: {view.stderr.strip()[:100]}")
+                )
+                continue
+            try:
+                snapshot = json.loads(view.stdout or "{}")
+            except json.JSONDecodeError:
+                snapshot = None
+            if not isinstance(snapshot, dict):
+                report.skipped.append((task_id, "gh_view_malformed"))
+                continue
+            ready, detail = _pr_is_mergeable(repo_path, pr_url, data=snapshot)
             if not ready:
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake
@@ -2321,7 +2367,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             # before the call -- so repeated failures cannot exceed the
             # per-tick mutation budget. DIRTY here would be a real conflict,
             # left for a rebase.
-            state = _merge_state(repo_path, pr_url)
+            state = _merge_state(repo_path, pr_url, data=snapshot)
             if state == "DIRTY":
                 report.skipped.append((task_id, "branch_dirty_needs_rebase"))
                 continue
