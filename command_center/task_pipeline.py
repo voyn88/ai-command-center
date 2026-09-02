@@ -1686,13 +1686,24 @@ def find_stuck_tasks(
     # 1. A decision that refused to launch for a structural reason. A transient
     #    DEFER (capacity, workspace busy, backoff) is explicitly *not* stuck —
     #    it clears on its own, and reporting it would drown the real cases.
+    #    `REASON_RETRY_TIMING_UNKNOWN` is a DEFER in *action* only: it means the
+    #    prior run's completion time can never be computed, so nothing about
+    #    this task changes tick to tick and it will defer forever exactly like
+    #    a structural block — mislabeling it as the former hid it from every
+    #    report the latter reaches (VOYN-W0-AICC-LAUNCH-STATUS-MISLABEL).
     for decision in decisions:
         if decision.launched or not decision.task_id:
             continue
         task = by_id.get(decision.task_id)
         if task is None or task.get("status") == "Done":
             continue
-        blocked_structurally = decision.action in (scheduler.ACTION_BLOCKED, ACTION_SKIPPED)
+        blocked_structurally = decision.action in (
+            scheduler.ACTION_BLOCKED,
+            ACTION_SKIPPED,
+        ) or (
+            decision.action == scheduler.ACTION_DEFER
+            and decision.reason_code == scheduler.REASON_RETRY_TIMING_UNKNOWN
+        )
         refused_at_launch = bool(decision.launch_reason_code) and not decision.launched
         if blocked_structurally or refused_at_launch:
             _add(
