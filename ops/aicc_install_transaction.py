@@ -4586,6 +4586,12 @@ GIT_CONFIG_FREE = (
     "filter.lfs.process=",
     "-c",
     "uploadpack.packObjectsHook=",
+    # Mirrors stage-0's GIT_CONFIG_FREE, and the release-manifest drift test
+    # holds the two lists identical. See the bootstrap module for the
+    # incident: GitHub 401s anonymous git-upload-pack over HTTP/2 from
+    # datacenter IPs while HTTP/1.1 succeeds (voyn-worker-01, 2026-09-02).
+    "-c",
+    "http.version=HTTP/1.1",
 )
 
 
