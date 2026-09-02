@@ -1717,28 +1717,28 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
 
 def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch):
     """After the marker is posted, the failing pull_request-triggered
-    Acceptance-gate run for the exact head is re-run so branch protection stops
-    seeing a red required check. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)"""
+    Acceptance-gate run for the exact head AND this PR's own number is
+    re-run so branch protection stops seeing a red required check.
+    (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)"""
     import subprocess
 
     sha = "a" * 40
     reran = []
-
-    branches = []
+    api_calls = []
 
     def fake_gh(argv, repo):
-        if argv[:2] == ["pr", "view"]:
-            return subprocess.CompletedProcess(
-                argv, 0, json.dumps({"headRefName": "feature/x"}), "")
-        if argv[:2] == ["run", "list"]:
-            branches.append(argv)  # must be scoped to the PR's branch
+        if argv[0] == "api":
+            api_calls.append(argv[1])
             body = json.dumps([
-                {"databaseId": 111, "headSha": sha, "event": "pull_request",
-                 "status": "completed", "conclusion": "failure"},
-                {"databaseId": 222, "headSha": sha, "event": "pull_request_review",
-                 "status": "completed", "conclusion": "success"},
-                {"databaseId": 333, "headSha": "b" * 40, "event": "pull_request",
-                 "status": "completed", "conclusion": "failure"},
+                {"id": 111, "status": "completed", "conclusion": "failure",
+                 "pull_requests": [{"number": 1}]},
+                {"id": 222, "status": "completed", "conclusion": "success",
+                 "pull_requests": [{"number": 1}]},
+                # Same head sha, but a DIFFERENT pull request (e.g. the same
+                # branch opened against a second base branch) -- must never
+                # be picked, even though sha and workflow both match.
+                {"id": 333, "status": "completed", "conclusion": "failure",
+                 "pull_requests": [{"number": 2}]},
             ])
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["run", "rerun"]:
@@ -1748,8 +1748,78 @@ def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/1", sha)
-    assert reran == ["111"]  # only the failing pull_request run for THIS head
-    assert branches and "--branch" in branches[0] and "feature/x" in branches[0]
+    assert reran == ["111"]  # only PR #1's own failing pull_request run
+    assert api_calls and f"head_sha={sha}" in api_calls[0]
+    assert "actions/workflows/acceptance-gate.yml/runs" in api_calls[0]
+    assert "event=pull_request" in api_calls[0]
+
+
+def test_marker_post_rerun_ignores_a_different_prs_run_on_the_same_sha(monkeypatch):
+    """Two PRs can share both a head sha and a head branch name when the
+    same branch is opened against two different base branches in the same
+    repo -- live defect confirmed by adversarial review of 487a78a. Only
+    THIS pull request's own failing run may ever be re-run; a same-sha
+    run belonging to a different PR number is left untouched, even when it
+    is the only failing run returned."""
+    import subprocess
+
+    sha = "c" * 40
+    reran = []
+
+    def fake_gh(argv, repo):
+        if argv[0] == "api":
+            body = json.dumps([
+                {"id": 999, "status": "completed", "conclusion": "failure",
+                 "pull_requests": [{"number": 42}]},  # belongs to a different PR
+            ])
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "rerun"]:
+            reran.append(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/7", sha)
+    assert reran == []
+
+
+def test_marker_post_rerun_paginates_past_the_first_page(monkeypatch):
+    """The intended run must not be missed just because it lands on a later
+    page -- a fixed client-side run-count limit was the earlier defect
+    (review of 487a78a). A full first page of non-matching runs is walked
+    before the matching run on page 2 is found and rerun."""
+    import subprocess
+
+    sha = "d" * 40
+    reran = []
+    pages_requested = []
+
+    def fake_gh(argv, repo):
+        if argv[0] == "api":
+            endpoint = argv[1]
+            page = int(endpoint.rsplit("page=", 1)[1])
+            pages_requested.append(page)
+            if page == 1:
+                filler = [
+                    {"id": i, "status": "completed", "conclusion": "success",
+                     "pull_requests": [{"number": 5}]}
+                    for i in range(100)
+                ]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(filler), "")
+            body = json.dumps([
+                {"id": 555, "status": "completed", "conclusion": "failure",
+                 "pull_requests": [{"number": 5}]},
+            ])
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "rerun"]:
+            reran.append(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/5", sha)
+    assert reran == ["555"]
+    assert pages_requested == [1, 2]
 
 
 # --- VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY + CI-FLAKE-AUTO-RERUN -----
