@@ -1,0 +1,95 @@
+name: Security scans
+
+# The deterministic first tier of independent review (VOYN-PLAT-FIND-12,
+# owner decision 2026-09-03 "ставим все"): secret scanning over the full
+# history (gitleaks), dependency/filesystem vulnerabilities (trivy), and
+# Python security lints (bandit). Deliberately built from checksum-pinned
+# release binaries and a version-pinned pip package rather than marketplace
+# actions: the only `uses:` here is the same SHA-pinned checkout ci.yml
+# already trusts, no step reads a repository secret, and the sweep
+# invariants in tests/test_release_gate_policy.py apply to this file
+# exactly as to every other workflow in the directory.
+#
+# Advisory during burn-in: these jobs are not yet required contexts.
+# Promotion to branch protection is a separate, deliberate change after the
+# false-positive rate on real traffic is known.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Weekly full sweep independent of change traffic, so a newly published
+    # CVE or a newly recognised secret pattern is found without waiting for
+    # the next PR.
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    name: Secret scan (gitleaks, full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository (full history)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (checksum-pinned release)
+        run: |
+          set -eu
+          curl -fsSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Scan full git history for secrets
+        run: gitleaks git --redact --no-banner --exit-code 1 .
+
+  dependency-scan:
+    name: Dependency and filesystem scan (trivy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install trivy (checksum-pinned release)
+        run: |
+          set -eu
+          curl -fsSL -o trivy.tar.gz \
+            https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz
+          echo "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a  trivy.tar.gz" | sha256sum -c -
+          tar -xzf trivy.tar.gz trivy
+          install -m 0755 trivy /usr/local/bin/trivy
+
+      - name: Scan lockfiles and filesystem (critical/high fail)
+        run: |
+          trivy fs --scanners vuln,misconfig,secret \
+            --severity CRITICAL,HIGH --exit-code 1 --no-progress .
+
+  python-security-lint:
+    name: Python security lint (bandit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Install bandit (version-pinned)
+        run: python -m pip install bandit==1.9.4
+
+      - name: Lint production Python for security issues
+        # Medium+ severity, medium+ confidence: the tier is deterministic
+        # and advisory; tests and fixtures are out of scope by design.
+        run: bandit -r command_center ops -ll -ii
