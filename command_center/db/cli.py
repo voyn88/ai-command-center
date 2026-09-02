@@ -9,6 +9,8 @@ every deploy as the migrator. The application credential does neither.
     AICC_PG_USER=postgres       ... python -m command_center.db bootstrap
     AICC_PG_USER=aicc_migrator  ... python -m command_center.db upgrade
     AICC_PG_USER=aicc_app       ... python -m command_center.db status
+    AICC_PG_USER=aicc_app       ... python -m command_center.db fleet-status
+    AICC_PG_USER=aicc_operator  ... python -m command_center.db fleet-suspend <id> --reason ...
 """
 
 from __future__ import annotations
@@ -173,6 +175,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    # The fleet's single-panel view over enrolled worker-host devices
+    # (VOYN-MIN-FARM: "10 devices managed by one operational panel"). Reads
+    # run as whichever role connects (`aicc_app` or `aicc_operator`); suspend
+    # is `aicc_operator`-only, enforced by the grant on
+    # `identity_revoke_principal`, not by this CLI.
+    fleet_status = sub.add_parser(
+        "fleet-status",
+        help="List every enrolled worker-host device: state, host, live "
+        "credential expiry, and last audit event, in one query.",
+    )
+    fleet_status.add_argument(
+        "--state",
+        default=None,
+        choices=("active", "suspended", "retired"),
+        help="Restrict to one lifecycle state.",
+    )
+    fleet_status.add_argument(
+        "--limit", type=int, default=100, help="Rows to show (default 100)."
+    )
+    fleet_suspend = sub.add_parser(
+        "fleet-suspend",
+        help="Suspend a worker-host device and revoke its live credential(s) "
+        "(operator-only: an incident decision, not a routine one).",
+    )
+    fleet_suspend.add_argument(
+        "principal_id", help="The worker-host principal id from fleet-status."
+    )
+    fleet_suspend.add_argument(
+        "--reason", required=True, help="Audited reason for the suspension."
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -295,6 +328,54 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
+
+            if args.command == "fleet-status":
+                from command_center.db.fleet_admin import FleetAdmin
+
+                devices = FleetAdmin(lambda: nullcontext(conn)).list_devices(
+                    state=args.state, limit=args.limit
+                )
+                if not devices:
+                    print("no worker-host devices enrolled")
+                    return 0
+                for device in devices:
+                    credential = device.credential_expires_at or "none issued"
+                    event = (
+                        f"{device.last_event_type}/{device.last_event_outcome}"
+                        f"@{device.last_event_at}"
+                        if device.last_event_type
+                        else "(no events)"
+                    )
+                    print(
+                        f"{device.principal_id}  state={device.state}  "
+                        f"host={device.host}  credential_expires={credential}  "
+                        f"last_event={event}"
+                    )
+                print(f"{len(devices)} device(s)")
+                return 0
+
+            if args.command == "fleet-suspend":
+                from command_center.db.fleet_admin import (
+                    FleetAdmin,
+                    UnknownDeviceError,
+                )
+
+                try:
+                    revoked = FleetAdmin(lambda: nullcontext(conn)).suspend(
+                        args.principal_id, args.reason
+                    )
+                except UnknownDeviceError:
+                    print(
+                        f"refused: {args.principal_id} is not an enrolled "
+                        "worker-host device",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(
+                    f"suspended {args.principal_id}; revoked {revoked} live "
+                    "credential(s)"
+                )
+                return 0
 
             if args.command == "backlog-import":
                 from pathlib import Path
