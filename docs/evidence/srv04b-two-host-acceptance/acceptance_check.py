@@ -134,6 +134,21 @@ def main() -> int:
     try:
         with psycopg.connect(test_dsn, autocommit=True) as admin_conn:
             roles.apply_bootstrap(admin_conn)
+            # apply_bootstrap() creates every product role NOLOGIN by design
+            # (command_center/db/roles.py:render_role_creation) -- passwords
+            # and LOGIN are an operator/test-fixture concern, not something
+            # committed. tests/db/conftest.py's role_passwords fixture does
+            # this same ALTER before connecting as any product role; this
+            # script needs the identical step for the two roles it
+            # authenticates as directly (MIGRATOR_ROLE to migrate, APP_ROLE
+            # to enqueue).
+            with admin_conn.cursor() as cur:
+                for role in (roles.MIGRATOR_ROLE, roles.APP_ROLE):
+                    cur.execute(
+                        sql.SQL("ALTER ROLE {} LOGIN PASSWORD {}").format(
+                            sql.Identifier(role), sql.Literal(role_passwords[role])
+                        )
+                    )
             with psycopg.connect(
                 as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]),
                 autocommit=True,

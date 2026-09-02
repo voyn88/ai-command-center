@@ -92,8 +92,8 @@ touches nothing else in the target cluster.
 
 The full raw output of one such run is committed at
 [`docs/evidence/srv04b-two-host-acceptance/run-2026-09-02.log`](evidence/srv04b-two-host-acceptance/run-2026-09-02.log)
-(SHA-256 `a06fccd6f8492618184b5c3dc9dcea3b092ab4d04c3a39e42ba21a46d50e44d0`),
-produced against PostgreSQL 16.15 on repo commit `c9d2e23d06814e04f8f44217730781f06f1308bf`.
+(SHA-256 `3e012c92c8b5bd98c1763fec25f3314829b12667f8a133020bb936f1ece9c72d`),
+produced against PostgreSQL 16.15 on repo commit `60bbc6f69c682e733530f504e5c1a5b9e53424fa`.
 The numbers quoted below are taken directly from that log.
 
 ## Exclusivity, under real concurrent connections
@@ -112,7 +112,7 @@ and idle (`pg_stat_activity` confirms the backend is alive throughout — this
 is what a stuck-but-connected owner looks like from the server's side, the
 scenario the fence exists for, described in
 `command_center/db/sql/0002_queue_claim.up.sql:31-38`). The log shows the
-attempt reaching `expired` state 2.013s after the claim, against the 2s
+attempt reaching `expired` state 2.046s after the claim, against the 2s
 window requested — measured by polling, not slept-and-hoped. The still-alive
 owner then attempts `queue_complete()` and is refused with `attempt_expired`
 (`_queue_owns`, `command_center/db/sql/0002_queue_claim.up.sql:645-650`); the
@@ -156,7 +156,7 @@ structural fact about the schema, not a sampled behavior — the query is
 exhaustive over every function this migration defines. Separately, two claims
 made in sessions with `SET TIME ZONE 'Etc/GMT-14'` (UTC+14) and `SET TIME
 ZONE 'Etc/GMT+12'` (UTC-12) against a 100-second visibility window produced
-`visible_until` values 0.012s apart when compared as absolute instants — the
+`visible_until` values 0.015s apart when compared as absolute instants — the
 window is computed from the server's `now()`, and the client's session time
 zone does not participate.
 
@@ -183,7 +183,7 @@ attribution (`session_user`) is unaffected either way.
   record, which claimed a non-Linux database host and offered no artifact for
   it. This record makes no claim about behavior under a non-Linux database
   host in either direction; it simply was not exercised, so none is made.
-- Timing numbers (the 2.013s expiry, the 0.012s time-zone delta) are this
+- Timing numbers (the 2.046s expiry, the 0.015s time-zone delta) are this
   run's measurements, not architectural guarantees; they will vary run to
   run within the bounds the protocol's design implies (expiry cannot fire
   before the requested visibility window, and the time-zone delta should

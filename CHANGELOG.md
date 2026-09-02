@@ -30,11 +30,35 @@ functional application milestones of `app.py`.
   machine, not physically separate hosts, and says so.
 - `docs/evidence/srv04b-two-host-acceptance/run-2026-09-02.log`: the raw,
   committed output of one such run (PostgreSQL 16.15, repo commit
-  `c9d2e23d06814e04f8f44217730781f06f1308bf`), the source of every number
+  `60bbc6f69c682e733530f504e5c1a5b9e53424fa`), the source of every number
   quoted in the record.
 - `docs/AIOS_BOUNDARY.md`: the SRV-04b exception note's cross-reference is
   corrected to name the tested SHA instead of claiming coverage of "this
   exact commit," and now links the evidence backing it.
+
+### Fixed — `acceptance_check.py` could not actually run as committed
+- The script authenticated as `MIGRATOR_ROLE`/`APP_ROLE` immediately after
+  `roles.apply_bootstrap()`, which creates every product role `NOLOGIN` by
+  design (`command_center/db/roles.py:render_role_creation`) — passwords and
+  `LOGIN` are deliberately an operator/test-fixture concern, granted by
+  `tests/db/conftest.py`'s `role_passwords` fixture, not by bootstrap itself.
+  Run verbatim against a real PostgreSQL 16.15 server, the script failed
+  immediately with `role "aicc_migrator" is not permitted to log in` — it
+  could not have produced the log it shipped with. Fixed by granting
+  `LOGIN`/`PASSWORD` to those two roles the same way the test fixture does,
+  before connecting as either. Re-ran end to end against a real server;
+  `docs/evidence/srv04b-two-host-acceptance/run-2026-09-02.log` and the
+  numbers quoted in `docs/srv04b-two-host-acceptance.md` are now this actual
+  run's output, not the previous (unreproducible) log.
+- `tests/architecture/aios_boundary.py`: the previous commit added
+  `docs/evidence/srv04b-two-host-acceptance/acceptance_check.py` (imports
+  `psycopg`, a DB driver) without updating `AIOS_BOUNDARY_BASELINE.json`, so
+  `pytest -q tests/architecture/` — the required merge gate — failed with
+  `NEW ENGINE MODULE`. `compute_engine_inventory()` now excludes
+  `docs/evidence/**` the same way it already excludes `tests/`: both are
+  manually invoked, produce no shipped capability, and exist only to
+  exercise the frozen engines and prove a property; Gate 1's repo-wide import
+  ban is unaffected.
 
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract

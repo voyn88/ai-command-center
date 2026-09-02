@@ -136,6 +136,12 @@ Name signatures are skipped for pure presentation layers
 existing engines don't count as engines — but the import/call signatures still
 apply there, so an engine cannot hide in the UI layer.
 
+Gate 2 also skips test files (`tests/**`, `test_*.py`) and standalone
+acceptance/reproducibility scripts committed alongside a doc record
+(`docs/evidence/**`, e.g. the SRV-04b check below): both exercise the frozen
+engines to prove a property rather than shipping capability. Gate 1's
+repo-wide import ban still applies to both.
+
 The current matches are frozen in
 [`tests/architecture/AIOS_BOUNDARY_BASELINE.json`](../tests/architecture/AIOS_BOUNDARY_BASELINE.json)
 (41 entries at freeze time). The gate fails when the detector's output differs

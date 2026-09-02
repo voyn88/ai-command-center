@@ -370,6 +370,16 @@ def _is_test_path(rel_path: str) -> bool:
     return "tests" in parts or parts[-1].startswith("test_")
 
 
+#: Standalone acceptance/reproducibility scripts committed alongside a
+#: `docs/` record (e.g. `docs/evidence/<record>/*.py`): manually invoked with
+#: an explicit env var, not imported by product code, not collected by
+#: pytest. Same reasoning as `_is_test_path` -- they exercise the frozen
+#: engines to produce evidence, they do not ship capability -- so Gate 2
+#: treats them the same way; Gate 1's import ban still applies repo-wide.
+def _is_evidence_path(rel_path: str) -> bool:
+    return rel_path.startswith("docs/evidence/")
+
+
 def _is_presentation(rel_path: str) -> bool:
     return rel_path.startswith(PRESENTATION_PREFIXES)
 
@@ -742,13 +752,14 @@ def classify_engine_categories(rel_path: str, tree: ast.AST) -> set[str]:
 def compute_engine_inventory() -> dict[str, list[str]]:
     """Current detector output: rel path → sorted engine categories.
 
-    Test files are out of scope (tests exercise the frozen engines; they do not
-    ship capability), but they remain fully covered by the import ban.
+    Test files and `docs/evidence/**` scripts are out of scope (both exercise
+    the frozen engines to prove a property; neither ships capability), but
+    they remain fully covered by the import ban.
     """
     inventory: dict[str, list[str]] = {}
     for path in iter_python_files():
         rel_path = _rel(path)
-        if _is_test_path(rel_path):
+        if _is_test_path(rel_path) or _is_evidence_path(rel_path):
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel_path)
         categories = classify_engine_categories(rel_path, tree)
