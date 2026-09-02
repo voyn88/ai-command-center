@@ -2309,10 +2309,14 @@ def force_remove_worktree(repo_root: str | Path, worktree_path: str | Path) -> N
 
     Best-effort and never raises: `git worktree remove --force` first: if
     that fails (the path was already gone, a lock, or any other refusal),
-    fall back to `shutil.rmtree` so the directory never lingers just because
-    git refused; then `git worktree prune` in the same repo unconditionally,
-    since a `--force` removal on some git versions can succeed on the
-    directory while leaving the `.git/worktrees/<name>` entry dangling."""
+    unlock it (a single `--force` does not override a lock -- git demands
+    either `-f -f` or an explicit unlock first, and `git worktree prune`
+    below will not touch a locked entry no matter how long its directory has
+    been gone), then fall back to `shutil.rmtree` so the directory never
+    lingers just because git refused; then `git worktree prune` in the same
+    repo unconditionally, since a `--force` removal on some git versions can
+    succeed on the directory while leaving the `.git/worktrees/<name>` entry
+    dangling."""
     repo = _resolve(repo_root)
     target = Path(worktree_path)
     try:
@@ -2328,6 +2332,17 @@ def force_remove_worktree(repo_root: str | Path, worktree_path: str | Path) -> N
     except _GIT_OPERATION_ERRORS:
         removed = False
     if not removed:
+        try:
+            subprocess.run(
+                ["git", "worktree", "unlock", str(target)],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except _GIT_OPERATION_ERRORS:
+            pass
         shutil.rmtree(target, ignore_errors=True)
     try:
         subprocess.run(
