@@ -8,6 +8,18 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Agent Leaderboard (`VOYN-AGT-LEADERBOARD`)
+- `command_center/leaderboard.py`: pure `compute_leaderboard()` over the
+  unified run list (`runtime.runs_read.list_unified_runs`), classifying each
+  agent into `Top`/`Challenger`/`Newcomer`/`Risky` from its scored-run
+  success rate, with a `trend` (`up`/`down`/`flat`/`insufficient_data`)
+  derived by comparing an earlier and a more recent half of its scored runs —
+  a sharp decline forces `Risky` even when the overall rate still looks
+  healthy, so the board shows a trend rather than only a static rank.
+- `command_center/ui/leaderboard_panel.py` + new "Лидерборд" section on the
+  existing "AI-агенты" page (`app.py`): read-only, per-tier rendering with
+  success rate, run counts and the earlier-vs-recent trend delta.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

@@ -47,6 +47,7 @@ from command_center.ui import (
     git_readers,
     home_dashboard,
     integration_center,
+    leaderboard_panel,
     legacy_task_helpers,
     live_board,
     master_backlog_panel,
@@ -2232,6 +2233,19 @@ elif page_key == "kanban":
 
 elif page_key == "agents":
     st.subheader("AI-агенты", anchor="agents")
+    agents_section = st.segmented_control(
+        "Раздел",
+        ["Каталог", "Лидерборд"],
+        default="Каталог",
+        key="agents_section",
+    )
+
+    if agents_section == "Лидерборд":
+        leaderboard_panel.render_leaderboard_panel(
+            db_path=get_execution_center_api().db_path, root=ROOT
+        )
+        st.stop()
+
     st.caption("Каталог типов задач, поддерживаемых scripts/start-task.sh")
 
     generated_files = artifacts.list_markdown_files(GENERATED_DIR)
