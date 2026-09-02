@@ -67,6 +67,17 @@ GIT_CONFIG_FREE = (
     "filter.lfs.process=",
     "-c",
     "uploadpack.packObjectsHook=",
+    # GitHub throttles ANONYMOUS git-upload-pack over HTTP/2 from datacenter
+    # address space: `info/refs` answers 200, then the POST answers 401 with
+    # `www-authenticate: Basic realm="GitHub"`, which surfaces here as
+    # `could not read Username ... terminal prompts disabled` and killed every
+    # install on voyn-worker-01 (Hetzner) on 2026-09-02. The same request over
+    # HTTP/1.1 succeeds. This module is deliberately config-free
+    # (GIT_CONFIG_NOSYSTEM=1), so the host cannot supply this knob -- it must
+    # live in the one command line this module builds. A deploy key was the
+    # cleaner fix and is refused by org policy ("Deploy keys are disabled").
+    "-c",
+    "http.version=HTTP/1.1",
 )
 
 

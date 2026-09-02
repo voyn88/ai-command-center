@@ -578,6 +578,11 @@ def test_git_argv_refuses_replacement_objects_and_execution_config():
         "core.sshCommand=/bin/false",
         "filter.lfs.smudge=",
         "uploadpack.packObjectsHook=",
+        # GitHub 401s anonymous git-upload-pack over HTTP/2 from datacenter
+        # IPs while the same POST over HTTP/1.1 succeeds (voyn-worker-01,
+        # 2026-09-02). This module ignores host git config on purpose, so the
+        # downgrade must ride the one command line it builds.
+        "http.version=HTTP/1.1",
     ):
         assert knob in flags, knob
     assert module._safe_environment(Path("/tmp"))["GIT_NO_REPLACE_OBJECTS"] == "1"
