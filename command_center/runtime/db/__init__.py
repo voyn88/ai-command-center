@@ -118,6 +118,7 @@ from command_center.runtime.db.execution import (  # noqa: F401
     get_reports_for_runs,
     get_run,
     get_run_finalization_claim,
+    get_runs_for_ids,
     get_session,
     get_task,
     latest_events_for_runs,

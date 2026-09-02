@@ -62,6 +62,99 @@ def test_new_run_persists_identity_and_explicit_unknowns(tmp_path):
     assert {"pr", "ci", "accepted_sha", "deployed_sha"} <= set(view["unknown_fields"])
 
 
+def test_view_surfaces_initiator_prompt_model_actions_and_reproducibility_hash(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    task = db.create_task(db_path, project="AICC", title="provenance", task_type="implementation")
+    session = db.create_session(
+        db_path, task_id=task["id"], project="AICC", repository_path="/worktrees/aicc/task"
+    )
+    run = db.create_run(
+        db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AICC",
+        task_type="implementation",
+        repository_path="/worktrees/aicc/task",
+        prompt="implement the thing",
+        is_resume=False,
+        command=["claude", "--session-id", session["id"]],
+        launch_source="kanban_task",
+        prompt_version=3,
+        provider_id="claude_code",
+        provider_metadata_json='{"model": "claude-sonnet-5"}',
+        capability_profile="WORKSPACE_WRITE",
+        granted_capabilities="fs.read,fs.write",
+        worktree_path="/worktrees/aicc/task",
+        branch="feature/x",
+        base_branch="main",
+        base_sha="a" * 40,
+        head_sha="a" * 40,
+    )
+
+    view = provenance.get_view(db_path, run["id"])
+
+    assert view["initiated_by"] == "kanban_task"
+    assert view["prompt"] == "implement the thing"
+    assert view["prompt_version"] == 3
+    assert view["model"] == "claude_code"
+    assert view["model_metadata"] == {"model": "claude-sonnet-5"}
+    assert view["actions"] == ["claude", "--session-id", session["id"]]
+    assert isinstance(view["reproducibility_hash"], str)
+    assert len(view["reproducibility_hash"]) == 64
+    for name in ("initiated_by", "prompt", "model", "actions", "reproducibility_hash"):
+        assert name not in view["unknown_fields"]
+
+
+def test_reproducibility_hash_is_deterministic_and_sensitive_to_its_inputs():
+    run = {
+        "prompt": "implement",
+        "prompt_version": 1,
+        "provider_id": "claude_code",
+        "provider_metadata_json": '{"model": "claude-sonnet-5"}',
+        "command_json": '["claude"]',
+        "capability_profile": "WORKSPACE_WRITE",
+        "granted_capabilities": "fs.read",
+    }
+    provenance_record = {"repository_path": "/repos/aicc", "branch": "main", "base_sha": "a" * 40}
+
+    first = provenance.compute_reproducibility_hash(run, provenance_record=provenance_record)
+    second = provenance.compute_reproducibility_hash(dict(run), provenance_record=dict(provenance_record))
+    assert first == second
+
+    changed_prompt = provenance.compute_reproducibility_hash(
+        {**run, "prompt": "implement differently"}, provenance_record=provenance_record
+    )
+    assert changed_prompt != first
+
+    changed_base_sha = provenance.compute_reproducibility_hash(
+        run, provenance_record={**provenance_record, "base_sha": "b" * 40}
+    )
+    assert changed_base_sha != first
+
+    assert provenance.compute_reproducibility_hash(None) is None
+
+
+def test_view_names_missing_initiator_prompt_model_and_actions_as_unknown(tmp_path):
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _run(db_path)
+
+    view = provenance.get_view(db_path, run["id"])
+
+    assert view["initiated_by"] is None
+    assert "initiated_by" in view["unknown_fields"]
+    assert view["actions"] is None
+    assert "actions" in view["unknown_fields"]
+    assert view["model_metadata"] is None
+    assert "model_metadata" in view["unknown_fields"]
+    # `prompt` and `model` are always supplied at launch (required constructor
+    # arguments on `create_run`), so they are never unknown for a real run.
+    assert view["prompt"] == "implement"
+    assert view["model"] == "claude_code"
+    assert view["reproducibility_hash"] is not None
+
+
 def test_legacy_backfill_is_bounded_idempotent_and_honest(tmp_path):
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)

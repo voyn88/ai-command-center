@@ -148,7 +148,47 @@ _SCALAR_UNKNOWN_FIELDS = (
     "head_sha",
     "accepted_sha",
     "deployed_sha",
+    "initiated_by",
+    "prompt",
+    "model",
+    "actions",
+    "reproducibility_hash",
 )
+
+#: The exact inputs a reproduction attempt must match: the instruction given
+#: to the agent (prompt/prompt_version), the model that executed it
+#: (provider_id/provider_metadata_json), the code state it started from
+#: (base_sha/branch — the "dataset" for a coding agent), the capabilities it
+#: was granted, and the literal command that was run. Two runs sharing this
+#: hash were given identical reproduction inputs; runs are free to differ in
+#: everything the hash omits (timestamps, pids, output) without breaking
+#: equality.
+_REPRODUCIBILITY_RUN_FIELDS = (
+    "prompt",
+    "prompt_version",
+    "provider_id",
+    "provider_metadata_json",
+    "command_json",
+    "capability_profile",
+    "granted_capabilities",
+)
+_REPRODUCIBILITY_PROVENANCE_FIELDS = ("repository_path", "branch", "base_sha")
+
+
+def compute_reproducibility_hash(
+    run: dict | None, *, provenance_record: dict | None = None
+) -> str | None:
+    """Hash the exact reproduction inputs for one run's result, or ``None``
+    when the run itself is unknown (never guess an identity for a run that
+    was not found)."""
+    if run is None:
+        return None
+    inputs = {field: run.get(field) for field in _REPRODUCIBILITY_RUN_FIELDS}
+    inputs.update(
+        {field: (provenance_record or {}).get(field) for field in _REPRODUCIBILITY_PROVENANCE_FIELDS}
+    )
+    canonical = json.dumps(inputs, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _decode_checks(value: str | None) -> list[dict]:
@@ -161,14 +201,44 @@ def _decode_checks(value: str | None) -> list[dict]:
     return decoded if isinstance(decoded, list) else []
 
 
+def _decode_json_object(value: str | None) -> dict | None:
+    if not value:
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _decode_command(value: str | None) -> list | None:
+    """`run.command_json` is the literal argv the provider was launched
+    with (`list[str] | None`) — the "actions performed" this run's result
+    came from."""
+    if not value:
+        return None
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, list) else None
+
+
 def build_view(
     record: dict | None,
     *,
+    run: dict | None = None,
     provider_route_record: dict | None = None,
     provider_attempts: list[dict] | None = None,
     evidence: list[dict] | None = None,
 ) -> dict | None:
-    """Return the one public provenance shape used by API and UI."""
+    """Return the one public provenance shape used by API and UI.
+
+    ``run`` carries the initiator/prompt/model/actions inputs that live on
+    the `run` row itself rather than `run_provenance` — passed in separately
+    because a run can exist (and be worth showing "unknown" for) before its
+    provenance row is backfilled, and vice versa for legacy rows.
+    """
     if record is None:
         return None
     checks = _decode_checks(record.get("ci_conclusions_json"))
@@ -202,6 +272,12 @@ def build_view(
         }
         for item in (evidence or [])
     ]
+    run = run or {}
+    initiated_by = run.get("launch_source")
+    prompt = run.get("prompt")
+    model = run.get("provider_id")
+    model_metadata = _decode_json_object(run.get("provider_metadata_json"))
+    actions = _decode_command(run.get("command_json"))
     view = {
         "run_id": record.get("run_id"),
         "task_id": record.get("task_id"),
@@ -223,6 +299,13 @@ def build_view(
         "provider_route": route,
         "provider_attempts": attempts,
         "evidence": safe_evidence,
+        "initiated_by": initiated_by,
+        "prompt": prompt,
+        "prompt_version": run.get("prompt_version"),
+        "model": model,
+        "model_metadata": model_metadata,
+        "actions": actions,
+        "reproducibility_hash": compute_reproducibility_hash(run or None, provenance_record=record),
     }
     unknown = [name for name in _SCALAR_UNKNOWN_FIELDS if view.get(name) is None]
     if pr is None:
@@ -235,6 +318,8 @@ def build_view(
         unknown.append("provider_attempts")
     if not safe_evidence:
         unknown.append("evidence")
+    if model_metadata is None:
+        unknown.append("model_metadata")
     view["unknown_fields"] = unknown
     return view
 
@@ -243,6 +328,7 @@ def get_view(db_path: Path, run_id: str) -> dict | None:
     evidence = db.get_provenance_evidence_for_runs(db_path, [run_id])
     return build_view(
         db.get_run_provenance(db_path, run_id),
+        run=db.get_run(db_path, run_id),
         provider_route_record=db.get_provider_route(db_path, run_id),
         provider_attempts=db.list_provider_attempts(db_path, run_id),
         evidence=evidence.get(run_id),
@@ -252,12 +338,14 @@ def get_view(db_path: Path, run_id: str) -> dict | None:
 def views_for_runs(db_path: Path, run_ids: Iterable[str]) -> dict[str, dict]:
     ids = list(run_ids)
     records = db.get_run_provenance_for_runs(db_path, ids)
+    runs = db.get_runs_for_ids(db_path, ids)
     routes = db.get_provider_routes_for_runs(db_path, ids)
     attempts = db.get_provider_attempts_for_runs(db_path, ids)
     evidence = db.get_provenance_evidence_for_runs(db_path, ids)
     return {
         run_id: build_view(
             record,
+            run=runs.get(run_id),
             provider_route_record=routes.get(run_id),
             provider_attempts=attempts.get(run_id),
             evidence=evidence.get(run_id),

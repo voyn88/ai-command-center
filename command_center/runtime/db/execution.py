@@ -560,6 +560,20 @@ def get_run(db_path: Path, run_id: str) -> dict | None:
         return db._row_to_dict(row)
 
 
+def get_runs_for_ids(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
+    """Batch of `get_run` keyed by run_id — one query for a whole board
+    instead of a `sqlite3.connect()` per run (same N+1 shape as
+    `get_reports_for_runs`)."""
+    if not run_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM run WHERE id IN ({placeholders})", tuple(run_ids)
+        ).fetchall()
+    return {row["id"]: db._row_to_dict(row) for row in rows}
+
+
 def get_latest_run_for_task(db_path: Path, task_id: str) -> dict | None:
     """Newest run row for `task_id`, or None if the task has no runs.
 
