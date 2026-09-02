@@ -31,6 +31,15 @@ The hard guarantees, enforced structurally here:
    same plan could have used.
 4. **No force-run.** A task that finds nothing eligible within budget stays
    queued with a typed reason. The engine never "assigns anyway".
+5. **Leadership standing is earned, never assumed (VOYN-AGT-REWARD).** Among
+   the executors otherwise eligible for a task, the one with the best
+   leaderboard tier wins the tie ahead of cost/locality — that is how a
+   top-performing agent gets first pick of priority work. An executor flagged
+   as an experimental zone is skipped entirely unless its own standing clears
+   the configured tier bar, and a top-tier agent's own per-agent budget/
+   concurrency limits are widened by its tier's multiplier — but the global
+   daily ceiling (guarantee 2) is never widened by tier, so a reward can never
+   itself become a budget breach.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ from command_center.dispatch.models import (
     DEFER_AGENT_CAPACITY,
     DEFER_COST_DATA_UNAVAILABLE,
     DEFER_DAILY_BUDGET,
+    DEFER_EXPERIMENTAL_TIER_REQUIRED,
     DEFER_KILL_SWITCH,
     DEFER_NO_AVAILABLE_EXECUTOR,
     DEFER_NO_ELIGIBLE_EXECUTOR,
@@ -69,10 +79,10 @@ def _task_sort_key(task: QueuedTask, policy: DispatchPolicy) -> tuple:
 
 
 def _eligible_executors(
-    task: QueuedTask, executors: dict[str, ExecutorProfile]
+    task: QueuedTask, executors: dict[str, ExecutorProfile], policy: DispatchPolicy
 ) -> tuple[list[ExecutorProfile], str | None]:
     """Return the executors permitted for `task`, and a defer reason when the
-    permitted set is empty or none of it is available.
+    permitted set is empty, tier-gated shut, or none of it is available.
 
     Order of the returned list is not yet cost-ordered — the caller sorts it.
     """
@@ -87,20 +97,37 @@ def _eligible_executors(
     if not permitted:
         return [], DEFER_NO_ELIGIBLE_EXECUTOR
 
-    available = [ex for ex in permitted if ex.available]
+    # Experimental zones (VOYN-AGT-REWARD): an executor flagged experimental
+    # takes work only once its own leaderboard standing clears the configured
+    # bar. Checked after project/pin eligibility — including for a hard pin,
+    # so a pin can never be used to route around the tier gate — and before
+    # availability, so the typed reason names the actual blocker.
+    tier_cleared = [
+        ex
+        for ex in permitted
+        if ex.id not in policy.experimental_executor_ids
+        or policy.meets_experimental_bar(ex.id)
+    ]
+    if not tier_cleared:
+        return [], DEFER_EXPERIMENTAL_TIER_REQUIRED
+
+    available = [ex for ex in tier_cleared if ex.available]
     if not available:
         return [], DEFER_NO_AVAILABLE_EXECUTOR
     return available, None
 
 
 def _cost_order_key(executor: ExecutorProfile, policy: DispatchPolicy) -> tuple:
-    """Local-first (cost economy) when `prefer_local`, then cheapest, then id.
+    """Leadership tier first (VOYN-AGT-REWARD), then local-first (cost
+    economy) when `prefer_local`, then cheapest, then id.
 
-    The cost matrix drives selection; `prefer_local` only decides the tie
-    posture — with it on, a local executor is preferred even if a cloud one is
-    nominally cheaper, which is the "economy" intent of the acceptance."""
+    A better-standing agent wins the tie over a merely-cheaper one — that is
+    how "best agents get priority tasks" is expressed structurally. Within the
+    same tier, the cost matrix and `prefer_local` drive selection exactly as
+    before."""
+    tier_rank = -policy.priority_bonus_for(executor.id)
     local_rank = 0 if (policy.prefer_local and executor.is_local) else 1
-    return (local_rank, executor.cost_per_task_usd, executor.id)
+    return (tier_rank, local_rank, executor.cost_per_task_usd, executor.id)
 
 
 def plan_dispatch(
@@ -155,7 +182,7 @@ def plan_dispatch(
     decisions: list[DispatchDecision] = []
 
     for task in ordered:
-        candidates, empty_reason = _eligible_executors(task, executor_by_id)
+        candidates, empty_reason = _eligible_executors(task, executor_by_id, policy)
         if empty_reason is not None:
             decisions.append(
                 DispatchDecision(
@@ -251,6 +278,11 @@ def _budget_block(
     Checked in the same fail-closed order the acceptance cares about: the
     global daily ceiling first (the kill-switch's budget sibling), then the
     per-agent concurrency/spend guardrails, then the per-project ceiling.
+
+    The per-agent guardrails are widened by the executor's tier budget
+    multiplier (VOYN-AGT-REWARD) — a top-performing agent earns more room
+    under its *own* limit, but the global daily ceiling above is never
+    touched by tier, so the reward can never itself blow the budget.
     """
     # Global daily spend ceiling. `<= ceiling` after adding this cost.
     if max_daily_spend_usd > 0 and (projected + cost) > max_daily_spend_usd:
@@ -258,14 +290,19 @@ def _budget_block(
 
     limit = policy.per_agent_limits.get(executor.id)
     if limit is not None:
+        multiplier = policy.budget_multiplier_for(executor.id)
         if limit.max_concurrent > 0:
+            effective_max_concurrent = max(
+                limit.max_concurrent, round(limit.max_concurrent * multiplier)
+            )
             running = active_by_executor.get(executor.id, 0)
             planned = agent_assigned.get(executor.id, 0)
-            if running + planned >= limit.max_concurrent:
+            if running + planned >= effective_max_concurrent:
                 return DEFER_AGENT_CAPACITY
         if limit.max_spend_usd > 0:
+            effective_max_spend = limit.max_spend_usd * multiplier
             spent = agent_spend.get(executor.id, 0.0)
-            if (spent + cost) > limit.max_spend_usd:
+            if (spent + cost) > effective_max_spend:
                 return DEFER_AGENT_BUDGET
 
     if task.project is not None:

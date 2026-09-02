@@ -27,6 +27,9 @@ DEFER_PROJECT_BUDGET = "project_budget_exceeded"
 DEFER_AGENT_CAPACITY = "agent_capacity_reached"
 DEFER_NO_ELIGIBLE_EXECUTOR = "no_eligible_executor"
 DEFER_NO_AVAILABLE_EXECUTOR = "no_available_executor"
+# The executor is flagged as an experimental zone and this agent's leadership
+# standing has not yet earned access to it (VOYN-AGT-REWARD).
+DEFER_EXPERIMENTAL_TIER_REQUIRED = "experimental_tier_required"
 
 DEFER_REASONS = frozenset(
     {
@@ -38,6 +41,7 @@ DEFER_REASONS = frozenset(
         DEFER_AGENT_CAPACITY,
         DEFER_NO_ELIGIBLE_EXECUTOR,
         DEFER_NO_AVAILABLE_EXECUTOR,
+        DEFER_EXPERIMENTAL_TIER_REQUIRED,
     }
 )
 
@@ -69,6 +73,10 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "No executor is permitted for this task by project/pin policy."
     ),
     DEFER_NO_AVAILABLE_EXECUTOR: "No permitted executor is currently available.",
+    DEFER_EXPERIMENTAL_TIER_REQUIRED: (
+        "This executor is an experimental zone: it takes work only once the "
+        "agent's leaderboard standing clears the configured minimum tier."
+    ),
 }
 
 
@@ -95,6 +103,41 @@ DEFAULT_LOCAL_EXECUTOR_IDS = frozenset({"ollama"})
 
 # Fallback per-task cost when the cost matrix names no price for an executor.
 DEFAULT_COST_USD = 1.0
+
+
+# --------------------------------------------------------------------------
+# Leadership metrics (VOYN-AGT-REWARD): the best-performing agents win
+# dispatch ties, unlock experimental executor zones, and get roomier budgets.
+# The score itself (0-100) is policy-configured, like the cost matrix — this
+# layer only decides what a given score *does*, not how it was computed.
+# --------------------------------------------------------------------------
+
+# Tier name -> minimum leaderboard score (0-100) required to hold that tier.
+# Also doubles as the tier's rank: a higher minimum is a better tier.
+DEFAULT_TIER_THRESHOLDS: dict[str, float] = {
+    "elite": 85.0,
+    "trusted": 60.0,
+    "standard": 0.0,
+}
+
+# Tier -> extra weight added when ranking executors for the *same* task, so a
+# better-standing agent wins the tie over a merely-cheaper one.
+DEFAULT_TIER_PRIORITY_BONUS: dict[str, int] = {
+    "elite": 2,
+    "trusted": 1,
+    "standard": 0,
+}
+
+# Tier -> multiplier applied to that agent's own `AgentLimit` (never below
+# 1.0 — this rewards, it never shrinks a configured limit).
+DEFAULT_TIER_BUDGET_MULTIPLIER: dict[str, float] = {
+    "elite": 2.0,
+    "trusted": 1.5,
+    "standard": 1.0,
+}
+
+# The tier an executor must hold to be assigned an "experimental zone" task.
+DEFAULT_EXPERIMENTAL_MIN_TIER = "trusted"
 
 
 # --------------------------------------------------------------------------
@@ -178,6 +221,23 @@ class DispatchPolicy:
         default_factory=lambda: dict(DEFAULT_PRIORITY_WEIGHTS)
     )
     local_executor_ids: frozenset[str] = DEFAULT_LOCAL_EXECUTOR_IDS
+    # Executor id -> leaderboard score (0-100). Config-driven, like the cost
+    # matrix: this policy layer decides what the score unlocks, not how it is
+    # computed.
+    leaderboard: dict[str, float] = field(default_factory=dict)
+    tier_thresholds: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_TIER_THRESHOLDS)
+    )
+    tier_priority_bonus: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_TIER_PRIORITY_BONUS)
+    )
+    tier_budget_multiplier: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_TIER_BUDGET_MULTIPLIER)
+    )
+    # Executors flagged as an "experimental zone": only reachable by an agent
+    # whose tier clears `experimental_min_tier`.
+    experimental_executor_ids: frozenset[str] = field(default_factory=frozenset)
+    experimental_min_tier: str = DEFAULT_EXPERIMENTAL_MIN_TIER
     updated_at: str | None = None
     updated_by: str | None = None
 
@@ -193,6 +253,54 @@ class DispatchPolicy:
     def is_local(self, executor_id: str) -> bool:
         return executor_id in self.local_executor_ids
 
+    def _effective_tier_thresholds(self) -> dict[str, float]:
+        return self.tier_thresholds if self.tier_thresholds else dict(
+            DEFAULT_TIER_THRESHOLDS
+        )
+
+    def score_for(self, executor_id: str) -> float:
+        value = self.leaderboard.get(executor_id)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return max(0.0, min(100.0, float(value)))
+        return 0.0
+
+    def tier_for(self, executor_id: str) -> str:
+        """The best tier whose minimum score `executor_id`'s standing clears."""
+        score = self.score_for(executor_id)
+        ordered = sorted(
+            self._effective_tier_thresholds().items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        for name, minimum in ordered:
+            if score >= minimum:
+                return name
+        return ordered[-1][0]
+
+    def _tier_rank(self, tier: str) -> float:
+        """A tier's rank, higher is better. An unrecognized tier name is
+        fail-closed to the strictest configured bar rather than 0 — a typo in
+        `experimental_min_tier` must never silently admit every agent."""
+        thresholds = self._effective_tier_thresholds()
+        if tier in thresholds:
+            return thresholds[tier]
+        if tier in DEFAULT_TIER_THRESHOLDS:
+            return DEFAULT_TIER_THRESHOLDS[tier]
+        return max(thresholds.values())
+
+    def priority_bonus_for(self, executor_id: str) -> int:
+        return self.tier_priority_bonus.get(self.tier_for(executor_id), 0)
+
+    def budget_multiplier_for(self, executor_id: str) -> float:
+        return max(
+            1.0, self.tier_budget_multiplier.get(self.tier_for(executor_id), 1.0)
+        )
+
+    def meets_experimental_bar(self, executor_id: str) -> bool:
+        return self._tier_rank(self.tier_for(executor_id)) >= self._tier_rank(
+            self.experimental_min_tier
+        )
+
     def as_dict(self) -> dict:
         return {
             "prefer_local": self.prefer_local,
@@ -204,6 +312,12 @@ class DispatchPolicy:
             "per_project_limits": dict(self.per_project_limits),
             "priority_weights": dict(self.priority_weights),
             "local_executor_ids": sorted(self.local_executor_ids),
+            "leaderboard": dict(self.leaderboard),
+            "tier_thresholds": dict(self.tier_thresholds),
+            "tier_priority_bonus": dict(self.tier_priority_bonus),
+            "tier_budget_multiplier": dict(self.tier_budget_multiplier),
+            "experimental_executor_ids": sorted(self.experimental_executor_ids),
+            "experimental_min_tier": self.experimental_min_tier,
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
         }
@@ -239,6 +353,35 @@ class DispatchPolicy:
             if isinstance(local_ids, (list, tuple, set, frozenset))
             else DEFAULT_LOCAL_EXECUTOR_IDS
         )
+        leaderboard = {
+            str(k): max(0.0, min(100.0, float(v)))
+            for k, v in _as_dict(data.get("leaderboard")).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+        tier_thresholds = {
+            str(k): max(0.0, float(v))
+            for k, v in _as_dict(data.get("tier_thresholds")).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        } or dict(DEFAULT_TIER_THRESHOLDS)
+        tier_priority_bonus = {
+            str(k): int(v)
+            for k, v in _as_dict(data.get("tier_priority_bonus")).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        } or dict(DEFAULT_TIER_PRIORITY_BONUS)
+        tier_budget_multiplier = {
+            str(k): max(1.0, float(v))
+            for k, v in _as_dict(data.get("tier_budget_multiplier")).items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        } or dict(DEFAULT_TIER_BUDGET_MULTIPLIER)
+        experimental_ids = data.get("experimental_executor_ids")
+        experimental_set = (
+            frozenset(str(x) for x in experimental_ids)
+            if isinstance(experimental_ids, (list, tuple, set, frozenset))
+            else frozenset()
+        )
+        experimental_min_tier = data.get("experimental_min_tier")
+        if not isinstance(experimental_min_tier, str) or not experimental_min_tier:
+            experimental_min_tier = DEFAULT_EXPERIMENTAL_MIN_TIER
         return cls(
             prefer_local=data.get("prefer_local", True) is not False,
             cost_matrix=cost_matrix,
@@ -249,6 +392,12 @@ class DispatchPolicy:
             per_project_limits=per_project,
             priority_weights=weights,
             local_executor_ids=local_set,
+            leaderboard=leaderboard,
+            tier_thresholds=tier_thresholds,
+            tier_priority_bonus=tier_priority_bonus,
+            tier_budget_multiplier=tier_budget_multiplier,
+            experimental_executor_ids=experimental_set,
+            experimental_min_tier=experimental_min_tier,
             updated_at=data.get("updated_at"),
             updated_by=data.get("updated_by"),
         )

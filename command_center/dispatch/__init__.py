@@ -29,6 +29,16 @@ Hard guarantees (acceptance): a dispatch decision can NEVER exceed a
 configured budget, NEVER bypass the kill switch and NEVER reorder past
 SLA/priority. When nothing eligible fits within budget the task stays queued
 with a typed reason — it is never force-run.
+
+Leadership metrics (VOYN-AGT-REWARD): `DispatchPolicy.leaderboard` scores each
+executor 0-100 and maps that score onto a configurable tier ladder
+(`tier_thresholds`). A better tier wins dispatch ties over a merely-cheaper
+rival (`tier_priority_bonus`), unlocks executors flagged as experimental zones
+(`experimental_executor_ids` / `experimental_min_tier`), and widens that
+agent's own per-agent budget/concurrency limit (`tier_budget_multiplier`) —
+never the global daily ceiling, which stays tier-blind. The score is
+policy-configured, like the cost matrix: this layer decides what a score
+unlocks, not how it is computed.
 """
 
 from __future__ import annotations

@@ -361,3 +361,124 @@ def test_plan_is_deterministic_for_identical_input():
     assert [d.as_dict() for d in first.decisions] == [
         d.as_dict() for d in second.decisions
     ]
+
+
+# --------------------------------------------------------------------------
+# Leadership metrics (VOYN-AGT-REWARD): the best-standing agents win
+# dispatch ties, unlock experimental zones and get roomier budgets.
+# --------------------------------------------------------------------------
+
+
+def test_elite_executor_wins_the_tie_over_a_cheaper_lower_tier_rival():
+    # claude_code is cheaper, but codex has earned elite standing.
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.1, "codex": 0.5},
+        leaderboard={"codex": 90.0, "claude_code": 10.0},
+    )
+    executors = [
+        _executor("claude_code", cost=0.1),
+        _executor("codex", cost=0.5),
+    ]
+    plan = _plan([_task("t1")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "codex"
+
+
+def test_equal_standing_falls_back_to_cost_ordering():
+    policy = DispatchPolicy(cost_matrix={"claude_code": 0.1, "codex": 0.5})
+    executors = [
+        _executor("claude_code", cost=0.1),
+        _executor("codex", cost=0.5),
+    ]
+    plan = _plan([_task("t1")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_experimental_executor_requires_the_configured_tier():
+    policy = DispatchPolicy(
+        cost_matrix={"codex": 0.0},
+        leaderboard={"codex": 10.0},
+        experimental_executor_ids=frozenset({"codex"}),
+        experimental_min_tier="trusted",
+    )
+    executors = [_executor("codex", cost=0.0)]
+    plan = _plan([_task("t1")], executors, policy)
+
+    assert plan.assignments == ()
+    assert plan.deferred[0].reason == models.DEFER_EXPERIMENTAL_TIER_REQUIRED
+
+
+def test_experimental_executor_is_assignable_once_it_earns_the_tier():
+    policy = DispatchPolicy(
+        cost_matrix={"codex": 0.0},
+        leaderboard={"codex": 75.0},
+        experimental_executor_ids=frozenset({"codex"}),
+        experimental_min_tier="trusted",
+    )
+    executors = [_executor("codex", cost=0.0)]
+    plan = _plan([_task("t1")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "codex"
+
+
+def test_experimental_tier_gate_applies_even_to_a_hard_pin():
+    policy = DispatchPolicy(
+        cost_matrix={"codex": 0.0},
+        leaderboard={"codex": 10.0},
+        experimental_executor_ids=frozenset({"codex"}),
+        experimental_min_tier="trusted",
+    )
+    executors = [_executor("codex", cost=0.0)]
+    plan = _plan([_task("t1", pinned="codex")], executors, policy)
+
+    assert plan.assignments == ()
+    assert plan.deferred[0].reason == models.DEFER_EXPERIMENTAL_TIER_REQUIRED
+
+
+def test_elite_tier_widens_the_agents_own_spend_and_concurrency_limits():
+    # Base cap is 1.0 with a 2.0x elite multiplier -> effective cap 2.0, so
+    # both 0.6 tasks fit where a non-elite agent would only fit one.
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.6},
+        leaderboard={"claude_code": 95.0},
+        per_agent_limits={"claude_code": AgentLimit(max_spend_usd=1.0)},
+    )
+    executors = [_executor("claude_code", cost=0.6)]
+    tasks = [_task("t1", priority="High"), _task("t2", priority="Medium")]
+    plan = _plan(tasks, executors, policy)
+
+    assert {d.task_id for d in plan.assignments} == {"t1", "t2"}
+
+
+def test_standard_tier_keeps_the_configured_limit_unchanged():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.6},
+        per_agent_limits={"claude_code": AgentLimit(max_spend_usd=1.0)},
+    )
+    executors = [_executor("claude_code", cost=0.6)]
+    tasks = [_task("t1", priority="High"), _task("t2", priority="Medium")]
+    plan = _plan(tasks, executors, policy)
+
+    assert [d.task_id for d in plan.assignments] == ["t1"]
+    assert plan.deferred[0].reason == models.DEFER_AGENT_BUDGET
+
+
+def test_tier_multiplier_never_widens_the_global_daily_ceiling():
+    # Elite standing widens the *agent's own* cap, but the global daily
+    # ceiling (guarantee 2) must still hold regardless of tier.
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.6},
+        leaderboard={"claude_code": 100.0},
+    )
+    executors = [_executor("claude_code", cost=0.6)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=0.5,
+        max_daily_spend_usd=1.0,
+    )
+
+    assert plan.assignments == ()
+    assert plan.deferred[0].reason == models.DEFER_DAILY_BUDGET

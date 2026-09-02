@@ -12,6 +12,9 @@ from command_center.dispatch import policy_config
 from command_center.http_auth.identity import Principal
 from command_center.dispatch.models import (
     DEFAULT_PRIORITY_WEIGHTS,
+    DEFAULT_TIER_BUDGET_MULTIPLIER,
+    DEFAULT_TIER_PRIORITY_BONUS,
+    DEFAULT_TIER_THRESHOLDS,
     AgentLimit,
     DispatchPolicy,
 )
@@ -48,6 +51,57 @@ def test_from_dict_is_fail_closed_on_garbage():
         assert policy.prefer_local is True
         assert policy.priority_weights == DEFAULT_PRIORITY_WEIGHTS
         assert policy.per_agent_limits == {}
+        # And the leadership-metrics defaults (VOYN-AGT-REWARD): no scores on
+        # file, standard tier ladder, no experimental zones carved out.
+        assert policy.leaderboard == {}
+        assert policy.tier_thresholds == DEFAULT_TIER_THRESHOLDS
+        assert policy.tier_priority_bonus == DEFAULT_TIER_PRIORITY_BONUS
+        assert policy.tier_budget_multiplier == DEFAULT_TIER_BUDGET_MULTIPLIER
+        assert policy.experimental_executor_ids == frozenset()
+        assert policy.experimental_min_tier == "trusted"
+
+
+def test_leaderboard_roundtrips_through_dict():
+    policy = DispatchPolicy(
+        leaderboard={"codex": 92.5, "claude_code": 40.0},
+        tier_thresholds={"elite": 90.0, "trusted": 50.0, "standard": 0.0},
+        tier_priority_bonus={"elite": 5, "trusted": 1, "standard": 0},
+        tier_budget_multiplier={"elite": 3.0, "trusted": 1.2, "standard": 1.0},
+        experimental_executor_ids=frozenset({"codex"}),
+        experimental_min_tier="elite",
+    )
+    restored = DispatchPolicy.from_dict(policy.as_dict())
+
+    assert restored.leaderboard == {"codex": 92.5, "claude_code": 40.0}
+    assert restored.tier_thresholds == {
+        "elite": 90.0,
+        "trusted": 50.0,
+        "standard": 0.0,
+    }
+    assert restored.tier_priority_bonus == {"elite": 5, "trusted": 1, "standard": 0}
+    assert restored.tier_budget_multiplier == {
+        "elite": 3.0,
+        "trusted": 1.2,
+        "standard": 1.0,
+    }
+    assert restored.experimental_executor_ids == frozenset({"codex"})
+    assert restored.experimental_min_tier == "elite"
+    assert restored.tier_for("codex") == "elite"
+    assert restored.meets_experimental_bar("codex") is True
+    assert restored.meets_experimental_bar("claude_code") is False
+
+
+def test_leaderboard_scores_are_clamped_to_0_100():
+    policy = DispatchPolicy.from_dict(
+        {"leaderboard": {"over": 500, "under": -20, "bad": "not-a-number"}}
+    )
+    assert policy.leaderboard == {"over": 100.0, "under": 0.0}
+
+
+def test_unrecognized_experimental_min_tier_fails_closed_to_the_strictest_bar():
+    policy = DispatchPolicy(experimental_min_tier="not-a-real-tier")
+    # No agent can clear a bar that fails closed to the strictest tier.
+    assert policy.meets_experimental_bar("anyone") is False
 
 
 def test_from_dict_drops_non_numeric_costs():
