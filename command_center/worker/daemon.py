@@ -51,7 +51,13 @@ from command_center.worker import sdnotify
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Handler", "HandlerOutcome", "WorkerConfig", "WorkerDaemon"]
+__all__ = [
+    "Handler",
+    "HandlerOutcome",
+    "MIN_VISIBILITY_SECONDS",
+    "WorkerConfig",
+    "WorkerDaemon",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +85,21 @@ class Handler(Protocol):
     ) -> HandlerOutcome: ...
 
 
+# The database will clamp anything from 1s up (`work_attempt_visibility_sane`,
+# `queue_claim`'s `least(greatest(..., 1), 3600)`), but 1s is a correctness
+# floor, not a cost-aware one. Measured host->DB round trips for this daemon's
+# own claim->complete pair (remote worker, n=19): min 60.9 / p50 66.5 / p95
+# 101.1 / max 135.0 ms, and the reaper's redelivery window runs 97-297 ms wide
+# against its own polling period. A worker doing nothing but reporting already
+# spends up to ~13.5% of a 1-second window on that report alone, and the
+# heartbeat loop's own 1-second floor (`_heartbeat_loop` below) cannot renew a
+# lease that short in time to matter. Requiring the window to be at least ten
+# times the measured worst-case redelivery tail (0.297s) keeps that unavoidable
+# reporting cost under ~10% and gives the heartbeat real headroom above its
+# floor.
+MIN_VISIBILITY_SECONDS = 3
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerConfig:
     queue: str = "execution"
@@ -88,6 +109,16 @@ class WorkerConfig:
     # from waiting long on a quiet host.
     idle_min_seconds: float = 1.0
     idle_max_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.visibility_seconds < MIN_VISIBILITY_SECONDS:
+            raise ValueError(
+                f"visibility_seconds={self.visibility_seconds} is below the "
+                f"{MIN_VISIBILITY_SECONDS}s reporting-cost floor -- a remote "
+                "worker's own claim/complete round trip (measured up to 135ms, "
+                "redelivery tail up to 297ms) would eat an unsafe fraction of "
+                "the window, or outrun the heartbeat entirely"
+            )
 
 
 class WorkerDaemon:

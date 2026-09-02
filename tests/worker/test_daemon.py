@@ -15,8 +15,11 @@ import signal
 import time
 from pathlib import Path
 
+import pytest
+
 from command_center.db.work_queue_store import ClaimedWork, QueueRefusal
 from command_center.worker.daemon import (
+    MIN_VISIBILITY_SECONDS,
     HandlerOutcome,
     WorkerConfig,
     WorkerDaemon,
@@ -336,7 +339,7 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
                         HandlerOutcome(ok=True),
                     )[-1]
                 },
-                WorkerConfig(visibility_seconds=1, idle_min_seconds=0.01),
+                WorkerConfig(visibility_seconds=3, idle_min_seconds=0.01),
                 notify=lambda _state: None,
             )
             daemon.install_signal_handlers()
@@ -380,7 +383,7 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
         # for this read (review finding on c4001c4).
         expiry = float((tmp_path / "lease").read_text())
         time.sleep(max(0.0, expiry - time.monotonic()) + 0.05)
-        redelivered = _FileLeaseStore(tmp_path).claim("execution", visibility_seconds=1)
+        redelivered = _FileLeaseStore(tmp_path).claim("execution", visibility_seconds=3)
         assert isinstance(redelivered, ClaimedWork)
         assert redelivered.work_item_id == "job-3600"
         assert redelivered.attempt_no == 2
@@ -679,3 +682,16 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
     assert any(
         frame == b"WATCHDOG=1" or frame.startswith(b"WATCHDOG=1\n") for frame in frames
     )
+
+
+def test_visibility_seconds_below_the_reporting_cost_floor_is_refused() -> None:
+    """A window this close to the measured claim->complete round trip (up to
+    135ms, redelivery tail up to 297ms) spends an unsafe fraction of itself on
+    reporting alone -- refuse the config instead of shipping a worker that
+    will race its own completion report against the reaper."""
+    with pytest.raises(ValueError, match="reporting-cost floor"):
+        WorkerConfig(visibility_seconds=MIN_VISIBILITY_SECONDS - 1)
+
+
+def test_visibility_seconds_at_the_floor_is_accepted() -> None:
+    WorkerConfig(visibility_seconds=MIN_VISIBILITY_SECONDS)
