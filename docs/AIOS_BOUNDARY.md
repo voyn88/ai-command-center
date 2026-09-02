@@ -92,18 +92,23 @@ signatures:
 | imports a scheduler/workflow framework (`apscheduler`, `airflow`, `prefect`, `temporalio`, `multiprocessing`, ...) | `orchestration` | |
 | imports an auth/token library (`jwt`, `passlib`, `bcrypt`, `authlib`, `casbin`, ...) | `authz` | |
 | *calls* `subprocess.Popen`, `os.fork`/`os.spawn*`/`os.posix_spawn` | `orchestration` | owning a process lifecycle is orchestration; synchronous `subprocess.run` (git/CLI invocation) deliberately is **not** a signature |
-| path segment named like an engine (`queue`, `scheduler`, `supervisor`, `executor`, `launcher`, `autonomy`, `audit`, ...) | per token | catches home-grown engines that use no framework at all |
+| path segment named like an engine (`scheduler`, `supervisor`, `executor`, `launcher`, `autonomy`, ...) | per token | catches home-grown engines that use no framework at all |
 | path segment named like a store (`db`, `database`, `store`, `storage`, `repository`, `persistence`, `memory`) **and** the file persists data | `memory` | see *Corroborated names* below |
+| path segment named like a queue (`queue`, `queues`) **and** the file hands work out (claim/lease/heartbeat/... or `SKIP LOCKED`) | `queue` | see *Corroborated names* below |
+| path segment named like an audit module (`audit`, `provenance`, ...) **and** the file is not a pure `PostgresTableMirror` declaration | `audit` | see *Corroborated names* below |
 
-### Corroborated names (`memory` only)
+### Corroborated names (`memory`, `queue`, `audit`)
 
-The `memory` tokens are the one group where a name is a question rather than a
-verdict. They name what a file is *about* as readily as what it *is*: a package
-directory called `db/` says where code lives, not whether the code inside owns
-an engine. Under a name-only rule a docstring-only `__init__.py` and a module
-that renders SQL text were violations — which left the control plane unable to
-keep any database-adjacent module at all, and turned the gate into one that
-polices names instead of behaviour.
+The `memory` tokens were the first group where a name turned out to be a
+question rather than a verdict. They name what a file is *about* as readily as
+what it *is*: a package directory called `db/` says where code lives, not
+whether the code inside owns an engine. Under a name-only rule a
+docstring-only `__init__.py` and a module that renders SQL text were
+violations — which left the control plane unable to keep any database-adjacent
+module at all, and turned the gate into one that polices names instead of
+behaviour. `queue` gained the same treatment for the same reason (a hand-rolled
+claim/lease loop is a queue engine regardless of what the file is called, and a
+`queue_store.py` that only stores rows is not one because it is called that).
 
 So a `memory` name classifies only when the same file also *persists data*:
 
@@ -116,16 +121,41 @@ So a `memory` name classifies only when the same file also *persists data*:
   is a persistence engine even with no driver anywhere in it, and a
   driver-only definition would let one out of the gate entirely.
 
-What deliberately does **not** corroborate is executing SQL on a connection the
-caller opened. That is delegation, not ownership — the engine is wherever the
-driver is — and counting it would flag SQL-rendering and grant modules while
-catching no engine the driver rule misses.
+A `queue` name classifies only when the same file also *hands work out* —
+claims, leases, heartbeats, acks, `SKIP LOCKED`/`FOR UPDATE` — as opposed to
+merely storing and listing queue rows, which a control-plane repository is
+allowed to do. Queue-handout behaviour also classifies **unconditionally**, on
+a narrower unconditional vocabulary, regardless of filename: an engine cannot
+hide by not being named `queue`.
 
-Nothing loosened for `queue`, `orchestration`, `authz` or `audit`: those names
-still classify on their own. And one signature was **tightened** at the same
-time: `psycopg_pool` is a separate distribution from `psycopg` and was missing
-from the driver list, so a file could open a PostgreSQL connection pool without
-the gate seeing a driver at all.
+`audit` is corroborated too, but not the same way: `memory`/`queue` ask "does
+this file *behave* like the engine?" (a wide vocabulary, safe because the name
+already narrowed the candidates); `audit` has no such behavioural substitute,
+so widening it the same way would be a straight loss of coverage. Instead the
+`audit` corroboration is a single, narrow, positively-validated exemption —
+`_behaves_like_an_audit_engine` in `tests/architecture/aios_boundary.py` — for
+one recurring false positive: a module whose entire body is imports, constant
+table declarations and well-formed `PostgresTableMirror` subclasses (each
+containing nothing but `spec = ...`), and nothing else. `db/audit_store.py`
+and `db/provenance_store.py` are exactly that shape and no longer appear in
+the baseline. Anything outside that exact shape — a `def`, a bare call at
+import time (a registration, `run_audit()`, SQL executed on import), a lambda
+bound to a name, or a `PostgresTableMirror` subclass carrying logic beyond
+`spec = ...` — still classifies as `audit` on the name alone, exactly as
+before. Recorded as `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION`.
+
+What deliberately does **not** corroborate `memory` is executing SQL on a
+connection the caller opened. That is delegation, not ownership — the engine
+is wherever the driver is — and counting it would flag SQL-rendering and grant
+modules while catching no engine the driver rule misses.
+
+Nothing loosened for `orchestration` or `authz`: those names still classify on
+their own, with no behavioural substitute and no positively-validated
+exemption having been demonstrated for either. And one signature was
+**tightened** at the same time `memory` was corroborated: `psycopg_pool` is a
+separate distribution from `psycopg` and was missing from the driver list, so
+a file could open a PostgreSQL connection pool without the gate seeing a
+driver at all.
 
 Acknowledged limit, stated rather than papered over: a driver reached through a
 *non-literal* dynamic import (`__import__(name_from_config)`) is beyond static
@@ -195,6 +225,30 @@ section below for why it exists at all):
   cascade. Every atomic decision is a SQL function of the store; the package
   owns candidate iteration, the static routing matrix and the plan report,
   and adds no engine capability of its own.
+  `command_center/db/roles.py`'s `principal`/`principal_credential`/
+  `principal_event` tables (VOYN-W0-AICC-SRV-03, `0003_worker_enrollment.up.sql`)
+  are SRV-02's identity registry, finally placed (VOYN-W0-AICC-SRV-02-PLACEMENT).
+  `0002_queue_claim.up.sql` had recorded it as "a design proposal, not a
+  deployed table" precisely to avoid landing an AICC-local registry that
+  duplicates AIOS's own tenant-scoped one (`principals`, `auth_principals`,
+  `credentials`) before a placement decision was made. Landing it here is not
+  that duplication, and it is not the "second principal registry" the
+  `http_auth/` section below forbids either — that ban is scoped to a
+  platform-identity stand-in, and this table answers a different question.
+  `principal.db_role` names a PostgreSQL role; `identity_assert()`
+  authenticates a separate, AICC-managed credential (`principal_credential`)
+  and cross-checks its `db_role` against `session_user` — the role PostgreSQL
+  itself already authenticated at connect time, by whatever mechanism
+  `pg_hba.conf` configures. Neither half of that pair is a platform tenant or
+  HTTP credential, and neither claims anything about the connection's own auth
+  method. (Also unrelated to [ADR-0010](adr/0010-agent-publisher-principal-isolation.md)'s
+  Unix-level `aicc-agent`/`aicc-worker` process separation — same word,
+  different layer.) Its three `kind`s (`operator`, `control_plane`,
+  `worker_host`) answer "which AICC-side database role is this queue attempt
+  running as", a question AIOS's registry has no vocabulary for and never
+  governed. It has no relationship to the actual seam to the platform's
+  identity, `http_auth/` below, and grants no HTTP capability there or
+  anywhere else.
 
 ### `command_center/http_auth/` — why it was added to a frozen category
 
@@ -222,8 +276,11 @@ added:
 * `routing.py` is a route table and a boot check. No engine behaviour at all.
 
 What would make this a genuine violation is AICC growing its own credential
-store, its own token format, or a second principal registry. Tests assert the
-absence of the first two, and the design records the third as forbidden.
+store, its own token format, or a second principal registry standing in for
+the platform's tenant-scoped one. Tests assert the absence of the first two,
+and the design records the third as forbidden — see the SRV lane paragraph
+above for the PostgreSQL-role registry that predates this rule and is not an
+instance of it.
 
 The residual question — whether the *grant map* should eventually live in AIOS
 as per-service authorization rather than in this repository — is real and is
