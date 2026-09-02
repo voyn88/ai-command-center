@@ -29,6 +29,10 @@ CLAIMERS = (
     "voyn-aicc-worker-2.service",
     "voyn-aicc-worker@.service",
 )
+AUXILIARY_JOURNALS = (
+    "sensitive-retirement.json",
+    "authority-membership.json",
+)
 
 _READ_ERRORS = (
     FileNotFoundError,
@@ -153,6 +157,84 @@ def _uninstall_capsule(state_dir: Path, *, expected_uid: int) -> Path:
     return recovery
 
 
+def _auxiliary_capsule(state_dir: Path, *, expected_uid: int) -> Path:
+    """Resolve legacy auxiliary-only WAL to its exact live capsule."""
+    current = json.loads(
+        _trusted_regular(
+            state_dir / "current.json", mode=0o600, expected_uid=expected_uid
+        )
+    )
+    if not isinstance(current, dict) or not isinstance(current.get("manifest"), str):
+        raise RuntimeError("current generation pointer is invalid")
+    manifests: set[Path] = set()
+    for name in AUXILIARY_JOURNALS:
+        journal = state_dir / name
+        try:
+            payload = json.loads(
+                _trusted_regular(journal, mode=0o600, expected_uid=expected_uid)
+            )
+        except FileNotFoundError:
+            continue
+        if not isinstance(payload, dict):
+            raise RuntimeError("auxiliary recovery journal is invalid")
+        manifest_value = payload.get("manifest")
+        if name == "sensitive-retirement.json" and payload.get("version") == 1:
+            generation = payload.get("generation")
+            if not isinstance(generation, str):
+                raise RuntimeError("legacy retirement generation is invalid")
+            manifest_value = str(state_dir / generation / "manifest.json")
+        if not isinstance(manifest_value, str):
+            raise RuntimeError("auxiliary recovery journal has no manifest")
+        manifests.add(Path(manifest_value))
+    if len(manifests) != 1:
+        raise RuntimeError("auxiliary recovery journals disagree on generation")
+    manifest = manifests.pop()
+    generation = manifest.parent
+    state_root = state_dir.resolve(strict=True)
+    expected_generation = state_root / generation.name
+    expected = expected_generation / "manifest.json"
+    if manifest != expected or not re.fullmatch(
+        r"generation-[0-9a-f]{16}", generation.name
+    ):
+        raise RuntimeError("auxiliary recovery generation is invalid")
+    if current["manifest"] != str(manifest):
+        # A journal naming a non-live generation is not corruption: it is
+        # the durable record of a rolled-back control transition, and the
+        # generation it names may already be deleted as an orphan. The
+        # capsule that can resolve it is the LIVE generation's -- its
+        # `recover()` decides the journal's direction from `current.json`,
+        # restores the memberships the rollback owes, and consumes the
+        # journal. Refusing here left exactly that host with no boot
+        # recovery at all (acceptance finding on 0e856b9a). The fallback
+        # capsule passes every trust check below that the journal's own
+        # would have.
+        manifest = Path(current["manifest"])
+        generation = manifest.parent
+        expected_generation = state_root / generation.name
+        expected = expected_generation / "manifest.json"
+        if manifest != expected or not re.fullmatch(
+            r"generation-[0-9a-f]{16}", generation.name
+        ):
+            raise RuntimeError("live generation pointer is invalid")
+    generation_info = expected_generation.lstat()
+    if (
+        not stat.S_ISDIR(generation_info.st_mode)
+        or stat.S_ISLNK(generation_info.st_mode)
+        or generation_info.st_uid != expected_uid
+        or stat.S_IMODE(generation_info.st_mode) != 0o700
+        or expected_generation.resolve(strict=True) != expected_generation
+    ):
+        raise RuntimeError("auxiliary recovery generation directory is untrusted")
+    if manifest.resolve(strict=True) != expected:
+        raise RuntimeError("auxiliary recovery manifest escaped its generation")
+    _trusted_regular(expected, mode=0o600, expected_uid=expected_uid)
+    recovery = expected_generation / "recovery.py"
+    if recovery.resolve(strict=True) != recovery:
+        raise RuntimeError("auxiliary recovery capsule escaped its generation")
+    _trusted_regular(recovery, mode=0o700, expected_uid=expected_uid)
+    return recovery
+
+
 def recover(state_dir: Path = STATE_DIR, *, expected_uid: int = 0) -> int:
     """Dispatch a boot recovery capsule after local filesystems are mounted."""
     def present(path: Path) -> bool:
@@ -165,16 +247,22 @@ def recover(state_dir: Path = STATE_DIR, *, expected_uid: int = 0) -> int:
     pending = present(state_dir / "pending.json")
     pending_release = present(state_dir / "pending-release")
     uninstall = present(state_dir / "uninstall.json")
+    auxiliary = any(present(state_dir / name) for name in AUXILIARY_JOURNALS)
     if pending_release and not pending:
         raise RuntimeError("pending release selector exists without install journal")
     if pending and uninstall:
         raise RuntimeError("install and uninstall recovery journals coexist")
-    if not pending and not uninstall:
+    if uninstall and auxiliary:
+        raise RuntimeError("uninstall and auxiliary recovery journals coexist")
+    if not pending and not uninstall and not auxiliary:
         return 0
     try:
         if uninstall:
             capsule = _uninstall_capsule(state_dir, expected_uid=expected_uid)
             action = "recover-uninstall-boot"
+        elif auxiliary and not pending:
+            capsule = _auxiliary_capsule(state_dir, expected_uid=expected_uid)
+            action = "recover-boot"
         else:
             # pending-release without pending.json is invalid: only the
             # generation capsule recorded by pending.json is trusted code.
