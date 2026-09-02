@@ -1503,6 +1503,35 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
         _assert_command_inside_shell_if(text, line, guard)
 
 
+def test_the_recovery_capsule_only_starts_on_the_worker_profile():
+    """aicc-principal-recovery.service is a WORKER_ONLY_TARGETS unit: a
+    control profile turns its FileSpec into a removal, so a control host
+    never has the persistent unit file the transaction installs. Starting it
+    unconditionally at either call site -- the fresh boot-anchor activation
+    before any generation exists, and the INTENT-abort reactivation on the
+    uninstall path -- is exactly the worker-only side effect a control
+    install must not perform, and on a first control install would fail
+    outright against a unit file that was never written.
+
+    The command text is identical at both sites, so
+    `_assert_command_inside_shell_if`'s exact-one-occurrence contract (which
+    exists so a duplicated *unconditional* call can't hide behind one
+    correctly-guarded occurrence) would reject the legitimate second call if
+    applied to the whole file. Each call site is instead checked against an
+    isolated slice containing only that one occurrence.
+    """
+    text = _installer_text()
+    command = "systemctl start aicc-principal-recovery.service"
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+
+    assert text.count(command) == 2, (
+        f"expected exactly two call sites, found {text.count(command)}"
+    )
+    before_first, after_first = text.split(command, 1)
+    _assert_command_inside_shell_if(before_first + command, command, guard)
+    _assert_command_inside_shell_if(after_first, command, guard)
+
+
 # ---------------------------------------------------------------------------
 # The two comparisons that blocked installation on both hosts, 2026-08-31.
 # ---------------------------------------------------------------------------
