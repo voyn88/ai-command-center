@@ -43,6 +43,9 @@ _SYSTEMCTL_ERRORS = (OSError, subprocess.SubprocessError)
 _PROC_STAT_MISSING_ERRORS = (FileNotFoundError, ProcessLookupError)
 
 FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
+MAX_TASK_TIMEOUT_SECONDS = 3600
+TRANSIENT_RUNTIME_GRACE_SECONDS = 30
+TRANSIENT_STOP_TIMEOUT_SECONDS = 20
 SOCKET_PATH = "/run/aicc-agent-launcher/control.sock"
 ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 COMMON_ENV_FILE = Path("/etc/aicc/agent.env")
@@ -235,7 +238,7 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, int)
-        or not 30 <= timeout <= 3600
+        or not 30 <= timeout <= MAX_TASK_TIMEOUT_SECONDS
     ):
         raise LaunchRefused("timeout_seconds is outside 30..3600")
     if not isinstance(value["workspace"], str):
@@ -975,8 +978,8 @@ def _systemd_command(
         "--property=MemoryHigh=5G",
         "--property=CPUQuota=300%",
         "--property=TasksMax=512",
-        f"--property=RuntimeMaxSec={timeout + 30}",
-        "--property=TimeoutStopSec=20",
+        f"--property=RuntimeMaxSec={timeout + TRANSIENT_RUNTIME_GRACE_SECONDS}",
+        f"--property=TimeoutStopSec={TRANSIENT_STOP_TIMEOUT_SECONDS}",
         f"--property=InaccessiblePaths={inaccessible_paths}",
         # The source is always a broker-created bind mount. There is no
         # pathname fallback: PID 1 must never resolve the mutable workspace
