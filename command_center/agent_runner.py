@@ -168,6 +168,24 @@ _COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
     "getaddrinfo",
     "econnreset",
 )
+#: Codex pre-task failures reported only as free text on a failed, non-zero
+#: process. Live incident 2026-09-02: the CLI exited 1 with
+#: "ERROR: You've hit your usage limit ... try again at Sep 7th" and an empty
+#: result, the review work item completed "successfully" with that error as
+#: its whole payload, and every review stalled on cascade step 1 until the
+#: quota window -- the account failed, not the task, and nothing advanced the
+#: cascade to the next executor. Same containment rules as the Copilot list:
+#: consulted only for status == "failed" with a non-zero exit code, so a
+#: successful review that merely DISCUSSES a usage limit cannot match.
+_CODEX_RETRYABLE_FAILURE_SIGNATURES = (
+    "you've hit your usage limit",
+    "usage limit reached",
+    "not logged in",
+    "authentication failed",
+    "unauthorized",
+    "too many requests",
+    "stream disconnected",
+)
 _CODEX_PREFLIGHT_PROMPT = (
     "This is a disposable sandbox capability probe. In the current repository, "
     "create a file named aicc-codex-commit-probe.txt containing exactly "
@@ -1117,13 +1135,16 @@ class RunResult:
         """
         if self.is_executor_api_error:
             return True
-        if executor != "copilot" or self.status != "failed" or not self.exit_code:
+        if self.status != "failed" or not self.exit_code:
+            return False
+        signatures = {
+            "copilot": _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
+            "codex": _CODEX_RETRYABLE_FAILURE_SIGNATURES,
+        }.get(executor)
+        if signatures is None:
             return False
         diagnostic = f"{self.stdout}\n{self.stderr}".lower()
-        return any(
-            signature in diagnostic
-            for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
-        )
+        return any(signature in diagnostic for signature in signatures)
 
     @property
     def is_executor_sandbox_error(self) -> bool:
