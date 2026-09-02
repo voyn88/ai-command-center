@@ -1,0 +1,12 @@
+{
+  "policy": "Frozen line-count ceiling for AICC's highest blast-radius hotspot files (VOYN-W0-AICC-HOTSPOT-EXTRACTION-SEAMS). A mass rewrite of these files is not wanted: every change that touches one must first pull the touched behavior into a module with an explicit interface (an extraction seam) and pin its current behavior with a characterization test before changing it -- see docs/HOTSPOT_EXTRACTION_SEAMS.md. This baseline records each file's line count at freeze time. Growing past a ceiling fails CI; shrinking (extracting code out) is always allowed and never fails the gate. Any edit to this file is a reviewed architectural decision -- see the policy doc for the procedure.",
+  "reference": "docs/HOTSPOT_EXTRACTION_SEAMS.md",
+  "frozen_at": "2026-09-02",
+  "ceilings": {
+    "app.py": 3332,
+    "command_center/runtime/supervisor.py": 3263,
+    "command_center/task_pipeline.py": 2459,
+    "command_center/workspace_provisioning.py": 2285,
+    "command_center/ui/execution_center_monitor.py": 1876
+  }
+}
