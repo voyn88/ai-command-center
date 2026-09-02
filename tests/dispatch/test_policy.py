@@ -38,6 +38,7 @@ def _task(
     pinned: str | None = None,
     sla: str | None = None,
     created: str | None = None,
+    task_class: str | None = None,
 ) -> QueuedTask:
     return QueuedTask(
         id=tid,
@@ -47,6 +48,7 @@ def _task(
         pinned_executor=pinned,
         sla_deadline=sla,
         created_at=created,
+        task_class=task_class,
     )
 
 
@@ -348,6 +350,48 @@ def test_hard_pin_restricts_to_the_pinned_executor():
     plan = _plan([_task("t1", pinned="codex")], executors, policy)
 
     assert plan.assignments[0].assigned_executor == "codex"
+
+
+# --------------------------------------------------------------------------
+# task_class: carried onto every decision, not read by selection (yet).
+# --------------------------------------------------------------------------
+
+
+def test_task_class_is_carried_onto_an_assigned_decision():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1", task_class="AICC:implementation")], executors, policy
+    )
+
+    assert plan.assignments[0].task_class == "AICC:implementation"
+
+
+def test_task_class_is_carried_onto_a_deferred_decision():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1", allowed=frozenset({"codex"}), task_class="AICC:review")],
+        executors,
+        policy,
+    )
+
+    assert plan.deferred[0].task_class == "AICC:review"
+
+
+def test_task_class_does_not_affect_which_executor_is_chosen():
+    """Selection still runs purely on cost/budget/SLA — task_class is only
+    threaded through for the decision record, not yet consumed as signal."""
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [
+        _executor("ollama", cost=0.5, is_local=True),
+        _executor("claude_code", cost=0.1, is_local=False),
+    ]
+    plan = _plan(
+        [_task("t1", task_class="AICC:implementation")], executors, policy
+    )
+
+    assert plan.assignments[0].assigned_executor == "ollama"
 
 
 def test_plan_is_deterministic_for_identical_input():

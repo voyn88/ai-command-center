@@ -134,6 +134,17 @@ class QueuedTask:
     # ISO-8601 SLA deadline (earliest first); None sorts last.
     sla_deadline: str | None = None
     created_at: str | None = None
+    # The agent-marketplace rating bucket this task belongs to (see
+    # `dispatch.task_class.task_class_for`). Not yet read by `plan_dispatch`'s
+    # selection logic — the engine still selects purely on cost/budget/SLA —
+    # it is only threaded through onto `DispatchDecision` so a decision
+    # carries the bucket it was made for. Consuming it in selection is a
+    # separate, later change (VOYN-W0-AICC-AGENT-MARKETPLACE acceptance
+    # criterion 3), and it stays deferred for the same reason the rating
+    # engine itself is not yet fed: there is no real ledger data behind it
+    # yet, and wiring an unfed signal into a live selection decision would be
+    # exactly the decorative "витрина" the owning idea warns against.
+    task_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -264,6 +275,10 @@ class DispatchDecision:
     reason: str  # ASSIGNED or a DEFER_* code
     assigned_executor: str | None = None
     estimated_cost_usd: float = 0.0
+    # The originating `QueuedTask.task_class`, carried through unchanged so a
+    # later ledger writer can record which agent-marketplace rating bucket
+    # this decision belongs to without re-deriving it from the task.
+    task_class: str | None = None
 
     @property
     def assigned(self) -> bool:
@@ -283,6 +298,7 @@ class DispatchDecision:
             "assigned_executor": self.assigned_executor,
             "estimated_cost_usd": self.estimated_cost_usd,
             "explanation": self.explanation,
+            "task_class": self.task_class,
         }
 
 

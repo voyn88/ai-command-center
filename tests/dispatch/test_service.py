@@ -136,6 +136,38 @@ def test_collect_queued_tasks_reads_pin_and_priority(monkeypatch):
     assert queued[0].pinned_executor == "codex"
 
 
+def test_collect_queued_tasks_derives_task_class_from_project_and_task_type(
+    monkeypatch,
+):
+    _queued_task(title="a", project="AICC", task_type="review")
+
+    queued = service.collect_queued_tasks(ROOT)
+
+    assert queued[0].task_class == "AICC:review"
+
+
+def test_collect_queued_tasks_defaults_task_class_task_type_to_implementation(
+    monkeypatch,
+):
+    # `_queued_task` sets `task_type="implementation"` by default; this test
+    # goes around that default the same way an absent field would in real
+    # data, mirroring `task_pipeline`'s own "absent task_type means
+    # implementation" convention.
+    task = _queued_task(title="a", project="AICC")
+
+    def _mutator(tasks):
+        for t in tasks:
+            if t["id"] == task["id"]:
+                t.pop("task_type", None)
+        return None
+
+    tasks_repository.mutate_tasks(ROOT, _mutator)
+
+    queued = service.collect_queued_tasks(ROOT)
+
+    assert queued[0].task_class == "AICC:implementation"
+
+
 # --------------------------------------------------------------------------
 # plan() wires the real primitives
 # --------------------------------------------------------------------------

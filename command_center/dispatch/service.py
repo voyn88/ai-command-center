@@ -35,6 +35,7 @@ from command_center.dispatch.models import (
     QueuedTask,
 )
 from command_center.dispatch.policy import plan_dispatch
+from command_center.dispatch.task_class import task_class_for
 from command_center.runtime import db as runtime_db
 
 if TYPE_CHECKING:  # a type-only import: the service layer stays free of FastAPI
@@ -108,6 +109,10 @@ def collect_queued_tasks(root: Path) -> list[QueuedTask]:
         if is_sensitive(task.get("project") or ""):
             continue
         pinned = task.get("executor") if task.get("executor_pinned") else None
+        # Same task_type default `task_pipeline.capabilities_for_task_type`
+        # already uses: an absent task_type is an implementation task, not an
+        # unknown one.
+        task_type = task.get("task_type") or "implementation"
         queued.append(
             QueuedTask(
                 id=str(task.get("id")),
@@ -117,6 +122,9 @@ def collect_queued_tasks(root: Path) -> list[QueuedTask]:
                 pinned_executor=pinned,
                 sla_deadline=task.get("sla_deadline") or task.get("deadline"),
                 created_at=task.get("created_at"),
+                task_class=task_class_for(
+                    project=task.get("project"), task_type=task_type
+                ),
             )
         )
     return queued

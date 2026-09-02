@@ -133,6 +133,7 @@ def plan_dispatch(
                 project=t.project,
                 priority=t.priority,
                 reason=reason,
+                task_class=t.task_class,
             )
             for t in sorted(tasks, key=lambda t: _task_sort_key(t, policy))
         )
@@ -163,6 +164,7 @@ def plan_dispatch(
                     project=task.project,
                     priority=task.priority,
                     reason=empty_reason,
+                    task_class=task.task_class,
                 )
             )
             continue
@@ -200,6 +202,7 @@ def plan_dispatch(
                     project=task.project,
                     priority=task.priority,
                     reason=blocking_reason or DEFER_DAILY_BUDGET,
+                    task_class=task.task_class,
                 )
             )
             continue
@@ -220,6 +223,7 @@ def plan_dispatch(
                 reason=ASSIGNED,
                 assigned_executor=chosen.id,
                 estimated_cost_usd=cost,
+                task_class=task.task_class,
             )
         )
 
