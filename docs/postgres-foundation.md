@@ -223,3 +223,33 @@ AICC_TEST_PG_ADMIN_DSN="host=127.0.0.1 port=55432 dbname=postgres user=postgres 
 Each test creates and drops its own database, so the suite is safe under
 `pytest -n auto`. CI supplies the DSN from a service container pinned to the
 same image digest as `docker-compose.server.yml`.
+
+### Hosts without Docker access or a running PostgreSQL server
+
+`scripts/check_postgres_host.sh` decides which route, if any, this host can
+use, proving each one by an operation that only succeeds against something
+actually listening — never by a binary's presence or a group membership:
+
+```bash
+scripts/check_postgres_host.sh
+# AICC_POSTGRES_HOST_ROUTE=docker|podman|native|harness
+```
+
+`scripts/provision_postgres_host.sh` stands up a throwaway server on whatever
+route it reports (`docker`, `podman`, or `harness`) and only then prints the
+DSN export — it waits on the new server's own readiness probe first, so it
+never reports success for something that merely started:
+
+```bash
+eval "$(scripts/provision_postgres_host.sh start)"   # exports AICC_TEST_PG_ADMIN_DSN
+pytest tests/db -q
+scripts/provision_postgres_host.sh stop
+```
+
+`harness` is the route for a host with no Docker/Podman access at all: as
+long as the `postgresql-16` server package (not just `-client`) is installed,
+`scripts/aicc_pg_harness.sh` runs a private, unprivileged cluster on a high
+port — `initdb`/`postgres` need no privilege beyond a writable data
+directory. `native` names a cluster the operator already runs and manages the
+credentials for; `provision_postgres_host.sh` will not touch it, only confirm
+it is reachable — export `AICC_TEST_PG_ADMIN_DSN` for it yourself.
