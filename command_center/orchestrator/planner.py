@@ -127,12 +127,20 @@ def _payload_for(
         # (VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP): completed work sat
         # uncommitted in the clone, `agent_worktree_clean` refused it, and the
         # cascade spent every remaining attempt reproducing the same refusal.
+        # Follow-up (VOYN-W0-AICC-PUBLISH-PREP-UNTRACKED-FILES): a bare `git
+        # commit` (or `git commit -a`) never stages a NEW file -- a created
+        # migration stayed untracked, `agent_worktree_clean` still refused,
+        # and the cascade parked again for the same reason. `git add -A`
+        # (not `git add` alone) is what actually stages untracked work.
         "Commit every change you make to the task branch in this clone before "
-        "you finish -- `git add` and `git commit` are yours to run, and an "
-        "uncommitted change is discarded work, not a result. Do NOT push and "
-        "do NOT open a pull request: you have no push capability, and the "
-        "orchestrator publishes your commits through the guarded publisher "
-        "after you exit.\n"
+        "you finish -- run `git add -A` (this also stages new files you "
+        "created, such as a migration, which a plain `git add` or "
+        "`git commit -a` would leave untracked) and then `git commit`. Run "
+        "`git status --porcelain` afterward and confirm it prints nothing: "
+        "an uncommitted or untracked change is discarded work, not a result. "
+        "Do NOT push and do NOT open a pull request: you have no push "
+        "capability, and the orchestrator publishes your commits through the "
+        "guarded publisher after you exit.\n"
         "End your final message with a line of exactly this form so the "
         "orchestrator can record the evidence:\n"
         "HEAD_SHA: <the branch head commit sha>"
