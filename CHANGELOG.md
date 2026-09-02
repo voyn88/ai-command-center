@@ -8,6 +8,12 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — expose `try_advisory_lock` through the db adapter (`VOYN-W0-AICC-DB-ADAPTER-TRYLOCK`)
+- `command_center/db/adapter.py` now re-exports `aios_db.try_advisory_lock`
+  alongside the existing `advisory_lock`, so a caller that wants a
+  non-blocking, single-sweeper-style acquire (`if not held: return` instead
+  of catching `AdvisoryLockTimeout`) no longer has to reach past the seam.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,

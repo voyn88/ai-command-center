@@ -37,6 +37,7 @@ from aios_db import (
     lock_key,
     open_pool,
     pool_stats,
+    try_advisory_lock,
 )
 
 __all__ = [
@@ -56,4 +57,5 @@ __all__ = [
     "lock_key",
     "open_pool",
     "pool_stats",
+    "try_advisory_lock",
 ]
