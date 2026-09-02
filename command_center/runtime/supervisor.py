@@ -674,7 +674,14 @@ def _capture_stable_process_identity(
     # run can finish inside the stabilization window, and once it has, its
     # identity is no longer readable at all — so waiting first and asking later
     # would refuse to launch exactly the fastest, healthiest runs.
-    immediate = identity.capture_identity(process.pid)
+    #
+    # `allow_zombie=True`: a process this short-lived can already be a zombie
+    # by the time this very first sample runs (spawning `ps`/reading procfs
+    # takes real time). This handle is still unreaped, so the pid cannot have
+    # been reused underneath it — a zombie sample is exactly as trustworthy as
+    # a live one here. Without this, the fastest, healthiest runs were exactly
+    # the ones that failed with "Could not capture process identity".
+    immediate = identity.capture_identity(process.pid, allow_zombie=True)
     previous = None
     consecutive = 0
     for _ in range(attempts):
@@ -684,7 +691,7 @@ def _capture_stable_process_identity(
             # sample is exactly as trustworthy as two matching ones.
             return immediate
 
-        current = identity.capture_identity(process.pid)
+        current = identity.capture_identity(process.pid, allow_zombie=True)
         if current is not None and previous is not None and current.as_string() == previous.as_string():
             consecutive += 1
             if consecutive >= 1:

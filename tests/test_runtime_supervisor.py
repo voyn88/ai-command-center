@@ -624,7 +624,7 @@ def test_missing_process_identity_fails_closed_and_reaps_child(
         return process
 
     monkeypatch.setattr(supervisor.subprocess, "Popen", capturing_popen)
-    monkeypatch.setattr(supervisor.identity, "capture_identity", lambda pid: None)
+    monkeypatch.setattr(supervisor.identity, "capture_identity", lambda pid, **kwargs: None)
 
     sup = supervisor.Supervisor()
     with pytest.raises(supervisor.SupervisorError, match="capture process identity"):
