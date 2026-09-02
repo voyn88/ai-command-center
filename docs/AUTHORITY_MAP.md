@@ -66,6 +66,56 @@ through its functions; WAL, optimistic `version` columns).
 | `data/daily-audit.*.log`, `data/audits/` | Daily-audit daemon output (`scripts/daily_audit_daemon.py`); disposable diagnostics. |
 | `data/task_pipeline.lock` | Advisory same-host tick serialization (`task_pipeline.pipeline_lock`); content-free. |
 
+## Merge enforcement authority (VOYN-W0-AICC-BRANCH-PROTECTION-LIMIT)
+
+GitHub-native branch protection is **not** the enforcement point for `main`.
+Confirmed directly against the live API on 2026-09-02 via
+`gh api repos/<owner>/<repo>/branches/main/protection`:
+`required_approving_review_count=0`, `required_status_checks` is absent, and
+`enforce_admins=false`. The current plan/repository has no branch protection
+or ruleset configured, so GitHub itself will accept a merge to `main` with no
+passing check and no review — anyone with direct write access can merge
+around every gate described below through the GitHub UI/API.
+
+Several parts of this codebase were written assuming GitHub-side enforcement
+existed: `.github/workflows/acceptance-gate.yml`; the merge-queue handling in
+`command_center/orchestrator/review_merge.py` (its comments describe "the
+required Acceptance-gate check" and the merge queue refusing a red run); and
+`scripts/assert_independent_acceptance.py`'s design note, which documents a
+required-status-check contract. That contract is **not configured at the
+GitHub level today** — whatever those flows deliver is only as strong as
+"nobody merges outside them," which GitHub is not enforcing.
+
+The enforcement that is actually real is **application-level, not
+GitHub-level**:
+
+* Only `command_center/runtime/completion_service.py` (via `git_ops` and
+  `GitHubClient`) ever pushes or merges — agents and their CLIs never hold
+  push/merge credentials. See
+  [`docs/adr/0010-agent-publisher-principal-isolation.md`](adr/0010-agent-publisher-principal-isolation.md):
+  the queue worker/guarded publisher is a distinct Unix principal from the
+  isolated, credential-scrubbed per-run agent unit.
+* It refuses to merge when checks are failing or a required review is
+  absent — evaluated by `CompletionEvaluator`/`CompletionPolicy`
+  (`command_center/runtime/completion.py`); review independence specifically
+  is evaluated by the acceptance-gate CI check
+  (`scripts/assert_independent_acceptance.py`), which exists because
+  GitHub's own `required_approving_review_count` cannot express "approved by
+  an identity that is not the author" for this repository's reviewer
+  identity model.
+
+This is a discipline enforced by *who holds credentials and what code they
+run*, not a GitHub setting, so it does not stop a human with direct
+repository write access from merging manually or an admin from disabling the
+workflow. Until real required checks are visible in
+`gh api repos/<owner>/<repo>/branches/main/protection`
+(`required_status_checks` populated and `required_approving_review_count >= 1`,
+or an equivalent ruleset), **no documentation or dashboard in this repository
+may describe GitHub branch protection as an active control.** The completion
+pipeline / guarded publisher above is the only enforcement point that may be
+claimed as real. `CURRENT_STATE.md` carries the standing operational note;
+this section is the source of truth for the underlying authority claim.
+
 ## Deployed truth
 
 The deployed AICC is whatever exact-SHA checkout a given instance runs from
