@@ -195,6 +195,30 @@ section below for why it exists at all):
   cascade. Every atomic decision is a SQL function of the store; the package
   owns candidate iteration, the static routing matrix and the plan report,
   and adds no engine capability of its own.
+  `command_center/db/roles.py`'s `principal`/`principal_credential`/
+  `principal_event` tables (VOYN-W0-AICC-SRV-03, `0003_worker_enrollment.up.sql`)
+  are SRV-02's identity registry, finally placed (VOYN-W0-AICC-SRV-02-PLACEMENT).
+  `0002_queue_claim.up.sql` had recorded it as "a design proposal, not a
+  deployed table" precisely to avoid landing an AICC-local registry that
+  duplicates AIOS's own tenant-scoped one (`principals`, `auth_principals`,
+  `credentials`) before a placement decision was made. Landing it here is not
+  that duplication, and it is not the "second principal registry" the
+  `http_auth/` section below forbids either — that ban is scoped to a
+  platform-identity stand-in, and this table answers a different question.
+  `principal.db_role` names a PostgreSQL role; `identity_assert()`
+  authenticates a separate, AICC-managed credential (`principal_credential`)
+  and cross-checks its `db_role` against `session_user` — the role PostgreSQL
+  itself already authenticated at connect time, by whatever mechanism
+  `pg_hba.conf` configures. Neither half of that pair is a platform tenant or
+  HTTP credential, and neither claims anything about the connection's own auth
+  method. (Also unrelated to [ADR-0010](adr/0010-agent-publisher-principal-isolation.md)'s
+  Unix-level `aicc-agent`/`aicc-worker` process separation — same word,
+  different layer.) Its three `kind`s (`operator`, `control_plane`,
+  `worker_host`) answer "which AICC-side database role is this queue attempt
+  running as", a question AIOS's registry has no vocabulary for and never
+  governed. It has no relationship to the actual seam to the platform's
+  identity, `http_auth/` below, and grants no HTTP capability there or
+  anywhere else.
 
 ### `command_center/http_auth/` — why it was added to a frozen category
 
@@ -222,8 +246,11 @@ added:
 * `routing.py` is a route table and a boot check. No engine behaviour at all.
 
 What would make this a genuine violation is AICC growing its own credential
-store, its own token format, or a second principal registry. Tests assert the
-absence of the first two, and the design records the third as forbidden.
+store, its own token format, or a second principal registry standing in for
+the platform's tenant-scoped one. Tests assert the absence of the first two,
+and the design records the third as forbidden — see the SRV lane paragraph
+above for the PostgreSQL-role registry that predates this rule and is not an
+instance of it.
 
 The residual question — whether the *grant map* should eventually live in AIOS
 as per-service authorization rather than in this repository — is real and is
