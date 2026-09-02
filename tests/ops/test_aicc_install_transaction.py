@@ -5933,3 +5933,204 @@ def test_a_quarantined_symlink_is_put_back_as_a_symlink(monkeypatch, tmp_path):
     assert os.readlink(link) == str(tmp_path / "somewhere-else")
     assert not list(link.parent.glob(".legacy.service.aicc-purge-*"))
     assert elsewhere.read_bytes() == b"legacy", "nothing followed the link"
+
+
+def _live_worker_runtime_tree(module, tmp_path):
+    """A live worker's runtime state at prepare time: the accept socket's
+    `control.sock` still bound, an (empty) session directory tree."""
+    root = tmp_path / "root"
+    launcher = root / "run/aicc-agent-launcher"
+    (launcher / "active").mkdir(parents=True)
+    (launcher / "control.sock").write_bytes(b"")
+    for directory in (root / "run", launcher, launcher / "active"):
+        os.chmod(directory, 0o700)
+    transaction = module.FileTransaction(root, tmp_path / "state")
+    specs = (
+        module.directory_removal_spec("/run/aicc-agent-launcher/active"),
+        module.directory_removal_spec("/run/aicc-agent-launcher"),
+    )
+    return transaction, launcher, specs
+
+
+def test_prepare_tolerates_live_runtime_content_under_run(tmp_path):
+    """The prescribed conversion order is prepare -> quiesce, so at prepare
+    time the worker layer is still live by design: `control.sock` is held
+    open by the accept socket until quiesce stops it, and session entries
+    are still draining. Refusing that guaranteed-present state made
+    conversion of every live worker host impossible (acceptance finding on
+    0e856b9a). The strict content check moves to apply()'s pre-mutation
+    assert, which the mandated sequence runs after quiesce."""
+    module = _module()
+    transaction, launcher, specs = _live_worker_runtime_tree(module, tmp_path)
+
+    transaction.prepare(specs)
+
+    assert transaction.pending.exists()
+    assert (launcher / "control.sock").exists(), "prepare touched nothing"
+    assert (launcher / "active").is_dir()
+
+
+def test_apply_refuses_runtime_content_that_survived_quiesce(tmp_path):
+    """The tolerance prepare() extends to live runtime state ends at apply:
+    by then the mandated sequence has quiesced the worker layer, so content
+    still present is unaccounted for -- exactly the invariant prepare()
+    used to assert, enforced at the first moment it can actually hold, and
+    still before the first mutation, host bit-for-bit untouched."""
+    module = _module()
+    transaction, launcher, specs = _live_worker_runtime_tree(module, tmp_path)
+    transaction.prepare(specs)
+
+    with pytest.raises(RuntimeError, match="unexpected content under worker-only"):
+        transaction.apply()
+
+    assert (launcher / "control.sock").exists()
+    assert (launcher / "active").is_dir()
+    # The refusal fires in the pre-mutation assert, before the apply loop's
+    # try: -- the host is untouched and pending.json deliberately stays
+    # armed. recover() is equally fail-closed while the unaccounted content
+    # persists, and converges once it is drained.
+    assert transaction.pending.exists()
+    with pytest.raises(RuntimeError, match="unexpected content"):
+        transaction.recover()
+    (launcher / "control.sock").unlink()
+    transaction.recover()
+    assert not transaction.pending.exists()
+    assert (launcher / "active").is_dir(), "recover touched nothing else"
+
+
+def test_apply_tolerates_a_runtime_tree_the_quiesce_step_tore_down(tmp_path):
+    """`RemoveOnStop=` and runtime-directory cleanup may remove the whole
+    tree together with the units that owned it between prepare and apply.
+    Absence is this removal's goal state, not drift."""
+    module = _module()
+    transaction, launcher, specs = _live_worker_runtime_tree(module, tmp_path)
+    transaction.prepare(specs)
+    shutil.rmtree(launcher)
+
+    transaction.apply()
+    transaction.commit()
+
+    assert not launcher.exists()
+
+
+def test_a_failed_apply_resolves_the_membership_journal_it_orphans(
+    monkeypatch, tmp_path
+):
+    """apply()'s rollback consumes pending.json, so no WAL governs the
+    membership journal afterwards, and the generation the journal is bound
+    to is deleted as an orphan in the same breath. The failure path must
+    therefore resolve the journal exactly as recover() resolves an
+    unguarded one: the generation is not live, so the memberships its
+    revocation took go back with it. Leaving the journal bound to a deleted
+    generation stranded the host -- publisher membership revoked, every
+    later recover() refusing (acceptance finding on 0e856b9a)."""
+    module = _module()
+    root = tmp_path / "root"
+    state, live, _calls, run, getgrnam, _manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    worker_only = root / "etc/aicc/agent.env"
+    worker_only.parent.mkdir(parents=True)
+    worker_only.write_bytes(b"agent-secret")
+    worker_only.chmod(0o640)
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare((module.removal_spec("/etc/aicc/agent.env"),))
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == set()
+    _restoring_recover(module, monkeypatch, run, getgrnam)
+
+    def failing_removal(self, record):
+        raise RuntimeError("injected apply failure")
+
+    monkeypatch.setattr(module.FileTransaction, "_apply_removal", failing_removal)
+
+    with pytest.raises(RuntimeError, match="injected apply failure"):
+        transaction.apply()
+
+    assert live == {"aicc-worker", "voynadmin"}, "membership came back with the rollback"
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+    assert not transaction.pending.exists()
+    assert worker_only.read_bytes() == b"agent-secret"
+    transaction.recover()
+
+
+def test_recover_resolves_a_journal_bound_to_a_rolled_back_generation(
+    monkeypatch, tmp_path
+):
+    """With no pending WAL, a membership journal naming a non-live
+    generation is not corruption -- it is the durable record of a rolled
+    back control transition whose generation may already be deleted.
+    Refusing it left that host unrecoverable by automation (acceptance
+    finding on 0e856b9a); recover() lets the resolver decide the direction
+    from what is actually live and puts the memberships back."""
+    module = _module()
+    root = tmp_path / "root"
+    state, live, _calls, run, getgrnam, _manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    transaction = module.FileTransaction(root, state)
+    source = tmp_path / "committed-file"
+    source.write_bytes(b"committed")
+    transaction.install((_spec(module, source, "/etc/committed-file"),))
+    dead = state / "generation-00000000deadbeef" / "manifest.json"
+    module.revoke_legacy_authority_membership(
+        state, dead, run=run, getgrnam=getgrnam
+    )
+    assert live == set()
+    _restoring_recover(module, monkeypatch, run, getgrnam)
+
+    transaction.recover()
+
+    assert live == {"aicc-worker", "voynadmin"}
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+    assert (root / "etc/committed-file").exists(), "the live generation is untouched"
+
+
+def test_generator_dispatches_an_orphaned_membership_journal_to_the_live_capsule(
+    monkeypatch, tmp_path
+):
+    """The membership journal of a rolled-back control transition names a
+    generation that may already be deleted as an orphan; the capsule that
+    can resolve it is the LIVE generation's recover(), which decides the
+    journal's direction from current.json. Refusing to dispatch left
+    exactly that host with no boot recovery at all (acceptance finding on
+    0e856b9a)."""
+    generator = _generator_module()
+    state = tmp_path / "state"
+    generation = state / "generation-0123456789abcdef"
+    generation.mkdir(parents=True)
+    generation.chmod(0o700)
+    manifest = generation / "manifest.json"
+    manifest.write_text(json.dumps({"version": 3, "records": []}), encoding="utf-8")
+    manifest.chmod(0o600)
+    recovery = generation / "recovery.py"
+    recovery.write_text("#!/usr/bin/python3\n", encoding="utf-8")
+    recovery.chmod(0o700)
+    current = state / "current.json"
+    current.write_text(json.dumps({"manifest": str(manifest)}), encoding="utf-8")
+    current.chmod(0o600)
+    journal = state / "authority-membership.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "group": "aicc-publisher",
+                "generation": "generation-00000000deadbeef",
+                "manifest": str(
+                    state / "generation-00000000deadbeef" / "manifest.json"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal.chmod(0o600)
+    called = []
+    monkeypatch.setattr(generator.os, "execv", lambda *args: called.append(args))
+
+    with pytest.raises(AssertionError, match="unreachable"):
+        generator.recover(state, expected_uid=os.getuid())
+
+    assert called[0][1][1] == str(recovery)
+    assert called[0][1][2] == "recover-boot"

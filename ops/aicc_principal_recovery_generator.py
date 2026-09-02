@@ -193,12 +193,29 @@ def _auxiliary_capsule(state_dir: Path, *, expected_uid: int) -> Path:
     state_root = state_dir.resolve(strict=True)
     expected_generation = state_root / generation.name
     expected = expected_generation / "manifest.json"
-    if (
-        manifest != expected
-        or not re.fullmatch(r"generation-[0-9a-f]{16}", generation.name)
-        or current["manifest"] != str(manifest)
+    if manifest != expected or not re.fullmatch(
+        r"generation-[0-9a-f]{16}", generation.name
     ):
-        raise RuntimeError("auxiliary recovery generation is not live")
+        raise RuntimeError("auxiliary recovery generation is invalid")
+    if current["manifest"] != str(manifest):
+        # A journal naming a non-live generation is not corruption: it is
+        # the durable record of a rolled-back control transition, and the
+        # generation it names may already be deleted as an orphan. The
+        # capsule that can resolve it is the LIVE generation's -- its
+        # `recover()` decides the journal's direction from `current.json`,
+        # restores the memberships the rollback owes, and consumes the
+        # journal. Refusing here left exactly that host with no boot
+        # recovery at all (acceptance finding on 0e856b9a). The fallback
+        # capsule passes every trust check below that the journal's own
+        # would have.
+        manifest = Path(current["manifest"])
+        generation = manifest.parent
+        expected_generation = state_root / generation.name
+        expected = expected_generation / "manifest.json"
+        if manifest != expected or not re.fullmatch(
+            r"generation-[0-9a-f]{16}", generation.name
+        ):
+            raise RuntimeError("live generation pointer is invalid")
     generation_info = expected_generation.lstat()
     if (
         not stat.S_ISDIR(generation_info.st_mode)

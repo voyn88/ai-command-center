@@ -1202,3 +1202,57 @@ def test_silent_post_stop_probe_cannot_confirm_an_absent_service():
 
     with pytest.raises(module.RolloutError, match="cannot prove absent service"):
         module.restore(systemd, state)
+
+
+class _ZeroMatchSystemd(FakeSystemd):
+    """Real systemd (255, live-verified on a pre-launcher worker):
+    `list-unit-files <pattern>` exits 1 with no stdout and no stderr when
+    the pattern matches no unit file at all."""
+
+    def probe(self, *args: str) -> tuple[int, str, str]:
+        if args[0] == "list-unit-files":
+            import fnmatch
+
+            pattern = args[1]
+            matches = [
+                f"{unit} enabled"
+                for unit in self.states
+                if fnmatch.fnmatch(unit, pattern)
+            ]
+            if not matches:
+                return 1, "", ""
+            return 0, "\n".join(matches), ""
+        return super().probe(*args)
+
+
+def test_snapshot_closure_tolerates_a_host_with_no_matching_templates():
+    """A pre-launcher worker, a control host (whose generation removes the
+    launcher template by design), and the post-uninstall closure check all
+    legitimately own zero matching unit files. `list-unit-files` reports
+    that answer as rc=1 with no output, and the closure check must read it
+    as "none" -- the same contract the install transaction's lane enumerator
+    already honours -- not abort the uninstall after mutation (acceptance
+    finding on 0e856b9a)."""
+    module = _module()
+
+    module.verify_snapshot_closure(
+        _ZeroMatchSystemd(()), {"version": 3, "units": {}}
+    )
+
+
+def test_snapshot_closure_still_fails_closed_on_a_real_enumeration_failure():
+    """Only the exact rc=1/no-output shape is the documented empty answer.
+    A diagnosed failure -- or silent breakage under any other status -- must
+    still refuse rather than report a closure it never proved."""
+    module = _module()
+
+    class BrokenSystemd(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            if args[0] == "list-unit-files":
+                return 1, "", "Failed to connect to bus"
+            return super().probe(*args)
+
+    with pytest.raises(module.RolloutError, match="Failed to connect"):
+        module.verify_snapshot_closure(
+            BrokenSystemd(()), {"version": 3, "units": {}}
+        )

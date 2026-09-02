@@ -356,7 +356,27 @@ def _listed_instances(
         ("list-unit-files", pattern, "--no-legend", "--no-pager"),
         ("list-units", pattern, "--all", "--no-legend", "--no-pager"),
     ):
-        for line in systemd.run(*command, check=check).splitlines():
+        if check and command[0] == "list-unit-files":
+            # `list-unit-files` exits 1 with no output at all when the
+            # pattern matches no unit file. That is the answer "none", not a
+            # failure: a pre-launcher worker, a control host, and the
+            # post-uninstall closure check all legitimately have zero
+            # matching templates (same contract, and the same live incident,
+            # as the tolerant lane enumerator in aicc_install_transaction).
+            # Only that exact shape is tolerated; any output or any other
+            # status stays fail-closed, and `list-units` below never gets
+            # this tolerance.
+            returncode, stdout, stderr = systemd.probe(*command)
+            if returncode and not (
+                returncode == 1 and not stdout and not stderr
+            ):
+                raise RolloutError(
+                    stderr or f"systemctl {' '.join(command)} failed"
+                )
+            output = stdout
+        else:
+            output = systemd.run(*command, check=check)
+        for line in output.splitlines():
             fields = line.split()
             if fields and fields[0] == "●":
                 fields = fields[1:]

@@ -2907,6 +2907,20 @@ class FileTransaction:
         provider cache nobody declared -- fails the generation closed, before
         `prepare()` has touched a single target, and the operator decides
         what it was.
+
+        Directories under `/run` are the one exception to checking that HERE:
+        the prescribed conversion order is prepare -> quiesce, so at prepare
+        time the worker layer is still live by design and its runtime state
+        (`control.sock` held open by the accept socket until quiesce stops
+        it, session entries the drain has not finished) is guaranteed to be
+        present -- refusing it made conversion of every live worker host
+        impossible (acceptance finding on 0e856b9a). The content check for
+        runtime directories therefore moves to `apply()`'s pre-mutation
+        assert (`_assert_directory_removal_snapshot`), which the mandated
+        sequence runs after quiesce has drained them: the same content
+        fails the generation closed with the host bit-for-bit untouched,
+        at the first moment the invariant can actually hold. Persistent
+        directories keep the prepare-time check unchanged.
         """
         try:
             info = target.lstat()
@@ -2936,12 +2950,13 @@ class FileTransaction:
             for other in removed
             if str(PurePosixPath(other).parent) == spec.target
         }
-        unexpected = sorted(set(os.listdir(target)) - expected)
-        if unexpected:
-            raise RuntimeError(
-                f"unexpected content under worker-only directory {target}: "
-                f"{unexpected}"
-            )
+        if not _runtime_target(spec.target):
+            unexpected = sorted(set(os.listdir(target)) - expected)
+            if unexpected:
+                raise RuntimeError(
+                    f"unexpected content under worker-only directory {target}: "
+                    f"{unexpected}"
+                )
         return BackupRecord(
             spec.target,
             True,
@@ -3160,7 +3175,9 @@ class FileTransaction:
                 f"purge directory changed before compare-and-remove: {target}"
             )
 
-    def _assert_directory_removal_snapshot(self, record: BackupRecord) -> None:
+    def _assert_directory_removal_snapshot(
+        self, record: BackupRecord, *, removal_targets: frozenset[str]
+    ) -> None:
         """Prove a purge directory is still the one `prepare()` recorded."""
         target = self._target(record.target)
         if not record.existed:
@@ -3172,10 +3189,34 @@ class FileTransaction:
         try:
             info = target.lstat()
         except FileNotFoundError as exc:
+            if _runtime_target(record.target):
+                # The quiesce step between prepare and apply may tear a
+                # runtime directory down wholesale (`RemoveOnStop=`,
+                # runtime-directory cleanup). Absence is this removal's goal
+                # state, not drift.
+                return
             raise RuntimeError(
                 f"purge directory disappeared before removal: {target}"
             ) from exc
         self._assert_directory_state(record, info, target)
+        if _runtime_target(record.target):
+            # The content check `prepare()` deliberately defers for runtime
+            # directories (see `_snapshot_directory_removal`): the mandated
+            # sequence has quiesced the worker layer by now, so anything
+            # still present here is unaccounted for. Refusing in this
+            # pre-mutation assert keeps the original guarantee -- the
+            # generation fails closed with the host bit-for-bit untouched.
+            expected = {
+                PurePosixPath(other).name
+                for other in removal_targets
+                if str(PurePosixPath(other).parent) == record.target
+            }
+            unexpected = sorted(set(os.listdir(target)) - expected)
+            if unexpected:
+                raise RuntimeError(
+                    f"unexpected content under worker-only directory {target}: "
+                    f"{unexpected}"
+                )
 
     @staticmethod
     def _release_directory_quarantine(
@@ -3230,6 +3271,11 @@ class FileTransaction:
         try:
             parent_fd = _open_directory_chain(target.parent, create=False)
         except FileNotFoundError as exc:
+            if _runtime_target(record.target):
+                # Runtime trees may vanish with the units that owned them
+                # between the pre-mutation assert and this removal; absence
+                # is the goal state (see `_assert_directory_removal_snapshot`).
+                return
             raise RuntimeError(
                 f"purge directory disappeared before removal: {target}"
             ) from exc
@@ -3237,6 +3283,8 @@ class FileTransaction:
             try:
                 info = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError as exc:
+                if _runtime_target(record.target):
+                    return
                 raise RuntimeError(
                     f"purge directory disappeared before removal: {target}"
                 ) from exc
@@ -3291,9 +3339,14 @@ class FileTransaction:
         # governs the unlink, but refusing here means a drifted target fails
         # the generation with the host bit-for-bit untouched, instead of after
         # half the installs have been written and must be rolled back.
+        removal_targets = frozenset(
+            record.target for record in records if record.remove
+        )
         for record in records:
             if record.remove and record.directory:
-                self._assert_directory_removal_snapshot(record)
+                self._assert_directory_removal_snapshot(
+                    record, removal_targets=removal_targets
+                )
             elif record.remove:
                 self._assert_removal_snapshot(record)
         try:
@@ -3336,6 +3389,25 @@ class FileTransaction:
                     "generation apply failed and immediate rollback failed; "
                     "durable recovery remains armed"
                 ) from rollback_error
+            # The rollback above consumed pending.json, so no WAL governs the
+            # authority-membership journal any more -- and this generation,
+            # which `revoke-worker-authority` bound that journal to, is about
+            # to be deleted as an orphan. Resolve the journal NOW, exactly as
+            # `recover()` does for the same no-pending state: the generation
+            # is not live, so the memberships it revoked go back with it.
+            # Leaving the journal bound to a deleted generation stranded the
+            # host with publisher membership revoked, worker units quiesced,
+            # and every later recover() refusing (acceptance finding on
+            # 0e856b9a). Resolution failure keeps the durable journal for
+            # recover() rather than masking the apply failure.
+            try:
+                self._resolve_authority_membership()
+            except BaseException as membership_error:
+                raise RuntimeError(
+                    "generation apply failed, rollback succeeded, but the "
+                    "authority membership journal could not be resolved; "
+                    "it remains durable for recover()"
+                ) from membership_error
             self._remove_orphan_generations()
             raise
 
@@ -3806,7 +3878,17 @@ class FileTransaction:
             membership: dict[str, object] | None = None
             if _path_present(self.state_dir / AUTHORITY_MEMBERSHIP_JOURNAL):
                 membership = _authority_membership_journal(self.state_dir)
-                _authority_membership_bound(membership, current_manifest)
+                # Deliberately NOT bound to the current generation here: with
+                # no pending WAL, a journal naming a non-live generation is
+                # not corruption -- it is the durable record of a rolled-back
+                # control transition whose memberships must go back (the
+                # exact state a failed `apply()` leaves when its own
+                # resolution step could not finish). Refusing it made that
+                # host unrecoverable by automation (acceptance finding on
+                # 0e856b9a). `_resolve_authority_membership` below decides
+                # the direction from what is actually live, and
+                # `_authority_membership_state` still refuses any group
+                # state this journal never described.
             if retirement is not None:
                 if current_manifest is None or retirement["manifest"] != str(
                     current_manifest
@@ -5100,6 +5182,20 @@ WORKER_ONLY_DIRECTORIES = (
     "/etc/systemd/system/voyn-aicc-worker@.service.d",
     "/etc/systemd/system/aicc-worker.service.d",
 )
+
+
+def _runtime_target(target: str) -> bool:
+    """Whether a logical target lives on the tmpfs runtime tree.
+
+    Runtime state under `/run` is owned by the live worker units the same
+    transaction quiesces between `prepare()` and `apply()`: it is expected
+    to exist at prepare time and expected to be gone -- possibly together
+    with its directory, via `RemoveOnStop=`/runtime-directory cleanup -- by
+    apply time. Both tolerances key off this predicate and nothing else
+    does; persistent trees keep every strict check.
+    """
+    path = PurePosixPath(target)
+    return path.is_relative_to("/run")
 
 PROFILES = ("worker", "control")
 
