@@ -32,11 +32,13 @@ from aios_db import (
     PoolError,
     ProbeResult,
     advisory_lock,
+    advisory_xact_lock,
     check_connectivity,
     discover,
     lock_key,
     open_pool,
     pool_stats,
+    try_advisory_lock,
 )
 
 __all__ = [
@@ -51,9 +53,11 @@ __all__ = [
     "PoolError",
     "ProbeResult",
     "advisory_lock",
+    "advisory_xact_lock",
     "check_connectivity",
     "discover",
     "lock_key",
     "open_pool",
     "pool_stats",
+    "try_advisory_lock",
 ]

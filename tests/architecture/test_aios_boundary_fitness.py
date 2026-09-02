@@ -236,6 +236,42 @@ def test_the_second_public_distribution_is_confined_to_its_own_adapter():
     assert boundary.find_forbidden_aios_imports(core, boundary.DB_ADAPTER_PATH)
 
 
+def test_db_adapter_exports_the_frozen_advisory_lock_surface():
+    """`command_center/db/adapter.py`'s public names are a reviewed, frozen list.
+
+    The adapter's own docstring commits to this: "a blanket `from aios_db
+    import *` would make every future addition to that library part of AICC's
+    surface without anyone deciding so." Pinning the exact set here means a new
+    `aios_db` re-export shows up as a diff to this test to review, not as a
+    silent widening of the seam.
+    """
+    from command_center.db import adapter
+
+    assert set(adapter.__all__) == {
+        "AdvisoryLockError",
+        "AdvisoryLockTimeout",
+        "AiosDbError",
+        "DB_CONTRACT",
+        "Migration",
+        "MigrationChecksumMismatch",
+        "MigrationError",
+        "MigrationRunner",
+        "PoolError",
+        "ProbeResult",
+        "advisory_lock",
+        "advisory_xact_lock",
+        "check_connectivity",
+        "discover",
+        "lock_key",
+        "open_pool",
+        "pool_stats",
+        "try_advisory_lock",
+    }
+    # `__all__` names what is actually importable, not just what is declared.
+    for name in adapter.__all__:
+        assert hasattr(adapter, name)
+
+
 def test_a_store_that_opens_its_own_file_as_an_attribute_is_still_an_engine():
     """The reviewer's escape: `self._path.open("a")` instead of `open(path, "a")`.
 
