@@ -909,7 +909,25 @@ def apply_table_grants(conn, schema: str = "public") -> int:
     upgrade) re-asserts the matrix for what exists instead of erroring on
     what does not; the #321 compliance checker is the guard against a LIVE
     object missing its declared grant.
+
+    `schema_migration` is `ALL_TABLES`' one entry no migration creates -- it is
+    the ledger `aios_db` owns, brought into being by `migrations.ensure_ledger()`
+    inside `migrations.upgrade()`. That means this function's correctness has
+    quietly depended on being called after `upgrade()` has run at least once; a
+    caller that provisions a database by applying the migration files directly
+    (a lightweight stand, a downgrade test harness) and then asks for grants
+    would see the catalog probe below simply not find `schema_migration` and
+    skip its grant -- no error, just a table `aicc_app`/`aicc_worker` can never
+    read, which only surfaces later as a permission error out of `/readyz`.
+    Ensuring the ledger here removes the ordering dependency instead of
+    documenting it: `ensure_ledger()` is `CREATE TABLE IF NOT EXISTS`, so this
+    is a no-op on every database that already went through `upgrade()`, and the
+    caller of `apply_table_grants()` is by contract the table owner, which is
+    exactly the DDL right `ensure_ledger()` needs.
     """
+    from command_center.db import migrations
+
+    migrations.ensure_ledger(conn)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT c.relname FROM pg_class c JOIN pg_namespace n "
