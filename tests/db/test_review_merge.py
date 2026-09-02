@@ -1583,8 +1583,16 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
 
 def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
     """A PR only BEHIND main (base advanced after it branched) is brought
-    current with `gh pr update-branch` so it re-enters the merge path instead
-    of gridlocking; nothing is merged this tick."""
+    current via the REST `update-branch` endpoint (`gh api -X PUT
+    repos/{owner}/{repo}/pulls/{n}/update-branch`) so it re-enters the merge
+    path instead of gridlocking; nothing is merged this tick.
+
+    The REST endpoint, not the `gh pr update-branch` CLI subcommand, because
+    the CLI subcommand does not exist on every `gh` version (live 2026-08-26,
+    control-01: "unknown command \"update-branch\" for \"gh pr\"" burned every
+    attempt without updating anything), while `gh api` reaches the same
+    endpoint on any `gh` version. (VOYN-W0-AICC-MERGE-TRAIN-UPDATE-BRANCH-
+    BROKEN)"""
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-MT1", "https://github.com/x/y/pull/41")
     head = "a" * 40
@@ -1592,7 +1600,7 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
 
     def fake_gh(argv, repo):
         import subprocess
-        calls.append(argv[:2])
+        calls.append(argv)
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
@@ -1602,13 +1610,14 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "update-branch"]:
+        if argv[:3] == ["api", "-X", "PUT"]:
             return subprocess.CompletedProcess(argv, 0, "updated", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] in calls
+    assert ["api", "-X", "PUT", "repos/x/y/pulls/41/update-branch"] in calls
+    assert ["pr", "update-branch", "https://github.com/x/y/pull/41"] not in calls
     assert ("VOYN-W0-MT1", "branch_updated_behind_main") in report.skipped
     assert not report.merged
 
@@ -1637,7 +1646,7 @@ def test_merge_train_does_not_update_an_unaccepted_behind_pr(rig, monkeypatch): 
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] not in calls
+    assert ["api", "-X"] not in calls
     assert ("VOYN-W0-MT3", "no_accept_marker_on_head") in report.skipped
     assert not report.merged
 
