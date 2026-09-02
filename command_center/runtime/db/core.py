@@ -747,3 +747,28 @@ def current_schema_version(db_path: Path) -> int:
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
+
+
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether `name` is a persistent table in the main schema.
+
+    Deliberately `sqlite_master` with an explicit `type = 'table'` filter, not
+    `PRAGMA table_info(?)`/`pragma_table_info(?)`: those two return rows for a
+    view or a temporary table sharing the name too, since they answer "does
+    this name resolve to *something* with columns" rather than "is this a
+    table". A same-named view or temp table would then make a caller like
+    `create_run`/`backfill_run_provenance` believe the real table is present
+    and attempt writes against it, which fails mid-operation against a view or
+    silently targets unrelated temporary state (rejected in the acceptance
+    review of VOYN-W0-AICC-REPORT-310, PR #549, HEAD
+    d0dfd2ca3b11ba469e505c716e9419928bc49853). `sqlite_master` only ever
+    describes the main schema's persistent objects, so a temp table of the
+    same name never shows up here regardless of `type`, and `type = 'table'`
+    excludes views outright."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        is not None
+    )

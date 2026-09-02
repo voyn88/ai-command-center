@@ -810,6 +810,100 @@ def test_foreign_keys_reject_orphan_session(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# table_exists — must not be fooled by a same-named view or temp table
+# (VOYN-W0-AICC-REPORT-310, rejected acceptance of PR #549,
+# HEAD d0dfd2ca3b11ba469e505c716e9419928bc49853: `pragma_table_info(?)`
+# resolves views and temp tables too, so it is not `table_exists`)
+# --------------------------------------------------------------------------
+
+
+def test_table_exists_true_for_a_real_table(tmp_path):
+    path = _fresh_db(tmp_path)
+    with db.connect(path) as conn:
+        assert db.table_exists(conn, "run") is True
+        assert db.table_exists(conn, "run_provenance") is True
+
+
+def test_table_exists_false_for_a_view_of_the_same_name(tmp_path):
+    path = _fresh_db(tmp_path)
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute("DROP TABLE run_provenance")
+            conn.execute("CREATE VIEW run_provenance AS SELECT 'x' AS run_id")
+        assert db.table_exists(conn, "run_provenance") is False
+
+
+def test_table_exists_false_for_a_temp_table_of_the_same_name(tmp_path):
+    path = _fresh_db(tmp_path)
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute("DROP TABLE run_provider_route")
+        conn.execute("CREATE TEMP TABLE run_provider_route (run_id TEXT)")
+        assert db.table_exists(conn, "run_provider_route") is False
+
+
+def test_table_exists_false_for_an_unknown_name(tmp_path):
+    path = _fresh_db(tmp_path)
+    with db.connect(path) as conn:
+        assert db.table_exists(conn, "no_such_table") is False
+
+
+def test_create_run_skips_provenance_and_route_insert_when_names_resolve_to_views(
+    tmp_path,
+):
+    """A same-named view standing in for a table dropped by a historical/
+    part-migrated schema must not be mistaken for the real table:
+    `create_run` must not try to `INSERT` into the read-only view (which
+    would raise `sqlite3.OperationalError: cannot modify run_provenance`),
+    and the run itself must still be created. (Temp-table shadowing is
+    exercised directly against `table_exists` above — a temp table is scoped
+    to the connection that created it, so it cannot outlive that connection
+    to shadow a check `create_run` makes on its own, separate connection.)"""
+    path = _fresh_db(tmp_path)
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute("DROP TABLE run_provenance")
+            conn.execute("DROP TABLE run_provider_route")
+            conn.execute("CREATE VIEW run_provenance AS SELECT 'decoy' AS run_id")
+            conn.execute("CREATE VIEW run_provider_route AS SELECT 'decoy' AS run_id")
+
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+    run = db.create_run(
+        path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        task_type="implementation",
+        repository_path="/tmp/x",
+        prompt="p",
+        is_resume=False,
+        provider_route=("claude_code",),
+    )
+
+    assert db.get_run(path, run["id"]) is not None
+    with db.connect(path) as conn:
+        # The decoy views were never touched — no row was smuggled into
+        # either under the real table's name.
+        assert [dict(r) for r in conn.execute("SELECT * FROM run_provenance")] == [
+            {"run_id": "decoy"}
+        ]
+        assert [dict(r) for r in conn.execute("SELECT * FROM run_provider_route")] == [
+            {"run_id": "decoy"}
+        ]
+
+
+def test_backfill_run_provenance_returns_zero_when_name_resolves_to_a_view(tmp_path):
+    path = _fresh_db(tmp_path)
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute("DROP TABLE run_provenance")
+            conn.execute("CREATE VIEW run_provenance AS SELECT 'decoy' AS run_id")
+
+    assert db.backfill_run_provenance(path, limit=500) == 0
+
+
+# --------------------------------------------------------------------------
 # Concurrent writers (WAL + busy_timeout should serialize, not fail)
 # --------------------------------------------------------------------------
 
@@ -1599,6 +1693,13 @@ def test_list_runs_states_empty_iterable_matches_nothing(tmp_path):
     path = _fresh_db(tmp_path)
     _make_run(path)
     assert db.list_runs(path, states=[]) == []
+
+
+def test_count_runs_states_empty_iterable_matches_nothing(tmp_path):
+    path = _fresh_db(tmp_path)
+    _make_run(path)
+    assert db.count_runs(path, states=[]) == 0
+    assert db.count_runs(path) == 1
 
 
 def test_list_runs_limit_bounds_result_set_and_preserves_order(tmp_path, monkeypatch):
