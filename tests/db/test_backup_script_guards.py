@@ -8,6 +8,7 @@ needs a database to exercise — so they run everywhere, not only where
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -66,8 +67,21 @@ def test_restore_refuses_the_live_database_without_the_flag(tmp_path) -> None:
     assert "refusing to restore over the live database" in result.stderr
 
 
+@pytest.mark.skipif(
+    not (shutil.which("pg_restore") and shutil.which("psql")),
+    reason="PostgreSQL client binaries are not installed",
+)
 def test_restore_warns_loudly_when_no_checksum_is_present(tmp_path) -> None:
-    """Integrity is not silently skipped: a missing sidecar is reported."""
+    """Integrity is not silently skipped: a missing sidecar is reported.
+
+    The script checks for `pg_restore`/`psql` on `PATH` before it ever reaches
+    the checksum warning, so a host missing either tool exits earlier with
+    `"pg_restore not found in PATH"` / `"psql not found in PATH"` instead —
+    the same host-dependent-marker shape `test_delivery_tooling.py` was fixed
+    for, on a host this suite's own CI lockfile does not describe. Skipped
+    rather than asserted around: this test's subject is the checksum warning,
+    not the tool-presence guard, which has no coverage of its own here.
+    """
     archive = tmp_path / "fake.dump"
     archive.write_bytes(b"not-a-real-archive")
     result = _run(RESTORE, "--archive", str(archive), "--target-db", "aicc_restore_check")

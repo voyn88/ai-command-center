@@ -29,6 +29,7 @@ from command_center import (
     agent_runner,
     artifacts,
     execution_queue,
+    hero_playbooks,
     launch,
     launch_service,
     models,
@@ -804,7 +805,7 @@ def _render_console_actions(tasks: list[dict], tasks_by_id: dict[str, dict]) -> 
 
     open_panel = st.session_state.get(_CONSOLE_PANEL_KEY)
     if open_panel == "create":
-        _render_inline_create_task()
+        _render_inline_create_task(tasks)
     elif open_panel == "waves":
         with st.container(border=True):
             waves_panel.render_waves_page(tasks, tasks_by_id, ROOT)
@@ -812,7 +813,7 @@ def _render_console_actions(tasks: list[dict], tasks_by_id: dict[str, dict]) -> 
         _render_inline_reports()
 
 
-def _render_inline_create_task() -> None:
+def _render_inline_create_task(tasks: list[dict]) -> None:
     """A minimal create form — project, title, type, priority, goal.
 
     Deliberately not the full Создать задачу page: this exists to capture a
@@ -841,6 +842,24 @@ def _render_inline_create_task() -> None:
                         project, title.strip(), task_type, status, goal=goal.strip() or None, priority=priority
                     )
                     st.success(f"Создана: {created.get('title')}")
+                    _render_hero_playbook_suggestion(created, tasks)
+
+
+def _render_hero_playbook_suggestion(created: dict, tasks: list[dict]) -> None:
+    """After a new scenario is created, check whether its context (project +
+    task type, falling back to task type alone or title/goal similarity)
+    matches a `hero_playbooks` combo with a strong historical track record —
+    VOYN-MIN-HERO's "a new scenario automatically suggests a Hero Playbook
+    for similar context" acceptance. Silent when nothing meets the match
+    bar; a low-confidence guess is worse than no suggestion."""
+    catalog = hero_playbooks.build_playbook_catalog(tasks)
+    suggestion = hero_playbooks.suggest_hero_playbook(created, catalog)
+    if suggestion is None:
+        return
+    playbook = suggestion.playbook
+    st.info(
+        f"🏆 Hero Playbook: агент «{playbook.agent}» для «{playbook.task_type}» — {suggestion.reason}."
+    )
 
 
 def _render_inline_reports() -> None:

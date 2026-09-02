@@ -33,7 +33,7 @@ from command_center import (
 )
 from command_center.runtime import api as runtime_api
 from command_center.runtime import session_view
-from command_center.ui import agent_launcher, inspector, legacy_task_helpers, tokens
+from command_center.ui import agent_launcher, confirm_dialog, inspector, legacy_task_helpers, tokens
 from command_center.ui.agent_launcher import ROOT, TASK_TYPE_LABELS, _get_execution_center_api
 
 # Canonical sources (no duplicate vocabularies here — same rule app.py follows).
@@ -323,56 +323,24 @@ def render_task_card(
                 legacy_task_helpers.update_task_status(task_id, new_status)
                 st.rerun()
 
-            delete_confirm_key = f"{key_prefix}_delete_confirm_open"
-            st.session_state.setdefault(delete_confirm_key, False)
+            delete_key_prefix = f"{key_prefix}_delete"
+            st.session_state.setdefault(f"{delete_key_prefix}_confirm_open", False)
             if st.button("Удалить", key=f"{key_prefix}_delete", icon=":material/delete:", width="stretch"):
-                st.session_state[delete_confirm_key] = True
+                confirm_dialog.open_confirmation(delete_key_prefix)
 
-            if st.session_state[delete_confirm_key]:
-                @st.dialog("Подтверждение удаления")
-                def _render_delete_confirmation() -> None:
-                    st.warning(
-                        f"Задача «{title}» (`{task_id}`) будет удалена. "
-                        "Это действие нельзя отменить."
-                    )
-                    confirmed = st.checkbox(
-                        "Я подтверждаю удаление этой задачи.",
-                        key=f"{key_prefix}_delete_confirmed",
-                    )
-                    confirm_cols = st.columns(2)
-                    with confirm_cols[0]:
-                        delete_clicked = st.button(
-                            "Подтвердить удаление",
-                            type="primary",
-                            key=f"{key_prefix}_delete_confirm_btn",
-                            disabled=not confirmed,
-                            icon=":material/delete_forever:",
-                        )
-                    with confirm_cols[1]:
-                        if st.button("Отмена", key=f"{key_prefix}_delete_cancel_btn"):
-                            st.session_state[delete_confirm_key] = False
-                            st.rerun()
-
-                    if not delete_clicked:
-                        return
-
-                    # Defense in depth: AppTest and future callers can trigger a
-                    # disabled widget programmatically, so never rely solely on
-                    # the button's disabled state for a destructive action.
-                    if not confirmed:
-                        st.error("Подтвердите удаление задачи.")
-                        return
-
-                    legacy_task_helpers.delete_task(
-                        task_id,
-                        # Same runtime.db cascade app.py's own delete_task shim
-                        # performs (audit AR-1), through the one API singleton.
-                        on_deleted=lambda tid: _get_execution_center_api().delete_task(tid),
-                    )
-                    st.session_state[delete_confirm_key] = False
-                    st.rerun()
-
-                _render_delete_confirmation()
+            confirm_dialog.render_destructive_confirmation(
+                key_prefix=delete_key_prefix,
+                dialog_title="Подтверждение удаления",
+                warning=f"Задача «{title}» (`{task_id}`) будет удалена. Это действие нельзя отменить.",
+                checkbox_label="Я подтверждаю удаление этой задачи.",
+                confirm_label="Подтвердить удаление",
+                on_confirm=lambda: legacy_task_helpers.delete_task(
+                    task_id,
+                    # Same runtime.db cascade app.py's own delete_task shim
+                    # performs (audit AR-1), through the one API singleton.
+                    on_deleted=lambda tid: _get_execution_center_api().delete_task(tid),
+                ),
+            )
 
 
 def render_next_task_callout(tasks: list[dict], project: str | None = None, *, active_runs: list[dict] | None = None) -> None:
