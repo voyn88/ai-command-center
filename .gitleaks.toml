@@ -7,9 +7,17 @@
 #     detect-secrets (pinned in ci.yml security-gates) stores SHA1 hashes of
 #     allowlisted fixture strings there, and gitleaks' generic-api-key rule
 #     matches those hashes as if they were keys.
-#   - 11 hits are deliberate fake fixtures in tests that exist to prove
+#   - 9 hits are deliberate fake fixtures in tests that exist to prove
 #     secret REDACTION and provider auth handling (`sk-abcdefgh` and
 #     friends) — files whose purpose requires secret-shaped strings.
+#   - 2 hits (tests/db/test_config.py, history 3abb32f..96e0ab8^) are NOT
+#     fakes: the old `_STRONG_PASSWORD` fixture shared its 16-character
+#     tail with a password then in real use on a developer machine — the
+#     repo's own #304 replaced the fixture for exactly that reason, but
+#     the value remains recoverable from history. Classified
+#     remediated-real-derived, not fixture: allowlisting is correct only
+#     together with rotation of the underlying developer-machine password,
+#     tracked as an owner action in VOYN-W0-AICC-SECRETS-IN-GIT-HISTORY.
 #
 # Trade-off, made explicitly: path-allowlisting these files means a real
 # secret pasted into one of them would not be flagged by gitleaks — but
@@ -19,7 +27,7 @@
 useDefault = true
 
 [allowlist]
-description = "detect-secrets baseline artifact and deliberate test fixtures (triaged 2026-09-03, 75/75 false positives)"
+description = "detect-secrets baseline artifact, deliberate test fixtures, and one remediated real-derived fixture (triaged 2026-09-03: 73 false positives + 2 real-derived, fixture replaced in #304, underlying password rotation tracked as owner action)"
 paths = [
   '''^\.secrets\.baseline$''',
   '''^tests/native_gateway/test_redaction\.py$''',
