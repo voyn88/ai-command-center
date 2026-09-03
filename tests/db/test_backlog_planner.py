@@ -856,41 +856,54 @@ def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
             assert cur.fetchone()[0] == 1
 
 
-def test_resume_budget_is_a_window_not_a_lifetime_score(rig) -> None:
+def test_resume_budget_is_a_window_not_a_lifetime_score(
+    rig, admin_conn
+) -> None:
     """0017 (VOYN-W0-AICC-DEFER-AUTO-RESUME-REM): three granted resumes
-    older than the 48h window must NOT exhaust the budget — a fixed
-    pipeline reclaims its old parks; three RECENT ones still refuse."""
+    OLDER than the 48h window must not exhaust the budget — a fixed
+    pipeline reclaims its old parks; three recent ones still refuse.
+
+    Grants are seeded through the real machine (park -> resume cycles),
+    never by raw INSERT: no role holds INSERT on backlog tables by design
+    (0005), and a grant fabricated after the park would trip the unchanged
+    superseded_park_evidence check anyway (independent review of 29d2152,
+    findings 1-2). Only created_at is backdated, via the admin connection —
+    the one property 0017's window reads."""
     app_factory, store, worker = rig
-    _park_technically(app_factory, store, worker, "VOYN-W0-RSW")
+    task = "VOYN-W0-RSW"
 
-    # Three historical resumes, well outside the window.
-    with app_factory() as conn, conn.cursor() as cur:
-        for _ in range(3):
-            cur.execute(
-                "INSERT INTO backlog_event (task_id, event, outcome, reason, "
-                "actor, detail, created_at) VALUES (%s, 'resume_deferred', "
-                "'granted', 'cascade_exhausted: old', 'test', '{}', "
-                "now() - interval '3 days')",
-                ("VOYN-W0-RSW",),
-            )
-        conn.commit()
+    # Three real park->resume cycles: each grant's event_id precedes the
+    # NEXT park, so superseded_park_evidence never trips.
+    for _ in range(3):
+        _park_technically(app_factory, store, worker, task)
+        ok, reason, _ = store.resume_deferred(task)
+        assert ok and reason == "OPEN"
+    _park_technically(app_factory, store, worker, task)
 
-    ok, reason, _ = store.resume_deferred("VOYN-W0-RSW")
+    # Lifetime budget is now spent (3 grants). Prove the OLD behaviour is
+    # gone by aging those grants out of the window.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_event SET created_at = now() - interval '3 days' "
+            "WHERE task_id = %s AND event = 'resume_deferred' "
+            "AND outcome = 'granted'",
+            (task,),
+        )
+        assert cur.rowcount == 3
+    admin_conn.commit()
+
+    ok, reason, _ = store.resume_deferred(task)
     assert ok and reason == "OPEN", (
         "stale resume history must not bury the task forever"
     )
 
-    # Re-park and add recent grants up to the window budget: refuse.
-    _park_technically(app_factory, store, worker, "VOYN-W0-RSW")
-    with app_factory() as conn, conn.cursor() as cur:
-        for _ in range(2):
-            cur.execute(
-                "INSERT INTO backlog_event (task_id, event, outcome, reason, "
-                "actor, detail) VALUES (%s, 'resume_deferred', 'granted', "
-                "'cascade_exhausted: recent', 'test', '{}')",
-                ("VOYN-W0-RSW",),
-            )
-        conn.commit()
+    # Three RECENT grants (the one above plus two more cycles) refuse the
+    # fourth — the window still stops a park that re-arms itself.
+    for _ in range(2):
+        _park_technically(app_factory, store, worker, task)
+        ok, reason, _ = store.resume_deferred(task)
+        assert ok and reason == "OPEN"
+    _park_technically(app_factory, store, worker, task)
 
-    ok, reason, _ = store.resume_deferred("VOYN-W0-RSW")
+    ok, reason, _ = store.resume_deferred(task)
     assert not ok and reason == "resume_budget_exhausted"
