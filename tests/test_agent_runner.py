@@ -1158,7 +1158,7 @@ def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
         def poll(self):
             return 0
 
-        def communicate(self, timeout=None):
+        def communicate(self, input=None, timeout=None):
             return ("", "")
 
         def wait(self, timeout=None):
@@ -1187,10 +1187,19 @@ def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
         )
         return captured["env"]
 
-    assert run("independent_review").get("ANTHROPIC_API_KEY") == "sk-ant-meter"
+    env = run("independent_review")
+    assert env.get("ANTHROPIC_API_KEY") == "sk-ant-meter"
+    assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
     assert run("verification_review").get("ANTHROPIC_API_KEY") == "sk-ant-meter"
-    assert "ANTHROPIC_API_KEY" not in run("implementation")
-    assert "ANTHROPIC_API_KEY" not in run("remediation")
+    for task_type in ("implementation", "remediation", "review"):
+        env = run(task_type)
+        assert "ANTHROPIC_API_KEY" not in env
+        # The raw name must be scrubbed from EVERY child, or a mutating
+        # run could read the metered key under its own name.
+        assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
+    env = run("independent_review", executor="codex")
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
 
     monkeypatch.delenv("AICC_REVIEW_ANTHROPIC_API_KEY")
     assert "ANTHROPIC_API_KEY" not in run("independent_review")

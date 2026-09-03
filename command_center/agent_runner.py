@@ -228,9 +228,10 @@ MUTATING_TASK_TYPES = {"implementation", "remediation"}
 
 #: The verdict tier — the only task classes allowed to spend the metered
 #: review key (see run_claude_code). Matches the orchestrator's dispatch
-#: vocabulary exactly; "review" is the legacy spelling still present in
-#: recorded payloads.
-REVIEW_TASK_TYPES = {"independent_review", "verification_review", "review"}
+#: vocabulary exactly. Deliberately NOT "review": that is the live
+#: task_type of interactive chat turns and web audit-sandbox runs — metered
+#: money is for verdicts, not conversation.
+REVIEW_TASK_TYPES = {"independent_review", "verification_review"}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
 # empirically verified (2026-07-21, real `claude` CLI, headless `-p` mode)
@@ -1364,7 +1365,11 @@ def run_claude_code(
     command = builder(prompt, task_type=task_type, model=model)
     launcher_input: str | None = None
     launch_environment = scrub_vcs_credentials(dict(os.environ))
-    review_key = os.environ.get("AICC_REVIEW_ANTHROPIC_API_KEY", "")
+    review_key = launch_environment.pop("AICC_REVIEW_ANTHROPIC_API_KEY", "")
+    # Popped UNCONDITIONALLY: the raw variable must never reach any child —
+    # a mutating run with Bash, or any third-party executor, could read it
+    # under its own name and defeat the positive list below (independent
+    # review of 3472b45, FINDING 1).
     if executor == "claude" and review_key and task_type in REVIEW_TASK_TYPES:
         # The verdict tier runs on the owner's metered review key
         # (VOYN-W0-SERVER-OWN-BILLING pilot, decision 2026-09-04): with
