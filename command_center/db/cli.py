@@ -105,6 +105,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    export = sub.add_parser(
+        "backlog-export",
+        help=(
+            "Render the canonical store as the master-file markdown "
+            "projection (the read format of backlog_client / the console's "
+            "Master Backlog panel)."
+        ),
+    )
+    export.add_argument(
+        "--output",
+        required=True,
+        help="Destination path; written atomically (tmp + rename), whole file.",
+    )
     plan = sub.add_parser(
         "backlog-plan",
         help="One planner tick (BO-S2): release finished lanes, dispatch "
@@ -411,6 +424,32 @@ def main(argv: list[str] | None = None) -> int:
                     BacklogStore(lambda: nullcontext(conn)).counts_by_status().items()
                 ):
                     print(f"{status}: {count}")
+                return 0
+
+            if args.command == "backlog-export":
+                import os as _os
+                import tempfile
+                from pathlib import Path as _Path
+
+                from command_center.db import backlog_export
+
+                rows = backlog_export.fetch_rows(conn)
+                text = backlog_export.render_projection(rows)
+                destination = _Path(args.output)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                # Atomic whole-file replace: a reader (the console) must never
+                # see a half-written projection.
+                fd, tmp_name = tempfile.mkstemp(
+                    dir=destination.parent, prefix=".backlog-export-"
+                )
+                try:
+                    with _os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.write(text)
+                    _os.replace(tmp_name, destination)
+                except BaseException:
+                    _os.unlink(tmp_name)
+                    raise
+                print(f"rendered {len(rows)} records -> {destination}")
                 return 0
 
             if args.command == "backlog-plan":
