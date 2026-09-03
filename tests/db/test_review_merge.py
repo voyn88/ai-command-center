@@ -1914,6 +1914,14 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
                  "conclusion": "failure", "attempt": 1},
                 {"databaseId": 14, "headSha": head, "status": "in_progress",
                  "conclusion": None, "attempt": 1},
+                # Concurrency-cancelled required run: strands the head out
+                # of the merge queue exactly like a failure (live: PR #602)
+                # and must get a FULL rerun -- `--failed` would rerun
+                # nothing, a cancelled run has no failed jobs.
+                {"databaseId": 15, "headSha": head, "status": "completed",
+                 "conclusion": "cancelled", "attempt": 1},
+                {"databaseId": 16, "headSha": head, "status": "completed",
+                 "conclusion": "cancelled", "attempt": 2},
             ]), "")
         if argv[:2] == ["run", "rerun"]:
             reruns.append(argv)
@@ -1923,8 +1931,11 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     skip = dict(report.skipped)["VOYN-W0-MF"]
-    assert skip.startswith("checks_not_green") and "flaky_rerun_dispatched:1" in skip
-    assert reruns == [["run", "rerun", "11", "--failed"]]
+    assert skip.startswith("checks_not_green") and "flaky_rerun_dispatched:2" in skip
+    assert reruns == [
+        ["run", "rerun", "11", "--failed"],
+        ["run", "rerun", "15"],
+    ]
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MF",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"

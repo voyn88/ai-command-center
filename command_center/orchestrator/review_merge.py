@@ -2269,12 +2269,23 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
             isinstance(run, dict)
             and run.get("headSha") == head
             and run.get("status") == "completed"
-            and run.get("conclusion") == "failure"
+            # `cancelled` rides with `failure`: the acceptance-gate workflow
+            # itself documents that its concurrency cancel-in-progress makes
+            # a cancelled run "report as a failure, which is the safe side"
+            # -- and branch protection agrees, holding the PR out of the
+            # merge queue on a cancelled required run exactly as on a red
+            # one (live: PR #602, 2026-09-04, a concurrency-cancelled gate
+            # run stranded an accepted head until a manual rerun).
+            and run.get("conclusion") in ("failure", "cancelled")
             and run.get("attempt") == 1
         ):
-            rerun = _gh(
-                ["run", "rerun", str(run.get("databaseId")), "--failed"], repo_path
-            )
+            # A failed run reruns only its failed jobs; a cancelled run HAS
+            # no failed jobs (they were cancelled, not red), so `--failed`
+            # would rerun nothing -- it gets the full rerun instead.
+            argv = ["run", "rerun", str(run.get("databaseId"))]
+            if run.get("conclusion") == "failure":
+                argv.append("--failed")
+            rerun = _gh(argv, repo_path)
             if rerun.returncode == 0:
                 dispatched += 1
     return f"flaky_rerun_dispatched:{dispatched}" if dispatched else ""
