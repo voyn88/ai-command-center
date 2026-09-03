@@ -505,7 +505,10 @@ def projection_board_tasks(path: str | os.PathLike[str] | None = None) -> list[d
             {
                 "id": record.issue_id,
                 "title": record.task,
-                "status": _MASTER_STATUS_TO_LANE.get(record.status, "Backlog"),
+                # An unmapped status keeps its raw name and lands in the
+                # read model's visible `other` bucket instead of silently
+                # inflating Backlog (independent review of 92a501f).
+                "status": _MASTER_STATUS_TO_LANE.get(record.status, record.status),
                 "project": record.owner if record.owner != "-" else "VOYN",
                 "priority": record.priority if record.priority != "-" else "",
                 "task_type": "backlog",

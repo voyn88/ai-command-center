@@ -57,15 +57,13 @@ def load_tasks() -> list[dict]:
     return backlog_client.projection_board_tasks()
 
 
-def _refuse_master_records(tasks: list[dict]) -> list[dict]:
-    """Write-path guard for the read-only master view."""
-    writable = [task for task in tasks if task.get("source") != "master"]
-    if len(writable) != len(tasks):
-        raise PermissionError(
-            "master-backlog records are a read-only projection: change them "
-            "through the backlog store (console edits would fork the truth)"
-        )
-    return writable
+def _drop_master_records(tasks: list[dict]) -> list[dict]:
+    """Write-path filter for the read-only master view. Dropping, not
+    raising: panels save whole task lists unconditionally, and a raise here
+    killed the page for users who launched nothing (independent review of
+    92a501f, finding 2). `tasks_repository.save_tasks` enforces the same
+    invariant structurally for every other write path."""
+    return [task for task in tasks if task.get("source") != "master"]
 
 
 def upsert_tasks(tasks: list[dict]) -> None:
@@ -74,7 +72,7 @@ def upsert_tasks(tasks: list[dict]) -> None:
     (via `execution_queue.launch_ready`, exactly like `launch_service`) and
     need to commit exactly those changes. Locked bulk upsert, not a blind
     overwrite of this script run's entire (possibly-stale) `tasks` snapshot."""
-    tasks_repository.get_repository(ROOT).upsert_all(_refuse_master_records(tasks))
+    tasks_repository.get_repository(ROOT).upsert_all(_drop_master_records(tasks))
 
 
 def new_task_record(

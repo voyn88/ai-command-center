@@ -291,15 +291,25 @@ def test_projection_board_tasks_maps_statuses_and_marks_read_only(tmp_path, monk
     assert tasks[0]["id"] == "VOYN-T0" and tasks[0]["project"] == "repo-x"
 
 
-def test_upsert_refuses_master_view_records(monkeypatch, tmp_path):
-    """The write path must refuse the read-only view — the local repository
-    can never silently fork the master backlog."""
-    import pytest as _pytest
+def test_master_view_records_never_reach_disk(monkeypatch, tmp_path):
+    """The invariant is structural, at the single persist point: whatever
+    path a master record arrives through — bulk panel save, single-record
+    repo.upsert, task creation — save_tasks drops it, and the local store
+    can never fork the master backlog (independent review of 92a501f:
+    a raise at a higher layer was both bypassable and page-killing)."""
+    from command_center import tasks_repository as tr
 
-    from command_center.ui import legacy_task_helpers as h
+    master = {"id": "VOYN-X", "source": "master", "read_only": True,
+              "status": "Backlog", "title": "view"}
+    local = {"id": "L-1", "status": "Backlog", "title": "mine"}
+    tr.save_tasks(tmp_path, [local, master])
 
-    with _pytest.raises(PermissionError, match="read-only projection"):
-        h.upsert_tasks([{"id": "VOYN-X", "source": "master", "read_only": True}])
+    stored = tr.load_tasks(tmp_path)
+    assert [t["id"] for t in stored] == ["L-1"]
+
+    # The single-record path funnels through the same gate.
+    tr.upsert_task(tmp_path, dict(master))
+    assert [t["id"] for t in tr.load_tasks(tmp_path)] == ["L-1"]
 
 
 def test_load_tasks_falls_back_to_projection_only_when_store_is_empty(

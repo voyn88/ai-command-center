@@ -236,7 +236,22 @@ def save_tasks(root: Path, tasks: list[dict]) -> None:
     # rather than duplicating its temp-file + `os.replace` pattern without the
     # `fsync` (audit MINOR-10): every other JSON store in the project already
     # goes through it, so `tasks.json` gets the same on-disk durability.
-    storage.atomic_write_json(tasks_file_path(root), tasks)
+    #
+    # Master-projection records never persist (VOYN-W0-AICC-WIRE-BACKLOG-
+    # API): the read-only board view stamps them `source: "master"`, and
+    # dropping them HERE — the single point every write path funnels into
+    # (mutate_tasks, upsert, upsert_all, create, status updates) — is what
+    # makes "no second task store" structural rather than a convention.
+    # A guard at any higher layer is bypassable by the next single-record
+    # helper (independent review of 92a501f, findings 1-2: repo.upsert and
+    # panel-wide save callbacks both walked straight past it). Dropping is
+    # the correct semantics, not an error: a view record "saved" back is a
+    # no-op by definition, and the panels keep working instead of dying on
+    # a PermissionError mid-render.
+    storage.atomic_write_json(
+        tasks_file_path(root),
+        [task for task in tasks if task.get("source") != "master"],
+    )
 
 
 @contextlib.contextmanager
@@ -577,7 +592,7 @@ class JSONTasksRepository:
         return delete_task(self._root, task_id)
 
 
-def get_repository(root: Path) -> "JSONTasksRepository | AIOSTasksRepository":  # type: ignore[name-defined]  # noqa: F821
+def get_repository(root: Path) -> JSONTasksRepository | AIOSTasksRepository:  # type: ignore[name-defined]  # noqa: F821
     """Return the active task store backend.
 
     ``AICC_TASKS_BACKEND=json`` (default) → ``JSONTasksRepository``
