@@ -854,3 +854,43 @@ def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
                 ("VOYN-W0-RSS",),
             )
             assert cur.fetchone()[0] == 1
+
+
+def test_resume_budget_is_a_window_not_a_lifetime_score(rig) -> None:
+    """0017 (VOYN-W0-AICC-DEFER-AUTO-RESUME-REM): three granted resumes
+    older than the 48h window must NOT exhaust the budget — a fixed
+    pipeline reclaims its old parks; three RECENT ones still refuse."""
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-RSW")
+
+    # Three historical resumes, well outside the window.
+    with app_factory() as conn, conn.cursor() as cur:
+        for _ in range(3):
+            cur.execute(
+                "INSERT INTO backlog_event (task_id, event, outcome, reason, "
+                "actor, detail, created_at) VALUES (%s, 'resume_deferred', "
+                "'granted', 'cascade_exhausted: old', 'test', '{}', "
+                "now() - interval '3 days')",
+                ("VOYN-W0-RSW",),
+            )
+        conn.commit()
+
+    ok, reason, _ = store.resume_deferred("VOYN-W0-RSW")
+    assert ok and reason == "OPEN", (
+        "stale resume history must not bury the task forever"
+    )
+
+    # Re-park and add recent grants up to the window budget: refuse.
+    _park_technically(app_factory, store, worker, "VOYN-W0-RSW")
+    with app_factory() as conn, conn.cursor() as cur:
+        for _ in range(2):
+            cur.execute(
+                "INSERT INTO backlog_event (task_id, event, outcome, reason, "
+                "actor, detail) VALUES (%s, 'resume_deferred', 'granted', "
+                "'cascade_exhausted: recent', 'test', '{}')",
+                ("VOYN-W0-RSW",),
+            )
+        conn.commit()
+
+    ok, reason, _ = store.resume_deferred("VOYN-W0-RSW")
+    assert not ok and reason == "resume_budget_exhausted"
