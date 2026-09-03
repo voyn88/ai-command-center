@@ -173,6 +173,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    # The control-plane reconciler (VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE).
+    # Two distinct commands for two distinct hosts/roles -- see
+    # command_center.orchestrator.control_plane_reconciler's module docstring
+    # for why they must not collapse into one.
+    sub.add_parser(
+        "control-reconcile",
+        help="One control-plane reconciler tick: re-assert every declared "
+        "timer active, quarantine known-sabotaging leftover units, restart "
+        "a service whose heartbeat has gone stale despite an active timer, "
+        "and record this tick's own heartbeat "
+        "(aicc-control-reconciler.timer, control-01, aicc_app).",
+    )
+    sub.add_parser(
+        "control-watchdog",
+        help="Independent cross-check of every declared tick's heartbeat: "
+        "read-only, touches no systemd unit, and runs on a DIFFERENT host "
+        "than the reconciler so a reconciler that silently stopped ticking "
+        "cannot hide its own stall the way the planner's timer did on "
+        "2026-08-29 (aicc-control-watchdog.timer, worker-01, aicc_worker).",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -437,6 +458,45 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "control-reconcile":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.control_plane_reconciler import (
+                    SubprocessSystemctl,
+                    reconcile_once,
+                )
+
+                report = reconcile_once(SubprocessSystemctl(), lambda: _nc(conn))
+                for name in report.ok:
+                    print(f"OK         {name}")
+                for name in report.restarted:
+                    print(f"RESTARTED  {name}")
+                for name in report.quarantined:
+                    print(f"QUARANTINE {name}")
+                for name in report.circuit_open_skipped:
+                    print(f"COOLDOWN   {name}")
+                for name, reason in report.escalated:
+                    print(f"ESCALATE   {name}: {reason}")
+                # Non-zero drives `OnFailure=` on the systemd unit -- an
+                # escalation is exactly the "not a silent stall" acceptance,
+                # surfaced to an operator instead of swallowed as exit 0.
+                return 0 if report.healthy else 1
+
+            if args.command == "control-watchdog":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.control_plane_reconciler import (
+                    check_heartbeats_once,
+                )
+
+                report = check_heartbeats_once(lambda: _nc(conn))
+                for name in report.ok:
+                    print(f"OK    {name}")
+                for name, age in report.stale:
+                    age_desc = "never recorded" if age == float("inf") else f"{age:.0f}s old"
+                    print(f"STALE {name}: {age_desc}")
+                return 0 if report.healthy else 1
 
             if args.command == "downgrade":
                 if not args.confirmed:

@@ -1,0 +1,62 @@
+# The control-plane reconciler (VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE).
+#
+# Install (control-01, beside the reaper/planner):
+#   cp deploy/systemd/aicc-control-reconciler.{service,timer} /etc/systemd/system/
+#   cp deploy/sudoers.d/aicc-control-reconciler /etc/sudoers.d/
+#   visudo -cf /etc/sudoers.d/aicc-control-reconciler && chmod 0440 /etc/sudoers.d/aicc-control-reconciler
+#   cp deploy/systemd/aicc-control-plane-alert@.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-control-reconciler.timer
+#
+# Live 2026-08-29: `aicc-backlog-planner.timer` went `inactive (dead)` with no
+# service failure, no OOM, no reboot -- and every OTHER control-plane signal
+# stayed green for 13 hours while zero new work dispatched. This tick is what
+# now re-asserts every declared timer active, quarantines known-sabotaging
+# leftover units (the old `voyn-aicc-rotate.timer`), and restarts a service
+# whose heartbeat has gone stale despite its timer reporting active -- the
+# exact "timer up, tick not working" case `systemctl is-active` alone cannot
+# see. See command_center/orchestrator/control_plane_reconciler.py for the
+# full design and deploy/sudoers.d/aicc-control-reconciler for the systemctl
+# grant this unit runs under.
+#
+# `Restart=on-failure` covers this PROCESS crashing outright (an unhandled
+# exception before it can even write its own heartbeat) -- the bounded
+# backoff/circuit-breaker for individual UNIT recovery lives inside the tick
+# itself (control_plane_reconciler.ReconcileConfig), not here, because a
+# systemd-level restart loop cannot know which units already have an open
+# circuit. `OnFailure=` fires the alert unit whenever a tick's own exit code
+# is non-zero -- which the CLI returns exactly when something escalated,
+# never merely because it dispatched restarts. This is the FIRST of the task's
+# two required supervision paths; worker-01's aicc-control-watchdog.timer,
+# which does not depend on this host being alive at all, is the second --
+# a reconciler that dies the same way the planner did is no reconciler.
+#
+# `NoNewPrivileges` is deliberately OMITTED (unlike the reaper/planner units):
+# this tick's ExecStart shells out to `sudo -n systemctl ...`
+# (SubprocessSystemctl), and NoNewPrivileges blocks sudo's setuid escalation
+# outright -- the same tradeoff voyn-aicc-self-deploy.service already makes
+# for the same reason.
+
+[Unit]
+Description=AI Command Center control-plane reconciler (timer/unit resilience tick)
+After=network-online.target
+Wants=network-online.target
+OnFailure=aicc-control-plane-alert@%n.service
+
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=30s
+User=aicc-app
+Group=aicc-app
+EnvironmentFile=/etc/aicc/app.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db control-reconcile
+# Worst case is one bounded systemctl command (command_timeout=30s in
+# ReconcileConfig) per declared timer/service/quarantine unit; DECLARED_TIMERS
+# is small (single digits), so this stays well inside 5 minutes even if every
+# unit needs recovery in the same tick.
+TimeoutStartSec=300s
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

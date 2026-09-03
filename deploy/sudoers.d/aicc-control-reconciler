@@ -1,0 +1,57 @@
+# Installed as /etc/sudoers.d/aicc-control-reconciler (root:root 0440).
+#
+# aicc-app (control_plane_reconciler.SubprocessSystemctl, "sudo -n
+# systemctl ...") may only inspect/start/stop/disable the EXACT unit names
+# control_plane_reconciler.py already declares -- one Cmnd_Alias line per
+# (verb, unit) pair, not a wildcard on the unit argument, so this grant
+# cannot be widened by adding an unrelated unit to the host.
+#
+# Keep this file in sync BY HAND with two names in
+# command_center/orchestrator/control_plane_reconciler.py:
+#   * DECLARED_TIMERS -- every ".timer" needs is-active + start; every
+#     ".service" whose DeclaredTimer carries a tick_name (the heartbeat-
+#     instrumented ones) also needs start, for the stale-heartbeat restart
+#     path (`restart_service_stale_heartbeat`);
+#   * DEFAULT_QUARANTINE_UNITS -- needs is-active, is-enabled, stop, disable.
+# A unit added to either without a matching line here fails closed: the
+# reconciler's systemctl call refuses (sudo: no) rather than silently
+# running as some broader grant would allow.
+
+Cmnd_Alias AICC_RECONCILE_IS_ACTIVE = \
+ /usr/bin/systemctl is-active aicc-backlog-planner.timer, \
+ /usr/bin/systemctl is-active aicc-backlog-review.timer, \
+ /usr/bin/systemctl is-active aicc-backlog-merge.timer, \
+ /usr/bin/systemctl is-active aicc-queue-reaper.timer, \
+ /usr/bin/systemctl is-active voyn-aicc-self-deploy.timer, \
+ /usr/bin/systemctl is-active voyn-aicc-credential-rotation.timer, \
+ /usr/bin/systemctl is-active aicc-worktree-prune.timer, \
+ /usr/bin/systemctl is-active aicc-control-reconciler.timer, \
+ /usr/bin/systemctl is-active voyn-aicc-rotate.timer, \
+ /usr/bin/systemctl is-active voyn-aicc-rotate.service
+
+Cmnd_Alias AICC_RECONCILE_IS_ENABLED = \
+ /usr/bin/systemctl is-enabled voyn-aicc-rotate.timer, \
+ /usr/bin/systemctl is-enabled voyn-aicc-rotate.service
+
+Cmnd_Alias AICC_RECONCILE_START = \
+ /usr/bin/systemctl start aicc-backlog-planner.timer, \
+ /usr/bin/systemctl start aicc-backlog-review.timer, \
+ /usr/bin/systemctl start aicc-backlog-merge.timer, \
+ /usr/bin/systemctl start aicc-queue-reaper.timer, \
+ /usr/bin/systemctl start voyn-aicc-self-deploy.timer, \
+ /usr/bin/systemctl start voyn-aicc-credential-rotation.timer, \
+ /usr/bin/systemctl start aicc-worktree-prune.timer, \
+ /usr/bin/systemctl start aicc-control-reconciler.timer, \
+ /usr/bin/systemctl start aicc-backlog-planner.service, \
+ /usr/bin/systemctl start aicc-backlog-review.service, \
+ /usr/bin/systemctl start aicc-backlog-merge.service, \
+ /usr/bin/systemctl start aicc-queue-reaper.service, \
+ /usr/bin/systemctl start aicc-control-reconciler.service
+
+Cmnd_Alias AICC_RECONCILE_QUARANTINE = \
+ /usr/bin/systemctl stop voyn-aicc-rotate.timer, \
+ /usr/bin/systemctl stop voyn-aicc-rotate.service, \
+ /usr/bin/systemctl disable voyn-aicc-rotate.timer, \
+ /usr/bin/systemctl disable voyn-aicc-rotate.service
+
+aicc-app ALL=(root) NOPASSWD: AICC_RECONCILE_IS_ACTIVE, AICC_RECONCILE_IS_ENABLED, AICC_RECONCILE_START, AICC_RECONCILE_QUARANTINE

@@ -1,0 +1,20 @@
+# Owner-visible alert for a failed control-plane check (VOYN-W0-AICC-
+# CONTROL-PLANE-RESILIENCE). `%I` is the failing unit (systemd expands
+# `OnFailure=aicc-control-plane-alert@%n.service` to the triggering unit's
+# own name), fired by BOTH aicc-control-reconciler.service (control-01,
+# escalated after its bounded retries are exhausted) and
+# aicc-control-watchdog.service (worker-01, a heartbeat stayed stale past
+# its SLO) -- one template, installed on both hosts, mirroring
+# voyn-aicc-credential-rotation-alert@.service's existing pattern.
+#
+# A log line, not a paging integration: this repository has no owner contact
+# channel to call out to. An operator (or a host-level log shipper watching
+# `daemon.err`) is the audience -- wiring an actual page/notification is a
+# host-specific follow-up, not something to fake here.
+
+[Unit]
+Description=Alert for a failed AICC control-plane check (%I)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.err -t aicc-control-plane "AICC control-plane check failed: %I -- a declared timer may be stopped, quarantined-but-still-active, or its tick's heartbeat stale past SLO; inspect 'journalctl -u %I' and the control_plane_event/control_plane_heartbeat tables immediately"

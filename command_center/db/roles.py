@@ -130,6 +130,9 @@ ALL_TABLES: tuple[str, ...] = (
     "completion_validation",
     "conflict",
     "contact",
+    "control_plane_event",
+    "control_plane_heartbeat",
+    "control_plane_unit_state",
     "council_decision",
     "council_event",
     "council_vote",
@@ -188,6 +191,7 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "backlog_event": "backlog_event_event_id_seq",
         "backlog_evidence": "backlog_evidence_evidence_id_seq",
         "completion_event": "completion_event_id_seq",
+        "control_plane_event": "control_plane_event_event_id_seq",
         "completion_validation": "completion_validation_id_seq",
         "council_event": "council_event_id_seq",
         "model_event": "model_event_id_seq",
@@ -247,6 +251,29 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
 # PostgreSQL authority must expose a dedicated CAS function, never blanket DML.
 _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
     "run_finalization_claim": _NONE,
+}
+
+# The control-plane reconciler's tables (0017). `aicc_app` gets the blanket
+# default (control-01 runs the reconciler and the ticks it watches over under
+# that credential), so only the worker's narrower policy is declared here.
+#
+# `control_plane_heartbeat` is readable by `aicc_worker` and nothing else --
+# it is the one fact worker-01's independent cross-check exists to read
+# (VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE's second acceptance clause: "a
+# reconciler that dies the same way is no reconciler", so the check that
+# catches it must not depend on the same host or the same credential). It
+# gets no write privilege: a compromised execution host must not be able to
+# forge a fresh `last_ok_at` and hide a real stall from the host watching
+# for one.
+#
+# `control_plane_unit_state` (the circuit-breaker bookkeeping) and
+# `control_plane_event` (the action ledger) are the reconciler's own
+# internal state, not evidence a cross-check needs -- staleness in the
+# heartbeat is the whole signal.
+_WORKER_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
+    "control_plane_heartbeat": _READ,
+    "control_plane_unit_state": _NONE,
+    "control_plane_event": _NONE,
 }
 
 # The structured backlog store (0005, BO-S1), the queue-claim idiom again:
@@ -599,6 +626,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _WORKER_ENROLMENT_TABLES,
                     _WORKER_BACKLOG_TABLES,
                     _FINALIZATION_CLAIM_TABLES,
+                    _WORKER_CONTROL_PLANE_TABLES,
                 )
             ),
             # No blanket default: this role is not a general-purpose one, and

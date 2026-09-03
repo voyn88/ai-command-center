@@ -240,6 +240,39 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-SRV-03",
     ),
+    "control_plane_heartbeat": Exclusion(
+        reason=(
+            "PostgreSQL-native from birth (0017): the only fact worker-01's "
+            "cross-check reads, and the whole point of that check is that "
+            "`aicc_worker` sees this table on the SAME server the reconciler "
+            "writes it to, live -- an eventually-consistent mirrored copy "
+            "would let the checker report a control-01 tick healthy after "
+            "it had already gone stale there, defeating the check that "
+            "exists precisely to catch staleness."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE",
+    ),
+    "control_plane_unit_state": Exclusion(
+        reason=(
+            "PostgreSQL-native (0017): circuit-breaker bookkeeping the "
+            "reconciler reads and writes every tick to decide whether to "
+            "retry a unit right now; no SQLite authority ever held it, and "
+            "a stale mirrored copy could make the breaker re-open on data "
+            "already superseded by the next real tick."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE",
+    ),
+    "control_plane_event": Exclusion(
+        reason=(
+            "PostgreSQL-native (0017): the reconciler's own append-only "
+            "action ledger, written in the same transaction as the "
+            "recovery attempt it records -- as `principal_event`, mirroring "
+            "it would give the one audit trail an operator reads to see "
+            "what the reconciler already tried a second, eventually-"
+            "consistent copy that can disagree with the first."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE",
+    ),
 }
 
 
