@@ -427,29 +427,20 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "backlog-export":
-                import os as _os
-                import tempfile
                 from pathlib import Path as _Path
 
+                from command_center import projection_writer
                 from command_center.db import backlog_export
 
                 rows = backlog_export.fetch_rows(conn)
-                text = backlog_export.render_projection(rows)
-                destination = _Path(args.output)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                # Atomic whole-file replace: a reader (the console) must never
-                # see a half-written projection.
-                fd, tmp_name = tempfile.mkstemp(
-                    dir=destination.parent, prefix=".backlog-export-"
+                # Atomic whole-file replace lives in projection_writer — a
+                # reader (the console) must never see a half-written
+                # projection, and durable-write calls must stay out of this
+                # frozen-category module (AIOS boundary gate).
+                projection_writer.write_atomically(
+                    _Path(args.output), backlog_export.render_projection(rows)
                 )
-                try:
-                    with _os.fdopen(fd, "w", encoding="utf-8") as handle:
-                        handle.write(text)
-                    _os.replace(tmp_name, destination)
-                except BaseException:
-                    _os.unlink(tmp_name)
-                    raise
-                print(f"rendered {len(rows)} records -> {destination}")
+                print(f"rendered {len(rows)} records -> {args.output}")
                 return 0
 
             if args.command == "backlog-plan":
