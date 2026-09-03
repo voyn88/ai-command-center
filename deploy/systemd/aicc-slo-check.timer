@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the AICC pipeline SLO check periodically (VOYN-W0-AICC-OBSERVABILITY-TRACE-SLO)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

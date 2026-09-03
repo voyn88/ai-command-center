@@ -1,0 +1,34 @@
+# The pipeline SLO check (VOYN-W0-AICC-OBSERVABILITY-TRACE-SLO): report-only,
+# alerts (ERROR-level structured log lines on the command_center.alerts
+# logger) and exits non-zero when a live invariant is violated -- duplicate
+# mutating attempts on one worktree, an active attempt with no heartbeat, or
+# a review cycle stuck past its SLA.
+#
+# Install (control-plane host, beside the planner/reviewer/merger):
+#   cp deploy/systemd/aicc-slo-check.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-slo-check.timer
+#
+# A non-zero exit here is the alert firing. Point this unit's OnFailure= at
+# whatever this deployment already uses to turn a failed systemd unit into a
+# page (an alerting-agent unit, a log shipper's alert rule on this journal
+# unit, a textfile collector) -- deliberately not invented in this change.
+
+[Unit]
+Description=AI Command Center pipeline SLO check
+After=network-online.target
+Wants=network-online.target
+# OnFailure=aicc-slo-check-notify@%n.service
+
+[Service]
+Type=oneshot
+User=aicc-app
+Group=aicc-app
+EnvironmentFile=/etc/aicc/app.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db slo-check
+TimeoutStartSec=60s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

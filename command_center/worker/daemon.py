@@ -47,6 +47,7 @@ from command_center.db.work_queue_store import (
     QueueRefusal,
     WorkQueueStore,
 )
+from command_center.observability.trace import log_span
 from command_center.worker import sdnotify
 
 logger = logging.getLogger(__name__)
@@ -271,6 +272,19 @@ class WorkerDaemon:
         self._notify("STOPPING=1")
 
     def _execute(self, work: ClaimedWork) -> None:
+        task_id = (
+            work.payload.get("backlog_task_id")
+            if isinstance(work.payload, dict)
+            else None
+        )
+        if task_id:
+            log_span(
+                "claim",
+                task_id=task_id,
+                work_item_id=work.work_item_id,
+                attempt_id=work.attempt_id,
+                attempt_no=work.attempt_no,
+            )
         lease_lost = threading.Event()
         beat_stop = threading.Event()
         beat = threading.Thread(

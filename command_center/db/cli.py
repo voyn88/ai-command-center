@@ -173,6 +173,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    slo = sub.add_parser(
+        "slo-check",
+        help="Evaluate pipeline SLOs over the queue and backlog tables -- "
+        "duplicate mutating attempts on one worktree, active attempts with "
+        "no heartbeat, review cycles stuck past their SLA -- and alert "
+        "(ERROR-level structured log lines) on any violation "
+        "(aicc-slo-check.timer). Report-only: never mutates state.",
+    )
+    slo.add_argument(
+        "--review-sla-seconds",
+        type=float,
+        default=None,
+        help="Override the review-cycle SLA (default 14400s = 4h).",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -449,6 +464,58 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "slo-check":
+                from datetime import datetime, timezone
+
+                from command_center.observability.slo import (
+                    DEFAULT_REVIEW_SLA_SECONDS,
+                    evaluate_slos,
+                    fire_alerts,
+                )
+
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT wi.task_id, wi.work_item_id, wa.attempt_id, "
+                        "wa.state, wa.visibility_seconds, wa.heartbeat_at, "
+                        "wa.created_at "
+                        "FROM work_item_public wi "
+                        "JOIN work_attempt_public wa "
+                        "  ON wa.work_item_id = wi.work_item_id "
+                        "WHERE wi.state = 'claimed' AND wa.state = 'active'"
+                    )
+                    columns = [d[0] for d in cur.description]
+                    attempts = [
+                        dict(zip(columns, row, strict=True)) for row in cur.fetchall()
+                    ]
+
+                    cur.execute(
+                        "SELECT task_id, status, updated_at FROM backlog_task "
+                        "WHERE status = 'READY_TO_REVIEW'"
+                    )
+                    columns = [d[0] for d in cur.description]
+                    tasks = [
+                        dict(zip(columns, row, strict=True)) for row in cur.fetchall()
+                    ]
+
+                violations = evaluate_slos(
+                    attempts=attempts,
+                    tasks=tasks,
+                    now=datetime.now(timezone.utc),
+                    review_sla_seconds=(
+                        args.review_sla_seconds
+                        if args.review_sla_seconds is not None
+                        else DEFAULT_REVIEW_SLA_SECONDS
+                    ),
+                )
+                fire_alerts(violations)
+                for violation in violations:
+                    print(f"ALERT  {violation.slo}  task={violation.task_id}: {violation.detail}")
+                if not violations:
+                    print("no SLO violations")
+                # Non-zero exit surfaces a real finding to a human/CI/systemd
+                # OnFailure= without this command ever touching a row.
+                return 1 if violations else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:

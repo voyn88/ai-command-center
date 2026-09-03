@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
+from command_center.observability.trace import log_span
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
@@ -520,6 +521,12 @@ def _run_agent(
                     # only once, when `stack.close()` runs in this function's
                     # own `finally`.
                     full_lifecycle_lease_held = True
+                    log_span(
+                        "lease",
+                        task_id=backlog_task,
+                        repository=str(repository),
+                        isolated_workspace=str(isolated_workspace),
+                    )
                 except writer_lease.WriterLeaseUnavailable as exc:
                     # Another writer already holds the repository's lease,
                     # or the authority refused/could not be reached: a data
@@ -572,6 +579,13 @@ def _run_agent(
                     retryable=True,
                 )
             run_repository = Path(evidence.workspace_path)
+            log_span(
+                "workspace",
+                task_id=backlog_task,
+                workspace_path=evidence.workspace_path,
+                expected_branch=evidence.expected_branch,
+                provision_outcome=evidence.provision_outcome,
+            )
 
         # VOYN-W0-AICC-FORCED-AGENT-CANCELLATION: the same `lease_lost` event
         # this function already checked once, above, *before* starting the
@@ -592,6 +606,13 @@ def _run_agent(
         # visibility-window expiry / supersession in `work_queue_store`,
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
+        log_span(
+            "agent",
+            task_id=backlog_task,
+            executor=executor,
+            task_type=task_type,
+            model=model,
+        )
         while True:
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
