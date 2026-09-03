@@ -226,6 +226,12 @@ READ_ONLY_TASK_TYPES = {
 MODEL_ONLY_TASK_TYPES = {"independent_review"}
 MUTATING_TASK_TYPES = {"implementation", "remediation"}
 
+#: The verdict tier — the only task classes allowed to spend the metered
+#: review key (see run_claude_code). Matches the orchestrator's dispatch
+#: vocabulary exactly; "review" is the legacy spelling still present in
+#: recorded payloads.
+REVIEW_TASK_TYPES = {"independent_review", "verification_review", "review"}
+
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
 # empirically verified (2026-07-21, real `claude` CLI, headless `-p` mode)
 # that *without* an explicit `--permission-mode`, the CLI's implicit default
@@ -1358,6 +1364,22 @@ def run_claude_code(
     command = builder(prompt, task_type=task_type, model=model)
     launcher_input: str | None = None
     launch_environment = scrub_vcs_credentials(dict(os.environ))
+    review_key = os.environ.get("AICC_REVIEW_ANTHROPIC_API_KEY", "")
+    if executor == "claude" and review_key and task_type in REVIEW_TASK_TYPES:
+        # The verdict tier runs on the owner's metered review key
+        # (VOYN-W0-SERVER-OWN-BILLING pilot, decision 2026-09-04): with
+        # ANTHROPIC_API_KEY set, the claude CLI bills the API instead of
+        # the subscription, so acceptance stops competing with every other
+        # lane for the subscription's rolling windows. The positive list
+        # is deliberate — implementation/remediation and anything else
+        # stay on the subscription; a task class must be added here
+        # explicitly to spend metered money. The console-side monthly cap
+        # and the merged spend machinery bound the burn (the 2026-08-20
+        # ungoverned-key incident is why this is env-gated and scoped,
+        # not a blanket switch). The principal-isolation branch below
+        # rebuilds the environment from root-owned files and is
+        # intentionally not touched by this.
+        launch_environment["ANTHROPIC_API_KEY"] = review_key
     launch_cwd = repository_path
     if principal_isolation_required():
         try:

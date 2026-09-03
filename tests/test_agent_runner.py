@@ -1141,3 +1141,56 @@ def test_independent_review_is_model_only_for_both_review_providers():
     assert "--available-tools=" in copilot
     assert "--allow-tool" not in copilot
     assert "--allow-all-tools" not in copilot
+
+
+def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
+    """The metered review key (VOYN-W0-SERVER-OWN-BILLING) is injected as
+    ANTHROPIC_API_KEY only for claude runs of the review task classes —
+    implementation stays on the subscription, other executors untouched,
+    and without the env var nothing changes at all."""
+    captured = {}
+
+    class _Proc:
+        pid = 4242
+        stdout = None
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def communicate(self, timeout=None):
+            return ("", "")
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured["env"] = kwargs.get("env")
+        captured["command"] = command
+        return _Proc()
+
+    monkeypatch.setattr(agent_runner.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_runner, "principal_isolation_required", lambda: False
+    )
+    monkeypatch.setenv("AICC_REVIEW_ANTHROPIC_API_KEY", "sk-ant-meter")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    def run(task_type, executor="claude"):
+        agent_runner.run_claude_code(
+            repository_path=tmp_path,
+            prompt="p",
+            task_type=task_type,
+            timeout_seconds=5,
+            executor=executor,
+            model="claude-sonnet-5" if executor != "claude" else None,
+        )
+        return captured["env"]
+
+    assert run("independent_review").get("ANTHROPIC_API_KEY") == "sk-ant-meter"
+    assert run("verification_review").get("ANTHROPIC_API_KEY") == "sk-ant-meter"
+    assert "ANTHROPIC_API_KEY" not in run("implementation")
+    assert "ANTHROPIC_API_KEY" not in run("remediation")
+
+    monkeypatch.delenv("AICC_REVIEW_ANTHROPIC_API_KEY")
+    assert "ANTHROPIC_API_KEY" not in run("independent_review")
