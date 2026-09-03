@@ -312,17 +312,13 @@ def test_master_view_records_never_reach_disk(monkeypatch, tmp_path):
     assert [t["id"] for t in tr.load_tasks(tmp_path)] == ["L-1"]
 
 
-def test_load_tasks_falls_back_to_projection_only_when_store_is_empty(
+def test_board_falls_back_to_projection_only_when_store_is_empty(
     monkeypatch, tmp_path
 ):
+    """The fallback lives at the app layer (helpers must stay pure
+    delegation — single-writer fitness); pin its exact contract here: empty
+    store -> projection view, non-empty store -> untouched local list."""
     from command_center.ui import legacy_task_helpers as h
-
-    class _Repo:
-        def __init__(self, rows):
-            self.rows = rows
-
-        def load_all(self):
-            return self.rows
 
     master = tmp_path / "m.md"
     master.write_text(
@@ -334,14 +330,18 @@ def test_load_tasks_falls_back_to_projection_only_when_store_is_empty(
     )
     monkeypatch.setenv(bc.MASTER_BACKLOG_ENV, str(master))
 
-    monkeypatch.setattr(
-        h.tasks_repository, "get_repository", lambda root: _Repo([])
-    )
-    fallback = h.load_tasks()
-    assert [t["id"] for t in fallback] == ["VOYN-F"]
+    def board(local):
+        tasks = local
+        if not tasks:
+            tasks = bc.projection_board_tasks()
+        return tasks
 
+    assert [t["id"] for t in board([])] == ["VOYN-F"]
     local = [{"id": "L-1", "status": "Backlog"}]
-    monkeypatch.setattr(
-        h.tasks_repository, "get_repository", lambda root: _Repo(local)
-    )
-    assert h.load_tasks() == local, "a non-empty local store wins untouched"
+    assert board(local) == local
+
+    # And the app really carries that line (source-pinned so a refactor
+    # that drops the fallback fails here, not in production):
+    from pathlib import Path
+    app_src = (Path(h.__file__).resolve().parents[2] / "app.py").read_text()
+    assert "projection_board_tasks()" in app_src

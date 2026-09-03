@@ -26,7 +26,6 @@ fresh immediately before writing.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from pathlib import Path
 
 from command_center import models, tasks_repository
@@ -44,26 +43,7 @@ def normalize_task(task: dict) -> dict:
 
 
 def load_tasks() -> list[dict]:
-    tasks = tasks_repository.get_repository(ROOT).load_all()
-    if tasks:
-        return tasks
-    # Deployed-console fallback (VOYN-W0-AICC-WIRE-BACKLOG-API): an empty
-    # local repository with a configured master projection renders the
-    # fleet's real board read-only instead of zeros. A VIEW, not a store:
-    # every record is read_only and upsert_tasks refuses them, so the local
-    # repository can never silently fork the master backlog.
-    from command_center import backlog_client
-
-    return backlog_client.projection_board_tasks()
-
-
-def _drop_master_records(tasks: list[dict]) -> list[dict]:
-    """Write-path filter for the read-only master view. Dropping, not
-    raising: panels save whole task lists unconditionally, and a raise here
-    killed the page for users who launched nothing (independent review of
-    92a501f, finding 2). `tasks_repository.save_tasks` enforces the same
-    invariant structurally for every other write path."""
-    return [task for task in tasks if task.get("source") != "master"]
+    return tasks_repository.get_repository(ROOT).load_all()
 
 
 def upsert_tasks(tasks: list[dict]) -> None:
@@ -71,8 +51,10 @@ def upsert_tasks(tasks: list[dict]) -> None:
     `queue_panel`: both mutate a subset of `tasks_by_id`'s dicts in place
     (via `execution_queue.launch_ready`, exactly like `launch_service`) and
     need to commit exactly those changes. Locked bulk upsert, not a blind
-    overwrite of this script run's entire (possibly-stale) `tasks` snapshot."""
-    tasks_repository.get_repository(ROOT).upsert_all(_drop_master_records(tasks))
+    overwrite of this script run's entire (possibly-stale) `tasks` snapshot.
+    Master-projection records in the list are harmless: `save_tasks` drops
+    them at the single persist point (VOYN-W0-AICC-WIRE-BACKLOG-API)."""
+    tasks_repository.get_repository(ROOT).upsert_all(tasks)
 
 
 def new_task_record(
