@@ -260,3 +260,78 @@ def test_rich_records_on_the_real_master_shape(tmp_path):
     )
     statuses = {r.record_id: r.status for r in load_rich_records(master)}
     assert statuses == {"VOYN-W0-A": "IN_PROGRESS", "VOYN-W0-B": "READY_TO_REVIEW"}
+
+
+def test_projection_board_tasks_maps_statuses_and_marks_read_only(tmp_path, monkeypatch):
+    """WIRE-BACKLOG-API increment 1: the projection renders as board tasks —
+    every master status lands in a canonical lane, every record is stamped
+    read-only master-source."""
+    master = tmp_path / "master.md"
+    lines = ["# generated", ""]
+    cases = {
+        "OPEN": "Backlog", "IN_PROGRESS": "In Progress",
+        "READY_TO_REVIEW": "Review", "REJECTED": "Blocked",
+        "DEFER_TO_USER": "Blocked", "DONE": "Done", "DECIDED": "Closed",
+    }
+    for index, status in enumerate(cases):
+        lines.append(
+            "- VOYN_RECOMMENDATION | ts=2026-09-04T00:00:00Z | "
+            f"status={status} | issue_id=VOYN-T{index} | current_wave=0 | "
+            "proposed_wave=0 | priority=P1 | owner=repo-x | effect=- | "
+            f"effort=- | acceptance=- | task=title {index} | evidence=- | "
+            "file_scope=- | parallel_domain=-"
+        )
+    master.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setenv(bc.MASTER_BACKLOG_ENV, str(master))
+
+    tasks = bc.projection_board_tasks()
+
+    assert [t["status"] for t in tasks] == list(cases.values())
+    assert all(t["read_only"] and t["source"] == "master" for t in tasks)
+    assert tasks[0]["id"] == "VOYN-T0" and tasks[0]["project"] == "repo-x"
+
+
+def test_upsert_refuses_master_view_records(monkeypatch, tmp_path):
+    """The write path must refuse the read-only view — the local repository
+    can never silently fork the master backlog."""
+    import pytest as _pytest
+
+    from command_center.ui import legacy_task_helpers as h
+
+    with _pytest.raises(PermissionError, match="read-only projection"):
+        h.upsert_tasks([{"id": "VOYN-X", "source": "master", "read_only": True}])
+
+
+def test_load_tasks_falls_back_to_projection_only_when_store_is_empty(
+    monkeypatch, tmp_path
+):
+    from command_center.ui import legacy_task_helpers as h
+
+    class _Repo:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def load_all(self):
+            return self.rows
+
+    master = tmp_path / "m.md"
+    master.write_text(
+        "- VOYN_RECOMMENDATION | ts=- | status=OPEN | issue_id=VOYN-F | "
+        "current_wave=0 | proposed_wave=0 | priority=- | owner=- | effect=- "
+        "| effort=- | acceptance=- | task=t | evidence=- | file_scope=- | "
+        "parallel_domain=-\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(bc.MASTER_BACKLOG_ENV, str(master))
+
+    monkeypatch.setattr(
+        h.tasks_repository, "get_repository", lambda root: _Repo([])
+    )
+    fallback = h.load_tasks()
+    assert [t["id"] for t in fallback] == ["VOYN-F"]
+
+    local = [{"id": "L-1", "status": "Backlog"}]
+    monkeypatch.setattr(
+        h.tasks_repository, "get_repository", lambda root: _Repo(local)
+    )
+    assert h.load_tasks() == local, "a non-empty local store wins untouched"

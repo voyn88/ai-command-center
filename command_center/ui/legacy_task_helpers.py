@@ -26,8 +26,8 @@ fresh immediately before writing.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from command_center import models, tasks_repository
 
@@ -44,7 +44,28 @@ def normalize_task(task: dict) -> dict:
 
 
 def load_tasks() -> list[dict]:
-    return tasks_repository.get_repository(ROOT).load_all()
+    tasks = tasks_repository.get_repository(ROOT).load_all()
+    if tasks:
+        return tasks
+    # Deployed-console fallback (VOYN-W0-AICC-WIRE-BACKLOG-API): an empty
+    # local repository with a configured master projection renders the
+    # fleet's real board read-only instead of zeros. A VIEW, not a store:
+    # every record is read_only and upsert_tasks refuses them, so the local
+    # repository can never silently fork the master backlog.
+    from command_center import backlog_client
+
+    return backlog_client.projection_board_tasks()
+
+
+def _refuse_master_records(tasks: list[dict]) -> list[dict]:
+    """Write-path guard for the read-only master view."""
+    writable = [task for task in tasks if task.get("source") != "master"]
+    if len(writable) != len(tasks):
+        raise PermissionError(
+            "master-backlog records are a read-only projection: change them "
+            "through the backlog store (console edits would fork the truth)"
+        )
+    return writable
 
 
 def upsert_tasks(tasks: list[dict]) -> None:
@@ -53,7 +74,7 @@ def upsert_tasks(tasks: list[dict]) -> None:
     (via `execution_queue.launch_ready`, exactly like `launch_service`) and
     need to commit exactly those changes. Locked bulk upsert, not a blind
     overwrite of this script run's entire (possibly-stale) `tasks` snapshot."""
-    tasks_repository.get_repository(ROOT).upsert_all(tasks)
+    tasks_repository.get_repository(ROOT).upsert_all(_refuse_master_records(tasks))
 
 
 def new_task_record(
