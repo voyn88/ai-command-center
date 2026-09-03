@@ -178,6 +178,37 @@ def test_plan_enforces_daily_budget_from_pipeline_settings(monkeypatch, pool):
     assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
 
 
+def test_plan_logs_when_spend_lookup_fails_closed(monkeypatch, pool, caplog):
+    """When `daily_spend_usd` raises, `plan()` fails closed — treats spend as
+    the ceiling so nothing launches on unknown cost data — but that must not
+    be *silent*: the same anti-pattern this task exists for (a swallowed
+    exception zeroing the spend cap with no error and no log line) applies
+    just as much to a swallowed exception that blocks every launch with no
+    error and no log line. An operator seeing every dispatch deferred for
+    budget reasons needs a log line to find out why."""
+    import dataclasses
+
+    _enable_master_switch()
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=0.4)
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _boom)
+    _queued_task(title="t1", executor="claude_code", executor_pinned=True)
+
+    with caplog.at_level("WARNING"):
+        plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
+    assert "fail-closed" in caplog.text
+    assert "db unavailable" in caplog.text
+
+
 # --------------------------------------------------------------------------
 # assign() applies through tasks_repository
 # --------------------------------------------------------------------------

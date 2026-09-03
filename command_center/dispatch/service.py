@@ -20,6 +20,7 @@ the task up and launches it on the recorded executor.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,8 @@ from command_center.runtime import db as runtime_db
 
 if TYPE_CHECKING:  # a type-only import: the service layer stays free of FastAPI
     from command_center.http_auth.identity import Principal
+
+_LOG = logging.getLogger(__name__)
 
 # Kanban statuses that mean "waiting to be dispatched" — not yet running,
 # not in review, not done. These are the only tasks a dispatch plan considers.
@@ -169,6 +172,12 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
     except Exception:  # noqa: BLE001 — no cost data => fail closed (assume ceiling hit)
+        _LOG.warning(
+            "dispatch.plan: daily_spend_usd failed, fail-closed at the ceiling "
+            "(%.2f) — dispatch blocked until this is resolved",
+            settings.max_daily_spend_usd or 0.0,
+            exc_info=True,
+        )
         spend = settings.max_daily_spend_usd or 0.0
 
     return plan_dispatch(
