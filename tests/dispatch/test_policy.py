@@ -165,11 +165,42 @@ def test_budget_unknown_defers_everything_even_with_zero_ceiling():
     policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
     executors = [_executor("ollama", cost=0.0, is_local=True)]
     tasks = [_task("t1", priority="Critical"), _task("t2", priority="High")]
-    plan = _plan(tasks, executors, policy, max_daily_spend_usd=0.0, budget_unknown=True)
+    plan = _plan(
+        tasks,
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=0.0,
+        budget_unknown=True,
+    )
 
     assert plan.budget_unknown is True
     assert plan.assignments == ()
     assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+
+
+def test_budget_unknown_reports_no_spend_figure_rather_than_a_fabricated_zero():
+    # The measurement fields must read as "unknown", never as "$0 spent
+    # today" — a caller that checks `daily_spend_usd == 0` without also
+    # checking `budget_unknown` must not be misled into thinking nothing was
+    # spent.
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=5.0,
+        budget_unknown=True,
+    )
+
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.budget_remaining_usd is None
+    assert plan.as_dict()["daily_spend_usd"] is None
+    assert plan.as_dict()["projected_spend_usd"] is None
+    assert plan.as_dict()["budget_remaining_usd"] is None
 
 
 def test_budget_unknown_defers_everything_with_a_nonzero_ceiling_and_free_executor():
