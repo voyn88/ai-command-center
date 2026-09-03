@@ -244,6 +244,13 @@ def _cascade_link(request, attempt_no: int) -> dict[str, Any] | None:
 
 
 def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
+    if executor == "openai_http":
+        # No CLI to probe and no principal to isolate: the bridge is this
+        # checkout's own module. Availability is exactly "a provider key is
+        # in the environment"; provider outages classify as attempt failures
+        # (next cascade link), never as executor absence.
+        available, detail = agent_runner.openai_http_preflight()
+        return available, detail, "openai_http provider key unavailable"
     if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"

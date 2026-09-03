@@ -411,7 +411,9 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # looser policy.
 _REVIEW_POLICY_VERSION = "v6"
 
-_MODEL_ONLY_REVIEW_EXECUTORS = frozenset({"copilot", "claude", "codex"})
+_MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
+    {"copilot", "claude", "codex", "openai_http"}
+)
 
 
 def _model_only_review_cascade() -> list[dict[str, Any]]:
