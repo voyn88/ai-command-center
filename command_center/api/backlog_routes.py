@@ -37,6 +37,14 @@ def status_counts() -> schemas.BacklogStatusCounts:
         raise HTTPException(status_code=503, detail=_UNCONFIGURED) from exc
 
 
+@router.get("/defer-report", response_model=schemas.BacklogDeferReport)
+def defer_report() -> schemas.BacklogDeferReport:
+    try:
+        return service.get_defer_report()
+    except PoolNotOpenError as exc:
+        raise HTTPException(status_code=503, detail=_UNCONFIGURED) from exc
+
+
 @router.get("/tasks", response_model=schemas.BacklogTaskList)
 def tasks(
     status: str | None = None,

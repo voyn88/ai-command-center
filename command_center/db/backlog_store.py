@@ -26,6 +26,10 @@ from command_center.db.backlog_parser import ParsedTask, parse_backlog
 
 __all__ = ["BacklogStore", "ImportReport"]
 
+#: The two buckets `backlog_defer_classification` (0017) ever assigns, in
+#: the order the report always shows them.
+_DEFER_BUCKETS = ("infra_induced_safe_to_retry", "genuine_owner_decision")
+
 
 @dataclass(slots=True)
 class ImportReport:
@@ -250,6 +254,47 @@ class BacklogStore:
                     (task_id,),
                 )
                 return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
+    def defer_classification(self) -> list[dict[str, Any]]:
+        """Every task currently in DEFER_TO_USER, bucketed by
+        ``backlog_defer_classification`` (0017) into ``infra_induced_safe_to_
+        retry`` (the 0014 gate would grant a resume right now) or
+        ``genuine_owner_decision`` (it would refuse, with the exact reason)
+        -- the read side of VOYN-W0-AICC-DEFER-QUEUE-ROOT-CAUSE-SWEEP's
+        "how many of these actually need the owner" question."""
+        keys = (
+            "task_id",
+            "wave",
+            "priority",
+            "title",
+            "repo",
+            "park_reason",
+            "resumes_granted",
+            "bucket",
+            "classification_reason",
+        )
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT task_id, wave, priority, title, repo, park_reason, "
+                    "resumes_granted, bucket, classification_reason "
+                    "FROM backlog_defer_classification "
+                    "ORDER BY bucket, priority NULLS LAST, wave, task_id"
+                )
+                return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
+    def defer_report(self) -> dict[str, int]:
+        """The explicit count `DEFER-QUEUE-ROOT-CAUSE-SWEEP` asks for:
+        genuine owner decisions vs. infra-induced failures safe to retry,
+        zero-filled so an empty bucket still reports 0 rather than vanishing."""
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT bucket, count(*) FROM backlog_defer_classification "
+                    "GROUP BY bucket"
+                )
+                live = {bucket: int(count) for bucket, count in cur.fetchall()}
+        return {bucket: live.get(bucket, 0) for bucket in _DEFER_BUCKETS}
 
     # -- the importer ---------------------------------------------------------
 

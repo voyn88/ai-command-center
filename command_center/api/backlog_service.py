@@ -50,6 +50,11 @@ def get_status_counts() -> schemas.BacklogStatusCounts:
     return schemas.BacklogStatusCounts(counts=counts, total=sum(counts.values()))
 
 
+def get_defer_report() -> schemas.BacklogDeferReport:
+    counts = BacklogStore().defer_report()
+    return schemas.BacklogDeferReport(counts=counts, total=sum(counts.values()))
+
+
 def list_tasks(
     *, status: str | None = None, limit: int = 100, offset: int = 0
 ) -> schemas.BacklogTaskList:

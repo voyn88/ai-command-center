@@ -854,3 +854,105 @@ def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
                 ("VOYN-W0-RSS",),
             )
             assert cur.fetchone()[0] == 1
+
+
+# --- VOYN-W0-AICC-DEFER-QUEUE-ROOT-CAUSE-SWEEP (0017): the classification --
+# view. Same four scenarios `backlog_resume_deferred` itself is proved
+# against above, this time read through `backlog_defer_classification`
+# rather than by attempting a resume -- the view must agree with the gate
+# it mirrors on every one of them.
+
+
+def _classification_of(store: BacklogStore, task_id: str) -> dict:
+    rows = {row["task_id"]: row for row in store.defer_classification()}
+    assert task_id in rows, f"{task_id} not in backlog_defer_classification"
+    return rows[task_id]
+
+
+def test_defer_classification_buckets_a_technical_park_as_infra_induced(rig) -> None:
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-DC1")
+
+    row = _classification_of(store, "VOYN-W0-DC1")
+    assert row["bucket"] == "infra_induced_safe_to_retry"
+    assert row["classification_reason"] == "cascade_exhausted_technical"
+    assert row["park_reason"] is not None and row["park_reason"].startswith(
+        "cascade_exhausted"
+    )
+    assert row["resumes_granted"] == 0
+
+    # The classification and the gate must never disagree.
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-DC1")
+    assert ok and reason == "OPEN"
+
+
+def test_defer_classification_buckets_an_owner_decision_park_as_genuine(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-DC2"))[0]
+    owner_reason = "owner must choose the product direction"
+    assert _dispatch(app_factory, "VOYN-W0-DC2")[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ok FROM backlog_return_to_pool(%s, %s)",
+                ("VOYN-W0-DC2", owner_reason),
+            )
+            assert cur.fetchone()[0]
+    _repark(app_factory, store, "VOYN-W0-DC2", owner_reason)
+
+    row = _classification_of(store, "VOYN-W0-DC2")
+    assert row["bucket"] == "genuine_owner_decision"
+    assert row["classification_reason"] == "owner_decision_park"
+
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-DC2")
+    assert (ok, reason) == (False, "owner_decision_park")
+
+
+def test_defer_classification_buckets_a_park_without_evidence_as_genuine(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-DC3", status="DEFER_TO_USER"))[0]
+
+    row = _classification_of(store, "VOYN-W0-DC3")
+    assert row["bucket"] == "genuine_owner_decision"
+    assert row["classification_reason"] == "no_machine_park_evidence"
+    assert row["park_reason"] is None
+
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-DC3")
+    assert (ok, reason) == (False, "no_machine_park_evidence")
+
+
+def test_defer_classification_buckets_a_budget_exhausted_park_as_genuine(rig) -> None:
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-DC4")
+
+    for _round_no in range(3):
+        ok, _reason, _rev = store.resume_deferred("VOYN-W0-DC4")
+        assert ok
+        _repark(
+            app_factory, store, "VOYN-W0-DC4", "cascade_exhausted: synthetic re-park"
+        )
+
+    row = _classification_of(store, "VOYN-W0-DC4")
+    assert row["bucket"] == "genuine_owner_decision"
+    assert row["classification_reason"] == "resume_budget_exhausted"
+    assert row["resumes_granted"] == 3
+
+    ok, reason, _rev = store.resume_deferred("VOYN-W0-DC4")
+    assert (ok, reason) == (False, "resume_budget_exhausted")
+
+
+def test_defer_report_counts_match_the_classification(rig) -> None:
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-DR1")
+    assert store.upsert_task(_task("VOYN-W0-DR2", status="DEFER_TO_USER"))[0]
+
+    report = store.defer_report()
+    rows = store.defer_classification()
+    assert report["infra_induced_safe_to_retry"] == len(
+        [r for r in rows if r["bucket"] == "infra_induced_safe_to_retry"]
+    )
+    assert report["genuine_owner_decision"] == len(
+        [r for r in rows if r["bucket"] == "genuine_owner_decision"]
+    )
+    assert report["infra_induced_safe_to_retry"] >= 1  # VOYN-W0-DR1
+    assert report["genuine_owner_decision"] >= 1  # VOYN-W0-DR2

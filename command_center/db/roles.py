@@ -172,6 +172,7 @@ ALL_TABLES: tuple[str, ...] = (
 # schema assertions compare `ALL_TABLES` against `BASE TABLE` rows: folding the
 # two together would make a view able to stand in for a dropped table.
 ALL_VIEWS: tuple[str, ...] = (
+    "backlog_defer_classification",
     "backlog_eligible",
     "enrollment_ticket_public",
     "principal_credential_public",
@@ -439,6 +440,7 @@ VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = 
         {
             APP_ROLE: MappingProxyType(
                 {
+                    "backlog_defer_classification": _READ,
                     "backlog_eligible": _READ,
                     "enrollment_ticket_public": _READ,
                     "principal_credential_public": _READ,

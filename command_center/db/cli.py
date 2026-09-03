@@ -103,6 +103,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    sub.add_parser(
+        "backlog-defer-report",
+        help="Classify every DEFER_TO_USER task (VOYN-W0-AICC-DEFER-QUEUE-"
+        "ROOT-CAUSE-SWEEP): the explicit count of genuine owner decisions "
+        "vs. infra-induced failures the 0014 gate would resume on its own, "
+        "plus the per-task breakdown.",
+    )
+    sweep = sub.add_parser(
+        "backlog-defer-sweep",
+        help="Retrospective one-off drain of DEFER_TO_USER (VOYN-W0-AICC-"
+        "DEFER-QUEUE-ROOT-CAUSE-SWEEP): resume every task "
+        "backlog_defer_classification buckets infra_induced_safe_to_retry, "
+        "in one pass -- unlike a planner tick, which trickles at "
+        "max_resumes_per_tick (default 10) per run. Genuine owner-decision "
+        "parks are never touched; each resume still goes through "
+        "backlog_resume_deferred, which revalidates and audits it.",
+    )
+    sweep.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap the number of resumes this run performs (default: no cap).",
+    )
     plan = sub.add_parser(
         "backlog-plan",
         help="One planner tick (BO-S2): release finished lanes, dispatch "
@@ -331,6 +354,57 @@ def main(argv: list[str] | None = None) -> int:
                 ):
                     print(f"{status}: {count}")
                 return 0
+
+            if args.command == "backlog-defer-report":
+                from command_center.db.backlog_store import BacklogStore
+
+                store = BacklogStore(lambda: nullcontext(conn))
+                report = store.defer_report()
+                total = sum(report.values())
+                print(f"DEFER_TO_USER total: {total}")
+                print(
+                    f"infra_induced_safe_to_retry: "
+                    f"{report['infra_induced_safe_to_retry']}"
+                )
+                print(f"genuine_owner_decision: {report['genuine_owner_decision']}")
+                for row in store.defer_classification():
+                    print(
+                        f"{row['bucket']:28} {row['task_id']}  "
+                        f"reason={row['classification_reason']}  "
+                        f"park={row['park_reason'] or '(none)'}  "
+                        f"resumes={row['resumes_granted']}"
+                    )
+                return 0
+
+            if args.command == "backlog-defer-sweep":
+                from command_center.db.backlog_store import BacklogStore
+
+                store = BacklogStore(lambda: nullcontext(conn))
+                candidates = [
+                    row
+                    for row in store.defer_classification()
+                    if row["bucket"] == "infra_induced_safe_to_retry"
+                ]
+                if args.limit is not None:
+                    candidates = candidates[: args.limit]
+                resumed = 0
+                refused: list[tuple[str, str]] = []
+                for row in candidates:
+                    # backlog_resume_deferred re-validates everything under
+                    # the row lock; a stale classification read here yields a
+                    # refusal, never a wrongful resume.
+                    ok, reason, _revision = store.resume_deferred(row["task_id"])
+                    if ok:
+                        resumed += 1
+                        print(f"RESUMED   {row['task_id']}: {row['park_reason']}")
+                    else:
+                        refused.append((row["task_id"], reason))
+                        print(f"REFUSED   {row['task_id']}: {reason}")
+                print(f"resumed {resumed}/{len(candidates)}")
+                # A refusal here means the queue moved under the sweep (a
+                # concurrent planner tick, a re-park) -- worth a non-zero
+                # exit so a human notices, never a reason to half-apply.
+                return 1 if refused else 0
 
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc

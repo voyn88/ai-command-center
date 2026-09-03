@@ -192,36 +192,18 @@ class Planner:
             # Reconcile technical DEFER_TO_USER parks back to OPEN (VOYN-W0-
             # AICC-DEFER-AUTO-RESUME) before selecting candidates, so a
             # resumed task is eligible in this very tick. The candidate query
-            # mirrors the 0014 gate's own conditions purely as a FILTER --
-            # so ineligible parks are not attempted (and not audit-spammed)
-            # every tick; the SECURITY DEFINER function remains the only
-            # authority and revalidates everything under the row lock.
+            # reads the classification from `backlog_defer_classification`
+            # (0017) rather than carrying its own copy of the 0014 gate's
+            # conditions -- one classification, expressed once, so ineligible
+            # parks are not attempted (and not audit-spammed) every tick; the
+            # SECURITY DEFINER function remains the only authority and
+            # revalidates everything under the row lock regardless of what
+            # the view says.
             if limits.max_resumes_per_tick > 0:
                 resumable = self._rows(
-                    "SELECT t.task_id, park.reason FROM backlog_task t "
-                    "CROSS JOIN LATERAL ("
-                    "  SELECT e.reason, e.event_id FROM backlog_event e"
-                    "   WHERE e.task_id = t.task_id"
-                    "     AND e.event = 'return_to_pool'"
-                    "     AND e.outcome = 'granted'"
-                    "     AND e.detail->>'target' = 'DEFER_TO_USER'"
-                    "   ORDER BY e.event_id DESC LIMIT 1"
-                    ") park "
-                    "WHERE t.status = 'DEFER_TO_USER' AND t.kind = 'task' "
-                    "  AND park.reason LIKE 'cascade_exhausted:%%' "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM backlog_event e2"
-                    "     WHERE e2.task_id = t.task_id"
-                    "       AND e2.outcome = 'granted'"
-                    "       AND e2.event IN ('upsert', 'transition', 'triage',"
-                    "                        'dispatch', 'return_to_pool',"
-                    "                        'resume_deferred')"
-                    "       AND e2.event_id > park.event_id) "
-                    "  AND (SELECT count(*) FROM backlog_event e"
-                    "        WHERE e.task_id = t.task_id"
-                    "          AND e.event = 'resume_deferred'"
-                    "          AND e.outcome = 'granted') < 3 "
-                    "ORDER BY t.priority NULLS LAST, t.wave, t.task_id "
+                    "SELECT task_id, park_reason FROM backlog_defer_classification "
+                    "WHERE bucket = 'infra_induced_safe_to_retry' "
+                    "ORDER BY priority NULLS LAST, wave, task_id "
                     "LIMIT %s",
                     (limits.max_resumes_per_tick,),
                 )

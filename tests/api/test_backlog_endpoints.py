@@ -21,16 +21,23 @@ from command_center.db.pool import PoolNotOpenError
 
 
 class _FakeStore:
-    def __init__(self, tasks=None, events=None, evidence=None):
+    def __init__(self, tasks=None, events=None, evidence=None, defer_report=None):
         self._tasks = tasks or []
         self._events = events or []
         self._evidence = evidence or []
+        self._defer_report = defer_report or {
+            "infra_induced_safe_to_retry": 0,
+            "genuine_owner_decision": 0,
+        }
 
     def counts_by_status(self):
         counts: dict[str, int] = {}
         for t in self._tasks:
             counts[t["status"]] = counts.get(t["status"], 0) + 1
         return counts
+
+    def defer_report(self):
+        return dict(self._defer_report)
 
     def list_tasks(self, *, status=None, limit=100, offset=0):
         rows = [t for t in self._tasks if status is None or t["status"] == status]
@@ -80,6 +87,31 @@ def test_status_counts_zero_fills_the_full_vocabulary(client, monkeypatch):
     assert body["counts"]["DONE"] == 1
     assert body["counts"]["DEFER_TO_USER"] == 0  # zero-filled, not absent
     assert body["total"] == 2
+
+
+def test_defer_report_zero_fills_both_buckets(client, monkeypatch):
+    monkeypatch.setattr(
+        backlog_service,
+        "BacklogStore",
+        lambda *a, **k: _FakeStore(
+            defer_report={"infra_induced_safe_to_retry": 5, "genuine_owner_decision": 2}
+        ),
+    )
+    resp = client.get("/api/v1/backlog/defer-report")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["counts"]["infra_induced_safe_to_retry"] == 5
+    assert body["counts"]["genuine_owner_decision"] == 2
+    assert body["total"] == 7
+
+
+def test_defer_report_unconfigured_backlog_is_503(client, monkeypatch):
+    def _raise(*a, **k):
+        raise PoolNotOpenError("PostgreSQL pool is not open.")
+
+    monkeypatch.setattr(backlog_service, "BacklogStore", _raise)
+    resp = client.get("/api/v1/backlog/defer-report")
+    assert resp.status_code == 503
 
 
 def test_tasks_filters_by_status(client, monkeypatch):
