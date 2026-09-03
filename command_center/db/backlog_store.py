@@ -15,14 +15,21 @@ moves through ``backlog_transition`` and its machine model. Dependencies are
 NOT imported: the file records them as prose ("Связи: …"), and prose is
 exactly what the no-substring rule forbids acting on; edges enter through
 ``add_dependency`` (cycle-checked) as BO-S2 formalizes them.
+
+The other direction (BO-S4) is ``export_tasks``/``write_projection``: the
+store is canonical, the file is a read projection for the owner, regenerated
+from every column ``render_backlog`` needs to reproduce exactly — including
+``body`` and ``repo``, which the paginated ``list_tasks`` read does not carry.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from command_center.db.backlog_parser import ParsedTask, parse_backlog
+from command_center.db.backlog_parser import ParsedTask, parse_backlog, render_backlog
+from command_center.db.backlog_projection import atomic_write_text
 
 __all__ = ["BacklogStore", "ImportReport"]
 
@@ -250,6 +257,36 @@ class BacklogStore:
                     (task_id,),
                 )
                 return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
+    # -- the projection (BO-S4) ------------------------------------------------
+
+    def export_tasks(self) -> list[ParsedTask]:
+        """Every task as a `ParsedTask`, ordered by id for a deterministic,
+        diff-friendly file — the full row `render_backlog` needs, not the
+        paginated summary `list_tasks` returns for the UI."""
+        keys = ("task_id", "wave", "priority", "status", "kind", "title", "body", "repo")
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT task_id, wave, priority, status, kind, title, body, "
+                    "repo FROM backlog_task ORDER BY task_id"
+                )
+                rows = cur.fetchall()
+        return [
+            ParsedTask(**dict(zip(keys, row, strict=True)), line_no=0) for row in rows
+        ]
+
+    def export_markdown(self) -> str:
+        return render_backlog(self.export_tasks())
+
+    def write_projection(self, path: str | Path) -> int:
+        """Regenerate the Markdown projection at `path` (BO-S4), atomically
+        (`atomic_write_text`) so a concurrently scheduled importer or reader
+        never observes a truncated or empty document. Returns the task
+        count written."""
+        tasks = self.export_tasks()
+        atomic_write_text(path, render_backlog(tasks))
+        return len(tasks)
 
     # -- the importer ---------------------------------------------------------
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center.db.backlog_parser import parse_backlog
+from command_center.db.backlog_parser import ParsedTask, parse_backlog, render_backlog
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "backlog_sample.md"
 
@@ -125,3 +125,130 @@ def test_repo_is_inferred_from_the_task_family() -> None:
     )
     r2 = parse_backlog(md2)
     assert r2.tasks[0].repo == "aios"  # hint aios beats AICC-family inference
+
+
+# -- the projection (BO-S4): render_backlog is parse_backlog's exact inverse --
+
+# Rejected twice by adversarial review before this suite existed: PR #431
+# (whitespace collapsed on export, `repo` never rendered, non-atomic write)
+# and PR #485 (`kind` never serialized, a record-shaped body line split into
+# a spurious new task on reimport). Each test below reproduces one of those
+# defect classes directly against the store's data model, which is more
+# general than anything `parse_backlog` alone would ever produce.
+
+
+def _fields(task: ParsedTask) -> tuple:
+    return (
+        task.task_id,
+        task.wave,
+        task.priority,
+        task.status,
+        task.kind,
+        task.title,
+        task.body,
+        task.repo,
+    )
+
+
+def _round_trip(tasks: list[ParsedTask]) -> list[ParsedTask]:
+    reparsed = parse_backlog(render_backlog(tasks))
+    assert reparsed.unparsed == [], reparsed.unparsed
+    return reparsed.tasks
+
+
+def _task(task_id: str, **overrides) -> ParsedTask:
+    values = dict(
+        task_id=task_id,
+        wave="0",
+        priority="P0",
+        status="OPEN",
+        kind="task",
+        title=task_id.lower(),
+        body="",
+        repo=None,
+        line_no=0,
+    )
+    values.update(overrides)
+    return ParsedTask(**values)
+
+
+def test_projection_round_trip_preserves_multiline_body_exactly():
+    """PR #431's regression: `_render_task_line()` joined the body into one
+    line, so a body with continuation bullets came back changed."""
+    original = _task(
+        "VOYN-W0-RT1",
+        body="First line of context.\n\nSecond paragraph after a blank line.\n"
+        "- a literal bullet that is not a record.",
+        repo="ai-command-center",
+    )
+    [reparsed] = _round_trip([original])
+    assert _fields(reparsed) == _fields(original)
+
+
+def test_projection_round_trip_survives_a_body_line_shaped_like_a_task_record():
+    """PR #485's regression: `_TASK_LINE` matches a record-shaped line at any
+    indentation, so a stored body line shaped like `- **ID** | ...` split the
+    record on reimport instead of staying body text."""
+    original = _task(
+        "VOYN-W0-RT2",
+        status="DONE",
+        priority=None,
+        body="- **VOYN-W0-RT3** | Wave 0 | OPEN | P0 | `injected` | should stay body text",
+    )
+    [reparsed] = _round_trip([original])
+    assert _fields(reparsed) == _fields(original)
+    assert reparsed.task_id == "VOYN-W0-RT2", "the injected line must not become a task"
+
+
+def test_projection_round_trip_preserves_kind_independent_of_id_shape():
+    """PR #485's regression: `kind` was derived solely from the id's `-G<n>`
+    suffix on reimport, silently flipping any API-created row where the two
+    disagree."""
+    originals = [
+        _task("VOYN-W0-RT4", kind="gate", title="gate-without-g-suffix"),
+        _task("VOYN-W0-RT5-G1", kind="task", title="task-with-gate-shaped-id"),
+    ]
+    reparsed = {t.task_id: t for t in _round_trip(originals)}
+    assert reparsed["VOYN-W0-RT4"].kind == "gate"
+    assert reparsed["VOYN-W0-RT5-G1"].kind == "task"
+
+
+def test_projection_round_trip_preserves_repo_including_explicit_none():
+    """PR #431's regression: `repo` was selected but never rendered, so it
+    was silently reconstructed (and overwritten) from body hint/id inference
+    alone — losing any stored value that disagrees with either heuristic."""
+    originals = [
+        _task("VOYN-W0-AICC-RT6", repo=None),  # family would infer non-None
+        _task("VOYN-OPS-RT7", repo="ai-command-center"),  # family infers None
+    ]
+    reparsed = {t.task_id: t for t in _round_trip(originals)}
+    assert reparsed["VOYN-W0-AICC-RT6"].repo is None
+    assert reparsed["VOYN-OPS-RT7"].repo == "ai-command-center"
+
+
+def test_projection_round_trip_preserves_a_title_hostile_to_the_slug_shape():
+    originals = [
+        _task("VOYN-W0-RT8", title="has a `backtick` in it"),
+        _task("VOYN-W0-RT9", title="has | a pipe delimiter"),
+    ]
+    reparsed = {t.task_id: t for t in _round_trip(originals)}
+    assert reparsed["VOYN-W0-RT8"].title == "has a `backtick` in it"
+    assert reparsed["VOYN-W0-RT9"].title == "has | a pipe delimiter"
+
+
+def test_projection_round_trip_is_a_fixed_point_over_two_generations():
+    """Exporting an already-exported-and-reimported set of tasks must change
+    nothing further — the property the store's own tests assert via
+    `changed == 0` after a real database round trip."""
+    originals = [
+        _task(
+            f"VOYN-W0-RT{10 + i}",
+            body=f"body {i}\nwith a second line",
+            repo="aios",
+        )
+        for i in range(5)
+    ]
+    once = _round_trip(originals)
+    twice = _round_trip(once)
+    assert [_fields(t) for t in twice] == [_fields(t) for t in once]
+    assert [_fields(t) for t in once] == [_fields(t) for t in originals]

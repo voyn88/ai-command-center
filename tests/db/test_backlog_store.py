@@ -210,6 +210,51 @@ def test_import_is_idempotent_and_loses_nothing(store) -> None:
     assert store.get_task("VOYN-W0-G1")["kind"] == "gate"
 
 
+def test_export_then_reimport_is_a_fixed_point(store, tmp_path) -> None:
+    """BO-S4's core property, proved against a live database rather than the
+    parser's own hermetic round trip: nothing the store can hold should
+    change on export then reimport. Deliberately includes the exact shapes
+    two prior adversarial reviews found broken — a multi-line body, a `kind`
+    independent of the id's `-G<n>` shape, an explicit `repo` disagreeing
+    with family inference, and a body line shaped like another task record."""
+    assert store.upsert_task(
+        _task(
+            "VOYN-W0-EXPORT1",
+            body="Line one.\n\nLine three after a blank line.\n"
+            "- **VOYN-W0-EXPORT2** | Wave 0 | OPEN | P0 | `injected` | body text",
+        )
+    )[0]
+    assert store.upsert_task(_task("VOYN-W0-EXPORT-G9", kind="gate"))[0]
+    assert store.upsert_task(
+        _task("VOYN-W0-AICC-EXPORT3", repo=None)
+    )[0]  # family would infer ai-command-center
+    assert store.upsert_task(
+        _task("VOYN-OPS-EXPORT4", repo="ai-command-center")
+    )[0]  # family would infer None
+
+    before = {
+        task_id: store.get_task(task_id)
+        for task_id in (
+            "VOYN-W0-EXPORT1",
+            "VOYN-W0-EXPORT-G9",
+            "VOYN-W0-AICC-EXPORT3",
+            "VOYN-OPS-EXPORT4",
+        )
+    }
+
+    path = tmp_path / "projection.md"
+    count = store.write_projection(path)
+    assert count >= 4
+
+    report = store.import_markdown(path.read_text(encoding="utf-8"))
+    assert report.changed == 0, "export then reimport must change nothing"
+    assert report.refused == []
+
+    for task_id, snapshot in before.items():
+        after = store.get_task(task_id)
+        assert after == snapshot, task_id
+
+
 def test_import_reports_a_record_the_schema_refuses(store) -> None:
     """The parser and the CHECKs are two fences; a record that leaps the
     first must still be caught, reported and not half-written by the second."""

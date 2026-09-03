@@ -22,14 +22,35 @@ Vocabulary facts measured on the real file (2026-08-19), not assumed:
 
 Pure module: no database, no I/O beyond the text it is given — so its tests
 are hermetic and the store's tests need only prove the seam.
+
+``render_backlog`` is the exact counterpart for BO-S4 (the Markdown
+projection): text in, structure out for ``parse_backlog``; structure in,
+text out for ``render_backlog``. The store's data model is more general than
+what a human ever writes by hand — ``kind`` can disagree with the id's
+``-G<n>`` shape, ``repo`` can be explicitly absent where the family would
+infer one, and ``body``/``title`` can contain arbitrary text, including text
+shaped exactly like another record. A naive renderer that only reproduces
+what a human would write loses those cases silently on reimport (found twice
+by adversarial review: PRs #431 and #485). So the projection emits, right
+after each record's head line, one HTML-comment "directive" per field the
+head line's own shape cannot carry losslessly (``kind``, ``repo``, and
+``title`` when it cannot survive as a plain backtick slug) — these are
+authoritative and override whatever the head line or body would otherwise
+imply. Body text is reproduced line-for-line rather than joined into prose,
+and any body line that would otherwise be misread — record-shaped, directive-
+shaped, blank, or already backslash-led — is escaped with one leading
+backslash, stripped back off on import. The result: ``parse_backlog`` of
+``render_backlog`` of any set of tasks reproduces every field exactly,
+regardless of where those tasks came from.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-__all__ = ["ParsedTask", "ParseReport", "parse_backlog"]
+__all__ = ["ParsedTask", "ParseReport", "parse_backlog", "render_backlog"]
 
 EXECUTABLE_STATUSES = ("OPEN", "IN_PROGRESS", "READY_TO_REVIEW", "DONE")
 NON_EXECUTABLE_STATUSES = (
@@ -55,6 +76,12 @@ _PRIORITY = re.compile(r"^P([0-9])(?:\s*\(.*\))?$", re.S)
 _SLUG = re.compile(r"^`([^`]+)`$")
 _GATE_ID = re.compile(r"-G[0-9]+$")
 _ID_SHAPE = re.compile(r"^VOYN-[A-Za-z0-9][A-Za-z0-9._-]*$")
+#: A machine-only override, emitted by `render_backlog` and consumed (never
+#: shown as prose) by `parse_backlog`. The value is escaped by
+#: `_escape_directive_value` so it can never smuggle a literal "-->" that
+#: would truncate the comment early.
+_MACHINE_DIRECTIVE = re.compile(r"^<!--\s*backlog:(kind|repo|title)=(.*?)\s*-->$")
+_WAVE_NUMERIC = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,29 +159,37 @@ def parse_backlog(text: str) -> ParseReport:
     current: ParsedTask | None = None
     current_indent = 0
     body_extra: list[str] = []
+    kind_override: str | None = None
+    title_override: str | None = None
+    repo_override_set = False
+    repo_override: str | None = None
 
     def flush() -> None:
         nonlocal current, body_extra
+        nonlocal kind_override, title_override, repo_override_set, repo_override
         if current is None:
             return
         body = current.body
         if body_extra:
             body = (body + "\n" if body else "") + "\n".join(body_extra)
-        repo = current.repo
-        if repo is None:
-            hint = _REPO_HINT.search(body)
-            if hint:
-                repo = hint.group(1).strip()
-        if repo is None:
-            repo = _infer_repo(current.task_id)
+        if repo_override_set:
+            repo = repo_override
+        else:
+            repo = current.repo
+            if repo is None:
+                hint = _REPO_HINT.search(body)
+                if hint:
+                    repo = hint.group(1).strip()
+            if repo is None:
+                repo = _infer_repo(current.task_id)
         report.tasks.append(
             ParsedTask(
                 task_id=current.task_id,
                 wave=current.wave,
                 priority=current.priority,
                 status=current.status,
-                kind=current.kind,
-                title=current.title,
+                kind=kind_override if kind_override is not None else current.kind,
+                title=title_override if title_override is not None else current.title,
                 body=body,
                 repo=repo,
                 line_no=current.line_no,
@@ -162,6 +197,10 @@ def parse_backlog(text: str) -> ParseReport:
         )
         current = None
         body_extra = []
+        kind_override = None
+        title_override = None
+        repo_override_set = False
+        repo_override = None
 
     for line_no, line in enumerate(lines, start=1):
         match = _TASK_LINE.match(line)
@@ -187,12 +226,22 @@ def parse_backlog(text: str) -> ParseReport:
                     or not line.lstrip().startswith("- **")
                 )
             ):
-                if len(line) - len(line.lstrip()) > current_indent:
-                    body_extra.append(line.strip())
-                elif not line.strip().startswith("#") and not line.strip().startswith(
-                    "- "
-                ):
-                    body_extra.append(line.strip())
+                stripped = line.strip()
+                directive = _MACHINE_DIRECTIVE.match(stripped)
+                if directive is not None:
+                    key = directive.group(1)
+                    value = _unescape_directive_value(directive.group(2))
+                    if key == "kind":
+                        kind_override = value
+                    elif key == "repo":
+                        repo_override_set = True
+                        repo_override = value or None
+                    else:  # "title"
+                        title_override = value
+                elif len(line) - len(line.lstrip()) > current_indent:
+                    body_extra.append(_unescape_body_line(stripped))
+                elif not stripped.startswith("#") and not stripped.startswith("- "):
+                    body_extra.append(_unescape_body_line(stripped))
                 else:
                     flush()
             elif current is not None and line.strip().startswith("#"):
@@ -284,3 +333,90 @@ def parse_backlog(text: str) -> ParseReport:
 
     flush()
     return report
+
+
+# -- the projection (BO-S4): the exact counterpart of the parse above --------
+
+
+def _escape_directive_value(value: str) -> str:
+    """Make `value` safe inside one `<!-- backlog:key=... -->` line: no
+    literal newline (would spill into a second line) and no literal ">"
+    (could complete a "-->" early and truncate the comment)."""
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace(">", "\\>")
+
+
+def _unescape_directive_value(value: str) -> str:
+    return re.sub(
+        r"\\(.)", lambda m: {"n": "\n", ">": ">"}.get(m.group(1), m.group(1)), value
+    )
+
+
+def _needs_body_escape(line: str) -> bool:
+    """Whether a body line, rendered verbatim, would be misread on reimport:
+    empty (continuation lines are dropped silently unless escaped),
+    record-shaped (would start a spurious new task), directive-shaped
+    (would be consumed as a machine override), or already backslash-led
+    (would collide with an escaped line)."""
+    return (
+        line == ""
+        or line.startswith("\\")
+        or _RECORD_SHAPED.match(line) is not None
+        or _MACHINE_DIRECTIVE.match(line) is not None
+    )
+
+
+def _escape_body_line(line: str) -> str:
+    return "\\" + line if _needs_body_escape(line) else line
+
+
+def _unescape_body_line(line: str) -> str:
+    return line[1:] if line.startswith("\\") else line
+
+
+def _render_wave(wave: str) -> str:
+    return f"Wave {wave}" if _WAVE_NUMERIC.match(wave) else wave
+
+
+def _title_fits_inline(title: str) -> bool:
+    """Whether `title` survives as the head line's backtick slug: non-empty
+    (an empty slug does not match `_SLUG` at all), no backtick (would end
+    the slug early), no newline (would split into a second raw line), and
+    no literal " | " (would be re-split into extra fields on reimport)."""
+    return bool(title) and "`" not in title and "\n" not in title and " | " not in title
+
+
+def _render_task(task: ParsedTask) -> list[str]:
+    # The head-line title slot is a single backtick-quoted field; a title
+    # that cannot survive that shape falls back to the task id there, and
+    # the authoritative value travels in a `title` directive instead — same
+    # pattern as `kind`/`repo` below.
+    safe_title = task.title if _title_fits_inline(task.title) else task.task_id
+    fields = [_render_wave(task.wave), task.status]
+    if task.priority:
+        fields.append(task.priority)
+    fields.append(f"`{safe_title}`")
+    lines = [f"- **{task.task_id}** | {' | '.join(fields)}"]
+    lines.append(f"  <!-- backlog:kind={_escape_directive_value(task.kind)} -->")
+    lines.append(
+        f"  <!-- backlog:repo={_escape_directive_value(task.repo or '')} -->"
+    )
+    if safe_title != task.title:
+        lines.append(
+            f"  <!-- backlog:title={_escape_directive_value(task.title)} -->"
+        )
+    if task.body:
+        lines.extend("  " + _escape_body_line(line) for line in task.body.split("\n"))
+    return lines
+
+
+def render_backlog(tasks: Iterable[ParsedTask]) -> str:
+    """The exact counterpart of `parse_backlog`: for any `tasks`, however
+    they were produced (parsed from Markdown, upserted through the API, or
+    round-tripped already), `parse_backlog(render_backlog(tasks)).tasks`
+    reproduces every field — `task_id`, `wave`, `priority`, `status`,
+    `kind`, `title`, `body`, `repo` — exactly, and reports nothing
+    unparsed."""
+    lines: list[str] = []
+    for task in tasks:
+        lines.extend(_render_task(task))
+    return "\n".join(lines) + "\n" if lines else ""
