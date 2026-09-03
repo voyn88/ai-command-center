@@ -107,6 +107,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from command_center.observability.trace import log_span
 from command_center.orchestrator import gh_access, github_app_auth
 from command_center.orchestrator.routing import cascade_for
 
@@ -1749,6 +1750,7 @@ def _review_once(
         for review_key, payload in prepared:
             enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
+        log_span("review", task_id=task_id, pr_url=pr_url, chunks=len(prepared))
         actions += 1
     if scan_token is not None:
         _scan_commit(factory, "scan:review_once", scan_token, last_processed)
@@ -4745,6 +4747,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     conn.commit()
                     finished_tasks.add(task_id)
                     report.merged.append((task_id, head))
+                    log_span("merge", task_id=task_id, head_sha=head)
                 else:
                     conn.rollback()
                     report.skipped.append((task_id, f"transition:{reason}"))
