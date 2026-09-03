@@ -33,6 +33,7 @@ projection — they render as ``-`` until the store grows those columns.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -49,17 +50,22 @@ _HEADER = (
     "\n"
 )
 
-#: The one character sequence a value may never contain is the field
-#: separator; newlines would end the record early. Both are flattened
-#: rather than escaped — the projection is for reading, and a value that
-#: needed escaping would round-trip as a different string anyway.
-_FLATTEN = (("\r", " "), ("\n", " "), (backlog_client.FIELD_SEP, " / "))
+#: Two character classes can break a record and both are removed outright
+#: rather than escaped (the projection is for reading; an escaped value
+#: would round-trip as a different string anyway):
+#: - every `|` becomes `/`: replacing only the exact `" | "` sequence was
+#:   proven insufficient — a value ENDING in " |" met the joining
+#:   FIELD_SEP as " | | " and shifted every later field (independent
+#:   review of 7bfda54, confirmed by execution);
+#: - every boundary `str.splitlines` recognises becomes a space — the
+#:   parser splits with splitlines, whose set is far wider than \r\n
+#:   (\v, \f, FS/GS/RS, \x85, U+2028/U+2029; same review).
+_VERTICAL_WS = re.compile("[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 
 
 def _clean(value: object) -> str:
-    text = "-" if value is None else str(value).strip()
-    for needle, replacement in _FLATTEN:
-        text = text.replace(needle, replacement)
+    text = "-" if value is None else str(value)
+    text = _VERTICAL_WS.sub(" ", text).replace("|", "/").strip()
     return text or "-"
 
 

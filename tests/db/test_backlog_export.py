@@ -29,7 +29,11 @@ _ROWS = [
         "wave": "0.5",
         "priority": None,
         "status": "READY_TO_REVIEW",
-        "title": "evil | title=with " + backlog_client.FIELD_SEP + " sep\nand line",
+        "title": (
+            "evil | trailing-pipe breaker |"
+            + backlog_client.FIELD_SEP
+            + " sep\nand\u2028unicode\x0bverticals |"
+        ),
         "repo": None,
         "updated_at": None,
     },
