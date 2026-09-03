@@ -1065,9 +1065,22 @@ def test_command_builders_table_covers_every_wired_executor():
     """The worker gates on this table (`handlers._run_agent`), and the routing
     matrix's own test derives its allowed set from it, so an entry here is the
     single act that makes an executor real."""
-    assert set(agent_runner.COMMAND_BUILDERS) == {"claude", "codex", "copilot"}
+    assert set(agent_runner.COMMAND_BUILDERS) == {
+        "claude",
+        "codex",
+        "copilot",
+        "openai_http",
+    }
     for name in agent_runner.COMMAND_BUILDERS:
-        command = agent_runner._command_builder(name)("x", task_type="review")
+        builder = agent_runner._command_builder(name)
+        if name == "openai_http":
+            # The bridge is model-only by construction and demands an
+            # explicit provider/model; "review" would rightly be refused.
+            command = builder(
+                "x", task_type="independent_review", model="groq/m"
+            )
+        else:
+            command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
         assert all(isinstance(part, str) for part in command), name
 
