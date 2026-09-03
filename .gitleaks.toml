@@ -1,0 +1,29 @@
+# Gitleaks configuration for the deterministic security-scan tier
+# (VOYN-W0-AICC-SECRETS-IN-GIT-HISTORY).
+#
+# First full-history scan (2026-09-03) reported 75 findings; triage showed
+# zero real credentials:
+#   - 64 hits are `.secrets.baseline` — the *other* scanner's own artifact:
+#     detect-secrets (pinned in ci.yml security-gates) stores SHA1 hashes of
+#     allowlisted fixture strings there, and gitleaks' generic-api-key rule
+#     matches those hashes as if they were keys.
+#   - 11 hits are deliberate fake fixtures in tests that exist to prove
+#     secret REDACTION and provider auth handling (`sk-abcdefgh` and
+#     friends) — files whose purpose requires secret-shaped strings.
+#
+# Trade-off, made explicitly: path-allowlisting these files means a real
+# secret pasted into one of them would not be flagged by gitleaks — but
+# detect-secrets still scans them (its baseline diff gate in ci.yml fails
+# on NEW findings), so coverage there is layered, not absent.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "detect-secrets baseline artifact and deliberate test fixtures (triaged 2026-09-03, 75/75 false positives)"
+paths = [
+  '''^\.secrets\.baseline$''',
+  '''^tests/native_gateway/test_redaction\.py$''',
+  '''^tests/db/test_config\.py$''',
+  '''^tests/test_codex_provider\.py$''',
+  '''^tests/test_copilot_provider\.py$''',
+]
