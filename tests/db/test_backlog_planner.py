@@ -872,13 +872,20 @@ def test_resume_budget_is_a_window_not_a_lifetime_score(
     app_factory, store, worker = rig
     task = "VOYN-W0-RSW"
 
-    # Three real park->resume cycles: each grant's event_id precedes the
-    # NEXT park, so superseded_park_evidence never trips.
-    for _ in range(3):
-        _park_technically(app_factory, store, worker, task)
+    # Three real park->resume cycles: the first park needs the fresh-task
+    # double exhaustion, every later one goes straight to DEFER via the
+    # repark path (prior granted returns >= 1 — live-confirmed by the
+    # independent verification of 4af6832 on real PostgreSQL). Each
+    # grant's event_id precedes the next park, so superseded_park_evidence
+    # never trips.
+    _park_technically(app_factory, store, worker, task)
+    ok, reason, _ = store.resume_deferred(task)
+    assert ok and reason == "OPEN"
+    for _ in range(2):
+        _repark(app_factory, store, task, "cascade_exhausted: again")
         ok, reason, _ = store.resume_deferred(task)
         assert ok and reason == "OPEN"
-    _park_technically(app_factory, store, worker, task)
+    _repark(app_factory, store, task, "cascade_exhausted: again")
 
     # Lifetime budget is now spent (3 grants). Prove the OLD behaviour is
     # gone by aging those grants out of the window.
@@ -900,10 +907,10 @@ def test_resume_budget_is_a_window_not_a_lifetime_score(
     # Three RECENT grants (the one above plus two more cycles) refuse the
     # fourth — the window still stops a park that re-arms itself.
     for _ in range(2):
-        _park_technically(app_factory, store, worker, task)
+        _repark(app_factory, store, task, "cascade_exhausted: again")
         ok, reason, _ = store.resume_deferred(task)
         assert ok and reason == "OPEN"
-    _park_technically(app_factory, store, worker, task)
+    _repark(app_factory, store, task, "cascade_exhausted: again")
 
     ok, reason, _ = store.resume_deferred(task)
     assert not ok and reason == "resume_budget_exhausted"
