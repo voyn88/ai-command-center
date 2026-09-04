@@ -468,3 +468,38 @@ def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -
     # defect it was named for: review restored the buggy source wholesale and
     # watched it go green. Asserting on the command makes that impossible.
     assert "pytest" in pinned, command
+
+
+def test_the_slice_sweep_pins_the_driver_the_suite_it_sweeps_needs() -> None:
+    """`cmd_sweep`'s own baseline could read green while covering nothing.
+
+    `_pytest_command` pinned `psycopg-pool` for its `uv` branch but not
+    `psycopg` itself, while `tests/db/conftest.py` gates every PostgreSQL test
+    on `pytest.importorskip("psycopg")` — a driver `psycopg-pool` does not
+    depend on. Under `uv`, with no project-level psycopg installed, every
+    database-backed test would skip silently: baseline exits 0, every
+    perturbation also exits 0, and `cmd_sweep` reports every hook UNNOTICED —
+    not because nothing covers it, but because the sweep's own command could
+    never have reached a covering test in the first place. `evidence.py`
+    pins both `psycopg[binary]` and `psycopg-pool` for exactly this suite, in
+    a list named `_DB_EXTRAS` specifically so a second, independent copy
+    could not drift from it — and this file was that second copy.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("slice_checks_under_test", SLICE_CHECKS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    evidence = _evidence_module()
+
+    with _forced_uv(module, present=True):
+        command = module._pytest_command("tests/db")
+    pinned = [command[i + 1] for i, token in enumerate(command) if token == "--with"]
+
+    # Every extra `evidence.py` pins for this exact suite, not just the one
+    # that happens to share a name with what this file already had.
+    expected = [
+        token for i, token in enumerate(evidence._DB_EXTRAS) if evidence._DB_EXTRAS[i - 1] == "--with"
+    ]
+    for extra in expected:
+        assert extra in pinned, f"{extra!r} missing from the sweep's pytest command: {command}"
