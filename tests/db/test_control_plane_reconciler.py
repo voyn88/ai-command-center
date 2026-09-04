@@ -333,3 +333,58 @@ def test_worker_reads_heartbeat_but_cannot_write_it_or_read_other_control_plane_
         with conn.cursor() as cur:
             with pytest.raises(Exception, match="permission denied"):
                 cur.execute("SELECT * FROM control_plane_event")
+
+
+# ---------------------------------------------------------------------------
+# The CLI wiring itself: `record_heartbeat` existing is not the acceptance,
+# a *tick command actually calling it* is. `backlog-plan`/`backlog-review`/
+# `backlog-merge`/`queue-reap` are the exact four ticks the 2026-08-29
+# incident named (dispatch starvation is silent; only a heartbeat this
+# module writes -- and only a CLI command that calls it -- can distinguish
+# "the timer is running" from "the tick is doing work" for them). This runs
+# `command_center.db.cli.main()` for real, against a freshly migrated
+# database and the `aicc_app` role it runs under in production, rather than
+# asserting on `record_heartbeat` in isolation, which would pass even if a
+# command handler never called it at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("role_passwords")
+def test_queue_reap_cli_command_writes_its_own_heartbeat(
+    admin_conn, psycopg, test_dsn, role_passwords, monkeypatch
+):
+    pytest.importorskip("aios_db")
+    from psycopg.conninfo import conninfo_to_dict
+
+    from command_center.db import cli, pool
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    params = conninfo_to_dict(test_dsn)
+
+    monkeypatch.setenv("AICC_PG_HOST", str(params["host"]))
+    monkeypatch.setenv("AICC_PG_PORT", str(params.get("port", 5432)))
+    monkeypatch.setenv("AICC_PG_DB", str(params["dbname"]))
+    monkeypatch.setenv("AICC_PG_USER", roles.APP_ROLE)
+    monkeypatch.setenv("AICC_PG_PASSWORD", role_passwords[roles.APP_ROLE])
+    # The test cluster's socket is local-only and unencrypted -- config.py
+    # exempts a Unix-domain socket host (one starting with "/") from the
+    # verify-full default for exactly this topology.
+    monkeypatch.setenv("AICC_PG_SSLMODE", "disable")
+
+    pool.close_pool()
+    try:
+        exit_code = cli.main(["queue-reap"])
+    finally:
+        pool.close_pool()
+
+    assert exit_code == 0
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_ok_at FROM control_plane_heartbeat WHERE tick_name = 'queue-reap'"
+        )
+        row = cur.fetchone()
+    assert row is not None, (
+        "queue-reap ran but never wrote control_plane_heartbeat -- the "
+        "reconciler's staleness check would see this tick as permanently "
+        "stale, the exact 2026-08-29 failure mode this task exists to close"
+    )

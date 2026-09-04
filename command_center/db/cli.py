@@ -277,9 +277,20 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.command == "queue-reap":
                 from command_center.db.work_queue_admin import WorkQueueAdmin
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
 
                 reaped = WorkQueueAdmin(lambda: nullcontext(conn)).reap()
                 print(f"reaped {reaped} lapsed attempt(s)")
+                # Heartbeat every completed tick, not only one that reaped
+                # something -- the reconciler's staleness check needs to
+                # distinguish "the tick stopped running" from "the tick ran
+                # and found nothing to do" (VOYN-W0-AICC-CONTROL-PLANE-
+                # RESILIENCE).
+                record_heartbeat(
+                    lambda: nullcontext(conn), "queue-reap", detail=f"reaped={reaped}"
+                )
                 return 0
 
             if args.command == "queue-dlq":
@@ -356,6 +367,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc
 
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
                 from command_center.orchestrator.planner import PlanLimits, plan_once
 
                 if args.dry_run:
@@ -375,6 +389,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if report.planner_busy:
                     print("planner lease held elsewhere; nothing done")
+                    # A lease held by a sibling control host is this tick
+                    # completing correctly, not the planner going quiet --
+                    # heartbeat it the same as a normal pass, or the
+                    # reconciler would mistake healthy lease contention for
+                    # the 2026-08-29 stall it exists to catch.
+                    record_heartbeat(lambda: _nc(conn), "backlog-plan", detail="busy")
                     return 0
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
@@ -388,12 +408,21 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REFUSED   {task_id}: {reason}")
                 for task_id, reason in report.undispatchable:
                     print(f"NO-REPO   {task_id}: {reason}")
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-plan",
+                    detail=f"dispatched={len(report.dispatched)} "
+                    f"ingested={len(report.ingested)}",
+                )
                 return 0
 
             if args.command == "backlog-review":
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     review_once,
@@ -424,11 +453,20 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REMEDIATE {task_id} -> {new_task_id}")
                 for task_id, reason in marker_report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-review",
+                    detail=f"reviewed={len(report.reviewed)} "
+                    f"markers={len(marker_report.reviewed)}",
+                )
                 return 0
 
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
 
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
                 from command_center.orchestrator.review_merge import merge_once
 
                 report = merge_once(lambda: _nc(conn), args.repo_path)
@@ -436,6 +474,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-merge",
+                    detail=f"merged={len(report.merged)}",
+                )
                 return 0
 
             if args.command == "backlog-merge-reconcile":
