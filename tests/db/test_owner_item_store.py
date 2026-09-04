@@ -22,8 +22,22 @@ from command_center.db.owner_item_store import (
     divergence,
 )
 from command_center.runtime.db import wave1
+from tests.db.mirror_probe import each_lost_write_is_noticed
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _patch(monkeypatch, factory) -> None:
+    from command_center.db import owner_item_store
+
+    # The real class, captured before the patch: reading it back through the
+    # module inside the lambda would resolve to the lambda itself, the mistake
+    # this exact shape has caught in the `run`/`execution` families already.
+    monkeypatch.setattr(
+        owner_item_store,
+        "PostgresOwnerItemMirror",
+        lambda: PostgresOwnerItemMirror(connection_factory=factory),
+    )
 
 
 def _row(item_id: str, **overrides: object) -> dict:
@@ -263,6 +277,112 @@ def test_reconciliation_is_clean_for_a_row_the_application_actually_wrote(
     mirror.upsert(created)
 
     assert divergence([created], mirror) == []
+
+
+def test_the_family_reconciles_after_every_write(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """`owner_item` has two write paths, not one: `create_owner_item` inserts
+    and `set_owner_item_done` updates in place, and each calls `_mirror_owner_item`
+    on its own. A reconciliation exercised only through `create_owner_item` —
+    which is all the suite checked before this test — proves nothing about
+    whether the second path still calls the mirror at all.
+
+    Unlike `test_reconciliation_is_clean_for_a_row_the_application_actually_wrote`,
+    this drives the mirror through the *real* dual-write hook (`_mirror_owner_item`,
+    patched to the test's PostgreSQL rather than upserting by hand), so a mirror
+    call deleted from either path is a divergence here, not silence.
+    """
+    _patch(monkeypatch, pg_connection_factory)
+    mirror = PostgresOwnerItemMirror(connection_factory=pg_connection_factory)
+
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+
+    def reconciled(stage: str) -> None:
+        assert divergence(wave1.list_owner_items(db_path), mirror) == [], stage
+
+    created = wave1.create_owner_item(db_path, title="mirror me")
+    reconciled("owner_item created")
+
+    wave1.set_owner_item_done(
+        db_path, created["id"], expected_version=created["version"], done=True
+    )
+    reconciled("owner_item done toggled")
+
+
+def test_every_lost_mirror_write_is_visible_to_reconciliation(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """The lost-write probe, applied to `owner_item`.
+
+    Two writes per run — one from each write path — and the property under
+    test is the one the incident actually was: a reviewer can delete the mirror
+    call from either `create_owner_item` or `set_owner_item_done` and, on a
+    table with only one write path, a static "every declared mirror has a
+    reachable caller" check would still find the other path's call and stay
+    green. Failing one write at a time and reconciling after each is what
+    catches that a *specific* path lost its call rather than merely that the
+    table has some caller somewhere.
+
+    Both paths upsert the *whole* row, not a delta, so a reconciliation taken
+    only at the end of the scenario is blind to a lost first write: the second
+    write's upsert carries the row's final state regardless, and silently
+    heals whatever the first write failed to mirror. Checked this the hard
+    way — the naive version below, `divergence` computed once after both
+    writes, left index 0 (the `create_owner_item` write) unnoticed even with
+    its mirror call actually failing. `noticed()` has to be true if divergence
+    was visible at *any* stage, which means checking after each write while
+    the failure is still fresh, not just once at the end.
+    """
+    from command_center.db import owner_item_store
+
+    mirror = PostgresOwnerItemMirror(connection_factory=pg_connection_factory)
+    state: dict[str, object] = {"runs": 0}
+
+    def scenario() -> None:
+        with pg_connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM owner_item")
+        db_path = tmp_path / f"runtime-{state['runs']}.db"
+        state["runs"] += 1
+        wave1.db.migrate(db_path)
+        state["db"] = db_path
+        state["diverged"] = False
+
+        created = wave1.create_owner_item(db_path, title="mirror me")
+        state["diverged"] = state["diverged"] or bool(
+            divergence(wave1.list_owner_items(db_path), mirror)
+        )
+
+        wave1.set_owner_item_done(
+            db_path, created["id"], expected_version=created["version"], done=True
+        )
+        state["diverged"] = state["diverged"] or bool(
+            divergence(wave1.list_owner_items(db_path), mirror)
+        )
+
+    def noticed() -> bool:
+        return bool(state["diverged"])
+
+    results = each_lost_write_is_noticed(
+        monkeypatch,
+        targets=(
+            (
+                owner_item_store,
+                ("PostgresOwnerItemMirror",),
+                lambda: PostgresOwnerItemMirror(connection_factory=pg_connection_factory),
+            ),
+        ),
+        scenario=scenario,
+        noticed=noticed,
+    )
+
+    assert [result.target for result in results] == [
+        "PostgresOwnerItemMirror",
+        "PostgresOwnerItemMirror",
+    ]
+    assert all(result.noticed for result in results), results
 
 
 def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
