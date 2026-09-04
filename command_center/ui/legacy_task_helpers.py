@@ -27,6 +27,7 @@ fresh immediately before writing.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from command_center import models, tasks_repository
 
