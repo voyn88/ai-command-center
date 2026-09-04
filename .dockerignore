@@ -54,7 +54,7 @@ projects/
 prompts/
 reports/
 roadmap/
-scripts/
+scripts/*
 !scripts/aml-entrypoint.sh
 templates/
 web/
