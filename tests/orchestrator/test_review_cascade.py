@@ -34,7 +34,8 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     ]
     _queue, key, payload, task_id, max_attempts = calls[0]
     assert task_id == "VOYN-W0-X"
-    assert ":v6:base:" in key and ":diff:" in key
+    assert f":{review_merge._REVIEW_POLICY_VERSION}:base:" in key
+    assert ":diff:" in key
     assert [link["executor"] for link in payload["cascade"]] == [
         "codex",
         "copilot",
