@@ -37,7 +37,12 @@ from command_center.runtime.db import (
     transaction,
 )
 
-_ARCHIVE_SELECT = """
+#: One batch's worth of doomed `run_event` rows: bounded so a single batch
+#: never `fetchall()`s more than this many full rows into memory, and never
+#: holds the write lock for longer than it takes to archive+delete this many.
+DEFAULT_ARCHIVE_BATCH_SIZE = 500
+
+_ARCHIVE_SELECT_BATCH = """
     SELECT run_event.* FROM run_event
      WHERE run_id IN (
         SELECT id FROM run
@@ -45,17 +50,8 @@ _ARCHIVE_SELECT = """
            AND completed_at IS NOT NULL
            AND completed_at < ?
      )
-     ORDER BY run_id, seq
-"""
-
-_ARCHIVE_DELETE = """
-    DELETE FROM run_event
-     WHERE run_id IN (
-        SELECT id FROM run
-         WHERE state IN ({placeholders})
-           AND completed_at IS NOT NULL
-           AND completed_at < ?
-     )
+     ORDER BY run_event.id
+     LIMIT ?
 """
 
 
@@ -85,10 +81,13 @@ def archive_and_prune(
     retention_days: int,
     archive_dir: Path,
     vacuum: bool = False,
+    batch_size: int = DEFAULT_ARCHIVE_BATCH_SIZE,
 ) -> dict:
     """Run the full sequence against `db_path` and return a truthful report."""
     if retention_days <= 0:
         raise MaintenanceError("retention_days must be positive")
+    if batch_size <= 0:
+        raise MaintenanceError("batch_size must be positive")
     db_path = Path(db_path)
     archive_dir = Path(archive_dir)
     stamp = _timestamp()
@@ -110,27 +109,42 @@ def archive_and_prune(
     digest = hashlib.sha256()
     archived = 0
 
+    # Streamed and batched: each iteration selects at most `batch_size` full
+    # rows (never the entire doomed set via `fetchall()`), writes them to the
+    # gzip stream as it goes, then deletes exactly those rows by id — so no
+    # single transaction holds the write lock for longer than one batch takes,
+    # no matter how large the accumulated backlog is
+    # (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`). Deleting by the exact ids
+    # just archived (rather than re-running the doomed-row predicate) keeps
+    # each batch's archive/delete counts trivially equal to compare.
     with connect(db_path) as conn:
-        with transaction(conn):
-            rows = conn.execute(
-                _ARCHIVE_SELECT.format(placeholders=placeholders),
-                (*TERMINAL_STATES, cutoff),
-            ).fetchall()
-            with gzip.open(archive_path, "wt", encoding="utf-8") as handle:
-                for row in rows:
-                    line = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
-                    handle.write(line + "\n")
-                    digest.update(line.encode("utf-8"))
-                    archived += 1
-            deleted = conn.execute(
-                _ARCHIVE_DELETE.format(placeholders=placeholders),
-                (*TERMINAL_STATES, cutoff),
-            ).rowcount
-            if deleted != archived:
-                # Roll the deletion back rather than lose unarchived history.
-                raise MaintenanceError(
-                    f"archived {archived} rows but deletion matched {deleted}"
-                )
+        with gzip.open(archive_path, "wt", encoding="utf-8") as handle:
+            while True:
+                with transaction(conn):
+                    rows = conn.execute(
+                        _ARCHIVE_SELECT_BATCH.format(placeholders=placeholders),
+                        (*TERMINAL_STATES, cutoff, batch_size),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    batch_archived = 0
+                    for row in rows:
+                        line = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
+                        handle.write(line + "\n")
+                        digest.update(line.encode("utf-8"))
+                        batch_archived += 1
+                    ids = [row["id"] for row in rows]
+                    id_placeholders = ",".join("?" for _ in ids)
+                    batch_deleted = conn.execute(
+                        f"DELETE FROM run_event WHERE id IN ({id_placeholders})",
+                        ids,
+                    ).rowcount
+                    if batch_deleted != batch_archived:
+                        # Roll this batch back rather than lose unarchived history.
+                        raise MaintenanceError(
+                            f"archived {batch_archived} rows but deletion matched {batch_deleted}"
+                        )
+                archived += batch_archived
         integrity = _integrity_ok(conn)
     if not integrity:
         raise MaintenanceError("integrity_check failed after prune")
@@ -161,6 +175,7 @@ def rehearse(
     retention_days: int,
     archive_dir: Path,
     vacuum: bool = False,
+    batch_size: int = DEFAULT_ARCHIVE_BATCH_SIZE,
 ) -> dict:
     """Run the identical sequence against a copy; prove the original intact."""
     db_path = Path(db_path)
@@ -175,6 +190,7 @@ def rehearse(
             retention_days=retention_days,
             archive_dir=archive_dir,
             vacuum=vacuum,
+            batch_size=batch_size,
         )
     finally:
         after = hashlib.sha256(db_path.read_bytes()).hexdigest()

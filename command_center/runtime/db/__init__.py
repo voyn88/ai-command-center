@@ -71,6 +71,7 @@ from command_center.runtime.db.core import (  # noqa: F401
     _validate_updatable_fields,
     LEDGER_TIMESTAMP_TZ_COLUMN,
     RETENTION_TZ_ENV,
+    RUNTIME_RETENTION_BATCH_SIZE,
     apply_runtime_retention,
     connect,
     current_schema_version,
