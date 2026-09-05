@@ -456,6 +456,37 @@ def test_all_actions_are_immutable_sha_pinned() -> None:
                 assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", uses), uses
 
 
+def _final_gate_assertion_step() -> dict:
+    final_gate = _workflow(CI_WORKFLOW)["jobs"]["final-gate"]
+    (assertion_step,) = [
+        step
+        for step in final_gate["steps"]
+        if step.get("name") == "Assert required checks"
+    ]
+    return assertion_step
+
+
+def _run_final_gate_script(results: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Execute the real "Assert required checks" script from ci.yml.
+
+    Each `${{ needs.<job>.result }}` expression is substituted with a literal
+    result value and the resulting bash is actually run, so this exercises the
+    workflow's own logic rather than a Python reimplementation of it that can
+    silently drift from what `ci.yml` really does.
+    """
+    script = _final_gate_assertion_step()["run"]
+    for job_id, result in results.items():
+        token = f"${{{{ needs.{job_id}.result }}}}"
+        assert token in script, f"{job_id} result is never read by the assertion step"
+        script = script.replace(token, result)
+    return subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
 def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
     final_gate = _workflow(CI_WORKFLOW)["jobs"]["final-gate"]
     required = {
@@ -469,22 +500,14 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
 
     assert final_gate["if"] == "always()"
     assert set(final_gate["needs"]) == required
-
-    (assertion_step,) = [
-        step
-        for step in final_gate["steps"]
-        if step.get("name") == "Assert required checks"
-    ]
-    script = assertion_step["run"]
-    for job_id in required:
-        assert f'${{{{ needs.{job_id}.result }}}}" != "success"' in script
-
-    def accepted(results: dict[str, str]) -> bool:
-        return all(results[job_id] == "success" for job_id in required)
+    assert _final_gate_assertion_step().get("shell") == "bash"
 
     success = {job_id: "success" for job_id in required}
-    assert accepted(success)
+    result = _run_final_gate_script(success)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
     for job_id in required:
         for negative_result in ("failure", "cancelled", "skipped"):
             results = success | {job_id: negative_result}
-            assert not accepted(results), (job_id, negative_result)
+            result = _run_final_gate_script(results)
+            assert result.returncode != 0, (job_id, negative_result, result.stdout)
