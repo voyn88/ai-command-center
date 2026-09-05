@@ -191,3 +191,35 @@ def test_fetch_rows_reads_the_real_table_in_wave_priority_task_order(pg_connecti
         "title": "voyn-w0-fetch-a",
         "repo": "repo-a",
     }
+
+
+def test_fetch_rows_orders_numeric_waves_numerically_not_lexically(pg_connection_factory):
+    """`ORDER BY wave` alone sorts the column as TEXT, where `'10'` < `'2'`
+    lexically -- the exact mistake `backlog_eligible` (0006_backlog_planner)
+    already casts around for the planner's own dispatch order. A wave-10
+    task rendered ahead of a wave-2 task would make this projection disagree
+    with what the planner actually dispatched next, once a wave reaches two
+    digits."""
+    store = BacklogStore(pg_connection_factory)
+    for task in [
+        _task("VOYN-W0-FETCH-WAVE10", wave="10", priority="P0", status="OPEN"),
+        _task("VOYN-W0-FETCH-WAVE2", wave="2", priority="P0", status="OPEN"),
+        _task("VOYN-W0-FETCH-NAMED", wave="COM", priority="P0", status="OPEN"),
+    ]:
+        ok, reason, _ = store.upsert_task(task)
+        assert ok, reason
+
+    with pg_connection_factory() as conn:
+        rows = backlog_export.fetch_rows(conn)
+
+    ours = [
+        row["task_id"]
+        for row in rows
+        if row["task_id"]
+        in {"VOYN-W0-FETCH-WAVE10", "VOYN-W0-FETCH-WAVE2", "VOYN-W0-FETCH-NAMED"}
+    ]
+    assert ours == [
+        "VOYN-W0-FETCH-WAVE2",
+        "VOYN-W0-FETCH-WAVE10",
+        "VOYN-W0-FETCH-NAMED",
+    ]

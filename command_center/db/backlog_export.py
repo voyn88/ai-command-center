@@ -170,11 +170,25 @@ def render_projection(rows: list[dict[str, Any]]) -> str:
 
 def fetch_rows(conn: Any) -> list[dict[str, Any]]:
     """Every task, terminal ones included: the projection is the store's
-    whole truth, and the panel filters by status itself."""
+    whole truth, and the panel filters by status itself.
+
+    Orders numeric waves (``'0'``, ``'0.5'``, ``'1'``, ...) by their NUMERIC
+    value, not their text value -- ``ORDER BY wave`` alone sorts lexically,
+    where ``'10'`` comes before ``'2'``; this matches the numeric cast
+    ``backlog_eligible`` (0006_backlog_planner) already applies for the same
+    reason, so wave order does not disagree between what the planner
+    dispatches and what this projection renders once a wave reaches two
+    digits. Named lanes (``COM``/``W1``/...) have no numeric value to sort
+    by, so they group after every numeric wave and fall back to their own
+    text order.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "select task_id, wave, priority, status, title, repo, updated_at "
-            "from backlog_task order by wave, priority nulls last, task_id"
+            "from backlog_task "
+            "order by (wave ~ '^[0-9]+(\\.[0-9]+)?$') desc, "
+            "case when wave ~ '^[0-9]+(\\.[0-9]+)?$' then wave::numeric end asc, "
+            "wave asc, priority nulls last, task_id"
         )
         columns = [description[0] for description in cur.description]
         return [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
