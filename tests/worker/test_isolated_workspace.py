@@ -447,7 +447,7 @@ def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
     publish failure would be unrecoverable data loss for the sake of
     tidiness."""
     run_agent, repo = agent_with_publish
-    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run())
+    monkeypatch.setattr(agent_runner, "run_claude_code", _dirty_without_commit_run)
 
     # Break the fake gh so `pr create` fails after a successful push.
     import os
@@ -465,9 +465,11 @@ def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
     assert not outcome.ok and outcome.retryable
     assert "publish failed" in outcome.reason
     assert outcome.result["publish"]["ok"] is False
+    assert outcome.result["publish"]["checkpointed_dirty_worktree"] is True
     workspace = _workspace(repo)
     assert workspace.is_dir()
-    assert (workspace / "change.txt").exists()
+    assert (workspace / "uncommitted-agent-work.txt").exists()
+    assert _git(workspace, "status", "--porcelain").stdout == ""
     config = (workspace / ".git" / "config").read_text()
     assert '[remote "origin"]' not in config
 
