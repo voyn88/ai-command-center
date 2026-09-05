@@ -26,6 +26,12 @@ DEFER_PROJECT_BUDGET = "project_budget_exceeded"
 DEFER_AGENT_CAPACITY = "agent_capacity_reached"
 DEFER_NO_ELIGIBLE_EXECUTOR = "no_eligible_executor"
 DEFER_NO_AVAILABLE_EXECUTOR = "no_available_executor"
+# Distinct from DEFER_DAILY_BUDGET: a cap is configured but today's spend
+# could not be measured (corrupt cost data or an unreachable store), so the
+# engine cannot tell whether there is headroom. Fail-closed by the same price
+# asymmetry as the budget check itself — an unmeasured amount is never
+# treated as "0" (would risk overspend) or "at cap" (would misreport why).
+DEFER_SPEND_UNKNOWN = "daily_spend_unknown"
 
 DEFER_REASONS = frozenset(
     {
@@ -36,6 +42,7 @@ DEFER_REASONS = frozenset(
         DEFER_AGENT_CAPACITY,
         DEFER_NO_ELIGIBLE_EXECUTOR,
         DEFER_NO_AVAILABLE_EXECUTOR,
+        DEFER_SPEND_UNKNOWN,
     }
 )
 
@@ -62,6 +69,10 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "No executor is permitted for this task by project/pin policy."
     ),
     DEFER_NO_AVAILABLE_EXECUTOR: "No permitted executor is currently available.",
+    DEFER_SPEND_UNKNOWN: (
+        "Today's spend could not be measured (corrupt cost data or an "
+        "unreachable store), so the daily budget cannot be checked."
+    ),
 }
 
 
@@ -285,9 +296,12 @@ class DispatchPlan:
 
     decisions: tuple[DispatchDecision, ...]
     kill_switch_engaged: bool
-    daily_spend_usd: float
+    # `None` means "not measured" — either unnecessary (no ceiling configured)
+    # or unmeasurable (corrupt cost data / unreachable store). Never a
+    # fabricated number standing in for either case.
+    daily_spend_usd: float | None
     max_daily_spend_usd: float
-    projected_spend_usd: float
+    projected_spend_usd: float | None
 
     @property
     def assignments(self) -> tuple[DispatchDecision, ...]:
@@ -298,9 +312,11 @@ class DispatchPlan:
         return tuple(d for d in self.decisions if not d.assigned)
 
     @property
-    def budget_remaining_usd(self) -> float:
+    def budget_remaining_usd(self) -> float | None:
         if self.max_daily_spend_usd <= 0:
             return float("inf")
+        if self.projected_spend_usd is None:
+            return None
         return self.max_daily_spend_usd - self.projected_spend_usd
 
     def as_dict(self) -> dict:

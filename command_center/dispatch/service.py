@@ -168,8 +168,16 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
 
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed (assume ceiling hit)
-        spend = settings.max_daily_spend_usd or 0.0
+    except task_pipeline.SpendUnknownError:
+        # Fail closed by the same price asymmetry `task_pipeline`'s own tick
+        # applies: an unmeasurable amount is never a fabricated verdict — not
+        # "0" (could hide an overspend) and not "at the ceiling" (misreports
+        # why nothing launched). `plan_dispatch` defers every task with
+        # `DEFER_SPEND_UNKNOWN` when a ceiling is configured, and simply
+        # proceeds when none is (spend was never going to gate anything).
+        # Any other exception is a caller bug, not an unknown amount, and is
+        # left to propagate rather than being swallowed as "fail closed".
+        spend = None
 
     return plan_dispatch(
         collect_queued_tasks(root),

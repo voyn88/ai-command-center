@@ -37,6 +37,7 @@ from command_center.dispatch.models import (
     DEFER_NO_AVAILABLE_EXECUTOR,
     DEFER_NO_ELIGIBLE_EXECUTOR,
     DEFER_PROJECT_BUDGET,
+    DEFER_SPEND_UNKNOWN,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
@@ -100,13 +101,24 @@ def plan_dispatch(
     executors: list[ExecutorProfile],
     policy: DispatchPolicy,
     *,
-    daily_spend_usd: float,
+    daily_spend_usd: float | None,
     max_daily_spend_usd: float,
     kill_switch_engaged: bool,
     active_by_executor: dict[str, int] | None = None,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
-    guarantees this function structurally enforces."""
+    guarantees this function structurally enforces.
+
+    `daily_spend_usd=None` means the caller could not measure today's spend
+    (corrupt cost data or an unreachable store — see `task_pipeline.
+    SpendUnknownError`). When a ceiling is configured, that unknown amount
+    blocks every assignment the same structural way the kill switch does:
+    deferred with `DEFER_SPEND_UNKNOWN`, never force-run and never treated as
+    "0" (could hide an overspend) or "at cap" (would misreport why nothing
+    launched). With no ceiling configured, spend was never going to gate
+    anything, so dispatch proceeds — but the unknown baseline is never
+    fabricated into a number in the returned plan either.
+    """
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
 
@@ -127,6 +139,26 @@ def plan_dispatch(
             daily_spend_usd=daily_spend_usd,
             max_daily_spend_usd=max_daily_spend_usd,
             projected_spend_usd=daily_spend_usd,
+        )
+
+    # (1b) A configured ceiling whose current spend is unmeasurable defers
+    # every task, structurally identical to the kill-switch branch above.
+    if max_daily_spend_usd > 0 and daily_spend_usd is None:
+        decisions = tuple(
+            DispatchDecision(
+                task_id=t.id,
+                project=t.project,
+                priority=t.priority,
+                reason=DEFER_SPEND_UNKNOWN,
+            )
+            for t in sorted(tasks, key=lambda t: _task_sort_key(t, policy))
+        )
+        return DispatchPlan(
+            decisions=decisions,
+            kill_switch_engaged=False,
+            daily_spend_usd=None,
+            max_daily_spend_usd=max_daily_spend_usd,
+            projected_spend_usd=None,
         )
 
     # (3) SLA/priority order.
@@ -189,9 +221,12 @@ def plan_dispatch(
             continue
 
         # (2) Record the assignment and advance every accumulator, so the next
-        #     task's budget checks see this commitment.
+        #     task's budget checks see this commitment. `projected` can only
+        #     be None here when `max_daily_spend_usd` is unset (the unmeasured
+        #     branch above already returned when a ceiling needs a number) —
+        #     stays None rather than fabricating a total from an unknown base.
         cost = chosen.cost_per_task_usd
-        projected += cost
+        projected = None if projected is None else projected + cost
         agent_spend[chosen.id] = agent_spend.get(chosen.id, 0.0) + cost
         agent_assigned[chosen.id] = agent_assigned.get(chosen.id, 0) + 1
         if task.project is not None:
@@ -222,7 +257,7 @@ def _budget_block(
     cost: float,
     task: QueuedTask,
     policy: DispatchPolicy,
-    projected: float,
+    projected: float | None,
     max_daily_spend_usd: float,
     agent_spend: dict[str, float],
     agent_assigned: dict[str, int],
@@ -237,6 +272,9 @@ def _budget_block(
     per-agent concurrency/spend guardrails, then the per-project ceiling.
     """
     # Global daily spend ceiling. `<= ceiling` after adding this cost.
+    # `projected` is only `None` when `max_daily_spend_usd <= 0` (an unknown
+    # baseline against a configured ceiling already deferred every task
+    # before this function is ever called) — the `and` short-circuits first.
     if max_daily_spend_usd > 0 and (projected + cost) > max_daily_spend_usd:
         return DEFER_DAILY_BUDGET
 

@@ -168,6 +168,10 @@ TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
 LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
+# Distinct from LAUNCH_BUDGET_EXHAUSTED: the cap may still have headroom, but
+# today's spend could not be measured (corrupt data or an unreachable store),
+# so dispatch pauses for this tick rather than guessing.
+LAUNCH_SPEND_UNKNOWN = "daily_spend_unknown"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -184,6 +188,7 @@ EV_PIPELINE_COMPLETED = "pipeline_task_completed"
 EV_PIPELINE_REWORK = "pipeline_rework"
 EV_PIPELINE_REMEDIATED = "pipeline_workspace_remediated"
 EV_PIPELINE_REVIEW = "pipeline_review"
+EV_PIPELINE_SPEND_UNKNOWN = "pipeline_spend_unknown"
 
 # Operator remediation per machine-readable reason code — the "and what do I do
 # about it?" half of every DEFER/BLOCKED/SKIPPED decision. Kept as data here
@@ -2224,23 +2229,41 @@ def _locked_tick(
     #    and only while the daily spend budget (when set) has headroom. The
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
+    #    When `max_daily_spend_usd` is unset there is no cap to check against,
+    #    so spend is never even measured — an entire failure class (corrupt
+    #    cost data, an unreachable store) cannot block dispatch in that
+    #    (default) config.
     spend_budget_exhausted = False
+    spend_unknown = False
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
         try:
             spend_budget_exhausted = (
                 daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
             )
-        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+        except SpendUnknownError as exc:
+            # Fail closed by the price asymmetry: an overspend is
+            # irreversible, skipping a tick is not — so an unknown amount
+            # pauses dispatch. It must never be silently treated as either
+            # "no spend" or "budget exhausted"; only `daily_spend_budget`
+            # failing loudly here does that job. Any other exception (a
+            # caller bug, not an unknown amount) is intentionally left to
+            # propagate rather than being swallowed as "fail closed".
+            spend_unknown = True
+            activity_log.log_event(
+                EV_PIPELINE_SPEND_UNKNOWN,
+                message=f"Автопилот приостановлен: расход за сутки неизвестен ({exc.kind}).",
+            )
             _record(exc, "daily_spend_budget")
-            spend_budget_exhausted = True
-    if settings.auto_launch_active and not spend_budget_exhausted:
+    if settings.auto_launch_active and not spend_budget_exhausted and not spend_unknown:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
+    elif spend_budget_exhausted:
+        launch_status = LAUNCH_BUDGET_EXHAUSTED
+    elif spend_unknown:
+        launch_status = LAUNCH_SPEND_UNKNOWN
     else:
-        launch_status = (
-            LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
-        )
+        launch_status = LAUNCH_DISABLED
 
     # 9b. Nothing silently stuck: compute, from the post-dispatch state, every
     #     task that has stopped without reaching Done. Read-only.
@@ -2401,35 +2424,74 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     }
 
 
+class SpendUnknownError(Exception):
+    """Raised by `daily_spend_usd` when the trailing-24h spend cannot be
+    trusted — not "no cost data" (a clean read that matches no events is a
+    legitimate `0.0`), but the read itself failing: the store could not be
+    reached, or a matched event's payload does not honor the `total_cost_usd`
+    reporting contract. Callers must never substitute a number for either
+    kind — both mean "today's spend is unknown", not "zero" or "over cap".
+    """
+
+    CORRUPT_COST_EVENT = "corrupt_cost_event"
+    STORAGE_UNAVAILABLE = "storage_unavailable"
+
+    def __init__(self, kind: str, *, detail: str = "") -> None:
+        self.kind = kind
+        message = f"daily spend unknown ({kind})"
+        super().__init__(f"{message}: {detail}" if detail else message)
+
+
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
     work started in it). Reads only the final `result` stream events, which are
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
+
+    Raises `SpendUnknownError` instead of returning a number when the amount
+    cannot be trusted: `storage_unavailable` if the database cannot be read,
+    `corrupt_cost_event` if a matched event's payload does not carry the
+    numeric `total_cost_usd` the reporting contract promises. A database with
+    no matching events at all is not an error — that is a genuine `0.0`.
     """
     import json as _json
+    import sqlite3 as _sqlite3
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
     cutoff = (anchor - _td(hours=24)).isoformat(timespec="seconds")
     total = 0.0
-    with runtime_db.connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT run_event.payload_json AS payload FROM run_event
-              JOIN run ON run.id = run_event.run_id
-               AND run_event.payload_json LIKE '%total_cost_usd%'
-               AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
-            """,
-            (cutoff, cutoff),
-        ).fetchall()
+    try:
+        with runtime_db.connect(db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT run_event.payload_json AS payload FROM run_event
+                  JOIN run ON run.id = run_event.run_id
+                   AND run_event.payload_json LIKE '%total_cost_usd%'
+                   AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
+                """,
+                (cutoff, cutoff),
+            ).fetchall()
+    except (_sqlite3.Error, OSError) as exc:
+        raise SpendUnknownError(SpendUnknownError.STORAGE_UNAVAILABLE, detail=str(exc)) from exc
     for row in rows:
         try:
             payload = _json.loads(row["payload"])
-        except (TypeError, ValueError):
-            continue
+        except (TypeError, ValueError) as exc:
+            raise SpendUnknownError(SpendUnknownError.CORRUPT_COST_EVENT, detail=str(exc)) from exc
+        if not isinstance(payload, dict):
+            raise SpendUnknownError(
+                SpendUnknownError.CORRUPT_COST_EVENT,
+                detail=f"event payload is {type(payload).__name__}, not an object",
+            )
         cost = payload.get("total_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total += float(cost)
+        if cost is None:
+            continue
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            raise SpendUnknownError(
+                SpendUnknownError.CORRUPT_COST_EVENT,
+                detail=f"total_cost_usd is {type(cost).__name__}, not numeric",
+            )
+        total += float(cost)
     return total

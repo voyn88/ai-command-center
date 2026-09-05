@@ -513,3 +513,58 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     )
     ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert [d.task_id for d in ungated.launched()] == ["s"]
+
+
+def test_daily_spend_unknown_pauses_dispatch_without_guessing(tmp_path, api, fake_claude):
+    """VOYN-W0-AICC-REPORT-319: spend-unknown is not a verdict. A configured
+    ceiling whose trailing-24h spend cannot be measured (corrupt cost data)
+    must pause dispatch with `daily_spend_unknown`, never be silently treated
+    as "0" (could overspend) or "at cap" (would misreport why nothing
+    launched)."""
+
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-u")
+    wt = tmp_path / "wt" / "u"
+    task = _task("u", "AIOS", wt, branch="task/u")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"u": task})
+    configs = project_config.load_project_configs()
+
+    # A completed run whose provider reported a non-numeric cost — corrupt
+    # data, not "no cost data" (which is a legitimate 0.0 and must not raise).
+    prior_task = runtime_db.create_task(
+        api.db_path, project="AIOS", title="prior", task_type="implementation"
+    )
+    prior_session = runtime_db.create_session(
+        api.db_path, task_id=prior_task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    prior = runtime_db.create_run(
+        api.db_path, session_id=prior_session["id"], task_id=prior_task["id"],
+        project="AIOS", task_type="implementation", repository_path="/tmp/x",
+        prompt="prior", is_resume=False,
+    )
+    runtime_db.append_run_event(
+        api.db_path, prior["id"], "stream_event",
+        {"type": "result", "total_cost_usd": "not-a-number", "usage": {"input_tokens": 1}},
+    )
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (models.iso_now(), prior["id"]),
+            )
+
+    with pytest.raises(task_pipeline.SpendUnknownError):
+        task_pipeline.daily_spend_usd(api.db_path)
+
+    result = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+    assert result.launched() == []
+    assert result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN

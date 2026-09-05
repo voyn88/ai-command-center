@@ -152,6 +152,43 @@ def test_zero_ceiling_means_no_budget_limit():
 
 
 # --------------------------------------------------------------------------
+# Unmeasurable spend is deferred, never guessed at as "0" or "at cap"
+# --------------------------------------------------------------------------
+
+
+def test_unknown_spend_with_a_ceiling_defers_everything_as_spend_unknown():
+    policy = DispatchPolicy()
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    tasks = [_task("t1", priority="Critical"), _task("t2", priority="High")]
+    plan = _plan(
+        tasks, executors, policy, daily_spend_usd=None, max_daily_spend_usd=1.0
+    )
+
+    assert plan.assignments == ()
+    assert all(d.reason == models.DEFER_SPEND_UNKNOWN for d in plan.decisions)
+    # Never a fabricated number standing in for the unknown amount.
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.budget_remaining_usd is None
+
+
+def test_unknown_spend_with_no_ceiling_does_not_block_dispatch():
+    # No cap configured -> spend was never going to gate anything, so an
+    # unmeasurable amount does not stop assignment either.
+    policy = DispatchPolicy(cost_matrix={"claude_code": 5.0})
+    executors = [_executor("claude_code", cost=5.0)]
+    plan = _plan(
+        [_task("t1")], executors, policy, daily_spend_usd=None, max_daily_spend_usd=0.0
+    )
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+    # Still honestly reported as unmeasured, not backfilled from 0.
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.budget_remaining_usd == float("inf")
+
+
+# --------------------------------------------------------------------------
 # Kill switch is respected — nothing is assigned while engaged
 # --------------------------------------------------------------------------
 

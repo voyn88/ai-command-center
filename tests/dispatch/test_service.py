@@ -158,6 +158,55 @@ def test_plan_reports_kill_switch_when_master_switch_off(monkeypatch, pool):
     assert plan.decisions[0].reason == models.DEFER_KILL_SWITCH
 
 
+def test_plan_defers_as_spend_unknown_when_measurement_raises(monkeypatch, pool):
+    import dataclasses
+
+    # A ceiling is configured, but the spend primitive cannot measure it (the
+    # store is unreachable / cost data is corrupt) — the old bug fabricated
+    # "assume ceiling hit" here; the fix must defer with the typed reason
+    # instead of silently pretending the budget is exhausted.
+    _enable_master_switch()
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=0.4)
+    )
+
+    def _raise(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SpendUnknownError.STORAGE_UNAVAILABLE
+        )
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_SPEND_UNKNOWN
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+
+
+def test_plan_does_not_gate_on_unknown_spend_without_a_ceiling(monkeypatch, pool):
+    # No ceiling configured -> spend was never going to gate anything, so an
+    # unmeasurable amount must not block dispatch either.
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+
+    def _raise(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+        )
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments[0].assigned_executor == "ollama"
+    assert plan.daily_spend_usd is None
+
+
 def test_plan_enforces_daily_budget_from_pipeline_settings(monkeypatch, pool):
     import dataclasses
 
