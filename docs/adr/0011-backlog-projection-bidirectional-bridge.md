@@ -19,19 +19,34 @@ migration is not finished:
   content.
 - **Export** (`command_center/db/backlog_export.py` + `backlog-export`,
   BO-S4, scheduled by `deploy/systemd/aicc-backlog-export.timer`): renders
-  `backlog_task` back into the same markdown shape, so the console's Master
-  Backlog panel and any other markdown reader see live store state instead
-  of freezing at the last hand-authored snapshot (measured live 2026-09-03:
-  a freshly booted console rendered a file two weeks stale).
+  `backlog_task` back into the `backlog_client.parse_recommendations`
+  record shape (`- VOYN_RECOMMENDATION | key=value | ...`), so the console's
+  Master Backlog panel and any other reader of that format see live store
+  state instead of freezing at the last hand-authored snapshot (measured
+  live 2026-09-03: a freshly booted console rendered a file two weeks
+  stale). This is a *different* line shape from the bold task lines
+  (`- **ID** | ...`) `backlog-import`'s parser (`backlog_parser.parse_backlog`)
+  recognizes — see below.
 
-Running both directions at once is a dual-write hazard by construction: a
-render written by `backlog-export` and then re-imported by
-`backlog-import` must be a no-op, or the two jobs fight over field values
-the store does not hold (`backlog_export` intentionally renders unmapped
-narrative fields as `-` rather than inventing prose, precisely so a
-round trip cannot manufacture content). The bridge is safe only as long as
-the owner treats the file as *input* and the rendered projection as
-*output*, and never edits the generated file directly.
+Running both directions at once would be a dual-write hazard if they ever
+shared a line shape or a file path; they do neither. Feeding a
+`backlog-export` render back through `backlog-import` is inert, but not
+because the two jobs agree on field values: `parse_backlog` only matches
+bold task lines, and a rendered `VOYN_RECOMMENDATION` line does not match
+that shape at all — it is invisible to the importer, not merely unparsed
+(`tests/db/test_backlog_export.py::test_reimporting_a_projection_through_the_real_importer_is_a_no_op`
+proves both `tasks == []` and `unparsed == []` for a re-parsed export). In
+production the two also never touch the same file: import reads a
+digest-staged copy of the owner's own machine's file
+(`ops/aicc_backlog_publish.py`), never `$AICC_MASTER_BACKLOG`, which only
+`backlog-export` writes. `backlog_export` still renders unmapped narrative
+fields (`effect`/`effort`/`acceptance`/`evidence`/`file_scope`/
+`parallel_domain`) as `-` rather than inventing prose — that is about the
+projection itself not fabricating content for the console, and is a
+property worth keeping regardless, but it is not what makes a re-import
+safe. The bridge is safe only as long as the owner treats their own file as
+*input* and the rendered `$AICC_MASTER_BACKLOG` as *output*, and never
+edits the generated file directly or repoints `backlog-import` at it.
 
 ## Decision
 

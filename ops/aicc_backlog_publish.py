@@ -23,11 +23,14 @@ a non-zero exit is returned for every failure, so a scheduler that only checks
 status still learns that the store is no longer current.
 
 This is one half of a deliberately temporary bidirectional bridge: the store
-also exports back to the same markdown shape (`command_center/db/
-backlog_export.py`, `backlog-export`, BO-S4) so readers of the file stay
-current without the owner touching it. Running both directions at once is
-safe only while the owner treats this file as input and never edits a
-generated export directly -- see
+also exports back to a markdown projection, in a different record shape
+(`command_center/db/backlog_export.py`, `backlog-export`, BO-S4), so readers
+of that file stay current without the owner touching it. The two never
+collide: this script's import never reads `$AICC_MASTER_BACKLOG` (only
+`backlog-export` writes it), and even a manual mix-up is inert -- the
+importer's parser does not recognize the exporter's line shape as a task
+record at all. Running both directions at once is safe only while the owner
+treats this file as input and never edits a generated export directly -- see
 docs/adr/0011-backlog-projection-bidirectional-bridge.md for the explicit
 condition and date this script retires under.
 """

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from command_center import backlog_client
 from command_center.db import backlog_export
+from command_center.db.backlog_parser import parse_backlog
 
 _ROWS = [
     {
@@ -78,3 +79,21 @@ def test_header_survives_the_parser_as_prose():
     text = backlog_export.render_projection([])
     result = backlog_client.parse_recommendations(text)
     assert result.records == [] and result.errors == []
+
+
+def test_reimporting_a_projection_through_the_real_importer_is_a_no_op():
+    """Proves the claim in the module docstring and ADR-0011 ("a render
+    written by backlog-export and then re-imported by backlog-import must be
+    a no-op") against `backlog_parser.parse_backlog` itself -- the function
+    `backlog-import` actually calls -- rather than assuming it.
+
+    The no-op holds, but not for the reason the docstring's field-mapping
+    paragraph might suggest (narrative fields rendering as `-`): `parse_backlog`
+    only recognizes bold task lines (`_TASK_LINE`: ``- **ID** | ...``), and a
+    rendered record (``- VOYN_RECOMMENDATION | ts=... | ...``, no bold id) does
+    not match that shape at all -- not even as a reported "unparsed" line, it
+    is simply invisible to the importer. The two formats occupy disjoint
+    syntax, which is the actual mechanism keeping a manual re-import inert."""
+    report = parse_backlog(backlog_export.render_projection(_ROWS))
+    assert report.tasks == []
+    assert report.unparsed == []

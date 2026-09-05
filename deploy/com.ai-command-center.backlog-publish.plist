@@ -15,6 +15,17 @@
   the store is never more than one tick behind the file. The import is
   idempotent, so a run with nothing to do reports `unchanged` and costs one
   ssh round trip.
+
+  This job is one half of a deliberately temporary bidirectional bridge
+  (VOYN-W0-BACKLOG-ORCHESTRATOR BO-S4): the store also exports back to a
+  markdown projection, in a different record shape, on
+  `aicc-backlog-export.timer`, so readers of that file stay current without
+  the owner touching it. This plist, the script it runs
+  (ops/aicc_backlog_publish.py) and the backlog-import command are the side
+  that retires (not deprecated, not feature-flagged, deleted outright) once
+  the revisit condition in
+  docs/adr/0011-backlog-projection-bidirectional-bridge.md is met, or by its
+  2026-11-01 target date at the latest.
 -->
 <plist version="1.0">
 <dict>

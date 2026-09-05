@@ -28,6 +28,18 @@ malformed is reported (never silently dropped and never allowed to crash the rea
 so the UI can surface "N lines could not be read" instead of quietly under-showing
 the backlog.
 
+As of VOYN-W0-BACKLOG-ORCHESTRATOR (BO-S1..S4), PostgreSQL's ``backlog_task``
+table is the canonical store for this data, not this file: ``backlog-export``
+(``command_center/db/backlog_export.py``) renders ``backlog_task`` back into
+exactly the record format above on a five-minute tick
+(``deploy/systemd/aicc-backlog-export.timer``), so this module keeps reading
+the same file format while what fills it changes underneath. ``backlog-import``
+(``ops/aicc_backlog_publish.py``) still feeds hand edits from this file into
+the store in the other direction — both directions are temporary by design;
+see ``docs/adr/0011-backlog-projection-bidirectional-bridge.md`` for the
+condition and 2026-11-01 date under which the import side retires and this
+file becomes purely generated output.
+
 The master file lives outside this repo (it belongs to the Backlog Engine
 project), so its path is *configuration*, resolved exactly like every other
 runtime location — an explicit argument, else the ``AICC_MASTER_BACKLOG``
