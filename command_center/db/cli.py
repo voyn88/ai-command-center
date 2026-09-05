@@ -25,6 +25,28 @@ from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
 
 
+def _non_empty_path(value: str) -> str:
+    """Reject an empty ``--output``, the shape an unset systemd
+    ``EnvironmentFile=`` variable produces.
+
+    Braced ``${VAR}`` substitution in a systemd unit always yields exactly
+    one argument, even when ``VAR`` is unset or blank -- it is not
+    word-split away like a shell ``$VAR`` would be. So an unset
+    ``AICC_MASTER_BACKLOG`` does not make ``--output`` go missing (which
+    ``required=True`` alone would catch); it makes it empty, and
+    ``argparse`` accepts an empty string as a supplied value. Left
+    unchecked, ``Path("")`` resolves to ``.``, and
+    ``projection_writer.write_atomically`` then tries to atomically replace
+    the current working directory with a file -- an ``OSError`` with no
+    hint that the real problem is an unset environment variable.
+    """
+    if not value:
+        raise argparse.ArgumentTypeError(
+            "must not be empty (is $AICC_MASTER_BACKLOG set?)"
+        )
+    return value
+
+
 def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
     """Build the ``enqueue(queue, key, payload, task_id, max_attempts)``
     writer that ``review_once``/``publish_review_verdicts`` call.
@@ -117,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument(
         "--output",
         required=True,
+        type=_non_empty_path,
         help="Destination path; written atomically (tmp + rename), whole file.",
     )
     plan = sub.add_parser(

@@ -52,6 +52,21 @@ def test_queue_redrive_requires_the_item_id() -> None:
         build_parser().parse_args(["queue-redrive"])
 
 
+def test_backlog_export_rejects_an_empty_output_path() -> None:
+    """`${AICC_MASTER_BACKLOG}` in the systemd unit's `EnvironmentFile=` is a
+    braced substitution: unset or blank still yields one argument (`''`),
+    never a dropped `--output` flag -- so only a check on the *value*, not
+    on presence (`required=True` alone), catches the unconfigured case
+    before it reaches `Path('')` and `write_atomically`'s atomic replace of
+    the current directory."""
+    args = build_parser().parse_args(["backlog-export", "--output", "/tmp/x.md"])
+    assert args.output == "/tmp/x.md"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["backlog-export", "--output", ""])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["backlog-export"])
+
+
 def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
     args = build_parser().parse_args(["backlog-merge-reconcile"])
     assert args.command == "backlog-merge-reconcile"
