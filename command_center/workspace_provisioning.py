@@ -25,21 +25,61 @@ Two responsibilities, kept separate so callers can compose them:
 
 `provision_and_verify(spec)` runs both in order.
 
-Git-write surface: the only mutating git subcommand this module ever runs is
-`git worktree add` (and only from `provision_workspace`, only when the target
-path does not already exist). It never runs `commit`/`push`/`merge`/`reset`/
-`rebase`/`clean`/`checkout`/branch-delete, and never touches a worktree it did
-not itself create. All other git access is read-only, via
-`command_center.git_info`.
+`remove_workspace(workspace_path, repository_path)` is the lifecycle's other
+half (VOYN-W0-AICC-ISOLATED-WORKTREE-PER-ATTEMPT): best-effort `git worktree
+remove` for a worktree this module (or an equivalent provisioner using the
+same convention) provisioned, gated by `is_pipeline_owned_worktree` so it can
+never remove a human's primary working tree, a different repository, or a
+worktree it cannot prove it owns.
+
+`prune_repository(repository_path)` closes the gap `remove_workspace`'s
+paired prune does not cover: a worker crash between `provision_workspace`
+and any cleanup attempt, or a `remove_workspace` call that returned
+`"not_owned"`/`"remove_failed"`, leaves a dangling `.git/worktrees/<name>`
+entry that nothing else ever revisits. `command_center.worktree_sweep` calls
+this periodically (via `aicc-worktree-prune.timer`) for every repository this
+host has configured, rather than adding a standalone reconciler here — the
+prune primitive belongs beside `remove_workspace`'s own use of it, the
+scheduling loop does not.
+
+Git-write surface: the only mutating git subcommands this module ever runs
+are `git worktree add` (from `provision_workspace`, only when the target path
+does not already exist) and `git worktree remove` / `git worktree prune`
+(from `remove_workspace`, only on a path already proven pipeline-owned, and
+from `prune_repository`, scoped to a repository path the caller already
+verified is configured on this host). It never runs
+`commit`/`push`/`merge`/`reset`/`rebase`/`clean`/`checkout`/branch-delete,
+and never touches a worktree it did not itself create or cannot prove it
+owns. All other git access is read-only, via `command_center.git_info`.
 """
 
 from __future__ import annotations
 
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import stat
 import subprocess
-from dataclasses import dataclass, field
+import tempfile
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from pathlib import Path
 
 from command_center import git_info
+from command_center.workspace_authority import decode_workspace_authority_key
+
+_GIT_OPERATION_ERRORS = (OSError, subprocess.SubprocessError)
+_MARKER_READ_ERRORS = (OSError, ValueError, TypeError)
+# Named, not inline `except (OSError, UnicodeDecodeError):` -- ruff-format
+# under this project's py314 target rewrites a parenthesized except-tuple to
+# PEP 758's bare `except OSError, UnicodeDecodeError:`, which is a
+# SyntaxError on the Python 3.12/3.13 runtimes this code actually ships on.
+_HEAD_READ_ERRORS = (OSError, UnicodeDecodeError)
 
 # Branch names that denote a repository's main line rather than isolated
 # feature/audit work. A task whose expected branch is one of these (or equals
@@ -48,13 +88,16 @@ from command_center import git_info
 MAIN_BRANCH_NAMES = frozenset({"main", "master"})
 
 # Working-tree cleanliness policies a caller can require before launch.
-STATUS_POLICY_ALLOW_DIRTY = "allow_dirty"      # default — never blocks on dirtiness
-STATUS_POLICY_NO_UNTRACKED = "no_untracked"    # block if there are untracked files
-STATUS_POLICY_CLEAN = "clean"                  # block on any modified/untracked file
+STATUS_POLICY_ALLOW_DIRTY = "allow_dirty"  # default — never blocks on dirtiness
+STATUS_POLICY_NO_UNTRACKED = "no_untracked"  # block if there are untracked files
+STATUS_POLICY_CLEAN = "clean"  # block on any modified/untracked file
 STATUS_POLICIES = frozenset(
     {STATUS_POLICY_ALLOW_DIRTY, STATUS_POLICY_NO_UNTRACKED, STATUS_POLICY_CLEAN}
 )
-PROVISION_OUTCOMES = frozenset({"skipped", "reused", "attached", "created"})
+PROVISION_OUTCOMES = frozenset({"skipped", "reused", "attached", "created", "cloned"})
+
+_TASK_LOCAL_MARKER = "aicc-task-workspace.json"
+_TASK_CLONE_PARENT_SUFFIX = "-task-clones"
 
 _DETACHED_HEAD = "(detached HEAD)"
 
@@ -81,6 +124,23 @@ class WorkspaceSpec:
     status_policy: str = STATUS_POLICY_ALLOW_DIRTY
     allow_provision: bool = True
     provision_outcome: str = "skipped"
+    # Mutating server workers run inside a Codex ``workspace-write`` sandbox.
+    # A linked worktree keeps its writable index/refs in the source repo's
+    # ``.git/worktrees`` directory, outside that sandbox.  This policy creates
+    # an independent clone whose complete Git metadata lives below
+    # ``workspace_path``.  Desktop launch paths keep the historical linked
+    # worktree default.
+    task_local_git_metadata: bool = False
+    # Optional trusted pin.  When absent, standalone provisioning resolves the
+    # base branch directly against the source repository's canonical remote and
+    # persists that exact SHA in its ownership marker.
+    base_sha: str | None = None
+    # Optional deployment-owned root for standalone task clones.  When set,
+    # the exact clone path is still derived from the canonical source
+    # repository and branch; callers cannot choose an arbitrary descendant.
+    # This lets hardened workers place the complete task-local Git surface
+    # below /srv/aicc-workspaces without falling back to linked worktrees.
+    task_clone_root: str | None = None
 
 
 class WorkspaceVerificationError(Exception):
@@ -144,6 +204,14 @@ class VerificationEvidence:
     is_worktree: bool = False
     is_isolated_worktree: bool = False
     provision_outcome: str = "skipped"
+    git_dir: str | None = None
+    git_common_dir: str | None = None
+    base_sha: str | None = None
+    start_sha: str | None = None
+    remote_task_sha: str | None = None
+    remote_url: str | None = None
+    workspace_device: int | None = None
+    workspace_inode: int | None = None
     checks: list[dict] = field(default_factory=list)
 
     def record(self, step: str, passed: bool, detail: str = "") -> None:
@@ -158,6 +226,14 @@ class VerificationEvidence:
             "is_worktree": self.is_worktree,
             "is_isolated_worktree": self.is_isolated_worktree,
             "provision_outcome": self.provision_outcome,
+            "git_dir": self.git_dir,
+            "git_common_dir": self.git_common_dir,
+            "base_sha": self.base_sha,
+            "start_sha": self.start_sha,
+            "remote_task_sha": self.remote_task_sha,
+            "remote_url": self.remote_url,
+            "workspace_device": self.workspace_device,
+            "workspace_inode": self.workspace_inode,
             "checks": list(self.checks),
         }
 
@@ -169,6 +245,36 @@ class VerificationEvidence:
 
 def _resolve(path: str | Path) -> Path:
     return Path(path).expanduser().resolve()
+
+
+def task_workspace_path(
+    repository: str | Path, branch: str, *, clone_root: str | Path | None = None
+) -> Path:
+    """Collision-resistant standalone workspace path for one task branch."""
+    repo = Path(repository).expanduser().resolve()
+    normalized = branch.strip().strip("/") or "work"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", normalized).strip("-._") or "work"
+    digest = sha256(branch.encode("utf-8")).hexdigest()[:12]
+    if clone_root is None:
+        parent = repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
+    else:
+        try:
+            root = Path(clone_root).expanduser().resolve(strict=True)
+        except OSError as error:
+            # A missing clone root must surface as the structured refusal
+            # callers handle, not a bare FileNotFoundError that bypasses the
+            # verification error path (review on 6e22b93).
+            raise WorkspaceVerificationError(
+                failed_step="task_clone_root_exists",
+                remediation="Create the task clone root directory on this host.",
+                expected_workspace=str(clone_root),
+                expected_branch="",
+                detail=f"task clone root is unusable: {error}",
+            ) from error
+        repository_id = sha256(str(repo).encode("utf-8")).hexdigest()[:16]
+        repository_slug = re.sub(r"[^A-Za-z0-9._-]", "-", repo.name)
+        parent = root / f"{repository_slug}-{repository_id}"
+    return parent / f"{slug[:80]}-{digest}"
 
 
 def _git_rev_parse_path(cwd: Path, flag: str) -> Path | None:
@@ -206,7 +312,9 @@ def _is_primary_worktree(cwd: Path) -> bool:
     return git_dir == common
 
 
-def is_pipeline_owned_worktree(workspace: str | Path, repository_path: str | Path | None) -> bool:
+def is_pipeline_owned_worktree(
+    workspace: str | Path, repository_path: str | Path | None
+) -> bool:
     """True when `workspace` is a *linked* worktree of `repository_path` — i.e. a
     directory this application provisions and owns, not a human's primary
     working tree and not an unrelated repository.
@@ -232,10 +340,14 @@ def is_pipeline_owned_worktree(workspace: str | Path, repository_path: str | Pat
         return False
     ws_common = _git_common_dir(ws)
     repo_common = _git_common_dir(repo)
-    return ws_common is not None and repo_common is not None and ws_common == repo_common
+    return (
+        ws_common is not None and repo_common is not None and ws_common == repo_common
+    )
 
 
-def _conflicting_worktree(repo: Path, branch: str, workspace_resolved: Path) -> str | None:
+def _conflicting_worktree(
+    repo: Path, branch: str, workspace_resolved: Path
+) -> str | None:
     """Path of another worktree of `repo` that already has `branch` checked
     out (a different path than `workspace_resolved`), or `None`."""
     for entry in git_info.get_worktrees(repo):
@@ -296,9 +408,7 @@ def is_feature_task(
         return False
     if expected_branch in MAIN_BRANCH_NAMES:
         return False
-    if base_branch and expected_branch == base_branch:
-        return False
-    return True
+    return not (base_branch and expected_branch == base_branch)
 
 
 # --------------------------------------------------------------------------
@@ -306,7 +416,515 @@ def is_feature_task(
 # --------------------------------------------------------------------------
 
 
-def _worktree_add(repo: Path, workspace: Path, extra_args: list[str], spec: WorkspaceSpec) -> None:
+def _run_provision_git(
+    argv: list[str],
+    *,
+    cwd: Path,
+    spec: WorkspaceSpec,
+    failed_step: str,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            ["git", *argv],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except _GIT_OPERATION_ERRORS as exc:
+        raise WorkspaceVerificationError(
+            failed_step=failed_step,
+            remediation="Resolve the standalone Git workspace failure and retry the launch.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail=f"git {' '.join(argv[:2])} could not be executed: {exc}",
+        ) from exc
+    if result.returncode != 0:
+        raise WorkspaceVerificationError(
+            failed_step=failed_step,
+            remediation="Resolve the standalone Git workspace failure and retry the launch.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail=(result.stderr or result.stdout).strip()
+            or f"git {' '.join(argv[:2])} failed",
+        )
+    return result
+
+
+def _source_remote_url(repo: Path, spec: WorkspaceSpec) -> str:
+    remote = git_info.run_git_command(repo, ["remote", "get-url", "origin"])
+    if remote is not None and remote.returncode == 0 and remote.stdout.strip():
+        value = remote.stdout.strip()
+        # Every use of this value is a positional argument to `git clone`/
+        # `git ls-remote`. A value starting with `-` would be parsed as an
+        # option instead of a repository (e.g. `--upload-pack=<command>`
+        # achieves execution during trusted provisioning) — refuse it outright
+        # rather than relying on callers to insert an option terminator that
+        # `git ls-remote` does not even support (review finding on 5f2f1dd).
+        if value.startswith("-"):
+            raise WorkspaceVerificationError(
+                failed_step="canonical_remote_not_option_like",
+                remediation="Replace origin with a repository URL that does not begin with '-'.",
+                expected_workspace=spec.workspace_path,
+                expected_branch=spec.expected_branch,
+                detail="origin URL begins with '-' and could be parsed as a git option",
+            )
+        # Never persist or hand an agent an HTTPS URL containing user-info.
+        # Canonical GitHub HTTPS and SSH URLs remain allowed.
+        if (
+            value.startswith(("http://", "https://"))
+            and "@" in value.split("//", 1)[1].split("/", 1)[0]
+        ):
+            raise WorkspaceVerificationError(
+                failed_step="canonical_remote_has_no_embedded_credentials",
+                remediation="Replace origin with a credential-free canonical repository URL.",
+                expected_workspace=spec.workspace_path,
+                expected_branch=spec.expected_branch,
+                detail="origin URL contains embedded user-info",
+            )
+        if (
+            not value.startswith(("http://", "https://", "ssh://", "file://", "git@"))
+            and ":" not in value.split("/", 1)[0]
+        ):
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                candidate = repo / candidate
+            value = str(candidate.resolve())
+            if value.startswith("-"):
+                raise WorkspaceVerificationError(
+                    failed_step="canonical_remote_not_option_like",
+                    remediation="Relocate the repository outside a '-'-prefixed path.",
+                    expected_workspace=spec.workspace_path,
+                    expected_branch=spec.expected_branch,
+                    detail="resolved local origin path begins with '-'",
+                )
+        return value
+    # Local repositories used by offline/test deployments may have no origin.
+    # ``--no-local`` below still creates independent objects and metadata.
+    return str(repo)
+
+
+def _resolve_remote_base_sha(repo: Path, remote_url: str, spec: WorkspaceSpec) -> str:
+    if spec.base_sha:
+        candidate = spec.base_sha.strip().lower()
+        if len(candidate) != 40 or any(
+            char not in "0123456789abcdef" for char in candidate
+        ):
+            raise WorkspaceVerificationError(
+                failed_step="base_sha_valid",
+                remediation="Provide a full 40-character hexadecimal base SHA.",
+                expected_workspace=spec.workspace_path,
+                expected_branch=spec.expected_branch,
+                detail=f"invalid base_sha {spec.base_sha!r}",
+            )
+        return candidate
+    if not spec.base_branch:
+        raise WorkspaceVerificationError(
+            failed_step="base_branch_exists",
+            remediation="Configure a base branch for the mutating task.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail="standalone provisioning requires base_branch",
+        )
+    remote = _run_provision_git(
+        ["ls-remote", "--exit-code", remote_url, f"refs/heads/{spec.base_branch}"],
+        cwd=repo,
+        spec=spec,
+        failed_step="resolve_remote_base_sha",
+    )
+    lines = [line.split() for line in remote.stdout.splitlines() if line.strip()]
+    if len(lines) != 1 or len(lines[0]) != 2:
+        raise WorkspaceVerificationError(
+            failed_step="resolve_remote_base_sha",
+            remediation="Make the canonical remote base branch resolve to one exact commit.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail=f"ambiguous base response for {spec.base_branch!r}",
+        )
+    candidate = lines[0][0].lower()
+    if len(candidate) != 40 or any(
+        char not in "0123456789abcdef" for char in candidate
+    ):
+        raise WorkspaceVerificationError(
+            failed_step="resolve_remote_base_sha",
+            remediation="Make the canonical remote return a full commit SHA.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail=f"malformed remote SHA {candidate!r}",
+        )
+    return candidate
+
+
+def _resolve_remote_ref_sha(
+    repo: Path, remote_url: str, ref: str, spec: WorkspaceSpec
+) -> str | None:
+    result = _run_provision_git(
+        ["ls-remote", remote_url, ref],
+        cwd=repo,
+        spec=spec,
+        failed_step="resolve_remote_ref_sha",
+    )
+    lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != ref:
+        raise WorkspaceVerificationError(
+            failed_step="resolve_remote_ref_sha",
+            remediation="Make the canonical remote ref resolve unambiguously.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail=f"ambiguous remote response for {ref!r}",
+        )
+    candidate = lines[0][0].lower()
+    if len(candidate) != 40 or any(
+        char not in "0123456789abcdef" for char in candidate
+    ):
+        raise WorkspaceVerificationError(
+            failed_step="resolve_remote_ref_sha",
+            remediation="Make the canonical remote return a full SHA-1.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail=f"malformed remote SHA {candidate!r}",
+        )
+    return candidate
+
+
+def _task_local_marker_path(workspace: Path) -> Path:
+    return (
+        workspace.parent
+        / ".aicc-task-metadata"
+        / f"{workspace.name}.{_TASK_LOCAL_MARKER}"
+    )
+
+
+def _workspace_authority_key() -> bytes | None:
+    # Retry authority has its own stable cryptographic domain.  Reusing the
+    # rotating database credential would invalidate every persisted task
+    # checkpoint during routine lease-password rotation and couples a DB
+    # secret to an unrelated signing purpose.
+    #
+    # Reading from the WORKER's own environment is safe against the same-UID
+    # agent because the agent process never inherits it:
+    # agent_runner.scrub_vcs_credentials() strips
+    # AICC_WORKSPACE_AUTHORITY_KEY (with the lease/publish variables) from
+    # every launch environment, and the systemd units source the key from a
+    # root-owned 0640 EnvironmentFile the agent cannot read (reviewed on
+    # 8a881d3: the forgery path claimed there requires env inheritance that
+    # the launch path explicitly removes).
+    return decode_workspace_authority_key(
+        os.environ.get("AICC_WORKSPACE_AUTHORITY_KEY")
+    )
+
+
+def _atomic_write_private(path: Path, payload: bytes) -> None:
+    """Replace one private authority file without following any symlink.
+
+    The model process currently shares the worker UID, so both the final name
+    and any predictable temporary name are attacker-controlled.  Operate
+    relative to a verified directory fd, create a random O_EXCL/O_NOFOLLOW
+    file, fsync it, rename it atomically, then fsync the parent so a reported
+    checkpoint survives a crash.
+    """
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "nt":
+        # AICC workers are Linux; retain functional Windows CI/developer
+        # support with the strongest primitives Python exposes there.
+        file_fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(file_fd, view)
+                if written <= 0:
+                    raise OSError("private authority write made no progress")
+                view = view[written:]
+            os.fsync(file_fd)
+            os.close(file_fd)
+            file_fd = -1
+            os.replace(temporary_path, path)
+        except BaseException:
+            if file_fd >= 0:
+                os.close(file_fd)
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
+        return
+    directory_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    temporary = f".{path.name}.{secrets.token_hex(16)}.tmp"
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(file_fd, view)
+            if written <= 0:
+                raise OSError("private authority write made no progress")
+            view = view[written:]
+        os.fchmod(file_fd, 0o600)
+        os.fsync(file_fd)
+        os.close(file_fd)
+        file_fd = None
+        os.replace(
+            temporary,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        final = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(final.st_mode):
+            raise OSError("private authority destination is not a regular file")
+        os.fsync(directory_fd)
+    except BaseException:
+        if file_fd is not None:
+            os.close(file_fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def _read_private_file(path: Path) -> bytes:
+    if os.name == "nt":
+        return path.read_bytes()
+    directory_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    file_fd: int | None = None
+    try:
+        file_fd = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("private authority source is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
+def _marker_signature(value: dict) -> str | None:
+    key = _workspace_authority_key()
+    if key is None:
+        return None
+    unsigned = {k: v for k, v in value.items() if k != "authority_hmac"}
+    payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(key, payload, "sha256").hexdigest()
+
+
+def _read_task_local_marker(workspace: Path) -> dict | None:
+    marker = _task_local_marker_path(workspace)
+    try:
+        value = json.loads(_read_private_file(marker).decode("utf-8"))
+    except _MARKER_READ_ERRORS:
+        return None
+    if not isinstance(value, dict):
+        return None
+    expected = _marker_signature(value)
+    actual = value.get("authority_hmac")
+    if (
+        expected is None
+        or not isinstance(actual, str)
+        or not hmac.compare_digest(actual, expected)
+    ):
+        return None
+    return value
+
+
+def _provision_task_local_clone(
+    spec: WorkspaceSpec, repo: Path, workspace: Path
+) -> str:
+    """Create an independent clone whose entire Git write surface is local.
+
+    The agent receives no remote at all. The guarded publisher later imports
+    only content-addressed objects into a fresh trusted clone.
+    """
+    raw_workspace = Path(spec.workspace_path).expanduser()
+    expected_path = task_workspace_path(
+        repo, spec.expected_branch or "", clone_root=spec.task_clone_root
+    )
+    if (
+        raw_workspace.parent.resolve() != expected_path.parent.resolve()
+        or raw_workspace.name != expected_path.name
+        or raw_workspace.is_symlink()
+    ):
+        raise WorkspaceVerificationError(
+            failed_step="task_clone_path_safe",
+            remediation="Use task_workspace_path() below the repository task-clone root.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail="task clone path is outside its trusted root or is a symlink",
+        )
+    if workspace.exists():
+        return "reused"
+    if not (spec.expected_branch and spec.base_branch):
+        return "skipped"
+
+    remote_url = _source_remote_url(repo, spec)
+    base_sha = _resolve_remote_base_sha(repo, remote_url, spec)
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    if workspace.parent.is_symlink():
+        raise WorkspaceVerificationError(
+            failed_step="task_clone_parent_safe",
+            remediation="Replace the task-clone parent symlink with a real directory.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail="task clone parent must not be a symlink",
+        )
+    target = workspace
+    created = False
+    try:
+        _run_provision_git(
+            [
+                "clone",
+                "--no-local",
+                "--no-checkout",
+                "--origin",
+                "origin",
+                "--config",
+                "core.hooksPath=.git/hooks",
+                remote_url,
+                str(target),
+            ],
+            cwd=repo,
+            spec=spec,
+            failed_step="provision_standalone_clone",
+            timeout=180,
+        )
+        created = True
+        present = git_info.run_git_command(
+            target, ["cat-file", "-e", f"{base_sha}^{{commit}}"]
+        )
+        if present is None or present.returncode != 0:
+            raise WorkspaceVerificationError(
+                failed_step="base_sha_present",
+                remediation="Fetch the pinned base SHA into the standalone clone and retry.",
+                expected_workspace=spec.workspace_path,
+                expected_branch=spec.expected_branch,
+                detail=f"pinned base SHA {base_sha} is absent from clone",
+            )
+
+        remote_branch = git_info.run_git_command(
+            target,
+            ["rev-parse", "--verify", f"origin/{spec.expected_branch}^{{commit}}"],
+        )
+        start_ref = (
+            f"origin/{spec.expected_branch}"
+            if remote_branch is not None and remote_branch.returncode == 0
+            else base_sha
+        )
+        _run_provision_git(
+            ["switch", "-c", spec.expected_branch, start_ref],
+            cwd=target,
+            spec=spec,
+            failed_step="checkout_task_branch",
+        )
+        # A deterministic identity permits local commits without granting any
+        # remote identity or credential.
+        _run_provision_git(
+            ["config", "--local", "user.name", "AICC Task Agent"],
+            cwd=target,
+            spec=spec,
+            failed_step="configure_task_identity",
+        )
+        _run_provision_git(
+            ["config", "--local", "user.email", "aicc-task-agent@localhost"],
+            cwd=target,
+            spec=spec,
+            failed_step="configure_task_identity",
+        )
+        # Remove the only publish destination before the model process starts.
+        _run_provision_git(
+            ["remote", "remove", "origin"],
+            cwd=target,
+            spec=spec,
+            failed_step="remove_agent_remote",
+        )
+        start_sha_result = git_info.run_git_command(target, ["rev-parse", "HEAD"])
+        if start_sha_result is None or start_sha_result.returncode != 0:
+            raise WorkspaceVerificationError(
+                failed_step="resolve_workspace_start_sha",
+                remediation="Re-provision the standalone task clone.",
+                expected_workspace=spec.workspace_path,
+                expected_branch=spec.expected_branch,
+                detail="cannot resolve the task branch start SHA",
+            )
+        start_sha = start_sha_result.stdout.strip()
+        trusted_base_result = git_info.run_git_command(
+            target, ["merge-base", base_sha, start_sha]
+        )
+        if trusted_base_result is None or trusted_base_result.returncode != 0:
+            raise WorkspaceVerificationError(
+                failed_step="resolve_trusted_task_base",
+                remediation="Rebase the task branch onto the canonical repository history.",
+                expected_workspace=spec.workspace_path,
+                expected_branch=spec.expected_branch,
+                detail="task branch has no trusted merge-base with the canonical base",
+            )
+        trusted_base_sha = trusted_base_result.stdout.strip()
+        marker = {
+            "version": 1,
+            "source_repository": str(repo),
+            "remote_url": remote_url,
+            "expected_branch": spec.expected_branch,
+            "base_branch": spec.base_branch,
+            "base_sha": trusted_base_sha,
+            "start_sha": start_sha,
+        }
+        signature = _marker_signature(marker)
+        if signature is None:
+            raise WorkspaceVerificationError(
+                failed_step="workspace_authority_key",
+                remediation="Configure AICC_WORKSPACE_AUTHORITY_KEY on the worker.",
+                expected_workspace=spec.workspace_path,
+                expected_branch=spec.expected_branch,
+                detail="task-local marker authority is not configured",
+            )
+        marker["authority_hmac"] = signature
+        marker_path = _task_local_marker_path(target)
+        _atomic_write_private(
+            marker_path,
+            (json.dumps(marker, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        return "cloned"
+    except BaseException:
+        # The path did not exist before this function and cannot contain user
+        # work.  Do not leave an unmarked half-clone that later retries might
+        # mistake for a verified workspace.
+        if created and target.exists() and not target.is_symlink():
+            shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def _worktree_add(
+    repo: Path, workspace: Path, extra_args: list[str], spec: WorkspaceSpec
+) -> None:
     workspace.parent.mkdir(parents=True, exist_ok=True)
     try:
         result = subprocess.run(
@@ -317,7 +935,7 @@ def _worktree_add(repo: Path, workspace: Path, extra_args: list[str], spec: Work
             timeout=60,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except _GIT_OPERATION_ERRORS as exc:
         raise WorkspaceVerificationError(
             failed_step="provision_worktree",
             remediation="Resolve the git worktree creation failure and retry the launch.",
@@ -331,7 +949,8 @@ def _worktree_add(repo: Path, workspace: Path, extra_args: list[str], spec: Work
             remediation="Resolve the git worktree creation failure and retry the launch.",
             expected_workspace=spec.workspace_path,
             expected_branch=spec.expected_branch,
-            detail=(result.stderr or result.stdout).strip() or "git worktree add failed",
+            detail=(result.stderr or result.stdout).strip()
+            or "git worktree add failed",
         )
 
 
@@ -349,10 +968,13 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
     Never rewrites `workspace_path` to the source repository: an unprovisioned
     workspace becomes a hard verification failure, never a silent fallback."""
     workspace = Path(spec.workspace_path).expanduser()
-    if workspace.exists():
-        return "reused"
-    if not spec.allow_provision:
-        return "skipped"
+    # Byte-for-byte the base ordering (65710ca): the authority-completeness
+    # check runs FIRST and an incomplete spec is "skipped" regardless of the
+    # directory; existing-workspace reuse is decided further down, exactly
+    # where the base decided it. An earlier remediation inserted an
+    # exists->"reused" fast path here on a reviewer's recollection of the
+    # legacy contract; the base bytes say otherwise, and the comment claiming
+    # "unchanged" was wrong with it (independent-review finding on fd5de6b).
     if not (spec.repository_path and spec.expected_branch and spec.base_branch):
         return "skipped"
 
@@ -360,10 +982,22 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
     if not git_info.get_status(repo).get("is_repo"):
         return "skipped"
 
+    if spec.task_local_git_metadata:
+        if not spec.allow_provision and not workspace.exists():
+            return "skipped"
+        return _provision_task_local_clone(spec, repo, workspace)
+
+    if workspace.exists():
+        return "reused"
+    if not spec.allow_provision:
+        return "skipped"
+
     workspace_target = workspace.resolve()
     branch_exists = spec.expected_branch in git_info.get_branches(repo)
     if branch_exists:
-        conflict = _conflicting_worktree(repo, spec.expected_branch, _resolve(workspace))
+        conflict = _conflicting_worktree(
+            repo, spec.expected_branch, _resolve(workspace)
+        )
         if conflict is not None:
             raise WorkspaceVerificationError(
                 failed_step="no_conflicting_worktree",
@@ -375,7 +1009,9 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
                 expected_branch=spec.expected_branch,
                 detail="cannot attach an already-checked-out branch to a second worktree",
             )
-        _worktree_add(repo, workspace, [str(workspace_target), spec.expected_branch], spec)
+        _worktree_add(
+            repo, workspace, [str(workspace_target), spec.expected_branch], spec
+        )
         return "attached"
 
     remote_branch = _remote_branch_ref(repo, spec.expected_branch)
@@ -383,18 +1019,31 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
         _worktree_add(
             repo,
             workspace,
-            ["--track", "-b", spec.expected_branch, str(workspace_target), remote_branch],
+            [
+                "--track",
+                "-b",
+                spec.expected_branch,
+                str(workspace_target),
+                remote_branch,
+            ],
             spec,
         )
         return "attached"
 
-    verify = git_info.run_git_command(repo, ["rev-parse", "--verify", f"{spec.base_branch}^{{commit}}"])
+    verify = git_info.run_git_command(
+        repo, ["rev-parse", "--verify", f"{spec.base_branch}^{{commit}}"]
+    )
     if verify is None or verify.returncode != 0:
         # Base branch missing — let `verify_workspace` report it as the
         # structured `base_branch_exists` / `workspace_exists` failure rather
         # than raising a less specific error here.
         return "skipped"
-    _worktree_add(repo, workspace, ["-b", spec.expected_branch, str(workspace_target), spec.base_branch], spec)
+    _worktree_add(
+        repo,
+        workspace,
+        ["-b", spec.expected_branch, str(workspace_target), spec.base_branch],
+        spec,
+    )
     return "created"
 
 
@@ -403,12 +1052,174 @@ def provision_workspace(spec: WorkspaceSpec) -> str:
 # --------------------------------------------------------------------------
 
 
+_FULL_SHA1 = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
+    """Verify a reused agent clone without executing its Git configuration."""
+    if not (spec.repository_path and spec.expected_branch and spec.base_branch):
+        raise WorkspaceVerificationError(
+            failed_step="task_local_authority_complete",
+            remediation="Provide repository_path, expected_branch and base_branch.",
+            expected_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch,
+            detail="task-local authority is incomplete",
+        )
+    repo = _resolve(spec.repository_path)
+    raw = Path(spec.workspace_path).expanduser()
+    absolute = Path(os.path.abspath(raw))
+    expected_path = task_workspace_path(
+        repo, spec.expected_branch, clone_root=spec.task_clone_root
+    )
+    if absolute != expected_path or raw.is_symlink():
+        raise WorkspaceVerificationError(
+            failed_step="task_clone_path_safe",
+            remediation="Use the deterministic task_workspace_path() clone root.",
+            expected_workspace=str(expected_path),
+            actual_workspace=str(absolute),
+            expected_branch=spec.expected_branch,
+            detail="task clone path differs from its trusted path or is a symlink",
+        )
+    try:
+        workspace_stat = absolute.lstat()
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="workspace_exists",
+            remediation="Provision the standalone task clone.",
+            expected_workspace=str(expected_path),
+            actual_workspace=str(absolute),
+            expected_branch=spec.expected_branch,
+            detail=f"workspace is unavailable: {exc}",
+        ) from exc
+    if not stat.S_ISDIR(workspace_stat.st_mode):
+        raise WorkspaceVerificationError(
+            failed_step="workspace_is_directory",
+            remediation="Replace the task path with a real standalone clone directory.",
+            expected_workspace=str(expected_path),
+            actual_workspace=str(absolute),
+            expected_branch=spec.expected_branch,
+            detail="task clone root is not a real directory",
+        )
+    marker = _read_task_local_marker(absolute)
+    if marker is None:
+        raise WorkspaceVerificationError(
+            failed_step="task_local_workspace_marker",
+            remediation="Preserve the workspace and re-provision from trusted authority.",
+            expected_workspace=str(expected_path),
+            actual_workspace=str(absolute),
+            expected_branch=spec.expected_branch,
+            detail="standalone workspace ownership marker is missing or invalid",
+        )
+    remote_url = _source_remote_url(repo, spec)
+    static_expected = {
+        "source_repository": str(repo),
+        "remote_url": remote_url,
+        "expected_branch": spec.expected_branch,
+        "base_branch": spec.base_branch,
+    }
+    static_failed = {
+        key: (marker.get(key), expected)
+        for key, expected in static_expected.items()
+        if marker.get(key) != expected
+    }
+    marker_base = str(marker.get("base_sha") or "").lower()
+    marker_start = str(marker.get("start_sha") or "").lower()
+    if (
+        static_failed
+        or not _FULL_SHA1.fullmatch(marker_base)
+        or not _FULL_SHA1.fullmatch(marker_start)
+    ):
+        raise WorkspaceVerificationError(
+            failed_step="workspace_belongs_to_repository",
+            remediation="Preserve the clone and recover it through trusted repository authority.",
+            expected_workspace=str(expected_path),
+            actual_workspace=str(absolute),
+            expected_branch=spec.expected_branch,
+            detail=f"task-local ownership mismatch: {static_failed or 'invalid base SHA'}",
+        )
+    candidate = _read_agent_head(absolute, spec.expected_branch)
+    if candidate != marker_start:
+        raise WorkspaceVerificationError(
+            failed_step="task_workspace_checkpoint",
+            remediation="Recover the uncheckpointed branch through trusted operator review.",
+            expected_workspace=str(expected_path),
+            actual_workspace=str(absolute),
+            expected_branch=spec.expected_branch,
+            detail=f"saved HEAD {candidate} differs from signed checkpoint {marker_start}",
+        )
+    current_base = _resolve_remote_ref_sha(
+        repo, remote_url, f"refs/heads/{spec.base_branch}", spec
+    )
+    if current_base is None:
+        raise WorkspaceVerificationError(
+            failed_step="remote_base_exists",
+            remediation=f"Restore remote base branch {spec.base_branch!r}.",
+            expected_workspace=str(expected_path),
+            actual_workspace=str(absolute),
+            expected_branch=spec.expected_branch,
+            detail="canonical remote base branch is missing",
+        )
+    remote_task = _resolve_remote_ref_sha(
+        repo, remote_url, f"refs/heads/{spec.expected_branch}", spec
+    )
+    # This disposable clone proves the marker's original base is a real
+    # ancestor of today's canonical base and that the saved candidate is a
+    # clean descendant. It never reads agent-controlled Git config.
+    with trusted_publish_clone(
+        absolute,
+        expected_branch=spec.expected_branch,
+        remote_url=remote_url,
+        start_sha=marker_base,
+        trusted_base_sha=marker_base,
+        current_base_sha=current_base,
+        expected_remote_sha=remote_task,
+        expected_inode=(workspace_stat.st_dev, workspace_stat.st_ino),
+        require_clean=spec.status_policy != STATUS_POLICY_ALLOW_DIRTY,
+    ):
+        pass
+    evidence = VerificationEvidence(
+        workspace_path=str(absolute),
+        repository_path=str(repo),
+        expected_branch=spec.expected_branch,
+        actual_branch=spec.expected_branch,
+        is_worktree=True,
+        is_isolated_worktree=True,
+        provision_outcome=spec.provision_outcome,
+        git_dir=str(absolute / ".git"),
+        git_common_dir=str(absolute / ".git"),
+        base_sha=marker_base,
+        start_sha=candidate,
+        remote_task_sha=remote_task,
+        remote_url=remote_url,
+        workspace_device=workspace_stat.st_dev,
+        workspace_inode=workspace_stat.st_ino,
+    )
+    for step, detail in (
+        ("workspace_exists", str(absolute)),
+        ("task_local_git_metadata", str(absolute / ".git")),
+        ("workspace_belongs_to_repository", str(repo)),
+        ("branch_matches", spec.expected_branch),
+        ("isolated_worktree_required", "is_isolated=True"),
+        ("base_branch_exists", current_base),
+        ("status_policy_satisfied", f"policy={spec.status_policy}"),
+    ):
+        evidence.record(step, True, detail)
+    return evidence
+
+
 def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     """Prove every launch invariant or raise `WorkspaceVerificationError`.
 
     Returns `VerificationEvidence` only when *all* checks pass — this return
     is the sole authorization for emitting "Workspace Verified". Never mutates
     anything (read-only git + filesystem stat)."""
+    if spec.status_policy not in STATUS_POLICIES:
+        raise ValueError(f"Unknown status_policy: {spec.status_policy!r}")
+    if spec.provision_outcome not in PROVISION_OUTCOMES:
+        raise ValueError(f"Unknown provision_outcome: {spec.provision_outcome!r}")
+    if spec.task_local_git_metadata:
+        return _verify_task_local_workspace(spec)
+
     workspace_input = spec.workspace_path
     workspace_resolved = _resolve(workspace_input)
     repo_resolved = _resolve(spec.repository_path) if spec.repository_path else None
@@ -420,7 +1231,9 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
         actual_branch=None,
     )
 
-    def fail(step: str, remediation: str, detail: str, actual_branch: str | None = None) -> None:
+    def fail(
+        step: str, remediation: str, detail: str, actual_branch: str | None = None
+    ) -> None:
         raise WorkspaceVerificationError(
             failed_step=step,
             remediation=remediation,
@@ -431,14 +1244,13 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
             detail=detail,
         )
 
-    if spec.status_policy not in STATUS_POLICIES:
-        raise ValueError(f"Unknown status_policy: {spec.status_policy!r}")
-    if spec.provision_outcome not in PROVISION_OUTCOMES:
-        raise ValueError(f"Unknown provision_outcome: {spec.provision_outcome!r}")
     evidence.provision_outcome = spec.provision_outcome
 
     # 1. Workspace exists.
-    if not Path(workspace_input).expanduser().exists() or not workspace_resolved.is_dir():
+    if (
+        not Path(workspace_input).expanduser().exists()
+        or not workspace_resolved.is_dir()
+    ):
         fail(
             "workspace_exists",
             "Provision the worktree (git worktree add) or fix the task's workspace_path.",
@@ -460,11 +1272,27 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     actual_branch = status.get("branch")
     evidence.actual_branch = actual_branch
 
+    git_dir = _git_rev_parse_path(workspace_resolved, "--git-dir")
+    git_common_dir = _git_common_dir(workspace_resolved)
+    evidence.git_dir = str(git_dir) if git_dir else None
+    evidence.git_common_dir = str(git_common_dir) if git_common_dir else None
+
     # 3. Workspace belongs to the expected repository.
+    # Task-local standalone clones never reach this comparison: they return
+    # through _verify_task_local_workspace at the top of this function, which
+    # carries the signed ownership-marker and canonical-remote validation a
+    # clone needs (its .git common dir is intentionally distinct from the
+    # source repository's, so THIS check would indeed refuse it -- reviewed
+    # on bedb7a1: the dispatch line sits outside changed hunks, so a chunk
+    # showing only the removal cannot see it).
     if repo_resolved is not None and git_info.get_status(repo_resolved).get("is_repo"):
         workspace_common = _git_common_dir(workspace_resolved)
         repo_common = _git_common_dir(repo_resolved)
-        if workspace_common is None or repo_common is None or workspace_common != repo_common:
+        if (
+            workspace_common is None
+            or repo_common is None
+            or workspace_common != repo_common
+        ):
             fail(
                 "workspace_belongs_to_repository",
                 "Use a worktree of the configured repository, not a different repository.",
@@ -473,7 +1301,11 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
             )
         evidence.record("workspace_belongs_to_repository", True, str(workspace_common))
     else:
-        evidence.record("workspace_belongs_to_repository", True, "source repository not provided; skipped")
+        evidence.record(
+            "workspace_belongs_to_repository",
+            True,
+            "source repository not provided; skipped",
+        )
 
     # 4. Current branch equals the expected branch.
     if spec.expected_branch:
@@ -498,7 +1330,9 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
 
     # 5. Expected branch is not checked out in a conflicting worktree.
     if spec.expected_branch and repo_resolved is not None:
-        conflict = _conflicting_worktree(repo_resolved, spec.expected_branch, workspace_resolved)
+        conflict = _conflicting_worktree(
+            repo_resolved, spec.expected_branch, workspace_resolved
+        )
         if conflict is not None:
             fail(
                 "no_conflicting_worktree",
@@ -511,8 +1345,9 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     # 6. The main repository is not used for a feature/audit task.
     feature = is_feature_task(spec.expected_branch, spec.base_branch, spec.task_type)
     is_primary = _is_primary_worktree(workspace_resolved)
-    evidence.is_isolated_worktree = not is_primary
-    if feature and is_primary:
+    isolated = not is_primary
+    evidence.is_isolated_worktree = isolated
+    if feature and not isolated:
         fail(
             "isolated_worktree_required",
             (
@@ -525,7 +1360,7 @@ def verify_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
             ),
             actual_branch=actual_branch,
         )
-    evidence.record("isolated_worktree_required", True, f"is_isolated={not is_primary}")
+    evidence.record("isolated_worktree_required", True, f"is_isolated={isolated}")
 
     # 7. Base branch exists (when one is configured).
     if spec.base_branch and repo_resolved is not None:
@@ -574,6 +1409,877 @@ def provision_and_verify(spec: WorkspaceSpec) -> VerificationEvidence:
     orchestration uses to guarantee a safe workspace before touching any task
     state or spawning any process."""
     outcome = provision_workspace(spec)
-    evidence = verify_workspace(spec)
+    evidence = verify_workspace(replace(spec, provision_outcome=outcome))
     evidence.provision_outcome = outcome
     return evidence
+
+
+def _open_relative_regular(
+    base_fd: int, parts: tuple[str, ...], open_flags: int, nofollow: int
+) -> tuple[int, os.stat_result] | None:
+    """Open a regular file at `parts`, relative to `base_fd`, one component at
+    a time with `O_NOFOLLOW` on every hop. Walking component-by-component
+    (rather than joining a pathname and opening it once) means an
+    intermediate directory being swapped for a symlink mid-walk cannot
+    redirect the final open — the same protection `_read_agent_head` already
+    applies to `HEAD` itself, extended to cover its multi-component `refs/
+    heads/<branch>` path (review finding on 5f2f1dd: "branch refs have
+    similar pathname races because parent components are not
+    descriptor-pinned"). Returns `None` if any component is simply absent;
+    raises `OSError` for any other failure. Caller closes the returned fd.
+    """
+    current_fd = os.dup(base_fd)
+    try:
+        for index, part in enumerate(parts):
+            is_last = index == len(parts) - 1
+            flags = open_flags | nofollow | (0 if is_last else os.O_DIRECTORY)
+            try:
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+            except FileNotFoundError:
+                os.close(current_fd)
+                return None
+            os.close(current_fd)
+            current_fd = next_fd
+        info = os.fstat(current_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise OSError(f"{'/'.join(parts)} is not a regular unlinked file")
+        return current_fd, info
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+_MAX_REF_BYTES = 4096
+_MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024
+
+
+def _read_pinned_regular(
+    descriptor: int, initial: os.stat_result, *, max_bytes: int
+) -> bytes:
+    """Read all bytes from a pinned regular-file fd and detect mutation.
+
+    ``os.read`` may legally return fewer bytes than requested.  A single call
+    would let a valid prefix hide trailing ref data, or make a transient short
+    read look like a different branch.  The fstat/EOF checks also fail closed
+    if the agent changes the file while the publisher is reading it.
+    """
+    if initial.st_size > max_bytes:
+        raise OSError("pinned regular file is implausibly large")
+    chunks: list[bytes] = []
+    remaining = initial.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 64 * 1024))
+        if not chunk:
+            raise OSError("pinned regular file was truncated while read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise OSError("pinned regular file grew while read")
+    final = os.fstat(descriptor)
+    if (
+        final.st_dev != initial.st_dev
+        or final.st_ino != initial.st_ino
+        or final.st_size != initial.st_size
+        or final.st_mtime_ns != initial.st_mtime_ns
+        or final.st_ctime_ns != initial.st_ctime_ns
+        or final.st_uid != initial.st_uid
+        or final.st_gid != initial.st_gid
+        or stat.S_IMODE(final.st_mode) != stat.S_IMODE(initial.st_mode)
+    ):
+        raise OSError("pinned regular file changed while read")
+    return b"".join(chunks)
+
+
+def _read_agent_head(workspace: Path, expected_branch: str) -> str:
+    """Resolve HEAD without invoking Git against agent-controlled config."""
+    git_dir = workspace / ".git"
+    # The workspace .git tree is agent-writable and this runs inside the
+    # credential-owning publisher clone, so nothing under it may ever be read
+    # by pathname: an lstat-then-read let the agent win a rename race,
+    # redirect a path at a root-owned secret via a symlink, and leak its
+    # bytes through an error detail. Pin .git to a directory fd and open
+    # everything beneath it *relative to that fd* with O_NOFOLLOW, validating
+    # each fd's own fstat before reading, so neither a swapped parent, a
+    # symlink, nor a hardlink can redirect any read.
+    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if any(part in {"", ".", ".."} for part in expected_branch.split("/")):
+        raise WorkspaceVerificationError(
+            failed_step="agent_head_branch",
+            remediation="Use a branch name without empty or dot path components.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="branch name would escape .git/refs/heads",
+        )
+    expected_ref = f"refs/heads/{expected_branch}"
+    dir_fd: int | None = None
+    head_fd: int | None = None
+    try:
+        try:
+            dir_fd = os.open(git_dir, open_flags | os.O_DIRECTORY | nofollow)
+            git_info_stat = os.fstat(dir_fd)
+            head_fd = os.open("HEAD", open_flags | nofollow, dir_fd=dir_fd)
+            head_stat = os.fstat(head_fd)
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_readable",
+                remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                detail=f"cannot read task-local HEAD safely: {exc}",
+            ) from exc
+        if (
+            not stat.S_ISDIR(git_info_stat.st_mode)
+            or not stat.S_ISREG(head_stat.st_mode)
+            or head_stat.st_nlink != 1
+            or head_stat.st_size > 4096
+        ):
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_regular",
+                remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                detail=".git must be a directory and HEAD a small unlinked regular file",
+            )
+        try:
+            head_text = (
+                _read_pinned_regular(head_fd, head_stat, max_bytes=_MAX_REF_BYTES)
+                .decode("ascii", "strict")
+                .strip()
+            )
+        except _HEAD_READ_ERRORS:
+            # Never echo the bytes: a non-ASCII HEAD is refused without
+            # surfacing its content in the error (or a chained exception).
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_regular",
+                remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                detail="task-local HEAD is not ASCII text",
+            ) from None
+        if head_text != f"ref: {expected_ref}":
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_branch",
+                remediation="Keep the task on its exact expected branch.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"unexpected HEAD contents: {head_text!r}",
+            )
+
+        candidate: str | None = None
+        try:
+            opened = _open_relative_regular(
+                dir_fd, tuple(expected_ref.split("/")), open_flags, nofollow
+            )
+            if opened is not None:
+                ref_fd, ref_stat = opened
+                try:
+                    candidate = (
+                        _read_pinned_regular(
+                            ref_fd, ref_stat, max_bytes=_MAX_REF_BYTES
+                        )
+                        .decode("ascii", "strict")
+                        .strip()
+                    )
+                finally:
+                    os.close(ref_fd)
+            else:
+                packed = _open_relative_regular(
+                    dir_fd, ("packed-refs",), open_flags, nofollow
+                )
+                if packed is not None:
+                    packed_fd, packed_stat = packed
+                    try:
+                        packed_text = _read_pinned_regular(
+                            packed_fd,
+                            packed_stat,
+                            max_bytes=_MAX_PACKED_REFS_BYTES,
+                        ).decode("ascii", "strict")
+                    finally:
+                        os.close(packed_fd)
+                    for line in packed_text.splitlines():
+                        if not line or line.startswith(("#", "^")):
+                            continue
+                        sha, _, ref = line.partition(" ")
+                        if ref == expected_ref:
+                            candidate = sha
+                            break
+        except _HEAD_READ_ERRORS as exc:
+            raise WorkspaceVerificationError(
+                failed_step="agent_head_ref",
+                remediation="Preserve the workspace for inspection and retry on a clean clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"cannot read branch ref safely: {exc}",
+            ) from exc
+    finally:
+        if head_fd is not None:
+            os.close(head_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
+    if (
+        candidate is None
+        or len(candidate) != 40
+        or any(char not in "0123456789abcdefABCDEF" for char in candidate)
+    ):
+        raise WorkspaceVerificationError(
+            failed_step="agent_head_sha",
+            remediation="Preserve the workspace for inspection and retry on a clean clone.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="branch ref does not contain one full SHA-1",
+        )
+    return candidate.lower()
+
+
+_LOOSE_OBJECT = re.compile(r"^[0-9a-f]{2}/[0-9a-f]{38}$")
+_PACK_OBJECT = re.compile(r"^pack/pack-[0-9a-f]{40}\.(?:pack|idx|rev|bitmap)$")
+_MAX_OBJECT_TRANSFER_BYTES = 1_073_741_824
+
+
+def _copy_agent_objects(workspace: Path, publisher: Path) -> None:
+    """Copy only content-addressed object files, never config/hooks/remotes."""
+    source = workspace / ".git" / "objects"
+    destination = publisher / ".git" / "objects"
+    try:
+        if not stat.S_ISDIR(source.lstat().st_mode):
+            raise OSError("objects is not a directory")
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="agent_objects_safe",
+            remediation="Preserve the task clone and retry after operator inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            detail=f"cannot inspect agent object database: {exc}",
+        ) from exc
+    total = 0
+    for root, directories, files in os.walk(source, followlinks=False):
+        root_path = Path(root)
+        for directory in list(directories):
+            child = root_path / directory
+            if child.is_symlink():
+                raise WorkspaceVerificationError(
+                    failed_step="agent_objects_safe",
+                    remediation="Remove symlinks from the task object database.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    detail=f"symlinked object directory: {child.relative_to(source)}",
+                )
+        for filename in files:
+            candidate = root_path / filename
+            relative = candidate.relative_to(source).as_posix()
+            if not (
+                _LOOSE_OBJECT.fullmatch(relative) or _PACK_OBJECT.fullmatch(relative)
+            ):
+                continue
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                )
+                info = os.fstat(descriptor)
+            except OSError as exc:
+                raise WorkspaceVerificationError(
+                    failed_step="agent_objects_safe",
+                    remediation="Preserve the task clone and retry after operator inspection.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    detail=f"cannot stat object {relative}: {exc}",
+                ) from exc
+            if not stat.S_ISREG(info.st_mode):
+                os.close(descriptor)
+                raise WorkspaceVerificationError(
+                    failed_step="agent_objects_safe",
+                    remediation="Only regular content-addressed Git objects may cross the boundary.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    detail=f"non-regular object: {relative}",
+                )
+            try:
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with os.fdopen(descriptor, "rb", closefd=False) as source_file:
+                    if target.exists():
+                        target_file = target.open("rb")
+                        writing = False
+                    else:
+                        target_file = target.open("xb")
+                        writing = True
+                    with target_file:
+                        copied = 0
+                        while True:
+                            chunk = source_file.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            copied += len(chunk)
+                            total += len(chunk)
+                            if total > _MAX_OBJECT_TRANSFER_BYTES:
+                                raise WorkspaceVerificationError(
+                                    failed_step="agent_objects_bounded",
+                                    remediation="Split the task or inspect the oversized object transfer.",
+                                    expected_workspace=str(workspace),
+                                    actual_workspace=str(workspace),
+                                    detail="agent object transfer exceeds 1 GiB",
+                                )
+                            if writing:
+                                target_file.write(chunk)
+                            elif target_file.read(len(chunk)) != chunk:
+                                raise WorkspaceVerificationError(
+                                    failed_step="agent_object_collision",
+                                    remediation="Preserve both repositories for object-integrity inspection.",
+                                    expected_workspace=str(workspace),
+                                    actual_workspace=str(workspace),
+                                    detail=f"object collision for {relative}",
+                                )
+                        if copied != info.st_size or (
+                            not writing and target_file.read(1)
+                        ):
+                            raise OSError("object size changed during transfer")
+            finally:
+                os.close(descriptor)
+
+
+@contextmanager
+def trusted_publish_clone(
+    workspace_path: str | Path,
+    *,
+    expected_branch: str,
+    remote_url: str,
+    start_sha: str,
+    trusted_base_sha: str | None = None,
+    current_base_sha: str | None = None,
+    expected_remote_sha: str | None = None,
+    expected_inode: tuple[int, int] | None = None,
+    expected_candidate_sha: str | None = None,
+    require_clean: bool = True,
+):
+    """Yield a fresh publisher-owned clone containing only verified objects.
+
+    No Git command is ever executed with the agent-controlled ``.git`` as its
+    repository.  Config, hooks, remotes and credential helpers therefore do
+    not cross into the process that owns publish credentials.
+    """
+    raw_workspace = Path(workspace_path).expanduser()
+    if raw_workspace.is_symlink():
+        raise WorkspaceVerificationError(
+            failed_step="agent_workspace_safe",
+            remediation="Preserve the path and re-provision a real task clone.",
+            expected_workspace=str(raw_workspace),
+            actual_workspace=str(raw_workspace),
+            expected_branch=expected_branch,
+            detail="agent workspace must not be a symlink",
+        )
+    workspace = raw_workspace.resolve()
+    try:
+        workspace_stat = raw_workspace.lstat()
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="agent_workspace_safe",
+            remediation="Preserve the path and re-provision a real task clone.",
+            expected_workspace=str(raw_workspace),
+            actual_workspace=str(raw_workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot inspect agent workspace: {exc}",
+        ) from exc
+    actual_inode = (workspace_stat.st_dev, workspace_stat.st_ino)
+    if not stat.S_ISDIR(workspace_stat.st_mode) or (
+        expected_inode is not None and actual_inode != expected_inode
+    ):
+        raise WorkspaceVerificationError(
+            failed_step="agent_workspace_identity",
+            remediation="Preserve the substituted path and recover the verified clone.",
+            expected_workspace=str(raw_workspace),
+            actual_workspace=str(raw_workspace),
+            expected_branch=expected_branch,
+            detail=f"workspace inode mismatch: expected={expected_inode}, actual={actual_inode}",
+        )
+    candidate_sha = _read_agent_head(workspace, expected_branch)
+    if expected_candidate_sha is not None and candidate_sha != expected_candidate_sha:
+        raise WorkspaceVerificationError(
+            failed_step="agent_candidate_changed_before_validation",
+            remediation="Stop the remaining writer and retry from a stable task clone.",
+            expected_workspace=str(raw_workspace),
+            actual_workspace=str(raw_workspace),
+            expected_branch=expected_branch,
+            detail=(
+                f"candidate changed: expected={expected_candidate_sha}, "
+                f"actual={candidate_sha}"
+            ),
+        )
+    with tempfile.TemporaryDirectory(prefix="aicc-trusted-publisher-") as raw:
+        publisher = Path(raw) / "repo"
+        spec = WorkspaceSpec(
+            workspace_path=str(publisher), expected_branch=expected_branch
+        )
+        _run_provision_git(
+            [
+                "clone",
+                "--no-checkout",
+                "--origin",
+                "origin",
+                remote_url,
+                str(publisher),
+            ],
+            cwd=Path(raw),
+            spec=spec,
+            failed_step="provision_trusted_publisher_clone",
+            timeout=180,
+        )
+        if trusted_base_sha is not None:
+            _run_provision_git(
+                ["cat-file", "-e", f"{trusted_base_sha}^{{commit}}"],
+                cwd=publisher,
+                spec=spec,
+                failed_step="trusted_base_present",
+            )
+        if current_base_sha is not None:
+            _run_provision_git(
+                ["cat-file", "-e", f"{current_base_sha}^{{commit}}"],
+                cwd=publisher,
+                spec=spec,
+                failed_step="current_base_present",
+            )
+        if trusted_base_sha is not None and current_base_sha is not None:
+            _run_provision_git(
+                ["merge-base", "--is-ancestor", trusted_base_sha, current_base_sha],
+                cwd=publisher,
+                spec=spec,
+                failed_step="trusted_base_ancestry",
+            )
+        if expected_remote_sha is not None:
+            _run_provision_git(
+                ["cat-file", "-e", f"{expected_remote_sha}^{{commit}}"],
+                cwd=publisher,
+                spec=spec,
+                failed_step="expected_remote_present",
+            )
+        _copy_agent_objects(workspace, publisher)
+        checks = [
+            (["cat-file", "-e", f"{candidate_sha}^{{commit}}"], "agent_commit_valid"),
+            (
+                ["merge-base", "--is-ancestor", start_sha, candidate_sha],
+                "agent_commit_ancestry",
+            ),
+            (
+                ["fsck", "--strict", "--no-reflogs", candidate_sha],
+                "agent_objects_valid",
+            ),
+        ]
+        if trusted_base_sha is not None:
+            checks.append(
+                (
+                    ["merge-base", "--is-ancestor", trusted_base_sha, candidate_sha],
+                    "candidate_base_ancestry",
+                )
+            )
+        if expected_remote_sha is not None:
+            checks.append(
+                (
+                    ["merge-base", "--is-ancestor", expected_remote_sha, candidate_sha],
+                    "candidate_remote_ancestry",
+                )
+            )
+        for argv, step in checks:
+            _run_provision_git(argv, cwd=publisher, spec=spec, failed_step=step)
+        _run_provision_git(
+            ["switch", "-c", expected_branch, candidate_sha],
+            cwd=publisher,
+            spec=spec,
+            failed_step="checkout_trusted_candidate",
+        )
+        safe_env = dict(os.environ)
+        safe_env.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+        clean = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                f"--git-dir={publisher / '.git'}",
+                f"--work-tree={workspace}",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            ],
+            cwd=publisher,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env=safe_env,
+        )
+        if clean.returncode != 0 or (require_clean and clean.stdout.strip()):
+            detail = (
+                f"uncommitted_changes: {clean.stdout.strip()}"
+                if clean.stdout.strip()
+                else clean.stderr.strip() or "cannot verify agent worktree status"
+            )
+            raise WorkspaceVerificationError(
+                failed_step="agent_worktree_clean",
+                remediation="Commit all task changes before guarded publish; preserve the clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=detail,
+            )
+        yield publisher
+
+
+def task_workspace_candidate_sha(
+    workspace_path: str | Path,
+    *,
+    expected_branch: str,
+    expected_inode: tuple[int, int],
+) -> str:
+    """Read one exact candidate from the task clone without invoking Git."""
+    raw_workspace = Path(workspace_path).expanduser()
+    if raw_workspace.is_symlink():
+        raise WorkspaceVerificationError(
+            failed_step="agent_workspace_safe",
+            remediation="Preserve the path and re-provision a real task clone.",
+            expected_workspace=str(raw_workspace),
+            actual_workspace=str(raw_workspace),
+            expected_branch=expected_branch,
+            detail="agent workspace must not be a symlink",
+        )
+    try:
+        workspace_stat = raw_workspace.lstat()
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="agent_workspace_safe",
+            remediation="Preserve the path and re-provision a real task clone.",
+            expected_workspace=str(raw_workspace),
+            actual_workspace=str(raw_workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot inspect agent workspace: {exc}",
+        ) from exc
+    actual_inode = (workspace_stat.st_dev, workspace_stat.st_ino)
+    if not stat.S_ISDIR(workspace_stat.st_mode) or actual_inode != expected_inode:
+        raise WorkspaceVerificationError(
+            failed_step="agent_workspace_identity",
+            remediation="Preserve the substituted path and recover the verified clone.",
+            expected_workspace=str(raw_workspace),
+            actual_workspace=str(raw_workspace),
+            expected_branch=expected_branch,
+            detail=(
+                f"workspace inode mismatch: expected={expected_inode}, "
+                f"actual={actual_inode}"
+            ),
+        )
+    return _read_agent_head(raw_workspace.resolve(), expected_branch)
+
+
+def task_workspace_is_unchanged(
+    workspace_path: str | Path,
+    *,
+    expected_branch: str,
+    remote_url: str,
+    start_sha: str,
+    trusted_base_sha: str,
+    expected_remote_sha: str | None,
+    expected_inode: tuple[int, int],
+) -> bool:
+    """Prove a failed executor made no filesystem or commit change."""
+    try:
+        if _read_agent_head(Path(workspace_path), expected_branch) != start_sha:
+            return False
+        with trusted_publish_clone(
+            workspace_path,
+            expected_branch=expected_branch,
+            remote_url=remote_url,
+            start_sha=start_sha,
+            trusted_base_sha=trusted_base_sha,
+            expected_remote_sha=expected_remote_sha,
+            expected_inode=expected_inode,
+        ):
+            pass
+    except WorkspaceVerificationError:
+        return False
+    return True
+
+
+def checkpoint_task_workspace(
+    workspace_path: str | Path,
+    *,
+    expected_branch: str,
+    previous_start_sha: str,
+    expected_candidate_sha: str,
+    expected_inode: tuple[int, int],
+) -> str:
+    """Atomically advance signed retry authority after trusted validation."""
+    workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
+    info = workspace.lstat()
+    actual_inode = (info.st_dev, info.st_ino)
+    if workspace.is_symlink() or actual_inode != expected_inode:
+        raise WorkspaceVerificationError(
+            failed_step="task_workspace_checkpoint_identity",
+            remediation="Preserve the substituted path for operator inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"workspace inode mismatch: {actual_inode}",
+        )
+    marker = _read_task_local_marker(workspace)
+    if marker is None or marker.get("start_sha") != previous_start_sha:
+        raise WorkspaceVerificationError(
+            failed_step="task_workspace_checkpoint_authority",
+            remediation="Preserve the clone; its signed authority changed during execution.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="signed marker is missing or no longer matches the pre-agent checkpoint",
+        )
+    candidate = _read_agent_head(workspace, expected_branch)
+    if candidate != expected_candidate_sha:
+        raise WorkspaceVerificationError(
+            failed_step="task_workspace_checkpoint_candidate",
+            remediation="Stop the remaining writer and retry from a stable task clone.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=(
+                f"candidate changed after validation: "
+                f"expected={expected_candidate_sha}, actual={candidate}"
+            ),
+        )
+    updated = dict(marker)
+    updated["start_sha"] = candidate
+    signature = _marker_signature(updated)
+    if signature is None:
+        raise WorkspaceVerificationError(
+            failed_step="workspace_authority_key",
+            remediation="Configure AICC_WORKSPACE_AUTHORITY_KEY on the worker.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="task-local marker authority is not configured",
+        )
+    updated["authority_hmac"] = signature
+    marker_path = _task_local_marker_path(workspace)
+    _atomic_write_private(
+        marker_path,
+        (json.dumps(updated, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    return candidate
+
+
+def _is_pipeline_owned_standalone_clone(
+    workspace: Path,
+    repository_path: str | Path,
+    verified_inode: tuple[int, int] | None,
+) -> bool:
+    repo = _resolve(repository_path)
+    if verified_inode is None:
+        return False
+    if (
+        workspace.is_symlink()
+        or workspace.parent != repo.parent / f"{repo.name}{_TASK_CLONE_PARENT_SUFFIX}"
+    ):
+        return False
+    git_dir = workspace / ".git"
+    try:
+        root_stat = workspace.lstat()
+        return (
+            stat.S_ISDIR(root_stat.st_mode)
+            and (root_stat.st_dev, root_stat.st_ino) == verified_inode
+            and stat.S_ISDIR(git_dir.lstat().st_mode)
+            and not git_dir.is_symlink()
+        )
+    except OSError:
+        return False
+
+
+# --------------------------------------------------------------------------
+# Teardown (the other mutating git subcommands: `worktree remove` / `prune`)
+# --------------------------------------------------------------------------
+
+
+def remove_workspace(
+    workspace_path: str | Path,
+    repository_path: str | Path,
+    *,
+    verified_clean: bool = False,
+    verified_inode: tuple[int | None, int | None] | None = None,
+) -> str:
+    """Best-effort teardown of a worktree this module (or a caller using the
+    same convention) provisioned. Never raises: this runs after a task's
+    outcome is already decided, so a cleanup failure must turn into a log
+    line for the next sweep, never into a retried or lost report.
+
+    Scoped by `is_pipeline_owned_worktree` — it removes only a linked
+    worktree of `repository_path`, never the primary working tree, a
+    different repository, or a path it cannot prove it owns — so a caller may
+    invoke this unconditionally on every attempt without risking a directory
+    it did not create.
+
+    Returns one of:
+    - `"removed"` — the worktree and its `.git/worktrees/<name>` metadata are
+      gone.
+    - `"not_found"` — nothing was there to remove (already cleaned by a prior
+      attempt, or provisioning never got far enough to create it).
+    - `"not_owned"` — fails closed rather than delete something unproven.
+    - `"remove_failed"` — `git worktree remove` refused, most commonly a
+      dirty tree (uncommitted or untracked leftovers). Deliberately not
+      retried with `--force`: force-removing would destroy whatever an agent
+      or an operator might still want to inspect after a failure. The path is
+      simply left in place and reused (`"reused"`) by the next
+      `provision_workspace` call for the same branch.
+    """
+    raw_workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
+    if raw_workspace.is_symlink():
+        return "not_owned"
+    if not raw_workspace.exists():
+        return "not_found"
+    inode = (
+        (int(verified_inode[0]), int(verified_inode[1]))
+        if verified_inode is not None and None not in verified_inode
+        else None
+    )
+    if _is_pipeline_owned_standalone_clone(raw_workspace, repository_path, inode):
+        # Never execute Git against agent-controlled config during teardown.
+        # The caller may set this only after the trusted publisher proved the
+        # candidate clean and durable, or when the executor never started.
+        if not verified_clean:
+            return "remove_failed"
+        quarantine_root = raw_workspace.parent / ".aicc-quarantine"
+        # An agent-writable parent means .aicc-quarantine could be a symlink
+        # to an attacker directory; mkdir(exist_ok=True) would follow it and
+        # os.replace would move the (credential-bearing) clone there with
+        # this privileged process's rights. Reject any non-directory /
+        # symlink and pin the mode explicitly (review finding on 6218a21).
+        try:
+            quarantine_root.mkdir(mode=0o700, exist_ok=True)
+        except OSError:
+            return "remove_failed"
+        # Pin the validated directory with a DESCRIPTOR: a pathname check
+        # followed by a pathname os.replace() left a swap window in which an
+        # agent controlling the parent redirects the privileged move
+        # (independent-review finding on 09554a1). O_NOFOLLOW+O_DIRECTORY
+        # refuses a symlink at open time; the fstat validates the very
+        # object the dst_dir_fd rename below will use.
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        try:
+            quarantine_fd = os.open(quarantine_root, directory_flags)
+        except OSError:
+            return "remove_failed"
+        except NotImplementedError:
+            # dir_fd-relative rename/lstat below are POSIX-only; Windows
+            # raises NotImplementedError, which is not an OSError and would
+            # escape the cleanup path (review on 6e22b93).
+            return "remove_failed"
+        try:
+            try:
+                root_stat = os.fstat(quarantine_fd)
+                if not stat.S_ISDIR(root_stat.st_mode):
+                    return "remove_failed"
+                # An attacker-OWNED real directory passes every shape check
+                # and would receive the credential-bearing clone; the
+                # quarantine root must belong to this privileged process
+                # (independent-review finding on fd5de6b).
+                if root_stat.st_uid not in {0, os.geteuid()}:
+                    return "remove_failed"
+                if stat.S_IMODE(root_stat.st_mode) != 0o700:
+                    os.fchmod(quarantine_fd, 0o700)
+            except OSError:
+                return "remove_failed"
+            quarantine_name = f"{raw_workspace.name}.{os.getpid()}.{time.time_ns()}"
+            quarantine = quarantine_root / quarantine_name
+            try:
+                try:
+                    os.rename(
+                        raw_workspace,
+                        quarantine_name,
+                        dst_dir_fd=quarantine_fd,
+                    )
+                except NotImplementedError:
+                    return "remove_failed"
+                # Residual: shutil.rmtree below re-resolves the quarantine
+                # by pathname; acceptable because the DESTINATION directory
+                # was fd-pinned for the move and the clone is already out of
+                # the agent-writable parent by then (review on 6e22b93).
+                quarantine_stat = os.lstat(quarantine_name, dir_fd=quarantine_fd)
+                if (quarantine_stat.st_dev, quarantine_stat.st_ino) != inode:
+                    return "remove_failed"
+                shutil.rmtree(quarantine)
+                # Marker last: a failed rmtree must not leave a quarantined
+                # clone whose ownership marker is already destroyed
+                # (independent-review finding on fd5de6b).
+                _task_local_marker_path(raw_workspace).unlink(missing_ok=True)
+            except OSError:
+                return "remove_failed"
+        finally:
+            os.close(quarantine_fd)
+        return "removed"
+    workspace = raw_workspace.resolve()
+    if not is_pipeline_owned_worktree(workspace, repository_path):
+        return "not_owned"
+    repo = _resolve(repository_path)
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "remove", str(workspace)],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except _GIT_OPERATION_ERRORS:
+        return "remove_failed"
+    if result.returncode != 0:
+        return "remove_failed"
+    # Reconciles this worktree's own `.git/worktrees/<name>` entry
+    # immediately, on the success path. `prune_repository` below covers every
+    # other path (crash, "not_owned", "remove_failed") via the periodic sweep.
+    prune_repository(repo)
+    return "removed"
+
+
+def prune_repository(repository_path: str | Path) -> str:
+    """Reconcile dangling `.git/worktrees/<name>` metadata for
+    `repository_path` via `git worktree prune`.
+
+    Read-mostly and safe: it only removes bookkeeping for a worktree whose
+    directory is already gone, never a worktree directory itself, and never
+    touches this repository's working tree or any other worktree's files.
+
+    Exists for the sweep `remove_workspace`'s inline prune cannot cover: a
+    worker crash between `provision_workspace` and any cleanup attempt, or a
+    `remove_workspace` call that returned `"not_owned"`/`"remove_failed"`,
+    leaves dangling metadata that only a later, independent pass ever
+    revisits. `command_center.worktree_sweep` is that pass — it calls this
+    once per repository this host has configured, on a periodic cadence.
+
+    Returns `"pruned"` on success, `"not_a_repository"` if `repository_path`
+    is not a git repository on this host, or `"prune_failed"` on any other
+    git/OS error. Never raises, so a sweep over many repositories cannot be
+    aborted by one bad path — same contract as `remove_workspace`."""
+    repo = _resolve(repository_path)
+    if not repo.is_dir() or not git_info.get_status(repo).get("is_repo"):
+        return "not_a_repository"
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except _GIT_OPERATION_ERRORS:
+        return "prune_failed"
+    return "pruned" if result.returncode == 0 else "prune_failed"

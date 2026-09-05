@@ -1,0 +1,18 @@
+# Prometheus binds to the control host's Tailscale address. The distro unit
+# starts before that address necessarily exists and uses Restart=on-abnormal,
+# which does not retry an ordinary exit(1). This timer starts the unchanged,
+# vendor-owned service after boot and rearms after it becomes inactive.
+[Unit]
+Description=Recover Prometheus after the Tailscale listener is available
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+RandomizedDelaySec=15s
+Persistent=true
+Unit=prometheus.service
+
+[Install]
+WantedBy=timers.target

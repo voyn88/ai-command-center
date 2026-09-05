@@ -376,7 +376,47 @@ _SCHEMA_VERSION_TABLE_SQL = (
 )
 
 
+@contextmanager
+def _migration_file_lock(db_path: Path) -> Iterator[None]:
+    """Serialize the complete version-discovery -> validation migration pass."""
+    lock_path = db_path.with_name(f"{db_path.name}.migration-lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if lock_path.stat().st_size == 0:
+                handle.write("0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if not handle.closed:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
 def migrate(db_path: Path) -> None:
+    """Serialize migrations so a fresh concurrent bootstrap stays fresh."""
+    with _migration_file_lock(db_path):
+        _migrate_unlocked(db_path)
+
+
+def _migrate_unlocked(db_path: Path) -> None:
     """Apply every migration newer than the recorded schema version.
 
     Idempotent in two senses: every SQL-script migration statement is `IF NOT
@@ -403,9 +443,21 @@ def migrate(db_path: Path) -> None:
         db._retry_on_busy(lambda: conn.execute(db._SCHEMA_VERSION_TABLE_SQL))
         row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
         current = row["v"] if row and row["v"] is not None else 0
+        initial_version = current
         for version, step in db.MIGRATIONS:
             if version <= current:
                 continue
+            if version == 25 and 0 < initial_version < 25:
+                # Even a row-clean v24 database cannot prove that every v24
+                # writer is stopped: a live old process may be between runs
+                # and create a claimless row immediately after this commit.
+                # Only the explicit exclusive-lock cutover can cross this
+                # mixed-version boundary. A genuinely fresh DB (initial v0)
+                # still installs the complete current schema atomically.
+                raise db.FinalizationClaimCutoverRequired(
+                    "existing pre-v25 runtime schema requires the explicit "
+                    "offline finalization cutover before v25"
+                )
             if callable(step):
                 db._retry_on_busy(lambda step=step: step(conn))
             else:
@@ -419,6 +471,15 @@ def migrate(db_path: Path) -> None:
             except sqlite3.IntegrityError:
                 pass  # another process already recorded this migration version
             current = version
+        if current > db.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"runtime schema v{current} is newer than supported v{db.SCHEMA_VERSION}"
+            )
+        if current == 25:
+            # The ledger row is not enough: a partially restored or manually
+            # drifted DB must never let Supervisor startup proceed without the
+            # one-claim-per-run fencing constraints it relies on.
+            db._validate_finalization_claim_schema(conn)
         # Stamp the zone this file's naive timestamps are on, from a process
         # that also writes them. Retention reads it back instead of trusting
         # its own `TZ` (VOYN-W0-AICC-RETENTION-TZ).
