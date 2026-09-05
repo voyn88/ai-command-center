@@ -1,0 +1,50 @@
+# The backlog export tick (VOYN-W0-BACKLOG-ORCHESTRATOR BO-S4): the
+# production caller of `backlog-export` — renders `backlog_task` back into
+# the master-file markdown projection that every markdown reader parses via
+# `backlog_client.load_projection` (the console's Master Backlog panel
+# first among them).
+#
+# Without this unit `backlog-export` is a CLI command nobody runs: it
+# existed after VOYN-W0-AICC-BACKLOG-EXPORT-PROJECTION (#602) but only ever
+# fired by hand, so a projection reader still froze at whatever snapshot
+# last predated the store — the exact failure that command was written to
+# close.
+#
+# Install (control-plane host, beside the planner/review/merge ticks):
+#   cp deploy/systemd/aicc-backlog-export.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-backlog-export.timer
+#
+# Writes to $AICC_MASTER_BACKLOG — the same variable the console reads
+# (command_center/backlog_client.py MASTER_BACKLOG_ENV) — so set it once in
+# /etc/aicc/app.env and both the reader and this writer agree on the path.
+# A missed tick leaves readers on a slightly stale render, never a
+# corrupted one: the write is an atomic whole-file replace
+# (`command_center.projection_writer.write_atomically`) and every run
+# regenerates the whole file from the store, so a skipped tick has no
+# lasting effect.
+#
+# This is one half of a deliberately temporary bidirectional bridge —
+# `ops/aicc_backlog_publish.py` still imports the human-authored file in
+# the other direction so the owner can keep hand-editing it during the
+# migration. See docs/adr/0011-backlog-projection-bidirectional-bridge.md
+# for why both directions exist right now and the explicit condition and
+# date for retiring the import side.
+
+[Unit]
+Description=AI Command Center backlog export (store -> markdown projection)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aicc-app
+Group=aicc-app
+EnvironmentFile=/etc/aicc/app.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db backlog-export --output ${AICC_MASTER_BACKLOG}
+TimeoutStartSec=60s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

@@ -1,0 +1,17 @@
+# Schedule for aicc-backlog-export.service (BO-S4). Five minutes matches the
+# publisher's own cadence (com.ai-command-center.backlog-publish.plist) and
+# the control plane's other ticks: a task landed by the planner is visible
+# in the rendered file within one round trip, and a change published from
+# the human-authored file is visible in the rendered file within two.
+
+[Unit]
+Description=Run the AICC backlog export every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

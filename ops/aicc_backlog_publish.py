@@ -21,6 +21,15 @@ import runs, so a truncated or garbled transfer is refused rather than
 imported; the staging file is removed whether the import succeeded or not; and
 a non-zero exit is returned for every failure, so a scheduler that only checks
 status still learns that the store is no longer current.
+
+This is one half of a deliberately temporary bidirectional bridge: the store
+also exports back to the same markdown shape (`command_center/db/
+backlog_export.py`, `backlog-export`, BO-S4) so readers of the file stay
+current without the owner touching it. Running both directions at once is
+safe only while the owner treats this file as input and never edits a
+generated export directly -- see
+docs/adr/0011-backlog-projection-bidirectional-bridge.md for the explicit
+condition and date this script retires under.
 """
 
 from __future__ import annotations

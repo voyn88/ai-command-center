@@ -29,6 +29,15 @@ route (the store's writer identity); the remaining narrative fields
 ``parallel_domain``) live inside free-text bodies, and inventing summaries
 here would put a second author's words into a record that claims to be a
 projection — they render as ``-`` until the store grows those columns.
+
+Rendering exists here but a tick has to actually call it: production runs
+this through ``backlog-export`` on ``deploy/systemd/aicc-backlog-export.timer``
+(five-minute cadence, matching the import side's own publisher). Both
+directions running together is a deliberately temporary bridge — see
+``docs/adr/0011-backlog-projection-bidirectional-bridge.md`` for the
+condition and date the import side (``backlog-import`` /
+``ops/aicc_backlog_publish.py``) retires under, leaving this module as the
+only crossing.
 """
 
 from __future__ import annotations
