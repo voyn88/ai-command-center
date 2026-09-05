@@ -173,4 +173,4 @@ def test_inactive_lane_and_prometheus_failure_are_reported() -> None:
 
 def test_prometheus_probe_rejects_non_http_urls() -> None:
     assert not prometheus_is_ready("file:///etc/passwd")
-    assert not prometheus_is_ready("http://user:secret@example.invalid/-/ready")
+    assert not prometheus_is_ready("http://user@example.invalid/-/ready")
