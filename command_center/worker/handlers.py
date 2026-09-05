@@ -243,6 +243,13 @@ def _cascade_link(request, attempt_no: int) -> dict[str, Any] | None:
     return request.cascade[min(attempt_no, len(request.cascade)) - 1]
 
 
+def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> bool:
+    """A route switch may change providers, never the workspace safety model."""
+    return (
+        current_task_type in agent_runner.MUTATING_TASK_TYPES
+    ) == (candidate_task_type in agent_runner.MUTATING_TASK_TYPES)
+
+
 def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     if executor == "openai_http":
         # No CLI to probe and no principal to isolate: the bridge is this
@@ -325,6 +332,8 @@ def _run_agent(
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
                 continue
             candidate_task_type = str(candidate.get("task_type", request.task_type))
+            if not _same_mutability_class(task_type, candidate_task_type):
+                continue
             candidate_available, candidate_detail, candidate_reason = (
                 _executor_preflight(candidate_executor, candidate_task_type)
             )
@@ -663,6 +672,8 @@ def _run_agent(
                         candidate_task_type = str(
                             candidate.get("task_type", request.task_type)
                         )
+                        if not _same_mutability_class(task_type, candidate_task_type):
+                            continue
                         candidate_available, _, _ = _executor_preflight(
                             candidate_executor, candidate_task_type
                         )
@@ -707,11 +718,20 @@ def _run_agent(
                 if candidate_executor not in agent_runner.COMMAND_BUILDERS:
                     continue
                 candidate_task_type = str(candidate.get("task_type", request.task_type))
+                if not _same_mutability_class(task_type, candidate_task_type):
+                    continue
                 candidate_available, _, _ = _executor_preflight(
                     candidate_executor, candidate_task_type
                 )
                 if not candidate_available:
                     continue
+                route_failovers.append(
+                    {
+                        "cascade_step": cascade_step,
+                        "executor": executor,
+                        "reason": "codex_workspace_sandbox",
+                    }
+                )
                 executor = candidate_executor
                 task_type = candidate_task_type
                 model = request.model

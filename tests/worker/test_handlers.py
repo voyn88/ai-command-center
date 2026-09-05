@@ -427,8 +427,11 @@ def test_bwrap_loopback_result_is_retryable_infrastructure_failure(
 ):
     run_agent, _runs = handler
     payload = _cascade_payload()
-    payload["cascade"][0]["executor"] = "codex"
-    payload["cascade"][0]["task_type"] = "implementation"
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
     monkeypatch.setattr(
         agent_runner, "_codex_workspace_write_preflight_result", (True, "")
     )
@@ -462,6 +465,13 @@ def test_bwrap_loopback_result_is_retryable_infrastructure_failure(
     assert outcome.ok
     assert outcome.result["cascade_step"] == 2
     assert seen == ["codex", payload["cascade"][1]["executor"]]
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "reason": "codex_workspace_sandbox",
+        }
+    ]
     assert agent_runner.codex_workspace_write_preflight()[0] is False
 
 
@@ -470,8 +480,11 @@ def test_codex_workspace_preflight_skips_to_fallback_without_spending_attempt(
 ):
     run_agent, runs = handler
     payload = _cascade_payload()
-    payload["cascade"][0]["executor"] = "codex"
-    payload["cascade"][0]["task_type"] = "implementation"
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
     monkeypatch.setattr(
         agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap")
     )
@@ -651,6 +664,39 @@ def test_unknown_copilot_failure_switches_for_read_only_review(
     assert outcome.ok
     assert outcome.result["cascade_step"] == 2
     assert runs[-1]["executor"] == "claude"
+
+
+def test_provider_failover_never_crosses_the_workspace_mutability_boundary(
+    handler, monkeypatch
+):
+    run_agent, runs = handler
+
+    def quota_failure(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=4,
+            stdout="",
+            stderr="AI credit usage limit reached",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", quota_failure)
+    payload = _payload(
+        task_type="review",
+        cascade=[
+            {"executor": "copilot", "task_type": "review"},
+            {"executor": "claude", "task_type": "implementation"},
+        ],
+    )
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable
+    assert [run["executor"] for run in runs] == ["copilot"]
+    assert "provider/auth/quota" in outcome.reason
 
 
 def test_genuine_task_failure_with_error_flavoured_text_still_ok(
