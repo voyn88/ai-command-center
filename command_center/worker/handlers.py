@@ -599,6 +599,7 @@ def _run_agent(
         # visibility-window expiry / supersession in `work_queue_store`,
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
+        route_failovers: list[dict[str, Any]] = []
         while True:
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
@@ -615,6 +616,77 @@ def _run_agent(
                 and isolated_workspace is not None
                 and not lease_lost.is_set()
             ):
+                result_text = agent_runner.extract_result_text(run.stdout)
+                provider_failure = run.is_executor_provider_error(executor) or (
+                    executor == "copilot"
+                    and task_type not in agent_runner.MUTATING_TASK_TYPES
+                    and run.status != "completed"
+                )
+                # A provider/auth/quota refusal happens before useful model work.
+                # For read-only work the execution policy already prevents writes;
+                # for mutating work prove the isolated workspace is untouched before
+                # allowing another provider to inherit it.  This keeps failover
+                # inside the current queue lease, so an exhausted account neither
+                # consumes an attempt nor creates a red work_attempt row.
+                safe_to_fail_over = task_type not in agent_runner.MUTATING_TASK_TYPES
+                if (
+                    provider_failure
+                    and not safe_to_fail_over
+                    and isolated_workspace is not None
+                ):
+                    safe_to_fail_over = workspace_provisioning.task_workspace_is_unchanged(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        remote_url=evidence.remote_url,
+                        start_sha=evidence.start_sha,
+                        trusted_base_sha=evidence.base_sha,
+                        expected_remote_sha=evidence.remote_task_sha,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                    )
+                fallback_selected = False
+                if (
+                    provider_failure
+                    and safe_to_fail_over
+                    and cascade_step is not None
+                    and not lease_lost.is_set()
+                ):
+                    for candidate_step in range(
+                        cascade_step + 1, len(request.cascade) + 1
+                    ):
+                        candidate = request.cascade[candidate_step - 1]
+                        candidate_executor = str(candidate.get("executor"))
+                        if candidate_executor not in agent_runner.COMMAND_BUILDERS:
+                            continue
+                        candidate_task_type = str(
+                            candidate.get("task_type", request.task_type)
+                        )
+                        candidate_available, _, _ = _executor_preflight(
+                            candidate_executor, candidate_task_type
+                        )
+                        if not candidate_available:
+                            continue
+                        route_failovers.append(
+                            {
+                                "cascade_step": cascade_step,
+                                "executor": executor,
+                                "reason": "provider_auth_or_quota",
+                            }
+                        )
+                        executor = candidate_executor
+                        task_type = candidate_task_type
+                        model = request.model
+                        model_override = candidate.get("model")
+                        if isinstance(model_override, str) and model_override.strip():
+                            model = model_override
+                        link = candidate
+                        cascade_step = candidate_step
+                        fallback_selected = True
+                        break
+                if fallback_selected:
+                    continue
                 break
             agent_runner.disable_codex_workspace_write(_tail(run.stderr or run.stdout))
             unchanged = workspace_provisioning.task_workspace_is_unchanged(
@@ -685,6 +757,7 @@ def _run_agent(
         result = {
             "cascade_step": cascade_step,
             "executor": (link or {}).get("executor", "claude"),
+            "route_failovers": route_failovers,
             **_machine_outcome(result_text),
             "status": run.status,
             "exit_code": run.exit_code,
