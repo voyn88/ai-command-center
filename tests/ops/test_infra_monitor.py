@@ -4,6 +4,7 @@ from command_center.ops.infra_monitor import (
     QueueSnapshot,
     evaluate,
     parse_worker_units,
+    prometheus_is_ready,
 )
 
 
@@ -73,3 +74,8 @@ def test_inactive_lane_and_prometheus_failure_are_reported() -> None:
 
     assert not report.ok
     assert report.failures == ("active_workers:1<2", "prometheus_unready")
+
+
+def test_prometheus_probe_rejects_non_http_urls() -> None:
+    assert not prometheus_is_ready("file:///etc/passwd")
+    assert not prometheus_is_ready("http://user:secret@example.invalid/-/ready")

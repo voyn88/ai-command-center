@@ -8,11 +8,12 @@ lanes, the durable queue, and the configured metrics endpoint instead.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import subprocess
-import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,12 +100,34 @@ def read_queue_snapshot() -> QueueSnapshot:
 
 
 def prometheus_is_ready(url: str) -> bool:
+    connection: http.client.HTTPConnection | None = None
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            body = response.read(256).decode("utf-8", errors="replace")
-            return response.status == 200 and "ready" in body.lower()
-    except (OSError, ValueError):
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return False
+        client = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        connection = client(parsed.hostname, parsed.port, timeout=5)
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        connection.request("GET", target)
+        response = connection.getresponse()
+        body = response.read(256).decode("utf-8", errors="replace")
+        return response.status == 200 and "ready" in body.lower()
+    except (OSError, ValueError, http.client.HTTPException):
         return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def evaluate(
