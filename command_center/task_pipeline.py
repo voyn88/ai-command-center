@@ -234,6 +234,10 @@ REMEDIATION_BY_REASON: dict[str, str] = {
         "Задача уже в статусе Done — запись очереди устарела, удалите её."
     ),
     execution_queue.LAUNCH_SKIP_TASK_NOT_FOUND: "Задача очереди больше не существует — очистите запись очереди.",
+    execution_queue.LAUNCH_SKIP_READ_ONLY_MASTER: (
+        "Задача из master backlog доступна только для чтения — "
+        "запускайте локальную задачу проекта, а не её master-проекцию."
+    ),
     execution_queue.LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED: (
         "Укажите workspace_path задачи или repository_path проекта."
     ),
