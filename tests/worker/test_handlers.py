@@ -194,9 +194,11 @@ def test_missing_fields_are_named() -> None:
     assert "project_id" in error.reason and "prompt" in error.reason
 
 
-def test_timeout_beyond_visibility_ceiling_is_refused() -> None:
+def test_timeout_beyond_agent_run_ceiling_is_refused() -> None:
     error = parse_agent_run(_payload(timeout_seconds=3601))
     assert isinstance(error, PayloadError) and "3600" in error.reason
+    assert "agent_runner" in error.reason and "run-length ceiling" in error.reason
+    assert "queue" not in error.reason and "visibility" not in error.reason
     assert isinstance(parse_agent_run(_payload(timeout_seconds=True)), PayloadError)
 
 
@@ -908,7 +910,7 @@ def test_every_payload_defect_is_non_retryable() -> None:
     payloads through max_attempts (review finding 2)."""
     defects = [
         _payload(prompt="", project_id=None),  # missing fields
-        _payload(timeout_seconds=7200),  # beyond visibility ceiling
+        _payload(timeout_seconds=7200),  # beyond agent_runner's run-length ceiling
         _payload(model=123),  # wrong type
         _payload(untrusted="yes"),  # wrong type
     ]
