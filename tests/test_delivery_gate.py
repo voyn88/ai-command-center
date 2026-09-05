@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from command_center.delivery_gate import CheckEvidence, evaluate_delivery
@@ -132,6 +133,18 @@ def test_reconciliation_snapshot_classifies_every_observed_open_pr_and_worktree(
 
     assert len(pr_rows) == 15
     assert len(worktree_rows) == 21
-    assert all(report.count(marker) == 1 for marker in pr_rows)
-    assert all(report.count(marker) == 1 for marker in worktree_rows)
+
+    lines = report.splitlines()
+    classification = re.compile(r"\*\*[A-Za-z][A-Za-z /-]*\*\*")
+    for marker in (*pr_rows, *worktree_rows):
+        matching_lines = [line for line in lines if marker in line]
+        assert len(matching_lines) == 1, (
+            f"{marker!r} should appear on exactly one row, found on "
+            f"{len(matching_lines)}"
+        )
+        assert classification.search(matching_lines[0]), (
+            f"row for {marker!r} names no bolded classification: "
+            f"{matching_lines[0]!r}"
+        )
+
     assert "PR #157 and #158 therefore remain separate and untouched" in report
