@@ -171,6 +171,11 @@ TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
 LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
+# The trailing-24h spend could not be read at all -- distinct from
+# LAUNCH_BUDGET_EXHAUSTED, which means the spend *was* read and is at/over the
+# cap. Collapsing "unknown" into "exhausted" would report a verdict nobody
+# actually reached (VOYN-W0-AICC-REPORT-319).
+LAUNCH_SPEND_UNKNOWN = "daily_spend_status_unknown"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -2231,23 +2236,36 @@ def _locked_tick(
     #    and only while the daily spend budget (when set) has headroom. The
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
+    #
+    #    A read failure fails closed the same as a confirmed-exhausted budget
+    #    (no launch either way), but is reported as its own diagnostic branch
+    #    rather than folded into `spend_budget_exhausted` — "we don't know" is
+    #    not the same claim as "we checked and it's exhausted", and reporting
+    #    the wrong one would tell an operator the cap was hit when it was
+    #    never actually read (VOYN-W0-AICC-REPORT-319).
     spend_budget_exhausted = False
+    spend_status_unknown = False
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
-        try:
-            spend_budget_exhausted = (
-                daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
-            )
-        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
-            _record(exc, "daily_spend_budget")
-            spend_budget_exhausted = True
-    if settings.auto_launch_active and not spend_budget_exhausted:
+        status = daily_spend_status(api.db_path)
+        if status.known:
+            spend_budget_exhausted = status.amount >= settings.max_daily_spend_usd
+        else:
+            spend_status_unknown = True
+            errors.append("daily_spend_budget: trailing-24h spend status unknown")
+    if (
+        settings.auto_launch_active
+        and not spend_budget_exhausted
+        and not spend_status_unknown
+    ):
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
+    elif spend_status_unknown:
+        launch_status = LAUNCH_SPEND_UNKNOWN
+    elif spend_budget_exhausted:
+        launch_status = LAUNCH_BUDGET_EXHAUSTED
     else:
-        launch_status = (
-            LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
-        )
+        launch_status = LAUNCH_DISABLED
 
     # 9b. Nothing silently stuck: compute, from the post-dispatch state, every
     #     task that has stopped without reaching Done. Read-only.
@@ -2461,3 +2479,37 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             total += float(cost)
     return total
+
+
+@dataclass(frozen=True)
+class SpendStatus:
+    """Whether the trailing-24h spend could be read, and its value when it could.
+
+    `amount` is `None` exactly when `known` is `False` -- a read failure (a DB
+    outage, a locked file, ...) means the caller does not know today's spend,
+    which is not the same fact as "today's spend is at or over the cap". A
+    caller must branch on `known` before ever looking at `amount`, never
+    collapse "unknown" into a spend figure (a fabricated `0.0`) or into a
+    budget verdict (VOYN-W0-AICC-REPORT-319: spend-unknown is not a verdict).
+    """
+
+    known: bool
+    amount: float | None
+
+
+def daily_spend_status(db_path: Path) -> SpendStatus:
+    """The one place that asks "what did we spend today, or do we even know?"
+
+    `dispatch.service.plan()` and this module's own launch gate both call this
+    instead of each wrapping `daily_spend_usd()` in their own `except
+    Exception` -- a read failure always produces the same `known=False`
+    diagnostic here, so the two call sites cannot drift into disagreeing about
+    what an unreadable spend figure means (as happened before: one caller kept
+    treating it as `budget_unknown`, the other silently treated it as
+    "budget exhausted").
+    """
+    try:
+        return SpendStatus(known=True, amount=daily_spend_usd(db_path))
+    except Exception as exc:  # noqa: BLE001 — any read failure => status unknown
+        _LOG.warning("daily_spend_usd read failed; spend status unknown: %s", exc)
+        return SpendStatus(known=False, amount=None)

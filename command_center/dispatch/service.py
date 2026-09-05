@@ -177,13 +177,15 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # `0.0`, so the reported `daily_spend_usd`/`projected_spend_usd` in the
     # plan also read as "unknown" rather than "nothing spent today" — the same
     # fail-closed standard the assignment decision already gets.
-    budget_unknown = False
-    spend: float | None
-    try:
-        spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
-        spend = None
-        budget_unknown = True
+    #
+    # `daily_spend_status` is the single place that turns a read failure into
+    # "unknown" (rather than each caller wrapping `daily_spend_usd` in its own
+    # `except Exception`) — this diagnostic branch on `.known` is what keeps
+    # this plan and the pipeline's own launch gate from ever disagreeing about
+    # what an unreadable spend figure means (VOYN-W0-AICC-REPORT-319).
+    status = task_pipeline.daily_spend_status(resolved_db)
+    budget_unknown = not status.known
+    spend = status.amount
 
     return plan_dispatch(
         collect_queued_tasks(root),

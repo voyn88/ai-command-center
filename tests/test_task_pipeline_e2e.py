@@ -533,6 +533,43 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     assert [d.task_id for d in ungated.launched()] == ["s"]
 
 
+def test_daily_spend_status_unknown_is_not_reported_as_exhausted(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    """VOYN-W0-AICC-REPORT-319: a trailing-24h spend read failure fails closed
+    (no launch) exactly like a confirmed-exhausted budget, but must not be
+    *reported* as `daily_spend_budget_exhausted` — that would tell an operator
+    the cap was checked and hit, when it was never actually read."""
+
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-s")
+    wt = tmp_path / "wt" / "s"
+    task = _task("s", "AIOS", wt, branch="task/s")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"s": task})
+    configs = project_config.load_project_configs()
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+
+    status = task_pipeline.daily_spend_status(api.db_path)
+    assert status.known is False
+    assert status.amount is None
+
+    gated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
+    assert gated.launched() == []
+    assert gated.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN
+    assert gated.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+
+
 def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeypatch, caplog):
     """A `jsonb`-backed read (the PostgreSQL mirror, VOYN-W0-AICC-SRV-01B) hands
     back a `payload` that is already a decoded `dict`, not JSON text, and
