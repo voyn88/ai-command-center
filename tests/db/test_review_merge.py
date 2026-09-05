@@ -1,18 +1,15 @@
-"""review_once / merge_once (BO-S3b 2/3, 3/3) on live PostgreSQL: the store
-side is real (READY_TO_REVIEW tasks with pr evidence), gh is faked in-process
-by patching the module's _gh, and enqueue is a recording stub."""
+"""review_once (BO-S3b 2/3) on live PostgreSQL: the store side is real
+(READY_TO_REVIEW tasks with pr evidence) and enqueue is a recording stub.
+
+The merge side (BO-S3b 3/3) is `command_center.orchestrator.merge_gateway`,
+tested in tests/db/test_merge_gateway.py — this module holds no merge
+capability at all (VOYN-W0-AICC-MERGE-GATEWAY)."""
 
 from __future__ import annotations
 
-import json
-
 
 from tests.db.test_backlog_planner import _test_repo_routes, rig  # noqa: F401 — pytest fixtures
-from command_center.orchestrator import review_merge
-from command_center.orchestrator.review_merge import (
-    merge_once, review_once,
-)
-
+from command_center.orchestrator.review_merge import review_once
 
 
 def _ready(store, factory, task_id, pr):
@@ -43,71 +40,3 @@ def test_review_enqueues_one_run_per_ready_task(rig):  # noqa: F811
     q, key, payload = calls[0]
     assert key == "review:VOYN-W0-R1"  # idempotency key
     assert payload["task_type"] == "review" and "pull/7" in payload["prompt"]
-
-
-def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noqa: F811
-
-    app_factory, store, _ = rig
-    _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
-    head = "a" * 40
-
-    def fake_gh(argv, repo):
-        import subprocess
-        if argv[:2] == ["pr", "view"]:
-            body = json.dumps({
-                "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-            })
-            return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
-        return subprocess.CompletedProcess(argv, 1, "", "?")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M1", head) in report.merged
-    with app_factory() as c, c.cursor() as cur:
-        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1",))
-        assert cur.fetchone()[0] == "DONE"
-
-
-def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
-
-    app_factory, store, _ = rig
-    _ready(store, app_factory, "VOYN-W0-M2", "https://github.com/x/y/pull/9")
-
-    def fake_gh(argv, repo):
-        import subprocess
-        body = json.dumps({
-            "state": "OPEN", "headRefOid": "b" * 40, "reviews": [],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-        })
-        return subprocess.CompletedProcess(argv, 0, body, "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M2", "no_accept_marker_on_head") in report.skipped
-    with app_factory() as c, c.cursor() as cur:
-        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M2",))
-        assert cur.fetchone()[0] == "READY_TO_REVIEW"  # untouched
-
-
-def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
-
-    app_factory, store, _ = rig
-    _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/10")
-    head = "c" * 40
-
-    def fake_gh(argv, repo):
-        import subprocess
-        body = json.dumps({
-            "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
-        })
-        return subprocess.CompletedProcess(argv, 0, body, "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    report = merge_once(app_factory, "/tmp")
-    assert any(t == "VOYN-W0-M3" and "checks_not_green" in r for t, r in report.skipped)

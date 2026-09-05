@@ -1,9 +1,36 @@
+# The merge-gateway tick (VOYN-W0-AICC-MERGE-GATEWAY, P0-5): the only process
+# in this deployment allowed to run `gh pr merge`.
+#
+# Runs as its own OS user (`aicc-merge-gateway`), never `aicc-worker`, and
+# loads its own environment file carrying a GitHub credential the worker does
+# not hold (AICC_MERGE_GATEWAY_TOKEN — a token for an identity distinct from
+# whatever publishes branches/PRs and whatever publishes the ACCEPT/REJECT
+# marker). Running this tick as `aicc-worker` under the worker's own env file
+# would put the merge credential right back in the same ambient session the
+# worker pushes and opens pull requests with — the exact sharing
+# `command_center.orchestrator.merge_gateway` exists to end.
+#
+# Install (control-plane host):
+#   useradd --system --no-create-home aicc-merge-gateway   # once
+#   install -m 0600 -o aicc-merge-gateway <token file> /etc/aicc/merge-gateway.env
+#   cp deploy/systemd/aicc-backlog-merge.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-backlog-merge.timer
+
 [Unit]
-Description=AICC backlog merge tick (BO-S3b)
+Description=AICC merge gateway tick (VOYN-W0-AICC-MERGE-GATEWAY)
 After=postgresql.service
 
 [Service]
 Type=oneshot
-User=aicc-worker
-EnvironmentFile=-/etc/ai-command-center.env
+User=aicc-merge-gateway
+Group=aicc-merge-gateway
+EnvironmentFile=/etc/aicc/merge-gateway.env
 ExecStart=/usr/bin/python -m command_center.db backlog-merge --repo-path /srv/ai-command-center
+
+# Containment: this process reads PR state, resolves its own identity, and
+# writes to PostgreSQL and to one `gh pr merge` call — nothing here needs a
+# home directory or a writable system.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

@@ -90,9 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser(
         "backlog-merge",
-        help="One merge tick (BO-S3b): merge every reviewed PR whose ACCEPT "
-        "marker and checks are green, closing the task DONE "
-        "(aicc-backlog-merge.timer). Needs --repo-path.",
+        help="One merge-gateway tick (VOYN-W0-AICC-MERGE-GATEWAY): merge every "
+        "PR carrying an independent, non-self ACCEPT verdict on its exact head "
+        "and terminally-green required checks, closing the task DONE "
+        "(aicc-backlog-merge.timer). Needs --repo-path and "
+        "AICC_MERGE_GATEWAY_TOKEN in the environment.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
@@ -281,14 +283,19 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
 
-                from command_center.orchestrator.review_merge import merge_once
+                from command_center.orchestrator.merge_gateway import merge_once
 
                 report = merge_once(lambda: _nc(conn), args.repo_path)
                 for task_id, head in report.merged:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
-                return 0
+                for task_id, reason in report.errors:
+                    print(f"ERROR     {task_id}: {reason}", file=sys.stderr)
+                # GitHub being unreachable/unauthenticated is a refusal, not a
+                # skip: a non-zero exit here fails the systemd oneshot loudly
+                # instead of the tick looking identical to "nothing ready yet".
+                return 1 if report.errors else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
