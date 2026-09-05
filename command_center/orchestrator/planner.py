@@ -217,10 +217,20 @@ class Planner:
                     "                        'dispatch', 'return_to_pool',"
                     "                        'resume_deferred')"
                     "       AND e2.event_id > park.event_id) "
+                    # The anti-ping-pong bound is a sliding WINDOW, not a
+                    # lifetime score: three granted resumes within the
+                    # trailing 48h say "this park re-arms itself faster than
+                    # automation can help — a human should look". A lifetime
+                    # count buried tasks forever: parks from the dead-codex
+                    # era (2026-09) exhausted their 3 and stayed DEFER even
+                    # after the pipeline that parked them was fixed
+                    # (VOYN-W0-AICC-DEFER-AUTO-RESUME-REM).
                     "  AND (SELECT count(*) FROM backlog_event e"
                     "        WHERE e.task_id = t.task_id"
                     "          AND e.event = 'resume_deferred'"
-                    "          AND e.outcome = 'granted') < 3 "
+                    "          AND e.outcome = 'granted'"
+                    "          AND e.created_at > now() - interval '48 hours'"
+                    "       ) < 3 "
                     "ORDER BY t.priority NULLS LAST, t.wave, t.task_id "
                     "LIMIT %s",
                     (limits.max_resumes_per_tick,),

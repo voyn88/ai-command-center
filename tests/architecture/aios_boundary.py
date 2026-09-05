@@ -53,8 +53,22 @@ Engine signatures (deliberately structural, never a grep over comments):
   docstring-only ``__init__.py`` and a module that renders SQL text were
   violations, which made it impossible for the control plane to keep any
   database-adjacent module at all -- a gate policing names rather than
-  behaviour. Every other category still classifies on the name alone: nothing
-  loosened for queue, orchestration, authz or audit.
+  behaviour. ``orchestration`` and ``authz`` still classify on the name alone:
+  nothing loosened for them.
+
+  The ``audit`` name tokens are also corroborated, but narrowly -- see
+  :func:`_behaves_like_an_audit_engine`. Two modules under ``command_center/db``
+  (``audit_store.py``, ``provenance_store.py``) declare nothing but
+  ``PostgresTableMirror`` tables over rows that already exist elsewhere; the
+  false positive is recorded in both files' docstrings and in
+  ``VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION``. Unlike ``memory``/``queue``,
+  where any file behaving like a store/queue corroborates the name, the
+  ``audit`` corroboration is a single positively-validated shape -- an
+  allow-list of "declares tables and nothing else", not a blocklist of
+  suspicious constructs -- because ``audit`` has no behavioural substitute the
+  way ``_runs_queue_operations`` is for ``queue``: anything that is not
+  *exactly* that declarative shape still classifies, so a real audit engine
+  cannot launder itself through this exemption by avoiding ``def``.
 
   Strictness is not reduced for a real engine. A file that owns persistence
   imports a driver (statically, aliased, or via ``importlib`` with a literal
@@ -242,10 +256,22 @@ NAME_SUBSTRING_SIGNATURES: dict[str, tuple[str, ...]] = {
 #: `repository`, `queue`, ...) name what a file is *about* as readily as what
 #: it *is* — a directory called `db/` says nothing about whether the code
 #: inside owns an engine — *and* because each has a behavioural substitute that
-#: keeps a home-grown engine detected. `orchestration`, `authz` and `audit` are
-#: deliberately absent: no equivalent substitute has been demonstrated for
-#: them, and corroborating a name without one is a straight loss of coverage.
-CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue"})
+#: keeps a home-grown engine detected: any file that behaves like a store or a
+#: queue still classifies, whatever it is (or is not) called.
+#:
+#: `audit` also qualifies, but on different terms — see
+#: `_behaves_like_an_audit_engine`. It has no behavioural substitute of that
+#: shape: nothing plays the role `_persists_data`/`_runs_queue_operations` play,
+#: so corroborating it the same way would be a straight loss of coverage. What
+#: it has instead is one *narrow, positively validated* exemption for a single
+#: recurring false positive: a module whose entire body is imports, constant
+#: table declarations and well-formed `PostgresTableMirror` subclasses, and
+#: nothing else. Anything outside that exact shape still classifies on the name
+#: alone, exactly as before.
+#:
+#: `orchestration` and `authz` remain uncorroborated: no substitute and no
+#: narrow exemption has been demonstrated for either.
+CORROBORATED_NAME_CATEGORIES = frozenset({"memory", "queue", "audit"})
 
 # --- queue-engine behaviour (corroboration for the `queue` name signature) ---
 
@@ -680,10 +706,184 @@ def _corroborates_queue_name(tree: ast.AST) -> bool:
     )
 
 
+# --- declarative-mirror shape (corroboration for the `audit` name signature) -
+
+#: Factory calls a declarative mirror module is allowed to make. Deliberately
+#: short: widening this list widens what can hide inside an "exempt" module, so
+#: it names exactly the callables `command_center/db/audit_store.py` and
+#: `command_center/db/provenance_store.py` actually use, not "anything that
+#: looks like a constructor".
+_DECLARATIVE_FACTORY_NAMES = frozenset(
+    {"MirroredTable", "ColumnCodec", "divergence_against", "frozenset"}
+)
+
+#: The one base a class must have to be considered a table declaration rather
+#: than engine code wearing a mirror's name.
+_MIRROR_BASE_NAME = "PostgresTableMirror"
+
+
+def _is_docstring_statement(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+def _call_target_name(node: ast.Call) -> str | None:
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _is_declarative_value(node: ast.AST) -> bool:
+    """Whether `node` is data — a literal, a name reference, or a call to one
+    of the known declarative factories built only from more of the same.
+
+    An allow-list, not a blocklist: anything not explicitly recognised (a
+    lambda, a comprehension, a call to an unlisted function, `**kwargs`, a
+    starred argument, an f-string) returns `False`, and `False` here means
+    "this module still classifies as `audit`" — the safe direction.
+    """
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_declarative_value(elt) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(
+            (key is None or _is_declarative_value(key)) and _is_declarative_value(value)
+            for key, value in zip(node.keys, node.values)
+        )
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, ast.Attribute):
+        return _is_declarative_value(node.value)
+    if isinstance(node, ast.Call):
+        if _call_target_name(node) not in _DECLARATIVE_FACTORY_NAMES:
+            return False
+        if any(isinstance(arg, ast.Starred) for arg in node.args):
+            return False
+        if any(kw.arg is None for kw in node.keywords):
+            return False
+        return all(_is_declarative_value(arg) for arg in node.args) and all(
+            _is_declarative_value(kw.value) for kw in node.keywords
+        )
+    return False
+
+
+def _is_declarative_assign(stmt: ast.Assign) -> bool:
+    if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+        return False
+    return _is_declarative_value(stmt.value)
+
+
+def _is_declarative_ann_assign(stmt: ast.AnnAssign) -> bool:
+    if not isinstance(stmt.target, ast.Name):
+        return False
+    # An annotation is inert under `from __future__ import annotations`
+    # (postponed evaluation), but that import is not required here: reject any
+    # annotation that itself calls something, rather than trust the file to
+    # have opted in.
+    if any(isinstance(node, ast.Call) for node in ast.walk(stmt.annotation)):
+        return False
+    return stmt.value is None or _is_declarative_value(stmt.value)
+
+
+def _is_mirror_base(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == _MIRROR_BASE_NAME
+    if isinstance(node, ast.Attribute):
+        return node.attr == _MIRROR_BASE_NAME
+    return False
+
+
+def _is_mirror_class_def(node: ast.ClassDef) -> bool:
+    """Whether `node` declares a table and nothing else.
+
+    Checked structurally, not by name: real bases only (`PostgresTableMirror`,
+    never an alias or a lookalike token), no decorator, no keyword (a
+    metaclass could run arbitrary code at class-creation time), and a body
+    that is a docstring plus plain `name = value` declarations — never a
+    method, a nested class, or a statement that merely happens not to be a
+    `def`. A class that inherits the base but carries a method or a bare
+    statement in its body is not this shape, and is not exempted.
+    """
+    if node.decorator_list or node.keywords:
+        return False
+    if not node.bases or not all(_is_mirror_base(base) for base in node.bases):
+        return False
+    for stmt in node.body:
+        if _is_docstring_statement(stmt):
+            continue
+        if isinstance(stmt, ast.Assign) and _is_declarative_assign(stmt):
+            continue
+        if isinstance(stmt, ast.AnnAssign) and _is_declarative_ann_assign(stmt):
+            continue
+        return False
+    return True
+
+
+def _is_declarative_mirror_module(tree: ast.AST) -> bool:
+    """Whether `tree` declares `PostgresTableMirror` tables and nothing else.
+
+    A positive allow-list of the entire module shape, walked top to bottom:
+    docstrings, imports, plain constant/table declarations and well-formed
+    mirror classes (:func:`_is_mirror_class_def`) are the only statements
+    permitted, and at least one mirror class must be present. A single
+    statement outside that shape — a `def`, a bare call (`run_audit()`, a
+    registration, SQL executed at import time), a lambda bound to a name, an
+    `if`/`for`/`try`, or a `PostgresTableMirror` subclass with anything beyond
+    `spec = ...` in its body — fails the whole module, because each of those
+    is exactly how "declares tables and nothing else" was true in appearance
+    but false in fact.
+    """
+    if not isinstance(tree, ast.Module):
+        return False
+    found_mirror_class = False
+    for stmt in tree.body:
+        if _is_docstring_statement(stmt):
+            continue
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(stmt, ast.Assign):
+            if not _is_declarative_assign(stmt):
+                return False
+            continue
+        if isinstance(stmt, ast.AnnAssign):
+            if not _is_declarative_ann_assign(stmt):
+                return False
+            continue
+        if isinstance(stmt, ast.ClassDef):
+            if not _is_mirror_class_def(stmt):
+                return False
+            found_mirror_class = True
+            continue
+        return False
+    return found_mirror_class
+
+
+def _behaves_like_an_audit_engine(tree: ast.AST) -> bool:
+    """Corroboration for the `audit` name signature (module docstring above).
+
+    Inverted relative to `_persists_data`/`_corroborates_queue_name`: those
+    return `True` for the rare file that *is* an engine among many that are
+    not, so a wide vocabulary is affordable. Here the narrow case is the
+    *exemption* — a module that is nothing but table declarations — so the
+    check is a strict positive match for that one shape
+    (:func:`_is_declarative_mirror_module`), and everything else, including
+    every construct the exemption must not be foolable by, still classifies.
+    """
+    return not _is_declarative_mirror_module(tree)
+
+
 #: Category -> the behaviour that has to corroborate its name signature.
 _CORROBORATION: dict[str, Callable[[ast.AST], bool]] = {
     "memory": _persists_data,
     "queue": _corroborates_queue_name,
+    "audit": _behaves_like_an_audit_engine,
 }
 
 

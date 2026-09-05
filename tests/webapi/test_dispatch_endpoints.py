@@ -178,6 +178,45 @@ def test_put_policy_no_longer_accepts_a_bare_body(monkeypatch):
 # --- redaction: a BANK task never surfaces in /dispatch/plan --------------
 
 
+def test_get_plan_reports_null_spend_not_a_fabricated_zero_when_unreadable(monkeypatch):
+    """End-to-end through the *real* service: a trailing-24h spend read that
+    raises must surface as `daily_spend_usd`/`projected_spend_usd` being
+    `null` in the JSON response, never `0.0` — a `0.0` reads as "nothing
+    spent today" to any caller that doesn't also check `budget_unknown`."""
+    monkeypatch.setattr(apimod, "_root", lambda: _ROOT)
+    monkeypatch.setattr(
+        dispatch_service,
+        "collect_executor_pool",
+        lambda policy: [
+            ExecutorProfile(
+                id="ollama", label="Ollama", kind="cli", is_local=True,
+                available=True, cost_per_task_usd=0.0,
+            )
+        ],
+    )
+    monkeypatch.setattr(dispatch_service, "active_by_executor", lambda db_path: {})
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    settings = pipeline_settings.load_settings(_ROOT)
+    pipeline_settings.save_settings(_ROOT, dataclasses.replace(settings, enabled=True))
+
+    tasks_repository.create_task(
+        _ROOT, project="AICC", title="ship dispatch",
+        task_type="implementation", status="Backlog",
+    )
+
+    body = _client().get("/api/v1/dispatch/plan").json()
+
+    assert body["budget_unknown"] is True
+    assert body["daily_spend_usd"] is None
+    assert body["projected_spend_usd"] is None
+    assert body["budget_remaining_usd"] is None
+    assert body["assignment_count"] == 0
+
+
 def test_get_plan_never_leaks_a_sensitive_project_task(monkeypatch):
     """End-to-end through the *real* service: a BANK task on the board must
     never appear (by id or by project) in the /dispatch/plan response, while a

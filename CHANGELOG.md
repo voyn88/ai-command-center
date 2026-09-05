@@ -8,9 +8,26 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
+- `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
+  over enrolled worker-host devices — one query joins `principal`,
+  `principal_credential_public` and `principal_event` into state, host, live
+  credential expiry and last audit event per device, plus an operator-only
+  `suspend()` over the existing `identity_revoke_principal`. Additive: no new
+  table, grant or privileged function.
+- `python -m command_center.db fleet-status` / `fleet-suspend`: the CLI
+  surface — "10 devices managed by one operational panel" as a runnable
+  command rather than five hand-run queries. See
+  `docs/operations/FLEET_STATUS.md`.
+
 ### Added (SRV-05 slice 2)
+- [`docs/adr/0011-headless-worker-service.md`](docs/adr/0011-headless-worker-service.md) — the
+  architecture record for the headless worker: the versioned payload contract, why its timeout bound
+  is `agent_runner`'s run-length ceiling and not the queue's own (continuously renewed) visibility
+  window, and why only `writer_lease.hold` — never `worktree_lease.blocking_lease` — confers mutation
+  authority for a dispatch.
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
-  (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
+  (v1): refusals as data, timeout bounded by `agent_runner`'s run-length ceiling,
   provenance defaults to untrusted.
 - `command_center/worker/handlers.py` — the payload→execution bridge through
   the existing `agent_runner.run_claude_code` (sandbox profiles, credential
