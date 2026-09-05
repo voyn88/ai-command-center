@@ -96,6 +96,12 @@ class ReviewConfig:
     queue: str = "execution"
     review_timeout: int = 900
     max_per_tick: int = 8
+    #: Global review-task backpressure. ``max_per_tick`` bounds one timer
+    #: invocation, but without accounting for work already ready/claimed,
+    #: every tick can add another full batch while the fleet is still busy.
+    #: Count distinct tasks rather than chunks so one large diff does not
+    #: consume the whole PR-level concurrency budget by itself.
+    max_active_reviews: int = 8
     #: Per-tick cap on merge-train branch updates (BEHIND PRs brought current
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
@@ -1088,6 +1094,21 @@ def review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    action_limit = cfg.max_per_tick
+    if task_id is None and callable(factory):
+        active_rows = _rows(
+            factory,
+            "SELECT count(DISTINCT task_id) FROM work_item "
+            "WHERE state IN ('ready', 'claimed') "
+            "AND idempotency_key LIKE 'review:%%'",
+        )
+        active_reviews = int(active_rows[0][0]) if active_rows else 0
+        action_limit = min(
+            action_limit,
+            max(cfg.max_active_reviews - active_reviews, 0),
+        )
+        if action_limit == 0:
+            return report
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
     # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
     # permanently filled by eternal skips (skips never bump updated_at --
@@ -1130,7 +1151,7 @@ def review_once(
     cascade = _model_only_review_cascade()
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
-        if actions >= cfg.max_per_tick:
+        if actions >= action_limit:
             break
         last_processed = (task_id, pr_url)
         if not cascade:
