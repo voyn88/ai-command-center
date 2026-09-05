@@ -440,6 +440,79 @@ def test_worker_can_call_queue_redrive_without_grants(
 
 
 # ---------------------------------------------------------------------------
+# The same defect in the backlog domain: a worker resurrecting its own park
+# via backlog_resume_deferred without grants (roles.py TODO, post-#321 slice)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_cannot_call_backlog_resume_deferred_when_grants_are_applied(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """With grants applied, the worker role must not reach backlog_resume_deferred.
+
+    ``backlog_resume_deferred`` is the backlog store's own audited exit from a
+    parked task (DEFER_TO_USER) — the same shape as ``queue_redrive`` for the
+    work queue, declared to ``aicc_app`` only (``roles._APP_BACKLOG_FUNCTIONS``).
+    A worker has no legitimate reason to un-park a task, let alone one whose
+    own dispatch parked it — resurrecting it would be indistinguishable from a
+    worker reviving its own dead letter.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with psycopg.connect(
+        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(Exception, match="permission denied"):
+                # A non-existent task id is fine: the denial must happen
+                # before any data check.
+                cur.execute("SELECT public.backlog_resume_deferred('nonexistent_task')")
+
+
+def test_worker_can_call_backlog_resume_deferred_without_grants(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Without grants the PUBLIC EXECUTE default reaches backlog_resume_deferred too.
+
+    Same defect as ``test_worker_can_call_queue_redrive_without_grants``, in the
+    backlog domain: a migrated-but-ungranted database leaves every SECURITY
+    DEFINER function reachable by any role through PostgreSQL's PUBLIC EXECUTE
+    default, so an execution host could resurrect a task out of DEFER_TO_USER
+    with no audit trail pinning that decision to an operator.
+    """
+    _migrate_only(admin_conn, psycopg, test_dsn, role_passwords)
+
+    # backlog_resume_deferred exists in the database after migrations.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.proname FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'public' AND p.proname = 'backlog_resume_deferred'"
+        )
+        assert cur.fetchone() is not None, (
+            "backlog_resume_deferred must exist after migrations"
+        )
+
+    # Without grants, worker reaches backlog_resume_deferred through PUBLIC
+    # EXECUTE. The call may succeed or fail for data reasons (there is no
+    # 'nonexistent_task' row), but it must not fail with "permission denied"
+    # — that is the defect.
+    with psycopg.connect(
+        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SELECT public.backlog_resume_deferred('nonexistent_task')")
+            except Exception as exc:
+                assert "permission denied" not in str(exc).lower(), (
+                    f"Worker got permission denied even WITHOUT grants — "
+                    f"the defect is already fixed or the test setup is wrong: {exc}"
+                )
+
+
+# ---------------------------------------------------------------------------
 # A new migration adding an object outside the policy must fail the check
 # ---------------------------------------------------------------------------
 

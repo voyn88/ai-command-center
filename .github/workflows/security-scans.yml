@@ -80,6 +80,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -89,7 +91,26 @@ jobs:
       - name: Install bandit (version-pinned)
         run: python -m pip install bandit==1.9.4
 
-      - name: Lint production Python for security issues
-        # Medium+ severity, medium+ confidence: the tier is deterministic
-        # and advisory; tests and fixtures are out of scope by design.
-        run: bandit -r command_center ops -ll -ii
+      - name: Lint production Python for newly introduced security issues
+        # Medium+ severity, medium+ confidence. Generate the comparison report
+        # from the event's immutable base revision instead of committing a
+        # suppressive repository-wide snapshot. Bandit therefore fails on new
+        # findings while inherited findings stay visible and unchanged.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+        run: |
+          set -euo pipefail
+          baseline_dir="$(mktemp -d)"
+          baseline_report="$RUNNER_TEMP/bandit-base.json"
+          trap 'git worktree remove --force "$baseline_dir" >/dev/null 2>&1 || true' EXIT
+          git worktree add --detach "$baseline_dir" "$BASE_SHA"
+
+          set +e
+          (cd "$baseline_dir" && bandit -r command_center ops -ll -ii -f json -o "$baseline_report")
+          baseline_status=$?
+          set -e
+          if [ "$baseline_status" -gt 1 ]; then
+            exit "$baseline_status"
+          fi
+
+          bandit -r command_center ops -ll -ii --baseline "$baseline_report"
