@@ -78,6 +78,49 @@ def test_pending_queue_without_recent_progress_fails_closed() -> None:
     assert report.failures == ("queue_stalled",)
 
 
+def test_recent_dead_letter_growth_fails_closed() -> None:
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=0,
+            claimed=0,
+            succeeded=10,
+            dead=12,
+            success_age_seconds=1,
+            pending_age_seconds=None,
+            recent_dead=2,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=0,
+    )
+
+    assert not report.ok
+    assert report.failures == ("dead_letter_growth:2>0",)
+
+
+def test_recent_dead_letter_threshold_is_configurable() -> None:
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=0,
+            claimed=0,
+            succeeded=10,
+            dead=12,
+            success_age_seconds=1,
+            pending_age_seconds=None,
+            recent_dead=2,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=2,
+    )
+
+    assert report.ok
+
+
 def test_new_pending_work_does_not_turn_an_idle_queue_red() -> None:
     report = evaluate(
         {

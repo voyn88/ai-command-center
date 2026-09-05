@@ -450,6 +450,43 @@ def test_a_refused_report_is_logged_not_swallowed(caplog) -> None:
     assert any("report refused as stale owner" in r.message for r in caplog.records)
 
 
+def test_a_raising_report_write_does_not_kill_the_daemon(caplog) -> None:
+    """The handler admitted a real outcome (`HandlerOutcome(ok=True, ...)`),
+    but persisting it raised -- a dropped connection, a driver that cannot
+    encode the result, any DB hiccup mid-write. That must not propagate out
+    of `run_forever` and kill the whole daemon over the one attempt it was
+    reporting: every other item still waiting in the queue would die with it.
+    The lease is left to lapse on its own; the next claim proves the daemon
+    survived and kept working."""
+    import logging
+
+    store = ScriptedStore(
+        [
+            _work({"kind": "echo"}, attempt_id="wat-1"),
+            _work({"kind": "echo"}, attempt_id="wat-2"),
+        ]
+    )
+
+    def raising_complete(work, result):
+        store.calls.append(("complete", work.attempt_id, result))
+        if work.attempt_id == "wat-1":
+            raise RuntimeError("connection reset")
+        return True
+
+    store.complete = raising_complete  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        store,
+        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
+        WorkerConfig(visibility_seconds=3),
+    )
+    with caplog.at_level(logging.ERROR):
+        _run_until_idle(daemon, store)  # must return normally, not raise
+
+    completes = [c for c in store.calls if c[0] == "complete"]
+    assert [c[1] for c in completes] == ["wat-1", "wat-2"]
+    assert any("writing the outcome raised" in r.message for r in caplog.records)
+
+
 def test_a_non_object_payload_dead_letters_instead_of_killing_the_daemon() -> None:
     """queue_enqueue accepts any jsonb; a list payload used to raise
     AttributeError out of run_forever and kill the process over one item."""
