@@ -123,6 +123,31 @@ def test_claimed_queue_without_recent_success_fails_closed() -> None:
     assert report.failures == ("queue_stalled",)
 
 
+def test_unrelated_success_does_not_hide_a_zombie_claim() -> None:
+    report = evaluate(
+        {
+            "voyn-aicc-worker@1.service": "active",
+            "voyn-aicc-worker@2.service": "active",
+            "voyn-aicc-worker@3.service": "active",
+            "voyn-aicc-worker@4.service": "active",
+        },
+        QueueSnapshot(
+            ready=0,
+            claimed=1,
+            succeeded=11,
+            dead=2,
+            success_age_seconds=5,
+            pending_age_seconds=901,
+        ),
+        minimum_active_workers=4,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert not report.ok
+    assert report.failures == ("queue_stalled",)
+
+
 def test_inactive_lane_and_prometheus_failure_are_reported() -> None:
     report = evaluate(
         {

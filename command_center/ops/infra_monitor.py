@@ -151,18 +151,14 @@ def evaluate(
     if not prometheus_ready:
         failures.append("prometheus_unready")
 
-    success_is_stale = (
-        queue.success_age_seconds is None
-        or queue.success_age_seconds > max_stalled_seconds
-    )
     # An old last-success timestamp is normal when there is no work. It becomes
-    # an incident whenever pending work (ready or claimed) has produced no
-    # recent completion; a zombie claim must not make a stalled queue healthy.
+    # context in the report once work appears; the oldest pending item is the
+    # alert clock. Unrelated successful work must not hide a zombie claim.
     pending_is_stale = (
         queue.pending_age_seconds is not None
         and queue.pending_age_seconds > max_stalled_seconds
     )
-    if queue.ready + queue.claimed > 0 and pending_is_stale and success_is_stale:
+    if queue.ready + queue.claimed > 0 and pending_is_stale:
         failures.append("queue_stalled")
 
     return MonitorReport(
