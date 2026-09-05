@@ -2766,14 +2766,16 @@ class Supervisor:
             return False
         return datetime.now() >= started + timedelta(seconds=float(timeout_seconds))
 
-    def _sigkill_orphan_group(self, run_id: str, pid: int | None, recorded_identity: str | None) -> bool:
-        """Terminalize only an orphan whose process is already confirmed gone.
+    def _orphan_confirmed_dead(self, run_id: str, pid: int | None, recorded_identity: str | None) -> bool:
+        """Whether an adopted orphan past its deadline is safe to terminalize.
 
         A persisted PID plus birth token can classify reuse, but cannot close
         the check-to-signal race or prove ownership of every descendant in a
         process group. Cross-restart destructive cleanup therefore requires a
         future pidfd+cgroup/job-object ownership handle; this conservative path
-        never signals an adopted orphan from database metadata alone.
+        never signals an adopted orphan from database metadata alone — it only
+        terminalizes the row once the process is independently confirmed gone,
+        never by sending it a signal.
         """
         if pid is None:
             return True  # nothing to signal; safe to terminalize
@@ -3163,18 +3165,21 @@ class Supervisor:
                     # timeout watchdog is gone; left alone it would run forever,
                     # holding its workspace lock and a global-concurrency slot with
                     # no way to reap it from the app (audit P0/H2). reconcile runs
-                    # periodically, so enforce the timeout here: SIGKILL its
-                    # (re-verified) process group and terminalize the row, which
-                    # releases the workspace lock and the global slot.
-                    if self._sigkill_orphan_group(run_id, pid, recorded_identity):
+                    # periodically, but a database identity is not a live
+                    # ownership handle: this never signals the process group, only
+                    # terminalizes the row once the process is independently
+                    # re-confirmed gone. A still-alive orphan past its deadline is
+                    # left adopted and RUNNING (see
+                    # test_reconcile_reaps_an_orphan_past_its_timeout).
+                    if self._orphan_confirmed_dead(run_id, pid, recorded_identity):
                         self._append_lifecycle_event_best_effort(
                             "reconciliation_orphan_timeout",
                             run_id,
                             pid=pid,
-                            detail="adopted orphan exceeded its timeout; process group killed",
+                            detail="adopted orphan exceeded its timeout and was confirmed already gone; row terminalized",
                         )
                         classification = "INTERRUPTED"
-                        detail = "orphaned run exceeded its timeout; process group terminated"
+                        detail = "orphaned run exceeded its timeout and was confirmed already gone; row terminalized"
 
                 persisted = self._persist_reconciliation_state(
                     run_id,
