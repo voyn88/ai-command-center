@@ -23,6 +23,13 @@
 # regenerates the whole file from the store, so a skipped tick has no
 # lasting effect.
 #
+# ProtectSystem=strict makes everything but ReadWritePaths= read-only, and
+# the write above needs one of those paths: ReadWritePaths= below assumes
+# $AICC_MASTER_BACKLOG lives under /opt/aicc/data, this app's own writable
+# data directory (the same one AICC_DATA_DIR defaults to: <app-root>/data).
+# Pointing the variable anywhere else means extending ReadWritePaths= to
+# match, or the tick fails with a read-only-filesystem error every run.
+#
 # This is one half of a deliberately temporary bidirectional bridge —
 # `ops/aicc_backlog_publish.py` still imports the human-authored file in
 # the other direction so the owner can keep hand-editing it during the
@@ -48,3 +55,4 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+ReadWritePaths=-/opt/aicc/data
