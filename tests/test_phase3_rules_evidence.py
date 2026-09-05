@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -230,7 +231,14 @@ def test_evaluate_disabled_rule_not_triggered(r_db: Path) -> None:
 def test_evaluate_event_ref_stored(r_db: Path) -> None:
     _make_rule(r_db, threshold=100.0)
     rule_engine.evaluate(r_db, {"amount": 200}, event_ref="txn-abc-123")
-    # No assertion on DB internals — just verify it doesn't raise
+    conn = sqlite3.connect(r_db)
+    try:
+        rows = conn.execute(
+            "SELECT event_ref, triggered FROM rule_evaluations"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [("txn-abc-123", 1)]
 
 
 def test_evaluate_multiple_rules(r_db: Path) -> None:
@@ -429,7 +437,10 @@ def test_seed_sanctions_triggers_for_iran(tmp_path: Path) -> None:
     seed(db)
     triggered = rule_engine.evaluate(db, {"country": "IR"})
     types = {r["alert_type"] for r in triggered}
-    assert "sanctions" in types or "high_risk_country" in types
+    # Iran is on both the seeded OFAC sanctions list and the FATF high-risk
+    # list, so both rules must fire independently — an "or" here would stay
+    # green even if the sanctions rule itself silently lost Iran.
+    assert {"sanctions", "high_risk_country"} <= types
 
 
 def test_seed_pep_triggers_for_pep_customer(tmp_path: Path) -> None:
