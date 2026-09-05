@@ -390,7 +390,10 @@ _REVIEW_PROMPT = (
 _CHUNK_REVIEW_PROMPT = (
     "This envelope is one deterministic chunk of an independent exact-SHA "
     "review. Review every byte in content.text, but do not infer an overall PR "
-    "ACCEPT from this partial view. The control plane posts one marker only "
+    "ACCEPT from this partial view. No tools are available or needed: do not "
+    "request or attempt any tool, shell, file, network, or permission action. "
+    "Use only content.text and always finish with the required exact two-line "
+    "verdict trailer. The control plane posts one marker only "
     "after every chunk in the same ordered manifest independently ACCEPTS the "
     "same head. "
 )
@@ -401,7 +404,7 @@ _COMPLETE_REVIEW_PROMPT = (
 
 _REVIEW_INPUT_MARKER = "\nINPUT_ENVELOPE_JSON:\n"
 
-_MAX_REVIEW_PROMPT_BYTES = 60_000
+_MAX_REVIEW_PROMPT_BYTES = 16_000
 _MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
 _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
@@ -413,7 +416,7 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # incrementing this constant, forcing every task to be re-reviewed under the
 # new contract rather than silently reusing a verdict given for an older,
 # looser policy.
-_REVIEW_POLICY_VERSION = "v6"
+_REVIEW_POLICY_VERSION = "v7"
 
 _MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
     {"copilot", "claude", "codex", "openai_http"}
@@ -1225,7 +1228,11 @@ def reconcile_review_once(
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     where = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (task_id, cfg.max_per_tick) if task_id else (cfg.max_per_tick,)
+    params: tuple[Any, ...] = (
+        (task_id, cfg.max_per_tick)
+        if task_id is not None
+        else (cfg.max_per_tick,)
+    )
     tasks = _rows(
         factory,
         "SELECT t.task_id, e.value FROM backlog_task t "
@@ -1241,19 +1248,22 @@ def reconcile_review_once(
         if not cascade:
             report.skipped.append((current_task_id, "no_review_executor_route"))
             continue
-        marker, _head = _has_accept_marker(repo_path, pr_url)
-        if marker:
-            report.skipped.append((current_task_id, "marker_already_posted"))
-            continue
         repo = _repo_from_pr_url(pr_url)
         route = repo_route(repo) if repo else None
+        if route is None:
+            report.skipped.append((current_task_id, "no_repo_route"))
+            continue
         snapshot = _pr_diff_and_head(repo_path, pr_url)
-        if route is None or snapshot is None:
+        if snapshot is None:
             report.skipped.append((current_task_id, "pr_diff_fetch_failed"))
+            continue
+        marker, marker_head = _has_accept_marker(repo_path, pr_url)
+        if marker and marker_head == snapshot.head:
+            report.skipped.append((current_task_id, "marker_already_posted"))
             continue
         key = _review_key(current_task_id, pr_url, snapshot)
         if key is None:
-            report.skipped.append((current_task_id, "no_repo_route"))
+            report.skipped.append((current_task_id, "review_key_invalid"))
             continue
         try:
             chunks = _review_chunks(snapshot, current_task_id, pr_url)
@@ -1261,6 +1271,7 @@ def reconcile_review_once(
             report.skipped.append((current_task_id, "review_prompt_budget_invalid"))
             continue
         project_id, repository_path = route
+        retries_before = actions
         for chunk in chunks:
             if actions >= cfg.max_per_tick:
                 break
@@ -1268,6 +1279,7 @@ def reconcile_review_once(
                 current_task_id, pr_url, snapshot, chunk
             )
             if base_key is None:
+                report.skipped.append((current_task_id, "review_chunk_key_invalid"))
                 continue
             retry_key = _next_retry_key(
                 factory, current_task_id, base_key, snapshot.head
@@ -1276,6 +1288,7 @@ def reconcile_review_once(
                 continue
             prompt = _render_review_prompt(current_task_id, pr_url, snapshot, chunk)
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
+                report.skipped.append((current_task_id, "review_prompt_budget_invalid"))
                 continue
             payload: dict[str, Any] = {
                 "kind": "agent_run", "v": 1, "project_id": project_id,
@@ -1296,6 +1309,10 @@ def reconcile_review_once(
             enqueue(cfg.queue, retry_key, payload, current_task_id, len(cascade))
             report.retried.append((current_task_id, retry_key))
             actions += 1
+        if actions == retries_before:
+            report.skipped.append(
+                (current_task_id, "no_malformed_review_result_eligible_for_retry")
+            )
     return report
 
 
@@ -1375,12 +1392,24 @@ def _chunk_review_rows(
         (task_id, prefix, prefix),
     )
     newest: dict[str, tuple[int, tuple[Any, ...]]] = {}
+    first_valid: dict[str, tuple[int, tuple[Any, ...]]] = {}
     for row in rows:
         base_key, attempt = _retry_attempt(row[0])
         current = newest.get(base_key)
         if current is None or attempt > current[0]:
             newest[base_key] = (attempt, (base_key, *row[1:]))
-    return prefix, [row for _attempt, row in newest.values()]
+        result = _json_object(row[3])
+        parsed = _parse_verdict((result or {}).get("result_text") or "")
+        valid = first_valid.get(base_key)
+        if parsed is not None and parsed[1] == snapshot.head and (
+            valid is None or attempt < valid[0]
+        ):
+            first_valid[base_key] = (attempt, (base_key, *row[1:]))
+    selected = {
+        base_key: first_valid.get(base_key, newest[base_key])
+        for base_key in newest
+    }
+    return prefix, [selected[key][1] for key in sorted(selected)]
 
 
 def _aggregate_chunk_verdict(

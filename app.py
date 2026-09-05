@@ -693,14 +693,7 @@ def build_commands() -> list[dict]:
 
 # Data loading happens before the shell render so the top command bar (search,
 # live glyph, Inspector) has the task map + api available without a second pass.
-tasks = load_tasks()
-if not tasks:
-    # Deployed-console fallback (VOYN-W0-AICC-WIRE-BACKLOG-API): an empty
-    # local repository with a configured master projection renders the
-    # fleet's real board read-only instead of zeros. Lives HERE, not in the
-    # task helpers — those must stay pure delegation (single-writer
-    # fitness); save_tasks drops master records structurally either way.
-    tasks = backlog_client.projection_board_tasks()
+tasks = backlog_client.board_tasks(load_tasks())
 tasks_by_id = {task["id"]: task for task in tasks}
 task_counts = read_model.task_snapshot(tasks)
 project_configs = project_config.load_project_configs()

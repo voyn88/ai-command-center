@@ -38,13 +38,21 @@ import os as _os
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from command_center import models, storage, task_view
+
+if TYPE_CHECKING:
+    from command_center.application.aios_tasks import AIOSTasksRepository
 
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+
+def is_master_projection_task(task: dict) -> bool:
+    """One control predicate for records owned by the master backlog view."""
+    return task.get("source") == "master"
 
 # Fields a task record cannot be useful without; a record missing any of these
 # is surfaced by `validate_tasks` rather than silently accepted (audit BLOCKER-4).
@@ -248,10 +256,15 @@ def save_tasks(root: Path, tasks: list[dict]) -> None:
     # the correct semantics, not an error: a view record "saved" back is a
     # no-op by definition, and the panels keep working instead of dying on
     # a PermissionError mid-render.
-    storage.atomic_write_json(
-        tasks_file_path(root),
-        [task for task in tasks if task.get("source") != "master"],
-    )
+    writable = [task for task in tasks if not is_master_projection_task(task)]
+    dropped = [task.get("id") for task in tasks if is_master_projection_task(task)]
+    if dropped:
+        logger.warning(
+            "tasks.json: ignored %d master projection record(s): %s",
+            len(dropped),
+            sorted(task_id for task_id in dropped if task_id),
+        )
+    storage.atomic_write_json(tasks_file_path(root), writable)
 
 
 @contextlib.contextmanager
@@ -592,7 +605,7 @@ class JSONTasksRepository:
         return delete_task(self._root, task_id)
 
 
-def get_repository(root: Path) -> JSONTasksRepository | AIOSTasksRepository:  # type: ignore[name-defined]  # noqa: F821
+def get_repository(root: Path) -> JSONTasksRepository | AIOSTasksRepository:
     """Return the active task store backend.
 
     ``AICC_TASKS_BACKEND=json`` (default) → ``JSONTasksRepository``

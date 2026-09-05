@@ -291,7 +291,7 @@ def test_projection_board_tasks_maps_statuses_and_marks_read_only(tmp_path, monk
     assert tasks[0]["id"] == "VOYN-T0" and tasks[0]["project"] == "repo-x"
 
 
-def test_master_view_records_never_reach_disk(monkeypatch, tmp_path):
+def test_master_view_records_never_reach_disk(tmp_path):
     """The invariant is structural, at the single persist point: whatever
     path a master record arrives through — bulk panel save, single-record
     repo.upsert, task creation — save_tasks drops it, and the local store
@@ -302,14 +302,17 @@ def test_master_view_records_never_reach_disk(monkeypatch, tmp_path):
     master = {"id": "VOYN-X", "source": "master", "read_only": True,
               "status": "Backlog", "title": "view"}
     local = {"id": "L-1", "status": "Backlog", "title": "mine"}
-    tr.save_tasks(tmp_path, [local, master])
+    local_read_only = {
+        "id": "L-2", "read_only": True, "status": "Backlog", "title": "local view"
+    }
+    tr.save_tasks(tmp_path, [local, local_read_only, master])
 
     stored = tr.load_tasks(tmp_path)
-    assert [t["id"] for t in stored] == ["L-1"]
+    assert [t["id"] for t in stored] == ["L-1", "L-2"]
 
     # The single-record path funnels through the same gate.
     tr.upsert_task(tmp_path, dict(master))
-    assert [t["id"] for t in tr.load_tasks(tmp_path)] == ["L-1"]
+    assert [t["id"] for t in tr.load_tasks(tmp_path)] == ["L-1", "L-2"]
 
 
 def test_board_falls_back_to_projection_only_when_store_is_empty(
@@ -318,8 +321,6 @@ def test_board_falls_back_to_projection_only_when_store_is_empty(
     """The fallback lives at the app layer (helpers must stay pure
     delegation — single-writer fitness); pin its exact contract here: empty
     store -> projection view, non-empty store -> untouched local list."""
-    from command_center.ui import legacy_task_helpers as h
-
     master = tmp_path / "m.md"
     master.write_text(
         "- VOYN_RECOMMENDATION | ts=- | status=OPEN | issue_id=VOYN-F | "
@@ -330,18 +331,6 @@ def test_board_falls_back_to_projection_only_when_store_is_empty(
     )
     monkeypatch.setenv(bc.MASTER_BACKLOG_ENV, str(master))
 
-    def board(local):
-        tasks = local
-        if not tasks:
-            tasks = bc.projection_board_tasks()
-        return tasks
-
-    assert [t["id"] for t in board([])] == ["VOYN-F"]
+    assert [t["id"] for t in bc.board_tasks([])] == ["VOYN-F"]
     local = [{"id": "L-1", "status": "Backlog"}]
-    assert board(local) == local
-
-    # And the app really carries that line (source-pinned so a refactor
-    # that drops the fallback fails here, not in production):
-    from pathlib import Path
-    app_src = (Path(h.__file__).resolve().parents[2] / "app.py").read_text()
-    assert "projection_board_tasks()" in app_src
+    assert bc.board_tasks(local) is local

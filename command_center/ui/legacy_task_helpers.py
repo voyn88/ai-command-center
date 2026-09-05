@@ -53,8 +53,8 @@ def upsert_tasks(tasks: list[dict]) -> None:
     (via `execution_queue.launch_ready`, exactly like `launch_service`) and
     need to commit exactly those changes. Locked bulk upsert, not a blind
     overwrite of this script run's entire (possibly-stale) `tasks` snapshot.
-    Master-projection records in the list are harmless: `save_tasks` drops
-    them at the single persist point (VOYN-W0-AICC-WIRE-BACKLOG-API)."""
+    Master-projection records are refused at queue/launch boundaries and are
+    also dropped here as a final persistence backstop."""
     tasks_repository.get_repository(ROOT).upsert_all(tasks)
 
 

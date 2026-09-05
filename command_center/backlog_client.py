@@ -517,3 +517,10 @@ def projection_board_tasks(path: str | os.PathLike[str] | None = None) -> list[d
             }
         )
     return tasks
+
+
+def board_tasks(
+    local_tasks: list[dict], path: str | os.PathLike[str] | None = None
+) -> list[dict]:
+    """Use the read-only master projection only when the local store is empty."""
+    return local_tasks if local_tasks else projection_board_tasks(path)
