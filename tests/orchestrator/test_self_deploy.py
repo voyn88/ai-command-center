@@ -94,13 +94,56 @@ def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_pat
     assert _git(clone, "rev-parse", "HEAD") == new
     assert calls["migrate"] == 1
     assert calls["migrate_cwd"] == str(clone)  # the NEW tree, review of f794b3e
-    assert report.steps.index("import_smoke_passed") < report.steps.index("migrations_applied")
+    assert (
+        report.steps.index("import_smoke_passed")
+        < report.steps.index("database_upgrade_ran_not_rolled_back")
+    )
     assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
     rows = [
         json.loads(line)
         for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
     ]
     assert rows[-1]["outcome"] == "deployed" and rows[-1]["target_sha"] == new
+
+
+def test_noop_looking_migration_still_records_unrolled_back_write(
+    pair, calls, tmp_path, monkeypatch
+):
+    """Review of 5eb6f62 (`migrations_applied` on any zero exit, even a
+    no-op) and review of 15774a77 (a stdout-parsed `schema_mutated` flag
+    that missed `db upgrade` unconditionally re-asserting table grants):
+    the step recorded for a successful `db upgrade` must neither claim a
+    confirmed mutation nor claim a confirmed no-op -- it must say a database
+    write happened that will not be undone, regardless of what the command's
+    stdout says and regardless of whether a later restart fails."""
+    origin, clone, first = pair
+    _commit(origin, "advance, no pending schema change")
+    monkeypatch.setattr(
+        self_deploy, "_run_migrations",
+        lambda repo_path, timeout: subprocess.CompletedProcess(
+            [], 0, "already up to date\nre-asserted 0 table grants\n", ""
+        ),
+    )
+    fails = {"left": 1}
+
+    def one_shot_systemctl(args, timeout):
+        calls["systemctl"].append(args)
+        if args[0] == "restart" and fails["left"] > 0:
+            fails["left"] -= 1
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        out = "active" if args[0] == "is-active" else ""
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(self_deploy, "_systemctl", one_shot_systemctl)
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "rolled_back"
+    assert "restart_failed" in report.detail
+    # The checkout and services were restored, but the database write from
+    # `db upgrade` is not -- and the report must still say so, not omit it
+    # just because the command's own output looked like a no-op.
+    assert "database_upgrade_ran_not_rolled_back" in report.steps
+    assert _git(clone, "rev-parse", "HEAD") == first
 
 
 def test_diverged_and_dirty_checkouts_refuse(pair, calls, tmp_path):
