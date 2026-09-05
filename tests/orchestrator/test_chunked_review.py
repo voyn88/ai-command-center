@@ -86,6 +86,117 @@ def test_chunk_completeness_failure_and_reject_are_fail_closed(monkeypatch):
     assert not posted and remediated and report.remediated
 
 
+def test_malformed_result_gets_fresh_bounded_retry_key(monkeypatch):
+    key = "review:identity:chunk:0001:abc"
+    monkeypatch.setattr(
+        review_merge,
+        "_latest_attempt",
+        lambda *_: (0, "succeeded", {"result_text": "tool transcript only"}),
+    )
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) == f"{key}:retry:1"
+
+    monkeypatch.setattr(
+        review_merge,
+        "_latest_attempt",
+        lambda *_: (0, "succeeded", {"result_text": f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"}),
+    )
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+
+    monkeypatch.setattr(
+        review_merge,
+        "_latest_attempt",
+        lambda *_: (
+            review_merge._MAX_RESULT_RETRY_ATTEMPTS - 1,
+            "succeeded",
+            {"result_text": "still malformed"},
+        ),
+    )
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) == (
+        f"{key}:retry:{review_merge._MAX_RESULT_RETRY_ATTEMPTS}"
+    )
+
+    monkeypatch.setattr(
+        review_merge,
+        "_latest_attempt",
+        lambda *_: (review_merge._MAX_RESULT_RETRY_ATTEMPTS, "succeeded", {"result_text": ""}),
+    )
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+
+
+def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    chunks = review_merge._review_chunks(snapshot, TASK, PR)
+    target = review_merge._chunk_review_key(TASK, PR, snapshot, chunks[1])
+    assert target is not None
+    monkeypatch.setattr(
+        review_merge, "_model_only_review_cascade", lambda: [{"executor": "copilot"}]
+    )
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
+    monkeypatch.setattr(
+        review_merge,
+        "_next_retry_key",
+        lambda _factory, _task, base_key, _head: f"{base_key}:retry:1"
+        if base_key == target else None,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_rows",
+        lambda _factory, sql, _params=(): [(TASK, PR)] if "SELECT t.task_id" in sql else [],
+    )
+    dispatched = []
+    report = review_merge.reconcile_review_once(
+        None, lambda *args: dispatched.append(args), "/repo"
+    )
+    assert [entry[1] for entry in dispatched] == [f"{target}:retry:1"]
+    assert report.retried == [(TASK, f"{target}:retry:1")]
+
+
+def test_reconcile_ignores_stale_marker_and_binds_empty_task_id(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n-old\n+new\n")
+    observed_params = []
+
+    def fake_rows(_factory, sql, params=()):
+        observed_params.append(params)
+        return [(TASK, PR)] if "SELECT t.task_id" in sql else []
+
+    monkeypatch.setattr(review_merge, "_rows", fake_rows)
+    monkeypatch.setattr(review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}])
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (True, "a" * 40))
+    monkeypatch.setattr(review_merge, "_next_retry_key", lambda *_: None)
+
+    report = review_merge.reconcile_review_once(
+        None, lambda *_: None, "/repo", task_id=""
+    )
+
+    assert observed_params[0] == ("", review_merge.ReviewConfig().max_per_tick)
+    assert report.skipped == [(TASK, "no_malformed_review_result_eligible_for_retry")]
+
+
+def test_chunk_rows_never_override_an_earlier_valid_verdict(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    base_row = rows(snapshot)[0]
+    key, state, payload, _result = base_row
+    database_rows = [
+        (key, state, payload, {"result_text": f"VERDICT: REJECT\nHEAD_SHA: {HEAD}"}),
+        (
+            f"{key}:retry:1",
+            state,
+            payload,
+            {"result_text": f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"},
+        ),
+    ]
+    monkeypatch.setattr(review_merge, "_rows", lambda *_: database_rows)
+
+    _prefix, selected = review_merge._chunk_review_rows(None, TASK, PR, snapshot)
+
+    assert len(selected) == 1
+    assert selected[0][3]["result_text"].startswith("VERDICT: REJECT")
+
+
 def test_manifest_reorder_hash_and_snapshot_identity_are_bound():
     a = "diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n"
     b = "diff --git a/b b/b\n@@ -1 +1 @@\n-x\n+y\n"
