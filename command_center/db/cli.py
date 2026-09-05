@@ -506,11 +506,22 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.orchestrator.control_plane_reconciler import (
+                    ReconcileConfig,
                     SubprocessSystemctl,
                     reconcile_once,
                 )
 
-                report = reconcile_once(SubprocessSystemctl(), lambda: _nc(conn))
+                # `command_timeout` governs both how long each `sudo -n
+                # systemctl` call is allowed to hang (SubprocessSystemctl)
+                # and the bounded-backoff circuit breaker inside the tick
+                # itself (reconcile_once) -- one ReconcileConfig, not two
+                # values that could drift apart.
+                recon_config = ReconcileConfig()
+                report = reconcile_once(
+                    SubprocessSystemctl(timeout=recon_config.command_timeout),
+                    lambda: _nc(conn),
+                    config=recon_config,
+                )
                 for name in report.ok:
                     print(f"OK         {name}")
                 for name in report.restarted:
