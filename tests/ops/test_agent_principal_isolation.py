@@ -1064,7 +1064,17 @@ def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
     assert "/home/" not in workspace_roots
 
 
-def test_versioned_os_boundary_acceptance_is_fail_closed():
+def test_agent_principal_isolation_wiring_is_consistent_across_scripts():
+    """A static cross-file audit: every literal below is grepped for, not
+
+    executed. It catches the four scripts' text drifting apart (a renamed
+    unit, a moved ordering marker) — it does not and cannot prove any of
+    them is fail-closed at runtime, because nothing here runs. That claim
+    lives in `test_worker_template_hash_check_is_fail_closed` below, which
+    extracts and actually executes the one guard in this group cheap enough
+    to run without root/systemd (review finding: the previous name on this
+    test, `..._is_fail_closed`, was checked by grepping for the string
+    "AICC_AGENT_PRINCIPAL_BOUNDARY_OK" and never executed anything)."""
     root = Path(__file__).parents[2]
     verifier = (root / "ops/verify-agent-principal-boundary.sh").read_text()
     installer = (root / "deploy/install-agent-principal-isolation.sh").read_text()
@@ -1128,6 +1138,62 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "st_gid != 0" in verifier
     assert "st_ino" in verifier
     assert "changed while being read" in verifier
+
+
+def test_worker_template_hash_check_is_fail_closed(tmp_path):
+    """Extract and actually execute the verifier's versioned-worker-template
+
+    guard (`fail()` plus the two `sha256sum`/`fail` lines immediately below
+    the `expected_template_hash=` assignment) against real files, instead of
+    grepping the surrounding script for the guard's presence. The rest of
+    `verify-agent-principal-boundary.sh` needs root and a real systemd/passwd
+    environment to run at all; this one guard does not, so it is the piece of
+    the "fail closed" claim that can be checked by running the real thing.
+    """
+    root = Path(__file__).parents[2]
+    real_template = (root / "deploy/systemd/voyn-aicc-worker@.service").read_text()
+
+    fake_repo = tmp_path / "repo"
+    (fake_repo / "deploy/systemd").mkdir(parents=True)
+    (fake_repo / "deploy/systemd/voyn-aicc-worker@.service").write_text(real_template)
+
+    verifier = (root / "ops/verify-agent-principal-boundary.sh").read_text()
+    fail_fn = verifier[verifier.index("fail() {") : verifier.index("}\n", verifier.index("fail() {")) + 2]
+    guard = verifier[
+        verifier.index("expected_template_hash=") : verifier.index(
+            "expected_dropin_hash="
+        )
+    ]
+    assert "versioned worker template is not installed" in guard
+    assert "installed worker template SHA drifted" in guard
+
+    def run(worker_template: Path) -> subprocess.CompletedProcess[str]:
+        script = (
+            f'repo_root="{fake_repo}"\n'
+            f'worker_template="{worker_template}"\n'
+            f"{fail_fn}\n{guard}\necho GUARD_PASSED"
+        )
+        return subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, check=False
+        )
+
+    missing = run(fake_repo / "no-such-unit")
+    assert missing.returncode != 0
+    assert "versioned worker template is not installed" in missing.stderr
+    assert "GUARD_PASSED" not in missing.stdout
+
+    drifted = fake_repo / "installed.service"
+    drifted.write_text(real_template + "\n# drifted\n")
+    mismatched = run(drifted)
+    assert mismatched.returncode != 0
+    assert "installed worker template SHA drifted" in mismatched.stderr
+    assert "GUARD_PASSED" not in mismatched.stdout
+
+    matching = fake_repo / "matching.service"
+    matching.write_text(real_template)
+    clean = run(matching)
+    assert clean.returncode == 0, clean.stderr
+    assert "GUARD_PASSED" in clean.stdout
 
 
 # ---------------------------------------------------------------------------

@@ -433,8 +433,16 @@ def test_default_policy_ships_five_tail_risk_scenarios_with_assumptions_and_limi
 
 
 def test_breaching_scenario_blocks_its_business_path_before_budget():
+    # The project cap is also breached by this executor's cost, so the
+    # budget check alone would independently defer this task with
+    # `DEFER_PROJECT_BUDGET`. Getting `DEFER_TAIL_RISK` back instead is what
+    # proves the tail-risk gate runs first — a free executor with no other
+    # cap set (the previous version of this test) can never be blocked by
+    # budget/eligibility regardless of check order, so it could not tell
+    # "checked first" from "checked last, but nothing else ever blocks".
     policy = DispatchPolicy(
-        cost_matrix={"claude_code": 0.0},
+        cost_matrix={"claude_code": 10.0},
+        per_project_limits={"AICC": 5.0},
         tail_risk_scenarios={
             "breach": _scenario(
                 "breach",
@@ -445,7 +453,7 @@ def test_breaching_scenario_blocks_its_business_path_before_budget():
             )
         },
     )
-    executors = [_executor("claude_code", cost=0.0)]
+    executors = [_executor("claude_code", cost=10.0)]
     plan = _plan([_task("t1", project="AICC")], executors, policy)
 
     assert plan.assignments == ()

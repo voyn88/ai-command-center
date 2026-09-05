@@ -64,13 +64,15 @@ installed_bootstrap_hash=$(sha256sum "$bootstrap" | cut -d' ' -f1)
   fail "installed exact-SHA bootstrap SHA drifted"
 
 expected_template_hash=$(sha256sum "$repo_root/deploy/systemd/voyn-aicc-worker@.service" | cut -d' ' -f1)
-installed_template_hash=$(sha256sum "$worker_template" | cut -d' ' -f1) || \
+installed_template_hash_line=$(sha256sum "$worker_template") || \
   fail "versioned worker template is not installed"
+installed_template_hash=$(printf '%s' "$installed_template_hash_line" | cut -d' ' -f1)
 [ "$installed_template_hash" = "$expected_template_hash" ] || \
   fail "installed worker template SHA drifted"
 expected_dropin_hash=$(sha256sum "$repo_root/deploy/systemd/voyn-aicc-worker-principal-isolation.conf" | cut -d' ' -f1)
-installed_dropin_hash=$(sha256sum "$worker_dropin" | cut -d' ' -f1) || \
+installed_dropin_hash_line=$(sha256sum "$worker_dropin") || \
   fail "principal worker drop-in is not installed"
+installed_dropin_hash=$(printf '%s' "$installed_dropin_hash_line" | cut -d' ' -f1)
 [ "$installed_dropin_hash" = "$expected_dropin_hash" ] || \
   fail "installed worker drop-in SHA drifted"
 [ "$(stat -c %U:%G:%a /etc/aicc/workspace-authority.env)" = \
