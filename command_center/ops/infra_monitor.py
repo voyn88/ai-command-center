@@ -23,6 +23,7 @@ class QueueSnapshot:
     succeeded: int
     dead: int
     success_age_seconds: float | None
+    pending_age_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,11 +84,15 @@ def read_queue_snapshot() -> QueueSnapshot:
                     count(*) FILTER (WHERE state = 'dead'),
                     extract(epoch FROM (
                         now() - max(updated_at) FILTER (WHERE state = 'succeeded')
+                    )),
+                    extract(epoch FROM (
+                        now() - min(updated_at)
+                        FILTER (WHERE state IN ('ready', 'claimed'))
                     ))
                 FROM work_item
                 """
             )
-            ready, claimed, succeeded, dead, success_age = cur.fetchone()
+            ready, claimed, succeeded, dead, success_age, pending_age = cur.fetchone()
     finally:
         pool.close_pool()
     return QueueSnapshot(
@@ -96,6 +101,7 @@ def read_queue_snapshot() -> QueueSnapshot:
         succeeded=int(succeeded),
         dead=int(dead),
         success_age_seconds=(float(success_age) if success_age is not None else None),
+        pending_age_seconds=(float(pending_age) if pending_age is not None else None),
     )
 
 
@@ -152,7 +158,11 @@ def evaluate(
     # An old last-success timestamp is normal when there is no work. It becomes
     # an incident whenever pending work (ready or claimed) has produced no
     # recent completion; a zombie claim must not make a stalled queue healthy.
-    if queue.ready + queue.claimed > 0 and success_is_stale:
+    pending_is_stale = (
+        queue.pending_age_seconds is not None
+        and queue.pending_age_seconds > max_stalled_seconds
+    )
+    if queue.ready + queue.claimed > 0 and pending_is_stale and success_is_stale:
         failures.append("queue_stalled")
 
     return MonitorReport(

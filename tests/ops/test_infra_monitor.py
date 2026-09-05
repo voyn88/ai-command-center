@@ -32,7 +32,14 @@ def test_idle_queue_is_healthy_even_when_last_success_is_old() -> None:
             "voyn-aicc-worker@3.service": "active",
             "voyn-aicc-worker@4.service": "active",
         },
-        QueueSnapshot(ready=0, claimed=0, succeeded=10, dead=2, success_age_seconds=9999),
+        QueueSnapshot(
+            ready=0,
+            claimed=0,
+            succeeded=10,
+            dead=2,
+            success_age_seconds=9999,
+            pending_age_seconds=None,
+        ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
         prometheus_ready=True,
@@ -50,7 +57,14 @@ def test_pending_queue_without_recent_progress_fails_closed() -> None:
             "voyn-aicc-worker@3.service": "active",
             "voyn-aicc-worker@4.service": "active",
         },
-        QueueSnapshot(ready=3, claimed=0, succeeded=10, dead=2, success_age_seconds=901),
+        QueueSnapshot(
+            ready=3,
+            claimed=0,
+            succeeded=10,
+            dead=2,
+            success_age_seconds=901,
+            pending_age_seconds=901,
+        ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
         prometheus_ready=True,
@@ -58,6 +72,30 @@ def test_pending_queue_without_recent_progress_fails_closed() -> None:
 
     assert not report.ok
     assert report.failures == ("queue_stalled",)
+
+
+def test_new_pending_work_does_not_turn_an_idle_queue_red() -> None:
+    report = evaluate(
+        {
+            "voyn-aicc-worker@1.service": "active",
+            "voyn-aicc-worker@2.service": "active",
+            "voyn-aicc-worker@3.service": "active",
+            "voyn-aicc-worker@4.service": "active",
+        },
+        QueueSnapshot(
+            ready=1,
+            claimed=0,
+            succeeded=10,
+            dead=2,
+            success_age_seconds=9999,
+            pending_age_seconds=10,
+        ),
+        minimum_active_workers=4,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert report.ok
 
 
 def test_claimed_queue_without_recent_success_fails_closed() -> None:
@@ -68,7 +106,14 @@ def test_claimed_queue_without_recent_success_fails_closed() -> None:
             "voyn-aicc-worker@3.service": "active",
             "voyn-aicc-worker@4.service": "active",
         },
-        QueueSnapshot(ready=0, claimed=2, succeeded=10, dead=2, success_age_seconds=901),
+        QueueSnapshot(
+            ready=0,
+            claimed=2,
+            succeeded=10,
+            dead=2,
+            success_age_seconds=901,
+            pending_age_seconds=901,
+        ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
         prometheus_ready=True,
@@ -84,7 +129,14 @@ def test_inactive_lane_and_prometheus_failure_are_reported() -> None:
             "voyn-aicc-worker@1.service": "active",
             "voyn-aicc-worker@2.service": "failed",
         },
-        QueueSnapshot(ready=0, claimed=0, succeeded=0, dead=0, success_age_seconds=None),
+        QueueSnapshot(
+            ready=0,
+            claimed=0,
+            succeeded=0,
+            dead=0,
+            success_age_seconds=None,
+            pending_age_seconds=None,
+        ),
         minimum_active_workers=2,
         max_stalled_seconds=900,
         prometheus_ready=False,
