@@ -2,9 +2,33 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import uuid
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def _docker_daemon_reachable() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+requires_docker = pytest.mark.skipif(
+    not _docker_daemon_reachable(),
+    reason="docker недоступен — тест пропускается локально без Docker "
+    "(тот же паттерн, что у tests/db для AICC_TEST_PG_ADMIN_DSN); CI собирает образ по-настоящему",
+)
 
 
 def test_dockerfile_exists() -> None:
@@ -44,6 +68,59 @@ def test_dockerignore_excludes_data() -> None:
     assert "data/" in ignore, "Директория data/ должна быть исключена"
     assert ".venv/" in ignore or "venv/" in ignore, ".venv должен быть исключён"
     assert ".git/" in ignore, ".git должен быть исключён"
+
+
+@requires_docker
+def test_image_builds_from_clean_checkout(tmp_path: Path) -> None:
+    """Собирает образ по-настоящему, а не грепает текст Dockerfile.
+
+    Регрессия для найденного приёмкой PR #314 дефекта: `.dockerignore` исключал
+    `scripts/`, из-за чего `COPY scripts/aml-entrypoint.sh` не резолвился и
+    `docker build` падал из чистого чекаута (сломано с 63581e1 / #131).
+    """
+    checkout = tmp_path / "checkout"
+    subprocess.run(
+        ["git", "worktree", "add", "--detach", "-q", str(checkout), "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tag = f"aicc-aml-test-{uuid.uuid4().hex[:12]}"
+    try:
+        build = subprocess.run(
+            ["docker", "build", "-t", tag, str(checkout)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        assert build.returncode == 0, (
+            f"docker build упал из чистого чекаута:\n{build.stdout}\n{build.stderr}"
+        )
+
+        check = subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "--entrypoint", "/bin/sh",
+                tag, "-c", "test -x /entrypoint.sh",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert check.returncode == 0, (
+            f"/entrypoint.sh отсутствует или не исполняем в собранном образе:\n{check.stderr}"
+        )
+    finally:
+        subprocess.run(["docker", "rmi", "-f", tag], capture_output=True, check=False)
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(checkout)],
+            cwd=ROOT,
+            capture_output=True,
+            check=False,
+        )
 
 
 def test_entrypoint_exists() -> None:
