@@ -21,4 +21,13 @@ client library.
 
 from __future__ import annotations
 
-__all__ = ["adapter", "config", "health", "migrations", "pool", "roles"]
+__all__ = [
+    "adapter",
+    "config",
+    "health",
+    "legacy_migration",
+    "migrations",
+    "mirror_registry",
+    "pool",
+    "roles",
+]

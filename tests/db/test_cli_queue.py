@@ -85,6 +85,47 @@ def test_fleet_suspend_requires_the_principal_id_and_a_reason() -> None:
         build_parser().parse_args(["fleet-suspend"])
 
 
+def test_legacy_migrate_defaults_every_path(tmp_path) -> None:
+    args = build_parser().parse_args(["legacy-migrate"])
+    assert args.command == "legacy-migrate"
+    assert args.sqlite_path is None
+    assert args.queue_path is None
+    assert args.snapshot_dir is None
+    assert args.report_dir is None
+
+    scoped = build_parser().parse_args(
+        [
+            "legacy-migrate",
+            "--sqlite-path", str(tmp_path / "runtime.db"),
+            "--queue-path", str(tmp_path / "execution_queue.json"),
+            "--snapshot-dir", str(tmp_path / "snapshots"),
+            "--report-dir", str(tmp_path / "reports"),
+        ]
+    )
+    assert scoped.sqlite_path == str(tmp_path / "runtime.db")
+    assert scoped.report_dir == str(tmp_path / "reports")
+
+
+def test_legacy_reconcile_takes_the_same_flags_as_legacy_migrate() -> None:
+    args = build_parser().parse_args(["legacy-reconcile"])
+    assert args.command == "legacy-reconcile"
+    assert args.sqlite_path is None and args.snapshot_dir is None
+
+
+def test_legacy_lock_requires_a_reconciliation_report() -> None:
+    args = build_parser().parse_args(["legacy-lock", "--report", "reports/reconciliation-report.json"])
+    assert args.command == "legacy-lock"
+    assert args.report == "reports/reconciliation-report.json"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["legacy-lock"])
+
+
+def test_legacy_unlock_takes_no_required_arguments() -> None:
+    args = build_parser().parse_args(["legacy-unlock"])
+    assert args.command == "legacy-unlock"
+    assert args.sqlite_path is None and args.queue_path is None
+
+
 def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
     """A review-class enqueue must outrank the priority=0 implementation
     dispatch enqueues (`backlog_dispatch`), or it queues FIFO behind runs

@@ -16,13 +16,35 @@ every deploy as the migrator. The application credential does neither.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
 
 from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
+
+
+def _default_sqlite_path() -> Path:
+    from command_center.runtime.db import core as runtime_core
+
+    return runtime_core.resolve_db_path()
+
+
+def _default_queue_path() -> Path:
+    from command_center import execution_queue
+    from command_center.runtime.db import core as runtime_core
+
+    return execution_queue.queue_file_path(runtime_core.ROOT)
+
+
+def _default_legacy_migration_dir(leaf: str) -> Path:
+    from command_center import storage
+    from command_center.runtime.db import core as runtime_core
+
+    return storage.resolve_data_dir(runtime_core.ROOT) / "legacy-migration" / leaf
 
 
 def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
@@ -218,6 +240,63 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_suspend.add_argument(
         "--reason", required=True, help="Audited reason for the suspension."
     )
+
+    # The legacy SQLite/JSON -> PostgreSQL cutover backfill (SRV-07). Every
+    # mirrored table already dual-writes going forward (SRV-01b); these
+    # commands are the one-time catch-up for rows written before that was
+    # wired in, plus the reconciliation and cutover the acceptance criteria
+    # require actually running, not just being importable as a library.
+    migrate = sub.add_parser(
+        "legacy-migrate",
+        help="One-time SQLite/JSON -> PostgreSQL backfill: freeze a checksummed "
+        "snapshot of the legacy runtime.db and execution_queue.json, import "
+        "every mirrored table in dependency order, then reconcile the result "
+        "table by table. Idempotent -- re-running against a fresh snapshot "
+        "re-imports the same rows. Does not lock the legacy sources; review "
+        "the reconciliation report, then run legacy-lock.",
+    )
+    migrate.add_argument(
+        "--sqlite-path", default=None, help="Legacy runtime.db (default: the configured runtime db path)."
+    )
+    migrate.add_argument(
+        "--queue-path", default=None, help="Legacy execution_queue.json (default: the configured queue path)."
+    )
+    migrate.add_argument(
+        "--snapshot-dir", default=None, help="Directory for the frozen, checksummed snapshots."
+    )
+    migrate.add_argument(
+        "--report-dir", default=None, help="Directory for the migration and reconciliation reports."
+    )
+
+    reconcile_p = sub.add_parser(
+        "legacy-reconcile",
+        help="Freeze a fresh snapshot of the legacy sources and compare it to "
+        "PostgreSQL without importing anything -- for checking drift after a "
+        "legacy-migrate run, or immediately before a legacy-lock decision.",
+    )
+    reconcile_p.add_argument("--sqlite-path", default=None)
+    reconcile_p.add_argument("--queue-path", default=None)
+    reconcile_p.add_argument("--snapshot-dir", default=None)
+    reconcile_p.add_argument("--report-dir", default=None)
+
+    lock_p = sub.add_parser(
+        "legacy-lock",
+        help="Cutover: revoke write access to the legacy sources. Refuses "
+        "unless given a clean reconciliation report from legacy-migrate/"
+        "legacy-reconcile.",
+    )
+    lock_p.add_argument("--sqlite-path", default=None)
+    lock_p.add_argument("--queue-path", default=None)
+    lock_p.add_argument(
+        "--report", required=True, help="Reconciliation report written by legacy-migrate/legacy-reconcile."
+    )
+
+    unlock_p = sub.add_parser(
+        "legacy-unlock",
+        help="Rollback: restore write access to the legacy sources revoked by legacy-lock.",
+    )
+    unlock_p.add_argument("--sqlite-path", default=None)
+    unlock_p.add_argument("--queue-path", default=None)
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -571,6 +650,93 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command in ("legacy-migrate", "legacy-reconcile"):
+                from command_center.db import legacy_migration as lm
+
+                sqlite_path = Path(args.sqlite_path) if args.sqlite_path else _default_sqlite_path()
+                queue_path = Path(args.queue_path) if args.queue_path else _default_queue_path()
+                snapshot_dir = (
+                    Path(args.snapshot_dir) if args.snapshot_dir else _default_legacy_migration_dir("snapshots")
+                )
+                report_dir = Path(args.report_dir) if args.report_dir else _default_legacy_migration_dir("reports")
+                factory = lambda: nullcontext(conn)  # noqa: E731
+
+                sqlite_snapshot = lm.snapshot_sqlite_db(sqlite_path, snapshot_dir)
+                queue_snapshot = lm.snapshot_json_file(queue_path, snapshot_dir, name="execution_queue")
+                queue_entries = json.loads(queue_snapshot.path.read_text(encoding="utf-8"))
+
+                if args.command == "legacy-migrate":
+                    migration_report = lm.import_snapshot(
+                        sqlite_snapshot, connection_factory=factory, queue_entries=queue_entries
+                    )
+                    lm.write_report(migration_report, report_dir / "migration-report.json")
+                    for table_report in migration_report.tables:
+                        status = "ok" if table_report.ok else f"ERROR: {table_report.error}"
+                        print(
+                            f"{table_report.table:30} source={table_report.source_rows:6} "
+                            f"imported={table_report.imported:6} {status}"
+                        )
+                    for table, resynced in sorted(migration_report.identity_resyncs.items()):
+                        print(f"resynced identity {table} -> {resynced}")
+                    if migration_report.queue_imported is not None:
+                        print(f"queue_entry             imported={migration_report.queue_imported}")
+                    if not migration_report.ok:
+                        print(
+                            "import failed for one or more tables; not reconciling", file=sys.stderr
+                        )
+                        return 1
+
+                reconciliation = lm.reconcile(
+                    sqlite_snapshot,
+                    connection_factory=factory,
+                    queue_snapshot=queue_snapshot,
+                    queue_entries=queue_entries,
+                )
+                lm.write_report(reconciliation, report_dir / "reconciliation-report.json")
+                for table_reconciliation in reconciliation.tables:
+                    status = (
+                        "clean"
+                        if table_reconciliation.clean
+                        else f"{len(table_reconciliation.differences)} difference(s)"
+                    )
+                    print(
+                        f"{table_reconciliation.table:30} source={table_reconciliation.source_rows:6} "
+                        f"mirror={table_reconciliation.mirror_rows:6} {status}"
+                    )
+                if reconciliation.clean:
+                    print(f"reconciliation clean; reports in {report_dir}")
+                    return 0
+                print("reconciliation is NOT clean; legacy-lock will refuse", file=sys.stderr)
+                return 1
+
+            if args.command == "legacy-lock":
+                from command_center.db import legacy_migration as lm
+
+                sqlite_path = Path(args.sqlite_path) if args.sqlite_path else _default_sqlite_path()
+                queue_path = Path(args.queue_path) if args.queue_path else _default_queue_path()
+                reconciliation = lm.read_reconciliation_report(Path(args.report))
+                try:
+                    locked = lm.lock_legacy_sources(
+                        [sqlite_path, queue_path], reconciliation=reconciliation
+                    )
+                except ValueError as exc:
+                    print(f"refused: {exc}", file=sys.stderr)
+                    return 1
+                for path in locked:
+                    print(f"locked: {path}")
+                if not locked:
+                    print("nothing to lock; both sources were already read-only")
+                return 0
+
+            if args.command == "legacy-unlock":
+                from command_center.db import legacy_migration as lm
+
+                sqlite_path = Path(args.sqlite_path) if args.sqlite_path else _default_sqlite_path()
+                queue_path = Path(args.queue_path) if args.queue_path else _default_queue_path()
+                for path in lm.unlock_legacy_sources([sqlite_path, queue_path]):
+                    print(f"unlocked: {path}")
+                return 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
