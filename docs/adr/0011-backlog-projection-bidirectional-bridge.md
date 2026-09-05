@@ -48,6 +48,24 @@ rather than being added as a quick follow-up. Until then, `native_gateway`
 sees only the approved/not-approved distinction, never
 IN_PROGRESS/READY_TO_REVIEW/DONE, for an export-generated file.
 
+**Safety analysis for that gap, completed 2026-09-05: no drop-in fix
+exists.** `backlog_client._RICH_LINE` (`- **VOYN-<id>** | <wave> | <status>
+| <priority> |`) is a strict subset of `backlog_parser`'s
+`_TASK_LINE`/`_RECORD_SHAPED` match (bold `**VOYN-...**` id followed by
+`| `) — any line the rich-record reader accepts, the importer accepts too,
+and parses fully as a real task, not merely as a reported `unparsed` line.
+The two readers were built to share that one convention on purpose, so no
+variant of the bold-id/pipe shape can satisfy one and not the other.
+Closing this gap needs either (a) a distinct marker format for
+machine-rendered rich status — the same move `VOYN_RECOMMENDATION` already
+made for 0B records — taught to `parse_rich_records` alongside the existing
+hand-authored bold-line shape, with an explicit precedence rule for a task
+that carries both during the migration window; or (b) simply outliving this
+ADR's own revisit condition below, after which the bold-line shape is no
+longer a live import surface and the exporter can emit it directly. Neither
+is a quick follow-up, and (b) is likely cheaper than (a) given the target
+date already sets an end to the ambiguity.
+
 Running both directions at once would be a dual-write hazard if they ever
 shared a line shape or a file path; they do neither. Feeding a
 `backlog-export` render back through `backlog-import` is inert, but not

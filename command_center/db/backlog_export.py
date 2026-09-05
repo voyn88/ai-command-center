@@ -63,11 +63,31 @@ it from the master file's *other* record surface — the body's bold
 card). This module renders 0B records only; it does not emit rich lines, so
 those consumers still see only the coarse approved/not-approved distinction
 for an export-generated file, never the finer IN_PROGRESS/READY_TO_REVIEW/
-DONE detail. Emitting rich lines is not a safe drop-in fix: that line shape
-is exactly what ``backlog_parser``'s importer (`_TASK_LINE`/`_RECORD_SHAPED`)
-recognizes, so doing so without a fresh safety analysis would break
-ADR-0011's "the two directions never share a line shape" argument. Left as
-an open, tracked gap rather than a silent one.
+DONE detail.
+
+**Safety analysis, done, conclusion: no drop-in fix exists.** Emitting rich
+lines is not safe by reusing the existing convention: ``backlog_client``'s
+own ``_RICH_LINE`` (``- **VOYN-<id>** | <wave> | <status> | <priority> |``)
+is a strict subset of ``backlog_parser``'s ``_TASK_LINE``/``_RECORD_SHAPED``
+match (bold ``**VOYN-...**`` id followed by a ``| ``) — every line the rich
+parser accepts, the importer accepts too, and would fully parse as a real
+task (not even land in ``unparsed``). There is no variant of the bold-id/
+pipe shape that satisfies one parser and not the other; the two consumers
+were built to share that exact convention on purpose. Closing this gap for
+real needs one of:
+
+1. A genuinely distinct marker format for machine-rendered rich status
+   (the same move ``VOYN_RECOMMENDATION`` already made for 0B records),
+   plus teaching ``parse_rich_records`` to read it alongside the existing
+   hand-authored bold-line shape, plus a precedence rule for the migration
+   window where a task could carry both an owner-typed bold line and an
+   export-rendered line — real design work, not a follow-up patch; or
+2. Waiting out ADR-0011's revisit condition (target 2026-11-01): once
+   ``backlog-import`` is deleted, the bold-line shape is no longer a live
+   import surface at all, and this module can start emitting it directly
+   with no ambiguity left to resolve.
+
+Left as an open, tracked gap rather than a silent one.
 
 Rendering exists here but a tick has to actually call it: production runs
 this through ``backlog-export`` on ``deploy/systemd/aicc-backlog-export.timer``
