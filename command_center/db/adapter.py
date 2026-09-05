@@ -7,11 +7,11 @@ the same reason nothing but `command_center/application/aios_tasks.py` imports
 `aios_sdk`: one file to review when the contract changes, and one file for the
 boundary gate to allow.
 
-What stays on this side of the seam is the domain: the 33-table schema and its
-migrations, the `aicc_*` roles and grants, the repositories, the backup and
-restore policy, and the composition that decides what "ready" means for this
-service. AIOS knows none of those, and this module does not export anything
-that would let it learn them.
+What stays on this side of the seam is the domain: the schema declared in
+`roles.ALL_TABLES` and its migrations, the `aicc_*` roles and grants, the
+repositories, the backup and restore policy, and the composition that decides
+what "ready" means for this service. AIOS knows none of those, and this module
+does not export anything that would let it learn them.
 
 The re-exports are deliberately narrow. A blanket `from aios_db import *` would
 make every future addition to that library part of AICC's surface without
