@@ -53,7 +53,10 @@ def test_roundtrip_through_the_real_parser():
     first, hostile = result.records
     assert first.issue_id == "VOYN-W0-AICC-EXAMPLE"
     assert first.ts == "2026-09-03T12:00:00Z"
-    assert first.status == "OPEN"
+    # `OPEN` is an execution status, translated to the planning vocabulary
+    # this field actually carries -- see test_status_translates_execution_
+    # vocabulary_into_planning_vocabulary below for the translation itself.
+    assert first.status == "PO-Approved"
     assert first.current_wave == "0"
     assert first.task == "plain title"
     assert hostile.issue_id == "VOYN-W0-AICC-HOSTILE"
@@ -80,6 +83,41 @@ def test_header_survives_the_parser_as_prose():
     text = backlog_export.render_projection([])
     result = backlog_client.parse_recommendations(text)
     assert result.records == [] and result.errors == []
+
+
+def test_status_translates_execution_vocabulary_into_planning_vocabulary():
+    """`backlog_task.status` is the store's execution vocabulary (OPEN,
+    IN_PROGRESS, ...); the 0B record's `status` field is a different,
+    planning vocabulary (AI-Reco/PO-Review/PO-Approved) that
+    `BacklogRecommendation.is_approved` checks by exact literal match against
+    `PO-Approved`. Writing the raw execution value straight into that field
+    would make `is_approved` -- and everything built on it: `approved_
+    recommendations`, `execution_queue`, the panel's "Approved" metric --
+    permanently false for every export-generated row, since no execution
+    status ever equals `PO-Approved`. Proves the translation actually bridges
+    the two, end to end through the real parser."""
+    rows = [
+        {**_ROWS[0], "status": "IN_PROGRESS"},
+        {**_ROWS[0], "task_id": "VOYN-W0-AICC-UNTRIAGED", "status": "UNTRIAGED"},
+    ]
+    result = backlog_client.parse_recommendations(backlog_export.render_projection(rows))
+    approved, untriaged = result.records
+    assert approved.status == "PO-Approved"
+    assert approved.is_approved is True
+    assert untriaged.status != "PO-Approved"
+    assert untriaged.is_approved is False
+
+
+def test_planning_status_partitions_the_full_db_vocabulary():
+    """Every status the store's CHECK constraint allows
+    (`backlog_parser.STATUSES`) must land in exactly one bucket -- guards
+    against a newly added status silently falling through to "not approved"
+    (or the reverse) without anyone updating this translation."""
+    from command_center.db.backlog_parser import EXECUTABLE_STATUSES, STATUSES
+
+    for status in STATUSES:
+        approved = backlog_export._planning_status(status) == backlog_client.STATUS_APPROVED
+        assert approved == (status in EXECUTABLE_STATUSES), status
 
 
 def test_reimporting_a_projection_through_the_real_importer_is_a_no_op():

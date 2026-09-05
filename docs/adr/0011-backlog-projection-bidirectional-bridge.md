@@ -28,6 +28,26 @@ migration is not finished:
   (`- **ID** | ...`) `backlog-import`'s parser (`backlog_parser.parse_backlog`)
   recognizes — see below.
 
+**Known gap, not a shape problem:** the rendered record's `status` field
+must carry the *planning* vocabulary (`AI-Reco`/`PO-Review`/`PO-Approved`)
+`backlog_client.BacklogRecommendation.is_approved` checks by exact literal
+match — not `backlog_task.status`'s *execution* vocabulary
+(`OPEN`/`IN_PROGRESS`/...) — or `is_approved` and everything built on it
+(`execution_queue`, the panel's "Approved" metric) reads as permanently
+empty for an export-generated file. `backlog_export._planning_status`
+translates one to the other (`EXECUTABLE_STATUSES` → `PO-Approved`,
+everything else → `PO-Review`), at the cost of losing execution-status
+granularity in this field. That granularity still exists nowhere in an
+export-generated file: it lives only in the master file's *other* record
+surface, the body's bold task lines (`backlog_client.parse_rich_records`,
+consumed by `native_gateway/projection_producer.py` for Kanban lanes and the
+wave-goal card), which this exporter does not emit — doing so is exactly the
+bold-line shape `backlog_parser`'s importer recognizes, so it needs its own
+safety analysis against the "never share a line shape" argument below,
+rather than being added as a quick follow-up. Until then, `native_gateway`
+sees only the approved/not-approved distinction, never
+IN_PROGRESS/READY_TO_REVIEW/DONE, for an export-generated file.
+
 Running both directions at once would be a dual-write hazard if they ever
 shared a line shape or a file path; they do neither. Feeding a
 `backlog-export` render back through `backlog-import` is inert, but not

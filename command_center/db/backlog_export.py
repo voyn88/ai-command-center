@@ -23,12 +23,51 @@ in the test through the parser itself — keeps the two sides from drifting:
 a field added to the parser breaks the exporter's test, not the console.
 
 Field mapping is honest about what the store holds: ``issue_id``/``task``/
-waves/priority/status/``ts`` come from columns; ``owner`` carries the repo
-route (the store's writer identity); the remaining narrative fields
+waves/priority/``ts`` come from columns; ``owner`` carries the repo route
+(the store's writer identity); the remaining narrative fields
 (``effect``/``effort``/``acceptance``/``evidence``/``file_scope``/
 ``parallel_domain``) live inside free-text bodies, and inventing summaries
 here would put a second author's words into a record that claims to be a
 projection — they render as ``-`` until the store grows those columns.
+
+``status`` is the one field that is NOT a straight column copy, and for a
+reason worth spelling out: ``backlog_client``'s own module docstring draws a
+hard line between two vocabularies that happen to share a field name — the
+0B ``VOYN_RECOMMENDATION`` record's ``status`` is *planning* status
+(``AI-Reco``/``PO-Review``/``PO-Approved``; see ``backlog_client.
+STATUS_APPROVED``), while ``backlog_task.status`` is the store's *execution*
+lifecycle (``backlog_parser.STATUSES``: ``OPEN``/``IN_PROGRESS``/etc). Every
+planning-status reader keys off the exact literal ``"PO-Approved"`` —
+``BacklogRecommendation.is_approved``, and everything built on it
+(``approved_recommendations``, ``execution_queue``, the panel's "Approved"
+metric, ``native_gateway``'s Next/Backlog lane) — so writing an execution
+value straight into this field would make every one of those readers see a
+permanently empty approved set for an export-generated file, without ever
+raising an error. ``_planning_status`` translates instead: a row's mere
+presence in ``backlog_task`` already means the owner authored it into the
+machine-managed pipeline (``backlog-import`` is the only writer for owner
+content), so ``backlog_parser.EXECUTABLE_STATUSES`` — the store's own line
+between "admitted to the execution machine" and "still needs triage" — is
+reused as the approval boundary rather than inventing a second one here.
+This necessarily loses the execution vocabulary's granularity in this field
+(``OPEN``/``IN_PROGRESS``/``DONE`` all read as ``PO-Approved``); the ``by_status``
+breakdown coarsens to two buckets for an export-generated file, the same
+kind of accepted, documented lossiness as the narrative fields above rather
+than the silent wrongness it replaces.
+
+This does NOT restore execution-status granularity for consumers that read
+it from the master file's *other* record surface — the body's bold
+``- **VOYN-<ID>** | <wave> | <status> | ...`` task lines
+(``backlog_client.parse_rich_records``/``load_rich_records``, consumed by
+``native_gateway/projection_producer.py`` for its Kanban lanes and wave-goal
+card). This module renders 0B records only; it does not emit rich lines, so
+those consumers still see only the coarse approved/not-approved distinction
+for an export-generated file, never the finer IN_PROGRESS/READY_TO_REVIEW/
+DONE detail. Emitting rich lines is not a safe drop-in fix: that line shape
+is exactly what ``backlog_parser``'s importer (`_TASK_LINE`/`_RECORD_SHAPED`)
+recognizes, so doing so without a fresh safety analysis would break
+ADR-0011's "the two directions never share a line shape" argument. Left as
+an open, tracked gap rather than a silent one.
 
 Rendering exists here but a tick has to actually call it: production runs
 this through ``backlog-export`` on ``deploy/systemd/aicc-backlog-export.timer``
@@ -47,6 +86,13 @@ from datetime import UTC, datetime
 from typing import Any
 
 from command_center import backlog_client
+from command_center.db.backlog_parser import EXECUTABLE_STATUSES
+
+#: A `backlog_task` row not yet admitted to the execution machine
+#: (`backlog_parser.NON_EXECUTABLE_STATUSES`) reads as still under review —
+#: "AI-Reco" would claim no one has looked at it yet, which is false for,
+#: say, a DEFER_TO_USER task.
+_STATUS_NOT_YET_APPROVED = "PO-Review"
 
 _HEADER = (
     "# VOYN master backlog — generated projection\n"
@@ -78,6 +124,17 @@ def _clean(value: object) -> str:
     return text or "-"
 
 
+def _planning_status(execution_status: object) -> str:
+    """Translate `backlog_task.status` (execution) into the 0B record's
+    planning vocabulary — see the module docstring for why the two must not
+    be confused."""
+    return (
+        backlog_client.STATUS_APPROVED
+        if execution_status in EXECUTABLE_STATUSES
+        else _STATUS_NOT_YET_APPROVED
+    )
+
+
 def render_record(row: dict[str, Any]) -> str:
     """One ``- VOYN_RECOMMENDATION | ...`` line from one ``backlog_task`` row."""
     updated = row.get("updated_at")
@@ -87,7 +144,7 @@ def render_record(row: dict[str, Any]) -> str:
         ts = _clean(updated)
     values = {
         "ts": ts,
-        "status": _clean(row.get("status")),
+        "status": _planning_status(row.get("status")),
         "issue_id": _clean(row.get("task_id")),
         "current_wave": _clean(row.get("wave")),
         "proposed_wave": _clean(row.get("wave")),
