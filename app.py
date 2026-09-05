@@ -13,6 +13,7 @@ from command_center import (
     activity_log,
     agent_runner,
     artifacts,
+    backlog_client,
     chat_service,
     dashboard_truth,
     execution_queue,
@@ -692,7 +693,7 @@ def build_commands() -> list[dict]:
 
 # Data loading happens before the shell render so the top command bar (search,
 # live glyph, Inspector) has the task map + api available without a second pass.
-tasks = load_tasks()
+tasks = backlog_client.board_tasks(load_tasks())
 tasks_by_id = {task["id"]: task for task in tasks}
 task_counts = read_model.task_snapshot(tasks)
 project_configs = project_config.load_project_configs()
