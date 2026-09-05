@@ -232,6 +232,16 @@ def test_prompt_encoding_and_utf8_budget_preserve_every_byte(monkeypatch):
     assert review_merge._parse_verdict(calls[0][2]["prompt"]) is None
 
 
+def test_complete_diff_prompt_forbids_unavailable_tool_calls():
+    snapshot = snap("diff --git a/a b/a\n-old\n+new\n")
+    chunk = review_merge._review_chunks(snapshot, TASK, PR)[0]
+
+    prompt = review_merge._render_review_prompt(TASK, PR, snapshot, chunk)
+
+    assert "No tools are available or needed" in prompt
+    assert "do not request or attempt any tool" in prompt
+
+
 def test_pr_snapshot_uses_only_atomic_pr_and_immutable_compare(monkeypatch):
     diff, calls = "diff --git a/pinned b/pinned\n", []
 
