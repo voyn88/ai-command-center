@@ -1,16 +1,14 @@
 # Repo-owned replacement for the retired /usr/local/sbin monitor.
 [Unit]
 Description=VOYN infrastructure fail-closed monitor
-After=network-online.target tailscaled.service voyn-aicc-pgtunnel.service
+After=network-online.target tailscaled.service
 Wants=network-online.target tailscaled.service
-Requires=voyn-aicc-pgtunnel.service
 
 [Service]
 Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
-EnvironmentFile=/home/voynadmin/aicc-preprod/worker.env
-ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --minimum-active-workers 4 --max-stalled-seconds 900 --prometheus-url http://100.114.209.119:9090/-/ready
+ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --minimum-active-workers 4 --skip-queue --prometheus-url http://100.114.209.119:9090/-/ready
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only

@@ -178,8 +178,32 @@ def test_prometheus_probe_rejects_non_http_urls() -> None:
     assert not prometheus_is_ready("http://user@example.invalid/-/ready")
 
 
-def test_systemd_monitor_uses_worker_database_credentials() -> None:
-    unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
+def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
+    worker_unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
+    queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
 
-    assert "EnvironmentFile=/home/voynadmin/aicc-preprod/worker.env" in unit
-    assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" not in unit
+    assert "--skip-queue" in worker_unit
+    assert "EnvironmentFile=" not in worker_unit
+    assert "--skip-workers" in queue_unit
+    assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" in queue_unit
+
+
+def test_evaluate_can_skip_queue_without_hiding_worker_failures() -> None:
+    healthy = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        None,
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+    failed = evaluate(
+        {"voyn-aicc-worker@1.service": "failed"},
+        None,
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert healthy.ok
+    assert healthy.queue is None
+    assert failed.failures == ("active_workers:0<1",)
