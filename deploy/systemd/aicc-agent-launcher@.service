@@ -1,0 +1,34 @@
+[Unit]
+Description=AICC root-owned agent launcher connection %i
+After=aicc-agent-launcher.socket
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/aicc-agent-launcher --serve-socket
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+LockPersonality=yes
+KeyringMode=private
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine
+UMask=0077
+MemoryMax=256M
+TasksMax=64
+TimeoutStopSec=30s

@@ -62,6 +62,7 @@ from command_center.runtime.db.core import (  # noqa: F401
     _UPDATABLE_RUN_FIELDS,
     _is_busy_or_locked,
     _machine_timestamp_zone,
+    _migration_file_lock,
     _new_session_id,
     _read_timestamp_zone,
     _retry_on_busy,
@@ -70,6 +71,8 @@ from command_center.runtime.db.core import (  # noqa: F401
     _validate_updatable_fields,
     LEDGER_TIMESTAMP_TZ_COLUMN,
     RETENTION_TZ_ENV,
+    RUNTIME_RETENTION_ARCHIVE_DIR_ENV,
+    RUNTIME_RETENTION_DRY_RUN_ENV,
     apply_runtime_retention,
     connect,
     current_schema_version,
@@ -81,6 +84,7 @@ from command_center.runtime.db.core import (  # noqa: F401
     transaction,
 )
 from command_center.runtime.db.schema import (  # noqa: F401
+    FinalizationClaimCutoverRequired,
     MIGRATIONS,
     SCHEMA_VERSION,
     _SCHEMA_V1,
@@ -97,12 +101,15 @@ from command_center.runtime.db.schema import (  # noqa: F401
     _migration_7_add_proposal_parameters_json,
     _migration_8_add_independent_review_fields,
     _migration_9_add_execution_provider_fields,
+    _validate_finalization_claim_schema,
+    bootstrap_finalization_claim_cutover,
 )
 from command_center.runtime.db.execution import (  # noqa: F401
     _QUEUE_ENTRY_COLUMNS,
     append_run_event,
     count_runs,
     count_unfinalized_runs,
+    claim_run_finalization,
     create_report,
     create_run,
     create_session,
@@ -112,6 +119,7 @@ from command_center.runtime.db.execution import (  # noqa: F401
     get_report,
     get_reports_for_runs,
     get_run,
+    get_run_finalization_claim,
     get_session,
     get_task,
     latest_events_for_runs,

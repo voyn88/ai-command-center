@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import threading
 import os
 from pathlib import Path
 
@@ -208,3 +209,54 @@ def test_create_update_delete_and_import_all_share_one_lock_and_lose_nothing(tmp
     data = json.loads(tasks_file.read_text(encoding="utf-8"))
     assert isinstance(data, list)
     assert len(data) == 11
+
+
+def test_unlocked_read_seeding_never_erases_a_committed_record(tmp_path, monkeypatch):
+    """The read path seeds a missing store — and it must never do so by
+    overwriting.
+
+    `JSONTasksRepository.load_all()` is called *outside* the store lock (see
+    `task_import.apply_task_package`, which reads existing ids before it takes
+    the lock for each create). When it observed a missing `tasks.json` it used
+    to write the empty seed with `save_tasks(root, [])`, an unconditional
+    `os.replace`. Between that observation and that write, a locked writer can
+    commit a real record — and the seed then landed on top of it and erased it.
+    Measured live in CI as the first task of a concurrently imported package
+    vanishing while every writer reported success
+    (VOYN-W0-AICC-TASK-IMPORT-CONCURRENCY-FLAKE).
+
+    The window is made deterministic here rather than raced for: the reader is
+    held at exactly the point where it has decided the file is absent, the
+    writer commits, and only then is the reader allowed to continue. Without
+    the exclusive-create fix this fails with the committed record gone.
+    """
+    reader_saw_missing = threading.Event()
+    writer_committed = threading.Event()
+
+    real_exists = Path.exists
+
+    def exists_with_the_race_window_held_open(self: Path) -> bool:
+        if self.name == "tasks.json" and not reader_saw_missing.is_set():
+            reader_saw_missing.set()
+            # The writer commits its record inside this window.
+            assert writer_committed.wait(timeout=30), "writer did not commit"
+            return False  # the reader proceeds on its now-stale observation
+        return real_exists(self)
+
+    def commit_under_the_lock() -> None:
+        assert reader_saw_missing.wait(timeout=30), "reader never reached the window"
+        tasks_repository.create_task(tmp_path, "AIOS", "committed", "implementation", "Backlog")
+        writer_committed.set()
+
+    writer = threading.Thread(target=commit_under_the_lock)
+    writer.start()
+    try:
+        monkeypatch.setattr(Path, "exists", exists_with_the_race_window_held_open)
+        tasks_repository.load_tasks(tmp_path)
+    finally:
+        monkeypatch.undo()
+        writer.join(timeout=30)
+    assert not writer.is_alive(), "writer thread did not finish"
+
+    titles = [t["title"] for t in tasks_repository.load_tasks(tmp_path)]
+    assert titles == ["committed"], "the unlocked read path erased a committed record"

@@ -287,12 +287,21 @@ Most local artifacts are excluded by the checked-in [`.gitignore`](.gitignore), 
 `data/runtime.db` grows with every run event. Retention is **off by default** and opt-in via
 environment variables, so existing installs and the test suite are unaffected:
 
-- `AICC_RUNTIME_RETENTION_DAYS=<N>` — on startup (after schema migration), delete `run_event` rows
-  for runs terminal longer than `N` days. The terminal run row itself is kept (it stays visible in
-  the Execution Center and to reconciliation); only the bulky per-output event history is pruned.
-- `AICC_RUNTIME_VACUUM_ON_START=1` — run `VACUUM` after pruning to reclaim disk. VACUUM rewrites the
-  database under an exclusive lock, so enable it only on a single-host install that can briefly pause
-  other writers.
+- `AICC_RUNTIME_RETENTION_DAYS=<N>` — on startup (after schema migration), archive and prune
+  `run_event` rows for runs terminal longer than `N` days, via the same rollback-safe
+  backup → cold archive → integrity-checked prune sequence as the deliberate
+  `maintenance.archive_and_prune`, never a bare delete. The terminal run row itself is kept (it
+  stays visible in the Execution Center and to reconciliation); only the bulky per-output event
+  history is pruned.
+- `AICC_RUNTIME_RETENTION_ARCHIVE_DIR=<path>` — **required** alongside `AICC_RUNTIME_RETENTION_DAYS`.
+  Without it, startup retention is skipped entirely — nothing is archived, so nothing is deleted —
+  because every `db.migrate()` call site is a service construction, not a deliberate operator action.
+- `AICC_RUNTIME_RETENTION_DRY_RUN=1` — run the identical sequence against a throwaway copy of the
+  database instead (`maintenance.rehearse`), proving the original byte-identical afterward. Use this
+  to validate a retention window before trusting it to delete for real on a given install.
+- `AICC_RUNTIME_VACUUM_ON_START=1` — run `VACUUM` after a clean prune to reclaim disk. VACUUM rewrites
+  the database under an exclusive lock, so enable it only on a single-host install that can briefly
+  pause other writers.
 
 ## Execution lifecycle
 
@@ -444,6 +453,23 @@ pytest -q -n 8 -m "not serial" && pytest -q -m serial   # or: make test-fast
 ```
 
 This is a local-only speedup; CI intentionally keeps its serial `pytest -q` run.
+
+For an even faster inner loop while iterating on one change, `pytest-testmon` (also in the dev
+dependency group) caches a coverage-derived test↔source dependency map and re-runs only the tests
+whose covered code actually changed since the last run — at test-function granularity, not just
+file granularity:
+
+```bash
+pytest -q --testmon          # first run seeds the cache (make test-impacted-seed)
+pytest -q --testmon          # subsequent runs: only affected tests re-execute (make test-impacted)
+```
+
+Also local-only and complementary to (not a replacement for) `scripts/ci/test_impact/
+select_tests.py`'s static-AST selector that drives CI's advisory `Impact fast pre-check` job:
+testmon's map comes from real coverage data, so it also catches dynamic-import and runtime-only
+dependencies the static walker can't see, at the cost of needing a seed run and going stale across
+a large rebase (re-seed with `make test-impacted-seed` if selections look suspiciously narrow).
+CI's required gate is unaffected either way — it always runs the full suite.
 
 `.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
 compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on

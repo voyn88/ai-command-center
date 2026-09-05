@@ -18,6 +18,7 @@ tests would let a migration test's `DROP TABLE` race a privilege test's
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 
@@ -27,14 +28,32 @@ from command_center.db import roles as _roles
 
 ADMIN_DSN_ENV = "AICC_TEST_PG_ADMIN_DSN"
 
-# Passwords for the login-enabled variants of the product roles. Random per
-# session: nothing in the suite should work against a fixed credential that
-# could accidentally be reused by a real deployment.
+# Passwords for the login-enabled variants of the product roles. Derived from
+# a per-RUN seed rather than plain `secrets.token_urlsafe()`: the roles are
+# cluster objects (one `aicc_migrator` for the whole cluster), but this dict
+# is a module-level constant computed once per xdist WORKER PROCESS, and each
+# worker independently calling `secrets.token_urlsafe()` produced a different
+# value -- the `role_passwords` fixture (session-scoped, so once per worker)
+# then had every worker overwrite the SAME cluster-wide role's password with
+# its own random value, leaving every worker except whichever ran last
+# holding a stale password its own connections then failed to authenticate
+# with (`password authentication failed for user aicc_migrator`, live in CI
+# 2026-08-21, only visible once the same flake's other two bugs were fixed
+# and stopped masking it). `PYTEST_XDIST_TESTRUNUID` is broadcast by the
+# xdist controller to every worker of one test session, so deriving from it
+# gives every worker the same passwords within a run while still varying
+# run to run -- nothing in the suite works against a fixed credential that
+# could accidentally be reused by a real deployment, which is the property
+# the original random-per-session design was for.
 #
 # Derived from `ALL_ROLES` rather than listed: a role added to the inventory
 # without a password here fails at fixture setup with a `KeyError`, which reads
 # as a broken test rather than as the missing provisioning step it is.
-_ROLE_PASSWORDS = {role: secrets.token_urlsafe(24) for role in _roles.ALL_ROLES}
+_RUN_SEED = os.environ.get("PYTEST_XDIST_TESTRUNUID") or secrets.token_urlsafe(24)
+_ROLE_PASSWORDS = {
+    role: hashlib.sha256(f"{_RUN_SEED}:{role}".encode()).hexdigest()
+    for role in _roles.ALL_ROLES
+}
 
 
 @pytest.fixture(scope="session")
@@ -57,13 +76,27 @@ def role_passwords(admin_dsn, psycopg) -> dict[str, str]:
     Roles are cluster objects rather than per-database ones, so this runs once
     and the per-test databases reuse them. Production does the same: the roles
     are created by `render_grants()`, and the operator attaches credentials.
+
+    "Session-scoped" is per xdist WORKER PROCESS, not cluster-wide, so N
+    workers each run this concurrently against the same cluster roles.
+    `render_role_creation()` guards its own CREATE with an advisory lock, but
+    that lock releases as soon as that one statement's implicit transaction
+    ends -- it does not cover the `ALTER ROLE ... PASSWORD` right after,
+    which two workers can then run concurrently on the very same catalog
+    row and get `tuple concurrently updated` from (found live, 2026-08-21,
+    after fixing the CREATE-side race and a missing-dependency bug in the
+    same flake: VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE turned out to be three
+    independent bugs under one error signature). Holding the lock for this
+    fixture's whole body, in one explicit transaction, serializes CREATE and
+    ALTER together across workers instead of only the CREATE half.
     """
     from psycopg import sql
 
     from command_center.db import roles as roles_module
 
-    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+    with psycopg.connect(admin_dsn, autocommit=False) as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(7823649102);")
             for role in roles_module.ALL_ROLES:
                 cur.execute(roles_module.render_role_creation(role))
                 cur.execute(
@@ -136,13 +169,24 @@ def _override(dsn: str, **overrides: str) -> str:
 
 
 @pytest.fixture
-def pg_connection_factory(admin_conn, psycopg, test_dsn):  # noqa: ARG001
+def pg_connection_factory(admin_conn, psycopg, test_dsn, role_passwords):  # noqa: ARG001
     """A `connection()`-shaped factory over a migrated throwaway database.
 
     Shaped like `command_center.db.pool.connection` so the store under test
     talks to the real seam rather than to a fixture-specific interface — a
     store proved against a bespoke connection object is not proved against the
     one it runs on.
+
+    Depends on `role_passwords` for its side effect, not its value: the
+    migrations this fixture applies GRANT to `aicc_app`/`aicc_worker` (e.g.
+    `backlog_triage()`), so those cluster-level roles must exist before
+    `migrations.upgrade()` runs. Nothing enforced that ordering before this
+    fix -- if the xdist worker running this test hadn't already resolved
+    `role_passwords` via some other fixture first, the GRANT hit a role
+    that plain didn't exist yet, independent of any concurrency race
+    (VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE: this, not the CREATE ROLE race
+    the advisory lock guards, is why it kept reproducing even after that
+    lock was correctly in place).
     """
     from contextlib import contextmanager
 

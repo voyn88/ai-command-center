@@ -37,8 +37,10 @@ import logging
 import random
 import signal
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from command_center.db.work_queue_store import (
     ClaimedWork,
@@ -93,38 +95,110 @@ class WorkerDaemon:
         self,
         store: WorkQueueStore,
         handlers: dict[str, Handler],
-        config: WorkerConfig = WorkerConfig(),
+        config: WorkerConfig | None = None,
         *,
         sleep: Callable[[float], None] | None = None,
         notify: Callable[[str], object] | None = None,
+        reload_credentials: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._handlers = dict(handlers)
-        self._config = config
+        self._config = config if config is not None else WorkerConfig()
         self._stop = threading.Event()
+        self._drain = threading.Event()
+        self._drain_closed = threading.Event()
+        self._drain_wakeup = threading.Event()
+        self._drain_stop = threading.Event()
+        # The coordinator and the claim loop meet at this lock.  The claim
+        # loop holds it from its final drain check through claim(), so a drain
+        # ACK cannot race ahead of an already-starting database claim.
+        self._claim_gate_lock = threading.Lock()
+        self._reload_requested = threading.Event()
+        self._reload_stop = threading.Event()
         # Injectable so tests drive time instead of waiting through it.
         self._sleep = sleep if sleep is not None else self._stop.wait
         # Injectable so tests observe pings; the default is a no-op outside
         # systemd (sd_notify returns quietly without NOTIFY_SOCKET).
         self._notify = notify if notify is not None else sdnotify.sd_notify
+        self._reload_credentials = reload_credentials or (lambda: None)
 
     # -- lifecycle ------------------------------------------------------------
 
     def install_signal_handlers(self) -> None:
         for signum in (signal.SIGTERM, signal.SIGINT):
             signal.signal(signum, self._on_signal)
+        signal.signal(signal.SIGUSR1, self._on_signal)
+        signal.signal(signal.SIGHUP, self._on_signal)
 
     def _on_signal(self, signum: int, _frame: Any) -> None:
+        if signum == signal.SIGUSR1:
+            logger.info("signal %s: draining; claiming no more", signum)
+            self.request_drain()
+            return
+        if signum == signal.SIGHUP:
+            logger.info("signal %s: credential reload requested", signum)
+            self.request_reload()
+            return
         logger.info("signal %s: finishing the item in hand, claiming no more", signum)
         self._stop.set()
 
     def request_stop(self) -> None:
         self._stop.set()
 
+    def request_drain(self) -> None:
+        self._drain.set()
+        # Signal handlers must never block on a lock the interrupted main
+        # thread may already hold inside claim().  A dedicated coordinator
+        # closes the gate and emits the ACK only after it owns the same lock.
+        self._drain_wakeup.set()
+
+    def request_reload(self) -> None:
+        self._notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1_000}")
+        self._reload_requested.set()
+
+    def _drain_coordinator_loop(self) -> None:
+        while not self._drain_stop.is_set():
+            if not self._drain_wakeup.wait(0.25):
+                continue
+            self._drain_wakeup.clear()
+            if self._drain_stop.is_set():
+                return
+            with self._claim_gate_lock:
+                if self._drain.is_set() and not self._drain_closed.is_set():
+                    self._drain_closed.set()
+                    # This is the protocol ACK consumed by the rotator.  At
+                    # this point claim() is not running and cannot begin until
+                    # the lock is released, after which the closed flag is
+                    # checked again before any claim.
+                    self._notify("STATUS=aicc-drained")
+
+    def _credential_reload_loop(self) -> None:
+        while not self._reload_stop.is_set():
+            if not self._reload_requested.wait(0.25):
+                continue
+            if self._reload_stop.is_set():
+                return
+            # Clear BEFORE reloading so a SIGHUP arriving mid-reload is
+            # coalesced into a follow-up pass instead of silently dropped
+            # (review finding on c4001c4).
+            self._reload_requested.clear()
+            try:
+                self._reload_credentials()
+            except Exception:  # reload failure is surfaced to systemd by no READY
+                logger.exception("credential reload failed")
+                self._notify("STATUS=aicc-reload-failed")
+                continue
+            with self._claim_gate_lock:
+                self._drain.clear()
+                self._drain_closed.clear()
+                self._notify("READY=1")
+                self._notify("STATUS=aicc-ready")
+
     # -- the loop -------------------------------------------------------------
 
     def run_forever(self) -> None:
         self._notify("READY=1")
+        self._notify("STATUS=aicc-ready")
         # Read once: systemd sets WATCHDOG_USEC at spawn and never changes it
         # for a running unit. Every sleep below is capped by it, so the ping
         # cadence adapts to whatever WatchdogSec the unit declares instead of
@@ -132,24 +206,66 @@ class WorkerDaemon:
         watchdog = sdnotify.watchdog_interval_seconds()
         cap = watchdog if watchdog is not None else float("inf")
         idle = self._config.idle_min_seconds
-        while not self._stop.is_set():
-            self._notify("WATCHDOG=1")
-            claimed = self._store.claim(
-                self._config.queue,
-                visibility_seconds=self._config.visibility_seconds,
-            )
-            if isinstance(claimed, QueueRefusal):
-                if claimed.reason == "no_work":
-                    self._sleep(min(idle + random.uniform(0, idle), cap))
-                    idle = min(idle * 2, self._config.idle_max_seconds)
+        reload_thread = threading.Thread(
+            target=self._credential_reload_loop,
+            name="credential-reload",
+            daemon=True,
+        )
+        drain_thread = threading.Thread(
+            target=self._drain_coordinator_loop,
+            name="claim-gate-drain",
+            daemon=True,
+        )
+        reload_thread.start()
+        drain_thread.start()
+        try:
+            while not self._stop.is_set():
+                # Both the flag read and the notify happen under the gate
+                # lock: an unlocked snapshot could interleave with the
+                # reload loop's clear-flags-then-READY sequence and stamp a
+                # stale aicc-drained STATUS over the fresh aicc-ready
+                # (independent-review finding on 61c73e7).
+                with self._claim_gate_lock:
+                    draining = self._drain.is_set()
+                    if draining:
+                        status = (
+                            "aicc-drained"
+                            if self._drain_closed.is_set()
+                            else "aicc-drain-requested"
+                        )
+                        self._notify(f"WATCHDOG=1\nSTATUS={status}")
+                if draining:
+                    self._sleep(min(self._config.idle_min_seconds, cap))
                     continue
-                # Every other refusal is a protocol-level fact worth a log
-                # line, and none of them is cured by asking again faster.
-                logger.warning("claim refused: %s", claimed.reason)
-                self._sleep(min(self._config.idle_max_seconds, cap))
-                continue
-            idle = self._config.idle_min_seconds
-            self._execute(claimed)
+                with self._claim_gate_lock:
+                    if self._drain.is_set() or self._drain_closed.is_set():
+                        continue
+                    # STATUS travels with every claim-path ping so a status
+                    # written by a dying drain cycle can never stick.
+                    self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
+                    claimed = self._store.claim(
+                        self._config.queue,
+                        visibility_seconds=self._config.visibility_seconds,
+                    )
+                if isinstance(claimed, QueueRefusal):
+                    if claimed.reason == "no_work":
+                        self._sleep(min(idle + random.uniform(0, idle), cap))
+                        idle = min(idle * 2, self._config.idle_max_seconds)
+                        continue
+                    # Every other refusal is a protocol-level fact worth a log
+                    # line, and none of them is cured by asking again faster.
+                    logger.warning("claim refused: %s", claimed.reason)
+                    self._sleep(min(self._config.idle_max_seconds, cap))
+                    continue
+                idle = self._config.idle_min_seconds
+                self._execute(claimed)
+        finally:
+            self._reload_stop.set()
+            self._reload_requested.set()
+            self._drain_stop.set()
+            self._drain_wakeup.set()
+            reload_thread.join(timeout=5)
+            drain_thread.join(timeout=5)
         # STOPPING=1 tells systemd the exit it is about to observe is ours,
         # not a crash — TimeoutStopSec pacing instead of watchdog action.
         self._notify("STOPPING=1")
@@ -180,12 +296,31 @@ class WorkerDaemon:
                 work.attempt_id,
             )
             return
-        if outcome.ok:
-            accepted = self._store.complete(work, outcome.result)
-        else:
-            accepted = self._store.fail(
-                work, reason=outcome.reason, retryable=outcome.retryable
+        try:
+            if outcome.ok:
+                accepted = self._store.complete(work, outcome.result)
+            else:
+                accepted = self._store.fail(
+                    work, reason=outcome.reason, retryable=outcome.retryable
+                )
+        except Exception:
+            # The handler successfully decided an outcome -- what it admits --
+            # but persisting it raised (a DB hiccup, a dropped connection, a
+            # result the driver cannot encode): the same class of failure
+            # `_dispatch` already guards for a raising HANDLER. Uncaught here,
+            # it would propagate out of `run_forever`'s loop and kill the
+            # whole daemon over the one attempt it was reporting, taking every
+            # other queued item down with it -- mirroring the non-object-
+            # payload crash this module already closed once. The lease is
+            # left to lapse on its own (visibility expiry, then the reaper),
+            # exactly like the stale-owner refusal below; a later delivery
+            # retries.
+            logger.exception(
+                "attempt %s: writing the outcome raised; the attempt's lease "
+                "will lapse and a later delivery will retry",
+                work.attempt_id,
             )
+            return
         if not accepted:
             # The database refused the report: the lease lapsed between our
             # last successful beat and this write, and the attempt belongs to
@@ -224,7 +359,7 @@ class WorkerDaemon:
             )
         try:
             return handler(work.payload, lease_lost, work.attempt_no)
-        except Exception as error:  # noqa: BLE001 -- the boundary of the daemon
+        except Exception as error:
             logger.exception("handler for %r raised", kind)
             return HandlerOutcome(ok=False, reason=repr(error), retryable=True)
 
@@ -251,7 +386,7 @@ class WorkerDaemon:
             self._notify("WATCHDOG=1")
             try:
                 alive = self._store.heartbeat(work)
-            except Exception:  # noqa: BLE001 -- transient DB errors must not kill the beat
+            except Exception:
                 consecutive_errors += 1
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
                 # Errors are not refusals, but they are not free either: after

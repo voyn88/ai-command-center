@@ -12,6 +12,7 @@ they did against the single module.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
@@ -24,6 +25,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 
 def _new_session_id() -> str:
@@ -373,7 +376,47 @@ _SCHEMA_VERSION_TABLE_SQL = (
 )
 
 
+@contextmanager
+def _migration_file_lock(db_path: Path) -> Iterator[None]:
+    """Serialize the complete version-discovery -> validation migration pass."""
+    lock_path = db_path.with_name(f"{db_path.name}.migration-lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if lock_path.stat().st_size == 0:
+                handle.write("0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if not handle.closed:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
 def migrate(db_path: Path) -> None:
+    """Serialize migrations so a fresh concurrent bootstrap stays fresh."""
+    with _migration_file_lock(db_path):
+        _migrate_unlocked(db_path)
+
+
+def _migrate_unlocked(db_path: Path) -> None:
     """Apply every migration newer than the recorded schema version.
 
     Idempotent in two senses: every SQL-script migration statement is `IF NOT
@@ -400,9 +443,21 @@ def migrate(db_path: Path) -> None:
         db._retry_on_busy(lambda: conn.execute(db._SCHEMA_VERSION_TABLE_SQL))
         row = conn.execute("SELECT MAX(version) AS v FROM schema_version").fetchone()
         current = row["v"] if row and row["v"] is not None else 0
+        initial_version = current
         for version, step in db.MIGRATIONS:
             if version <= current:
                 continue
+            if version == 25 and 0 < initial_version < 25:
+                # Even a row-clean v24 database cannot prove that every v24
+                # writer is stopped: a live old process may be between runs
+                # and create a claimless row immediately after this commit.
+                # Only the explicit exclusive-lock cutover can cross this
+                # mixed-version boundary. A genuinely fresh DB (initial v0)
+                # still installs the complete current schema atomically.
+                raise db.FinalizationClaimCutoverRequired(
+                    "existing pre-v25 runtime schema requires the explicit "
+                    "offline finalization cutover before v25"
+                )
             if callable(step):
                 db._retry_on_busy(lambda step=step: step(conn))
             else:
@@ -416,6 +471,15 @@ def migrate(db_path: Path) -> None:
             except sqlite3.IntegrityError:
                 pass  # another process already recorded this migration version
             current = version
+        if current > db.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"runtime schema v{current} is newer than supported v{db.SCHEMA_VERSION}"
+            )
+        if current == 25:
+            # The ledger row is not enough: a partially restored or manually
+            # drifted DB must never let Supervisor startup proceed without the
+            # one-claim-per-run fencing constraints it relies on.
+            db._validate_finalization_claim_schema(conn)
         # Stamp the zone this file's naive timestamps are on, from a process
         # that also writes them. Retention reads it back instead of trusting
         # its own `TZ` (VOYN-W0-AICC-RETENTION-TZ).
@@ -644,13 +708,37 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     return removed
 
 
+#: Where the automatic retention path (below) writes its backup and cold
+#: archive. Required, on top of `AICC_RUNTIME_RETENTION_DAYS`, to delete
+#: anything: every `db.migrate()` call site is a service construction, not a
+#: deliberate operator action, so the automatic path refuses to run the bare,
+#: archive-less `apply_runtime_retention` delete it used to
+#: (VOYN-W0-AICC-RETENTION-NO-DRYRUN). Set to run `maintenance.rehearse`
+#: instead — the identical sequence against a throwaway copy, proving the
+#: original byte-identical afterward — to validate a retention window before
+#: trusting it to delete for real on a given install.
+RUNTIME_RETENTION_ARCHIVE_DIR_ENV = "AICC_RUNTIME_RETENTION_ARCHIVE_DIR"
+RUNTIME_RETENTION_DRY_RUN_ENV = "AICC_RUNTIME_RETENTION_DRY_RUN"
+
+
 def maybe_apply_runtime_retention(db_path: Path) -> None:
     """Apply retention iff the operator set `AICC_RUNTIME_RETENTION_DAYS` to a
     positive integer. Default (unset / <= 0) is a no-op, so this never changes
     behavior for existing installs or the test suite.
 
-    A companion `AICC_RUNTIME_VACUUM_ON_START=1` runs `VACUUM` after pruning to
-    reclaim disk. VACUUM rewrites the whole database under an exclusive lock, so
+    Routes through `maintenance.archive_and_prune` — backup, cold archive,
+    integrity check, all in the same transaction scope as the delete — the
+    same rollback-safe sequence the deliberate maintenance path uses, never
+    the bare `apply_runtime_retention` delete on its own. That also means
+    `AICC_RUNTIME_RETENTION_ARCHIVE_DIR` must be set; without it, this skips
+    entirely (no archive, no deletion) rather than delete without one. With
+    `AICC_RUNTIME_RETENTION_DRY_RUN=1`, it calls `maintenance.rehearse`
+    instead: the identical sequence against a throwaway copy of the database,
+    which raises rather than returns if the original turns out not to be
+    byte-identical afterward.
+
+    A companion `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk after a clean
+    prune. VACUUM rewrites the whole database under an exclusive lock, so
     it is opt-in and should only be enabled on a single-host install that can
     pause other writers briefly.
     """
@@ -663,8 +751,33 @@ def maybe_apply_runtime_retention(db_path: Path) -> None:
         return
     if retention_days <= 0:
         return
+    archive_dir = os.environ.get(RUNTIME_RETENTION_ARCHIVE_DIR_ENV)
+    if not archive_dir:
+        _LOG.warning(
+            "AICC_RUNTIME_RETENTION_DAYS=%s is set but %s is not; skipping "
+            "automatic retention rather than deleting without an archive. "
+            "Set both, or run maintenance.archive_and_prune/rehearse "
+            "deliberately instead.",
+            raw,
+            RUNTIME_RETENTION_ARCHIVE_DIR_ENV,
+        )
+        return
+    vacuum = os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1"
+    dry_run = os.environ.get(RUNTIME_RETENTION_DRY_RUN_ENV) == "1"
+
+    # Imported here, not at module scope: `maintenance` imports the `db`
+    # facade package, which imports this module — a module-level import would
+    # be a cycle broken only by import order.
+    from command_center.runtime import maintenance
+
+    run = maintenance.rehearse if dry_run else maintenance.archive_and_prune
     try:
-        db.apply_runtime_retention(db_path, retention_days=retention_days)
+        run(
+            db_path,
+            retention_days=retention_days,
+            archive_dir=Path(archive_dir),
+            vacuum=vacuum,
+        )
     except ValueError:
         # An unusable `AICC_RUNTIME_TZ`. This path runs inside `migrate()`, on
         # every service construction, so it must not take the app down — but it
@@ -672,9 +785,16 @@ def maybe_apply_runtime_retention(db_path: Path) -> None:
         # safe half of that trade; the operator's next deliberate
         # `apply_runtime_retention` call raises and says why.
         return
-    if os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1":
-        with db.connect(db_path) as conn:
-            conn.execute("VACUUM")
+    except maintenance.MaintenanceError:
+        # Backup, archive/delete-count mismatch, integrity check or rehearsal
+        # byte-identity all raise this. Same trade as the `ValueError` above:
+        # this runs on every service construction, so it logs and skips
+        # rather than taking the app down or deleting on an unproven path.
+        _LOG.exception(
+            "automatic runtime retention failed against %s; left as-is",
+            db_path,
+        )
+        return
 
 
 def current_schema_version(db_path: Path) -> int:

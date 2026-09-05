@@ -34,6 +34,7 @@ Usage:
     python scripts/execution_center_debug.py run-status RUN_ID
     python scripts/execution_center_debug.py events RUN_ID [--after-seq N]
     python scripts/execution_center_debug.py reconcile
+    python scripts/execution_center_debug.py offline-finalization-cutover --confirm-offline
     python scripts/execution_center_debug.py launch PROJECT REPO_PATH TASK_TYPE INSTRUCTION --confirm
         Blocks in the foreground, printing each new event as it is
         persisted, until the run reaches a terminal state. Ctrl+C requests
@@ -47,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -54,7 +56,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from command_center.runtime import db, identity  # noqa: E402
+from command_center.runtime import db, identity, supervisor  # noqa: E402
 from command_center.runtime.api import ExecutionCenterAPI  # noqa: E402
 from command_center.runtime.supervisor import SupervisorError  # noqa: E402
 
@@ -102,6 +104,10 @@ _EXIT_CODE_UNFINALIZED = 5
 #: the news: the news is that this CLI is exiting without having stopped a
 #: process it started.
 _EXIT_CODE_CANCEL_FAILED = 6
+
+# The operator requested an offline cutover but the database still contains a
+# shape that cannot safely cross the v24 -> v25 fencing boundary.
+_EXIT_CODE_CUTOVER_REFUSED = 7
 
 #: How long a row may be behind its process before this CLI stops waiting and
 #: decides from the process instead. Short: the sites that raise mid-write
@@ -181,7 +187,13 @@ def _settled_run(api: ExecutionCenterAPI, run_id: str) -> dict | None:
     return current
 
 
-def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
+def _run_foreground(
+    api: ExecutionCenterAPI,
+    run: dict,
+    *,
+    deferred_interrupt: dict[str, bool] | None = None,
+    previous_sigint_handler=None,
+) -> int:
     """Block until `run` reaches a terminal state *and its supervisor has
     finished finalizing it*, printing new events as they're persisted. Ctrl+C
     triggers confirmed cancellation and waits for it to finish before this
@@ -191,6 +203,14 @@ def _run_foreground(api: ExecutionCenterAPI, run: dict) -> int:
     after_seq = 0
 
     try:
+        # `start_run()` can make the child visible before it returns to this
+        # CLI.  Defer SIGINT across that narrow hand-off, then restore normal
+        # KeyboardInterrupt delivery *inside* this try block so a Ctrl+C can
+        # never strand the just-created run between launch and supervision.
+        if previous_sigint_handler is not None:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+        if deferred_interrupt and deferred_interrupt["pending"]:
+            raise KeyboardInterrupt
         while True:
             current = api.get_run(run_id)
             for event in api.get_events(run_id, after_seq=after_seq):
@@ -317,7 +337,82 @@ def main() -> int:
 
     sub.add_parser("reconcile")
 
+    p = sub.add_parser(
+        "offline-finalization-cutover",
+        help=(
+            "After intake and every pre-v25 Supervisor are stopped, atomically "
+            "fence legacy terminal crash rows and recover their finalization."
+        ),
+    )
+    p.add_argument(
+        "--confirm-offline",
+        action="store_true",
+        help="Confirm that intake and every pre-v25 Supervisor are stopped.",
+    )
+
     args = parser.parse_args()
+
+    # This must run before constructing ExecutionCenterAPI: Supervisor.__init__
+    # invokes the ordinary fail-closed migration, which deliberately refuses a
+    # v24 terminal-but-unfinalized crash row. The cutover first installs the
+    # fence and gives this exact process ownership; the API then recovers the
+    # durable artifacts under that same process-scoped token.
+    if args.command == "offline-finalization-cutover":
+        db_path = db.resolve_db_path()
+        if not args.confirm_offline:
+            print(
+                "CUTOVER REFUSED: stop and mask intake plus every pre-v25 "
+                "Supervisor, verify no legacy PID remains, then pass "
+                "--confirm-offline",
+                file=sys.stderr,
+            )
+            return _EXIT_CODE_CUTOVER_REFUSED
+        try:
+            maintenance_token, fence_created, maintenance_lock_handle = (
+                supervisor.acquire_offline_cutover_fence(db_path)
+            )
+            owner_pid, owner_identity, owner_token = (
+                supervisor._ensure_process_finalization_context()
+            )
+            seeded = db.bootstrap_finalization_claim_cutover(
+                db_path,
+                owner_token=owner_token,
+                owner_pid=owner_pid,
+                owner_identity=owner_identity.as_string(),
+                offline_confirmed=True,
+            )
+            api = ExecutionCenterAPI(
+                db_path=db_path,
+                maintenance_token=maintenance_token,
+                maintenance_lock_handle=maintenance_lock_handle,
+                enable_completion_autopilot=False,
+            )
+            outcomes = api.reconcile()
+            remaining = db.count_unfinalized_runs(db_path)
+        except (db.FinalizationClaimCutoverRequired, SupervisorError) as exc:
+            print(f"CUTOVER REFUSED: {exc}", file=sys.stderr)
+            return _EXIT_CODE_CUTOVER_REFUSED
+        result = {
+            "schema_version": db.current_schema_version(db_path),
+            "claims_seeded": seeded,
+            "reconciliation": outcomes,
+            "unfinalized_remaining": remaining,
+            "restart_fence": str(supervisor.offline_cutover_fence_path(db_path)),
+            "restart_fence_created": fence_created,
+        }
+        _print(result)
+        if remaining:
+            print(
+                "CUTOVER INCOMPLETE: restart fence remains active; rerun recovery "
+                "before starting any Supervisor",
+                file=sys.stderr,
+            )
+            return _EXIT_CODE_UNFINALIZED
+        supervisor.release_offline_cutover_fence(
+            db_path, maintenance_token, maintenance_lock_handle
+        )
+        return 0
+
     api = ExecutionCenterAPI()
 
     if args.command == "list-sessions":
@@ -329,22 +424,39 @@ def main() -> int:
     elif args.command == "events":
         _print(api.get_events(args.run_id, after_seq=args.after_seq))
     elif args.command == "launch":
-        run = api.start_run(
-            project=args.project,
-            repository_path=args.repository_path,
-            task_type=args.task_type,
-            instruction=args.instruction,
-            confirmed=args.confirm,
-            confirmed_items=args.confirmed_items or None,
-            model=args.model,
-            timeout_seconds=args.timeout_seconds,
-        )
+        deferred_interrupt = {"pending": False}
+        previous_sigint_handler = signal.getsignal(signal.SIGINT)
+
+        def _defer_sigint(_signum, _frame) -> None:
+            deferred_interrupt["pending"] = True
+
+        signal.signal(signal.SIGINT, _defer_sigint)
+        try:
+            run = api.start_run(
+                project=args.project,
+                repository_path=args.repository_path,
+                task_type=args.task_type,
+                instruction=args.instruction,
+                confirmed=args.confirm,
+                confirmed_items=args.confirmed_items or None,
+                model=args.model,
+                timeout_seconds=args.timeout_seconds,
+            )
+        except BaseException:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+            raise
         if run["state"] in db.TERMINAL_STATES:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
             # Popen itself failed (e.g. `claude` binary missing) — nothing
             # to wait on, no process was ever left running.
             _print(run)
             return _EXIT_CODE_BY_STATE.get(run["state"], 1)
-        return _run_foreground(api, run)
+        return _run_foreground(
+            api,
+            run,
+            deferred_interrupt=deferred_interrupt,
+            previous_sigint_handler=previous_sigint_handler,
+        )
     elif args.command == "reconcile":
         _print(api.reconcile())
 

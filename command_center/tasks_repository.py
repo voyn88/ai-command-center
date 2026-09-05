@@ -35,17 +35,24 @@ import contextlib
 import json
 import logging
 import os as _os
-import shutil
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from command_center import models, storage, task_view
+
+if TYPE_CHECKING:
+    from command_center.application.aios_tasks import AIOSTasksRepository
 
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+
+def is_master_projection_task(task: dict) -> bool:
+    """One control predicate for records owned by the master backlog view."""
+    return task.get("source") == "master"
 
 # Fields a task record cannot be useful without; a record missing any of these
 # is surfaced by `validate_tasks` rather than silently accepted (audit BLOCKER-4).
@@ -171,6 +178,10 @@ def _dedupe_by_id(tasks: list[dict]) -> tuple[list[dict], list[str]]:
 def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = False) -> list[dict]:
     """Load the task list. A missing file is created empty (or seeded from
     `example_file`) and read back as `[]` — that is a legitimate fresh store.
+    That creation is exclusive (`storage.create_json_if_absent`), never an
+    overwrite: this function is called on unlocked read paths, so seeding a
+    store another writer is concurrently populating must never replace what
+    that writer already committed.
 
     `strict` controls what happens when the file *exists* but cannot be decoded
     (transient `OSError`, a torn write, or non-JSON): the read-only default
@@ -191,10 +202,24 @@ def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = F
     data_dir.mkdir(parents=True, exist_ok=True)
     tasks_file = tasks_file_path(root)
     if not tasks_file.exists():
+        # Creation, never replacement. This runs on the *read* path — including
+        # `JSONTasksRepository.load_all`, which `task_import.apply_task_package`
+        # calls before it takes the store lock — so an unconditional write here
+        # races every locked writer and can erase a record that was already
+        # committed: `save_tasks(root, [])` was exactly that lost update (the
+        # first task of a concurrently imported package disappeared while every
+        # writer reported success — VOYN-W0-AICC-TASK-IMPORT-CONCURRENCY-FLAKE).
+        # `create_json_if_absent` publishes only when the file is still absent,
+        # so losing this race costs nothing but an unused temp file.
         if example_file and example_file.exists():
-            shutil.copyfile(example_file, tasks_file)
+            # Copied verbatim, never parsed. Decoding the example here would
+            # move its decode error *outside* the handler below, so a malformed
+            # example would raise from a read that `strict=False` promises will
+            # not (independent review of `4b058ff`). Copying keeps the failure
+            # exactly where it was before: in `_decode_tasks`, under `strict`.
+            storage.create_bytes_if_absent(tasks_file, example_file.read_bytes())
         else:
-            save_tasks(root, [])
+            storage.create_json_if_absent(tasks_file, [])
     try:
         tasks = _decode_tasks(tasks_file)
     except (json.JSONDecodeError, OSError, ValueError):
@@ -219,7 +244,27 @@ def save_tasks(root: Path, tasks: list[dict]) -> None:
     # rather than duplicating its temp-file + `os.replace` pattern without the
     # `fsync` (audit MINOR-10): every other JSON store in the project already
     # goes through it, so `tasks.json` gets the same on-disk durability.
-    storage.atomic_write_json(tasks_file_path(root), tasks)
+    #
+    # Master-projection records never persist (VOYN-W0-AICC-WIRE-BACKLOG-
+    # API): the read-only board view stamps them `source: "master"`, and
+    # dropping them HERE — the single point every write path funnels into
+    # (mutate_tasks, upsert, upsert_all, create, status updates) — is what
+    # makes "no second task store" structural rather than a convention.
+    # A guard at any higher layer is bypassable by the next single-record
+    # helper (independent review of 92a501f, findings 1-2: repo.upsert and
+    # panel-wide save callbacks both walked straight past it). Dropping is
+    # the correct semantics, not an error: a view record "saved" back is a
+    # no-op by definition, and the panels keep working instead of dying on
+    # a PermissionError mid-render.
+    writable = [task for task in tasks if not is_master_projection_task(task)]
+    dropped = [task.get("id") for task in tasks if is_master_projection_task(task)]
+    if dropped:
+        logger.warning(
+            "tasks.json: ignored %d master projection record(s): %s",
+            len(dropped),
+            sorted(task_id for task_id in dropped if task_id),
+        )
+    storage.atomic_write_json(tasks_file_path(root), writable)
 
 
 @contextlib.contextmanager
@@ -560,7 +605,7 @@ class JSONTasksRepository:
         return delete_task(self._root, task_id)
 
 
-def get_repository(root: Path) -> "JSONTasksRepository | AIOSTasksRepository":  # type: ignore[name-defined]  # noqa: F821
+def get_repository(root: Path) -> "JSONTasksRepository | AIOSTasksRepository":  # noqa: UP037
     """Return the active task store backend.
 
     ``AICC_TASKS_BACKEND=json`` (default) → ``JSONTasksRepository``
