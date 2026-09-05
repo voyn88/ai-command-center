@@ -260,3 +260,77 @@ def test_rich_records_on_the_real_master_shape(tmp_path):
     )
     statuses = {r.record_id: r.status for r in load_rich_records(master)}
     assert statuses == {"VOYN-W0-A": "IN_PROGRESS", "VOYN-W0-B": "READY_TO_REVIEW"}
+
+
+def test_projection_board_tasks_maps_statuses_and_marks_read_only(tmp_path, monkeypatch):
+    """WIRE-BACKLOG-API increment 1: the projection renders as board tasks —
+    every master status lands in a canonical lane, every record is stamped
+    read-only master-source."""
+    master = tmp_path / "master.md"
+    lines = ["# generated", ""]
+    cases = {
+        "OPEN": "Backlog", "IN_PROGRESS": "In Progress",
+        "READY_TO_REVIEW": "Review", "REJECTED": "Blocked",
+        "DEFER_TO_USER": "Blocked", "DONE": "Done", "DECIDED": "Closed",
+    }
+    for index, status in enumerate(cases):
+        lines.append(
+            "- VOYN_RECOMMENDATION | ts=2026-09-04T00:00:00Z | "
+            f"status={status} | issue_id=VOYN-T{index} | current_wave=0 | "
+            "proposed_wave=0 | priority=P1 | owner=repo-x | effect=- | "
+            f"effort=- | acceptance=- | task=title {index} | evidence=- | "
+            "file_scope=- | parallel_domain=-"
+        )
+    master.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    monkeypatch.setenv(bc.MASTER_BACKLOG_ENV, str(master))
+
+    tasks = bc.projection_board_tasks()
+
+    assert [t["status"] for t in tasks] == list(cases.values())
+    assert all(t["read_only"] and t["source"] == "master" for t in tasks)
+    assert tasks[0]["id"] == "VOYN-T0" and tasks[0]["project"] == "repo-x"
+
+
+def test_master_view_records_never_reach_disk(tmp_path):
+    """The invariant is structural, at the single persist point: whatever
+    path a master record arrives through — bulk panel save, single-record
+    repo.upsert, task creation — save_tasks drops it, and the local store
+    can never fork the master backlog (independent review of 92a501f:
+    a raise at a higher layer was both bypassable and page-killing)."""
+    from command_center import tasks_repository as tr
+
+    master = {"id": "VOYN-X", "source": "master", "read_only": True,
+              "status": "Backlog", "title": "view"}
+    local = {"id": "L-1", "status": "Backlog", "title": "mine"}
+    local_read_only = {
+        "id": "L-2", "read_only": True, "status": "Backlog", "title": "local view"
+    }
+    tr.save_tasks(tmp_path, [local, local_read_only, master])
+
+    stored = tr.load_tasks(tmp_path)
+    assert [t["id"] for t in stored] == ["L-1", "L-2"]
+
+    # The single-record path funnels through the same gate.
+    tr.upsert_task(tmp_path, dict(master))
+    assert [t["id"] for t in tr.load_tasks(tmp_path)] == ["L-1", "L-2"]
+
+
+def test_board_falls_back_to_projection_only_when_store_is_empty(
+    monkeypatch, tmp_path
+):
+    """The fallback lives at the app layer (helpers must stay pure
+    delegation — single-writer fitness); pin its exact contract here: empty
+    store -> projection view, non-empty store -> untouched local list."""
+    master = tmp_path / "m.md"
+    master.write_text(
+        "- VOYN_RECOMMENDATION | ts=- | status=OPEN | issue_id=VOYN-F | "
+        "current_wave=0 | proposed_wave=0 | priority=- | owner=- | effect=- "
+        "| effort=- | acceptance=- | task=t | evidence=- | file_scope=- | "
+        "parallel_domain=-\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(bc.MASTER_BACKLOG_ENV, str(master))
+
+    assert [t["id"] for t in bc.board_tasks([])] == ["VOYN-F"]
+    local = [{"id": "L-1", "status": "Backlog"}]
+    assert bc.board_tasks(local) is local
