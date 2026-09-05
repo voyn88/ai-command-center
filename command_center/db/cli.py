@@ -108,9 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
     export = sub.add_parser(
         "backlog-export",
         help=(
-            "Render the canonical store as the master-file markdown "
-            "projection (the read format of backlog_client / the console's "
-            "Master Backlog panel)."
+            "One export tick (BO-S4): render the canonical store as the "
+            "master-file markdown projection (the read format of "
+            "backlog_client / the console's Master Backlog panel), run by "
+            "aicc-backlog-export.timer."
         ),
     )
     export.add_argument(
