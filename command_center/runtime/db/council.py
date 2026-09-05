@@ -212,7 +212,7 @@ def _mirror_motion(record: dict) -> None:
 
         PostgresMotionMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror motion into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror motion into PostgreSQL", exc_info=True)
 
 
 def _mirror_vote(record: dict) -> None:
@@ -222,7 +222,7 @@ def _mirror_vote(record: dict) -> None:
 
         PostgresCouncilVoteMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror council_vote into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror council_vote into PostgreSQL", exc_info=True)
 
 
 def _mirror_decision(record: dict) -> None:
@@ -237,7 +237,7 @@ def _mirror_decision(record: dict) -> None:
 
         PostgresCouncilDecisionMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror council_decision into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror council_decision into PostgreSQL", exc_info=True)
 
 
 def _mirror_council_event(record: dict) -> None:
@@ -252,7 +252,7 @@ def _mirror_council_event(record: dict) -> None:
 
         PostgresCouncilEventMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror council_event into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror council_event into PostgreSQL", exc_info=True)
 
 
 

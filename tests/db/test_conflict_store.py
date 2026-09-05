@@ -363,9 +363,9 @@ def test_every_write_path_mirrors_the_committed_row(tmp_path, monkeypatch) -> No
 
     Recorded rather than asserted inside the callback. `_mirror_conflict`
     swallows every `Exception`, and `AssertionError` is one — an assertion in
-    there is caught, logged at DEBUG and lost, so the test would pass whatever
-    it claimed. Independent review proved that on slice 2 by inverting the
-    condition and watching the test still pass.
+    there is caught, logged at WARNING and lost, so the test would pass
+    whatever it claimed. Independent review proved that on slice 2 by
+    inverting the condition and watching the test still pass.
     """
     from command_center.db import conflict_store
 

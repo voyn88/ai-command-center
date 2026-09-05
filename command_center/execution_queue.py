@@ -137,7 +137,7 @@ def _mirror_to_runtime_db(root: Path, entries: list[dict]) -> None:
     try:
         runtime_db.replace_queue_entries(runtime_db.resolve_db_path(root), entries)
     except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        logger.debug("Could not mirror execution queue into runtime.db", exc_info=True)
+        logger.warning("Could not mirror execution queue into runtime.db", exc_info=True)
 
 
 def backfill_mirror(root: Path) -> int:

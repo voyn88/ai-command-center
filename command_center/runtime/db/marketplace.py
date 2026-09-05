@@ -171,7 +171,7 @@ def _mirror_market_item(record: dict) -> None:
 
         PostgresMarketItemMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror market_item into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror market_item into PostgreSQL", exc_info=True)
 
 
 def _mirror_install_log(record: dict) -> None:
@@ -185,7 +185,7 @@ def _mirror_install_log(record: dict) -> None:
 
         PostgresInstallLogMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror market_install_log into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror market_install_log into PostgreSQL", exc_info=True)
 
 
 

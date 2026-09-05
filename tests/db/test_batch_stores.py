@@ -31,6 +31,7 @@ What still gets per-table attention, because it is per-table by nature:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -423,9 +424,19 @@ def test_advisor_proposals_reconcile_after_every_write(
 # --- failure isolation, once for the batch ------------------------------------
 
 
-def test_a_mirror_failure_cannot_break_any_authoritative_write(tmp_path, monkeypatch) -> None:
+def test_a_mirror_failure_cannot_break_any_authoritative_write(tmp_path, monkeypatch, caplog) -> None:
     """One test for six tables: the rule is the same everywhere, and repeating
-    it per table would assert the same swallow six times."""
+    it per table would assert the same swallow six times.
+
+    Also covers `VOYN-W0-AICC-MIRROR-SILENT-DROP`'s log-level half: every
+    application entry point in this package defaults to INFO
+    (``logging.basicConfig(level=logging.INFO)`` in `command_center/db/cli.py`,
+    `command_center/worker/__main__.py`, `command_center/worktree_sweep.py`),
+    so a swallowed failure logged at DEBUG would never appear anywhere an
+    operator actually looks — indistinguishable from not being logged at all.
+    `caplog` defaults to WARNING, matching that default, so this only passes
+    if the six hooks below actually log at WARNING or louder.
+    """
     from command_center.db import advisor_store, audit_store, marketplace_store, networking_store
 
     class Exploding:
@@ -444,29 +455,45 @@ def test_a_mirror_failure_cannot_break_any_authoritative_write(tmp_path, monkeyp
     db_path = tmp_path / "runtime.db"
     wave1.db.migrate(db_path)
 
-    contact = net_db.create_contact(db_path, display_name="survives")
-    invitation = net_db.create_invitation(db_path, contact_id=contact["id"], council_ref="c1")
-    item = market_db.create_market_item(db_path, name="pack", kind="module", version="1.0")
-    market_db.install_market_item(
-        db_path,
-        item["id"],
-        expected_version=item["lock_version"],
-        actor="ops",
-        installer="cli",
-    )
-    run = audit_db.create_audit_run(db_path, project_ref="AICC", checks=["lint"])
-    audit_db.create_audit_finding(
-        db_path, run_id=run["id"], category="security", summary="s", owner="ops"
-    )
-    proposal = wave1.create_advisor_proposal(
-        db_path, kind="trend", title="t", project_ref="AICC"
-    )
+    with caplog.at_level(logging.WARNING):
+        contact = net_db.create_contact(db_path, display_name="survives")
+        invitation = net_db.create_invitation(db_path, contact_id=contact["id"], council_ref="c1")
+        item = market_db.create_market_item(db_path, name="pack", kind="module", version="1.0")
+        market_db.install_market_item(
+            db_path,
+            item["id"],
+            expected_version=item["lock_version"],
+            actor="ops",
+            installer="cli",
+        )
+        run = audit_db.create_audit_run(db_path, project_ref="AICC", checks=["lint"])
+        audit_db.create_audit_finding(
+            db_path, run_id=run["id"], category="security", summary="s", owner="ops"
+        )
+        proposal = wave1.create_advisor_proposal(
+            db_path, kind="trend", title="t", project_ref="AICC"
+        )
 
     assert net_db.get_invitation(db_path, invitation["id"])["council_ref"] == "c1"
     assert market_db.get_market_item(db_path, item["id"])["name"] == "pack"
     assert len(market_db.list_install_log(db_path, item["id"])) == 1
     assert len(audit_db.list_audit_findings(db_path)) == 1
     assert wave1.get_advisor_proposal(db_path, proposal["id"])["title"] == "t"
+
+    warned_tables = {
+        record.getMessage().split()[3]
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "Could not mirror" in record.getMessage()
+    }
+    assert warned_tables == {
+        "contact",
+        "networking_invitation",
+        "market_item",
+        "market_install_log",
+        "audit_run",
+        "audit_finding",
+        "advisor_proposal",
+    }
 
 
 def test_importing_the_new_stores_needs_no_postgresql_client() -> None:

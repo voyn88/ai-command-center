@@ -171,7 +171,7 @@ def _mirror_audit_run(record: dict) -> None:
 
         PostgresAuditRunMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror audit_run into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror audit_run into PostgreSQL", exc_info=True)
 
 
 def _mirror_audit_finding(record: dict) -> None:
@@ -181,7 +181,7 @@ def _mirror_audit_finding(record: dict) -> None:
 
         PostgresAuditFindingMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror audit_finding into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror audit_finding into PostgreSQL", exc_info=True)
 
 
 

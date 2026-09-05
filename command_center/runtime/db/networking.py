@@ -158,15 +158,17 @@ def _mirror_contact(record: dict) -> None:
     swallowed failure here does not cost one row. Every later ``message`` write
     for this contact is refused by the target as well, and swallowed in turn,
     so one dropped parent becomes a growing hole that only reconciliation
-    shows. Tracked as ``VOYN-W0-AICC-MIRROR-SILENT-DROP``, which this table
-    gives a multiplier rather than a new cause.
+    resolves. Tracked as ``VOYN-W0-AICC-MIRROR-SILENT-DROP``, which this table
+    gives a multiplier rather than a new cause. The failure still logs at
+    WARNING, though, so the hole is at least visible from the first row that
+    falls into it rather than only once someone runs ``divergence``.
     """
     try:
         from command_center.db.networking_store import PostgresContactMirror
 
         PostgresContactMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror contact into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror contact into PostgreSQL", exc_info=True)
 
 
 def _mirror_message(record: dict) -> None:
@@ -183,7 +185,7 @@ def _mirror_message(record: dict) -> None:
 
         PostgresMessageMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror message into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror message into PostgreSQL", exc_info=True)
 
 
 def get_contact(db_path: Path, contact_id: str) -> dict | None:
@@ -444,7 +446,7 @@ def _mirror_invitation(record: dict) -> None:
 
         PostgresInvitationMirror().upsert(record)
     except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror networking_invitation into PostgreSQL", exc_info=True)
+        _LOG.warning("Could not mirror networking_invitation into PostgreSQL", exc_info=True)
 
 
 
