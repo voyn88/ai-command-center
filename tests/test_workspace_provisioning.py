@@ -210,6 +210,28 @@ def test_standalone_clone_under_canonical_worker_root_is_exact_and_reusable(
         wp.verify_workspace(wrong)
 
 
+def test_github_https_and_ssh_remotes_have_one_repository_identity():
+    https = "https://github.com/voyn88/aios.git"
+
+    assert wp._repository_remote_identity(https) == wp._repository_remote_identity(
+        "git@github.com:voyn88/aios.git"
+    )
+    assert wp._repository_remote_identity(https) == wp._repository_remote_identity(
+        "ssh://git@github.com/voyn88/aios.git"
+    )
+
+
+def test_repository_identity_never_collapses_different_github_repositories():
+    expected = wp._repository_remote_identity("https://github.com/voyn88/aios.git")
+
+    assert expected != wp._repository_remote_identity(
+        "git@github.com:voyn88/ai-command-center.git"
+    )
+    assert ("literal", "https://example.com/voyn88/aios.git") == (
+        wp._repository_remote_identity("https://example.com/voyn88/aios.git")
+    )
+
+
 def test_branch_is_created_from_base_branch(tmp_path):
     repo = _make_repo(tmp_path / "repo")
     # A distinct base commit so we can prove the worktree forked from it.
