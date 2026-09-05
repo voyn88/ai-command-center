@@ -1484,6 +1484,32 @@ _MAX_REF_BYTES = 4096
 _MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024
 
 
+def _validate_task_branch_ref(expected_branch: str, workspace: Path) -> None:
+    """Apply Git's ref-name restrictions before any raw path operation."""
+    components = expected_branch.split("/")
+    forbidden = set(" ~^:?*[\\")
+    invalid = (
+        not expected_branch
+        or len(expected_branch.encode("utf-8", "surrogatepass")) > _MAX_REF_BYTES
+        or expected_branch == "@"
+        or expected_branch.startswith(('/', '.'))
+        or expected_branch.endswith(('/', '.'))
+        or ".." in expected_branch
+        or "@{" in expected_branch
+        or any(part in {"", ".", ".."} or part.endswith(".lock") for part in components)
+        or any(ord(char) < 32 or ord(char) == 127 or char in forbidden for char in expected_branch)
+    )
+    if invalid:
+        raise WorkspaceVerificationError(
+            failed_step="agent_head_branch",
+            remediation="Use a valid Git branch name below refs/heads.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="branch name is not a safe Git heads ref",
+        )
+
+
 def _read_pinned_regular(
     descriptor: int, initial: os.stat_result, *, max_bytes: int
 ) -> bytes:
@@ -1534,15 +1560,7 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
     # symlink, nor a hardlink can redirect any read.
     open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if any(part in {"", ".", ".."} for part in expected_branch.split("/")):
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_branch",
-            remediation="Use a branch name without empty or dot path components.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail="branch name would escape .git/refs/heads",
-        )
+    _validate_task_branch_ref(expected_branch, workspace)
     expected_ref = f"refs/heads/{expected_branch}"
     dir_fd: int | None = None
     head_fd: int | None = None
@@ -2106,7 +2124,14 @@ def _copy_trusted_loose_object_to_agent(
         except FileExistsError:
             existing = os.open(oid[2:], os.O_RDONLY | nofollow, dir_fd=prefix_fd)
             try:
-                if os.read(existing, len(payload) + 1) != payload:
+                existing_stat = os.fstat(existing)
+                if (
+                    not stat.S_ISREG(existing_stat.st_mode)
+                    or _read_pinned_regular(
+                        existing, existing_stat, max_bytes=_MAX_OBJECT_TRANSFER_BYTES
+                    )
+                    != payload
+                ):
                     raise OSError(f"object collision for {oid}")
             finally:
                 os.close(existing)
@@ -2143,6 +2168,7 @@ def _advance_agent_branch_ref(
     checkpoint_sha: str,
 ) -> None:
     """Atomically advance only the already-verified task branch ref."""
+    _validate_task_branch_ref(expected_branch, workspace)
     if _read_agent_head(workspace, expected_branch) != previous_sha:
         raise WorkspaceVerificationError(
             failed_step="dirty_checkpoint_ref_race",
