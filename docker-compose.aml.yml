@@ -12,9 +12,10 @@ services:
       # writes that rule below a host firewall, so the exposure would not show
       # up in the firewall's own configuration. This service has no
       # authentication and performs privileged git/gh and subprocess
-      # operations, so reaching it off-host must be a deliberate act:
-      # set AML_BIND_HOST to widen it, in front of a reviewed authenticating
-      # proxy.
+      # operations, so reaching it off-host must be a deliberate act: widening
+      # AML_BIND_HOST off 127.0.0.1 is not authorized without the
+      # identity-aware reverse proxy required by
+      # docs/adr/0011-streamlit-console-identity-boundary.md in front of it.
       - "${AML_BIND_HOST:-127.0.0.1}:${AML_PORT:-8501}:8501"
     volumes:
       - aml-data:/data

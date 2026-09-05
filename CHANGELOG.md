@@ -8,6 +8,21 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Security — recorded the identity boundary for external Streamlit deployment (`VOYN-W0-AICC-CONSOLE-NO-AUTH`)
+- [ADR-0011](docs/adr/0011-streamlit-console-identity-boundary.md): the loopback-only bind
+  enforced by `VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH` is a compensating control, not an
+  identity boundary. External deployment of the console (widening `AML_BIND_HOST`, or any
+  other way of making it reachable by more than "whoever has a shell on this host") is not
+  authorized until it sits behind an identity-aware reverse proxy consuming the same AIOS
+  identity surface `command_center/http_auth/` already consumes for the HTTP control plane
+  (`VOYN-W0-AICC-AUTH-HTTP-01`), or is retired in favor of a client that reaches parity for
+  privileged operations and adopts that boundary itself. A Streamlit-native auth layer is
+  rejected as a second identity/authz engine, forbidden by ADR-0008.
+- No behavior changes: every launch path already defaults to loopback. Comments in
+  `.streamlit/config.toml`, `scripts/start-ui.sh`, `scripts/aml-entrypoint.sh` and
+  `docker-compose.aml.yml`, plus `docs/AIOS_BOUNDARY.md` and `README.md`, now point at the
+  ADR so the decision is discoverable from every place the risk was previously only noted.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,

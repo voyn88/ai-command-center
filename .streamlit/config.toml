@@ -15,8 +15,9 @@
 # subprocess operations, so the console must never be reachable off-host. Pinning
 # localhost here makes it the default for EVERY launch path — including a bare
 # `streamlit run app.py`, which does not go through scripts/start-ui.sh. An
-# explicit `--server.address` CLI flag still overrides this for an intentional,
-# reviewed exposure (see README "Getting started").
+# explicit `--server.address` CLI flag still overrides this locally, but external
+# deployment is not authorized without the identity-aware reverse proxy required
+# by docs/adr/0011-streamlit-console-identity-boundary.md.
 address = "localhost"
 
 [client]

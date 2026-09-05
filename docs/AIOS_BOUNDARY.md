@@ -287,6 +287,15 @@ as per-service authorization rather than in this repository — is real and is
 tracked as `VOYN-W0-AICC-AUTHZ-BOUNDARY-01`. Until AIOS offers that contract,
 an AICC-local, deny-by-default ACL is the least-authority option available.
 
+This boundary covers only the FastAPI `webapi/` routes. It does not extend to
+the Streamlit console (`app.py`), which has no per-route middleware seam to
+attach it to and remains fully unauthenticated, compensated for only by a
+loopback-only bind. [ADR-0011](adr/0011-streamlit-console-identity-boundary.md)
+records the decision for that surface: external deployment requires an
+identity-aware reverse proxy in front of Streamlit consuming this same AIOS
+identity surface (or retirement in favor of a client that reaches parity and
+adopts this boundary itself), never a second, Streamlit-native auth layer.
+
 ## Changing the baseline (a reviewed change)
 
 The baseline may only change through an ordinary reviewed PR that explains the

@@ -25,6 +25,8 @@ if [[ -z "${STREAMLIT_SERVER_ADDRESS:-}" ]]; then
     echo "[AML] chosen explicitly. Use 127.0.0.1 to keep it on the host, or 0.0.0.0" >&2
     echo "[AML] only when the container network namespace is private and the port is" >&2
     echo "[AML] published on a specific host address." >&2
+    echo "[AML] Publishing off loopback is not authorized without the reverse proxy" >&2
+    echo "[AML] required by docs/adr/0011-streamlit-console-identity-boundary.md." >&2
     exit 78  # EX_CONFIG
 fi
 

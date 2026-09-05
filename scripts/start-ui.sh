@@ -18,7 +18,9 @@ fi
 
 # Bind to localhost by default: the application has no authentication layer,
 # so it must not be reachable from the local network unless the operator
-# explicitly opts in. Pass an explicit --server.address to override.
+# explicitly opts in. Pass an explicit --server.address to override locally;
+# external deployment is not authorized without the identity-aware reverse
+# proxy required by docs/adr/0011-streamlit-console-identity-boundary.md.
 if [[ $# -eq 0 ]] || ! grep -q -- "--server.address" <<<"$*"; then
   set -- --server.address localhost "$@"
 fi

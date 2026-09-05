@@ -497,7 +497,9 @@ merges are to be blocked on it.
   low-level/ad-hoc launches preserve their separate behavior.
 - Streamlit and the web dashboard bind to localhost by default; passing an explicit
   `--server.address` overrides that. No interface has authentication, so do not bind to a reachable
-  interface.
+  interface. External deployment is not authorized until an identity-aware reverse proxy (consuming
+  the same AIOS identity surface as `command_center/http_auth/`) or a parity-reaching authenticated
+  replacement exists — see [ADR-0011](docs/adr/0011-streamlit-console-identity-boundary.md).
 - The system does not provide distributed execution, remote-worker durability, or seamless process
   resumption.
 
