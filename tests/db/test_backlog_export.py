@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from command_center import backlog_client
 from command_center.db import backlog_export
-from command_center.db.backlog_parser import parse_backlog
+from command_center.db.backlog_parser import ParsedTask, parse_backlog
+from command_center.db.backlog_store import BacklogStore
 
 _ROWS = [
     {
@@ -97,3 +98,58 @@ def test_reimporting_a_projection_through_the_real_importer_is_a_no_op():
     report = parse_backlog(backlog_export.render_projection(_ROWS))
     assert report.tasks == []
     assert report.unparsed == []
+
+
+def _task(task_id: str, **overrides) -> ParsedTask:
+    values = dict(
+        task_id=task_id,
+        wave="0",
+        priority="P0",
+        status="OPEN",
+        kind="task",
+        title=task_id.lower(),
+        body="",
+        repo=None,
+        line_no=1,
+    )
+    values.update(overrides)
+    return ParsedTask(**values)
+
+
+def test_fetch_rows_reads_the_real_table_in_wave_priority_task_order(pg_connection_factory):
+    """`render_record`/`render_projection` are proved above as pure functions
+    over plain dicts; `fetch_rows` — the only part of this module that talks
+    to `backlog_task` — had no coverage against a real table. Proves its
+    column list matches the schema, and that a NULL priority sorts last
+    within its wave (the query's explicit `nulls last`) rather than first
+    (`NULLS FIRST` is Postgres's ASC default and would put an untriaged task
+    ahead of a P0 one)."""
+    store = BacklogStore(pg_connection_factory)
+    for task in [
+        _task("VOYN-W0-FETCH-B", wave="1", priority="P1", status="DONE", repo="repo-b"),
+        _task("VOYN-W0-FETCH-NULL", wave="0", priority=None, status="OPEN"),
+        _task("VOYN-W0-FETCH-A", wave="0", priority="P0", status="IN_PROGRESS", repo="repo-a"),
+    ]:
+        ok, reason, _ = store.upsert_task(task)
+        assert ok, reason
+
+    with pg_connection_factory() as conn:
+        rows = backlog_export.fetch_rows(conn)
+
+    ours = [row for row in rows if row["task_id"].startswith("VOYN-W0-FETCH-")]
+    assert [row["task_id"] for row in ours] == [
+        "VOYN-W0-FETCH-A",
+        "VOYN-W0-FETCH-NULL",
+        "VOYN-W0-FETCH-B",
+    ]
+    first = dict(ours[0])
+    updated_at = first.pop("updated_at")
+    assert isinstance(updated_at, datetime)
+    assert first == {
+        "task_id": "VOYN-W0-FETCH-A",
+        "wave": "0",
+        "priority": "P0",
+        "status": "IN_PROGRESS",
+        "title": "voyn-w0-fetch-a",
+        "repo": "repo-a",
+    }
