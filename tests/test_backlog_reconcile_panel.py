@@ -58,7 +58,7 @@ def test_self_completed_finding_is_shown_and_moves_to_review(isolated_data_dir):
     assert reloaded["t1"]["status"] == "Review"
 
 
-def test_duplicate_of_done_is_deleted(isolated_data_dir):
+def test_duplicate_of_done_requires_explicit_confirmation_before_deleting(isolated_data_dir):
     root = isolated_data_dir
     tasks_repository.save_tasks(
         root,
@@ -69,7 +69,18 @@ def test_duplicate_of_done_is_deleted(isolated_data_dir):
     )
 
     at = _run()
-    at.button(key="t_delete_o1").click().run()
+    at = at.button(key="t_delete_o1").click().run()
+
+    # A single click opens the confirmation dialog but must not delete
+    # anything yet — the whole point of the gate is that one accidental
+    # click on "Удалить" can't remove a task.
+    ids = {t["id"] for t in tasks_repository.load_tasks(root)}
+    assert "o1" in ids
+    confirm_button = at.button(key="t_delete_o1_confirm_btn")
+    assert confirm_button.disabled is True
+
+    at = at.checkbox(key="t_delete_o1_confirmed").check().run()
+    at = at.button(key="t_delete_o1_confirm_btn").click().run()
 
     ids = {t["id"] for t in tasks_repository.load_tasks(root)}
     assert "o1" not in ids

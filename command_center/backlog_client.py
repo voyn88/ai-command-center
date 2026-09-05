@@ -465,3 +465,62 @@ def load_rich_records(path: str | os.PathLike[str] | None = None) -> list[RichRe
     except OSError:
         return []
     return parse_rich_records(text)
+
+
+# --- read-only board view over the projection (VOYN-W0-AICC-WIRE-BACKLOG-
+# API-TO-DEPLOYED-WEBAPI, first increment) ---------------------------------
+#
+# The console's Overview/Kanban read the local task repository; on a host
+# whose store is empty (the deployed console) they rendered zeros while the
+# fleet's real state sat in the same projection file the Master Backlog
+# panel already reads. This maps that projection into the read model's task
+# shape — a VIEW, never a store: every record is stamped `source: "master"`
+# and `read_only: True`, and the write path refuses them (see
+# `legacy_task_helpers.upsert_tasks`), so no second task store can emerge.
+
+#: Master-store execution statuses → the read model's canonical lanes.
+#: DECIDED maps to Closed (record closed by decision, not by work);
+#: REJECTED and DEFER_TO_USER surface as Blocked — both wait on something
+#: other than an executor.
+_MASTER_STATUS_TO_LANE: dict[str, str] = {
+    "OPEN": "Backlog",
+    "UNTRIAGED": "Backlog",
+    "NEEDS_REFINEMENT": "Backlog",
+    "IN_PROGRESS": "In Progress",
+    "READY_TO_REVIEW": "Review",
+    "REJECTED": "Blocked",
+    "DEFER_TO_USER": "Blocked",
+    "SPLIT": "Blocked",
+    "DONE": "Done",
+    "DECIDED": "Closed",
+}
+
+
+def projection_board_tasks(path: str | os.PathLike[str] | None = None) -> list[dict]:
+    """The master projection as read-only board tasks (empty when absent)."""
+    projection = load_projection(path)
+    tasks: list[dict] = []
+    for record in projection.records:
+        tasks.append(
+            {
+                "id": record.issue_id,
+                "title": record.task,
+                # An unmapped status keeps its raw name and lands in the
+                # read model's visible `other` bucket instead of silently
+                # inflating Backlog (independent review of 92a501f).
+                "status": _MASTER_STATUS_TO_LANE.get(record.status, record.status),
+                "project": record.owner if record.owner != "-" else "VOYN",
+                "priority": record.priority if record.priority != "-" else "",
+                "task_type": "backlog",
+                "source": "master",
+                "read_only": True,
+            }
+        )
+    return tasks
+
+
+def board_tasks(
+    local_tasks: list[dict], path: str | os.PathLike[str] | None = None
+) -> list[dict]:
+    """Use the read-only master projection only when the local store is empty."""
+    return local_tasks if local_tasks else projection_board_tasks(path)
