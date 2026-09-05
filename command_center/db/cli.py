@@ -487,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
+                    reconcile_review_once,
                     review_once,
                 )
 
@@ -513,6 +514,16 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REVIEW    {task_id} -> {pr}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                retry_report = reconcile_review_once(
+                    lambda: _nc(conn),
+                    enqueue,
+                    args.repo_path,
+                    task_id=args.task_id,
+                )
+                for task_id, retry_key in retry_report.retried:
+                    print(f"RETRY     {task_id} -> {retry_key}")
+                for task_id, reason in retry_report.skipped:
+                    print(f"RETRY-SKIP {task_id}: {reason}")
                 marker_report = publish_review_verdicts(
                     lambda: _nc(conn), args.repo_path, task_id=args.task_id,
                     # The same queue writer review_once uses: a REJECT
