@@ -440,6 +440,42 @@ def test_worker_can_call_queue_redrive_without_grants(
 
 
 # ---------------------------------------------------------------------------
+# The backlog store (0005, BO-S1): behavioural proof, not just catalog diff
+# ---------------------------------------------------------------------------
+#
+# roles.py's `_APP_BACKLOG_TABLES`/`_WORKER_BACKLOG_TABLES` comment promised
+# this suite's provisioning coverage would extend to the backlog tables "in
+# the first post-#321 slice" (BO-S1, #326) — the generic catalog-diff tests
+# above already exercise `backlog_task` et al because `ALL_TABLES`/`PRIVILEGES`
+# include them, but that promise was specifically about a *behavioural*
+# check, the same kind `test_worker_cannot_call_queue_redrive_*` gives the
+# queue-claim tables: connect as the role, run the query, observe what the
+# database itself allows — not just that the catalog says so. Closed here
+# (BO-S4) rather than at BO-S1 to keep that PR's surface reviewable, per the
+# comment's own deferral.
+
+
+def test_worker_cannot_read_backlog_task_when_grants_are_applied(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """A compromised execution host must not be able to read the programme's
+    plan: `_WORKER_BACKLOG_TABLES` declares `backlog_task` (and its siblings)
+    as `_NONE` for `aicc_worker`. Unlike function EXECUTE, PostgreSQL grants
+    no table privilege to PUBLIC by default, so there is no "without grants"
+    mirror here — the worker has no path to this table under any state.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with psycopg.connect(
+        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(Exception, match="permission denied"):
+                cur.execute("SELECT task_id FROM backlog_task LIMIT 1")
+
+
+# ---------------------------------------------------------------------------
 # A new migration adding an object outside the policy must fail the check
 # ---------------------------------------------------------------------------
 

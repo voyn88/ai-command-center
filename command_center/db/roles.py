@@ -256,12 +256,12 @@ _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
 # execution host has no business reading the programme's plan, and a
 # compromised one must not learn it.
 #
-# TODO(VOYN-W0-BACKLOG-ORCHESTRATOR BO-S1, after #321 merged): #321's grant
-# compliance checker now verifies this matrix against the live catalog;
-# extend tests/db/test_grant_compliance.py's provisioning coverage to the
-# backlog tables/functions in the first post-#321 slice. [#321 merged
-# 2026-08-19 as 8b9c89d — the extension rides the next BO slice to keep this
-# PR's surface reviewable.]
+# The catalog-diff tests in test_grant_compliance.py already cover these
+# tables/functions generically (ALL_TABLES/PRIVILEGES/FUNCTION_PRIVILEGES
+# include them since BO-S1, #326); the behavioural proof this comment
+# deferred to "the next BO slice" — connect as aicc_worker, run the query,
+# observe the denial — landed in BO-S4 as
+# test_worker_cannot_read_backlog_task_when_grants_are_applied.
 _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _READ,
     "backlog_dependency": _READ,
