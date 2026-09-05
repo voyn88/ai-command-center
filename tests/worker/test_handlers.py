@@ -427,8 +427,11 @@ def test_bwrap_loopback_result_is_retryable_infrastructure_failure(
 ):
     run_agent, _runs = handler
     payload = _cascade_payload()
-    payload["cascade"][0]["executor"] = "codex"
-    payload["cascade"][0]["task_type"] = "implementation"
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
     monkeypatch.setattr(
         agent_runner, "_codex_workspace_write_preflight_result", (True, "")
     )
@@ -462,6 +465,13 @@ def test_bwrap_loopback_result_is_retryable_infrastructure_failure(
     assert outcome.ok
     assert outcome.result["cascade_step"] == 2
     assert seen == ["codex", payload["cascade"][1]["executor"]]
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "reason": "codex_workspace_sandbox",
+        }
+    ]
     assert agent_runner.codex_workspace_write_preflight()[0] is False
 
 
@@ -470,8 +480,11 @@ def test_codex_workspace_preflight_skips_to_fallback_without_spending_attempt(
 ):
     run_agent, runs = handler
     payload = _cascade_payload()
-    payload["cascade"][0]["executor"] = "codex"
-    payload["cascade"][0]["task_type"] = "implementation"
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
     monkeypatch.setattr(
         agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap")
     )
@@ -517,7 +530,7 @@ def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
         "network error: connection refused",
     ],
 )
-def test_copilot_provider_failure_retries_into_the_next_cascade_link(
+def test_copilot_provider_failure_switches_inside_the_same_attempt(
     handler, monkeypatch, diagnostic
 ):
     run_agent, runs = handler
@@ -550,19 +563,90 @@ def test_copilot_provider_failure_retries_into_the_next_cascade_link(
         {"executor": "copilot", "task_type": "review"},
         {"executor": "claude", "task_type": "review"},
     ]
-    first = run_agent(payload, _event(), 1)
-    assert not first.ok and first.retryable
-    assert "executor infrastructure failure" in first.reason
-    second = run_agent(payload, _event(), 2)
-    assert second.ok and runs[-1]["executor"] == "claude"
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert runs[-1]["executor"] == "claude"
+    assert outcome.result["cascade_step"] == 2
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "copilot",
+            "reason": "provider_auth_or_quota",
+        }
+    ]
 
 
-def test_unknown_copilot_failure_is_fail_closed_for_read_only_review(
+@pytest.mark.parametrize("workspace_unchanged", [True, False])
+def test_mutating_provider_failover_requires_unchanged_workspace(
+    handler, monkeypatch, workspace_unchanged
+):
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_is_unchanged",
+        lambda *args, **kwargs: workspace_unchanged,
+    )
+
+    def quota_then_success(**kwargs):
+        runs.append(kwargs)
+        if kwargs["executor"] == "copilot":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=4,
+                stdout="",
+                stderr="AI credit usage limit reached",
+                duration_seconds=0.1,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:01+00:00",
+            completed_at="2026-08-23T12:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", quota_then_success)
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "copilot", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    if workspace_unchanged:
+        assert outcome.ok
+        assert [run["executor"] for run in runs] == ["copilot", "claude"]
+        assert outcome.result["cascade_step"] == 2
+    else:
+        assert not outcome.ok and outcome.retryable
+        assert [run["executor"] for run in runs] == ["copilot"]
+        assert "provider/auth/quota" in outcome.reason
+
+
+def test_unknown_copilot_failure_switches_for_read_only_review(
     handler, monkeypatch
 ):
-    run_agent, _runs = handler
+    run_agent, runs = handler
 
     def failed_copilot(**kwargs):
+        if kwargs["executor"] != "copilot":
+            runs.append(kwargs)
+            return agent_runner.RunResult(
+                status="completed",
+                exit_code=0,
+                stdout='{"result": "done"}',
+                stderr="",
+                duration_seconds=0.1,
+                started_at="2026-08-23T12:00:01+00:00",
+                completed_at="2026-08-23T12:00:02+00:00",
+            )
         return agent_runner.RunResult(
             status="failed",
             exit_code=9,
@@ -577,8 +661,42 @@ def test_unknown_copilot_failure_is_fail_closed_for_read_only_review(
     payload = _cascade_payload()
     payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
     outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert runs[-1]["executor"] == "claude"
+
+
+def test_provider_failover_never_crosses_the_workspace_mutability_boundary(
+    handler, monkeypatch
+):
+    run_agent, runs = handler
+
+    def quota_failure(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=4,
+            stdout="",
+            stderr="AI credit usage limit reached",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", quota_failure)
+    payload = _payload(
+        task_type="review",
+        cascade=[
+            {"executor": "copilot", "task_type": "review"},
+            {"executor": "claude", "task_type": "implementation"},
+        ],
+    )
+
+    outcome = run_agent(payload, _event(), 1)
+
     assert not outcome.ok and outcome.retryable
-    assert "unexpected provider-side failure" in outcome.reason
+    assert [run["executor"] for run in runs] == ["copilot"]
+    assert "provider/auth/quota" in outcome.reason
 
 
 def test_genuine_task_failure_with_error_flavoured_text_still_ok(
