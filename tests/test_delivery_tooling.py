@@ -161,6 +161,25 @@ def test_the_sweep_leaves_the_tree_untouched(tmp_path) -> None:
     assert target.read_text(encoding="utf-8") == before
 
 
+def test_the_sweep_leaves_the_tree_untouched_after_actually_perturbing_it(tmp_path) -> None:
+    """The red-suite version above never reaches the write: `cmd_sweep` returns
+    before its `try`/`finally` when the baseline is already failing, so it
+    cannot see whether the restore that follows a real perturbation works. A
+    green baseline is the only path that ever calls `target.write_text(...)`,
+    so it is the only path that can prove the `finally` restore holds.
+    """
+    suite = _write_suite(tmp_path / "green", green=True)
+    target = ROOT / "command_center/runtime/db/completion.py"
+    before = target.read_text(encoding="utf-8")
+
+    result = _run(
+        SLICE_CHECKS, "sweep", "command_center/runtime/db/completion.py", "--suite", str(suite)
+    )
+    assert "baseline green" in result.stdout, result.stdout
+
+    assert target.read_text(encoding="utf-8") == before
+
+
 def test_measure_emits_a_line_check_can_read_back(tmp_path) -> None:
     """The documented workflow is measure, paste, check — so it must round-trip.
 
