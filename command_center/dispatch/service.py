@@ -173,12 +173,16 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # entirely) and a free executor's $0 cost never pushes a simulated total
     # past any ceiling either. Only an explicit gate, structurally checked in
     # `plan_dispatch` before any assignment (like the kill switch), actually
-    # stops dispatch.
+    # stops dispatch. `spend` is `None` on failure rather than a fabricated
+    # `0.0`, so the reported `daily_spend_usd`/`projected_spend_usd` in the
+    # plan also read as "unknown" rather than "nothing spent today" — the same
+    # fail-closed standard the assignment decision already gets.
     budget_unknown = False
+    spend: float | None
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
     except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
-        spend = 0.0
+        spend = None
         budget_unknown = True
 
     return plan_dispatch(

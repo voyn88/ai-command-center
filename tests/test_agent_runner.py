@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -554,13 +555,93 @@ def test_run_claude_code_cancel_event_sigterms_a_running_process(monkeypatch, tm
 
 
 @pytest.mark.skipif(
-    sys.platform == "win32", reason="SIGTERM/killpg semantics are POSIX-specific"
+    sys.platform == "win32", reason="os.killpg and SIG_IGN are POSIX-specific"
 )
-def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(
+def test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored(
     monkeypatch, tmp_path
 ):
-    """A process that ignores SIGTERM is SIGKILL'd once the grace period
-    elapses, and the run is still reported (never hangs forever)."""
+    """Escalation is proven by the signals actually delivered, not by elapsed
+    wall clock.
+
+    The readiness marker is what makes this deterministic. A child that has not
+    yet reached `signal.signal(...)` still carries the *default* SIGTERM
+    disposition, so an early SIGTERM simply kills it, no escalation is needed,
+    and an `elapsed >= grace` assertion then fails — on exactly the slow,
+    loaded runners the test exists to protect. Waiting for the handler to be
+    installed removes that race, and asserting on the signal sequence removes
+    the dependency on how fast the machine happens to be.
+    """
+    ready = tmp_path / "sigterm-handler-installed"
+    proc = subprocess.Popen(
+        _fake_command(
+            "import signal, sys, time, pathlib; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "pathlib.Path(sys.argv[1]).write_text('ready'); "
+            "time.sleep(60)",
+            str(ready),
+        ),
+        **agent_runner._popen_new_process_group_kwargs(),
+    )
+    # Captured before the patch and outside `try`, so the cleanup below can
+    # always reach the real operations even if the body fails early.
+    unpatched_killpg = os.killpg
+    unpatched_wait = proc.wait
+    try:
+        assert _wait_until(ready.exists), "child never installed its SIGTERM handler"
+
+        trace: list[tuple[str, object]] = []
+        wait_calls = 0
+
+        def recording_killpg(pgid, sig):
+            result = unpatched_killpg(pgid, sig)
+            trace.append(("signal", sig))
+            return result
+
+        def controlled_wait(timeout=None):
+            nonlocal wait_calls
+            wait_calls += 1
+            trace.append(("wait", timeout))
+            if wait_calls == 1:
+                # Deterministically model a process that outlives the complete
+                # grace wait.  This proves the wait happens between the two
+                # signals without making the test spend that wall-clock time.
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            return unpatched_wait(timeout=timeout)
+
+        monkeypatch.setattr(agent_runner.os, "killpg", recording_killpg)
+        monkeypatch.setattr(proc, "wait", controlled_wait)
+        grace_seconds = 37.25
+        agent_runner._terminate_process_group(proc, grace_seconds=grace_seconds)
+
+        assert trace == [
+            ("signal", signal.SIGTERM),
+            ("wait", grace_seconds),
+            ("signal", signal.SIGKILL),
+            ("wait", grace_seconds),
+        ]
+        assert proc.poll() is not None
+    finally:
+        # Never route this through `os.killpg`: inside the test it is still the
+        # recording wrapper, and rebinding the name it closes over would make
+        # the wrapper call itself.
+        if proc.poll() is None:
+            try:
+                unpatched_killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            unpatched_wait(timeout=10)
+
+
+def test_run_claude_code_cancel_event_reports_cancelled_and_never_hangs(
+    monkeypatch, tmp_path
+):
+    """A process that ignores SIGTERM is still reported (never hangs forever).
+
+    This is the integration half of the contract above; the escalation
+    mechanics themselves are asserted deterministically in
+    `test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored`,
+    so nothing here depends on the child winning a race against our signal.
+    """
     monkeypatch.setattr(
         agent_runner,
         "build_command",
@@ -586,10 +667,7 @@ def test_run_claude_code_cancel_event_escalates_to_sigkill_after_grace(
     )
     elapsed = time.monotonic() - started
     assert result.status == "cancelled"
-    # Had to wait out the (short, test-scoped) grace period before SIGKILL —
-    # proves escalation actually happened, not just an early SIGTERM success.
-    assert elapsed >= 1.0
-    assert elapsed < 10
+    assert elapsed < 30
 
 
 @pytest.mark.skipif(
@@ -987,9 +1065,22 @@ def test_command_builders_table_covers_every_wired_executor():
     """The worker gates on this table (`handlers._run_agent`), and the routing
     matrix's own test derives its allowed set from it, so an entry here is the
     single act that makes an executor real."""
-    assert set(agent_runner.COMMAND_BUILDERS) == {"claude", "codex", "copilot"}
+    assert set(agent_runner.COMMAND_BUILDERS) == {
+        "claude",
+        "codex",
+        "copilot",
+        "openai_http",
+    }
     for name in agent_runner.COMMAND_BUILDERS:
-        command = agent_runner._command_builder(name)("x", task_type="review")
+        builder = agent_runner._command_builder(name)
+        if name == "openai_http":
+            # The bridge is model-only by construction and demands an
+            # explicit provider/model; "review" would rightly be refused.
+            command = builder(
+                "x", task_type="independent_review", model="groq/m"
+            )
+        else:
+            command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
         assert all(isinstance(part, str) for part in command), name
 
@@ -1050,3 +1141,65 @@ def test_independent_review_is_model_only_for_both_review_providers():
     assert "--available-tools=" in copilot
     assert "--allow-tool" not in copilot
     assert "--allow-all-tools" not in copilot
+
+
+def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
+    """The metered review key (VOYN-W0-SERVER-OWN-BILLING) is injected as
+    ANTHROPIC_API_KEY only for claude runs of the review task classes —
+    implementation stays on the subscription, other executors untouched,
+    and without the env var nothing changes at all."""
+    captured = {}
+
+    class _Proc:
+        pid = 4242
+        stdout = None
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def communicate(self, input=None, timeout=None):
+            return ("", "")
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured["env"] = kwargs.get("env")
+        captured["command"] = command
+        return _Proc()
+
+    monkeypatch.setattr(agent_runner.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_runner, "principal_isolation_required", lambda: False
+    )
+    monkeypatch.setenv("AICC_REVIEW_ANTHROPIC_API_KEY", "sk-ant-meter")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    def run(task_type, executor="claude"):
+        agent_runner.run_claude_code(
+            repository_path=tmp_path,
+            prompt="p",
+            task_type=task_type,
+            timeout_seconds=5,
+            executor=executor,
+            model="claude-sonnet-5" if executor != "claude" else None,
+        )
+        return captured["env"]
+
+    env = run("independent_review")
+    assert env.get("ANTHROPIC_API_KEY") == "sk-ant-meter"
+    assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
+    assert run("verification_review").get("ANTHROPIC_API_KEY") == "sk-ant-meter"
+    for task_type in ("implementation", "remediation", "review"):
+        env = run(task_type)
+        assert "ANTHROPIC_API_KEY" not in env
+        # The raw name must be scrubbed from EVERY child, or a mutating
+        # run could read the metered key under its own name.
+        assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
+    env = run("independent_review", executor="codex")
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
+
+    monkeypatch.delenv("AICC_REVIEW_ANTHROPIC_API_KEY")
+    assert "ANTHROPIC_API_KEY" not in run("independent_review")

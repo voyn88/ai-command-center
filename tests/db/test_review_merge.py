@@ -5,6 +5,7 @@ by patching the module's _gh, and enqueue is a recording stub."""
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -662,6 +663,99 @@ def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):  # 
             ("VOYN-W0-P2B-REM%",),
         )
         assert cur.fetchone()[0] == 1
+
+
+def _chain(store, factory, base, links, pr_url, head_sha):
+    """Build a recorded remediation chain `base -> base-REM -> ...` of `links`
+    links, the way successive rejections would have built it."""
+    from tests.db.test_backlog_planner import _task
+
+    ids = [base]
+    for _ in range(links):
+        ids.append(ids[-1] + "-REM")
+    for task_id in ids[:-1]:
+        assert store.upsert_task(_task(task_id, repo="repo-x", status="OPEN"))[0]
+    # The last link is the one about to be rejected, so it must be in the state
+    # a rejection actually arrives from: READY_TO_REVIEW carrying its PR.
+    _ready(store, factory, ids[-1], pr_url)
+    for parent, child in itertools.pairwise(ids):
+        assert store.record_remediation(child, parent, pr_url, head_sha)[0]
+    return ids
+
+
+def test_remediation_depth_counts_the_recorded_chain_not_the_name(rig):  # noqa: F811
+    """Depth walks the recorded parent links, not the `-REM` suffix. The suffix
+    is a naming convention; a task named by hand would make a string count
+    wrong in the direction that matters -- silently unbounded."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/40"
+    head = "1" * 40
+    ids = _chain(store, app_factory, "VOYN-W0-DEPTHCOUNT", 3, pr_url, head)
+
+    with app_factory() as c, c.cursor() as cur:
+        assert review_merge._remediation_depth(cur, ids[0]) == 0
+        assert review_merge._remediation_depth(cur, ids[1]) == 1
+        assert review_merge._remediation_depth(cur, ids[3]) == 3
+        # A task with no remediation record at all is depth 0, not an error.
+        assert review_merge._remediation_depth(cur, "VOYN-W0-NOT-A-REMEDIATION") == 0
+
+
+def test_a_rejection_below_the_depth_limit_still_spawns_a_remediation(rig):  # noqa: F811
+    """The boundary from below: the limit must not shorten the chain by one."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/41"
+    head = "2" * 40
+    ids = _chain(
+        store, app_factory, "VOYN-W0-DEPTHOK",
+        review_merge.MAX_REMEDIATION_DEPTH - 1, pr_url, head,
+    )
+
+    spawned = review_merge._remediate_rejection(
+        app_factory, ids[-1], pr_url, head, "Still wrong.\nVERDICT: REJECT\n"
+    )
+    assert spawned == ids[-1] + "-REM"
+
+
+def test_the_remediation_chain_stops_at_the_depth_limit(rig):  # noqa: F811
+    """Nothing bounded this chain: each rejected remediation spawned another
+    task, branch, pull request and full CI run, and the live backlog reached
+    158 `-REM` tasks with chains nine links deep. Past a few attempts the
+    evidence is about the task or the reviewer, not the implementation, and a
+    further link fixes neither while still costing a full pipeline."""
+    app_factory, store, _worker = rig
+    pr_url = "https://github.com/x/y/pull/42"
+    head = "3" * 40
+    ids = _chain(
+        store, app_factory, "VOYN-W0-DEPTHSTOP",
+        review_merge.MAX_REMEDIATION_DEPTH, pr_url, head,
+    )
+    last = ids[-1]
+
+    assert review_merge._remediate_rejection(
+        app_factory, last, pr_url, head, "Rejected again.\nVERDICT: REJECT\n"
+    ) is None
+
+    with app_factory() as c, c.cursor() as cur:
+        # No further link was created.
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id = %s", (last + "-REM",))
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "SELECT count(*) FROM backlog_task_remediation WHERE parent_task_id = %s",
+            (last,),
+        )
+        assert cur.fetchone()[0] == 0
+
+        # Closed through the state machine, not around it: READY_TO_REVIEW
+        # fans out to DONE and REJECTED only, so a nicer-reading DEFER_TO_USER
+        # would have to be written past `backlog_transition` -- the very rule
+        # this code exists to uphold. The body carries why it stopped.
+        cur.execute("SELECT status, body FROM backlog_task WHERE task_id = %s", (last,))
+        status, body = cur.fetchone()
+        assert status == "REJECTED"
+        assert "Remediation chain stopped" in body
+        assert pr_url in body
+        # And it is not left where the merge tick would reconsider it forever.
+        assert status != "READY_TO_REVIEW"
 
 
 def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):  # noqa: F811
@@ -1658,6 +1752,71 @@ def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch
     assert branches and "--branch" in branches[0] and "feature/x" in branches[0]
 
 
+def test_out_of_band_acceptance_pairs_marker_with_gate_rerun(monkeypatch):
+    """The one entry point for lanes outside the tick composes exactly the
+    tick's own pair: marker first, then the gate rerun for the same head --
+    an out-of-band marker without the rerun left five armed auto-merges
+    outside the merge queue (live, 2026-09-02).
+    (VOYN-W0-AICC-GATE-RED-SUITE-HOLDS-QUEUE-ENTRY)"""
+    sha = "a" * 40
+    calls = []
+    monkeypatch.setattr(
+        review_merge,
+        "_post_marker_as_bot",
+        lambda creds, pr_url, decision, marker_sha: (
+            calls.append(("marker", decision, marker_sha)) or (True, "")
+        ),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_rerun_failing_acceptance_gate",
+        lambda repo_path, pr_url, rerun_sha: calls.append(("rerun", rerun_sha)),
+    )
+
+    ok, reason = review_merge.publish_out_of_band_acceptance(
+        object(), "/tmp", "https://github.com/x/y/pull/1", "ACCEPT", sha
+    )
+
+    assert (ok, reason) == (True, "")
+    assert calls == [("marker", "ACCEPT", sha), ("rerun", sha)]
+
+
+def test_out_of_band_rejection_posts_marker_without_rerun(monkeypatch):
+    """A REJECT marker agrees with the red run; re-running the gate would
+    only spend a runner re-confirming the refusal, and a failed marker post
+    must not trigger any rerun at all."""
+    calls = []
+    monkeypatch.setattr(
+        review_merge,
+        "_post_marker_as_bot",
+        lambda creds, pr_url, decision, sha: (
+            calls.append(("marker", decision)) or (True, "")
+        ),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_rerun_failing_acceptance_gate",
+        lambda *a: calls.append(("rerun",)),
+    )
+
+    ok, _ = review_merge.publish_out_of_band_acceptance(
+        object(), "/tmp", "https://github.com/x/y/pull/1", "REJECT", "b" * 40
+    )
+    assert ok and calls == [("marker", "REJECT")]
+
+    calls.clear()
+    monkeypatch.setattr(
+        review_merge,
+        "_post_marker_as_bot",
+        lambda creds, pr_url, decision, sha: (False, "app_auth_failed: x"),
+    )
+    ok, reason = review_merge.publish_out_of_band_acceptance(
+        object(), "/tmp", "https://github.com/x/y/pull/1", "ACCEPT", "b" * 40
+    )
+    assert (ok, reason) == (False, "app_auth_failed: x")
+    assert calls == []
+
+
 # --- VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY + CI-FLAKE-AUTO-RERUN -----
 
 
@@ -1755,6 +1914,14 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
                  "conclusion": "failure", "attempt": 1},
                 {"databaseId": 14, "headSha": head, "status": "in_progress",
                  "conclusion": None, "attempt": 1},
+                # Concurrency-cancelled required run: strands the head out
+                # of the merge queue exactly like a failure (live: PR #602)
+                # and must get a FULL rerun -- `--failed` would rerun
+                # nothing, a cancelled run has no failed jobs.
+                {"databaseId": 15, "headSha": head, "status": "completed",
+                 "conclusion": "cancelled", "attempt": 1},
+                {"databaseId": 16, "headSha": head, "status": "completed",
+                 "conclusion": "cancelled", "attempt": 2},
             ]), "")
         if argv[:2] == ["run", "rerun"]:
             reruns.append(argv)
@@ -1764,8 +1931,11 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     skip = dict(report.skipped)["VOYN-W0-MF"]
-    assert skip.startswith("checks_not_green") and "flaky_rerun_dispatched:1" in skip
-    assert reruns == [["run", "rerun", "11", "--failed"]]
+    assert skip.startswith("checks_not_green") and "flaky_rerun_dispatched:2" in skip
+    assert reruns == [
+        ["run", "rerun", "11", "--failed"],
+        ["run", "rerun", "15"],
+    ]
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MF",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"

@@ -8,6 +8,18 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
+- `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
+  over enrolled worker-host devices — one query joins `principal`,
+  `principal_credential_public` and `principal_event` into state, host, live
+  credential expiry and last audit event per device, plus an operator-only
+  `suspend()` over the existing `identity_revoke_principal`. Additive: no new
+  table, grant or privileged function.
+- `python -m command_center.db fleet-status` / `fleet-suspend`: the CLI
+  surface — "10 devices managed by one operational panel" as a runnable
+  command rather than five hand-run queries. See
+  `docs/operations/FLEET_STATUS.md`.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
