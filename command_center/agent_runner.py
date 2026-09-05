@@ -53,14 +53,36 @@ Security model:
   listed above. That guarantee is unconditional and does not depend on what a spawned
   `claude` process chooses to do.
 
-- Cancellation: Streamlit re-executes the whole script top-to-bottom on every
-  interaction, so there is no supervisor process that could safely interrupt a
-  `subprocess.run` call already in flight from a *previous* run. This module
-  therefore implements a robust **synchronous** runner: the calling Streamlit page
-  blocks (with a spinner) until the process exits or the timeout fires. "Cancelled" is
-  a valid `RUN_STATUSES` value but is only ever reached if the process could not be
-  started at all — there is no fake mid-flight cancel button. This is a known,
-  documented limitation (see ARCHITECTURE.md / README "Known limitations").
+- Cancellation (Streamlit v1 path): Streamlit re-executes the whole script
+  top-to-bottom on every interaction, so there is no supervisor process that
+  could safely interrupt a run already in flight from a *previous* Streamlit
+  rerun. Callers that never pass `cancel_event` (`chat_service`,
+  `launch_service`) still get this behavior: the call blocks (with a spinner)
+  until the process exits or the timeout fires, and there is no fake
+  mid-flight cancel button for them. This is a known, documented limitation
+  (see ARCHITECTURE.md / README "Known limitations").
+
+- Cancellation (worker daemon path, VOYN-W0-AICC-FORCED-AGENT-CANCELLATION):
+  the worker daemon (`worker.daemon.WorkerDaemon`) *does* have a live
+  out-of-band signal — the `lease_lost` event its heartbeat thread sets the
+  moment the database says this attempt's lease is gone
+  (`worker.daemon._heartbeat_loop`). `worker.handlers._run_agent` passes that
+  same event through as `run_claude_code`'s `cancel_event`, so a lease lost
+  *mid-run* (not just before the subprocess was started) now forcibly
+  terminates the in-flight `claude` process instead of leaving it to mutate
+  an isolated worktree the daemon can no longer account for. The subprocess
+  is always launched as its own process-group leader (`os.setsid` on POSIX,
+  `CREATE_NEW_PROCESS_GROUP` on Windows) specifically so termination can
+  target the whole group — the CLI process plus any child it spawned (tool
+  subprocesses, MCP servers) — not just its own PID; killing only the PID
+  would leave orphaned children as the same class of unaccountable mutation
+  this change exists to close. Termination escalates SIGTERM (POSIX) /
+  CTRL_BREAK_EVENT (Windows) -> bounded grace period -> SIGKILL (POSIX) /
+  `Popen.kill()` (Windows), mirroring the existing `timeout_seconds`
+  enforcement (which now also targets the process group, for the same
+  orphan-child reason, rather than only the CLI's own PID as the previous
+  `subprocess.run(timeout=...)` form did). "Cancelled" is a valid
+  `RUN_STATUSES` value, returned only via this path.
 """
 
 from __future__ import annotations
@@ -68,12 +90,25 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
+import threading
 import time
-from datetime import datetime
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
-from command_center import models, project_config, storage
+from command_center import models, openai_exec, project_config, storage
+
+# Ruff targets the product's Python 3.14 desktop runtime and would otherwise
+# apply PEP 758's optional-parentheses rewrite.  Worker/control hosts and CI
+# still execute this module on Python 3.13, so named exception tuples keep the
+# source valid on every supported delivery runtime after ``ruff format``.
+_OS_SUBPROCESS_ERRORS = (OSError, subprocess.SubprocessError)
+_JSON_ERRORS = (json.JSONDecodeError, ValueError)
+_OS_VALUE_ERRORS = (OSError, ValueError)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = storage.resolve_data_dir(ROOT)
@@ -81,6 +116,79 @@ RUNS_FILE = DATA_DIR / "runs.jsonl"
 RUNS_EXAMPLE_FILE = ROOT / "data" / "runs.example.jsonl"
 
 CLAUDE_BINARY = "claude"
+# Overridable because the worker service's own PATH is not a login shell's:
+# the CLI is installed under `~/.local/bin` on worker-01 (no root needed --
+# the service already runs as that user), which systemd does not add for it.
+CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
+COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
+
+# The worker never elevates and keeps NoNewPrivileges=yes.  A root-owned,
+# socket-activated launcher is the sole bridge to the separate aicc-agent UID.
+# This path is deliberately not environment-overridable: worker.env contains
+# publisher authority and must not be able to replace the executable that
+# enforces the boundary around it.
+PRINCIPAL_ISOLATION_LAUNCHER = "/usr/libexec/aicc-agent-launcher"
+PRINCIPAL_ISOLATION_REQUIRED_ENV = "AICC_AGENT_PRINCIPAL_ISOLATION"
+PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
+PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
+    "claude": "/usr/local/bin/claude",
+    "codex": "/usr/local/bin/codex",
+    # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
+    # principal isolation because its login credential carries GitHub /
+    # repository authority -- staging it would hand untrusted model code the
+    # exact capability this boundary exists to withhold (review finding on
+    # b311666). The retry-loop hazard that once motivated listing it is
+    # closed in handlers instead: an unavailable executor falls through the
+    # cascade to the next link rather than respinning forever.
+}
+_PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
+
+# Codex 0.149.0 on worker-01 can exit zero after its vendor bwrap fails to
+# create loopback inside the network namespace. This exact, two-part signature
+# is an executor-host failure, not a task result.
+_CODEX_BWRAP_LOOPBACK_SIGNATURE = (
+    "bwrap: loopback:",
+    "failed rtm_newaddr: operation not permitted",
+)
+_COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
+    "ai credit usage limit",
+    "rate limit",
+    "not logged in",
+    "authentication required",
+    "authentication failed",
+    "unauthorized",
+    "forbidden",
+    "failed during startup",
+    "service unavailable",
+    "temporarily unavailable",
+    "network error",
+    "connection refused",
+    "too many requests",
+    "could not authenticate",
+    "getaddrinfo",
+    "econnreset",
+)
+_CODEX_PREFLIGHT_PROMPT = (
+    "This is a disposable sandbox capability probe. In the current repository, "
+    "create a file named aicc-codex-commit-probe.txt containing exactly "
+    "AICC_CODEX_COMMIT_OK followed by a newline. Run git add for that file and "
+    "git commit -m 'aicc codex commit probe'. Do not inspect any other path or "
+    "use a remote. After the commit succeeds, reply exactly: "
+    "AICC_CODEX_WORKSPACE_WRITE_OK"
+)
+_codex_workspace_write_preflight_lock = threading.Lock()
+_codex_workspace_write_preflight_result: tuple[bool, str] | None = None
+
+
+def disable_codex_workspace_write(detail: str = "") -> None:
+    """Open the worker-local Codex circuit after a runtime bwrap failure."""
+    global _codex_workspace_write_preflight_result
+    reason = "Codex workspace-write sandbox unavailable"
+    if detail:
+        reason = f"{reason}: {detail[-400:]}"
+    with _codex_workspace_write_preflight_lock:
+        _codex_workspace_write_preflight_result = (False, reason)
+
 
 # --------------------------------------------------------------------------
 # Execution profiles — named, testable single source of truth for "what can
@@ -104,8 +212,26 @@ CLAUDE_BINARY = "claude"
 PROFILE_READ_ONLY = "read_only"
 PROFILE_TRUSTED_DEVELOPMENT = "trusted_development"
 
-READ_ONLY_TASK_TYPES = {"review", "final_gate", "architecture_review"}
+READ_ONLY_TASK_TYPES = {
+    "review",
+    "final_gate",
+    "architecture_review",
+    # Finding verification (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT): must READ the
+    # tree at the PR head to reproduce or refute review findings, so it is
+    # read-only -- deliberately NOT in MODEL_ONLY_TASK_TYPES, whose zero-tool
+    # profile is exactly what made the retired full-context adjudication
+    # unable to gather any evidence at all.
+    "verification_review",
+}
+MODEL_ONLY_TASK_TYPES = {"independent_review"}
 MUTATING_TASK_TYPES = {"implementation", "remediation"}
+
+#: The verdict tier — the only task classes allowed to spend the metered
+#: review key (see run_claude_code). Matches the orchestrator's dispatch
+#: vocabulary exactly. Deliberately NOT "review": that is the live
+#: task_type of interactive chat turns and web audit-sandbox runs — metered
+#: money is for verdicts, not conversation.
+REVIEW_TASK_TYPES = {"independent_review", "verification_review"}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
 # empirically verified (2026-07-21, real `claude` CLI, headless `-p` mode)
@@ -137,7 +263,11 @@ def profile_for_task_type(task_type: str) -> str:
     Only reviewed implementation/remediation types receive development
     capabilities. Unknown and future task types fail closed as read-only.
     """
-    return PROFILE_TRUSTED_DEVELOPMENT if task_type in MUTATING_TASK_TYPES else PROFILE_READ_ONLY
+    return (
+        PROFILE_TRUSTED_DEVELOPMENT
+        if task_type in MUTATING_TASK_TYPES
+        else PROFILE_READ_ONLY
+    )
 
 
 def is_untrusted_source(source: str | None) -> bool:
@@ -160,7 +290,9 @@ def is_untrusted_task(task: dict) -> bool:
     return bool(task.get("untrusted_import")) or is_untrusted_source(task.get("source"))
 
 
-def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevated: bool = False) -> str:
+def profile_for_task(
+    task_type: str, *, untrusted: bool = False, operator_elevated: bool = False
+) -> str:
     """Provenance-aware execution profile (audit D7).
 
     Read-only task types are always `PROFILE_READ_ONLY` (they have no dangerous
@@ -174,6 +306,7 @@ def profile_for_task(task_type: str, *, untrusted: bool = False, operator_elevat
     if untrusted and not operator_elevated:
         return PROFILE_READ_ONLY
     return PROFILE_TRUSTED_DEVELOPMENT
+
 
 # The *complete* available tool set for read-only task types, passed via `--tools`
 # (not `--allowedTools`/`--disallowedTools`). Per `claude --help`, `--tools` replaces
@@ -236,7 +369,19 @@ _VCS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "GITHUB_API_TOKEN",
         "GITHUB_ACCESS_TOKEN",
         "GIT_ASKPASS",
+        "GIT_SSH_COMMAND",
+        "SSH_AUTH_SOCK",
         "SSH_ASKPASS",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "AICC_WORKSPACE_AUTHORITY_KEY",
+        "AICC_PUBLISH_DEPLOY_KEY",
+        "AICC_PUBLISH_OWNER",
+        "PGPASSFILE",
+        "VOYN_LEASE_DSN",
+        "VOYN_LEASE_TOOL",
+        "VOYN_LEASE_SESSION",
+        "VOYN_LEASE_REPOSITORY",
     }
 )
 
@@ -245,7 +390,111 @@ def scrub_vcs_credentials(environment: dict[str, str]) -> dict[str, str]:
     """Return a copy of `environment` with Git/GitHub credential variables
     (`_VCS_CREDENTIAL_ENV_VARS`) removed, so a spawned agent cannot inherit
     ambient push/merge credentials. Never removes the agent's own model auth."""
-    return {key: value for key, value in environment.items() if key not in _VCS_CREDENTIAL_ENV_VARS}
+    scrubbed = {
+        key: value
+        for key, value in environment.items()
+        if key not in _VCS_CREDENTIAL_ENV_VARS
+        and not key.startswith(
+            ("GIT_CONFIG_", "AICC_PG_", "AICC_PUBLISH_", "VOYN_LEASE_")
+        )
+        and not key.endswith("_DSN")
+    }
+    # Ignore machine/user Git config and the host gh credential store for the
+    # model process.  The task clone carries only the local identity needed to
+    # commit; it has no remote until the guarded publisher restores one after
+    # the process exits.
+    scrubbed.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GH_CONFIG_DIR": "/nonexistent/aicc-agent-gh",
+            "SSH_ASKPASS_REQUIRE": "never",
+        }
+    )
+    return scrubbed
+
+
+def build_principal_isolation_manifest(
+    *,
+    repository_path: Path,
+    prompt: str,
+    task_type: str,
+    timeout_seconds: int,
+    executor: str,
+    model: str | None,
+) -> dict[str, object]:
+    """Build the only payload accepted by the privileged launcher.
+
+    No environment value crosses this interface.  In particular, publisher,
+    lease, workspace-HMAC and GitHub credentials remain in the aicc-worker
+    process.  The launcher loads only provider-specific model authentication
+    from root-owned allowlisted files after it has selected ``aicc-agent``.
+    """
+    if executor not in COMMAND_BUILDERS:
+        raise RunnerError(f"unknown executor {executor!r}")
+    return {
+        "version": 1,
+        "run_id": uuid.uuid4().hex,
+        "workspace": str(repository_path.resolve(strict=True)),
+        "executor": executor,
+        "profile": profile_for_task_type(task_type),
+        "prompt": prompt,
+        "model": model,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def principal_isolation_required() -> bool:
+    return os.environ.get(PRINCIPAL_ISOLATION_REQUIRED_ENV) == "required"
+
+
+def principal_workspace_root(
+    config_path: Path | None = None, *, require_root_owned: bool = True
+) -> Path:
+    """Read the one canonical task root shared with the privileged broker."""
+    path = config_path or PRINCIPAL_WORKSPACE_ROOTS_FILE
+    info = path.stat()
+    if require_root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
+        raise RunnerError("principal workspace-root config is not immutable root-owned")
+    roots = [
+        Path(line.strip())
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if len(roots) != 1 or not roots[0].is_absolute():
+        raise RunnerError(
+            "principal workspace-root config must contain one absolute root"
+        )
+    return roots[0].resolve(strict=True)
+
+
+def principal_executor_preflight(executor: str) -> tuple[bool, str]:
+    """Cheap worker-side check for the fixed root-owned provider path.
+
+    The privileged broker repeats ownership/mode validation.  This check only
+    avoids spending a queue attempt when deployment is visibly incomplete.
+    """
+    binary = PRINCIPAL_EXECUTOR_BINARIES.get(executor)
+    if binary is None:
+        return False, f"executor {executor!r} is not allowlisted"
+    if Path(binary).is_file() and os.access(binary, os.X_OK):
+        return True, ""
+    return False, f"isolated executor binary is unavailable: {binary}"
+
+
+def _principal_launcher_environment() -> dict[str, str]:
+    """Minimal environment for the unprivileged socket client.
+
+    The client needs no model or repository credential.  Keeping HOME, XDG,
+    SSH and Git variables out also prevents a future client regression from
+    turning the bridge into an ambient-secret transport.
+    """
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+    }
 
 
 DEFAULT_TIMEOUT_SECONDS = 900
@@ -280,11 +529,194 @@ def claude_cli_preflight(binary: str | None = None) -> tuple[bool, str]:
     resolved = binary or CLAUDE_BINARY
     if claude_cli_available(resolved):
         return True, ""
+    # The remedy deliberately no longer says `npm install -g`: on a production
+    # host that is the exact thing the toolchain gate forbids -- it resolves
+    # packages online and runs their lifecycle scripts, as root if the operator
+    # follows the hint with sudo (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED). An
+    # error message that sends an operator down a path the installer refuses is
+    # worse than no message.
     return False, (
         f"CLI `{resolved}` не найден в PATH — запуск Claude Code завершится ошибкой ещё до "
-        "старта агента. Установите Claude Code (`npm install -g @anthropic-ai/claude-code`) "
-        "и убедитесь, что бинарник доступен в PATH, либо выберите другой execution provider."
+        "старта агента. На production-хосте исполнители ставятся только content-addressed "
+        "артефактом: `deploy/install-agent-principal-isolation.sh` вызывает "
+        "`ops/aicc_toolchain_install.py`, который проверяет sha256 из "
+        "`deploy/agent-toolchain.lock.json` и выбирает релиз в "
+        "`/opt/aicc/toolchains/current`. Устанавливать пакеты вручную на хосте нельзя. "
+        "Локально для разработки достаточно любого доступного CLI в PATH, либо выберите "
+        "другой execution provider."
     )
+
+
+def codex_workspace_write_preflight() -> tuple[bool, str]:
+    """Probe the exact workspace-write launch path once per worker.
+
+    Version/help probes cannot discover the worker's AppArmor/user-namespace
+    refusal: it happens only when Codex starts bwrap. The probe uses a
+    disposable git workspace, never a task repository. A negative result is
+    cached, so later tasks skip Codex instead of consuming another attempt.
+    """
+    global _codex_workspace_write_preflight_result
+    with _codex_workspace_write_preflight_lock:
+        if _codex_workspace_write_preflight_result is not None:
+            return _codex_workspace_write_preflight_result
+        if principal_isolation_required():
+            binary_available, binary_detail = principal_executor_preflight("codex")
+        else:
+            binary_available = shutil.which(CODEX_BINARY) is not None
+            binary_detail = f"Codex CLI {CODEX_BINARY!r} is not available on PATH"
+        if not binary_available:
+            _codex_workspace_write_preflight_result = (
+                False,
+                binary_detail,
+            )
+            return _codex_workspace_write_preflight_result
+
+        import tempfile
+
+        try:
+            probe_parent = (
+                str(principal_workspace_root())
+                if principal_isolation_required()
+                else None
+            )
+        except (OSError, RunnerError) as exc:
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"isolated workspace root is unavailable: {exc}",
+            )
+            return _codex_workspace_write_preflight_result
+        try:
+            temporary = tempfile.TemporaryDirectory(
+                prefix="aicc-codex-preflight-", dir=probe_parent
+            )
+        except OSError as exc:
+            _codex_workspace_write_preflight_result = (
+                False,
+                f"cannot create isolated Codex probe workspace: {exc}",
+            )
+            return _codex_workspace_write_preflight_result
+        with temporary as raw_probe:
+            probe = Path(raw_probe)
+            initialized = subprocess.run(
+                ["git", "init", "--quiet", str(probe)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if initialized.returncode != 0:
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"cannot create disposable Codex probe workspace: {initialized.stderr.strip()}",
+                )
+                return _codex_workspace_write_preflight_result
+            for key, value in (
+                ("user.name", "AICC Codex Preflight"),
+                ("user.email", "aicc-codex-preflight@localhost"),
+            ):
+                configured = subprocess.run(
+                    ["git", "config", "--local", key, value],
+                    cwd=probe,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if configured.returncode != 0:
+                    _codex_workspace_write_preflight_result = (
+                        False,
+                        f"cannot configure disposable Codex probe: {configured.stderr.strip()}",
+                    )
+                    return _codex_workspace_write_preflight_result
+            seed = probe / ".aicc-codex-preflight-seed"
+            seed.write_text("seed\n", encoding="utf-8")
+            seeded = subprocess.run(
+                ["git", "add", seed.name],
+                cwd=probe,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if seeded.returncode == 0:
+                seeded = subprocess.run(
+                    ["git", "commit", "--quiet", "-m", "aicc codex preflight seed"],
+                    cwd=probe,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            if seeded.returncode != 0:
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"cannot seed disposable Codex probe: {seeded.stderr.strip()}",
+                )
+                return _codex_workspace_write_preflight_result
+            before = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=probe,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            run = run_claude_code(
+                repository_path=probe,
+                prompt=_CODEX_PREFLIGHT_PROMPT,
+                task_type="implementation",
+                timeout_seconds=MIN_TIMEOUT_SECONDS,
+                executor="codex",
+            )
+            diagnostic = "\n".join(part for part in (run.stdout, run.stderr) if part)
+            if run.is_executor_sandbox_error:
+                detail = (
+                    diagnostic[-400:] or "bwrap loopback namespace setup was denied"
+                )
+                _codex_workspace_write_preflight_result = (
+                    False,
+                    f"Codex workspace-write sandbox unavailable: {detail}",
+                )
+            elif run.status != "completed":
+                detail = diagnostic[-400:] or f"exit_code={run.exit_code!r}"
+                # Provider/auth/network failures are transient. Do not pin a
+                # worker-wide negative forever; only the proven bwrap/capability
+                # failures above/below open the persistent local circuit.
+                return (
+                    False,
+                    f"Codex workspace-write preflight failed: {detail}",
+                )
+            else:
+                after = _run_git(["rev-parse", "HEAD"], probe)
+                status = _run_git(["status", "--porcelain"], probe)
+                common = _run_git(
+                    ["rev-parse", "--path-format=absolute", "--git-common-dir"], probe
+                )
+                probe_file = probe / "aicc-codex-commit-probe.txt"
+                try:
+                    probe_content = probe_file.read_text(encoding="utf-8")
+                except OSError:
+                    probe_content = None
+                commit_ok = bool(
+                    after
+                    and after.returncode == 0
+                    and after.stdout.strip()
+                    and after.stdout.strip() != before
+                    and status
+                    and status.returncode == 0
+                    and not status.stdout.strip()
+                    and common
+                    and common.returncode == 0
+                    and Path(common.stdout.strip()).resolve()
+                    == (probe / ".git").resolve()
+                    and probe_content == "AICC_CODEX_COMMIT_OK\n"
+                )
+                if not commit_ok:
+                    _codex_workspace_write_preflight_result = (
+                        False,
+                        (
+                            "Codex workspace-write preflight could not create a clean local commit "
+                            "with task-local Git metadata"
+                        ),
+                    )
+                else:
+                    _codex_workspace_write_preflight_result = (True, "")
+        return _codex_workspace_write_preflight_result
 
 
 def validate_repository(project_id: str, repository_path: str) -> Path:
@@ -306,11 +738,15 @@ def validate_repository(project_id: str, repository_path: str) -> Path:
             "Запуск отклонён."
         )
     if not resolved_configured.is_dir():
-        raise RunnerError(f"Настроенный путь репозитория не существует: {resolved_configured}")
+        raise RunnerError(
+            f"Настроенный путь репозитория не существует: {resolved_configured}"
+        )
     return resolved_configured
 
 
-def _run_git(args: list[str], cwd: Path, timeout: int = 10) -> subprocess.CompletedProcess | None:
+def _run_git(
+    args: list[str], cwd: Path, timeout: int = 10
+) -> subprocess.CompletedProcess | None:
     try:
         return subprocess.run(
             ["git", *args],
@@ -320,7 +756,7 @@ def _run_git(args: list[str], cwd: Path, timeout: int = 10) -> subprocess.Comple
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except _OS_SUBPROCESS_ERRORS:
         return None
 
 
@@ -332,17 +768,32 @@ def is_git_repository(repo_path: Path) -> bool:
 def git_snapshot(repo_path: Path) -> dict:
     """Read-only branch/HEAD/status snapshot of `repo_path`, used for pre/post-run records."""
     if not is_git_repository(repo_path):
-        return {"is_git_repo": False, "branch": None, "head": None, "status_summary": None}
+        return {
+            "is_git_repo": False,
+            "branch": None,
+            "head": None,
+            "status_summary": None,
+        }
 
     branch = _run_git(["branch", "--show-current"], cwd=repo_path)
     head = _run_git(["rev-parse", "HEAD"], cwd=repo_path)
     status = _run_git(["status", "--porcelain"], cwd=repo_path)
 
-    status_lines = [line for line in (status.stdout.splitlines() if status and status.returncode == 0 else []) if line]
+    status_lines = [
+        line
+        for line in (
+            status.stdout.splitlines() if status and status.returncode == 0 else []
+        )
+        if line
+    ]
 
     return {
         "is_git_repo": True,
-        "branch": (branch.stdout.strip() if branch and branch.stdout.strip() else "(detached HEAD)"),
+        "branch": (
+            branch.stdout.strip()
+            if branch and branch.stdout.strip()
+            else "(detached HEAD)"
+        ),
         "head": head.stdout.strip() if head and head.returncode == 0 else None,
         "status_summary": "\n".join(status_lines) if status_lines else "(чисто)",
     }
@@ -362,7 +813,11 @@ def build_command(
     capability_override: str | None = None,
 ) -> list[str]:
     if capability_override is not None:
-        profile = PROFILE_READ_ONLY if capability_override.lower() in ("read_only", "readonly") else PROFILE_TRUSTED_DEVELOPMENT
+        profile = (
+            PROFILE_READ_ONLY
+            if capability_override.lower() in ("read_only", "readonly")
+            else PROFILE_TRUSTED_DEVELOPMENT
+        )
     else:
         profile = profile_for_task_type(task_type)
     command = [
@@ -375,7 +830,12 @@ def build_command(
         PERMISSION_MODE_BY_PROFILE[profile],
     ]
 
-    if profile == PROFILE_READ_ONLY:
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        # The exact PR diff is already embedded in the prompt by the trusted
+        # control plane. Giving this reviewer Read/Grep/Glob would add ambient
+        # repository authority it neither needs nor can bind to that exact SHA.
+        command += ["--tools", ""]
+    elif profile == PROFILE_READ_ONLY:
         # Tool-set replacement, not a permission-layer denial: Bash (and every
         # shell-reachable mutation) is not in this list, so it cannot be invoked by
         # this run at all. See the module docstring and READ_ONLY_ALLOWED_TOOLS.
@@ -390,6 +850,219 @@ def build_command(
     return command
 
 
+def build_codex_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """The `codex exec` argv, mapped onto the SAME two execution profiles
+    `build_command` resolves for Claude (VOYN-W0-AICC-EXECUTOR-CODEX).
+
+    Why a second executor at all: the fleet's Claude credential is a Max
+    *subscription*, whose 5-hour rolling window is a hard cap no amount of
+    retrying gets past -- live-measured 2026-08-23 as the single largest
+    cause of parked work (142 of 167 `task_status_failed` tasks were
+    literally "You've hit your session limit", not a task defect). Codex
+    bills against a different account entirely, so it is capacity the
+    Claude cap cannot consume, not merely a second attempt at the same
+    exhausted pool. That is also why it belongs on the implementation
+    cascade's ESCALATION link specifically (see `routing.ROUTING_MATRIX`),
+    replacing what was previously a duplicate `claude` entry that could
+    only ever re-hit the same limit.
+
+    Profile mapping, deliberately equivalent rather than merely similar:
+
+    * `PROFILE_READ_ONLY`   -> `--sandbox read-only`. The sandbox is the
+      enforcement, exactly as `--tools` is for Claude: a read-only sandbox
+      cannot write the tree no matter what the model decides to attempt.
+    * `PROFILE_TRUSTED_DEVELOPMENT` -> `--sandbox workspace-write`, which
+      confines writes to the working root `--cd` names. `danger-full-
+      access` is never used: it removes the boundary this profile exists
+      to draw.
+
+    `--skip-git-repo-check` is NOT passed: every dispatch runs inside a
+    real git worktree (`workspace_provisioning`), so the check is a free
+    assertion that we are where we think we are.
+
+    Output is left as plain text rather than `--json`: `extract_result_
+    text` already falls through to raw stdout for shapes it does not
+    recognise, and the pipeline's own contract with an agent is the
+    `HEAD_SHA:` / `VERDICT:` trailer in that text -- identical for either
+    executor, so nothing downstream has to learn a second format.
+    """
+    profile = profile_for_task_type(task_type)
+    sandbox = "read-only" if profile == PROFILE_READ_ONLY else "workspace-write"
+    command = [
+        CODEX_BINARY,
+        "exec",
+        "--sandbox",
+        sandbox,
+        "--color",
+        "never",
+    ]
+    if model:
+        command += ["--model", model]
+    # Terminate option parsing before the untrusted task prompt. Without `--`,
+    # a prompt beginning with a Codex flag could replace the selected sandbox.
+    command += ["--", prompt]
+    return command
+
+
+def build_copilot_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """The GitHub Copilot CLI argv, on the SAME two profiles as the others
+    (VOYN-W0-AICC-EXECUTOR-CODEX, second executor of the same change).
+
+    A third account, for the same reason Codex is a second one: Copilot bills
+    against a GitHub subscription, so it is capacity neither the Claude Max
+    5-hour window nor the Codex account can exhaust.
+
+    Profile mapping. Copilot's permission model is per-tool rather than a
+    named sandbox, so the profiles are expressed with `--allow-tool` /
+    `--deny-tool`:
+
+    * `PROFILE_READ_ONLY`   -> no write tool is allowed at all. Only the
+      read-side tools are granted, so the run cannot modify the tree even if
+      the model tries -- the same property `--tools` gives Claude and
+      `--sandbox read-only` gives Codex.
+    * `PROFILE_TRUSTED_DEVELOPMENT` -> write and shell are allowed, but the
+      git-write subcommands the prompts already forbid are denied explicitly
+      (`GIT_WRITE_DISALLOWED_TOOLS`'s intent, expressed in Copilot's own
+      `shell(git ...)` syntax). Publishing is the pipeline's job, never the
+      agent's.
+
+    `--allow-all` / `--allow-all-paths` are never passed: they would erase
+    exactly the boundary these profiles draw.
+    """
+    profile = profile_for_task_type(task_type)
+    command = [
+        COPILOT_BINARY,
+        "-p",
+        prompt,
+        "--no-color",
+        "--silent",
+        "--no-remote",
+        "--no-remote-export",
+        "--disable-builtin-mcps",
+        "--no-custom-instructions",
+        "--no-ask-user",
+    ]
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        # Empty availability is stronger than a permission prompt: no Copilot
+        # tool is exposed to the model at all, including read and shell.
+        command += ["--available-tools="]
+    elif profile == PROFILE_READ_ONLY:
+        # Grant reads only. Absent `write`/`shell`, mutation is unreachable.
+        command += ["--allow-tool", "read"]
+    else:
+        command += [
+            "--allow-tool",
+            "read",
+            "--allow-tool",
+            "write",
+            "--allow-tool",
+            "shell",
+            # The agent commits locally; pushing/PR-opening belongs to
+            # `publish_run`, which holds the writer lease. Denying the remote-
+            # mutating subcommands keeps that boundary technical, not advisory.
+            "--deny-tool",
+            "shell(git push)",
+            "--deny-tool",
+            "shell(git remote)",
+        ]
+    if model:
+        command += ["--model", model]
+    return command
+
+
+#: executor id -> the NAME of its argv builder in this module. The worker
+#: refuses any executor absent from this table (`handlers._run_agent`), so an
+#: unknown/unproven name can never silently burn a cascade attempt on a
+#: phantom link -- the failure mode `routing.py`'s module docstring warns
+#: about.
+#:
+#: Names, not function objects, and resolved via `globals()` at call time
+#: (`_command_builder`): binding the objects here would capture them at import
+#: and silently defeat `monkeypatch.setattr(agent_runner, "build_command", ...)`,
+#: which several existing tests rely on to stub the argv without launching a
+#: real CLI. Caught by exactly those tests when this was first written the
+#: other way.
+COMMAND_BUILDERS: dict[str, str] = {
+    "claude": "build_command",
+    "codex": "build_codex_command",
+    "copilot": "build_copilot_command",
+    "openai_http": "build_openai_http_command",
+}
+
+
+def build_openai_http_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+    capability_override: str | None = None,
+) -> list[str]:
+    """Argv for the model-only OpenAI-compatible HTTP bridge
+    (`command_center.openai_exec`; VOYN-W0-AICC-GROQ-VERDICT-BENCH).
+
+    The bridge has no tool loop, no workspace and no repository access, so
+    the ONLY task types it may serve are the MODEL_ONLY ones whose prompt
+    already embeds the exact bytes under review. Refusing here is fail
+    closed at the builder — and `openai_exec.main` re-validates, because an
+    argv builder can be bypassed by hand. `capability_override` is accepted
+    for signature parity with `build_command` and refused for the same
+    reason: there is no wider capability to grant.
+
+    `sys.executable` rather than a binary name: the worker daemon runs in
+    the fleet venv, and the bridge must import from the same checkout the
+    daemon does — a PATH lookup could find another install.
+    """
+    if task_type not in MODEL_ONLY_TASK_TYPES:
+        raise ValueError(
+            f"openai_http serves only MODEL_ONLY task types, not {task_type!r}"
+        )
+    if capability_override is not None:
+        raise ValueError("openai_http has no capabilities to override")
+    if not model:
+        raise ValueError("openai_http requires an explicit provider/model")
+    return [
+        sys.executable,
+        "-m",
+        "command_center.openai_exec",
+        "--model",
+        model,
+        "--task-type",
+        task_type,
+        "--",
+        prompt,
+    ]
+
+
+def openai_http_preflight() -> tuple[bool, str]:
+    """Available iff at least one provider key is present in the environment.
+
+    Deliberately does not probe the network: preflight runs on every
+    dispatch, and a provider blip must classify as that attempt's failure
+    (retryable, next cascade link), not as executor absence.
+    """
+    present = [
+        env for _, env in sorted(openai_exec.PROVIDERS.values()) if os.environ.get(env)
+    ]
+    if present:
+        return True, "keys: " + ",".join(sorted(present))
+    return False, "no provider key set (GROQ/OPENROUTER/MISTRAL_API_KEY)"
+
+
+def _command_builder(executor: str) -> Callable[..., list[str]] | None:
+    name = COMMAND_BUILDERS.get(executor)
+    return globals().get(name) if name else None
+
+
 def extract_result_text(stdout: str) -> str:
     """Extract the assistant's final report text from `claude -p --output-format json` stdout.
 
@@ -399,7 +1072,7 @@ def extract_result_text(stdout: str) -> str:
     """
     try:
         data = json.loads(stdout)
-    except (json.JSONDecodeError, ValueError):
+    except _JSON_ERRORS:
         return stdout
     if isinstance(data, list):
         for item in reversed(data):
@@ -409,6 +1082,27 @@ def extract_result_text(stdout: str) -> str:
     if isinstance(data, dict):
         return data.get("result", stdout) or stdout
     return stdout
+
+
+def _parse_cli_result_payload(stdout: str) -> dict | None:
+    """Parse `stdout` as the single JSON object `claude -p --output-format json`
+    emits on a completed invocation, returning it only when it decodes to a
+    dict.
+
+    Returns `None` for anything else — empty output, a JSON array (the
+    `stream-json`/NDJSON shape `extract_result_text` also has to tolerate),
+    plain non-JSON text, or a parse error. Callers (`RunResult.is_executor_api_error`)
+    must treat `None` as "no signal", never as a default classification either
+    way: this function only ever *positively confirms* a shape, it never
+    guesses one.
+    """
+    if not stdout:
+        return None
+    try:
+        data = json.loads(stdout)
+    except _JSON_ERRORS:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class RunResult:
@@ -431,9 +1125,185 @@ class RunResult:
         self.started_at = started_at
         self.completed_at = completed_at
 
+        # Parsed once here (not re-parsed by every caller) so
+        # `is_executor_api_error` below and any other consumer read plain
+        # attributes rather than each re-implementing JSON parsing/fallback
+        # over raw stdout. See `_parse_cli_result_payload` for the fail-safe
+        # contract.
+        payload = _parse_cli_result_payload(stdout)
+        self.is_error: bool = bool(payload.get("is_error")) if payload else False
+        self.api_error_status = payload.get("api_error_status") if payload else None
+        self.terminal_reason = payload.get("terminal_reason") if payload else None
+
     @property
     def result_status(self) -> str:
         return self.status
+
+    @property
+    def is_executor_api_error(self) -> bool:
+        """True only when the CLI's own structured output positively confirms
+        an API-level failure (rate limit, auth, overload, ...) rather than a
+        genuine task-level outcome.
+
+        Incident 2026-08-21 16:09 UTC (control-01/worker-01): a shared
+        Claude-CLI account hit its session/rate limit mid-fleet. The CLI
+        still exited non-zero with output on stdout (`exit_code=1`,
+        non-empty `stdout`), so the pre-existing "process never started"
+        check in `worker.handlers._run_agent`
+        (`status == "failed" and exit_code is None and not stdout`) never
+        fired, and the run fell through to `ok=True` -- an infrastructure
+        failure recorded as a genuine task success, permanently un-retried.
+        The real payload carried `is_error: true`, `api_error_status: 429`
+        and `terminal_reason: "api_error"` -- a signal the CLI emits
+        specifically when it never got to attempt the task, distinct from a
+        task that executed and failed on its own merits. Checked here as
+        `(is_error and api_error_status is not None) or terminal_reason ==
+        "api_error"` -- either half alone has been observed in real captures,
+        so both are treated as sufficient. Deliberately does NOT look at
+        `result` text content: a genuinely completed task's own report could
+        contain unrelated words like "error" or "rate limit", and heuristics
+        on free text would misclassify real task failures as infrastructure
+        failures, causing exactly the "retrying a completed mutating run
+        re-applies its side effects" hazard `worker.handlers` warns against.
+        `False` (never `True`) when `_parse_cli_result_payload` could not
+        positively confirm a parseable dict payload -- fail safe to today's
+        behavior rather than guess.
+        """
+        return (
+            self.is_error and self.api_error_status is not None
+        ) or self.terminal_reason == "api_error"
+
+    def is_executor_provider_error(self, executor: str) -> bool:
+        """Whether the selected CLI positively reports a provider failure.
+
+        Claude exposes structured API fields; Copilot 1.0.x reports its
+        pre-task auth/quota/network failures on stderr. Copilot free-text is
+        considered only for a failed, non-zero process, so a successful
+        review that merely discusses a rate limit cannot trigger a retry.
+        """
+        if self.is_executor_api_error:
+            return True
+        if executor != "copilot" or self.status != "failed" or not self.exit_code:
+            return False
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
+        return any(
+            signature in diagnostic
+            for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
+        )
+
+    @property
+    def is_executor_sandbox_error(self) -> bool:
+        """Whether the sandbox launcher reported its known loopback failure."""
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
+        return all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
+
+    @property
+    def is_principal_isolation_error(self) -> bool:
+        """The OS launcher refused or lost the isolated execution service.
+
+        The broker's failure response is structurally fixed: exit 125, empty
+        stdout, and a marker-prefixed stderr line.  Searching arbitrary model
+        output for the marker is unsafe because an independent review of this
+        very source contains the literal and previously classified its valid
+        verdict as infrastructure failure.  Match the transport envelope,
+        never prompt/transcript content.
+        """
+        return (
+            self.status == "failed"
+            and self.exit_code == 125
+            and not self.stdout
+            and any(
+                line.startswith(f"{_PRINCIPAL_ISOLATION_FAILURE}:")
+                for line in self.stderr.splitlines()
+            )
+        )
+
+
+# How often the mid-run poll loop wakes to re-check `cancel_event` and the
+# deadline. Short enough that a lease-loss signal turns into a SIGTERM within
+# a fraction of a second of the heartbeat thread setting the event; long
+# enough not to spin the CPU over the lifetime of a run that can last up to
+# MAX_TIMEOUT_SECONDS.
+CANCEL_POLL_INTERVAL_SECONDS = 0.5
+
+# Grace period between SIGTERM and SIGKILL when forcibly terminating a
+# process group (mid-run cancellation, and now also the timeout path — see
+# the module docstring's "Cancellation (worker daemon path)" note for why
+# both share this mechanism). Configurable per call via
+# `termination_grace_seconds`; this is only the default. 15s matches the
+# existing convention of generous-but-bounded waits elsewhere in this module
+# (MIN_TIMEOUT_SECONDS=30 is the shortest a whole run is ever given; 15s is a
+# fraction of that, enough for the CLI's own signal handling / MCP server
+# shutdown to run without leaving a lost lease's mutation in flight for long).
+DEFAULT_TERMINATION_GRACE_SECONDS = 15.0
+
+
+def _popen_new_process_group_kwargs() -> dict:
+    """Extra `Popen` kwargs so the spawned `claude` process becomes the leader
+    of its own process group (POSIX) / process group (Windows), never sharing
+    ours. This is what makes group-wide termination possible at all — without
+    it, `os.killpg`/`CTRL_BREAK_EVENT` would reach this worker process too."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {
+        "start_new_session": True
+    }  # POSIX: equivalent to a preexec_fn calling os.setsid()
+
+
+def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) -> None:
+    """Escalating termination of `proc`'s entire process group: SIGTERM (POSIX)
+    / CTRL_BREAK_EVENT (Windows), wait up to `grace_seconds`, then SIGKILL
+    (POSIX) / `Popen.kill()` (Windows) if it is still alive.
+
+    Targets the *group*, not just `proc.pid` — see `_popen_new_process_group_
+    kwargs` and the module docstring: a plain `proc.kill()` would leave any
+    child the CLI spawned (tool subprocesses, MCP servers) running and
+    unaccounted for, which is the exact defect class this change closes.
+    Never raises: a process that already exited (race between our poll and
+    its own completion) is treated as success, not an error.
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+        except _OS_VALUE_ERRORS:
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return  # already gone
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if sys.platform == "win32":
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return  # already gone
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        # Even SIGKILL cannot be un-delivered short of a kernel bug or an
+        # uninterruptible (D-state) child; there is nothing further this
+        # function can do. The caller's own bookkeeping (worker.daemon
+        # discarding the outcome, the isolated worktree staying leased-out
+        # until the group is confirmed dead) is what protects against
+        # redelivery, not a guarantee that this call blocks forever.
+        pass
 
 
 def run_claude_code(
@@ -443,48 +1313,124 @@ def run_claude_code(
     task_type: str,
     timeout_seconds: int,
     model: str | None = None,
+    cancel_event: threading.Event | None = None,
+    termination_grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
+    executor: str = "claude",
 ) -> RunResult:
-    """Execute Claude Code synchronously. Never raises for expected failure modes."""
-    command = build_command(prompt, task_type=task_type, model=model)
+    """Execute an agent CLI. Never raises for expected failure modes.
+
+    `executor` selects the argv builder from `COMMAND_BUILDERS`; everything
+    else in this function -- process-group isolation, the cancellation and
+    timeout polling loop, the escalating SIGTERM/SIGKILL teardown, the
+    deadlock-free output collection -- is executor-independent and is
+    deliberately NOT duplicated per executor. The function keeps its
+    historical name so the many existing callers (and the tests that
+    monkeypatch it) are untouched; `executor` defaults to `"claude"`, so
+    every one of them behaves exactly as before.
+
+    Runs the CLI as its own process-group leader (`_popen_new_process_group_
+    kwargs`) via `subprocess.Popen` rather than the blocking `subprocess.run`
+    form, specifically so a caller that hands in `cancel_event` gets a hook to
+    intervene mid-run: while the process is alive, this function polls both
+    `cancel_event` and the `timeout_seconds` deadline every
+    `CANCEL_POLL_INTERVAL_SECONDS`, and on either trip forcibly terminates the
+    whole process group (`_terminate_process_group`) rather than leaving it
+    running. `cancel_event` is optional and defaults to `None` (never set) so
+    every existing caller that does not pass one — `chat_service`,
+    `launch_service`, and any future v1 Streamlit launch — is unaffected: the
+    call still blocks until the process exits or the timeout fires, exactly
+    as the previous `subprocess.run(timeout=...)` implementation did, just
+    without a hook nobody asked for.
+
+    `worker.handlers._run_agent` is the one caller that passes `cancel_event`
+    today, wiring in the daemon's own `lease_lost` event so a lease lost
+    mid-run now actually stops the subprocess instead of merely being noticed
+    after the fact once it exits on its own.
+    """
+    builder = _command_builder(executor)
+    if builder is None:
+        # Refuse rather than silently falling back to Claude: a typo'd or
+        # unwired executor name must surface as a routing failure, not as a
+        # run that quietly consumed the very quota the route existed to
+        # avoid.
+        return RunResult(
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr=f"unknown executor {executor!r}; known: {sorted(COMMAND_BUILDERS)}",
+            duration_seconds=0.0,
+            started_at=models.iso_now(),
+            completed_at=models.iso_now(),
+        )
+    command = builder(prompt, task_type=task_type, model=model)
+    launcher_input: str | None = None
+    launch_environment = scrub_vcs_credentials(dict(os.environ))
+    review_key = launch_environment.pop("AICC_REVIEW_ANTHROPIC_API_KEY", "")
+    # Popped UNCONDITIONALLY: the raw variable must never reach any child —
+    # a mutating run with Bash, or any third-party executor, could read it
+    # under its own name and defeat the positive list below (independent
+    # review of 3472b45, FINDING 1).
+    if executor == "claude" and review_key and task_type in REVIEW_TASK_TYPES:
+        # The verdict tier runs on the owner's metered review key
+        # (VOYN-W0-SERVER-OWN-BILLING pilot, decision 2026-09-04): with
+        # ANTHROPIC_API_KEY set, the claude CLI bills the API instead of
+        # the subscription, so acceptance stops competing with every other
+        # lane for the subscription's rolling windows. The positive list
+        # is deliberate — implementation/remediation and anything else
+        # stay on the subscription; a task class must be added here
+        # explicitly to spend metered money. The console-side monthly cap
+        # and the merged spend machinery bound the burn (the 2026-08-20
+        # ungoverned-key incident is why this is env-gated and scoped,
+        # not a blanket switch). The principal-isolation branch below
+        # rebuilds the environment from root-owned files and is
+        # intentionally not touched by this.
+        launch_environment["ANTHROPIC_API_KEY"] = review_key
+    launch_cwd = repository_path
+    if principal_isolation_required():
+        try:
+            manifest = build_principal_isolation_manifest(
+                repository_path=repository_path,
+                prompt=prompt,
+                task_type=task_type,
+                timeout_seconds=timeout_seconds,
+                executor=executor,
+                model=model,
+            )
+        except (OSError, RunnerError) as exc:
+            now = models.iso_now()
+            return RunResult(
+                status="failed",
+                exit_code=None,
+                stdout="",
+                stderr=f"{_PRINCIPAL_ISOLATION_FAILURE}: invalid manifest: {exc}",
+                duration_seconds=0.0,
+                started_at=now,
+                completed_at=now,
+            )
+        command = [PRINCIPAL_ISOLATION_LAUNCHER, "--client"]
+        launcher_input = json.dumps(manifest, separators=(",", ":")) + "\n"
+        launch_environment = _principal_launcher_environment()
+        # The client only opens the protected Unix socket.  It must not need
+        # access to the task tree; the root launcher bind-mounts the verified
+        # workspace into the aicc-agent unit as /workspace.
+        launch_cwd = Path("/")
     started_at = models.iso_now()
     started_monotonic = time.monotonic()
 
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
-            cwd=repository_path,
-            capture_output=True,
+            cwd=launch_cwd,
+            stdin=subprocess.PIPE if launcher_input is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_seconds,
-            check=False,
             # Strip ambient Git/GitHub credentials: this agent has no reason to
             # authenticate to a remote, and the completion pipeline (not the
             # agent) owns push/merge. See scrub_vcs_credentials.
-            env=scrub_vcs_credentials(dict(os.environ)),
-        )
-        duration = time.monotonic() - started_monotonic
-        status = "completed" if completed.returncode == 0 else "failed"
-        return RunResult(
-            status=status,
-            exit_code=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
-            duration_seconds=duration,
-            started_at=started_at,
-            completed_at=models.iso_now(),
-        )
-    except subprocess.TimeoutExpired as exc:
-        duration = time.monotonic() - started_monotonic
-        stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return RunResult(
-            status="timed_out",
-            exit_code=None,
-            stdout=stdout,
-            stderr=stderr,
-            duration_seconds=duration,
-            started_at=started_at,
-            completed_at=models.iso_now(),
+            env=launch_environment,
+            close_fds=True,
+            **_popen_new_process_group_kwargs(),
         )
     except OSError as exc:
         duration = time.monotonic() - started_monotonic
@@ -497,6 +1443,92 @@ def run_claude_code(
             started_at=started_at,
             completed_at=models.iso_now(),
         )
+
+    # `Popen.communicate()` is the only safe way to drain stdout/stderr
+    # without risking the classic pipe-full deadlock (the CLI's own
+    # `--output-format json` transcript can comfortably exceed the OS pipe
+    # buffer). It is called exactly once, from a background thread, so the
+    # main loop below is free to poll `cancel_event`/the deadline without
+    # itself blocking on I/O — `communicate()` is documented to work
+    # correctly when the process is killed out from under it (it simply
+    # returns whatever was written before the pipes closed).
+    collected: dict[str, str] = {}
+
+    def _collect() -> None:
+        try:
+            out, err = proc.communicate(input=launcher_input)
+        except _OS_VALUE_ERRORS:
+            out, err = "", ""
+        collected["stdout"] = out or ""
+        collected["stderr"] = err or ""
+
+    collector = threading.Thread(target=_collect, name="agent-runner-io", daemon=True)
+    collector.start()
+
+    deadline = started_monotonic + timeout_seconds
+    outcome = "exited"
+    while True:
+        collector.join(timeout=CANCEL_POLL_INTERVAL_SECONDS)
+        if not collector.is_alive():
+            outcome = "exited"
+            break
+        if cancel_event is not None and cancel_event.is_set():
+            outcome = "cancelled"
+            break
+        if time.monotonic() >= deadline:
+            outcome = "timed_out"
+            break
+
+    if outcome in ("cancelled", "timed_out"):
+        _terminate_process_group(proc, grace_seconds=termination_grace_seconds)
+        # The collector thread's `communicate()` call unblocks once the
+        # killed process closes its pipes; bound the wait generously (grace
+        # period again, plus headroom) rather than joining forever, so a
+        # pathological D-state child cannot hang this call indefinitely.
+        collector.join(timeout=termination_grace_seconds + 5.0)
+
+    duration = time.monotonic() - started_monotonic
+    stdout = collected.get("stdout", "")
+    stderr = collected.get("stderr", "")
+    exit_code = proc.poll()
+
+    if outcome == "cancelled":
+        return RunResult(
+            status="cancelled",
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            duration_seconds=duration,
+            started_at=started_at,
+            completed_at=models.iso_now(),
+        )
+    if outcome == "timed_out":
+        return RunResult(
+            status="timed_out",
+            exit_code=None,
+            stdout=stdout,
+            stderr=stderr,
+            duration_seconds=duration,
+            started_at=started_at,
+            completed_at=models.iso_now(),
+        )
+    diagnostic = f"{stdout}\n{stderr}".lower()
+    status = (
+        "failed"
+        if all(token in diagnostic for token in _CODEX_BWRAP_LOOPBACK_SIGNATURE)
+        else "completed"
+        if exit_code == 0
+        else "failed"
+    )
+    return RunResult(
+        status=status,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=duration,
+        started_at=started_at,
+        completed_at=models.iso_now(),
+    )
 
 
 def resolve_timeout(requested: int | None) -> int:
@@ -548,7 +1580,9 @@ def load_runs() -> list[dict]:
     storage.ensure_seeded_jsonl(RUNS_FILE)
     records = storage.read_jsonl(RUNS_FILE)
     latest = storage.fold_latest_by_id(records)
-    return sorted(latest.values(), key=lambda run: run.get("created_at") or "", reverse=True)
+    return sorted(
+        latest.values(), key=lambda run: run.get("created_at") or "", reverse=True
+    )
 
 
 def get_run(run_id: str) -> dict | None:
@@ -565,7 +1599,11 @@ def get_run(run_id: str) -> dict | None:
 # See `command_center.runtime.reports.REPORTS_ROOT` for why this honors
 # `AICC_REPORTS_ROOT` — same subprocess-isolation gap, same fix, applied here too
 # for consistency between the v1.2 and v2 report-writing paths.
-REPORTS_ROOT = Path(os.environ["AICC_REPORTS_ROOT"]) if os.environ.get("AICC_REPORTS_ROOT") else ROOT / "reports"
+REPORTS_ROOT = (
+    Path(os.environ["AICC_REPORTS_ROOT"])
+    if os.environ.get("AICC_REPORTS_ROOT")
+    else ROOT / "reports"
+)
 
 
 # Path components are restricted to this conservative charset so a hand-authored
@@ -588,7 +1626,7 @@ def report_path_for(run: dict) -> Path:
     try:
         started_dt = datetime.fromisoformat(started)
     except ValueError:
-        started_dt = datetime.now()
+        started_dt = datetime.now(UTC)
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
     task_part = _safe_path_component(run.get("task_id") or "adhoc", "adhoc")[:12]
     agent = _safe_path_component(run.get("agent") or "agent", "agent")
@@ -618,48 +1656,48 @@ def render_report_markdown(run: dict, parsed: dict) -> str:
 
     return f"""# Отчёт агента
 
-- Run ID: `{run.get('id', '—')}`
-- Task ID: `{run.get('task_id') or '—'}`
-- Project: {run.get('project', '—')}
-- Agent: {run.get('agent', '—')}
-- Task type: {run.get('task_type', '—')}
-- Repository: `{run.get('repository_path', '—')}`
-- Branch before run: {pre.get('branch') or '—'}
-- HEAD before run: {pre.get('head') or '—'}
-- Branch after run: {post.get('branch') or '—'}
-- HEAD after run: {post.get('head') or '—'}
-- Started: {run.get('started_at') or '—'}
-- Completed: {run.get('completed_at') or '—'}
+- Run ID: `{run.get("id", "—")}`
+- Task ID: `{run.get("task_id") or "—"}`
+- Project: {run.get("project", "—")}
+- Agent: {run.get("agent", "—")}
+- Task type: {run.get("task_type", "—")}
+- Repository: `{run.get("repository_path", "—")}`
+- Branch before run: {pre.get("branch") or "—"}
+- HEAD before run: {pre.get("head") or "—"}
+- Branch after run: {post.get("branch") or "—"}
+- HEAD after run: {post.get("head") or "—"}
+- Started: {run.get("started_at") or "—"}
+- Completed: {run.get("completed_at") or "—"}
 - Duration: {duration_str}
-- Exit code: {run.get('exit_code')}
-- Status: {run.get('status', '—')}
+- Exit code: {run.get("exit_code")}
+- Status: {run.get("status", "—")}
 
 ## Prompt
 
 ```
-{run.get('prompt', '')}
+{run.get("prompt", "")}
 ```
 
 ## Stdout (полный, без сокращений)
 
 ```
-{run.get('stdout', '')}
+{run.get("stdout", "")}
 ```
 
 ## Stderr (полный, без сокращений)
 
 ```
-{run.get('stderr', '')}
+{run.get("stderr", "")}
 ```
 
 ## Извлечённые данные (парсер)
 
-- Verdict: {parsed.get('verdict') or 'не определено'}
-- Confidence: {parsed.get('confidence', 'none')}
-- Commit hash: {parsed.get('commit_hash') or '—'}
-- Branch: {parsed.get('branch') or '—'}
-- Pull Request: {parsed.get('pull_request_url') or '—'}
-- Recommended next action: {parsed.get('recommended_next_action') or '—'}
+- Verdict: {parsed.get("verdict") or "не определено"}
+- Confidence: {parsed.get("confidence", "none")}
+- Commit hash: {parsed.get("commit_hash") or "—"}
+- Branch: {parsed.get("branch") or "—"}
+- Pull Request: {parsed.get("pull_request_url") or "—"}
+- Recommended next action: {parsed.get("recommended_next_action") or "—"}
 
 ### Findings
 
@@ -668,13 +1706,13 @@ def render_report_markdown(run: dict, parsed: dict) -> str:
 ## Git status до запуска
 
 ```
-{pre.get('status_summary') or '—'}
+{pre.get("status_summary") or "—"}
 ```
 
 ## Git status после запуска
 
 ```
-{post.get('status_summary') or '—'}
+{post.get("status_summary") or "—"}
 ```
 """
 

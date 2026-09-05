@@ -39,6 +39,7 @@ error: it yields an empty-but-usable projection (``exists=False``), so ACC rende
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -370,3 +371,156 @@ def to_read_model(rec: BacklogRecommendation) -> dict:
         "source": "master_backlog",
         "read_only": True,
     }
+
+
+# --- Rich execution records (section-body task lines) -------------------------
+#
+# Beyond section 0B's machine `VOYN_RECOMMENDATION` records, the master file's
+# body carries one structured list line per executable task:
+#
+#     - **VOYN-<ID>** | <wave> | <status>[ annotations] | <priority> | ...
+#
+# These lines are where execution STATUS actually lives (`OPEN`,
+# `IN_PROGRESS`, `READY_TO_REVIEW`, `DONE`, ...) — the 0B records carry only
+# the planning status (`PO-Approved`). This parser is the shared, exact-token
+# reader for that surface (machine-fields rule: no substring matching; an
+# unrecognized status is surfaced as `UNKNOWN`, never guessed and never
+# silently dropped). Read-only, like everything in this module.
+
+#: The exact execution-status vocabulary. Annotations after the token (e.g.
+#: "OPEN (сверено ...)") are permitted and ignored; the token itself must
+#: match exactly.
+RICH_STATUSES: frozenset[str] = frozenset(
+    {
+        "UNTRIAGED",
+        "OPEN",
+        "IN_PROGRESS",
+        "READY_TO_REVIEW",
+        "DONE",
+        "DEFER_TO_USER",
+        "NEEDS_REFINEMENT",
+        "SPLIT",
+    }
+)
+
+_RICH_LINE = re.compile(
+    r"^- \*\*(?P<id>VOYN-[A-Z0-9-]+)\*\*\s*\|\s*(?P<wave>[^|]+?)\s*\|\s*"
+    r"(?P<status>[^|]+?)\s*\|\s*(?P<priority>[^|]+?)\s*\|",
+    re.MULTILINE,
+)
+
+
+@dataclass(frozen=True)
+class RichRecord:
+    """One structured body task line: id, wave text, exact status, priority.
+
+    ``status`` is a member of :data:`RICH_STATUSES` or the literal
+    ``"UNKNOWN"`` when the line's token is outside the vocabulary. ``slug``
+    is the backticked short name when the line carries one, else ``""``.
+    """
+
+    record_id: str
+    wave: str
+    status: str
+    priority: str
+    slug: str = ""
+
+    @property
+    def title(self) -> str:
+        text = self.slug.replace("-", " ").replace("_", " ").strip()
+        return text[:1].upper() + text[1:] if text else self.record_id
+
+
+_RICH_SLUG = re.compile(r"`([^`]+)`")
+
+
+def parse_rich_records(text: str) -> list[RichRecord]:
+    records: list[RichRecord] = []
+    for match in _RICH_LINE.finditer(text):
+        status_raw = match.group("status").strip().strip("*")
+        token = status_raw.split()[0].strip("*") if status_raw else ""
+        status = token if token in RICH_STATUSES else "UNKNOWN"
+        line_end = text.find("\n", match.end())
+        line = text[match.start() : line_end if line_end != -1 else len(text)]
+        slug_match = _RICH_SLUG.search(line)
+        records.append(
+            RichRecord(
+                record_id=match.group("id"),
+                wave=match.group("wave").strip(),
+                status=status,
+                priority=match.group("priority").strip().strip("*"),
+                slug=slug_match.group(1) if slug_match else "",
+            )
+        )
+    return records
+
+
+def load_rich_records(path: str | os.PathLike[str] | None = None) -> list[RichRecord]:
+    """Read-only rich execution records from the master file (or [])."""
+    resolved = resolve_backlog_path(path)
+    if resolved is None or not resolved.exists():
+        return []
+    try:
+        text = resolved.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return parse_rich_records(text)
+
+
+# --- read-only board view over the projection (VOYN-W0-AICC-WIRE-BACKLOG-
+# API-TO-DEPLOYED-WEBAPI, first increment) ---------------------------------
+#
+# The console's Overview/Kanban read the local task repository; on a host
+# whose store is empty (the deployed console) they rendered zeros while the
+# fleet's real state sat in the same projection file the Master Backlog
+# panel already reads. This maps that projection into the read model's task
+# shape — a VIEW, never a store: every record is stamped `source: "master"`
+# and `read_only: True`, and the write path refuses them (see
+# `legacy_task_helpers.upsert_tasks`), so no second task store can emerge.
+
+#: Master-store execution statuses → the read model's canonical lanes.
+#: DECIDED maps to Closed (record closed by decision, not by work);
+#: REJECTED and DEFER_TO_USER surface as Blocked — both wait on something
+#: other than an executor.
+_MASTER_STATUS_TO_LANE: dict[str, str] = {
+    "OPEN": "Backlog",
+    "UNTRIAGED": "Backlog",
+    "NEEDS_REFINEMENT": "Backlog",
+    "IN_PROGRESS": "In Progress",
+    "READY_TO_REVIEW": "Review",
+    "REJECTED": "Blocked",
+    "DEFER_TO_USER": "Blocked",
+    "SPLIT": "Blocked",
+    "DONE": "Done",
+    "DECIDED": "Closed",
+}
+
+
+def projection_board_tasks(path: str | os.PathLike[str] | None = None) -> list[dict]:
+    """The master projection as read-only board tasks (empty when absent)."""
+    projection = load_projection(path)
+    tasks: list[dict] = []
+    for record in projection.records:
+        tasks.append(
+            {
+                "id": record.issue_id,
+                "title": record.task,
+                # An unmapped status keeps its raw name and lands in the
+                # read model's visible `other` bucket instead of silently
+                # inflating Backlog (independent review of 92a501f).
+                "status": _MASTER_STATUS_TO_LANE.get(record.status, record.status),
+                "project": record.owner if record.owner != "-" else "VOYN",
+                "priority": record.priority if record.priority != "-" else "",
+                "task_type": "backlog",
+                "source": "master",
+                "read_only": True,
+            }
+        )
+    return tasks
+
+
+def board_tasks(
+    local_tasks: list[dict], path: str | os.PathLike[str] | None = None
+) -> list[dict]:
+    """Use the read-only master projection only when the local store is empty."""
+    return local_tasks if local_tasks else projection_board_tasks(path)

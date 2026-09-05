@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the VOYN durable queue monitor every two minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+Persistent=true
+Unit=voyn-queue-monitor.service
+
+[Install]
+WantedBy=timers.target

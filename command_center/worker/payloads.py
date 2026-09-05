@@ -17,19 +17,33 @@ out of this module.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+
+from command_center.agent_runner import MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS
 
 __all__ = ["AgentRunRequest", "PayloadError", "parse_agent_run"]
 
 AGENT_RUN_SCHEMA_VERSION = 1
 
-# Bounds are refusals, not clamps: a payload asking for more than the queue's
-# own visibility ceiling (3600s, clamped server-side in queue_claim) would
-# outlive any lease its worker can hold, so it is refused at parse time where
-# the operator can see why, instead of timing out opaquely mid-run.
-_MAX_TIMEOUT_SECONDS = 3600
-_MIN_TIMEOUT_SECONDS = 30
+# Bounds are refusals, not clamps, and they are `agent_runner.MIN_TIMEOUT_
+# SECONDS` / `MAX_TIMEOUT_SECONDS` themselves -- imported, not re-typed --
+# the existing hard cap on how long a single agent run may take. They are NOT
+# the queue's own visibility window: that lease (`work_queue_store.claim`'s
+# `visibility_seconds`, default 300s) is renewed, not lengthened, by a
+# heartbeat thread that runs beside the handler for the whole of a run
+# (`worker.daemon.WorkerDaemon._heartbeat_loop`), so a run far longer than
+# one visibility window survives on live heartbeats alone and nothing here is
+# "outlived" by it. A payload requesting a timeout `resolve_timeout`/
+# `agent_runner` would clamp anyway is refused here instead, at parse time
+# where the operator can see why, rather than silently narrowed and timing
+# out opaquely mid-run.
+_MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_SECONDS
+_MIN_TIMEOUT_SECONDS = MIN_TIMEOUT_SECONDS
+# Dot-runs are excluded by construction (separators carry exactly one
+# non-alphanumeric), so no separate ".." check is needed.
+_BACKLOG_TASK_ID = re.compile(r"^VOYN-[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +75,15 @@ class AgentRunRequest:
     #: COLLISION, found 2026-08-21: 29 backlog tasks pointed at one PR with a
     #: single 7-line diff).
     backlog_task_id: str | None = None
+    #: VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: a finding-verification run must read
+    #: the tree at the PR's exact head, not whatever state the shared
+    #: checkout happens to be in. When present, the handler fetches
+    #: ``refs/pull/<review_head_pr_number>/head``, verifies the head sha is
+    #: present, and runs the agent in a detached read-only worktree at that
+    #: sha. Only honored for non-mutating task types (fail closed in the
+    #: handler); absent keeps the historical behaviour byte-for-byte.
+    review_head_pr_number: str | None = None
+    review_head_sha: str | None = None
 
 
 def _string(payload: dict[str, Any], key: str) -> str | None:
@@ -107,7 +130,7 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         return PayloadError(
             reason=(
                 f"timeout_seconds {timeout} outside [{_MIN_TIMEOUT_SECONDS}, "
-                f"{_MAX_TIMEOUT_SECONDS}] (the queue's own visibility ceiling)"
+                f"{_MAX_TIMEOUT_SECONDS}] (agent_runner's own run-length ceiling)"
             )
         )
 
@@ -142,6 +165,34 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         cascade.append(dict(link))
 
     backlog_task_id = _string(payload, "backlog_task_id")
+    if backlog_task_id is not None and not _BACKLOG_TASK_ID.fullmatch(backlog_task_id):
+        return PayloadError(
+            reason=("backlog_task_id must use the canonical VOYN-... identifier format")
+        )
+
+    # VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: the head-pinned checkout request.
+    # Absent is the historical behaviour; present but malformed is a payload
+    # defect (non-retryable -- redelivery re-reads the same broken pin).
+    review_head = payload.get("review_head")
+    review_head_pr_number: str | None = None
+    review_head_sha: str | None = None
+    if review_head is not None:
+        if not isinstance(review_head, dict):
+            return PayloadError(
+                reason=f"review_head must be an object, got {type(review_head).__name__}"
+            )
+        pr_number = review_head.get("pr_number")
+        head_sha = review_head.get("head_sha")
+        if not (isinstance(pr_number, str) and re.fullmatch(r"[0-9]{1,10}", pr_number)):
+            return PayloadError(
+                reason=f"review_head.pr_number must be a decimal string, got {pr_number!r}"
+            )
+        if not (isinstance(head_sha, str) and re.fullmatch(r"[0-9a-f]{40}", head_sha)):
+            return PayloadError(
+                reason=f"review_head.head_sha must be a 40-hex sha, got {head_sha!r}"
+            )
+        review_head_pr_number = pr_number
+        review_head_sha = head_sha
 
     return AgentRunRequest(
         project_id=project_id,
@@ -153,4 +204,6 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         untrusted=untrusted,
         cascade=tuple(cascade),
         backlog_task_id=backlog_task_id,
+        review_head_pr_number=review_head_pr_number,
+        review_head_sha=review_head_sha,
     )
