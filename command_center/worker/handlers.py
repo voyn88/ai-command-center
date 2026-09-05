@@ -984,7 +984,25 @@ def _run_agent(
                     retryable=True,
                 )
             try:
-                candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
+                candidate_sha, checkpointed_dirty_worktree = (
+                    workspace_provisioning.checkpoint_dirty_task_workspace(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        remote_url=evidence.remote_url,
+                        start_sha=evidence.start_sha,
+                        trusted_base_sha=evidence.base_sha,
+                        expected_remote_sha=evidence.remote_task_sha,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                        message=f"{backlog_task}: checkpoint executor changes",
+                    )
+                )
+                # The checkpoint helper reads HEAD without invoking Git against
+                # agent-owned metadata.  Read it once more immediately before
+                # validation so a late writer cannot substitute the candidate.
+                observed_candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
                     run_repository,
                     expected_branch=evidence.expected_branch,
                     expected_inode=(
@@ -992,6 +1010,18 @@ def _run_agent(
                         evidence.workspace_inode,
                     ),
                 )
+                if observed_candidate_sha != candidate_sha:
+                    raise workspace_provisioning.WorkspaceVerificationError(
+                        failed_step="dirty_checkpoint_candidate_race",
+                        remediation="Stop the remaining writer and retry the preserved task clone.",
+                        expected_workspace=str(run_repository),
+                        actual_workspace=str(run_repository),
+                        expected_branch=evidence.expected_branch,
+                        detail=(
+                            f"checkpoint changed before publish validation: "
+                            f"expected={candidate_sha}, actual={observed_candidate_sha}"
+                        ),
+                    )
                 with workspace_provisioning.trusted_publish_clone(
                     run_repository,
                     expected_branch=evidence.expected_branch,
@@ -1052,6 +1082,7 @@ def _run_agent(
                 "branch": pub.branch,
                 "pr_url": pub.pr_url,
                 "reason": pub.reason,
+                "checkpointed_dirty_worktree": checkpointed_dirty_worktree,
             }
             if pub.pr_url:
                 result["pr_url"] = pub.pr_url

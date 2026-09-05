@@ -127,6 +127,11 @@ def handler(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         workspace_provisioning,
+        "checkpoint_dirty_task_workspace",
+        lambda workspace, **kwargs: ("0" * 40, False),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
         "checkpoint_task_workspace",
         lambda workspace, **kwargs: kwargs["previous_start_sha"],
     )

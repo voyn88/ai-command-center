@@ -487,31 +487,106 @@ def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
     assert not workspace.exists()
 
 
-def test_dirty_no_commit_is_retryable_and_preserved(agent_with_publish, monkeypatch):
+def test_dirty_no_commit_is_checkpointed_and_published(agent_with_publish, monkeypatch):
     run_agent, repo = agent_with_publish
     monkeypatch.setattr(agent_runner, "run_claude_code", _dirty_without_commit_run)
 
     outcome = run_agent(_payload(), _event(), 1)
 
-    assert not outcome.ok and outcome.retryable
-    assert "uncommitted_changes" in outcome.reason
-    workspace = _workspace(repo)
-    assert (workspace / "uncommitted-agent-work.txt").read_text() == "preserve me\n"
-
-    def commit_recovered_work(**kwargs):
-        target = Path(kwargs["repository_path"])
-        _git(target, "add", "uncommitted-agent-work.txt")
-        _git(target, "commit", "-q", "-m", "recover prior dirty work")
-        return _fake_run(commit=False)(**kwargs)
-
-    monkeypatch.setattr(agent_runner, "run_claude_code", commit_recovered_work)
-    recovered = run_agent(_payload(), _event(), 2)
-    assert recovered.ok and recovered.result["publish"]["ok"] is True
+    assert outcome.ok and outcome.result["publish"]["ok"] is True
+    assert outcome.result["publish"]["checkpointed_dirty_worktree"] is True
+    assert not _workspace(repo).exists()
     _git(repo, "fetch", "-q", "origin", "backlog/VOYN-TASK-A")
     assert (
         _git(repo, "show", "FETCH_HEAD:uncommitted-agent-work.txt").stdout
         == "preserve me\n"
     )
+
+
+def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
+    agent_with_publish, monkeypatch, tmp_path
+):
+    run_agent, repo = agent_with_publish
+    (repo / "delete-me.txt").write_text("remove me\n")
+    _git(repo, "add", "delete-me.txt")
+    _git(repo, "commit", "-q", "-m", "seed deletion")
+    _git(repo, "push", "-q", "origin", "main")
+
+    sentinel = tmp_path / "agent-git-executed"
+    attacker = tmp_path / "attacker.sh"
+    attacker.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat\n")
+    attacker.chmod(0o755)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "post-commit").write_text(f"#!/bin/sh\ntouch '{sentinel}'\n")
+    (hooks / "post-commit").chmod(0o755)
+
+    def leave_mixed_dirty_tree(**kwargs):
+        target = Path(kwargs["repository_path"])
+        (target / "f.txt").write_text("modified\n")
+        (target / "delete-me.txt").unlink()
+        (target / "new.txt").write_text("new\n")
+        executable = target / "tool.sh"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        (target / "linked.txt").symlink_to("new.txt")
+        (target / ".gitattributes").write_text("payload.txt filter=evil\n")
+        (target / "payload.txt").write_text("raw payload\n")
+        _git(target, "config", "core.fsmonitor", str(attacker))
+        _git(target, "config", "core.hooksPath", str(hooks))
+        _git(target, "config", "filter.evil.clean", str(attacker))
+        _git(target, "config", "filter.evil.required", "true")
+        return _fake_run(commit=False)(**kwargs)
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", leave_mixed_dirty_tree)
+
+    outcome = run_agent(_payload(), _event(), 1)
+
+    assert outcome.ok and outcome.result["publish"]["checkpointed_dirty_worktree"]
+    assert not sentinel.exists(), "agent-controlled Git config or hooks executed"
+    _git(repo, "fetch", "-q", "origin", "backlog/VOYN-TASK-A")
+    assert _git(repo, "show", "FETCH_HEAD:f.txt").stdout == "modified\n"
+    assert _git(repo, "show", "FETCH_HEAD:new.txt").stdout == "new\n"
+    assert _git(repo, "show", "FETCH_HEAD:payload.txt").stdout == "raw payload\n"
+    assert _git(repo, "show", "FETCH_HEAD:linked.txt").stdout == "new.txt"
+    assert _git(repo, "ls-tree", "FETCH_HEAD", "tool.sh").stdout.startswith("100755 ")
+    deleted = subprocess.run(
+        ["git", "cat-file", "-e", "FETCH_HEAD:delete-me.txt"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert deleted.returncode != 0
+
+
+def test_dirty_checkpoint_failure_is_retryable_and_preserves_clone(
+    agent_with_publish, monkeypatch
+):
+    run_agent, repo = agent_with_publish
+    monkeypatch.setattr(agent_runner, "run_claude_code", _dirty_without_commit_run)
+
+    def refuse_checkpoint(workspace, **kwargs):
+        raise workspace_provisioning.WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_object_write",
+            remediation="preserve and retry",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=kwargs["expected_branch"],
+            detail="simulated durable-object failure",
+        )
+
+    monkeypatch.setattr(
+        workspace_provisioning, "checkpoint_dirty_task_workspace", refuse_checkpoint
+    )
+
+    outcome = run_agent(_payload(), _event(), 1)
+
+    assert not outcome.ok and outcome.retryable
+    assert "dirty_checkpoint_object_write" in outcome.reason
+    workspace = _workspace(repo)
+    assert workspace.is_dir()
+    assert (workspace / "uncommitted-agent-work.txt").read_text() == "preserve me\n"
 
 
 def test_reused_clone_never_executes_agent_git_config_before_retry_publish(
