@@ -631,6 +631,47 @@ def test_the_marker_is_write_once(git_repo, configure_project_repo, fake_claude)
     assert db.get_run(sup.db_path, run["id"])["version"] == before["version"]
 
 
+def test_persist_run_failure_does_not_finalize_a_pre_existing_terminal_row(
+    git_repo, configure_project_repo
+):
+    """The bounded CAS fallback must never treat someone else's terminal row
+    as its own to complete (VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-
+    DURABILITY-REM: a rejected revision called the equivalent of
+    `confirm_finalized()` for every pre-existing terminal row here, which can
+    stamp `finalized_at` before the owning supervisor's report or auto-commit
+    has actually run — the marker would then claim durability writes finished
+    that were only ever scheduled).
+
+    A row already in a terminal state may belong to a supervisor that is
+    still writing its report; `persist_run_failure` is only the fallback for
+    a *newly* confirmed exit, so it must leave such a row exactly as it found
+    it — no report, no finalization marker — and defer to that owner's (or a
+    recovery's) explicit finalization claim.
+    """
+    configure_project_repo("AIOS", git_repo)
+    owner = supervisor.Supervisor()
+    run = _create_claimed_terminal_run(owner, git_repo, state="CANCELLED")
+    assert db.get_run(owner.db_path, run["id"])["finalized_at"] is None
+
+    intruder = run_finalizer.RunFinalizer(
+        owner.db_path, owner_token="intruder-token", owner_pid=os.getpid()
+    )
+
+    assert (
+        intruder.persist_run_failure(
+            run["id"],
+            exit_code=None,
+            failure_reason="supervision_failed",
+            lifecycle="supervision_failed",
+        )
+        is False
+    )
+    row = db.get_run(owner.db_path, run["id"])
+    assert row["state"] == "CANCELLED", "the pre-existing terminal state must not be overwritten"
+    assert row["finalized_at"] is None
+    assert db.get_report(owner.db_path, run["id"]) is None
+
+
 def test_successful_marker_is_final_local_database_access(monkeypatch, tmp_path):
     """Publishing finalized_at must not be followed by a SQLite reopen."""
     marker_written = False
@@ -851,11 +892,23 @@ def test_recovery_claim_requires_full_owner_death_proof(
     recovery = supervisor.Supervisor(db_path=original.db_path)
     recovery._finalization_owner_token = "recovery-owner"
     recovery._finalizer.owner_token = "recovery-owner"
-    monkeypatch.setattr(supervisor.identity, "query_identity", lambda _pid: query)
+    queried_pids = []
+
+    def record_and_query(pid):
+        queried_pids.append(pid)
+        return query
+
+    monkeypatch.setattr(supervisor.identity, "query_identity", record_and_query)
 
     assert recovery._acquire_recovery_finalization_claim(run["id"]) is takeover
     claim = db.get_run_finalization_claim(original.db_path, run["id"])
     assert claim["owner_token"] == ("recovery-owner" if takeover else "prior-owner")
+    # The contender's own PID is not proof of anything here: an implementation
+    # that queried the wrong PID (its own, or the run's process PID) would
+    # still pass every case above by coincidence. The claim's *recorded*
+    # owner PID (4242) is the only PID whose liveness/identity is relevant to
+    # whether the prior owner is provably dead.
+    assert queried_pids == [4242]
 
 
 def test_recovery_never_steals_legacy_live_claim_on_format_or_timezone_mismatch(
