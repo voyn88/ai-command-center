@@ -175,7 +175,17 @@ def _value_for(table: str, column: str, spec: MirroredTable, row_id: str) -> obj
     if declared.startswith("double"):
         return 1.5
     if declared.startswith("boolean"):
-        return True
+        # SQLite has no boolean type, so the authority's own value is always
+        # the 0/1 integer `flags` exists to convert — never a native `bool`.
+        # Returning one here would round-trip cleanly with no codec at all:
+        # psycopg adapts Python `bool` to `boolean` directly, and
+        # `ColumnCodec.comparable` normalises *any* bool unconditionally, so a
+        # mirror that forgot to declare the column in `flags` would insert
+        # without error and reconcile with zero divergence — the omission this
+        # fallback exists to catch stays invisible. The integer shape does not:
+        # PostgreSQL has no cast, implicit or otherwise, from integer to
+        # boolean, so an undeclared column fails the insert outright.
+        return 1
     if declared.startswith("timestamptz"):
         # Declared as a timestamp but not converted: the map keeps two such
         # columns as free text on both sides, so this only fires if a mirror
