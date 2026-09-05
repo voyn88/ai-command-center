@@ -183,6 +183,19 @@ need reconciliation.
 Both FastAPI applications served no authentication at all. Every mutating route
 now requires a verified platform principal and an explicit AICC-local grant.
 
+This delivery also fulfils `VOYN-W0-AICC-SRV-02` ("principal-and-permission-model").
+`SRV-02` was filed in the `SRV` sequence between `SRV-01`/`SRV-01a`/`SRV-01b`
+(PostgreSQL foundation) and `SRV-03` (worker host admission), but every
+dispatch of it was refused by the writer-lease bug fixed in
+`VOYN-W0-AICC-LEASE-STUCK-EXPIRED-NO-RECLAIM` (PR #358) — so it never ran, and
+this AUTH-HTTP-01 delivery (filed and completed independently) covers its
+intended scope in full: `command_center/http_auth/` is the HTTP-layer
+principal-and-permission model, and `command_center/db/roles.py` (`SRV-01a`)
+is its database-layer counterpart. `SRV-02` needs no further code and should
+not be re-attempted; this note is the closure record for anyone who finds the
+gap in the `SRV` numbering, the same gap that prompted its retry
+(`VOYN-W0-AICC-SRV-02-RETRY`) on 2026-08-26.
+
 #### Added
 - **`command_center/http_auth/`** — `identity.py` (forwards the caller's platform
   bearer credential to `GET /api/v1/whoami`; stores no credential, hashes
