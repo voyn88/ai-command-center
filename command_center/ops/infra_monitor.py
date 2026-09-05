@@ -24,6 +24,7 @@ class QueueSnapshot:
     dead: int
     success_age_seconds: float | None
     pending_age_seconds: float | None
+    recent_dead: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,11 +89,23 @@ def read_queue_snapshot() -> QueueSnapshot:
                     extract(epoch FROM (
                         now() - min(updated_at)
                         FILTER (WHERE state IN ('ready', 'claimed'))
-                    ))
+                    )),
+                    count(*) FILTER (
+                        WHERE state = 'dead'
+                          AND updated_at > now() - interval '1 hour'
+                    )
                 FROM work_item
                 """
             )
-            ready, claimed, succeeded, dead, success_age, pending_age = cur.fetchone()
+            (
+                ready,
+                claimed,
+                succeeded,
+                dead,
+                success_age,
+                pending_age,
+                recent_dead,
+            ) = cur.fetchone()
     finally:
         pool.close_pool()
     return QueueSnapshot(
@@ -102,6 +115,7 @@ def read_queue_snapshot() -> QueueSnapshot:
         dead=int(dead),
         success_age_seconds=(float(success_age) if success_age is not None else None),
         pending_age_seconds=(float(pending_age) if pending_age is not None else None),
+        recent_dead=int(recent_dead),
     )
 
 
@@ -143,6 +157,7 @@ def evaluate(
     minimum_active_workers: int,
     max_stalled_seconds: float,
     prometheus_ready: bool,
+    max_recent_dead: int = 0,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
     failures: list[str] = []
@@ -161,6 +176,10 @@ def evaluate(
         )
         if queue.ready + queue.claimed > 0 and pending_is_stale:
             failures.append("queue_stalled")
+        if queue.recent_dead > max_recent_dead:
+            failures.append(
+                f"dead_letter_growth:{queue.recent_dead}>{max_recent_dead}"
+            )
 
     return MonitorReport(
         ok=not failures,
@@ -176,6 +195,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m command_center.ops.infra_monitor")
     parser.add_argument("--minimum-active-workers", type=int, default=1)
     parser.add_argument("--max-stalled-seconds", type=float, default=900)
+    parser.add_argument(
+        "--max-recent-dead",
+        type=int,
+        default=0,
+        help="Maximum dead-lettered items allowed in the trailing hour.",
+    )
     parser.add_argument("--prometheus-url", required=True)
     parser.add_argument(
         "--skip-workers",
@@ -208,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             minimum_active_workers=args.minimum_active_workers,
             max_stalled_seconds=args.max_stalled_seconds,
             prometheus_ready=metrics_ready,
+            max_recent_dead=args.max_recent_dead,
         )
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
