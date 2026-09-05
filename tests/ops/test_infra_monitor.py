@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from command_center.ops.infra_monitor import (
     QueueSnapshot,
     evaluate,
@@ -174,3 +176,10 @@ def test_inactive_lane_and_prometheus_failure_are_reported() -> None:
 def test_prometheus_probe_rejects_non_http_urls() -> None:
     assert not prometheus_is_ready("file:///etc/passwd")
     assert not prometheus_is_ready("http://user@example.invalid/-/ready")
+
+
+def test_systemd_monitor_uses_worker_database_credentials() -> None:
+    unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
+
+    assert "EnvironmentFile=/home/voynadmin/aicc-preprod/worker.env" in unit
+    assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" not in unit
