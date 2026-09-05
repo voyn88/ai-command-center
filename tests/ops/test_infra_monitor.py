@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+from command_center.ops import infra_monitor
 from command_center.ops.infra_monitor import (
     QueueSnapshot,
     evaluate,
@@ -174,3 +178,89 @@ def test_inactive_lane_and_prometheus_failure_are_reported() -> None:
 def test_prometheus_probe_rejects_non_http_urls() -> None:
     assert not prometheus_is_ready("file:///etc/passwd")
     assert not prometheus_is_ready("http://user@example.invalid/-/ready")
+
+
+def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
+    worker_unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
+    queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
+
+    assert "--skip-queue" in worker_unit
+    assert "EnvironmentFile=" not in worker_unit
+    assert "--skip-workers" in queue_unit
+    assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" in queue_unit
+
+
+def test_evaluate_can_skip_queue_without_hiding_worker_failures() -> None:
+    healthy = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        None,
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+    failed = evaluate(
+        {"voyn-aicc-worker@1.service": "failed"},
+        None,
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert healthy.ok
+    assert healthy.queue is None
+    assert failed.failures == ("active_workers:0<1",)
+
+
+def test_main_skip_queue_serializes_null_without_reading_database(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(
+        infra_monitor,
+        "discover_worker_units",
+        lambda: {"voyn-aicc-worker@1.service": "active"},
+    )
+    monkeypatch.setattr(
+        infra_monitor,
+        "read_queue_snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("queue must stay unread")),
+    )
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+
+    result = infra_monitor.main(
+        [
+            "--minimum-active-workers",
+            "1",
+            "--skip-queue",
+            "--prometheus-url",
+            "http://metrics/ready",
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["queue"] is None
+
+
+def test_main_skip_workers_reads_queue_without_inspecting_systemd(
+    monkeypatch, capsys
+) -> None:
+    queue = QueueSnapshot(0, 0, 1, 0, 1.0, None)
+    monkeypatch.setattr(
+        infra_monitor,
+        "discover_worker_units",
+        lambda: (_ for _ in ()).throw(AssertionError("workers must stay unread")),
+    )
+    monkeypatch.setattr(infra_monitor, "read_queue_snapshot", lambda: queue)
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+
+    result = infra_monitor.main(
+        [
+            "--skip-workers",
+            "--minimum-active-workers",
+            "0",
+            "--prometheus-url",
+            "http://metrics/ready",
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out)["queue"]["succeeded"] == 1

@@ -31,7 +31,7 @@ class MonitorReport:
     ok: bool
     active_workers: int
     discovered_workers: int
-    queue: QueueSnapshot
+    queue: QueueSnapshot | None
     prometheus_ready: bool
     failures: tuple[str, ...]
 
@@ -138,7 +138,7 @@ def prometheus_is_ready(url: str) -> bool:
 
 def evaluate(
     worker_states: dict[str, str],
-    queue: QueueSnapshot,
+    queue: QueueSnapshot | None,
     *,
     minimum_active_workers: int,
     max_stalled_seconds: float,
@@ -154,12 +154,13 @@ def evaluate(
     # An old last-success timestamp is normal when there is no work. It becomes
     # context in the report once work appears; the oldest pending item is the
     # alert clock. Unrelated successful work must not hide a zombie claim.
-    pending_is_stale = (
-        queue.pending_age_seconds is not None
-        and queue.pending_age_seconds > max_stalled_seconds
-    )
-    if queue.ready + queue.claimed > 0 and pending_is_stale:
-        failures.append("queue_stalled")
+    if queue is not None:
+        pending_is_stale = (
+            queue.pending_age_seconds is not None
+            and queue.pending_age_seconds > max_stalled_seconds
+        )
+        if queue.ready + queue.claimed > 0 and pending_is_stale:
+            failures.append("queue_stalled")
 
     return MonitorReport(
         ok=not failures,
@@ -176,6 +177,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-active-workers", type=int, default=1)
     parser.add_argument("--max-stalled-seconds", type=float, default=900)
     parser.add_argument("--prometheus-url", required=True)
+    parser.add_argument(
+        "--skip-workers",
+        action="store_true",
+        help="Do not inspect local worker units (for the control-host queue probe).",
+    )
+    parser.add_argument(
+        "--skip-queue",
+        action="store_true",
+        help="Do not read queue tables (for the least-privileged worker-host probe).",
+    )
     return parser
 
 
@@ -188,8 +199,8 @@ def _json_report(report: MonitorReport) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        workers = discover_worker_units()
-        queue = read_queue_snapshot()
+        workers = {} if args.skip_workers else discover_worker_units()
+        queue = None if args.skip_queue else read_queue_snapshot()
         metrics_ready = prometheus_is_ready(args.prometheus_url)
         report = evaluate(
             workers,
