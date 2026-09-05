@@ -451,8 +451,13 @@ and MyPy type-check steps alongside — for pull requests into `main`, pushes to
 dispatches on Python 3.14. It uses a read-only token, SHA-pinned actions, and cancels superseded runs for the same
 ref.
 
-The workflow does not configure GitHub branch protection. Whether its result is a required merge
-gate remains a repository-setting concern outside this codebase.
+`main`'s branch protection requires `Final merge gate` and `Acceptance gate (independent verdict on
+exact SHA)` (`strict: true`), denies force-push and deletion, and requires zero GitHub approvals —
+acceptance comes from the independent-review marker keyed to the exact head SHA instead, since
+authors and review agents share an account. A GitHub merge queue is enabled on `main` (squash,
+`maximumEntriesToBuild: 5`) so batches of parallel-developed PRs are tested against their prospective
+merged result before landing, and a conflicting entry is dropped without stalling the rest of the
+queue; `.github/workflows/ci.yml`'s `merge_group` trigger exists for this.
 
 ## 13. Current risks and boundaries
 
