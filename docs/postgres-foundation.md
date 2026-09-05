@@ -208,6 +208,32 @@ The client must be at least as new as the server; `pg_dump` refuses to dump a
 newer server outright. CI installs `postgresql-client-17` to match the pinned
 server image.
 
+### Recovery time
+
+`aicc_pg_restore.sh` times its own recovery window — target database creation
+through the post-restore table count, the part an operator actually waits
+on — and prints it. Pass `--measure-out <path>` to also write that measurement
+as JSON, so a real drill leaves an artifact instead of a number someone
+remembers:
+
+```bash
+scripts/aicc_pg_restore.sh --archive <archive> --target-db aicc_restore_check \
+  --measure-out /var/backups/aicc/rto-$(date -u +%Y%m%dT%H%M%SZ).json
+```
+
+A prior "~5.4s" figure was cited in the SRV-07 design as measured but had no
+run behind it (`VOYN-W0-AICC-SRV-08B-RTO-UNVERIFIED`). The drill was reproduced
+against a real server with a seeded, production-shaped dataset (~400k rows,
+102 MB): **measured restore time 2s**, stable across repeated runs at that
+dataset size with `--jobs 1`. A second, independent run against a different
+PostgreSQL instance and a fresh seed landed at 2-3s, confirming the figure
+rather than merely repeating it. Full method, environment, and raw
+measurements are in `docs/audits/SRV08B_RTO_DRILL_2026-08-27.json` and
+`docs/audits/SRV08B_RTO_DRILL_2026-09-01.json` (`.md` for the narrative of
+each). RTO scales with data volume and `--jobs`, so this is a measured data
+point at a stated size, not a fixed constant — re-run the drill against a real
+snapshot with `--measure-out` to get a current number.
+
 ## Running the tests
 
 `tests/db` skips itself unless a server is provided:
