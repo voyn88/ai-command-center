@@ -605,7 +605,7 @@ class JSONTasksRepository:
         return delete_task(self._root, task_id)
 
 
-def get_repository(root: Path) -> JSONTasksRepository | AIOSTasksRepository:
+def get_repository(root: Path) -> "JSONTasksRepository | AIOSTasksRepository":  # noqa: UP037
     """Return the active task store backend.
 
     ``AICC_TASKS_BACKEND=json`` (default) → ``JSONTasksRepository``
