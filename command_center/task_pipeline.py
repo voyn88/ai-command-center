@@ -2435,7 +2435,7 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             """
             SELECT run_event.payload_json AS payload FROM run_event
               JOIN run ON run.id = run_event.run_id
-               AND run_event.payload_json LIKE '%total_cost_usd%'
+               AND CAST(run_event.payload_json AS TEXT) LIKE '%total_cost_usd%'
                AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
             """,
             (cutoff, cutoff),
