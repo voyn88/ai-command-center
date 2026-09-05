@@ -503,3 +503,25 @@ def test_the_slice_sweep_pins_the_driver_the_suite_it_sweeps_needs() -> None:
     ]
     for extra in expected:
         assert extra in pinned, f"{extra!r} missing from the sweep's pytest command: {command}"
+
+
+def test_the_statements_probe_finds_a_delete_by_the_capability_not_the_name() -> None:
+    """`collect_statements` claimed to probe whole-predicate deletes "wherever
+    a store exposes it rather than naming it", while the code named exactly
+    one: `for extra in ("delete_day",):`. `PostgresTaskMirror.delete_task`
+    existed the whole time, was never in that tuple, and so `cmd_statements`'s
+    diff had zero signal for changes to its generated SQL — a second,
+    unnamed instance of the same defect this file's own docstring calls out
+    for `--root` inference. `task` mirroring only `upsert` and `list_records`
+    (2 statements, not 3) is exactly what that blind spot looked like.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("slice_checks_under_test", SLICE_CHECKS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    statements = module.collect_statements()
+    assert len(statements["task"]) == 3, (
+        f"expected upsert + list_records + delete_task, got {statements['task']}"
+    )

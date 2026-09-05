@@ -174,11 +174,22 @@ def collect_statements() -> dict[str, list[dict]]:
                 mirror.list_records()
                 if spec.identity:
                     mirror.resync_identity()
-                # Whole-predicate deletes exist on one table today; probe the
-                # capability wherever a store exposes it rather than naming it.
-                for extra in ("delete_day",):
-                    if hasattr(mirror, extra):
-                        getattr(mirror, extra)("2026-08-14")
+                # Whole-predicate deletes -- `delete_day`, `delete_task` -- are
+                # declared directly on a mirror subclass, never inherited from
+                # `PostgresTableMirror`, and each takes one positional value
+                # the way `delete_where`'s own `value` argument does. This used
+                # to name `delete_day` in a hardcoded tuple while claiming to
+                # probe "wherever a store exposes it rather than naming it" --
+                # a second method, `delete_task`, existed the whole time and
+                # was never in the tuple, so `cmd_statements`'s diff had zero
+                # signal for changes to its generated SQL. Finding every extra
+                # method by introspecting what the subclass itself defines
+                # makes that claim true instead of aspirational.
+                base_methods = set(vars(PostgresTableMirror))
+                for name, member in vars(attribute).items():
+                    if name.startswith("_") or name in base_methods or not callable(member):
+                        continue
+                    getattr(mirror, name)("2026-08-14")
                 if spec.table in out:
                     raise SystemExit(
                         f"two mirrors declare `{spec.table}`: {attribute.__name__} and an "
