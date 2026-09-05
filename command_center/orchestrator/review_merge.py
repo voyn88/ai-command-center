@@ -85,6 +85,7 @@ __all__ = [
     "merge_once",
     "publish_review_verdicts",
     "reconcile_merge_evidence",
+    "reconcile_review_once",
     "review_once",
 ]
 
@@ -117,6 +118,9 @@ class LoopReport:
     #: publish_review_verdicts' docstring for why this is a new task, not a
     #: cycle back into the rejected task's own state machine.
     remediated: list[tuple[str, str]] = field(default_factory=list)
+    #: Fresh, bounded identities dispatched to replace succeeded review runs
+    #: whose final result cannot be parsed for the current PR head.
+    retried: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -878,6 +882,58 @@ def _chunk_key_prefix(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str |
     return f"{base}:chunk:" if base else None
 
 
+# A completed queue item cannot be redelivered.  A malformed terminal review
+# result therefore gets a *new* identity, at most twice; it is never rewritten
+# and an exhausted/malformed identity remains fail-closed.
+_MAX_RESULT_RETRY_ATTEMPTS = 2
+_RETRY_KEY_SUFFIX = re.compile(r":retry:([0-9]+)\Z")
+
+
+def _retry_attempt(key: str) -> tuple[str, int]:
+    match = _RETRY_KEY_SUFFIX.search(key)
+    return (key, 0) if match is None else (key[: match.start()], int(match.group(1)))
+
+
+def _review_attempt_rows(
+    factory: Any, task_id: str, base_key: str
+) -> list[tuple[Any, Any, Any]]:
+    return _rows(
+        factory,
+        "SELECT i.idempotency_key, i.state, wr.payload "
+        "FROM work_item i LEFT JOIN work_result wr ON wr.result_id = i.result_id "
+        "WHERE i.task_id = %s AND left(i.idempotency_key, char_length(%s)) = %s",
+        (task_id, base_key, base_key),
+    )
+
+
+def _latest_attempt(
+    factory: Any, task_id: str, base_key: str
+) -> tuple[int, str, Any] | None:
+    pattern = re.compile(rf"\A{re.escape(base_key)}(?::retry:[0-9]+)?\Z")
+    candidates = [
+        (_retry_attempt(row_key)[1], state, payload)
+        for row_key, state, payload in _review_attempt_rows(factory, task_id, base_key)
+        if pattern.fullmatch(row_key)
+    ]
+    return max(candidates, key=lambda item: item[0]) if candidates else None
+
+
+def _next_retry_key(
+    factory: Any, task_id: str, base_key: str, expected_head: str
+) -> str | None:
+    latest = _latest_attempt(factory, task_id, base_key)
+    if latest is None:
+        return None
+    attempt, state, payload_value = latest
+    if state != "succeeded" or attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+        return None
+    result = _json_object(payload_value)
+    parsed = _parse_verdict((result or {}).get("result_text") or "")
+    if parsed is not None and parsed[1] == expected_head:
+        return None
+    return f"{base_key}:retry:{attempt + 1}"
+
+
 def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
@@ -1146,6 +1202,103 @@ def review_once(
     return report
 
 
+# -- Part 2a: retry succeeded but malformed independent reviews ------------
+
+
+def reconcile_review_once(
+    factory: Any,
+    enqueue: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
+) -> LoopReport:
+    """Add bounded fresh attempts for malformed terminal review results.
+
+    Existing work items and their outputs are immutable.  This only derives
+    the current PR snapshot again and enqueues an identical payload under a
+    fresh `:retry:N` key when the latest attempt succeeded but lacks a valid
+    verdict for that same head SHA.
+    """
+    from command_center.orchestrator.planner import repo_route
+
+    cfg = cfg or ReviewConfig()
+    report = LoopReport()
+    where = " AND t.task_id = %s" if task_id is not None else ""
+    params: tuple[Any, ...] = (task_id, cfg.max_per_tick) if task_id else (cfg.max_per_tick,)
+    tasks = _rows(
+        factory,
+        "SELECT t.task_id, e.value FROM backlog_task t "
+        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+        "WHERE t.status = 'READY_TO_REVIEW'" + where + " ORDER BY t.task_id LIMIT %s",
+        params,
+    )
+    cascade = _model_only_review_cascade()
+    actions = 0
+    for current_task_id, pr_url in tasks:
+        if actions >= cfg.max_per_tick:
+            break
+        if not cascade:
+            report.skipped.append((current_task_id, "no_review_executor_route"))
+            continue
+        marker, _head = _has_accept_marker(repo_path, pr_url)
+        if marker:
+            report.skipped.append((current_task_id, "marker_already_posted"))
+            continue
+        repo = _repo_from_pr_url(pr_url)
+        route = repo_route(repo) if repo else None
+        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        if route is None or snapshot is None:
+            report.skipped.append((current_task_id, "pr_diff_fetch_failed"))
+            continue
+        key = _review_key(current_task_id, pr_url, snapshot)
+        if key is None:
+            report.skipped.append((current_task_id, "no_repo_route"))
+            continue
+        try:
+            chunks = _review_chunks(snapshot, current_task_id, pr_url)
+        except (RuntimeError, ValueError):
+            report.skipped.append((current_task_id, "review_prompt_budget_invalid"))
+            continue
+        project_id, repository_path = route
+        for chunk in chunks:
+            if actions >= cfg.max_per_tick:
+                break
+            base_key = key if chunk.count == 1 else _chunk_review_key(
+                current_task_id, pr_url, snapshot, chunk
+            )
+            if base_key is None:
+                continue
+            retry_key = _next_retry_key(
+                factory, current_task_id, base_key, snapshot.head
+            )
+            if retry_key is None:
+                continue
+            prompt = _render_review_prompt(current_task_id, pr_url, snapshot, chunk)
+            if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
+                continue
+            payload: dict[str, Any] = {
+                "kind": "agent_run", "v": 1, "project_id": project_id,
+                "repository_path": repository_path,
+                "task_type": "independent_review", "prompt": prompt,
+                "timeout_seconds": cfg.review_timeout, "untrusted": True,
+                "cascade": cascade,
+            }
+            if chunk.count > 1:
+                payload["review_chunk"] = {
+                    "version": 3, "index": chunk.index, "count": chunk.count,
+                    "content_bytes": len(chunk.text.encode("utf-8")),
+                    "content_hash": chunk.content_hash,
+                    "manifest_hash": chunk.manifest_hash,
+                    "base_sha": snapshot.base, "head_sha": snapshot.head,
+                    "diff_hash": snapshot.digest,
+                }
+            enqueue(cfg.queue, retry_key, payload, current_task_id, len(cascade))
+            report.retried.append((current_task_id, retry_key))
+            actions += 1
+    return report
+
+
 # -- Part 2b: publish the verdict as the marker merge_once reads -------------
 
 # Three rounds of independent review (2026-08-21) each broke a version of
@@ -1188,18 +1341,11 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
     guesses or falls back to "the most recent review for this task_id",
     which is what let a stale, superseded verdict be read as current before
     the review-cycle key existed."""
-    rows = _rows(
-        factory,
-        "SELECT wr.payload FROM work_item i "
-        "JOIN work_result wr ON wr.result_id = i.result_id "
-        "WHERE i.task_id = %s AND i.idempotency_key = %s AND i.state = 'succeeded' "
-        "ORDER BY wr.created_at DESC LIMIT 1",
-        (task_id, key),
-    )
-    if not rows:
+    latest = _latest_attempt(factory, task_id, key)
+    if latest is None or latest[1] != "succeeded":
         return None
-    payload = rows[0][0]
-    return json.loads(payload) if isinstance(payload, str) else payload
+    payload = latest[2]
+    return _json_object(payload)
 
 
 def _json_object(value: Any) -> dict[str, Any] | None:
@@ -1228,7 +1374,13 @@ def _chunk_review_rows(
         "ORDER BY i.idempotency_key",
         (task_id, prefix, prefix),
     )
-    return prefix, rows
+    newest: dict[str, tuple[int, tuple[Any, ...]]] = {}
+    for row in rows:
+        base_key, attempt = _retry_attempt(row[0])
+        current = newest.get(base_key)
+        if current is None or attempt > current[0]:
+            newest[base_key] = (attempt, (base_key, *row[1:]))
+    return prefix, [row for _attempt, row in newest.values()]
 
 
 def _aggregate_chunk_verdict(
