@@ -75,6 +75,7 @@ __all__ = [
     "ALL_VIEWS",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
+    "merge_column_privileges",
     "merge_privileges",
     "VIEW_PRIVILEGES",
     "apply_bootstrap",
@@ -232,6 +233,30 @@ def merge_privileges(
     return merged
 
 
+def merge_column_privileges(
+    *contributions: dict[str, dict[str, tuple[str, ...]]],
+) -> dict[str, dict[str, tuple[str, ...]]]:
+    """The `merge_privileges` union, one level deeper, for column-scoped grants.
+
+    `COLUMN_PRIVILEGES` carries the same risk `merge_privileges` exists to close:
+    it is a role -> table -> privilege -> columns mapping, and a second
+    contribution naming a table another contribution already narrowed would, under
+    a plain `{**a, **b}`, replace that table's whole per-privilege dict rather than
+    add to it. Unioned here per (table, privilege) instead, so two contributions
+    can each widen the same table's carve-out without either erasing the other.
+    """
+    merged: dict[str, dict[str, tuple[str, ...]]] = {}
+    for contribution in contributions:
+        for table, per_privilege in contribution.items():
+            columns_by_privilege = dict(merged.get(table, {}))
+            for privilege, columns in per_privilege.items():
+                existing = dict.fromkeys(columns_by_privilege.get(privilege, ()))
+                existing.update(dict.fromkeys(columns))
+                columns_by_privilege[privilege] = tuple(existing)
+            merged[table] = columns_by_privilege
+    return merged
+
+
 # The queue-claim tables (0002), which the control plane may read and may not
 # write: every state change goes through a function so that it audits. The
 # entries exist rather than being omitted — an absent key is a table nobody
@@ -376,20 +401,33 @@ _WORKER_COMPLETION_COLUMNS = tuple(
     column for column in _COMPLETION_COLUMNS if column not in _REVIEW_COLUMNS
 )
 
+# The completion carve-out (see the module docstring's `aicc_worker` paragraph),
+# named so a later contribution to WORKER_ROLE's column grants is a second
+# argument to `merge_column_privileges` below rather than an edit inside this
+# dict — the same per-task-constant shape `PRIVILEGES` uses for table grants.
+_WORKER_COMPLETION_COLUMN_GRANTS: dict[str, dict[str, tuple[str, ...]]] = {
+    "completion": {
+        "INSERT": _WORKER_COMPLETION_COLUMNS,
+        "UPDATE": _WORKER_COMPLETION_COLUMNS,
+    }
+}
+
 # role -> table -> privilege -> the columns it is limited to. A privilege listed
-# here is granted per column; anything not listed is granted table-wide.
+# here is granted per column; anything not listed is granted table-wide. Routed
+# through `merge_column_privileges` — not written as a bare literal — for the
+# same reason `PRIVILEGES` is routed through `merge_privileges`: a second
+# contribution naming a table already narrowed here must union with it, not
+# silently replace it.
 COLUMN_PRIVILEGES: MappingProxyType[
     str, MappingProxyType[str, MappingProxyType[str, tuple[str, ...]]]
 ] = MappingProxyType(
     {
         WORKER_ROLE: MappingProxyType(
             {
-                "completion": MappingProxyType(
-                    {
-                        "INSERT": _WORKER_COMPLETION_COLUMNS,
-                        "UPDATE": _WORKER_COMPLETION_COLUMNS,
-                    }
-                )
+                table: MappingProxyType(per_privilege)
+                for table, per_privilege in merge_column_privileges(
+                    _WORKER_COMPLETION_COLUMN_GRANTS
+                ).items()
             }
         )
     }
@@ -431,6 +469,30 @@ _WORKER_TABLES: dict[str, frozenset[str]] = {
     "work_event": _NONE,
 }
 
+# View grants, split by contributing task the same way `PRIVILEGES`' table
+# grants are: one constant per task, unioned through `merge_privileges` below
+# rather than written into one shared literal. `merge_privileges` unions a plain
+# table -> privileges mapping regardless of whether the relation named is a
+# table or a view, so the same helper — and the same protection against a
+# second contribution silently replacing a table's worth of an earlier one's
+# view grants — applies unchanged.
+_APP_QUEUE_VIEWS: dict[str, frozenset[str]] = {
+    "work_attempt_public": _READ,
+    "work_dlq": _READ,
+    "work_item_public": _READ,
+}
+_APP_ENROLMENT_VIEWS: dict[str, frozenset[str]] = {
+    "enrollment_ticket_public": _READ,
+    "principal_credential_public": _READ,
+}
+_APP_BACKLOG_VIEWS: dict[str, frozenset[str]] = {
+    "backlog_eligible": _READ,
+}
+_OPERATOR_ENROLMENT_VIEWS: dict[str, frozenset[str]] = {
+    "enrollment_ticket_public": _READ,
+    "principal_credential_public": _READ,
+}
+
 # Views are granted separately from tables: `information_schema` reports them
 # through the same catalog, so folding them into `PRIVILEGES` would let a view
 # silently satisfy an assertion about a table.
@@ -438,21 +500,13 @@ VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = 
     MappingProxyType(
         {
             APP_ROLE: MappingProxyType(
-                {
-                    "backlog_eligible": _READ,
-                    "enrollment_ticket_public": _READ,
-                    "principal_credential_public": _READ,
-                    "work_attempt_public": _READ,
-                    "work_dlq": _READ,
-                    "work_item_public": _READ,
-                }
+                merge_privileges(
+                    _APP_QUEUE_VIEWS, _APP_ENROLMENT_VIEWS, _APP_BACKLOG_VIEWS
+                )
             ),
             WORKER_ROLE: MappingProxyType({}),
             OPERATOR_ROLE: MappingProxyType(
-                {
-                    "enrollment_ticket_public": _READ,
-                    "principal_credential_public": _READ,
-                }
+                merge_privileges(_OPERATOR_ENROLMENT_VIEWS)
             ),
         }
     )

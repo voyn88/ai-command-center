@@ -122,6 +122,49 @@ def test_the_blanket_default_never_widens_a_narrowed_table() -> None:
     )
 
 
+def test_merge_column_privileges_keeps_both_contributions() -> None:
+    """`COLUMN_PRIVILEGES` carries the same risk one level deeper: role -> table
+    -> privilege -> columns. Two contributions naming different tables for the
+    same role must both survive the merge."""
+    first = {"first_table": {"INSERT": ("a", "b")}}
+    second = {"second_table": {"UPDATE": ("c",)}}
+
+    merged = roles.merge_column_privileges(first, second)
+
+    assert merged["first_table"] == {"INSERT": ("a", "b")}
+    assert merged["second_table"] == {"UPDATE": ("c",)}
+
+
+def test_a_later_column_contribution_cannot_silently_replace_an_earlier_one() -> None:
+    """The regression, one level deeper than `merge_privileges`' own.
+
+    A second contribution narrowing a table another contribution already
+    narrowed must add to it, not replace its whole per-privilege dict — which
+    is what the obvious `dict(first) | second` does.
+    """
+    first = {"shared_table": {"INSERT": ("a",)}}
+    second = {"shared_table": {"UPDATE": ("b",)}}
+
+    naive = dict(first) | second
+    assert naive["shared_table"] == {"UPDATE": ("b",)}, "the mistake, reproduced"
+    assert "INSERT" not in naive["shared_table"]
+
+    merged = roles.merge_column_privileges(first, second)
+    assert merged["shared_table"] == {"INSERT": ("a",), "UPDATE": ("b",)}
+
+
+def test_merge_column_privileges_unions_columns_for_the_same_privilege() -> None:
+    """Two contributions can each widen the same table's *same* privilege
+    carve-out — the column list must union, not have the second replace the
+    first's columns outright."""
+    first = {"completion": {"UPDATE": ("review_verdict",)}}
+    second = {"completion": {"UPDATE": ("review_summary",)}}
+
+    merged = roles.merge_column_privileges(first, second)
+
+    assert merged["completion"]["UPDATE"] == ("review_verdict", "review_summary")
+
+
 def test_the_rendered_matrix_covers_every_declared_privilege() -> None:
     """End to end: nothing declared may be missing from the rendered SQL.
 
