@@ -487,6 +487,102 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
     assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
 
 
+def test_merge_skips_a_marker_whose_reviewer_login_matches_the_merger_identity(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE (remaining gap): a marker
+    must not authorize merge merely because its reviewer login differs
+    from the PR's own author -- it must ALSO differ from the identity
+    that will actually execute `gh pr merge` (looked up fresh via `gh api
+    user`, never assumed equal to the author). Today's ambient `gh`
+    credential happens to author every PR too, but that is a deployment
+    coincidence, not a guarantee this check may rely on: a marker posted
+    under the merger's own login is exactly as much a self-approval as
+    one posted under the PR author's, even though the two logins here are
+    distinct."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1E", "https://github.com/x/y/pull/26")
+    head = "5" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["api", "user"]:
+            return subprocess.CompletedProcess(argv, 0, "merger-bot\n", "")
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "merger-bot"},
+            }],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1E", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1E",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_skips_a_dismissed_accept_marker(rig, monkeypatch):  # noqa: F811
+    """A DISMISSED review no longer represents its author's position, even
+    though it is the most recent review on the head and its body still
+    carries the marker text exactly -- it must not authorize merge."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1F", "https://github.com/x/y/pull/27")
+    head = "6" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+                "state": "DISMISSED",
+                "submittedAt": "2026-01-01T00:00:00Z",
+            }],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1F", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1F",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_ignores_a_marker_that_is_not_the_first_line(rig, monkeypatch):  # noqa: F811
+    """The exact `ACCEPTANCE: ACCEPT <sha>` line must be the review body's
+    FIRST line -- not text appearing anywhere in a longer comment -- so
+    prose that merely quotes or discusses an old marker cannot forge an
+    accept."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1G", "https://github.com/x/y/pull/28")
+    head = "7" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"Note: an earlier run said\nACCEPTANCE: ACCEPT {head}\nbut that was a mistake.",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            }],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1G", "no_accept_marker_on_head") in report.skipped
+
+
 def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811, E501
     """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: the agent's own ACCEPT
     verdict must reach GitHub as the exact `ACCEPTANCE: ACCEPT <sha>`

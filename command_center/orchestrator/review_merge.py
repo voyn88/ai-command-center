@@ -13,7 +13,13 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   ``ACCEPTANCE: ACCEPT <sha>`` marker as a comment-type PR review under the
   independent acceptance App's identity (``_post_marker_as_bot``,
   ``voyn88-acceptance-gate[bot]``) -- the exact string ``merge_once`` scans
-  for, from a login it checks is not the PR's own author.
+  for, from a login it checks is neither the PR's own author nor the login
+  the ambient ``gh`` credential that will actually execute the merge
+  resolves to (``_merger_login``). The two identities are the same account
+  on this deployment today, but the check asks for the merger explicitly
+  rather than assuming that from the author, since it is a deployment
+  choice pending VOYN-W0-AICC-MERGE-GATEWAY's own separate merge identity,
+  not a guarantee this module may rely on.
 
   This function's original implementation (VOYN-W0-AICC-MISSING-MARKER-
   PUBLISHER, 2026-08-21) posted that same marker under the pipeline's own
@@ -1543,8 +1549,51 @@ def _chunk_payload_matches_envelope(
     )
 
 
+#: Individual review states that can never carry a standing accept, even
+#: when the review is the most recent one on the head and its body still
+#: matches the marker text exactly.  A DISMISSED review no longer
+#: represents its author's position (`scripts/assert_independent_
+#: acceptance.py`'s own DISMISSED handling, mirrored here); a PENDING
+#: review is an unsubmitted draft visible only to its own author and was
+#: never actually posted as a verdict anyone else could see.
+_NON_STANDING_REVIEW_STATES = frozenset({"DISMISSED", "PENDING"})
+
+
+#: A plausible GitHub login (also matches the `[bot]` suffix an App
+#: identity carries, e.g. `voyn88-acceptance-gate[bot]`). `_merger_login`
+#: uses this to reject a malformed `gh api user` response -- e.g. stray
+#: warning text ahead of the JSON, or a `--jq` failure that still exited
+#: 0 -- rather than trust arbitrary stdout as an identity.
+_GH_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?")
+
+
+def _merger_login(repo_path: str) -> str | None:
+    """The GitHub login the ambient `gh` credential in `repo_path` will act
+    as -- the identity `merge_once` actually executes `gh pr merge` under.
+    Looked up fresh via `gh api user` rather than assumed: today that
+    credential is the SAME one that opens every pull request in the first
+    place (see this module's docstring above on the marker publisher's
+    history), a deliberate interim choice pending VOYN-W0-AICC-MERGE-
+    GATEWAY's real separate merge identity, not an architectural
+    guarantee. `_accept_marker_on_latest_review`'s
+    author-independence check must not silently rely on that coincidence
+    holding forever, so the merger is asked for directly. Returns None on
+    any lookup failure or malformed response (network hiccup, no `gh`
+    auth, unparseable stdout) -- treated the same as an unfetched PR
+    author: this half of the independence check is skipped rather than
+    refusing an otherwise-valid marker on an inconclusive read."""
+    result = _gh(["api", "user", "--jq", ".login"], repo_path)
+    if result.returncode != 0:
+        return None
+    login = (result.stdout or "").strip()
+    return login if login and _GH_LOGIN.fullmatch(login) else None
+
+
 def _accept_marker_on_latest_review(
-    reviews: list[dict[str, Any]], head: str, pr_author_login: str | None
+    reviews: list[dict[str, Any]],
+    head: str,
+    pr_author_login: str | None,
+    merger_login: str | None = None,
 ) -> bool:
     """Whether the marker stands on the MOST RECENT review, not merely
     somewhere in the array. A superseded/earlier review carrying the marker
@@ -1552,6 +1601,15 @@ def _accept_marker_on_latest_review(
     ACCEPT from before a rejected re-review (or before a dismissed review)
     would still authorize merge. `submittedAt` is ISO 8601, so lexical max
     is chronological max; a missing timestamp sorts first (never wins).
+    That latest review must also be a standing one: a DISMISSED or PENDING
+    state (`_NON_STANDING_REVIEW_STATES`) never counts, even with a
+    matching body, because dismissing (or never submitting) a review
+    withdraws it as a verdict. And the marker line must be the body's
+    FIRST line exactly -- not text appearing anywhere in a longer comment
+    -- so prose that merely quotes, discusses, or recommends the marker
+    format cannot forge an accept (matching `scripts/
+    assert_independent_acceptance.py`'s own `fullmatch`-on-first-line
+    parse, not a bare substring search).
 
     `pr_author_login` closes VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE
     (found live 2026-08-22: PRs #354/#355 both merged by the same account
@@ -1560,19 +1618,37 @@ def _accept_marker_on_latest_review(
     `scripts/assert_independent_acceptance.py`'s own comparison exactly
     (login against the pull request's author login, not text alone --
     that script's docstring explains why `authorAssociation` is the wrong
-    field). None (author unknown/unfetched) skips this check rather than
-    refusing everything -- callers that cannot supply it keep prior
-    behavior; `_pr_is_mergeable` and `_has_accept_marker` below always can
-    and always do."""
+    field).
+
+    `merger_login` (`_merger_login`, above) closes the other half of the
+    same gap: a marker whose review author is the SAME login as the
+    identity that will actually execute the merge does not count either,
+    independent of whether that identity happens to equal the PR author --
+    it must not, since the two are only the same account by today's
+    deployment choice, not by anything this check can assume.
+
+    None (author or merger unknown/unfetched) skips that half of the
+    check rather than refusing everything -- callers that cannot supply
+    one keep prior behavior for it; `_pr_is_mergeable`, `_has_accept_
+    marker`, and `_merged_target_sha` below always can and always do
+    supply both."""
     if not reviews:
         return False
     latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
-    if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
+    if latest.get("state") in _NON_STANDING_REVIEW_STATES:
         return False
-    if pr_author_login is None:
+    body = (latest.get("body") or "").replace("\r\n", "\n")
+    first_line = body.split("\n", 1)[0]
+    if first_line != f"ACCEPTANCE: ACCEPT {head}":
+        return False
+    if pr_author_login is None and merger_login is None:
         return True
     reviewer_login = (latest.get("author") or {}).get("login")
-    return reviewer_login is not None and reviewer_login != pr_author_login
+    if reviewer_login is None:
+        return False
+    if pr_author_login is not None and reviewer_login == pr_author_login:
+        return False
+    return not (merger_login is not None and reviewer_login == merger_login)
 
 
 def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
@@ -1587,7 +1663,9 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     data = json.loads(view.stdout or "{}")
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
+    accept = _accept_marker_on_latest_review(
+        data.get("reviews", []), head, author_login, _merger_login(repo_path)
+    )
     return accept, head
 
 
@@ -2328,7 +2406,9 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
+    accept = _accept_marker_on_latest_review(
+        data.get("reviews", []), head, author_login, _merger_login(repo_path)
+    )
     if not accept:
         return False, "no_accept_marker_on_head"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
@@ -2399,7 +2479,7 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
     if not _accept_marker_on_latest_review(
-        data.get("reviews", []), head, author_login
+        data.get("reviews", []), head, author_login, _merger_login(repo_path)
     ):
         return None, "merged_without_acceptance_evidence"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
