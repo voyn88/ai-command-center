@@ -55,6 +55,19 @@ launcher=/usr/libexec/aicc-agent-launcher
 expected_hash=$(sha256sum "$repo_root/ops/aicc_agent_launcher.py" | cut -d' ' -f1)
 installed_hash=$(sha256sum "$launcher" | cut -d' ' -f1)
 [ "$installed_hash" = "$expected_hash" ] || fail "installed launcher SHA drifted"
+
+# The "quality_band" launcher profile (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS)
+# executes this deployed copy against every candidate workspace it is handed
+# -- the same immutable-root-owned + exact-SHA proof as the launcher itself,
+# since the same class of drift here would mean the broker is running
+# something other than the reviewed script.
+quality_band=/usr/libexec/aicc-agent-quality-band
+[ "$(stat -Lc %U:%G:%a "$quality_band")" = root:root:755 ] || \
+  fail "quality_band script is not immutable root-owned"
+expected_quality_band_hash=$(sha256sum "$repo_root/scripts/ci/prepush/quality_band.sh" | cut -d' ' -f1)
+installed_quality_band_hash=$(sha256sum "$quality_band" | cut -d' ' -f1)
+[ "$installed_quality_band_hash" = "$expected_quality_band_hash" ] || \
+  fail "installed quality_band script SHA drifted"
 bootstrap=/usr/local/sbin/voyn-aicc-bootstrap
 [ "$(stat -Lc %U:%G:%a "$bootstrap")" = root:root:755 ] || \
   fail "exact-SHA bootstrap is not immutable root-owned"

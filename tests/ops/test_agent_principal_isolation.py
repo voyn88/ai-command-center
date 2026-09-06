@@ -198,6 +198,142 @@ def test_root_launcher_provider_argv_cannot_drift_from_worker_policy(
     assert launcher._provider_command(manifest) == expected
 
 
+# --- quality_band launcher profile (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) -----
+# A third, distinct kind of profile: not an LLM permission level like
+# read_only/trusted_development, but the allowlisted fixed-script impacted-
+# test run. `_load_manifest` enforces its executor/profile pairing, its
+# command is fixed and manifest-independent (the caller-controlled
+# prompt/model must never reach an argv), and its transient unit carries
+# neither network nor a model credential.
+
+
+def test_quality_band_manifest_requires_the_paired_profile(launcher, tmp_path):
+    mismatched = _manifest(
+        tmp_path, executor="quality_band", profile="trusted_development"
+    )
+    with pytest.raises(launcher.LaunchRefused, match="paired"):
+        launcher._load_manifest((json.dumps(mismatched) + "\n").encode())
+
+    reverse = _manifest(tmp_path, executor="codex", profile="quality_band")
+    with pytest.raises(launcher.LaunchRefused, match="paired"):
+        launcher._load_manifest((json.dumps(reverse) + "\n").encode())
+
+    valid = _manifest(tmp_path, executor="quality_band", profile="quality_band")
+    assert launcher._load_manifest((json.dumps(valid) + "\n").encode()) == valid
+
+
+def test_quality_band_command_is_fixed_and_ignores_caller_supplied_fields(
+    launcher, tmp_path
+):
+    """The manifest's prompt/model are caller-supplied and therefore never
+    trusted to shape an argv that runs candidate code: nothing from the
+    manifest reaches this command except the trusted, allowlisted binary
+    path itself."""
+    plain = launcher._provider_command(
+        _manifest(tmp_path, executor="quality_band", profile="quality_band")
+    )
+    assert plain == [launcher.EXECUTOR_BINARIES["quality_band"]]
+
+    poisoned = launcher._provider_command(
+        _manifest(
+            tmp_path,
+            executor="quality_band",
+            profile="quality_band",
+            prompt="; rm -rf / #",
+            model="--danger-full-access",
+        )
+    )
+    assert poisoned == [launcher.EXECUTOR_BINARIES["quality_band"]]
+
+
+def test_quality_band_agent_home_carries_no_model_credential(
+    launcher, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+    homes = tmp_path / "homes"
+    homes.mkdir()
+    monkeypatch.setattr(launcher, "EPHEMERAL_HOME_ROOT", homes)
+
+    def _unexpected_read(*args, **kwargs):
+        raise AssertionError(
+            "quality_band must never read a model credential (NO_MODEL_AUTH_EXECUTORS)"
+        )
+
+    monkeypatch.setattr(launcher, "_read_exact_protected_file", _unexpected_read)
+
+    home = launcher._prepare_agent_home("quality_band", "a" * 32)
+
+    assert home == homes / ("a" * 32)
+    assert list(home.iterdir()) == []
+    # Still non-world-readable, even though it carries no credential.
+    assert stat.S_IMODE(home.stat().st_mode) == 0o770
+
+
+def test_quality_band_systemd_command_has_no_network_and_no_model_auth_group(
+    launcher, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        launcher, "_validate_environment_file", lambda *args, **kwargs: False
+    )
+    manifest = _manifest(tmp_path, executor="quality_band", profile="quality_band")
+
+    command = launcher._systemd_command(
+        manifest,
+        Path("/run/aicc-agent-homes/band"),
+        "aicc-agent-band.service",
+        "aicc-agent-launcher@band.service",
+        tmp_path.parent,
+        tmp_path,
+    )
+
+    assert "--property=IPAddressDeny=any" in command
+    restrict = [
+        value
+        for value in command
+        if value.startswith("--property=RestrictAddressFamilies=")
+    ]
+    assert restrict == ["--property=RestrictAddressFamilies=AF_UNIX"]
+    # aicc-agent-auth grants access to the ephemeral model-credential copy;
+    # quality_band's home never carries one, so the group is omitted rather
+    # than granted and unused.
+    supplementary = next(
+        value
+        for value in command
+        if value.startswith("--property=SupplementaryGroups=")
+    )
+    assert supplementary == "--property=SupplementaryGroups=aicc-workspace"
+    assert "--setenv=VOYN_QUALITY_BAND_REPO_ROOT=/workspace" in command
+
+
+def test_quality_band_systemd_command_env_file_is_common_only(
+    launcher, monkeypatch, tmp_path
+):
+    """quality_band authenticates to nothing, so it never reads a
+    provider-specific EnvironmentFile -- only the common locale/cert one."""
+    seen = []
+
+    def _record(path, executor):
+        seen.append((path, executor))
+        return True
+
+    monkeypatch.setattr(launcher, "_validate_environment_file", _record)
+    manifest = _manifest(tmp_path, executor="quality_band", profile="quality_band")
+
+    launcher._systemd_command(
+        manifest,
+        Path("/run/aicc-agent-homes/band"),
+        "aicc-agent-band.service",
+        "aicc-agent-launcher@band.service",
+        tmp_path.parent,
+        tmp_path,
+    )
+
+    assert seen == [(launcher.COMMON_ENV_FILE, "quality_band")]
+
+
 def test_only_publisher_group_or_root_can_call_broker(launcher, monkeypatch):
     monkeypatch.setattr(
         launcher.pwd,

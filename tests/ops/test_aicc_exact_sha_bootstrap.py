@@ -196,6 +196,21 @@ def test_transaction_installs_future_root_owned_bootstrap():
     assert "installed exact-SHA bootstrap SHA drifted" in verifier
 
 
+def test_transaction_and_boundary_verifier_pin_the_quality_band_script():
+    """VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS: the broker's `quality_band`
+    launcher profile executes a deployed, root-owned copy of
+    `scripts/ci/prepush/quality_band.sh` -- never the candidate worktree's
+    own copy. The installed copy needs the same exact-SHA proof as the
+    launcher itself, or a host could silently run something else."""
+    root = Path(__file__).parents[2]
+    transaction = (root / "ops/aicc_install_transaction.py").read_text()
+    verifier = (root / "ops/verify-agent-principal-boundary.sh").read_text()
+
+    assert '"/usr/libexec/aicc-agent-quality-band"' in transaction
+    assert '"scripts/ci/prepush/quality_band.sh"' in transaction
+    assert "installed quality_band script SHA drifted" in verifier
+
+
 def test_bootstrap_uses_absolute_system_python():
     root = Path(__file__).parents[2]
     bootstrap = (root / "ops/aicc_exact_sha_bootstrap.py").read_text()

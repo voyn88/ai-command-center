@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from command_center import agent_runner
 from command_center.orchestrator.publish import PublishConfig, publish_run
 
 
@@ -652,6 +653,119 @@ def test_committed_ruff_config_cannot_neuter_the_gate(repo, monkeypatch):
 
     assert not r.ok
     assert r.reason.startswith("quality_band_failed:")
+
+
+# --- pre-push isolated impacted-test gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS)
+# `_static_quality_gate` above never executes candidate code in this
+# credentialed process; it cannot cover the impacted-TEST phase without doing
+# so. `_quality_band_isolated_gate` closes that gap by handing a fixed
+# manifest to `agent_runner.run_quality_band_gate`, which itself never
+# executes anything here -- the candidate's tests run only inside the root
+# broker's isolated `quality_band` launcher profile. These tests stub that
+# one function so they exercise the WIRING (order before the lease, red ->
+# refuse, clean/deferred -> proceed) without needing a real broker.
+
+
+def test_isolated_gate_refuses_red_result_before_lease(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean tree, red isolated run")
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda repo_path, **kwargs: (True, "fail phase=tests"),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason == "quality_band_failed: fail phase=tests"
+    # A red isolated result must cost zero lease and zero gh traffic, exactly
+    # like the static gate above: it runs before acquire.
+    assert not calls.exists()
+
+
+def test_isolated_gate_proceeds_on_a_clean_result(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean tree, clean isolated run")
+    captured = {}
+
+    def _fake_gate(repo_path, **kwargs):
+        captured["repo_path"] = repo_path
+        return False, ""
+
+    monkeypatch.setattr(agent_runner, "run_quality_band_gate", _fake_gate)
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+    assert captured["repo_path"] == work
+
+
+def test_isolated_gate_deferring_still_proceeds(repo, monkeypatch):
+    """`(False, "")` also covers principal isolation being unavailable on this
+    host -- an economy device that can only fail a publish sooner than CI,
+    never widen what it refuses."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean tree, isolation unavailable")
+    monkeypatch.setattr(
+        agent_runner, "run_quality_band_gate", lambda repo_path, **kwargs: (False, "")
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_isolated_gate_runs_after_the_static_gate_and_is_skipped_without_opt_in(
+    repo, monkeypatch
+):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "no opt-in")
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError(
+            "isolated gate must not run for a repo without scripts/ci/prepush/"
+        )
+
+    monkeypatch.setattr(agent_runner, "run_quality_band_gate", _unexpected)
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_isolated_gate_env_off_is_an_operator_bypass(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "bypass")
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("VOYN_QUALITY_BAND=off must skip the isolated gate too")
+
+    monkeypatch.setattr(agent_runner, "run_quality_band_gate", _unexpected)
+    monkeypatch.setenv("VOYN_QUALITY_BAND", "off")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
 
 
 def test_publish_refuses_a_committed_instruction_file(repo, monkeypatch):

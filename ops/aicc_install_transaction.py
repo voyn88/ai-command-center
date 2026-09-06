@@ -5136,6 +5136,7 @@ WORKER_ONLY_TARGETS = frozenset(
         "/usr/lib/tmpfiles.d/aicc-agent.conf",
         "/usr/libexec/aicc-agent-launcher",
         "/usr/libexec/aicc-staged-worker-rollout",
+        "/usr/libexec/aicc-agent-quality-band",
         "/etc/systemd/system/aicc-principal-recovery.service",
         "/etc/systemd/system/aicc-agent-launcher.socket",
         "/etc/systemd/system/aicc-agent-launcher@.service",
@@ -5329,6 +5330,21 @@ def default_specs(
         FileSpec(
             repo_root / "ops/aicc_staged_worker_rollout.py",
             "/usr/libexec/aicc-staged-worker-rollout",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        # The broker's "quality_band" launcher profile (VOYN-W0-AICC-SANDBOX-
+        # PREPUSH-TESTS) executes exactly this deployed, root-owned copy --
+        # never the candidate worktree's own scripts/ci/prepush/quality_band.sh
+        # -- inside its own unprivileged transient unit (see
+        # ops/aicc_agent_launcher.py QUALITY_BAND_SCRIPT / EXECUTOR_BINARIES).
+        # Deployed from the same trusted, verified checkout as every other
+        # target here, so its content is exactly what this generation's
+        # release attestation already covers.
+        FileSpec(
+            repo_root / "scripts/ci/prepush/quality_band.sh",
+            "/usr/libexec/aicc-agent-quality-band",
             0o755,
             root_uid,
             root_gid,
