@@ -143,6 +143,11 @@ class Projection:
     ``source_mtime`` is the file's modification time at read; the caller re-reads
     to get a fresh projection, which is what makes the view "live" without ACC
     ever holding its own copy of the truth.
+
+    ``read_error`` distinguishes "the store is not configured/missing" (normal,
+    ``exists=False`` with no error — render "not connected") from "the store is
+    there but could not be read" (broken encoding, permission denied — render the
+    reason instead of letting the exception reach the page).
     """
 
     records: list[BacklogRecommendation] = field(default_factory=list)
@@ -150,6 +155,7 @@ class Projection:
     source_path: Path | None = None
     source_mtime: float | None = None
     exists: bool = False
+    read_error: str | None = None
 
 
 def _is_record_line(stripped: str) -> bool:
@@ -206,25 +212,55 @@ def parse_recommendations(text: str) -> ParseResult:
 
 
 def resolve_backlog_path(path: str | os.PathLike[str] | None = None) -> Path | None:
-    """Resolve the master backlog file: explicit ``path`` > env var > ``None``."""
+    """Resolve the master backlog file: explicit ``path`` > env var > ``None``.
+
+    ``expanduser()`` so a ``~``-relative path (a natural thing to put in
+    ``AICC_MASTER_BACKLOG``) resolves to the real file instead of a literal
+    ``~`` path that can never exist, which would otherwise read as "not
+    connected" rather than the misconfiguration it is.
+    """
     if path is not None:
-        return Path(path)
+        return Path(path).expanduser()
     override = os.environ.get(MASTER_BACKLOG_ENV)
-    return Path(override) if override else None
+    return Path(override).expanduser() if override else None
 
 
 def load_projection(path: str | os.PathLike[str] | None = None) -> Projection:
-    """Read and project the master backlog. Absence is empty, never an error."""
+    """Read and project the master backlog. Absence is empty, never an error.
+
+    The read is attempted directly rather than gated by a preceding
+    ``is_file()`` check, which would leave a TOCTOU window (the file can be
+    deleted or become unreadable between the check and the read). A store that
+    exists but cannot be read — broken UTF-8, permission denied, or any other
+    OS-level failure — is reported via ``read_error`` instead of letting the
+    exception reach the page.
+    """
     resolved = resolve_backlog_path(path)
-    if resolved is None or not resolved.is_file():
+    if resolved is None:
+        return Projection(source_path=None, exists=False)
+    try:
+        text = resolved.read_text(encoding="utf-8")
+        mtime = resolved.stat().st_mtime
+    except FileNotFoundError:
         return Projection(source_path=resolved, exists=False)
-    text = resolved.read_text(encoding="utf-8")
+    except OSError as exc:
+        return Projection(
+            source_path=resolved,
+            exists=False,
+            read_error=exc.strerror or str(exc),
+        )
+    except UnicodeDecodeError as exc:
+        return Projection(
+            source_path=resolved,
+            exists=False,
+            read_error=f"invalid UTF-8: {exc}",
+        )
     result = parse_recommendations(text)
     return Projection(
         records=result.records,
         errors=result.errors,
         source_path=resolved,
-        source_mtime=resolved.stat().st_mtime,
+        source_mtime=mtime,
         exists=True,
     )
 
@@ -258,13 +294,36 @@ class BacklogSummary:
     by_domain: dict[str, int]
 
 
-def _ordered_counts(values: list[str], order: tuple[str, ...] = ()) -> dict[str, int]:
-    """Count ``values``, listing ``order`` first (even at zero), then any extras."""
+#: Extracts a leading number from a wave label (``W2`` -> ``2``, ``W10`` -> ``10``)
+#: so waves sort by magnitude rather than character-by-character.
+_WAVE_NUMBER = re.compile(r"^(\D*)(\d+)(.*)$")
+
+
+def _wave_sort_key(wave: str) -> tuple:
+    """Natural sort key for a wave label: ``W2`` before ``W10``, not ``"W10" < "W2"``
+    as plain string comparison would have it. Labels without a leading number
+    (unexpected shapes) sort after every numbered wave, alphabetically among
+    themselves, rather than crashing."""
+    match = _WAVE_NUMBER.match(wave)
+    if not match:
+        return (1, wave, 0, "")
+    prefix, digits, suffix = match.groups()
+    return (0, prefix, int(digits), suffix)
+
+
+def _ordered_counts(
+    values: list[str],
+    order: tuple[str, ...] = (),
+    *,
+    key=None,
+) -> dict[str, int]:
+    """Count ``values``, listing ``order`` first (even at zero — a declared
+    facet like ``P0`` is meaningful information even when nothing occupies it),
+    then any extra keys sorted by ``key`` (default: alphabetical)."""
     counts = Counter(values)
-    result = {key: counts.get(key, 0) for key in order if counts.get(key, 0)}
-    for key in sorted(counts):
-        if key not in result:
-            result[key] = counts[key]
+    result = {declared: counts.get(declared, 0) for declared in order}
+    for extra in sorted((k for k in counts if k not in result), key=key):
+        result[extra] = counts[extra]
     return result
 
 
@@ -275,7 +334,7 @@ def summarize(projection: Projection) -> BacklogSummary:
         total=len(records),
         approved=sum(1 for r in records if r.is_approved),
         errors=len(projection.errors),
-        by_wave=_ordered_counts([r.proposed_wave for r in records]),
+        by_wave=_ordered_counts([r.proposed_wave for r in records], key=_wave_sort_key),
         by_priority=_ordered_counts([r.priority for r in records], PRIORITY_ORDER),
         by_status=_ordered_counts([r.status for r in records]),
         by_domain=_ordered_counts([r.parallel_domain for r in records]),
@@ -291,12 +350,12 @@ def execution_queue(projection: Projection) -> list[BacklogRecommendation]:
     Backlog API, not here.
     """
 
-    def sort_key(rec: BacklogRecommendation) -> tuple[int, str, str]:
+    def sort_key(rec: BacklogRecommendation) -> tuple:
         try:
             priority_rank = PRIORITY_ORDER.index(rec.priority)
         except ValueError:
             priority_rank = len(PRIORITY_ORDER)
-        return (priority_rank, rec.proposed_wave, rec.issue_id)
+        return (priority_rank, _wave_sort_key(rec.proposed_wave), rec.issue_id)
 
     return sorted(approved_recommendations(projection), key=sort_key)
 
@@ -346,11 +405,14 @@ def filter_records(
 
 
 def to_read_model(rec: BacklogRecommendation) -> dict:
-    """A stable, read-only dict view of a record for ACC's UI/task surfaces.
+    """A stable dict view of a record for ACC's UI/task surfaces.
 
-    ``read_only`` and ``source`` are explicit so any consumer that mistakes this
-    for a mutable task record fails loudly rather than trying to persist it. Wave
-    is the *proposed* wave — the planning engine's current placement.
+    ``read_only`` and ``source`` are a declared contract, not an enforced one:
+    the returned dict is a plain, mutable ``dict`` (required so Streamlit's
+    ``st.dataframe`` can consume it directly), so nothing here stops a caller
+    from writing to it. The fields exist so a consumer that inspects them can
+    tell this is a projection and must not try to persist it back. Wave is the
+    *proposed* wave — the planning engine's current placement.
     """
     return {
         "id": rec.issue_id,
@@ -458,10 +520,10 @@ def parse_rich_records(text: str) -> list[RichRecord]:
 def load_rich_records(path: str | os.PathLike[str] | None = None) -> list[RichRecord]:
     """Read-only rich execution records from the master file (or [])."""
     resolved = resolve_backlog_path(path)
-    if resolved is None or not resolved.exists():
+    if resolved is None:
         return []
     try:
         text = resolved.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
     return parse_rich_records(text)
