@@ -399,6 +399,106 @@ def test_a_wedged_finalization_does_not_exit_zero(configured_repo, monkeypatch):
     )
 
 
+def _first_terminal_unfinalized_run(timeout: float = 20.0) -> dict:
+    """Block until some run in the shared db is terminal but not finalized —
+    the window `db.wait_for_run_finalized` exists to close. Paired with a
+    widened `launch` (see `WIDEN_FINALIZATION_WRAPPER`), so this poll has
+    seconds, not milliseconds, to land inside the window it is watching for.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            runs = db.list_runs(db.resolve_db_path())
+        except sqlite3.OperationalError:
+            runs = []
+        unfinalized = [r for r in runs if r["state"] in db.TERMINAL_STATES and r["finalized_at"] is None]
+        if unfinalized:
+            return unfinalized[0]
+        time.sleep(0.02)
+    raise AssertionError(f"no terminal-but-unfinalized run appeared within {timeout}s")
+
+
+@pytest.mark.serial  # deadline-sensitive subprocess run; the widened window is seconds, not minutes
+def test_run_status_from_a_separate_process_waits_for_finalization(configured_repo):
+    """The gap this task closes: `run-status`, invoked as a genuinely separate
+    OS process from `launch`, has no `Supervisor._active` entry for the run it
+    is asking about (see the module docstring) — only this database. Reading
+    `state` alone there would report a run "COMPLETED" while its own
+    supervisor, running in the other process, was still appending
+    `process_exited`, auto-committing the agent's work and writing the report.
+    Widened deterministically, the same way
+    `test_the_cli_waits_for_finalization_and_not_merely_for_a_terminal_row`
+    is, so the race is certain rather than a ~1-in-100 shot.
+    """
+    env = _cli_env()
+    env["AICC_TEST_WIDEN_FINALIZATION_SECONDS"] = "2.0"
+
+    launch_proc = subprocess.Popen(
+        [sys.executable, str(WIDEN_FINALIZATION_WRAPPER), "launch", "AIOS", str(configured_repo),
+         "implementation", "say ok", "--confirm"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+    try:
+        caught = _first_terminal_unfinalized_run()
+        status_result = subprocess.run(
+            [sys.executable, str(CLI_SCRIPT), "run-status", caught["id"]],
+            capture_output=True, text=True, timeout=30,
+        )
+        launch_stdout, launch_stderr = launch_proc.communicate(timeout=30)
+    finally:
+        if launch_proc.poll() is None:
+            launch_proc.kill()
+            launch_proc.communicate(timeout=5)
+
+    assert launch_proc.returncode == 0, launch_stdout + launch_stderr
+    assert status_result.returncode == 0, status_result.stdout + status_result.stderr
+    assert "WARNING" not in status_result.stderr, status_result.stderr
+    status = _extract_last_json_object(status_result.stdout)
+    assert status["state"] == "COMPLETED"
+    assert status["finalized_at"] is not None, (
+        "run-status returned a terminal-but-unfinalized row instead of waiting "
+        "on the durable marker — a caller in a different process than launch "
+        "was told the run finished before its report existed"
+    )
+
+
+@pytest.mark.serial  # deadline-sensitive subprocess run; the widened window is seconds, not minutes
+def test_run_status_on_a_wedged_finalization_does_not_exit_zero(configured_repo):
+    """Same defect as `test_a_wedged_finalization_does_not_exit_zero`, one
+    process over: a `run-status` invocation that gives up waiting on a
+    supervisor that will never finish finalizing must say so and exit
+    nonzero — not report a terminal-but-unfinalized run as if it had
+    completed cleanly, which is the exact guarantee this task exists to keep
+    a separate process from losing.
+    """
+    env = _cli_env()
+    env["AICC_TEST_WIDEN_FINALIZATION_SECONDS"] = "5.0"
+
+    launch_proc = subprocess.Popen(
+        [sys.executable, str(WIDEN_FINALIZATION_WRAPPER), "launch", "AIOS", str(configured_repo),
+         "implementation", "say ok", "--confirm"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+    )
+    try:
+        caught = _first_terminal_unfinalized_run()
+        status_env = dict(os.environ)
+        status_env["AICC_TEST_FINALIZATION_TIMEOUT_SECONDS"] = "1.0"
+        status_result = subprocess.run(
+            [sys.executable, str(CLI_SCRIPT), "run-status", caught["id"]],
+            capture_output=True, text=True, timeout=30, env=status_env,
+        )
+    finally:
+        if launch_proc.poll() is None:
+            launch_proc.wait(timeout=30)
+        launch_proc.communicate(timeout=5)
+
+    assert "did not finish finalizing" in status_result.stderr, status_result.stderr
+    assert status_result.returncode == 5, (
+        f"a wedged finalization exited {status_result.returncode}; a caller reading "
+        "run-status from a separate process was told the run finished cleanly"
+    )
+
+
 def _load_cli():
     """Import the CLI as a module so `_run_foreground` can be driven directly.
 

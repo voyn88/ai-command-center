@@ -196,17 +196,26 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         and task.get("terminal_projection_run_id") == run["id"]
     ):
         return False
+
     # ``launch_status`` cannot be the idempotency key: provider failures are
     # deliberately projected back to ``Ready`` for failover/retry, which made
     # every subsequent UI refresh re-append the same terminal and
     # ``executor_failed`` events.  Persist the run whose terminal facts were
     # projected instead.  A new remediation attempt has a new run id and is
     # therefore projected independently, while reload/restart remains a no-op.
+    #
+    # Keyed on `terminal_projection_run_id` itself, not a `launch_status`
+    # heuristic: `launch_status` can now reach a `_TERMINAL_LAUNCH_STATUSES`
+    # value (e.g. "Needs Review") on a pass where the run is terminal but not
+    # yet finalized — see the `finalized_at` gate on `_apply_terminal_fields`
+    # below — *without* `terminal_projection_run_id` having been set that
+    # same pass (VOYN-W0-AICC-FLAKE-03b). A `launch_status`-only proxy would
+    # then read that later pass as "already handled" and permanently skip the
+    # executor-fallback/interrupted-retry blocks for a run they were never
+    # actually run against.
     already_finalized_for_this_run = (
         not is_new_run_for_task
-        and (
-            task.get("launch_status") in _TERMINAL_LAUNCH_STATUSES
-        )
+        and task.get("terminal_projection_run_id") == run["id"]
     )
 
     if is_new_run_for_task:
@@ -231,7 +240,20 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
             models.set_current_stage(task, "Implementation")
             mutated = True
 
-    if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run:
+    # `state` turns terminal before finalization is durable — the report, the
+    # auto-commit and the `process_exited` event are all written *after* it,
+    # on a daemon thread interpreter shutdown does not join (see
+    # `db.mark_run_finalized`). A cross-process reader (this sync pass is one:
+    # it reads `run` fresh from the db, not from the supervisor that launched
+    # it) that projects off a terminal-but-unfinalized row would latch
+    # `terminal_projection_run_id` — this function's own idempotency guard —
+    # against a read with no report, no verdict and no PR url, permanently
+    # stranding the task even after the run genuinely finishes finalizing
+    # (VOYN-W0-AICC-FLAKE-03b). So terminal projection additionally waits on
+    # `run["finalized_at"]`, exactly the durable marker `db.wait_for_run_finalized`
+    # polls for cross-process callers that can afford to block instead.
+    run_is_finalized = run.get("finalized_at") is not None
+    if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run and run_is_finalized:
         # Must run *before* `target_launch_status` is resolved below: a
         # `Completed` run's launch status depends on `task["progress"]`
         # *after* this call's own stage advancement, not before it.
@@ -239,7 +261,14 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         task["terminal_projection_run_id"] = run["id"]
         mutated = True
 
-    target_launch_status = _resolve_target_launch_status(status, task)
+    if status in session_view.TERMINAL_DISPLAY_STATUSES and not run_is_finalized:
+        # No durable evidence yet to resolve a terminal launch status from —
+        # leave it exactly where it was; the next sync pass, once
+        # `finalized_at` lands, re-evaluates from the (by-then up to date)
+        # `task["progress"]`.
+        target_launch_status = task.get("launch_status", "Ready")
+    else:
+        target_launch_status = _resolve_target_launch_status(status, task)
 
     # --- Executor fallback auto-retry (AICC-DESKTOP-017) -----------------
     # A run that died because the *executor itself* is unavailable is a strong

@@ -38,6 +38,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -489,3 +490,100 @@ def test_without_the_widening_the_marker_and_the_report_never_disagree(
         # assertions above already proved it stayed visible.
         assert result.returncode == -signal.SIGKILL, result.stderr
         assert not finalized
+
+
+# ---------------------------------------------------------------------------
+# `wait_for_run_finalized` — the durable marker's own cross-process wait
+# ---------------------------------------------------------------------------
+#
+# `count_unfinalized_runs`/`list_unfinalized_runs` answer "is anything
+# pending", a set-level question for an operator draining a cutover. A reader
+# that asked about one specific run — a status invocation, a UI, a gateway
+# request handled by a process that did not launch it — needed the same
+# database-only guarantee but for a single id, with a bound on how long it
+# waits. That is `db.wait_for_run_finalized`, and it is the reason a
+# terminal-but-unfinalized row is no longer reported as "done" by a process
+# that never had a `Supervisor._active` entry to lean on in the first place.
+
+
+def test_wait_for_run_finalized_returns_the_row_once_finalized(
+    git_repo, configure_project_repo, fake_claude
+):
+    """The ordinary case: a run that finalizes while the wait is polling
+    returns the moment the marker lands, not merely the moment the call was
+    made — proving the wait actually observes the write rather than reading
+    once and returning."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    run = sup.start_raw(
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="do a thing",
+        confirmed=True,
+    )
+
+    row = db.wait_for_run_finalized(sup.db_path, run["id"], timeout=30)
+    assert row is not None
+    assert row["state"] == "COMPLETED"
+    assert row["finalized_at"] is not None
+
+
+def test_wait_for_run_finalized_returns_none_for_a_run_that_does_not_exist(
+    git_repo, configure_project_repo
+):
+    """A reader does not always know the id is good; the wait must report
+    that plainly rather than hang or raise."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    assert db.wait_for_run_finalized(sup.db_path, "does-not-exist", timeout=1) is None
+
+
+def test_wait_for_run_finalized_times_out_on_a_run_that_never_finalizes(
+    git_repo, configure_project_repo
+):
+    """Bounded, not merely eventual: a caller must get its process back even
+    for a run stuck terminal-but-unfinalized forever — the state a supervisor
+    killed inside the finalization window leaves behind (see
+    `test_a_kill_inside_the_window_leaves_the_run_visibly_unfinalized`).
+    Written directly rather than by racing a real kill, because this test is
+    about whether the wait *honours its bound*, not about producing the state.
+    """
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    task = db.create_task(sup.db_path, project="AIOS", title="stuck", task_type="implementation")
+    session = db.create_session(
+        sup.db_path, task_id=task["id"], project="AIOS", repository_path=str(git_repo)
+    )
+    run = db.create_run(
+        sup.db_path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        repository_path=str(git_repo),
+        task_type="implementation",
+        prompt="stuck",
+        is_resume=False,
+        command=["claude", "--print"],
+    )
+    db.update_run_state(sup.db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
+    current = db.get_run(sup.db_path, run["id"])
+    db.update_run_state(
+        sup.db_path, run["id"], expected_version=current["version"], new_state="RUNNING"
+    )
+    current = db.get_run(sup.db_path, run["id"])
+    db.update_run_state(
+        sup.db_path, run["id"], expected_version=current["version"], new_state="COMPLETED"
+    )
+    # Deliberately no `db.mark_run_finalized` call — this run stays terminal
+    # and unfinalized for the life of the test, exactly the shape the wait is
+    # bounded against.
+
+    started = time.monotonic()
+    row = db.wait_for_run_finalized(sup.db_path, run["id"], timeout=0.3, poll_interval=0.02)
+    elapsed = time.monotonic() - started
+
+    assert row is not None
+    assert row["state"] == "COMPLETED"
+    assert row["finalized_at"] is None, "a run this test never finalized read as finalized"
+    assert elapsed < 5, "wait_for_run_finalized did not honour its timeout and blocked instead"

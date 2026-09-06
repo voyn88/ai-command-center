@@ -21,7 +21,18 @@ def _make_task(**overrides) -> dict:
     return task
 
 
-def _make_run(db_path, *, state: str, task_id: str = "task-1", provider_id: str = "claude_code", **fields) -> dict:
+def _make_run(
+    db_path, *, state: str, task_id: str = "task-1", provider_id: str = "claude_code",
+    finalize: bool = True, **fields,
+) -> dict:
+    """`finalize=True` (the default) marks a terminal run's `finalized_at` the
+    way a real Supervisor eventually does, once its own finalization sequence
+    has run — every existing caller here builds a run to hand to
+    `sync_task_from_run` well after that would have happened for real, so
+    defaulting to "already finalized" keeps this helper honest about the
+    ordinary case. `finalize=False` models the FLAKE-03b race instead: a run
+    whose `state` just turned terminal but whose report/commit/lifecycle
+    event are not yet durable — see the tests using it below."""
     task = db.create_task(db_path, project="AIOS", title="t", task_type="implementation", task_id=task_id)
     session = db.create_session(db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
     run = db.create_run(
@@ -41,6 +52,9 @@ def _make_run(db_path, *, state: str, task_id: str = "task-1", provider_id: str 
         run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="RUNNING")
     if state not in ("PREPARED", "QUEUED", "RUNNING"):
         run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state=state, fields=fields)
+        if finalize and state in db.TERMINAL_STATES:
+            db.mark_run_finalized(db_path, run["id"])
+            run = db.get_run(db_path, run["id"])
     return run
 
 
@@ -130,6 +144,70 @@ def test_sync_task_from_run_completed_with_no_verdict_or_pr_needs_review(tmp_pat
 
     assert task["launch_status"] == "Needs Review"
     assert task["progress"] == 0
+
+
+def test_sync_task_from_run_terminal_but_unfinalized_does_not_latch_empty_fields(tmp_path):
+    """VOYN-W0-AICC-FLAKE-03b: a run whose `state` just turned `COMPLETED` but
+    whose report/commit/`process_exited` event are not yet durable (
+    `finalized_at` still `None`) must not be projected onto the task at all —
+    and, critically, must not set `terminal_projection_run_id` either. That
+    field is this function's own idempotency guard (see the top of
+    `sync_task_from_run`): once set for a run id, every future call for that
+    same id is a silent no-op. Setting it off an incomplete read would
+    permanently strand the task with no report, no verdict and no PR url,
+    even after the run genuinely finishes finalizing — this is the actual
+    incident (`terminal_projection_run_id` latched during a race) that
+    `test_sync_task_from_run_completed_advances_progress_and_extracts_fields`
+    cannot see, because its fixture is always already finalized. A later sync
+    call, once the run *is* finalized, must still extract everything."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00", finalize=False)
+    assert run["finalized_at"] is None
+    # The report and result event exist in the db already in this scenario —
+    # they just haven't landed yet in the schedule this test models; the
+    # point under test is that `finalized_at`, not their mere presence,
+    # gates projection.
+    db.append_run_event(
+        db_path, run["id"], "result",
+        {"result": "Verdict: APPROVED FOR COMMIT\nPR: https://example.invalid/pr/1\nCommit: abcdef1"},
+    )
+    db.create_report(db_path, run["id"], f"reports/AIOS/{run['id'][:8]}.md")
+    # Already attached to this run id (as it would be from an earlier sync
+    # while the run was still RUNNING), so the assertions below isolate the
+    # terminal-projection gate under test from the unrelated `current_run_id`
+    # first-sight mutation.
+    task = _make_task(current_run_id=run["id"])
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert "report_path" not in task, "an unfinalized run's report was projected onto the task"
+    assert "pull_request_url" not in task
+    assert "latest_verdict" not in task
+    assert task["launch_status"] == "Ready", (
+        "launch_status must not advance to a terminal value off an unfinalized "
+        "run either — doing so would desynchronize it from "
+        "terminal_projection_run_id, the guard the rest of this function relies on"
+    )
+    assert "terminal_projection_run_id" not in task, (
+        "the idempotency latch must not be set off an unfinalized read — doing "
+        "so would permanently skip re-projection once the run actually finalizes"
+    )
+
+    # Now finalize for real and sync again: the same run id, previously
+    # skipped, must be fully projected this time — proving the guard did not
+    # permanently strand it.
+    db.mark_run_finalized(db_path, run["id"])
+    finalized_run = db.get_run(db_path, run["id"])
+    assert finalized_run["finalized_at"] is not None
+
+    mutated_again = task_sync.sync_task_from_run(task, finalized_run, db_path=db_path)
+
+    assert mutated_again is True
+    assert task["terminal_projection_run_id"] == run["id"]
+    assert task["latest_verdict"] == "APPROVED_FOR_COMMIT"
+    assert task["pull_request_url"] == "https://example.invalid/pr/1"
+    assert task["report_path"] == f"reports/AIOS/{run['id'][:8]}.md"
 
 
 def test_sync_task_from_run_failed_sets_launch_status_failed(tmp_path):

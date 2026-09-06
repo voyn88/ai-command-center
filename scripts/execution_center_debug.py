@@ -26,12 +26,21 @@ The read-only inspection subcommands (`list-sessions`, `list-runs`,
 `run-status`, `events`, `reconcile`) have no such problem — they only read
 (or, for `reconcile`, conservatively reclassify) rows in the shared SQLite
 db, which genuinely is persistent cross-process state — and remain safe to
-call from any number of separate invocations at any time.
+call from any number of separate invocations at any time. `run-status` is the
+one exception to "purely instantaneous": a `state` column that just turned
+terminal does not yet mean the run is finalized (`run.finalized_at`, see
+`db.wait_for_run_finalized`) — its own supervisor, in another process, may
+still be appending the `process_exited` event, auto-committing the agent's
+work or writing the report. `run-status` waits (bounded) on that durable
+marker before printing a terminal-but-unfinalized row, the same way `launch`
+already does for its own runs.
 
 Usage:
     python scripts/execution_center_debug.py list-sessions [--task-id ID]
     python scripts/execution_center_debug.py list-runs [--session-id ID] [--task-id ID] [--state STATE]
     python scripts/execution_center_debug.py run-status RUN_ID
+        Exit code: 0 normally, 5 if the run is terminal but did not finish
+        finalizing within the timeout (see `launch`'s exit code 5, below).
     python scripts/execution_center_debug.py events RUN_ID [--after-seq N]
     python scripts/execution_center_debug.py reconcile
     python scripts/execution_center_debug.py launch PROJECT REPO_PATH TASK_TYPE INSTRUCTION --confirm
@@ -160,6 +169,39 @@ def _await_finalization(api: ExecutionCenterAPI, run_id: str) -> tuple[dict, boo
         # precisely the guarantee that had just been lost.
         return final or api.get_run(run_id), False
     return final or api.get_run(run_id), True
+
+
+def _run_status(api: ExecutionCenterAPI, run_id: str) -> int:
+    """`run-status` is documented in the module docstring as safe to call from
+    any separate invocation, at any time — but a bare `api.get_run()` reads
+    `state` alone, and `state` turns terminal before finalization is durable
+    (see `_await_finalization`). `launch`'s own foreground wait never has this
+    problem because it waits on `Supervisor.wait_for_run`, but that reads
+    `Supervisor._active`, which belongs to *this* process — and a `run-status`
+    invocation racing a still-finalizing `launch` running as a different
+    process has no handle on that registry at all, only this database. So it
+    waits on `db.wait_for_run_finalized` instead: the cross-process
+    counterpart, bounded by the same timeout and reported the same way.
+    """
+    current = api.get_run(run_id)
+    if current is None or current["state"] not in db.TERMINAL_STATES or current["finalized_at"] is not None:
+        _print(current)
+        return 0
+
+    db.wait_for_run_finalized(api.db_path, run_id, timeout=_FINALIZATION_TIMEOUT_SECONDS)
+    current = api.get_run(run_id)
+    if current is not None and current["state"] in db.TERMINAL_STATES and current["finalized_at"] is None:
+        print(
+            f"WARNING: run {run_id} reached a terminal state but its supervisor did not "
+            f"finish finalizing within {_FINALIZATION_TIMEOUT_SECONDS:.0f}s — the "
+            "process_exited event, the auto-commit of the agent's work and the run "
+            "report may all be missing.",
+            file=sys.stderr,
+        )
+        _print(current)
+        return _EXIT_CODE_UNFINALIZED
+    _print(current)
+    return 0
 
 
 def _settled_run(api: ExecutionCenterAPI, run_id: str) -> dict | None:
@@ -325,7 +367,7 @@ def main() -> int:
     elif args.command == "list-runs":
         _print(api.list_runs(session_id=args.session_id, task_id=args.task_id, state=args.state))
     elif args.command == "run-status":
-        _print(api.get_run(args.run_id))
+        return _run_status(api, args.run_id)
     elif args.command == "events":
         _print(api.get_events(args.run_id, after_seq=args.after_seq))
     elif args.command == "launch":
