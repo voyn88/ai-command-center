@@ -72,6 +72,7 @@ import urllib.error
 import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1599,6 +1600,38 @@ def _accept_marker_on_latest_review(
     return reviewer_login is not None and reviewer_login != pr_author_login
 
 
+def _accept_marker_submitted_at(
+    reviews: Any, head: str, pr_author_login: str | None
+) -> str | None:
+    """The ACCEPT marker review's own `submittedAt` on `head`, or None if no
+    marker stands there -- same latest-review and author-independence rules
+    as `_accept_marker_on_latest_review` (so the timestamp always names the
+    SAME review that authorized merge), but defensive against shapes that
+    function is never asked to survive: this one feeds best-effort verdict-
+    ->merge latency telemetry computed AFTER GitHub has already merged the
+    PR (`_persist_verdict_merge_latency`), so it must return None rather
+    than raise on anything short of a well-formed list of dict reviews
+    (independent review, CONFIRMED: a non-list `reviews`, or a list holding
+    a non-dict entry, raised TypeError/AttributeError here and escaped
+    before the DONE evidence and transition committed, stranding an
+    already-merged PR in READY_TO_REVIEW)."""
+    if not isinstance(reviews, list):
+        return None
+    candidates = [r for r in reviews if isinstance(r, dict)]
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda r: r.get("submittedAt") or "")
+    if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
+        return None
+    if pr_author_login is not None:
+        author = latest.get("author")
+        reviewer_login = author.get("login") if isinstance(author, dict) else None
+        if reviewer_login is None or reviewer_login == pr_author_login:
+            return None
+    submitted = latest.get("submittedAt")
+    return submitted if isinstance(submitted, str) and submitted else None
+
+
 def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
@@ -2323,6 +2356,226 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
     return list(latest.values())
 
 
+#: The exact required-check display name the Acceptance-gate workflow
+#: produces, and the exact workflow file `_find_failing_gate_run` below
+#: reruns. `_acceptance_gate_conclusion` must classify by this SAME exact
+#: name -- a substring match (the pre-VOYN-W0-AICC-MARKER-REVIEWER-
+#: INDEPENDENCE code used one) can hit an unrelated check such as
+#: "Acceptance gate integration" and dispatch a rerun of a workflow that was
+#: never actually red, spending the per-head budget on the wrong check
+#: entirely (independent review, CONFIRMED).
+ACCEPTANCE_GATE_CHECK_NAME = "Acceptance gate"
+ACCEPTANCE_GATE_WORKFLOW = "acceptance-gate.yml"
+
+#: Bound on `_reconcile_stale_acceptance_gate` attempts per exact head sha.
+MAX_GATE_RERUNS_PER_HEAD = 3
+
+
+def _acceptance_gate_conclusion(repo_path: str, pr_url: str) -> tuple[str, str]:
+    """(head_sha, conclusion) for the exact `ACCEPTANCE_GATE_CHECK_NAME`
+    check on the PR's CURRENT head -- self-contained (its own `gh pr view`,
+    like `_rerun_failed_ci_once`) so a caller need not thread rollup data
+    through.
+
+    conclusion is "" whenever the check is not eligible for reconciliation:
+    absent from the rollup, not yet COMPLETED (GitHub's `conclusion` is only
+    ever set once it is -- a queued or in-progress run reports None here,
+    and treating that as red would burn a rerun attempt on a check that
+    hasn't even finished, independent review of an earlier attempt at this
+    task, CONFIRMED), or the synthetic "AMBIGUOUS" `_latest_checks_by_name`
+    substitutes for an unorderable duplicate rerun -- an ordering ambiguity
+    is not evidence the check itself is red, and it stays a passive,
+    fail-closed skip rather than a rerun target."""
+    view = _gh(
+        ["pr", "view", pr_url, "--json", "headRefOid,statusCheckRollup,state"],
+        repo_path,
+    )
+    if view.returncode != 0:
+        return "", ""
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return "", ""
+    if not isinstance(data, dict) or data.get("state") != "OPEN":
+        return "", ""
+    head = str(data.get("headRefOid") or "")
+    if not head:
+        return "", ""
+    rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
+    for check in rollup:
+        if check.get("name") != ACCEPTANCE_GATE_CHECK_NAME:
+            continue
+        conclusion = check.get("conclusion")
+        if conclusion is None or conclusion == "AMBIGUOUS":
+            return head, ""
+        return head, str(conclusion)
+    return "", ""
+
+
+def _find_failing_gate_run(repo_path: str, pr_url: str, head_sha: str) -> tuple[int | None, str]:
+    """The completed, failing `ACCEPTANCE_GATE_WORKFLOW` run at this EXACT
+    head, or (None, reason) for any lookup miss -- an unreadable branch, a
+    `gh` failure, or simply no matching run (yet, or ever, e.g. it hasn't
+    reached GitHub's run list before this tick, or the classification and
+    the rerun target have drifted apart). None of these dispatch anything,
+    so `_reconcile_stale_acceptance_gate` must never treat a lookup miss as
+    a spent attempt (independent review of an earlier attempt at this task,
+    CONFIRMED: transient `gh run list` failures silently exhausted the
+    three-attempt budget without ever requeueing anything)."""
+    view = _gh(["pr", "view", pr_url, "--json", "headRefName"], repo_path)
+    if view.returncode != 0:
+        return None, "pr_view_failed"
+    try:
+        branch = (json.loads(view.stdout or "{}")).get("headRefName")
+    except json.JSONDecodeError:
+        return None, "pr_view_malformed"
+    if not branch:
+        return None, "no_head_branch"
+    listing = _gh(
+        ["run", "list", "--workflow", ACCEPTANCE_GATE_WORKFLOW, "--branch", str(branch),
+         "--limit", "30", "--json", "databaseId,headSha,status,conclusion"],
+        repo_path,
+    )
+    if listing.returncode != 0:
+        return None, "run_list_failed"
+    try:
+        runs = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError:
+        return None, "run_list_malformed"
+    if not isinstance(runs, list):
+        return None, "run_list_malformed"
+    for run in runs:
+        if (
+            isinstance(run, dict)
+            and run.get("headSha") == head_sha
+            and run.get("status") == "completed"
+            and run.get("conclusion") not in (None, "success", "neutral", "skipped")
+        ):
+            run_id = run.get("databaseId")
+            if isinstance(run_id, int):
+                return run_id, ""
+    return None, "no_matching_failing_run"
+
+
+def _reserve_gate_rerun_attempt(factory: Any, task_id: str, head_sha: str) -> int | None:
+    """Atomically reserve the next `_reconcile_stale_acceptance_gate` attempt
+    slot for this task's exact head, capped at MAX_GATE_RERUNS_PER_HEAD, or
+    None once the cap already stands. `backlog_reserve_gate_rerun` (0018)
+    does the count-and-insert as one row-locked operation, so two concurrent
+    merge ticks against the same task can never both observe room under the
+    cap and both reserve the same slot (independent review of an earlier
+    attempt at this task, CONFIRMED: a separate count-then-insert let that
+    race exceed the promised per-head cap). Reserving is a normal
+    autocommit statement -- durable the instant it returns, and always
+    called BEFORE the caller dispatches the GitHub rerun, never after, so a
+    crash between dispatch and bookkeeping cannot under-count either."""
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT ok, reason FROM backlog_reserve_gate_rerun(%s, %s, %s)",
+            (task_id, head_sha, MAX_GATE_RERUNS_PER_HEAD),
+        )
+        ok, reason = cur.fetchone()
+    return int(reason) if ok else None
+
+
+def _reconcile_stale_acceptance_gate(
+    factory: Any, repo_path: str, task_id: str, pr_url: str, head_sha: str
+) -> str:
+    """Bounded backstop for a definitively-red Acceptance gate standing
+    under an already-accepted head (VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY):
+    the marker can post after the pull_request-triggered run that GitHub
+    keeps evaluating for branch protection already went red, and
+    `_rerun_failed_ci_once`'s one-shot flaky retry (bounded by GitHub's own
+    per-run attempt counter) does not touch a run already past its first
+    attempt -- live baseline 2026-08-26, PR #382: the marker landed at
+    03:00Z and the gate was not re-run until a human did it by hand at
+    09:15Z. This is the tick's own bounded, automatic version of that same
+    manual act.
+
+    Only called once `_acceptance_gate_conclusion` has already classified
+    the check by its exact name as COMPLETED and non-green (never on None,
+    never on the synthetic "AMBIGUOUS" ordering marker -- both stay a
+    passive skip). The lookup for a real matching run happens FIRST and
+    costs nothing on a miss; the per-head attempt is reserved durably only
+    once a run to dispatch is actually found, and strictly BEFORE the
+    dispatch itself; and once reserved it is never refunded, because a
+    nonzero `gh run rerun` exit is ambiguous -- a timeout or a dropped
+    response can follow a rerun GitHub already accepted, and refunding on
+    an ambiguous failure is exactly what would let a later tick exceed the
+    promised cap (independent reviews of two earlier attempts at this task,
+    both CONFIRMED)."""
+    run_id, reason = _find_failing_gate_run(repo_path, pr_url, head_sha)
+    if run_id is None:
+        return f"acceptance_gate_rerun_lookup_failed:{reason}"
+    attempt = _reserve_gate_rerun_attempt(factory, task_id, head_sha)
+    if attempt is None:
+        return "acceptance_gate_rerun_cap_reached"
+    _gh(["run", "rerun", str(run_id)], repo_path)
+    return f"acceptance_gate_rerun_requeued:{attempt}"
+
+
+def _persist_verdict_merge_latency(
+    factory: Any, repo_path: str, task_id: str, pr_url: str
+) -> None:
+    """Best-effort verdict->merge latency evidence (acceptance criterion: p95
+    last-commit->merged tracked via DONE evidence) -- called ONLY after
+    `merge_once` has already committed the sha evidence and the DONE
+    transition, so nothing this function does, including raising, can ever
+    block, delay, undo, or even observe the merge itself; the worst outcome
+    of any failure here is one missing latency sample. Every step is inside
+    one broad `except Exception`, not just the timestamp math: independent
+    reviews of two earlier attempts at this task were CONFIRMED to let this
+    kind of telemetry raise before it reached a narrower guard -- once from
+    a naive/aware datetime subtraction (`TypeError`, not the `ValueError` a
+    narrower catch expected) and once from assuming `reviews` was a
+    well-formed list of dicts -- either of which escaped BEFORE this was
+    moved to run strictly after the commit, where a raise could still reach
+    the caller and made the whole guarantee depend on catching the right
+    exception type. Naive timestamps are normalized to UTC rather than
+    merely tolerated, so the subtraction below can never raise in the first
+    place."""
+    try:
+        view = _gh(
+            ["pr", "view", pr_url, "--json", "reviews,mergedAt,headRefOid,author"],
+            repo_path,
+        )
+        if view.returncode != 0:
+            return
+        data = json.loads(view.stdout or "{}")
+        if not isinstance(data, dict):
+            return
+        head = data.get("headRefOid")
+        merged_at = data.get("mergedAt")
+        if not isinstance(head, str) or not head:
+            return
+        if not isinstance(merged_at, str) or not merged_at:
+            return
+        author = data.get("author")
+        author_login = author.get("login") if isinstance(author, dict) else None
+        verdict_at = _accept_marker_submitted_at(data.get("reviews"), head, author_login)
+        if not verdict_at:
+            return
+        verdict_dt = datetime.fromisoformat(verdict_at.replace("Z", "+00:00"))
+        merged_dt = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+        if verdict_dt.tzinfo is None:
+            verdict_dt = verdict_dt.replace(tzinfo=timezone.utc)
+        if merged_dt.tzinfo is None:
+            merged_dt = merged_dt.replace(tzinfo=timezone.utc)
+        seconds = (merged_dt - verdict_dt).total_seconds()
+        if seconds < 0:
+            return
+        value = json.dumps(
+            {"verdict_at": verdict_at, "merged_at": merged_at, "seconds": round(seconds, 3)},
+            sort_keys=True,
+        )
+        with factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT backlog_record_evidence(%s, 'merge_latency', %s)", (task_id, value)
+            )
+    except Exception:
+        return
+
+
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
     marker -- from a reviewer login that is NOT the PR's own author -- stands
@@ -2500,7 +2753,18 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
     as evidence, only once GitHub reports the PR actually MERGED (see
-    `_merged_target_sha`; a queued merge is a wait, not a completion)."""
+    `_merged_target_sha`; a queued merge is a wait, not a completion).
+
+    A marker that stands over a still-red, exact-name Acceptance-gate check
+    gets a bounded (`MAX_GATE_RERUNS_PER_HEAD` per head) rerun via
+    `_reconcile_stale_acceptance_gate` rather than waiting on a human --
+    never a merge around the red check itself, and never for any other
+    check or a merely pending/ambiguous one (see that function and
+    `_acceptance_gate_conclusion`). Every DONE also gets a best-effort
+    verdict->merge latency sample recorded as evidence
+    (`_persist_verdict_merge_latency`), strictly after the transition
+    commits so it can never affect the merge (VOYN-W0-AICC-ACCEPTANCE-TAIL-
+    LATENCY)."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
@@ -2562,6 +2826,23 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     # AUTO-RERUN). Only reached with the marker standing, so
                     # unaccepted PRs never spend reruns.
                     rerun = _rerun_failed_ci_once(repo_path, pr_url)
+                    if not rerun:
+                        # The flaky retry above only ever touches a run still
+                        # at GitHub's own attempt 1; a gate that already went
+                        # through that once (or was re-run by the marker post
+                        # itself, `_rerun_failing_acceptance_gate`) and is
+                        # STILL red under a standing marker gets this bounded
+                        # backstop instead (VOYN-W0-AICC-ACCEPTANCE-TAIL-
+                        # LATENCY) -- distinct budget, distinct evidence,
+                        # never touches a check that isn't the exact
+                        # Acceptance gate by name.
+                        gate_head, gate_conclusion = _acceptance_gate_conclusion(
+                            repo_path, pr_url
+                        )
+                        if gate_head and gate_conclusion:
+                            rerun = _reconcile_stale_acceptance_gate(
+                                factory, repo_path, task_id, pr_url, gate_head
+                            )
                     if rerun:
                         detail = f"{detail}; {rerun}"
                 report.skipped.append((task_id, detail))
@@ -2641,6 +2922,11 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                 if ok:
                     conn.commit()
                     report.merged.append((task_id, head))
+                    # Strictly AFTER the commit above: see
+                    # `_persist_verdict_merge_latency`'s docstring for why
+                    # nothing it does, including raising, can affect the
+                    # merge or the DONE transition already recorded.
+                    _persist_verdict_merge_latency(factory, repo_path, task_id, pr_url)
                 else:
                     conn.rollback()
                     report.skipped.append((task_id, f"transition:{reason}"))
