@@ -1255,6 +1255,140 @@ def test_auto_accept_is_conditioned_on_the_audit_comment(rig, monkeypatch):  # n
     assert not report.remediated
 
 
+def test_minor_findings_text_extracts_only_confirmed_minor_lines():
+    """`_minor_findings_text` (VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE) must
+    pull exactly the CONFIRMED_MINOR dispositions out of a verifier's mixed
+    output -- ARTIFACT and CONFIRMED_BLOCKING lines are not real, non-blocking
+    findings and must not be carried into a follow-up task."""
+    text = (
+        "FINDING 1: ARTIFACT -- tree contradicts the claim.\n"
+        "FINDING 2: CONFIRMED_MINOR -- unused import, harmless.\n"
+        "FINDING 3: CONFIRMED_MINOR -- naming only, no behavior change.\n"
+        "SECURITY_CLAIMS: NONE\n"
+    )
+    extracted = review_merge._minor_findings_text(text)
+    assert "FINDING 2: CONFIRMED_MINOR -- unused import, harmless." in extracted
+    assert "FINDING 3: CONFIRMED_MINOR -- naming only, no behavior change." in extracted
+    assert "ARTIFACT" not in extracted
+    assert review_merge._minor_findings_text("FINDING 1: ARTIFACT -- cited.\n") == ""
+
+
+def test_confirmed_minor_findings_become_a_tracked_followup_task(rig, monkeypatch):  # noqa: F811, E501
+    """A CONFIRMED_MINOR finding the auto-accept verifier confirmed real (not
+    an artifact) must not just live in the audit comment: it becomes an
+    ordinary OPEN follow-up task, linked to the parent through
+    backlog_task_followup, so the planner can actually dispatch it. The
+    parent still merges zero-touch regardless -- the marker still posts in
+    the same tick."""
+    app_factory, store, _ = rig
+    head = "b" * 40
+    pr_url = "https://github.com/x/y/pull/22"
+    _ready(store, app_factory, "VOYN-W0-ADJ-MIN", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(
+        monkeypatch,
+        f"FINDING 1: ARTIFACT -- tree contradicts the claim.\n"
+        f"FINDING 2: CONFIRMED_MINOR -- naming only, no behavior change.\n"
+        f"SECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+    fake_gh = _fake_pr_view(head)
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot",
+                        lambda creds, pr, decision, sha: (posted.append((pr, decision, sha)) or (True, "")))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert posted == [(pr_url, "ACCEPT", head)]
+    assert not report.remediated
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT status, title, body FROM backlog_task WHERE task_id=%s",
+            ("VOYN-W0-ADJ-MIN-MINOR",),
+        )
+        row = cur.fetchone()
+        assert row is not None
+        status, title, body = row
+        assert status == "OPEN"
+        assert "voyn-w0-adj-min" in title.lower()
+        assert "CONFIRMED_MINOR -- naming only, no behavior change." in body
+        assert "ARTIFACT" not in body  # only the real, non-blocking finding
+        assert pr_url in body and head in body
+
+        cur.execute(
+            "SELECT parent_task_id, pr_url, head_sha, kind "
+            "FROM backlog_task_followup WHERE task_id=%s",
+            ("VOYN-W0-ADJ-MIN-MINOR",),
+        )
+        parent, linked_pr, linked_sha, kind = cur.fetchone()
+        assert parent == "VOYN-W0-ADJ-MIN"
+        assert linked_pr == pr_url
+        assert linked_sha == head
+        assert kind == "minor_findings"
+
+
+def test_artifact_only_override_creates_no_followup_task(rig, monkeypatch):  # noqa: F811, E501
+    """An override whose findings are all ARTIFACT (never real) must not
+    spawn a follow-up task -- there is nothing confirmed real to track."""
+    app_factory, store, _ = rig
+    head = "c" * 40
+    pr_url = "https://github.com/x/y/pull/23"
+    _ready(store, app_factory, "VOYN-W0-ADJ-NOMIN", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    _force_chunk_reject(
+        monkeypatch,
+        f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_view(head))
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot", lambda *a: (True, ""))
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert not report.remediated
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_task WHERE task_id=%s",
+            ("VOYN-W0-ADJ-NOMIN-MINOR",),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_record_minor_followup_is_idempotent(rig):  # noqa: F811
+    """Called twice for the same parent (a retried tick after a same-tick
+    failure elsewhere), the guard on `backlog_task_followup`'s unique
+    (parent_task_id, kind) must refuse the second write rather than
+    double-creating the follow-up task."""
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/96"
+    head = "9" * 40
+    _ready(store, app_factory, "VOYN-W0-ADJ-IDEM", pr_url)
+
+    first = review_merge._record_minor_followup(
+        app_factory, "VOYN-W0-ADJ-IDEM", pr_url, head,
+        "FINDING 1: CONFIRMED_MINOR -- naming only.",
+    )
+    assert first == "VOYN-W0-ADJ-IDEM-MINOR"
+
+    again = review_merge._record_minor_followup(
+        app_factory, "VOYN-W0-ADJ-IDEM", pr_url, head,
+        "FINDING 1: CONFIRMED_MINOR -- naming only.",
+    )
+    assert again is None
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_task WHERE task_id = %s",
+            ("VOYN-W0-ADJ-IDEM-MINOR",),
+        )
+        assert cur.fetchone()[0] == 1
+
+
 def test_chunk_reject_confirmed_by_verification_reject_remediates(rig, monkeypatch):  # noqa: F811, E501
     """When verification CONFIRMS a blocking finding, the REJECT stands:
     remediation is dispatched carrying the confirmation, no marker."""

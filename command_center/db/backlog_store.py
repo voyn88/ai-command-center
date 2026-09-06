@@ -120,6 +120,21 @@ class BacklogStore:
         )
         return bool(ok), str(reason or "")
 
+    def record_followup(
+        self, task_id: str, parent_task_id: str, pr_url: str, head_sha: str, kind: str
+    ) -> tuple[bool, str]:
+        """Link a follow-up task to a review it did not block. Currently only
+        `kind='minor_findings'`: a CONFIRMED_MINOR finding the auto-accept
+        verifier confirmed real but non-blocking, tracked as ordinary
+        backlog work instead of living only in the PR audit comment. As
+        with `record_remediation`, this is audit lineage, never a readiness
+        gate on either task."""
+        ok, reason, _revision = self._row(
+            "SELECT * FROM backlog_record_followup(%s, %s, %s, %s, %s)",
+            (task_id, parent_task_id, pr_url, head_sha, kind),
+        )
+        return bool(ok), str(reason or "")
+
     def add_dependency(
         self, task_id: str, depends_on: str
     ) -> tuple[bool, str, list[str] | None]:

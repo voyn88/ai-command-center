@@ -122,6 +122,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_event",
     "backlog_evidence",
     "backlog_task",
+    "backlog_task_followup",
     "backlog_task_remediation",
     "backlog_scan_cursor",
     "backlog_writer_lease",
@@ -269,6 +270,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_event": _READ,
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
+    "backlog_task_followup": _READ,
     "backlog_scan_cursor": _READ,
 }
 
@@ -279,6 +281,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_event": _NONE,
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
+    "backlog_task_followup": _NONE,
     "backlog_scan_cursor": _NONE,
 }
 
@@ -484,6 +487,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_transition(text, text, bigint)",
     "backlog_record_evidence(text, text, text)",
     "backlog_record_remediation(text, text, text, text)",
+    "backlog_record_followup(text, text, text, text, text)",
     "backlog_add_dependency(text, text)",
     "backlog_lease_acquire(text, text, integer)",
     "backlog_lease_heartbeat(text, text, integer)",
