@@ -1496,7 +1496,12 @@ def _validate_task_branch_ref(expected_branch: str, workspace: Path) -> None:
         or expected_branch.endswith(('/', '.'))
         or ".." in expected_branch
         or "@{" in expected_branch
-        or any(part in {"", ".", ".."} or part.endswith(".lock") for part in components)
+        or any(
+            part in {"", ".", ".."}
+            or part.startswith(".")
+            or part.endswith(".lock")
+            for part in components
+        )
         or any(ord(char) < 32 or ord(char) == 127 or char in forbidden for char in expected_branch)
     )
     if invalid:
@@ -2077,14 +2082,14 @@ def _copy_trusted_loose_object_to_agent(
             detail=f"cannot read trusted loose object {oid}: {exc}",
         ) from exc
     if os.name == "nt":
-        destination = workspace / ".git" / "objects" / oid[:2] / oid[2:]
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            if destination.read_bytes() != payload:
-                raise OSError(f"object collision for {oid}")
-            return
-        destination.write_bytes(payload)
-        return
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_platform",
+            remediation="Preserve the clone and checkpoint it on a Linux worker.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="secure no-follow object persistence is unavailable on Windows",
+        )
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     git_fd = objects_fd = prefix_fd = target_fd = None
@@ -2178,74 +2183,79 @@ def _advance_agent_branch_ref(
             expected_branch=expected_branch,
             detail="task branch changed before checkpoint ref update",
         )
-    ref = workspace / ".git" / "refs" / "heads" / Path(expected_branch)
     if os.name == "nt":
-        _atomic_write_private(ref, f"{checkpoint_sha}\n".encode("ascii"))
-    else:
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        directory_fd = os.open(
-            workspace / ".git", os.O_RDONLY | os.O_DIRECTORY | nofollow
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_platform",
+            remediation="Preserve the clone and checkpoint it on a Linux worker.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="secure descriptor-relative ref persistence is unavailable on Windows",
         )
-        temporary = f".aicc-checkpoint-{secrets.token_hex(16)}"
-        file_fd: int | None = None
-        try:
-            for component in ("refs", "heads", *expected_branch.split("/")[:-1]):
-                try:
-                    os.mkdir(component, mode=0o755, dir_fd=directory_fd)
-                except FileExistsError:
-                    pass
-                next_fd = os.open(
-                    component,
-                    os.O_RDONLY | os.O_DIRECTORY | nofollow,
-                    dir_fd=directory_fd,
-                )
-                os.close(directory_fd)
-                directory_fd = next_fd
-            file_fd = os.open(
-                temporary,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
-                0o600,
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(
+        workspace / ".git", os.O_RDONLY | os.O_DIRECTORY | nofollow
+    )
+    temporary = f".aicc-checkpoint-{secrets.token_hex(16)}"
+    file_fd: int | None = None
+    try:
+        for component in ("refs", "heads", *expected_branch.split("/")[:-1]):
+            try:
+                os.mkdir(component, mode=0o755, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | nofollow,
                 dir_fd=directory_fd,
             )
-            payload = f"{checkpoint_sha}\n".encode("ascii")
-            view = memoryview(payload)
-            while view:
-                written = os.write(file_fd, view)
-                if written <= 0:
-                    raise OSError("ref write made no progress")
-                view = view[written:]
-            os.fsync(file_fd)
-            os.close(file_fd)
-            file_fd = None
-            # Re-check through the separately hardened reader immediately
-            # before replacement.  A live writer can only make this fail; it
-            # cannot redirect the descriptor-pinned destination chain.
-            if _read_agent_head(workspace, expected_branch) != previous_sha:
-                raise OSError("task branch changed during checkpoint ref update")
-            os.replace(
-                temporary,
-                expected_branch.split("/")[-1],
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-            )
-            os.fsync(directory_fd)
-        except OSError as exc:
-            raise WorkspaceVerificationError(
-                failed_step="dirty_checkpoint_ref_write",
-                remediation="Preserve the task clone for ref-integrity inspection.",
-                expected_workspace=str(workspace),
-                actual_workspace=str(workspace),
-                expected_branch=expected_branch,
-                detail=f"cannot atomically advance task ref: {exc}",
-            ) from exc
-        finally:
-            if file_fd is not None:
-                os.close(file_fd)
-            try:
-                os.unlink(temporary, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
             os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        payload = f"{checkpoint_sha}\n".encode("ascii")
+        view = memoryview(payload)
+        while view:
+            written = os.write(file_fd, view)
+            if written <= 0:
+                raise OSError("ref write made no progress")
+            view = view[written:]
+        os.fsync(file_fd)
+        os.close(file_fd)
+        file_fd = None
+        # Re-check through the separately hardened reader immediately
+        # before replacement.  A live writer can only make this fail; it
+        # cannot redirect the descriptor-pinned destination chain.
+        if _read_agent_head(workspace, expected_branch) != previous_sha:
+            raise OSError("task branch changed during checkpoint ref update")
+        os.replace(
+            temporary,
+            expected_branch.split("/")[-1],
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_write",
+            remediation="Preserve the task clone for ref-integrity inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot atomically advance task ref: {exc}",
+        ) from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
     if _read_agent_head(workspace, expected_branch) != checkpoint_sha:
         raise WorkspaceVerificationError(
             failed_step="dirty_checkpoint_ref_verify",
@@ -2276,6 +2286,15 @@ def checkpoint_dirty_task_workspace(
     failed push remains retryable.
     """
     workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
+    if os.name == "nt":
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_platform",
+            remediation="Preserve the clone and checkpoint it on a Linux worker.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="automatic dirty-worktree checkpointing is fail-closed on Windows",
+        )
     candidate_sha = task_workspace_candidate_sha(
         workspace, expected_branch=expected_branch, expected_inode=expected_inode
     )

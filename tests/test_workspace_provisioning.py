@@ -724,6 +724,7 @@ def test_read_agent_head_reads_a_real_head_via_pinned_fd(tmp_path):
         "feature//x",
         "feature/../x",
         "feature/x.lock",
+        "feature/.hidden",
         "feature/x..y",
         "feature/x@{1}",
         "feature/x y",
@@ -743,6 +744,27 @@ def test_read_agent_head_rejects_unsafe_ref_names_before_path_access(
 
     assert exc_info.value.failed_step == "agent_head_branch"
     assert not (tmp_path / "outside").exists()
+
+
+def test_dirty_checkpoint_fails_closed_before_writing_on_windows(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(wp.os, "name", "nt")
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.checkpoint_dirty_task_workspace(
+            workspace,
+            expected_branch="feature/x",
+            remote_url="https://example.invalid/repo.git",
+            start_sha="0" * 40,
+            trusted_base_sha="0" * 40,
+            expected_remote_sha=None,
+            expected_inode=(workspace.stat().st_dev, workspace.stat().st_ino),
+            message="checkpoint",
+        )
+
+    assert exc_info.value.failed_step == "dirty_checkpoint_platform"
+    assert list(workspace.iterdir()) == []
 
 
 def test_read_agent_head_handles_short_regular_file_reads(tmp_path, monkeypatch):

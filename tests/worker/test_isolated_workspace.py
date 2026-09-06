@@ -15,6 +15,7 @@ recorded.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -441,6 +442,7 @@ def test_no_cleanup_when_publish_is_not_configured(agent, monkeypatch):
     assert (workspace / "change.txt").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="secure dirty checkpoint runs on Linux workers")
 def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
     """A push/PR failure leaves the worktree in place: it may be the only
     remaining copy of the agent's commit, and deleting it on a transient
@@ -450,8 +452,6 @@ def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
     monkeypatch.setattr(agent_runner, "run_claude_code", _dirty_without_commit_run)
 
     # Break the fake gh so `pr create` fails after a successful push.
-    import os
-
     bin_dir = None
     for entry in os.environ["PATH"].split(os.pathsep):
         if (Path(entry) / "gh").exists():
@@ -489,6 +489,7 @@ def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
     assert not workspace.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="secure dirty checkpoint runs on Linux workers")
 def test_dirty_no_commit_is_checkpointed_and_published(agent_with_publish, monkeypatch):
     run_agent, repo = agent_with_publish
     monkeypatch.setattr(agent_runner, "run_claude_code", _dirty_without_commit_run)
@@ -505,6 +506,7 @@ def test_dirty_no_commit_is_checkpointed_and_published(agent_with_publish, monke
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="secure dirty checkpoint runs on Linux workers")
 def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
     agent_with_publish, monkeypatch, tmp_path
 ):
