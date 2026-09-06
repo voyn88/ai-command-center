@@ -137,6 +137,65 @@ class WorkQueueReadStore:
             out.append(entry)
         return out
 
+    def executor_availability(self) -> list[dict[str, Any]]:
+        """Current fleet-wide verdict per executor that has ever been marked
+        (0018, VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY) — the same read grant
+        `queue_metrics` above uses (`aicc_app` SELECT, roles.py's
+        `_APP_EXECUTOR_TABLES`), so a dashboard mixing queue depth and
+        executor health issues one kind of query against one role, not two
+        authorities. An executor absent from the result has never been
+        marked unavailable; this is the durable-state table, not a seeded
+        roster of every executor id `command_center.executors` knows about.
+        """
+        sql = (
+            "SELECT executor_id, status, reason, unavailable_until, updated_at"
+            " FROM executor_availability ORDER BY executor_id"
+        )
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                columns = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+        out = []
+        for row in rows:
+            entry = dict(zip(columns, row, strict=True))
+            for key in ("unavailable_until", "updated_at"):
+                entry[key] = None if entry[key] is None else str(entry[key])
+            out.append(entry)
+        return out
+
+    def escalation_reasons(self, *, hours: int = 24) -> list[dict[str, Any]]:
+        """Why routing fell over to the next cascade link, aggregated over
+        `executor_availability_event` — the durable audit trail a worker's
+        own `executor_mark_unavailable` call writes (VOYN-W0-AICC-EXECUTOR-
+        QUOTA-VISIBILITY), not the ephemeral per-delivery `route_failovers`
+        list that lives only in one `work_result` row. One row per
+        (executor, reason) with how many times it fired in the window,
+        busiest first — the same 'read a table, don't parse a log' shape
+        `queue_metrics` uses.
+        """
+        sql = (
+            "SELECT executor_id, reason, count(*) AS occurrences,"
+            " max(created_at) AS last_occurred_at"
+            " FROM executor_availability_event"
+            " WHERE event = 'marked_unavailable'"
+            "   AND created_at >= now() - (%s || ' hours')::interval"
+            " GROUP BY executor_id, reason"
+            " ORDER BY occurrences DESC, last_occurred_at DESC"
+        )
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (max(1, int(hours)),))
+                columns = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+        out = []
+        for row in rows:
+            entry = dict(zip(columns, row, strict=True))
+            entry["occurrences"] = int(entry["occurrences"])
+            entry["last_occurred_at"] = str(entry["last_occurred_at"])
+            out.append(entry)
+        return out
+
     def get_item(self, work_item_id: str) -> dict[str, Any] | None:
         """One item with its attempt trail and, when finished, its result.
 
