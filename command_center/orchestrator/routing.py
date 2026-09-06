@@ -53,7 +53,18 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         # `max_attempts` is 3 (the attempt budget IS the cascade length), so a
         # task gets one genuine try per independent quota pool rather than
         # three tries at one pool.
-        {"executor": "copilot", "task_type": "implementation"},
+        #
+        # copilot link WITHDRAWN 2026-09-06 (VOYN-W0-AICC-COPILOT-QUOTA-CASCADE):
+        # the Copilot account's MONTHLY quota is exhausted — measured live on
+        # wki_c63ab59d (canary, 2026-09-06): the attempt fails in ~3s with
+        # "You have exceeded your monthly quota", so the link is a phantom in
+        # exactly the sense this module's docstring forbids — it silently burns
+        # the task's final attempt on a guaranteed refusal and dead-letters
+        # work that a real pool might have finished. Re-add condition: the
+        # quota resets (2026-10-01) or quota telemetry proves capacity.
+        # The durable fix — quota-aware link skipping so no executor's
+        # exhausted pool ever consumes an attempt — is tracked as
+        # VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING.
     ],
     "review": [
         # codex first: it is the only review pool currently reachable on the
@@ -62,7 +73,8 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         # resolves to the read-only profile, so codex reviews under
         # `--sandbox read-only` -- a model-only reviewer that never writes.
         {"executor": "codex", "task_type": "review"},
-        {"executor": "copilot", "task_type": "review"},
+        # copilot review link withdrawn 2026-09-06 with the implementation
+        # link above (same exhausted monthly quota, same re-add condition).
         {"executor": "claude", "task_type": "review"},
     ],
 }

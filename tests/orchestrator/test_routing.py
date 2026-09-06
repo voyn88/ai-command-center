@@ -52,10 +52,22 @@ def test_cascade_for_returns_copies_not_the_matrix():
     assert ROUTING_MATRIX["review"][0]["executor"] == "codex"
 
 
-def test_review_uses_copilot_then_claude_once_each():
+def test_review_cascade_reaches_each_available_pool_once():
     cascade = cascade_for("review")
-    assert [link["executor"] for link in cascade] == ["codex", "copilot", "claude"]
+    assert [link["executor"] for link in cascade] == ["codex", "claude"]
     assert all(link["task_type"] == "review" for link in cascade)
+
+
+def test_copilot_is_withdrawn_while_its_monthly_quota_is_exhausted():
+    """VOYN-W0-AICC-COPILOT-QUOTA-CASCADE (live-measured 2026-09-06 on the
+    canary wki_c63ab59d): every copilot attempt fails in ~3 seconds with
+    "You have exceeded your monthly quota", so a copilot link burns an
+    attempt on a guaranteed refusal. Withdrawn until the quota resets
+    (2026-10-01) or quota telemetry proves capacity; the durable fix is
+    VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING. Delete this test when the
+    link returns."""
+    for task_class, cascade in ROUTING_MATRIX.items():
+        assert "copilot" not in [link["executor"] for link in cascade], task_class
 
 
 def test_unknown_task_class_falls_back_to_implementation():

@@ -38,7 +38,6 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     assert ":diff:" in key
     assert [link["executor"] for link in payload["cascade"]] == [
         "codex",
-        "copilot",
         "claude",
     ]
     assert payload["untrusted"] is True
@@ -60,7 +59,7 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
             assert argv[argv.index("--sandbox") + 1] == "read-only"
         else:
             assert argv[argv.index("--tools") + 1] == ""
-    assert max_attempts == len(payload["cascade"]) == 3
+    assert max_attempts == len(payload["cascade"]) == 2
 
 
 def test_exact_task_target_is_parameterized_for_enqueue_and_marker(monkeypatch):
