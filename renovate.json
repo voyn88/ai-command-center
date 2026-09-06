@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommitsDisabled"],
+  "labels": ["deps"],
+  "prConcurrentLimit": 3,
+  "rangeStrategy": "pin",
+  "packageRules": [
+    {
+      "description": "Low-risk patch/minor dev-tooling may auto-merge only after the repo's required gates; everything else waits for the normal acceptance train (delivery rules: allowlisted low-risk only).",
+      "matchUpdateTypes": ["patch"],
+      "matchDepTypes": ["devDependencies"],
+      "automerge": false
+    },
+    {
+      "description": "Security-sensitive, major, runtime and protocol updates always go through independent acceptance.",
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "addLabels": ["deps-major"]
+    }
+  ],
+  "vulnerabilityAlerts": { "enabled": true, "addLabels": ["security"] },
+  "osvVulnerabilityAlerts": true
+}
