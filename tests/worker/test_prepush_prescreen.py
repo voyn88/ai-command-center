@@ -11,8 +11,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from command_center.runtime import providers
 from command_center.worker import prepush_prescreen as ps
 
@@ -200,6 +198,74 @@ def test_ollama_step_surfaces_findings_from_a_fake_model(git_repo, monkeypatch, 
     step = next(s for s in report.steps if s.name == "ollama_prescreen")
     assert step.ran and not step.passed
     assert "test coverage" in step.detail
+
+
+# -- workspace git safety: agent-controlled config/hooks must never fire ---------
+
+
+def test_poisoned_fsmonitor_and_hooks_never_execute(git_repo, monkeypatch, tmp_path) -> None:
+    """An agent-controlled `.git/config`/hooks must not fire just because the
+    prescreen ran a `git` command in this workspace -- mirrors
+    `test_isolated_workspace.py::test_agent_git_config_cannot_redirect_guarded_publish`,
+    the same threat against the guarded-publish checkpoint that runs right
+    after this."""
+    _unavailable(monkeypatch)
+    sentinel = tmp_path / "sentinel"
+    attacker = tmp_path / "attacker.sh"
+    attacker.write_text(f"#!/bin/sh\ntouch '{sentinel}'\n")
+    attacker.chmod(0o755)
+    subprocess.run(["git", "config", "core.fsmonitor", str(attacker)], cwd=git_repo, check=True)
+    hooks_dir = git_repo / ".git" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    for hook_name in ("pre-push", "post-commit"):
+        hook = hooks_dir / hook_name
+        hook.write_text(f"#!/bin/sh\ntouch '{sentinel}'\n")
+        hook.chmod(0o755)
+    (git_repo / "changed.py").write_text("y = 2\n")
+
+    ps.run_prepush_prescreen(git_repo, base_sha=_head(git_repo))
+
+    assert not sentinel.exists()
+
+
+def test_poisoned_clean_filter_on_an_untracked_file_never_executes(
+    git_repo, monkeypatch, tmp_path
+) -> None:
+    """An untracked `.gitattributes` plus a local `filter.<name>.clean` --
+    both fully agent-controlled -- must not run just because the ollama step
+    reads an untracked file's content. Regression: `git diff --no-index`
+    still resolves and executes attribute-driven filters even though the
+    file itself was never added to the index."""
+    fake = tmp_path / "fake-ollama"
+    fake.write_text("#!/bin/sh\necho 'no findings'\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(
+        providers,
+        "get_provider",
+        lambda pid: type(
+            "_Available",
+            (),
+            {
+                "availability": staticmethod(
+                    lambda: providers.ProviderAvailability(
+                        "ollama", True, "usable", "ok", str(fake), "0"
+                    )
+                )
+            },
+        )(),
+    )
+    sentinel = tmp_path / "sentinel"
+    attacker = tmp_path / "attacker.sh"
+    attacker.write_text(f"#!/bin/sh\ntouch '{sentinel}'\ncat\n")
+    attacker.chmod(0o755)
+    subprocess.run(["git", "config", "filter.evil.clean", str(attacker)], cwd=git_repo, check=True)
+    subprocess.run(["git", "config", "filter.evil.required", "true"], cwd=git_repo, check=True)
+    (git_repo / ".gitattributes").write_text("payload.txt filter=evil\n")
+    (git_repo / "payload.txt").write_text("raw payload\n")
+
+    ps.run_prepush_prescreen(git_repo, base_sha=_head(git_repo))
+
+    assert not sentinel.exists()
 
 
 # -- aider auto-fix: opt-in, off by default --------------------------------------
