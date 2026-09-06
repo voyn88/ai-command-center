@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from pathlib import Path
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
@@ -40,61 +41,69 @@ def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
         return 0
     now = db.iso_now()
     with db.connect(db_path) as conn:
-        table = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provenance'"
-        ).fetchone()
-        if table is None:
+        try:
+            with db.transaction(conn):
+                cursor = conn.execute(
+                    """INSERT INTO run_provenance (
+                           run_id, task_id, repository_path, worktree_path, branch,
+                           base_branch, base_sha, head_sha, pull_request_number,
+                           pull_request_url, pull_request_head_sha, accepted_sha,
+                           accepted_at, created_at, updated_at
+                       )
+                       SELECT r.id, r.task_id, NULL, r.repository_path, c.branch,
+                              c.base_branch, NULL, c.head_commit, c.pull_request_number,
+                              c.pull_request_url,
+                              CASE WHEN c.pull_request_number IS NOT NULL THEN c.head_commit END,
+                              CASE
+                                  WHEN c.completion_state = 'COMPLETED'
+                                   AND c.last_reason_code = 'TARGET_VERIFIED'
+                                  THEN COALESCE(c.merge_commit, c.head_commit)
+                              END,
+                              CASE
+                                  WHEN c.completion_state = 'COMPLETED'
+                                   AND c.last_reason_code = 'TARGET_VERIFIED'
+                                  THEN c.updated_at
+                              END,
+                              r.created_at, ?
+                       FROM run AS r
+                       LEFT JOIN completion AS c ON c.run_id = r.id
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM run_provenance AS p WHERE p.run_id = r.id
+                       )
+                       ORDER BY r.created_at, r.rowid
+                       LIMIT ?
+                       RETURNING *""",
+                    (now, limit),
+                )
+                # `RETURNING *` gives the rows this statement created — exactly
+                # them, and nothing else.
+                #
+                # The previous version read them back with `WHERE updated_at = ?`
+                # and its comment claimed to be "the rows this INSERT just
+                # created", bounded by `limit`. Independent acceptance measured
+                # both claims false: `iso_now()` is second-precision, so a row
+                # written by `update_run_provenance` a moment earlier, or by an
+                # earlier backfill call in the same second, came back too. Every
+                # row read was still a current authority row, so the consequence
+                # was over-mirroring rather than corruption — but a comment
+                # describing a set the query does not return is the defect class
+                # this migration keeps rejecting, and on a busy system the set it
+                # returns is bounded by how many rows share a second rather than
+                # by `limit`.
+                backfilled = [dict(row) for row in cursor.fetchall()]
+                inserted = len(backfilled)
+        except sqlite3.OperationalError as exc:
+            # `migrate()` only calls this once the schema is at version 13 or
+            # newer, so `run_provenance` is always present on that path — an
+            # instrumented 1442-call run never hit a missing-table condition
+            # here (VOYN-W0-AICC-TABLE-EXISTS-HELPER). This is a safety net
+            # for the function's other callers (it is exported from
+            # `db/__init__.py`), not a live branch, so it reacts to the
+            # driver's actual error instead of spending a query per call
+            # proving what is already known.
+            if "no such table" not in str(exc):
+                raise
             return 0
-        with db.transaction(conn):
-            cursor = conn.execute(
-                """INSERT INTO run_provenance (
-                       run_id, task_id, repository_path, worktree_path, branch,
-                       base_branch, base_sha, head_sha, pull_request_number,
-                       pull_request_url, pull_request_head_sha, accepted_sha,
-                       accepted_at, created_at, updated_at
-                   )
-                   SELECT r.id, r.task_id, NULL, r.repository_path, c.branch,
-                          c.base_branch, NULL, c.head_commit, c.pull_request_number,
-                          c.pull_request_url,
-                          CASE WHEN c.pull_request_number IS NOT NULL THEN c.head_commit END,
-                          CASE
-                              WHEN c.completion_state = 'COMPLETED'
-                               AND c.last_reason_code = 'TARGET_VERIFIED'
-                              THEN COALESCE(c.merge_commit, c.head_commit)
-                          END,
-                          CASE
-                              WHEN c.completion_state = 'COMPLETED'
-                               AND c.last_reason_code = 'TARGET_VERIFIED'
-                              THEN c.updated_at
-                          END,
-                          r.created_at, ?
-                   FROM run AS r
-                   LEFT JOIN completion AS c ON c.run_id = r.id
-                   WHERE NOT EXISTS (
-                       SELECT 1 FROM run_provenance AS p WHERE p.run_id = r.id
-                   )
-                   ORDER BY r.created_at, r.rowid
-                   LIMIT ?
-                   RETURNING *""",
-                (now, limit),
-            )
-            # `RETURNING *` gives the rows this statement created — exactly
-            # them, and nothing else.
-            #
-            # The previous version read them back with `WHERE updated_at = ?`
-            # and its comment claimed to be "the rows this INSERT just
-            # created", bounded by `limit`. Independent acceptance measured
-            # both claims false: `iso_now()` is second-precision, so a row
-            # written by `update_run_provenance` a moment earlier, or by an
-            # earlier backfill call in the same second, came back too. Every
-            # row read was still a current authority row, so the consequence
-            # was over-mirroring rather than corruption — but a comment
-            # describing a set the query does not return is the defect class
-            # this migration keeps rejecting, and on a busy system the set it
-            # returns is bounded by how many rows share a second rather than
-            # by `limit`.
-            backfilled = [dict(row) for row in cursor.fetchall()]
-            inserted = len(backfilled)
     for record in backfilled:
         _mirror("PostgresRunProvenanceMirror", record, "run_provenance")
     return inserted

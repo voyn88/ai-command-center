@@ -81,6 +81,21 @@ def test_legacy_backfill_is_bounded_idempotent_and_honest(tmp_path):
         assert "base_sha" in view["unknown_fields"]
 
 
+def test_backfill_on_a_schema_without_run_provenance_returns_zero(tmp_path):
+    """Safety net for callers other than `migrate()` (VOYN-W0-AICC-TABLE-EXISTS-HELPER):
+    `migrate()` only reaches `backfill_run_provenance` once the schema is at
+    version 13+, so `run_provenance` always exists on that path. A caller
+    invoking it directly against an older/partial schema must still get `0`
+    rather than an unhandled `sqlite3.OperationalError`."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    with db.connect(db_path) as conn:
+        with db.transaction(conn):
+            conn.execute("DROP TABLE run_provenance")
+
+    assert db.backfill_run_provenance(db_path, limit=1) == 0
+
+
 def test_pr_and_completed_ci_are_bound_to_exact_run_and_head(tmp_path):
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)

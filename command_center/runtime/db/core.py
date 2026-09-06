@@ -368,6 +368,27 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether table `name` exists on this connection, dialect-independent.
+
+    `execution.py`'s `run_provenance`/`run_provider_route` guards are live,
+    not dead code (VOYN-W0-AICC-TABLE-EXISTS-HELPER: an instrumented 3869-test
+    run hit the missing-table branch twice, both from tests that build a
+    partially migrated schema on purpose) — a database migrated only part-way
+    genuinely lacks these tables, and the guarded callers must keep working
+    against it. This centralizes the check so every call site — and a future
+    PostgreSQL-backed `connect()` — shares one dialect switch instead of each
+    hand-rolling its own `sqlite_master`/`to_regclass` query.
+    """
+    if isinstance(conn, sqlite3.Connection):
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        return row is not None
+    row = conn.execute("SELECT to_regclass(%s) IS NOT NULL", (name,)).fetchone()
+    return bool(row[0])
+
+
 _SCHEMA_VERSION_TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
 )
