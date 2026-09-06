@@ -193,6 +193,25 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-SRV-04b",
     ),
+    "executor_availability": Exclusion(
+        reason=(
+            "PostgreSQL-native authority from birth (0018): there is no SQLite "
+            "predecessor for a fleet-wide fact — the whole point is that it is "
+            "shared by every host, which a per-host SQLite database structurally "
+            "cannot be. A mirror would also fail the contract's own reachable-"
+            "non-test-caller property for the same reason `work_item`'s does."
+        ),
+        task="VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY",
+    ),
+    "executor_availability_event": Exclusion(
+        reason=(
+            "As `executor_availability`: the protocol's own audit, written "
+            "inside the same transaction as the mark/clear it records; "
+            "mirroring it would give that audit a second, eventually-"
+            "consistent copy, and there is still no SQLite source to mirror."
+        ),
+        task="VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY",
+    ),
     "principal": Exclusion(
         reason=(
             "PostgreSQL-native authority with no SQLite source: an identity is "

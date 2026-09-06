@@ -84,6 +84,9 @@
       "audit",
       "orchestration"
     ],
+    "command_center/db/executor_availability.py": [
+      "orchestration"
+    ],
     "command_center/db/work_queue_store.py": [
       "queue"
     ],

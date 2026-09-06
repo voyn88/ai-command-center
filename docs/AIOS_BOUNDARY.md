@@ -249,6 +249,19 @@ section below for why it exists at all):
   governed. It has no relationship to the actual seam to the platform's
   identity, `http_auth/` below, and grants no HTTP capability there or
   anywhere else.
+  `command_center/db/executor_availability.py` (VOYN-W0-AICC-EXECUTOR-QUOTA-
+  VISIBILITY, `0018_executor_availability.up.sql`) is the same shape again:
+  a thin client of a PL/pgSQL-owned protocol (`executor_mark_unavailable`,
+  `executor_mark_available`, function-only mutation under the queue-claim
+  idiom) that reports a worker's own observation of a provider's account
+  fleet-wide and lets `worker/handlers.py`'s preflight skip a still-cooling-
+  down executor before it is dispatched — not a scheduler, not a second
+  routing engine; `command_center/orchestrator/`'s routing matrix and
+  cascade-candidate iteration above are untouched, this only narrows which
+  candidate that iteration is allowed to pick. The `executor` name token is
+  the domain's own vocabulary (the migration, its tables, and this task's own
+  name all use it), not a name a rename would make more accurate, so it is
+  carried in the baseline under this same heading rather than renamed away.
 
 ### `command_center/http_auth/` — why it was added to a frozen category
 

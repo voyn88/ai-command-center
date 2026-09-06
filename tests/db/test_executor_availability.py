@@ -180,18 +180,43 @@ def test_list_all_reports_every_marked_executor(stores) -> None:
     assert verdicts["copilot_cli"].reason == "authentication_failed"
 
 
-def test_expired_cooldown_reports_unavailable_until_expiry_confirmed_live(
+def test_expired_cooldown_reports_available_without_an_explicit_clear(
     stores,
 ) -> None:
-    """The TTL is a cooldown a caller chooses, not a self-clearing timer —
-    `executor_availability`'s row stays `unavailable` past `unavailable_until`
-    until something calls `executor_mark_available` (an operator, or a later
-    successful run). This is the honest half of the migration's own
-    docstring: nothing on this side of the CLI knows when to clear itself."""
+    """The TTL IS a self-expiring cooldown, not a mark that only an explicit
+    `executor_mark_available` can lift — the migration's own docstring says
+    `executor_mark_available` lets a caller "clear it early rather than
+    waiting out a guess", which only makes sense if waiting the guess out is
+    itself a way back to available. A monthly quota's cooldown is deliberately
+    much shorter than the real reset it is guessing at (0018's own docstring),
+    so retrying automatically once it elapses is the intended behaviour, not
+    a bug: a human (or a route through a different executor entirely) decides
+    whether that retry was premature, the same way any other bounded backoff
+    in this codebase works."""
     worker, app, _operator, _read = stores
     worker.mark_unavailable("codex", "quota_limit", 1)
     time.sleep(1.2)
 
     verdict = app.get("codex", use_cache=False)
-    assert verdict.status == "unavailable"  # still true until explicitly cleared
+    assert verdict.available
+    assert verdict.reason is None and verdict.unavailable_until is None
+
+
+def test_unexpired_cooldown_still_reports_unavailable(stores) -> None:
+    worker, app, _operator, _read = stores
+    worker.mark_unavailable("codex", "quota_limit", 3600)
+
+    verdict = app.get("codex", use_cache=False)
+    assert not verdict.available
     assert verdict.reason == "quota_limit"
+
+
+def test_list_all_reflects_the_same_self_expiry_as_get(stores) -> None:
+    worker, app, _operator, _read = stores
+    worker.mark_unavailable("codex", "quota_limit", 1)
+    worker.mark_unavailable("copilot_cli", "authentication_failed", 3600)
+    time.sleep(1.2)
+
+    verdicts = {v.executor_id: v for v in app.list_all()}
+    assert verdicts["codex"].available
+    assert not verdicts["copilot_cli"].available

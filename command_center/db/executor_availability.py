@@ -39,6 +39,27 @@ _CACHE_TTL_SECONDS = 5.0
 _cache: dict[str, tuple[float, "ExecutorAvailability"]] = {}
 _cache_lock = threading.Lock()
 
+# A row past its own `unavailable_until` reads back as available -- the
+# cooldown is a TTL, not a mark that only an explicit `executor_mark_available`
+# or a fresh `executor_mark_unavailable` can move (see 0018's own docstring:
+# "clear it early rather than waiting out a guess", which only makes sense if
+# waiting the guess out is itself a way to become available again). The
+# comparison runs in Postgres, against Postgres's own `now()`, both to avoid
+# trusting a caller's clock and to keep the semantics in one place shared by
+# every reader (`get()`, `list_all()`, and `work_queue_read.py`'s dashboard
+# query) rather than duplicated as a Python-side time check in each.
+_LIVE_STATUS_SQL = (
+    "CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+    " THEN status ELSE 'available' END"
+)
+_LIVE_REASON_SQL = (
+    "CASE WHEN status = 'unavailable' AND unavailable_until > now() THEN reason END"
+)
+_LIVE_UNTIL_SQL = (
+    "CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+    " THEN unavailable_until END"
+)
+
 
 def clear_cache() -> None:
     """Drop every memoized verdict. Tests that mark/clear an executor mid-run
@@ -101,8 +122,8 @@ class ExecutorAvailabilityStore:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT status, reason, unavailable_until FROM executor_availability"
-                    " WHERE executor_id = %s",
+                    f"SELECT {_LIVE_STATUS_SQL}, {_LIVE_REASON_SQL}, {_LIVE_UNTIL_SQL}"
+                    " FROM executor_availability WHERE executor_id = %s",
                     (executor_id,),
                 )
                 row = cur.fetchone()
@@ -124,8 +145,8 @@ class ExecutorAvailabilityStore:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT executor_id, status, reason, unavailable_until"
-                    " FROM executor_availability ORDER BY executor_id"
+                    f"SELECT executor_id, {_LIVE_STATUS_SQL}, {_LIVE_REASON_SQL},"
+                    f" {_LIVE_UNTIL_SQL} FROM executor_availability ORDER BY executor_id"
                 )
                 rows = cur.fetchall()
         return [

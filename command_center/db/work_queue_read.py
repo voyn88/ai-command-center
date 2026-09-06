@@ -147,8 +147,19 @@ class WorkQueueReadStore:
         marked unavailable; this is the durable-state table, not a seeded
         roster of every executor id `command_center.executors` knows about.
         """
+        # A row past its own `unavailable_until` reads back as available, the
+        # same self-expiring comparison `ExecutorAvailabilityStore.get()` and
+        # `.list_all()` apply — a dashboard mixing this with the routing
+        # verdict must not disagree with what routing itself is doing.
         sql = (
-            "SELECT executor_id, status, reason, unavailable_until, updated_at"
+            "SELECT executor_id,"
+            " CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+            "      THEN status ELSE 'available' END AS status,"
+            " CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+            "      THEN reason END AS reason,"
+            " CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+            "      THEN unavailable_until END AS unavailable_until,"
+            " updated_at"
             " FROM executor_availability ORDER BY executor_id"
         )
         with self._connection() as conn:
