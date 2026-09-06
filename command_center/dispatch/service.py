@@ -29,10 +29,15 @@ from command_center import task_pipeline
 from command_center.project_config import is_sensitive
 from command_center.dispatch import policy_config
 from command_center.dispatch.models import (
+    SPEND_KIND_ACTUAL,
+    SPEND_KIND_ASSUMED_CEILING,
+    SPEND_MEASURED,
+    SPEND_UNAVAILABLE,
     DispatchPlan,
     DispatchPolicy,
     ExecutorProfile,
     QueuedTask,
+    SpendMeasurement,
 )
 from command_center.dispatch.policy import plan_dispatch
 from command_center.runtime import db as runtime_db
@@ -168,8 +173,18 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
 
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
+        spend_measurement = SpendMeasurement(
+            status=SPEND_MEASURED, kind=SPEND_KIND_ACTUAL
+        )
     except Exception:  # noqa: BLE001 — no cost data => fail closed (assume ceiling hit)
+        # The ceiling below is a safety stand-in for the engine's own budget
+        # math, never an observation — `spend_measurement` carries that
+        # distinction through so a consumer can't mistake it for a reading
+        # (VOYN-W0-AICC-DISPATCH-PLAN-FABRICATED-SPEND).
         spend = settings.max_daily_spend_usd or 0.0
+        spend_measurement = SpendMeasurement(
+            status=SPEND_UNAVAILABLE, kind=SPEND_KIND_ASSUMED_CEILING
+        )
 
     return plan_dispatch(
         collect_queued_tasks(root),
@@ -179,6 +194,7 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         max_daily_spend_usd=settings.max_daily_spend_usd,
         kill_switch_engaged=kill_switch_engaged,
         active_by_executor=active_by_executor(resolved_db),
+        spend_measurement=spend_measurement,
     )
 
 

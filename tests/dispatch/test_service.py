@@ -158,6 +158,39 @@ def test_plan_reports_kill_switch_when_master_switch_off(monkeypatch, pool):
     assert plan.decisions[0].reason == models.DEFER_KILL_SWITCH
 
 
+def test_plan_reports_unmeasured_spend_as_null_and_fails_closed(monkeypatch, pool):
+    import dataclasses
+
+    # The trailing-24h read is unavailable (e.g. a DB error): the plan must
+    # not present the ceiling it fails closed on internally as a measured
+    # spend (VOYN-W0-AICC-DISPATCH-PLAN-FABRICATED-SPEND).
+    _enable_master_switch()
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=0.4)
+    )
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("runtime.db unavailable")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    # Pin the paid executor so the free local one can't sidestep the budget —
+    # with spend assumed at the 0.4 ceiling, any positive cost must be refused.
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1", executor="claude_code", executor_pinned=True)
+
+    plan = service.plan(ROOT)
+
+    assert plan.daily_spend_usd is None
+    assert plan.spend_measurement.status == models.SPEND_UNAVAILABLE
+    assert plan.spend_measurement.kind == models.SPEND_KIND_ASSUMED_CEILING
+    # Fail-closed: nothing is assigned when the real spend is unknown.
+    assert plan.assignments == ()
+    d = plan.as_dict()
+    assert d["daily_spend_usd"] is None
+    assert d["spend_measurement"]["status"] == models.SPEND_UNAVAILABLE
+
+
 def test_plan_enforces_daily_budget_from_pipeline_settings(monkeypatch, pool):
     import dataclasses
 

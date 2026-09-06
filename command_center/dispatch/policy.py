@@ -37,11 +37,13 @@ from command_center.dispatch.models import (
     DEFER_NO_AVAILABLE_EXECUTOR,
     DEFER_NO_ELIGIBLE_EXECUTOR,
     DEFER_PROJECT_BUDGET,
+    SPEND_MEASURED,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
     ExecutorProfile,
     QueuedTask,
+    SpendMeasurement,
 )
 
 # A deadline of None must sort *after* every real deadline. ISO-8601 strings
@@ -104,11 +106,24 @@ def plan_dispatch(
     max_daily_spend_usd: float,
     kill_switch_engaged: bool,
     active_by_executor: dict[str, int] | None = None,
+    spend_measurement: SpendMeasurement,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
-    guarantees this function structurally enforces."""
+    guarantees this function structurally enforces.
+
+    `daily_spend_usd` is always a concrete number here — the budget arithmetic
+    needs one to fail closed on even when the real measurement failed (the
+    caller substitutes the ceiling in that case). What changes based on
+    `spend_measurement` is only what the *returned plan* reports: the
+    reported `daily_spend_usd` is `None` unless `spend_measurement.status`
+    is `SPEND_MEASURED`, so a fail-closed stand-in is never mistaken for an
+    observation.
+    """
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
+    reported_spend = (
+        daily_spend_usd if spend_measurement.status == SPEND_MEASURED else None
+    )
 
     # (1) Kill switch first: no assignment is even considered.
     if kill_switch_engaged:
@@ -124,9 +139,10 @@ def plan_dispatch(
         return DispatchPlan(
             decisions=decisions,
             kill_switch_engaged=True,
-            daily_spend_usd=daily_spend_usd,
+            daily_spend_usd=reported_spend,
             max_daily_spend_usd=max_daily_spend_usd,
             projected_spend_usd=daily_spend_usd,
+            spend_measurement=spend_measurement,
         )
 
     # (3) SLA/priority order.
@@ -210,9 +226,10 @@ def plan_dispatch(
     return DispatchPlan(
         decisions=tuple(decisions),
         kill_switch_engaged=False,
-        daily_spend_usd=daily_spend_usd,
+        daily_spend_usd=reported_spend,
         max_daily_spend_usd=max_daily_spend_usd,
         projected_spend_usd=projected,
+        spend_measurement=spend_measurement,
     )
 
 

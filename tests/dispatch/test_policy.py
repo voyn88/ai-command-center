@@ -8,10 +8,15 @@ from __future__ import annotations
 
 from command_center.dispatch import models
 from command_center.dispatch.models import (
+    SPEND_KIND_ACTUAL,
+    SPEND_KIND_ASSUMED_CEILING,
+    SPEND_MEASURED,
+    SPEND_UNAVAILABLE,
     AgentLimit,
     DispatchPolicy,
     ExecutorProfile,
     QueuedTask,
+    SpendMeasurement,
 )
 from command_center.dispatch.policy import plan_dispatch
 
@@ -54,6 +59,9 @@ def _plan(tasks, executors, policy, **ctx):
     ctx.setdefault("daily_spend_usd", 0.0)
     ctx.setdefault("max_daily_spend_usd", 0.0)
     ctx.setdefault("kill_switch_engaged", False)
+    ctx.setdefault(
+        "spend_measurement", SpendMeasurement(SPEND_MEASURED, SPEND_KIND_ACTUAL)
+    )
     return plan_dispatch(tasks, executors, policy, **ctx)
 
 
@@ -298,6 +306,72 @@ def test_hard_pin_restricts_to_the_pinned_executor():
     plan = _plan([_task("t1", pinned="codex")], executors, policy)
 
     assert plan.assignments[0].assigned_executor == "codex"
+
+
+# --------------------------------------------------------------------------
+# Spend measurement — a fail-closed stand-in is never reported as a reading
+# --------------------------------------------------------------------------
+
+
+def test_measured_spend_is_reported_verbatim():
+    policy = DispatchPolicy(cost_matrix={"claude_code": 0.4})
+    executors = [_executor("claude_code", cost=0.4)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=0.6,
+        max_daily_spend_usd=1.0,
+        spend_measurement=SpendMeasurement(SPEND_MEASURED, SPEND_KIND_ACTUAL),
+    )
+
+    assert plan.daily_spend_usd == 0.6
+    assert plan.spend_measurement.status == SPEND_MEASURED
+    assert plan.spend_measurement.kind == SPEND_KIND_ACTUAL
+
+
+def test_unmeasured_spend_is_reported_as_null_but_still_fails_closed():
+    # The caller substitutes the ceiling internally so the engine still fails
+    # closed (no assignment fits when "spent" already equals the ceiling),
+    # but the plan must report `daily_spend_usd` as unknown, not as 1.0.
+    policy = DispatchPolicy(cost_matrix={"claude_code": 0.4})
+    executors = [_executor("claude_code", cost=0.4)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=1.0,
+        max_daily_spend_usd=1.0,
+        spend_measurement=SpendMeasurement(SPEND_UNAVAILABLE, SPEND_KIND_ASSUMED_CEILING),
+    )
+
+    assert plan.daily_spend_usd is None
+    assert plan.spend_measurement.status == SPEND_UNAVAILABLE
+    assert plan.spend_measurement.kind == SPEND_KIND_ASSUMED_CEILING
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
+    d = plan.as_dict()
+    assert d["daily_spend_usd"] is None
+    assert d["spend_measurement"] == {
+        "status": SPEND_UNAVAILABLE,
+        "kind": SPEND_KIND_ASSUMED_CEILING,
+    }
+
+
+def test_unmeasured_spend_is_reported_as_null_under_kill_switch_too():
+    policy = DispatchPolicy()
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=1.0,
+        kill_switch_engaged=True,
+        spend_measurement=SpendMeasurement(SPEND_UNAVAILABLE, SPEND_KIND_ASSUMED_CEILING),
+    )
+
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd == 1.0
 
 
 def test_plan_is_deterministic_for_identical_input():

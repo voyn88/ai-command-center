@@ -89,6 +89,37 @@ DEFAULT_LOCAL_EXECUTOR_IDS = frozenset({"ollama"})
 # Fallback per-task cost when the cost matrix names no price for an executor.
 DEFAULT_COST_USD = 1.0
 
+# --------------------------------------------------------------------------
+# Spend measurement — whether `daily_spend_usd` is a real reading or a
+# fail-closed stand-in, so a consumer never mistakes the latter for the former
+# (VOYN-W0-AICC-DISPATCH-PLAN-FABRICATED-SPEND).
+# --------------------------------------------------------------------------
+
+SPEND_MEASURED = "measured"
+SPEND_UNAVAILABLE = "unavailable"
+
+# The kind of number backing the engine's budget arithmetic right now.
+SPEND_KIND_ACTUAL = "actual"
+SPEND_KIND_ASSUMED_CEILING = "assumed_ceiling"
+
+
+@dataclass(frozen=True)
+class SpendMeasurement:
+    """Whether `DispatchPlan.daily_spend_usd` is a real reading.
+
+    When the trailing-24h read fails, the engine still needs a concrete
+    number to fail closed on (it assumes the ceiling is hit, so nothing gets
+    assigned) — but that assumed number must never be reported to a consumer
+    as if it were an actual measurement. `status`/`kind` carry that
+    distinction through to `DispatchPlan.as_dict()`.
+    """
+
+    status: str  # SPEND_MEASURED | SPEND_UNAVAILABLE
+    kind: str  # SPEND_KIND_ACTUAL | SPEND_KIND_ASSUMED_CEILING
+
+    def as_dict(self) -> dict:
+        return {"status": self.status, "kind": self.kind}
+
 
 # --------------------------------------------------------------------------
 # Value objects
@@ -281,13 +312,22 @@ class DispatchDecision:
 
 @dataclass(frozen=True)
 class DispatchPlan:
-    """The whole plan: one decision per task plus the budget arithmetic."""
+    """The whole plan: one decision per task plus the budget arithmetic.
+
+    `daily_spend_usd` is `None` whenever `spend_measurement.status` is
+    `SPEND_UNAVAILABLE` — the trailing-24h read failed and the number the
+    engine used internally to fail closed (see `spend_measurement.kind`) is a
+    safety stand-in, not an observation, so it is never reported as one.
+    """
 
     decisions: tuple[DispatchDecision, ...]
     kill_switch_engaged: bool
-    daily_spend_usd: float
+    daily_spend_usd: float | None
     max_daily_spend_usd: float
     projected_spend_usd: float
+    spend_measurement: SpendMeasurement = field(
+        default_factory=lambda: SpendMeasurement(SPEND_MEASURED, SPEND_KIND_ACTUAL)
+    )
 
     @property
     def assignments(self) -> tuple[DispatchDecision, ...]:
@@ -308,6 +348,7 @@ class DispatchPlan:
         return {
             "kill_switch_engaged": self.kill_switch_engaged,
             "daily_spend_usd": self.daily_spend_usd,
+            "spend_measurement": self.spend_measurement.as_dict(),
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,
             "budget_remaining_usd": (None if remaining == float("inf") else remaining),

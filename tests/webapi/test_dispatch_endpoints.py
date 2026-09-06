@@ -54,6 +54,7 @@ def test_get_plan_returns_serialized_plan(monkeypatch):
     assert body["assignment_count"] == 1
     assert body["decisions"][0]["assigned_executor"] == "ollama"
     assert body["budget_remaining_usd"] == 5.0
+    assert body["spend_measurement"] == {"status": "measured", "kind": "actual"}
 
 
 def test_post_assign_forwards_confirmation(monkeypatch, authenticated_caller):
