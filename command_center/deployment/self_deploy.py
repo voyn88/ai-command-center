@@ -263,16 +263,26 @@ def self_deploy_once(
                 f"{(migrated.stderr or migrated.stdout).strip()[:130]}",
                 services_touched=False,
             )
-        report.steps.append("migrations_applied")
+        # `db upgrade` runs the pending migrations AND unconditionally
+        # re-asserts the grant matrix (roles.apply_table_grants) even when
+        # no migration was pending -- so a clean exit is never provably a
+        # no-op (review of 5eb6f62: "ran once" isn't "mutated"; review of
+        # 15774a77: an "already up to date" schema can still see its grants
+        # change). Rather than guess from exit code or stdout, every
+        # successful invocation is recorded as a write that will NOT be
+        # rolled back, which is true whether or not anything actually
+        # changed.
+        report.steps.append("database_upgrade_ran_not_rolled_back")
 
-    # Applied migrations are deliberately NOT rolled back on a later restart
-    # failure: this codebase's migration policy is expand-contract (each
-    # migration is backward-compatible with the previous code, and the
+    # A completed `db upgrade` is deliberately NOT rolled back on a later
+    # restart failure: this codebase's migration policy is expand-contract
+    # (each migration is backward-compatible with the previous code, and the
     # legacy path is removed only by a separately accepted change), so the
-    # PREVIOUS code running against the migrated schema is the supported
-    # state by design. An automatic `downgrade` here would be the opposite
-    # of safety: it is the one operation that can DROP data, which is why
-    # the CLI gates it behind --yes-i-understand-this-drops-data.
+    # PREVIOUS code running against the upgraded database (schema and
+    # grants) is the supported state by design. An automatic `downgrade`
+    # here would be the opposite of safety: it is the one operation that can
+    # DROP data, which is why the CLI gates it behind
+    # --yes-i-understand-this-drops-data.
     failure = _restart_services(cfg, report)
     if failure is not None:
         # Half old, half new is the state rollback exists to prevent -- so
