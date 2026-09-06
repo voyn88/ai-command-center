@@ -656,7 +656,12 @@ def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, s
     return cutoff, zone_name, source
 
 
-def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
+_RUNTIME_RETENTION_BATCH_SIZE = 500
+
+
+def apply_runtime_retention(
+    db_path: Path, *, retention_days: int, batch_size: int = _RUNTIME_RETENTION_BATCH_SIZE
+) -> int:
     """Delete `run_event` rows (and orphaned `report` rows) for runs that have
     been terminal for longer than `retention_days`, returning the number of
     `run_event` rows removed.
@@ -674,6 +679,15 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
         in the Execution Center and to reconciliation); only the bulky
         per-output-event history is pruned;
       * runs with a NULL `completed_at` are left untouched.
+      * deletion is batched at `batch_size` rows per transaction instead of one
+        unbounded `DELETE`, so a long-neglected database is pruned as a series
+        of short write-lock holds rather than one transaction that blocks every
+        other writer for as long as the whole backlog takes to remove
+        (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`). Each batch selects the
+        exact `run_event.id`s it is about to remove and deletes precisely
+        those ids, so the deleted count for a batch always matches the number
+        selected even though the eligibility query is re-evaluated fresh each
+        time (rows already removed simply drop out of the next batch).
 
     Does not VACUUM here — reclaiming disk is a separate, heavier, lock-holding
     operation the operator should run deliberately (see `maybe_apply_runtime_retention`).
@@ -684,21 +698,35 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
         db_path, retention_days=retention_days
     )
     placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
+    select_ids_sql = f"""
+        SELECT id FROM run_event
+         WHERE run_id IN (
+            SELECT id FROM run
+             WHERE state IN ({placeholders})
+               AND completed_at IS NOT NULL
+               AND completed_at < ?
+         )
+         LIMIT ?
+    """
+    removed = 0
     with db.connect(db_path) as conn:
-        with db.transaction(conn):
-            cur = conn.execute(
-                f"""
-                DELETE FROM run_event
-                 WHERE run_id IN (
-                    SELECT id FROM run
-                     WHERE state IN ({placeholders})
-                       AND completed_at IS NOT NULL
-                       AND completed_at < ?
-                 )
-                """,
-                (*db.TERMINAL_STATES, cutoff),
-            )
-            removed = cur.rowcount
+        while True:
+            with db.transaction(conn):
+                ids = [
+                    row["id"]
+                    for row in conn.execute(
+                        select_ids_sql, (*db.TERMINAL_STATES, cutoff, batch_size)
+                    ).fetchall()
+                ]
+                if not ids:
+                    break
+                id_placeholders = ",".join("?" for _ in ids)
+                cur = conn.execute(
+                    f"DELETE FROM run_event WHERE id IN ({id_placeholders})", ids
+                )
+                removed += cur.rowcount
+            if len(ids) < batch_size:
+                break
         # `report` rows cascade-delete with `run` via FK, but a terminal run's
         # report file on disk is also historical; leave the DB row (the path is
         # small) — only events are bulky.
