@@ -69,6 +69,7 @@ import os
 import re
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -1789,6 +1790,10 @@ def _remediate_rejection(
             conn.autocommit = True
 
 
+_ACCEPTANCE_GATE_RERUN_PAGE_SIZE = 100
+_ACCEPTANCE_GATE_RERUN_MAX_PAGES = 5
+
+
 def _rerun_failing_acceptance_gate(repo_path: str, pr_url: str, sha: str) -> None:
     """After posting the marker, re-run the Acceptance-gate run that failed on
     this PR's exact head before the marker existed.
@@ -1800,44 +1805,70 @@ def _rerun_failing_acceptance_gate(repo_path: str, pr_url: str, sha: str) -> Non
     (live-confirmed on #383/#392/#393: the merge queue refused with "Required
     status check Acceptance gate is failing" until this run was re-run).
     Re-running that failing pull_request run makes it re-evaluate on the
-    now-present marker and go green. The lookup is scoped to the PR's own head
-    branch, so a different PR that happens to share the head sha (a different
-    base branch) is never touched and the run-list window cannot be exhausted
-    by unrelated PRs' runs on an active repo. Best-effort and idempotent -- any
-    failure just leaves the event-driven or a manual re-run to cover it.
+    now-present marker and go green.
+
+    Scoped to THIS pull request by number, not merely by head sha or head
+    branch: two PRs in the same repo can share both when the same branch is
+    opened against two different base branches, and sha/branch scoping alone
+    can rerun the wrong PR's gate while leaving the intended one red (review
+    of 487a78a, REJECT). Each workflow run's own `pull_requests` field names
+    the PR(s) that triggered it, so matching on
+    `pr_number in {p.number for p in run.pull_requests}` stays correct even
+    when sha and branch are shared. The `head_sha` query parameter also
+    filters server-side, so correctness does not depend on a client-side
+    run-count limit the way `gh run list --limit N` did; the page loop below
+    is just a bound on how far a pathological number of same-sha runs is
+    walked, not the mechanism that finds the right run. Best-effort and
+    idempotent -- any failure just leaves the event-driven or a manual
+    re-run to cover it.
     (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)
     """
-    view = _gh(["pr", "view", pr_url, "--json", "headRefName"], repo_path)
-    if view.returncode != 0:
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
         return
+    owner, repo, number = parsed
     try:
-        branch = (json.loads(view.stdout or "{}")).get("headRefName")
-    except json.JSONDecodeError:
+        pr_number = int(number)
+    except ValueError:
         return
-    if not branch:
-        return
-    listing = _gh(
-        ["run", "list", "--workflow", "acceptance-gate.yml", "--branch", branch,
-         "--limit", "30", "--json", "databaseId,headSha,event,conclusion,status"],
-        repo_path,
+    endpoint = (
+        f"repos/{urllib.parse.quote(owner)}/{urllib.parse.quote(repo)}"
+        "/actions/workflows/acceptance-gate.yml/runs"
     )
-    if listing.returncode != 0:
-        return
-    try:
-        runs = json.loads(listing.stdout or "[]")
-    except json.JSONDecodeError:
-        return
-    if not isinstance(runs, list):
-        return
-    for run in runs:
-        if (
-            isinstance(run, dict)
-            and run.get("headSha") == sha
-            and run.get("event") == "pull_request"
-            and run.get("status") == "completed"
-            and run.get("conclusion") != "success"
-        ):
-            _gh(["run", "rerun", str(run.get("databaseId"))], repo_path)
+    for page in range(1, _ACCEPTANCE_GATE_RERUN_MAX_PAGES + 1):
+        query = urllib.parse.urlencode({
+            "head_sha": sha,
+            "event": "pull_request",
+            "per_page": _ACCEPTANCE_GATE_RERUN_PAGE_SIZE,
+            "page": page,
+        })
+        listing = _gh(
+            ["api", f"{endpoint}?{query}", "--jq", ".workflow_runs"],
+            repo_path,
+        )
+        if listing.returncode != 0:
+            return
+        try:
+            runs = json.loads(listing.stdout or "[]")
+        except json.JSONDecodeError:
+            return
+        if not isinstance(runs, list) or not runs:
+            return
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            pr_numbers = {
+                p.get("number") for p in (run.get("pull_requests") or [])
+                if isinstance(p, dict)
+            }
+            if (
+                pr_number in pr_numbers
+                and run.get("status") == "completed"
+                and run.get("conclusion") != "success"
+            ):
+                _gh(["run", "rerun", str(run.get("id"))], repo_path)
+                return
+        if len(runs) < _ACCEPTANCE_GATE_RERUN_PAGE_SIZE:
             return
 
 
