@@ -1170,6 +1170,89 @@ def test_merge_transaction_rolls_back_before_restoring_autocommit_on_error(monke
     assert autocommit_restores and autocommit_restores[-1] > rollback_index
 
 
+def test_merge_retries_the_done_transition_after_a_transaction_failure(monkeypatch):
+    """VOYN-W0-AICC-MERGE-GATEWAY-REM (adversarial review of #618, chunk
+    3/7): a task must never be permanently wedged in READY_TO_REVIEW after
+    GitHub has already merged its PR. If the evidence+DONE transaction
+    fails on the tick that first observes the merge (e.g. a concurrent
+    optimistic-revision conflict), a later tick must retry -- and succeed --
+    because `_merged_target_sha` re-derives "already merged" from GitHub
+    itself on every tick rather than from any local state, so the exact
+    same merged PR is seen again. This must happen WITHOUT calling `gh pr
+    merge` a second time: the merge already happened, only the bookkeeping
+    is being retried."""
+    merge_bot_calls = []
+
+    class _FakeCursor:
+        def __init__(self, transition_outcome):
+            self._last_sql = ""
+            self._transition_outcome = transition_outcome
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=()):
+            self._last_sql = sql
+
+        def fetchone(self):
+            if "backlog_transition" in self._last_sql:
+                return self._transition_outcome
+            return (1,)  # revision
+
+    class _FakeConn:
+        def __init__(self, transition_outcome):
+            self._transition_outcome = transition_outcome
+            self.autocommit = True
+            self.committed = False
+            self.rolledback = False
+
+        def cursor(self):
+            return _FakeCursor(self._transition_outcome)
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            self.rolledback = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    head = "a" * 40
+    monkeypatch.setattr(
+        review_merge, "_scan_tasks",
+        lambda *a, **k: ([("T1", "https://github.com/x/y/pull/1")], None),
+    )
+    monkeypatch.setattr(review_merge, "_scan_commit", lambda *a, **k: None)
+    monkeypatch.setattr(review_merge, "_merged_target_sha", lambda *a, **k: (head, ""))
+    monkeypatch.setattr(
+        review_merge, "_merge_pull_request_as_bot",
+        lambda *a, **k: merge_bot_calls.append(1) or (True, "", False),
+    )
+
+    # Tick 1: the transition reports a conflict (e.g. a concurrent writer)
+    # -- the task must stay READY_TO_REVIEW, not raise, and not be dropped.
+    conn1 = _FakeConn((False, "stale_revision"))
+    report1 = review_merge.merge_once(lambda: conn1, "/tmp")
+    assert ("T1", "transition:stale_revision") in report1.skipped
+    assert not report1.merged
+    assert conn1.rolledback and not conn1.committed
+
+    # Tick 2: GitHub still reports the same PR merged; this time the
+    # transition succeeds -- no re-merge was ever attempted.
+    conn2 = _FakeConn((True, None))
+    report2 = review_merge.merge_once(lambda: conn2, "/tmp")
+    assert ("T1", head) in report2.merged
+    assert conn2.committed and not conn2.rolledback
+    assert merge_bot_calls == []
+
+
 def test_mergeability_uses_latest_check_rerun(monkeypatch):
     import subprocess
 
