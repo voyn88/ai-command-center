@@ -140,6 +140,52 @@ def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
     assert report.retried == [(TASK, f"{target}:retry:1")]
 
 
+def test_six_chunk_review_retries_only_the_malformed_chunk(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 100_000)
+    chunks = review_merge._review_chunks(snapshot, TASK, PR)
+    assert len(chunks) == 6
+
+    accept_output = {"result_text": f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"}
+    malformed_output = {"result_text": "tool transcript only, no verdict"}
+
+    malformed_key = review_merge._chunk_review_key(TASK, PR, snapshot, chunks[2])
+    exhausted_key = review_merge._chunk_review_key(TASK, PR, snapshot, chunks[4])
+    attempt_rows = []
+    for index, chunk in enumerate(chunks):
+        key = review_merge._chunk_review_key(TASK, PR, snapshot, chunk)
+        if key == malformed_key:
+            attempt_rows.append((key, "succeeded", malformed_output))
+        elif key == exhausted_key:
+            attempt_rows.append((key, "succeeded", malformed_output))
+            attempt_rows.append((f"{key}:retry:1", "succeeded", malformed_output))
+            attempt_rows.append((f"{key}:retry:2", "succeeded", malformed_output))
+        else:
+            attempt_rows.append((key, "succeeded", accept_output))
+
+    def fake_rows(_factory, sql, params=()):
+        if "SELECT t.task_id" in sql:
+            return [(TASK, PR)]
+        assert "i.idempotency_key" in sql
+        _task_id, prefix, _prefix2 = params
+        return [row for row in attempt_rows if row[0].startswith(prefix)]
+
+    monkeypatch.setattr(review_merge, "_rows", fake_rows)
+    monkeypatch.setattr(
+        review_merge, "_model_only_review_cascade", lambda: [{"executor": "copilot"}]
+    )
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
+
+    dispatched = []
+    report = review_merge.reconcile_review_once(
+        None, lambda *args: dispatched.append(args), "/repo"
+    )
+
+    assert [entry[1] for entry in dispatched] == [f"{malformed_key}:retry:1"]
+    assert report.retried == [(TASK, f"{malformed_key}:retry:1")]
+
+
 def test_manifest_reorder_hash_and_snapshot_identity_are_bound():
     a = "diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n"
     b = "diff --git a/b b/b\n@@ -1 +1 @@\n-x\n+y\n"
