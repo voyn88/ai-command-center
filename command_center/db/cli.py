@@ -156,6 +156,35 @@ def build_parser() -> argparse.ArgumentParser:
         "not the merge commit). Never changes a task's status.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
 
+    pr_agent = sub.add_parser(
+        "pr-agent-review",
+        help="One PR-Agent (Qodo OSS) review tick (VOYN-W0-AICC-PR-AGENT-"
+        "INTEGRATION): run PR-Agent's read-only `review` tool against every "
+        "open, non-draft pull request whose head it has not already "
+        "covered, posting findings as a plain PR comment for a human or "
+        "review_merge.py's own reviewer to weigh -- it never submits a "
+        "GitHub PR review and never posts the ACCEPTANCE marker "
+        "(aicc-pr-agent-review.timer). Needs GEMINI_API_KEY or "
+        "GROQ_API_KEY plus PR_AGENT_MODEL in the environment; skips "
+        "loudly (not a failure) when neither is configured.",
+    )
+    pr_agent.add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    pr_agent.add_argument(
+        "--state-path",
+        required=True,
+        help="JSON file recording the last-reviewed head sha per PR "
+        "number. Must live outside the git checkout (a systemd "
+        "StateDirectory path on a real deployment) so it can never make "
+        "self-deploy's clean-checkout check see a dirty tree.",
+    )
+    pr_agent.add_argument(
+        "--max-per-tick",
+        type=int,
+        default=3,
+        help="Bounded per-tick review count (default 3) -- free-tier LLM "
+        "quota is the scarce resource, not compute.",
+    )
+
     self_deploy = sub.add_parser(
         "self-deploy",
         help="One self-deploy tick (VOYN-W0-AICC-DEPLOY-AUTOMATION): fast-"
@@ -268,6 +297,31 @@ def main(argv: list[str] | None = None) -> int:
         # A refusal or rollback exits non-zero so systemd surfaces the
         # failed tick to the operator; noop/deployed is success.
         return 0 if deploy_report.outcome in ("noop", "deployed") else 1
+
+    if args.command == "pr-agent-review":
+        # Deliberately BEFORE any database configuration or pool: this tick
+        # never opens a database connection at all (VOYN-W0-AICC-PR-AGENT-
+        # INTEGRATION) -- its own findings are advisory PR comments, not a
+        # row in the queue schema, so it has no need of one.
+        from pathlib import Path
+
+        from command_center.orchestrator.pr_agent_review import (
+            PrAgentConfig,
+            review_once,
+        )
+
+        pr_report = review_once(
+            PrAgentConfig(
+                repo_path=args.repo_path,
+                state_path=Path(args.state_path),
+                max_per_tick=args.max_per_tick,
+            )
+        )
+        for number, url in pr_report.reviewed:
+            print(f"REVIEWED  {number} -> {url}")
+        for number, reason in pr_report.skipped:
+            print(f"SKIP      {number}: {reason}")
+        return 0
 
     try:
         config = load_config()

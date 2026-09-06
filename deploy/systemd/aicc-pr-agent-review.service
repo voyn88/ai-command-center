@@ -1,0 +1,46 @@
+# PR-Agent (Qodo OSS) wired to the review contour
+# (VOYN-W0-AICC-PR-AGENT-INTEGRATION): the production caller of
+# command_center.orchestrator.pr_agent_review.review_once, which runs
+# PR-Agent's read-only `review` tool against every open, non-draft pull
+# request and posts its findings as a plain PR comment -- never a GitHub
+# PR review, never the ACCEPTANCE marker review_merge.py owns. See that
+# module's docstring for the full safety argument.
+#
+# Install (control-plane host, beside aicc-backlog-review):
+#   cp deploy/systemd/aicc-pr-agent-review.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-pr-agent-review.timer
+#
+# BLOCKED-ON-CREDENTIAL until GEMINI_API_KEY or GROQ_API_KEY plus
+# PR_AGENT_MODEL are set in /etc/ai-command-center.env (the same file
+# aicc-backlog-review.service/aicc-backlog-merge.service already read):
+# every tick skips loudly (`pr_agent_not_configured`) until then, which is
+# a normal, successful tick, not a failure -- the unit is safe to enable
+# before that decision lands.
+#
+# Identity: aicc-worker, the same principal aicc-backlog-review.service
+# already runs review_merge.py's own reviewer as -- it already carries the
+# ambient `gh` credential this needs to list pull requests and post
+# comments, and a plain comment needs no independent identity the way the
+# acceptance marker does.
+
+[Unit]
+Description=PR-Agent (Qodo OSS) review tick for the review contour
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aicc-worker
+Group=aicc-worker
+EnvironmentFile=-/etc/ai-command-center.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db pr-agent-review --repo-path /srv/ai-command-center --state-path /var/lib/aicc-pr-agent-review/state.json
+# max_per_tick(3) * per-PR subprocess timeout(480s), plus slack.
+TimeoutStartSec=1800s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=aicc-pr-agent-review
+StateDirectoryMode=0700

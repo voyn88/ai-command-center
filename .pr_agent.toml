@@ -1,0 +1,26 @@
+# PR-Agent (Qodo OSS) self-hosted review contour wiring
+# (VOYN-W0-AICC-PR-AGENT-INTEGRATION). Findings land here as plain PR
+# comments for a human or review_merge.py's own reviewer to weigh -- this
+# integration never decides ACCEPT/REJECT and never gates a merge.
+#
+# The systemd timer (aicc-pr-agent-review.timer, via
+# command_center/orchestrator/pr_agent_review.py) invokes only the bare
+# `review` tool, never the `auto_approve` sub-command -- pr_reviewer.py's
+# auto-approve branch is reachable only from that argument, so with it
+# never passed this integration cannot submit a formal GitHub PR review
+# (approve or otherwise), only the plain issue comment `review` already
+# posts. The two enable_auto_approval settings below are defense in depth
+# against that invariant changing, not the primary control.
+#
+# Provider/model selection is deliberately NOT here: see PR_AGENT_MODEL in
+# .env.example, which keeps the model name out of code the same way
+# OPENAI_MODEL already does for the OpenAI provider.
+
+[config]
+enable_auto_approval = false
+
+[pr_reviewer]
+enable_auto_approval = false
+persistent_comment = true
+require_score_review = false
+num_max_findings = 5
