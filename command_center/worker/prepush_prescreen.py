@@ -26,6 +26,7 @@ the same "never raise, absence degrades to no findings" contract this mirrors.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -125,16 +126,47 @@ def _skip(report: PrescreenReport, name: str, reason: str = "time budget exhaust
     report.budget_exhausted = True
 
 
+def _safe_workspace_git_env() -> dict[str, str]:
+    """Environment for any subprocess run inside the agent's own workspace,
+    directly (`git`) or indirectly (`select_tests.py`, `aider`, both of which
+    shell out to `git` themselves).
+
+    Unlike a fresh publish clone, this workspace's `.git/config` and hooks
+    are agent-controlled: a `core.fsmonitor` setting or a `pre-push` hook
+    planted there would execute the moment anything here runs an
+    index-refreshing git command (`status`, `diff`, `add`, ...), before the
+    checkpoint below ever hands off to the trusted publish clone.
+    `GIT_CONFIG_COUNT`/`_KEY_N`/`_VALUE_N` force both off regardless of what
+    the repo's own config says, and survive into child processes we don't
+    control the argv of. Mirrors the threat
+    `workspace_provisioning._trusted_git_environment` closes for the publish
+    side; see `test_isolated_workspace.py::test_agent_git_config_cannot_redirect_guarded_publish`.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_CONFIG_")}
+    env.update(
+        {
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "core.hooksPath",
+            "GIT_CONFIG_VALUE_1": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return env
+
+
 def _git(workspace: Path, *args: str, timeout: float = _GIT_TIMEOUT_SECONDS) -> str:
     """Best-effort git invocation: empty string on any failure, never raises."""
     try:
         proc = subprocess.run(
-            ["git", *args],
+            ["git", "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", *args],
             cwd=str(workspace),
             capture_output=True,
             text=True,
             timeout=timeout,
             check=False,
+            env=_safe_workspace_git_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -145,6 +177,62 @@ def _no_bytecode_env() -> dict[str, str]:
     env = dict(os.environ)
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     return env
+
+
+def _untracked_files(workspace: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in _git(workspace, "ls-files", "--others", "--exclude-standard", "--", ".").splitlines()
+        if line.strip()
+    ]
+
+
+def _changed_paths(workspace: Path, base_sha: str) -> list[str]:
+    """Files this task touched, tracked or not.
+
+    This runs before the checkpoint commit (see `handlers.py`), so a brand
+    new file the agent created is still untracked -- plain `git diff
+    --name-only` is blind to it. Order preserved, duplicates dropped.
+    """
+    tracked = [
+        line.strip()
+        for line in _git(workspace, "diff", "--name-only", base_sha, "--", ".").splitlines()
+        if line.strip()
+    ]
+    seen: set[str] = set()
+    result: list[str] = []
+    for path in (*tracked, *_untracked_files(workspace)):
+        if path not in seen:
+            seen.add(path)
+            result.append(path)
+    return result
+
+
+def _diff_including_untracked(workspace: Path, base_sha: str) -> str:
+    """`git diff` plus whole-file text for untracked new files (see `_changed_paths`).
+
+    Untracked content is read straight off disk with plain Python I/O, never
+    through `git diff --no-index`: an untracked `.gitattributes` (itself
+    invisible to `git diff <base_sha>`, so this is the only place that would
+    touch it) can assign a `clean` filter to an untracked file, and
+    `--no-index` still resolves and runs it -- see
+    `test_isolated_workspace.py::test_dirty_checkpoint_captures_file_modes_without_agent_git_execution`.
+    """
+    parts = []
+    tracked_diff = _git(workspace, "diff", base_sha, "--", ".")
+    if tracked_diff.strip():
+        parts.append(tracked_diff)
+    for path in _untracked_files(workspace):
+        file_path = workspace / path
+        if file_path.is_symlink() or not file_path.is_file():
+            continue
+        try:
+            content = file_path.read_text(errors="replace")
+        except OSError:
+            continue
+        body = "\n".join(f"+{line}" for line in content.splitlines())
+        parts.append(f"--- /dev/null\n+++ {path}\n{body}")
+    return "\n".join(parts)
 
 
 def _ollama_model() -> str:
@@ -210,12 +298,12 @@ def _run_compileall(workspace: Path, report: PrescreenReport, budget: _Budget) -
 
 def _run_impacted_tests(workspace: Path, report: PrescreenReport, budget: _Budget, base_sha: str | None) -> None:
     name = "impacted_tests"
+    if not base_sha:
+        report.steps.append(StepResult(name, ran=False, passed=True, detail="no base sha to diff against"))
+        return
     selector = workspace / "scripts" / "ci" / "test_impact" / "select_tests.py"
     if not selector.is_file():
         report.steps.append(StepResult(name, ran=False, passed=True, detail="test-impact selector not present in this workspace"))
-        return
-    if not base_sha:
-        report.steps.append(StepResult(name, ran=False, passed=True, detail="no base sha to diff against"))
         return
     if budget.remaining() < 2:
         _skip(report, name)
@@ -230,6 +318,10 @@ def _run_impacted_tests(workspace: Path, report: PrescreenReport, budget: _Budge
                 text=True,
                 timeout=min(_SELECTOR_TIMEOUT_SECONDS, budget.remaining()),
                 check=False,
+                # The selector shells out to `git diff`/`git status` itself
+                # against this same agent-controlled workspace -- see
+                # `_safe_workspace_git_env`.
+                env=_safe_workspace_git_env(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             report.steps.append(StepResult(name, ran=False, passed=True, detail=f"selector failed to run: {exc}"))
@@ -293,7 +385,7 @@ def _run_ollama_prescreen(workspace: Path, report: PrescreenReport, budget: _Bud
     if not availability.available or not availability.executable:
         report.steps.append(StepResult(name, ran=False, passed=True, detail=f"ollama unavailable: {availability.message}"))
         return
-    diff = _git(workspace, "diff", base_sha, "--", ".")
+    diff = _diff_including_untracked(workspace, base_sha)
     if not diff.strip():
         report.steps.append(StepResult(name, ran=True, passed=True, detail="no diff to review"))
         return
@@ -351,16 +443,15 @@ def _run_aider_autofix(workspace: Path, report: PrescreenReport, budget: _Budget
     if not availability.available:
         report.steps.append(StepResult(name, ran=False, passed=True, detail=f"aider needs a local model backend; ollama unavailable: {availability.message}"))
         return
-    changed = [
-        line.strip()
-        for line in _git(workspace, "diff", "--name-only", base_sha, "--", ".").splitlines()
-        if line.strip() and (workspace / line.strip()).is_file()
-    ]
+    changed = [path for path in _changed_paths(workspace, base_sha) if (workspace / path).is_file()]
     if not changed:
         report.steps.append(StepResult(name, ran=True, passed=True, detail="no changed files to review"))
         return
     before = _git(workspace, "status", "--porcelain")
-    env = dict(os.environ)
+    # aider reads git status/diff itself for context even with
+    # `--no-auto-commits`, against this same agent-controlled workspace --
+    # see `_safe_workspace_git_env`.
+    env = _safe_workspace_git_env()
     env.setdefault("OLLAMA_API_BASE", "http://localhost:11434")
     argv = [
         aider_bin,
