@@ -795,3 +795,252 @@ def test_open_relative_regular_closes_pinned_fd_when_component_is_missing(
         assert closed == duplicated
     finally:
         real_close(base_fd)
+
+
+# --------------------------------------------------------------------------
+# Dirty checkpoint: materialize uncommitted agent output as a trusted commit
+# --------------------------------------------------------------------------
+
+
+def _dirty_worktree(tmp_path: Path) -> tuple[Path, Path, str]:
+    """A repo plus a *linked* worktree of a feature branch -- the actual shape
+    every dispatched mutating task runs in (`.git` at the worktree root is a
+    file, not a directory)."""
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "worktrees" / "feature"
+    _git(repo, "worktree", "add", "-b", "feature/dirty", str(workspace), "main")
+    assert (workspace / ".git").is_file()  # linked worktree, not a full clone
+    start_sha = git_info.run_git_command(workspace, ["rev-parse", "HEAD"]).stdout.strip()
+    return repo, workspace, start_sha
+
+
+def test_checkpoint_dirty_task_workspace_commits_a_linked_worktree(tmp_path):
+    """The primary defect from the first rejected PR: the earlier revision
+    assumed `workspace / ".git"` was a directory and would fail closed with
+    ENOTDIR against exactly this shape -- the one dispatched tasks actually
+    use."""
+    repo, workspace, start_sha = _dirty_worktree(tmp_path)
+    (workspace / "f.txt").write_text("hello\nedited by the agent\n")
+    (workspace / "new-file.txt").write_text("untracked agent output\n")
+    info = workspace.lstat()
+    expected_inode = (info.st_dev, info.st_ino)
+
+    new_sha = wp.checkpoint_dirty_task_workspace(
+        workspace,
+        expected_branch="feature/dirty",
+        remote_url=str(repo),
+        start_sha=start_sha,
+        trusted_base_sha=start_sha,
+        expected_remote_sha=None,
+        expected_inode=expected_inode,
+    )
+
+    assert new_sha != start_sha
+    assert wp._OID_HEX.fullmatch(new_sha)
+    # The agent's own branch ref (in the *repository's* common dir, since
+    # this is a linked worktree) now points at the new commit.
+    ref_value = (repo / ".git" / "refs" / "heads" / "feature" / "dirty").read_text().strip()
+    assert ref_value == new_sha
+    # And the new objects are readable from the agent's own object store,
+    # forming a valid, fsck-clean history.
+    fsck = subprocess.run(
+        ["git", "fsck", "--strict", "--no-reflogs"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert fsck.returncode == 0, fsck.stdout + fsck.stderr
+    log = subprocess.run(
+        ["git", "--git-dir", str(repo / ".git"), "show", f"{new_sha}:new-file.txt"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert log.stdout == "untracked agent output\n"
+    # A fresh, independent verification (exactly what the ordinary
+    # trusted_publish_clone + checkpoint_task_workspace path performs next)
+    # sees the work-tree as an exact match for the new commit -- proving
+    # publication proceeds through the same exact-head review either way.
+    with wp.trusted_publish_clone(
+        workspace,
+        expected_branch="feature/dirty",
+        remote_url=str(repo),
+        start_sha=start_sha,
+        trusted_base_sha=start_sha,
+        expected_remote_sha=None,
+        expected_inode=expected_inode,
+        expected_candidate_sha=new_sha,
+        require_clean=True,
+    ):
+        pass
+
+
+def test_checkpoint_dirty_task_workspace_refuses_when_nothing_is_dirty(tmp_path):
+    repo, workspace, start_sha = _dirty_worktree(tmp_path)
+    info = workspace.lstat()
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.checkpoint_dirty_task_workspace(
+            workspace,
+            expected_branch="feature/dirty",
+            remote_url=str(repo),
+            start_sha=start_sha,
+            trusted_base_sha=start_sha,
+            expected_remote_sha=None,
+            expected_inode=(info.st_dev, info.st_ino),
+        )
+
+    assert exc_info.value.failed_step == "dirty_checkpoint_nothing_to_commit"
+
+
+def test_advance_agent_branch_ref_refuses_a_concurrent_advance(tmp_path):
+    """The branch moved after `start_sha` was read (a race with another
+    writer) must be refused, not silently overwritten."""
+    repo, workspace, start_sha = _dirty_worktree(tmp_path)
+    other_sha = start_sha
+    ref_path = repo / ".git" / "refs" / "heads" / "feature" / "dirty"
+    ref_path.write_text("1" * 40 + "\n")
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp._advance_agent_branch_ref(
+            repo / ".git",
+            "feature/dirty",
+            previous_sha=other_sha,
+            new_sha="2" * 40,
+            workspace=workspace,
+        )
+
+    assert exc_info.value.failed_step == "dirty_checkpoint_ref_race"
+    assert ref_path.read_text().strip() == "1" * 40
+
+
+def test_copy_trusted_loose_object_to_agent_refuses_symlinked_shard_directory(
+    tmp_path,
+):
+    """The agent controls everything under its own `objects/`; a symlinked
+    shard directory (`objects/<aa> -> /somewhere/else`) must not redirect the
+    write -- the entire reason this function exists rather than a plain
+    `shutil.copy`."""
+    publisher_git_dir = tmp_path / "publisher" / ".git"
+    oid = "a" * 40
+    (publisher_git_dir / "objects" / oid[:2]).mkdir(parents=True)
+    (publisher_git_dir / "objects" / oid[:2] / oid[2:]).write_bytes(b"trusted content")
+
+    agent_common_dir = tmp_path / "agent" / ".git"
+    (agent_common_dir / "objects").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (agent_common_dir / "objects" / oid[:2]).symlink_to(outside)
+
+    workspace = tmp_path / "agent"
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp._copy_trusted_loose_object_to_agent(
+            oid,
+            publisher_git_dir=publisher_git_dir,
+            agent_common_dir=agent_common_dir,
+            workspace=workspace,
+            expected_branch="feature/dirty",
+        )
+
+    assert exc_info.value.failed_step == "dirty_checkpoint_object_write"
+    assert not list(outside.iterdir())
+
+
+def test_copy_trusted_loose_object_to_agent_detects_content_collision(tmp_path):
+    oid = "b" * 40
+    publisher_git_dir = tmp_path / "publisher" / ".git"
+    (publisher_git_dir / "objects" / oid[:2]).mkdir(parents=True)
+    (publisher_git_dir / "objects" / oid[:2] / oid[2:]).write_bytes(b"trusted content")
+
+    agent_common_dir = tmp_path / "agent" / ".git"
+    (agent_common_dir / "objects" / oid[:2]).mkdir(parents=True)
+    (agent_common_dir / "objects" / oid[:2] / oid[2:]).write_bytes(b"different content")
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp._copy_trusted_loose_object_to_agent(
+            oid,
+            publisher_git_dir=publisher_git_dir,
+            agent_common_dir=agent_common_dir,
+            workspace=tmp_path / "agent",
+            expected_branch="feature/dirty",
+        )
+
+    assert exc_info.value.failed_step == "dirty_checkpoint_object_write"
+    assert "collision" in exc_info.value.detail
+
+
+def test_copy_trusted_loose_object_to_agent_writes_a_new_object(tmp_path):
+    oid = "c" * 40
+    publisher_git_dir = tmp_path / "publisher" / ".git"
+    (publisher_git_dir / "objects" / oid[:2]).mkdir(parents=True)
+    (publisher_git_dir / "objects" / oid[:2] / oid[2:]).write_bytes(b"trusted content")
+
+    agent_common_dir = tmp_path / "agent" / ".git"
+    (agent_common_dir / "objects").mkdir(parents=True)
+
+    wp._copy_trusted_loose_object_to_agent(
+        oid,
+        publisher_git_dir=publisher_git_dir,
+        agent_common_dir=agent_common_dir,
+        workspace=tmp_path / "agent",
+        expected_branch="feature/dirty",
+    )
+
+    destination = agent_common_dir / "objects" / oid[:2] / oid[2:]
+    assert destination.read_bytes() == b"trusted content"
+    assert oct(stat.S_IMODE(destination.stat().st_mode)) == oct(0o444)
+
+
+def test_copy_trusted_loose_object_to_agent_windows_branch_refuses_symlink(
+    tmp_path, monkeypatch
+):
+    """Same symlink-safety contract on the platform branch that has no
+    dir_fd/O_NOFOLLOW support: refused with the identical structured error,
+    never a bare OSError."""
+    monkeypatch.setattr(wp.os, "name", "nt")
+    oid = "d" * 40
+    publisher_git_dir = tmp_path / "publisher" / ".git"
+    (publisher_git_dir / "objects" / oid[:2]).mkdir(parents=True)
+    (publisher_git_dir / "objects" / oid[:2] / oid[2:]).write_bytes(b"trusted content")
+
+    agent_common_dir = tmp_path / "agent" / ".git"
+    (agent_common_dir / "objects").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (agent_common_dir / "objects" / oid[:2]).symlink_to(outside)
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp._copy_trusted_loose_object_to_agent(
+            oid,
+            publisher_git_dir=publisher_git_dir,
+            agent_common_dir=agent_common_dir,
+            workspace=tmp_path / "agent",
+            expected_branch="feature/dirty",
+        )
+
+    assert exc_info.value.failed_step == "dirty_checkpoint_object_write"
+    assert not list(outside.iterdir())
+
+
+def test_copy_trusted_loose_object_to_agent_windows_branch_writes_object(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(wp.os, "name", "nt")
+    oid = "e" * 40
+    publisher_git_dir = tmp_path / "publisher" / ".git"
+    (publisher_git_dir / "objects" / oid[:2]).mkdir(parents=True)
+    (publisher_git_dir / "objects" / oid[:2] / oid[2:]).write_bytes(b"trusted content")
+
+    agent_common_dir = tmp_path / "agent" / ".git"
+    (agent_common_dir / "objects").mkdir(parents=True)
+
+    wp._copy_trusted_loose_object_to_agent(
+        oid,
+        publisher_git_dir=publisher_git_dir,
+        agent_common_dir=agent_common_dir,
+        workspace=tmp_path / "agent",
+        expected_branch="feature/dirty",
+    )
+
+    destination = agent_common_dir / "objects" / oid[:2] / oid[2:]
+    assert destination.read_bytes() == b"trusted content"

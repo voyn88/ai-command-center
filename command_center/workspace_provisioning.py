@@ -2104,6 +2104,771 @@ def checkpoint_task_workspace(
     return candidate
 
 
+# --------------------------------------------------------------------------
+# Dirty checkpoint: materialize uncommitted agent output as one trusted
+# commit, without ever running Git against the agent's own config or hooks.
+# --------------------------------------------------------------------------
+
+_OID_HEX = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _trusted_git_environment() -> dict[str, str]:
+    """A credential-free, hook-neutral environment for Git commands that must
+    read or write an agent-controlled work-tree.
+
+    Starts from the process environment (`PATH`, `HOME`, locale, and so on
+    stay, so `git` itself still runs) but drops every inherited `GIT_*`
+    variable first -- an agent-controlled launch environment could otherwise
+    smuggle in `GIT_SSH_COMMAND`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, or a
+    similar override -- then reinstates only this fixed, non-secret set.
+    `GIT_AUTHOR_*`/`GIT_COMMITTER_*` are pinned so the resulting commit never
+    depends on (or reveals) any identity the agent's own `.git/config` might
+    contain; `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL=/dev/null` match the
+    same neutralization `trusted_publish_clone` already applies.
+    """
+    env = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "nul" if os.name == "nt" else "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_AUTHOR_NAME": "AICC Dirty Checkpoint",
+            "GIT_AUTHOR_EMAIL": "dirty-checkpoint@aicc.invalid",
+            "GIT_COMMITTER_NAME": "AICC Dirty Checkpoint",
+            "GIT_COMMITTER_EMAIL": "dirty-checkpoint@aicc.invalid",
+        }
+    )
+    return env
+
+
+def _run_trusted_worktree_git(
+    argv: list[str],
+    *,
+    git_dir: Path,
+    work_tree: Path,
+    workspace: Path,
+    expected_branch: str | None,
+    failed_step: str,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    """Run one Git command against a trusted `--git-dir` with an agent-owned
+    `--work-tree`, hooks and agent config neutralized.
+
+    Never executed with the agent's own `.git` (or its real, shared common
+    directory) passed as `--git-dir`: only a freshly cloned, credential-free
+    publisher clone may hold that role, so nothing under the agent's
+    `.git/config` or `.git/hooks` ever runs, matching `trusted_publish_clone`'s
+    own status check immediately below.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=" + ("NUL" if os.name == "nt" else "/dev/null"),
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "gc.auto=0",
+                f"--git-dir={git_dir}",
+                f"--work-tree={work_tree}",
+                *argv,
+            ],
+            cwd=git_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=_trusted_git_environment(),
+        )
+    except _GIT_OPERATION_ERRORS as exc:
+        raise WorkspaceVerificationError(
+            failed_step=failed_step,
+            remediation="Preserve the dirty clone for operator inspection and retry.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"git {' '.join(argv[:2])} could not be executed: {exc}",
+        ) from exc
+    if result.returncode != 0:
+        raise WorkspaceVerificationError(
+            failed_step=failed_step,
+            remediation="Preserve the dirty clone for operator inspection and retry.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=(result.stderr or result.stdout).strip()
+            or f"git {' '.join(argv[:2])} failed",
+        )
+    return result
+
+
+def _copy_trusted_loose_object_to_agent(
+    oid: str,
+    *,
+    publisher_git_dir: Path,
+    agent_common_dir: Path,
+    workspace: Path,
+    expected_branch: str,
+) -> None:
+    """Copy one content-addressed object through no-follow directory fds.
+
+    `publisher_git_dir` is the freshly cloned, credential-free trusted clone;
+    its loose object files are trusted content. `agent_common_dir` is the
+    agent-owned object store: every path component from `objects/` down is
+    attacker-influenced, so on POSIX every hop is opened relative to a
+    directory fd with `O_NOFOLLOW`, exactly as `_read_agent_head` already
+    does for `HEAD` and branch refs. A destination collision is resolved by a
+    byte-for-byte comparison against the pinned source content, never by
+    trusting that an existing object with the same name already holds the
+    same bytes.
+
+    Windows has no `dir_fd`/`O_NOFOLLOW` support in Python's `os` module, so
+    this cannot pin every hop the way the POSIX branch does; it instead
+    refuses outright if any ancestor component is already a symlink/junction
+    and re-verifies the written bytes after the atomic replace. That is the
+    strongest check the platform's primitives allow, not an equivalent
+    guarantee -- but every failure here, on either platform, raises the same
+    `WorkspaceVerificationError` contract the rest of this module uses, never
+    a bare `OSError`.
+    """
+    if not _OID_HEX.fullmatch(oid):
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_object_write",
+            remediation="Preserve the dirty clone for operator inspection and retry.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"refusing malformed object id: {oid!r}",
+        )
+    source = publisher_git_dir / "objects" / oid[:2] / oid[2:]
+    try:
+        payload = source.read_bytes()
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_object_write",
+            remediation="Preserve the dirty clone for operator inspection and retry.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot read trusted object {oid}: {exc}",
+        ) from exc
+
+    if os.name == "nt":
+        objects_dir = agent_common_dir / "objects"
+        shard_dir = objects_dir / oid[:2]
+        destination = shard_dir / oid[2:]
+        try:
+            for ancestor in (agent_common_dir, objects_dir, shard_dir):
+                if ancestor.is_symlink():
+                    raise OSError(f"{ancestor} must not be a symlink")
+            shard_dir.mkdir(parents=True, exist_ok=True)
+            if destination.is_symlink():
+                raise OSError(f"{destination} must not be a symlink")
+            if destination.exists():
+                if destination.read_bytes() != payload:
+                    raise OSError(f"object collision for {oid}")
+                return
+            temporary = shard_dir / f".tmp-{secrets.token_hex(16)}"
+            file_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            try:
+                with os.fdopen(file_fd, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+            try:
+                os.replace(temporary, destination)
+            except OSError:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+            if destination.is_symlink() or destination.read_bytes() != payload:
+                raise OSError(f"object {oid} did not verify after write")
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_object_write",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"cannot write agent object {oid}: {exc}",
+            ) from exc
+        return
+
+    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    objects_fd: int | None = None
+    shard_fd: int | None = None
+    temp_name = f".tmp-{secrets.token_hex(16)}"
+    temp_pending = False
+    try:
+        try:
+            objects_fd = os.open(
+                agent_common_dir / "objects",
+                os.O_RDONLY | os.O_DIRECTORY | nofollow,
+            )
+            try:
+                os.mkdir(oid[:2], 0o755, dir_fd=objects_fd)
+            except FileExistsError:
+                pass
+            shard_fd = os.open(
+                oid[:2], os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=objects_fd
+            )
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_object_write",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"cannot open agent object shard for {oid}: {exc}",
+            ) from exc
+
+        try:
+            existing_fd = os.open(oid[2:], open_flags | nofollow, dir_fd=shard_fd)
+        except FileNotFoundError:
+            existing_fd = None
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_object_write",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"cannot inspect existing agent object {oid}: {exc}",
+            ) from exc
+
+        if existing_fd is not None:
+            try:
+                info = os.fstat(existing_fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError(f"existing object {oid} is not a regular file")
+                existing_bytes = _read_pinned_regular(
+                    existing_fd, info, max_bytes=_MAX_OBJECT_TRANSFER_BYTES
+                )
+            except OSError as exc:
+                raise WorkspaceVerificationError(
+                    failed_step="dirty_checkpoint_object_write",
+                    remediation="Preserve both repositories for object-integrity inspection.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    expected_branch=expected_branch,
+                    detail=f"cannot read existing agent object {oid}: {exc}",
+                ) from exc
+            finally:
+                os.close(existing_fd)
+            if existing_bytes != payload:
+                raise WorkspaceVerificationError(
+                    failed_step="dirty_checkpoint_object_write",
+                    remediation="Preserve both repositories for object-integrity inspection.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    expected_branch=expected_branch,
+                    detail=f"object collision for {oid}",
+                )
+            return
+
+        try:
+            temp_fd = os.open(
+                temp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                0o444,
+                dir_fd=shard_fd,
+            )
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_object_write",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"cannot create temporary object file for {oid}: {exc}",
+            ) from exc
+        temp_pending = True
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(temp_fd, view)
+                if written <= 0:
+                    raise OSError("object write made no progress")
+                view = view[written:]
+            os.fsync(temp_fd)
+        finally:
+            os.close(temp_fd)
+
+        try:
+            os.link(temp_name, oid[2:], src_dir_fd=shard_fd, dst_dir_fd=shard_fd)
+        except FileExistsError:
+            # Lost a race with a concurrent writer of the same
+            # content-addressed name; verify it is byte-identical rather
+            # than trusting it.
+            race_fd = os.open(oid[2:], open_flags | nofollow, dir_fd=shard_fd)
+            try:
+                race_info = os.fstat(race_fd)
+                race_bytes = _read_pinned_regular(
+                    race_fd, race_info, max_bytes=_MAX_OBJECT_TRANSFER_BYTES
+                )
+            finally:
+                os.close(race_fd)
+            if race_bytes != payload:
+                raise WorkspaceVerificationError(
+                    failed_step="dirty_checkpoint_object_write",
+                    remediation="Preserve both repositories for object-integrity inspection.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    expected_branch=expected_branch,
+                    detail=f"object collision for {oid}",
+                )
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_object_write",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"cannot finalize agent object {oid}: {exc}",
+            ) from exc
+        finally:
+            try:
+                os.unlink(temp_name, dir_fd=shard_fd)
+            except FileNotFoundError:
+                pass
+            temp_pending = False
+    finally:
+        if temp_pending:
+            try:
+                os.unlink(temp_name, dir_fd=shard_fd)
+            except (FileNotFoundError, OSError):
+                pass
+        if shard_fd is not None:
+            os.close(shard_fd)
+        if objects_fd is not None:
+            os.close(objects_fd)
+
+
+@contextmanager
+def _lock_agent_branch_ref(
+    agent_common_dir: Path,
+    branch: str,
+    *,
+    previous_sha: str,
+    workspace: Path,
+):
+    """Acquire Git's own `<ref>.lock` for `refs/heads/<branch>` in the
+    agent's real (worktree-resolved) common directory, after proving the ref
+    still holds `previous_sha` -- all through no-follow directory fds,
+    descending one path component at a time so a swapped intermediate
+    directory cannot redirect the final open (the same protection
+    `_open_relative_regular` already gives `HEAD` and packed-refs lookups).
+
+    Yields `(parent_fd, lock_fd, leaf_name)`. The caller writes the new SHA
+    to `lock_fd` and installs it with
+    `os.replace(f"{leaf_name}.lock", leaf_name, src_dir_fd=parent_fd,
+    dst_dir_fd=parent_fd)` before this context manager exits. Cleanup always
+    attempts to close `lock_fd` and unlink `<leaf_name>.lock`: on the success
+    path the rename already removed it, so the unlink is a harmless no-op
+    caught via `FileNotFoundError`; on any failure path it actually releases
+    the lock.
+    """
+    parts = tuple(branch.split("/"))
+    if any(part in {"", ".", ".."} for part in parts):
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_lock",
+            remediation="Use a branch name without empty or dot path components.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=branch,
+            detail="branch name would escape refs/heads",
+        )
+    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    heads_fd: int | None = None
+    parent_fd: int | None = None
+    lock_fd: int | None = None
+    lock_name = f"{parts[-1]}.lock"
+    try:
+        try:
+            heads_fd = os.open(
+                agent_common_dir / "refs" / "heads",
+                os.O_RDONLY | os.O_DIRECTORY | nofollow,
+            )
+            parent_fd = os.dup(heads_fd)
+            for part in parts[:-1]:
+                next_fd = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=parent_fd
+                )
+                os.close(parent_fd)
+                parent_fd = next_fd
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail=f"cannot open agent refs/heads path safely: {exc}",
+            ) from exc
+
+        opened = _open_relative_regular(parent_fd, (parts[-1],), open_flags, nofollow)
+        if opened is None:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail="agent branch ref is missing",
+            )
+        leaf_fd, leaf_stat = opened
+        try:
+            current = (
+                _read_pinned_regular(leaf_fd, leaf_stat, max_bytes=_MAX_REF_BYTES)
+                .decode("ascii", "strict")
+                .strip()
+                .lower()
+            )
+        except _HEAD_READ_ERRORS as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail=f"cannot read agent branch ref safely: {exc}",
+            ) from exc
+        finally:
+            os.close(leaf_fd)
+        if not _OID_HEX.fullmatch(current):
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail=f"agent branch ref does not hold one full SHA: {current!r}",
+            )
+        if current != previous_sha:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_race",
+                remediation="Stop the remaining writer and retry from a stable task clone.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail=(
+                    f"branch advanced concurrently: expected={previous_sha}, "
+                    f"actual={current}"
+                ),
+            )
+
+        try:
+            lock_fd = os.open(
+                lock_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                0o644,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Retry once the concurrent writer releases the branch ref lock.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail="branch ref lock is already held",
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail=f"cannot create branch ref lock: {exc}",
+            ) from exc
+
+        yield parent_fd, lock_fd, parts[-1]
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            try:
+                os.unlink(lock_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
+        if heads_fd is not None:
+            os.close(heads_fd)
+
+
+def _advance_agent_branch_ref(
+    agent_common_dir: Path,
+    branch: str,
+    *,
+    previous_sha: str,
+    new_sha: str,
+    workspace: Path,
+) -> None:
+    """Atomically compare-and-swap `refs/heads/<branch>` in the agent's own
+    (worktree-resolved) object store.
+
+    Follows Git's own lockfile convention (`<ref>.lock` created with
+    `O_EXCL`, installed with an atomic rename) via `_lock_agent_branch_ref`,
+    so a concurrent `git` process in the agent's worktree observes the same
+    mutual exclusion Git itself would use, rather than a bespoke lock it does
+    not know to respect. Reads the ref back after installing it so a failed
+    or partial rename is never mistaken for success.
+    """
+    if not (_OID_HEX.fullmatch(previous_sha) and _OID_HEX.fullmatch(new_sha)):
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_lock",
+            remediation="Preserve the dirty clone for operator inspection and retry.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=branch,
+            detail="refusing malformed ref SHA",
+        )
+    open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    with _lock_agent_branch_ref(
+        agent_common_dir, branch, previous_sha=previous_sha, workspace=workspace
+    ) as (parent_fd, lock_fd, leaf_name):
+        try:
+            payload = f"{new_sha}\n".encode("ascii")
+            view = memoryview(payload)
+            while view:
+                written = os.write(lock_fd, view)
+                if written <= 0:
+                    raise OSError("branch ref lock write made no progress")
+                view = view[written:]
+            os.fsync(lock_fd)
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail=f"cannot write branch ref lock: {exc}",
+            ) from exc
+        try:
+            os.replace(
+                f"{leaf_name}.lock",
+                leaf_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail=f"cannot install advanced branch ref: {exc}",
+            ) from exc
+        verified = _open_relative_regular(parent_fd, (leaf_name,), open_flags, nofollow)
+        if verified is None:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_verify",
+                remediation="Preserve the dirty clone for operator inspection; branch ref may be inconsistent.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail="branch ref disappeared after install",
+            )
+        verified_fd, verified_stat = verified
+        try:
+            confirmed = (
+                _read_pinned_regular(verified_fd, verified_stat, max_bytes=_MAX_REF_BYTES)
+                .decode("ascii", "strict")
+                .strip()
+                .lower()
+            )
+        finally:
+            os.close(verified_fd)
+        if confirmed != new_sha:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_verify",
+                remediation="Preserve the dirty clone for operator inspection; branch ref may be inconsistent.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=branch,
+                detail="branch ref did not read back the advanced SHA",
+            )
+
+
+def checkpoint_dirty_task_workspace(
+    workspace_path: str | Path,
+    *,
+    expected_branch: str,
+    remote_url: str,
+    start_sha: str,
+    trusted_base_sha: str | None,
+    expected_remote_sha: str | None,
+    expected_inode: tuple[int, int],
+) -> str:
+    """Materialize an agent's uncommitted dirty output as one trusted commit.
+
+    The agent's own `.git`/`git commit` is never invoked -- an agent-owned
+    Git config or hook could otherwise smuggle in identity, signing, or
+    arbitrary command execution. Instead this stages and commits the
+    work-tree's current file contents from inside a freshly cloned,
+    credential-free `trusted_publish_clone` (hooks and config neutralized,
+    fixed non-secret author/committer identity), copies only the objects the
+    new commit actually introduces into the agent's *real* object store --
+    resolved via `--git-common-dir` so a linked worktree (where `.git` at the
+    workspace root is a file, not a directory) works exactly like a full
+    clone -- and atomically advances the agent's own `refs/heads/<branch>`
+    to it.
+
+    Returns the new commit SHA, now reachable from the agent's own branch
+    ref. Callers proceed exactly as they would for a commit the agent made
+    itself: `task_workspace_candidate_sha` will read this SHA back, and the
+    ordinary `trusted_publish_clone` + `checkpoint_task_workspace` + publish
+    sequence re-validates it (ancestry, `fsck`, exact-tree-vs-work-tree
+    status) with no awareness that it did not originate from an agent-run
+    `git commit`.
+    """
+    workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
+    info = workspace.lstat()
+    actual_inode = (info.st_dev, info.st_ino)
+    if workspace.is_symlink() or actual_inode != expected_inode:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_identity",
+            remediation="Preserve the substituted path for operator inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"workspace inode mismatch: {actual_inode}",
+        )
+    # Resolved via `git rev-parse --git-common-dir` rather than assumed to be
+    # `workspace / ".git"`: a dispatched task runs in a linked worktree,
+    # where `.git` at the worktree root is a plain file ("gitdir: ...")
+    # pointing at `<common>/worktrees/<name>`, and the objects/refs this
+    # function must write live in `<common>` itself, not that per-worktree
+    # directory (review finding: the earlier revision assumed a full clone's
+    # `.git` layout and would fail closed with ENOTDIR on every real
+    # dispatched-task worktree).
+    agent_common_dir = _git_common_dir(workspace)
+    if agent_common_dir is None:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_git_dir",
+            remediation="Preserve the workspace for operator inspection; Git metadata is unreadable.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="cannot resolve the agent's real Git object/ref directory",
+        )
+    with trusted_publish_clone(
+        workspace,
+        expected_branch=expected_branch,
+        remote_url=remote_url,
+        start_sha=start_sha,
+        trusted_base_sha=trusted_base_sha,
+        expected_remote_sha=expected_remote_sha,
+        expected_inode=expected_inode,
+        expected_candidate_sha=start_sha,
+        require_clean=False,
+    ) as publisher:
+        publisher_git_dir = publisher / ".git"
+
+        def run(
+            argv: list[str], failed_step: str, timeout: int = 120
+        ) -> subprocess.CompletedProcess[str]:
+            return _run_trusted_worktree_git(
+                argv,
+                git_dir=publisher_git_dir,
+                work_tree=workspace,
+                workspace=workspace,
+                expected_branch=expected_branch,
+                failed_step=failed_step,
+                timeout=timeout,
+            )
+
+        status = run(
+            ["status", "--porcelain", "--untracked-files=all"],
+            "dirty_checkpoint_status",
+        )
+        if not status.stdout.strip():
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_nothing_to_commit",
+                remediation="Nothing is dirty; use the ordinary checkpoint path instead.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail="agent work-tree has no uncommitted changes",
+            )
+        run(["add", "--all", "--", "."], "dirty_checkpoint_add")
+        run(
+            [
+                "commit",
+                "--no-verify",
+                "--no-gpg-sign",
+                "-m",
+                "AICC dirty checkpoint: persist unstaged executor output",
+            ],
+            "dirty_checkpoint_commit",
+        )
+        new_sha = run(["rev-parse", "HEAD"], "dirty_checkpoint_new_sha").stdout.strip().lower()
+        if not _OID_HEX.fullmatch(new_sha):
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_new_sha",
+                remediation="Preserve the dirty clone for operator inspection and retry.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"malformed new commit sha: {new_sha!r}",
+            )
+        object_list = run(
+            ["rev-list", "--objects", f"{start_sha}..{new_sha}"],
+            "dirty_checkpoint_object_list",
+        )
+        oids: list[str] = []
+        for line in object_list.stdout.splitlines():
+            oid = line.split(" ", 1)[0].strip().lower()
+            if not oid:
+                continue
+            if not _OID_HEX.fullmatch(oid):
+                raise WorkspaceVerificationError(
+                    failed_step="dirty_checkpoint_object_list",
+                    remediation="Preserve the dirty clone for operator inspection and retry.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    expected_branch=expected_branch,
+                    detail=f"malformed object id in rev-list output: {oid!r}",
+                )
+            oids.append(oid)
+        for oid in oids:
+            _copy_trusted_loose_object_to_agent(
+                oid,
+                publisher_git_dir=publisher_git_dir,
+                agent_common_dir=agent_common_dir,
+                workspace=workspace,
+                expected_branch=expected_branch,
+            )
+        _advance_agent_branch_ref(
+            agent_common_dir,
+            expected_branch,
+            previous_sha=start_sha,
+            new_sha=new_sha,
+            workspace=workspace,
+        )
+    return new_sha
+
+
 def _is_pipeline_owned_standalone_clone(
     workspace: Path,
     repository_path: str | Path,
