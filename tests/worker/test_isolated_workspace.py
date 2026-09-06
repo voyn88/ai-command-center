@@ -553,6 +553,9 @@ def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
     assert _git(repo, "show", "FETCH_HEAD:new.txt").stdout == "new\n"
     assert _git(repo, "show", "FETCH_HEAD:payload.txt").stdout == "raw payload\n"
     assert _git(repo, "show", "FETCH_HEAD:linked.txt").stdout == "new.txt"
+    assert _git(repo, "ls-tree", "FETCH_HEAD", "linked.txt").stdout.startswith(
+        "120000 "
+    )
     assert _git(repo, "ls-tree", "FETCH_HEAD", "tool.sh").stdout.startswith("100755 ")
     deleted = subprocess.run(
         ["git", "cat-file", "-e", "FETCH_HEAD:delete-me.txt"],
@@ -562,6 +565,25 @@ def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
         check=False,
     )
     assert deleted.returncode != 0
+
+
+def test_dirty_checkpoint_uses_one_shared_git_ref_lock(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+
+    with workspace_provisioning._lock_agent_branch_ref(
+        repo, expected_branch="main"
+    ):
+        with pytest.raises(
+            workspace_provisioning.WorkspaceVerificationError,
+            match="dirty_checkpoint_ref_lock",
+        ):
+            with workspace_provisioning._lock_agent_branch_ref(
+                repo, expected_branch="main"
+            ):
+                pass
+        assert (repo / ".git" / "refs" / "heads" / "main.lock").exists()
+
+    assert not (repo / ".git" / "refs" / "heads" / "main.lock").exists()
 
 
 def test_dirty_checkpoint_failure_is_retryable_and_preserves_clone(

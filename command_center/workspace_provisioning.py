@@ -2069,6 +2069,15 @@ def _copy_trusted_loose_object_to_agent(
             expected_branch=expected_branch,
             detail="trusted Git returned a malformed object id",
         )
+    if os.name == "nt":
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_platform",
+            remediation="Preserve the clone and checkpoint it on a Linux worker.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="secure no-follow object persistence is unavailable on Windows",
+        )
     source = publisher / ".git" / "objects" / oid[:2] / oid[2:]
     try:
         payload = source.read_bytes()
@@ -2081,15 +2090,6 @@ def _copy_trusted_loose_object_to_agent(
             expected_branch=expected_branch,
             detail=f"cannot read trusted loose object {oid}: {exc}",
         ) from exc
-    if os.name == "nt":
-        raise WorkspaceVerificationError(
-            failed_step="dirty_checkpoint_platform",
-            remediation="Preserve the clone and checkpoint it on a Linux worker.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail="secure no-follow object persistence is unavailable on Windows",
-        )
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     git_fd = objects_fd = prefix_fd = target_fd = None
@@ -2165,24 +2165,12 @@ def _copy_trusted_loose_object_to_agent(
                 os.close(descriptor)
 
 
-def _advance_agent_branch_ref(
-    workspace: Path,
-    *,
-    expected_branch: str,
-    previous_sha: str,
-    checkpoint_sha: str,
-) -> None:
-    """Atomically advance only the already-verified task branch ref."""
+@contextmanager
+def _lock_agent_branch_ref(
+    workspace: Path, *, expected_branch: str
+):
+    """Hold Git's conventional branch lock through index + ref persistence."""
     _validate_task_branch_ref(expected_branch, workspace)
-    if _read_agent_head(workspace, expected_branch) != previous_sha:
-        raise WorkspaceVerificationError(
-            failed_step="dirty_checkpoint_ref_race",
-            remediation="Stop the remaining writer and retry from the preserved clone.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail="task branch changed before checkpoint ref update",
-        )
     if os.name == "nt":
         raise WorkspaceVerificationError(
             failed_step="dirty_checkpoint_platform",
@@ -2196,8 +2184,8 @@ def _advance_agent_branch_ref(
     directory_fd = os.open(
         workspace / ".git", os.O_RDONLY | os.O_DIRECTORY | nofollow
     )
-    temporary = f".aicc-checkpoint-{secrets.token_hex(16)}"
-    file_fd: int | None = None
+    lock_name = f"{expected_branch.split('/')[-1]}.lock"
+    lock_fd: int | None = None
     try:
         for component in ("refs", "heads", *expected_branch.split("/")[:-1]):
             try:
@@ -2211,29 +2199,78 @@ def _advance_agent_branch_ref(
             )
             os.close(directory_fd)
             directory_fd = next_fd
-        file_fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
-            0o600,
-            dir_fd=directory_fd,
+        try:
+            lock_fd = os.open(
+                lock_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Retry after the existing task-branch writer finishes.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"task branch lock is already held: {exc}",
+            ) from exc
+        yield directory_fd, lock_fd, lock_name
+    except WorkspaceVerificationError:
+        raise
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_lock",
+            remediation="Preserve the task clone for ref-integrity inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot securely lock the task branch: {exc}",
+        ) from exc
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+            try:
+                os.unlink(lock_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
+
+
+def _advance_agent_branch_ref(
+    workspace: Path,
+    *,
+    expected_branch: str,
+    previous_sha: str,
+    checkpoint_sha: str,
+    directory_fd: int,
+    lock_fd: int,
+    lock_name: str,
+) -> None:
+    """Advance the task ref while its conventional Git lock is held."""
+    if _read_agent_head(workspace, expected_branch) != previous_sha:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_race",
+            remediation="Stop the remaining writer and retry from the preserved clone.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="task branch changed before checkpoint ref update",
         )
+    try:
         payload = f"{checkpoint_sha}\n".encode("ascii")
         view = memoryview(payload)
         while view:
-            written = os.write(file_fd, view)
+            written = os.write(lock_fd, view)
             if written <= 0:
                 raise OSError("ref write made no progress")
             view = view[written:]
-        os.fsync(file_fd)
-        os.close(file_fd)
-        file_fd = None
-        # Re-check through the separately hardened reader immediately
-        # before replacement.  A live writer can only make this fail; it
-        # cannot redirect the descriptor-pinned destination chain.
+        os.fsync(lock_fd)
+        # Re-check while the shared Git lock excludes another ref writer.
         if _read_agent_head(workspace, expected_branch) != previous_sha:
             raise OSError("task branch changed during checkpoint ref update")
         os.replace(
-            temporary,
+            lock_name,
             expected_branch.split("/")[-1],
             src_dir_fd=directory_fd,
             dst_dir_fd=directory_fd,
@@ -2248,14 +2285,6 @@ def _advance_agent_branch_ref(
             expected_branch=expected_branch,
             detail=f"cannot atomically advance task ref: {exc}",
         ) from exc
-    finally:
-        if file_fd is not None:
-            os.close(file_fd)
-        try:
-            os.unlink(temporary, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
-        os.close(directory_fd)
     if _read_agent_head(workspace, expected_branch) != checkpoint_sha:
         raise WorkspaceVerificationError(
             failed_step="dirty_checkpoint_ref_verify",
@@ -2377,13 +2406,31 @@ def checkpoint_dirty_task_workspace(
                 expected_branch=expected_branch,
                 detail=f"cannot read trusted checkpoint index: {exc}",
             ) from exc
-        _atomic_write_private(workspace / ".git" / "index", trusted_index)
-    _advance_agent_branch_ref(
-        workspace,
-        expected_branch=expected_branch,
-        previous_sha=candidate_sha,
-        checkpoint_sha=checkpoint_sha,
-    )
+        # Serialize the index/ref pair with every Git-compatible ref writer.
+        # A second checkpoint can build concurrently, but it must acquire the
+        # same `<branch>.lock` and re-check the old SHA before touching either.
+        with _lock_agent_branch_ref(
+            workspace, expected_branch=expected_branch
+        ) as (directory_fd, lock_fd, lock_name):
+            if _read_agent_head(workspace, expected_branch) != candidate_sha:
+                raise WorkspaceVerificationError(
+                    failed_step="dirty_checkpoint_ref_race",
+                    remediation="Stop the remaining writer and retry from the preserved clone.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    expected_branch=expected_branch,
+                    detail="task branch changed before checkpoint persistence",
+                )
+            _atomic_write_private(workspace / ".git" / "index", trusted_index)
+            _advance_agent_branch_ref(
+                workspace,
+                expected_branch=expected_branch,
+                previous_sha=candidate_sha,
+                checkpoint_sha=checkpoint_sha,
+                directory_fd=directory_fd,
+                lock_fd=lock_fd,
+                lock_name=lock_name,
+            )
     # Re-open a fresh publisher after the ref update: this proves the copied
     # object graph is complete and the task tree is now exactly clean.
     with trusted_publish_clone(
