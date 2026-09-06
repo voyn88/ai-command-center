@@ -68,10 +68,30 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
 }
 
 
-def cascade_for(task_class: str) -> list[dict[str, Any]]:
+def cascade_for(
+    task_class: str, *, claude_window_exhausted: bool = False
+) -> list[dict[str, Any]]:
     """The cascade for a task class; unknown classes get the implementation
-    route rather than a refusal — routing chooses HOW, never WHETHER."""
-    return [
+    route rather than a refusal — routing chooses HOW, never WHETHER.
+
+    ``claude_window_exhausted=True`` (VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING)
+    drops every ``claude`` link before returning: a link the control plane
+    already knows is provably closed (via
+    ``orchestrator.credential_window.claude_window_reset_at``) would
+    otherwise still cost a real CLI invocation and the round-trip latency of
+    asking Anthropic to confirm what is already known, without buying back
+    any attempt budget -- the worker's own in-process circuit
+    (``agent_runner.claude_window_preflight``) already skips it WITHIN one
+    delivery, but only for a worker process that itself observed the
+    failure. This is the cross-process version of the same decision, made
+    before the delivery -- and the worker process that will run it -- even
+    exist. Every ``ROUTING_MATRIX`` entry names at least one non-claude
+    executor, so the result is never empty.
+    """
+    cascade = [
         dict(link)
         for link in ROUTING_MATRIX.get(task_class, ROUTING_MATRIX["implementation"])
     ]
+    if claude_window_exhausted:
+        cascade = [link for link in cascade if link.get("executor") != "claude"]
+    return cascade

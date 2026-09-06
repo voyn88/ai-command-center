@@ -259,6 +259,16 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
+    if executor == "claude":
+        # VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: checked ahead of the
+        # principal-isolation/CLI probes below (which apply to every
+        # executor) so a Claude link known-exhausted from an earlier
+        # delivery on this host is skipped without spawning a process --
+        # the same "avoid spending a queue attempt" property
+        # `codex_workspace_write_preflight` gives Codex's sandbox circuit.
+        available, detail = agent_runner.claude_window_preflight()
+        if not available:
+            return available, detail, "claude usage window exhausted"
     if agent_runner.principal_isolation_required():
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
@@ -607,6 +617,13 @@ def _run_agent(
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
         route_failovers: list[dict[str, Any]] = []
+        # VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: the reset time (if any) the
+        # CURRENT loop iteration's provider failure reported for Claude's
+        # credential window -- reset to None at the top of every iteration
+        # (below) so a stale value from an earlier candidate in this same
+        # attempt can never attach itself to a later, unrelated executor's
+        # outcome.
+        claude_window_reset_at: str | None = None
         while True:
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
@@ -629,6 +646,14 @@ def _run_agent(
                     and task_type not in agent_runner.MUTATING_TASK_TYPES
                     and run.status != "completed"
                 )
+                claude_window_reset_at = None
+                if provider_failure and executor == "claude":
+                    diagnostic = f"{result_text}\n{run.stderr}"
+                    if agent_runner.claude_diagnostic_is_session_limit(diagnostic):
+                        window = agent_runner.record_claude_window_exhaustion(
+                            diagnostic=diagnostic, observed_at=run.completed_at
+                        )
+                        claude_window_reset_at = window["reset_at"]
                 # A provider/auth/quota refusal happens before useful model work.
                 # For read-only work the execution policy already prevents writes;
                 # for mutating work prove the isolated workspace is untouched before
@@ -677,13 +702,20 @@ def _run_agent(
                         )
                         if not candidate_available:
                             continue
-                        route_failovers.append(
-                            {
-                                "cascade_step": cascade_step,
-                                "executor": executor,
-                                "reason": "provider_auth_or_quota",
-                            }
-                        )
+                        failover_entry = {
+                            "cascade_step": cascade_step,
+                            "executor": executor,
+                            "reason": "provider_auth_or_quota",
+                        }
+                        if claude_window_reset_at is not None:
+                            # Read back by `orchestrator.planner.Planner.
+                            # _claude_window_reset_at`: the common case (this
+                            # attempt still succeeds via the next cascade
+                            # link) never reaches the `outcome_reason` text
+                            # path below, so this structured result is the
+                            # signal the planner actually sees most often.
+                            failover_entry["credential_reset_at"] = claude_window_reset_at
+                        route_failovers.append(failover_entry)
                         executor = candidate_executor
                         task_type = candidate_task_type
                         model = request.model
@@ -913,14 +945,22 @@ def _run_agent(
             checkpoint_failure = checkpoint_preserved_candidate()
             if checkpoint_failure is not None:
                 return checkpoint_failure
-            return HandlerOutcome(
-                ok=False,
-                reason=(
-                    "executor infrastructure failure "
-                    f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
-                ),
-                retryable=True,
+            reason = (
+                "executor infrastructure failure "
+                f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
             )
+            if claude_window_reset_at is not None:
+                # The cascade is exhausted (every remaining link also failed,
+                # or none was left), so this is a genuine FAILED attempt --
+                # `outcome_reason` is the only place the planner can read the
+                # reset time back from for this delivery (see
+                # `orchestrator.planner.Planner._claude_window_reset_at`; the
+                # structured `route_failovers` path above only exists on a
+                # SUCCEEDED attempt).
+                reason += " " + agent_runner.credential_window_marker(
+                    agent_runner.CLAUDE_CREDENTIAL_ID, claude_window_reset_at
+                )
+            return HandlerOutcome(ok=False, reason=reason, retryable=True)
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.
             if executor == "codex":

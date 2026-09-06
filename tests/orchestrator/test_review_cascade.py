@@ -94,7 +94,7 @@ def test_empty_review_route_fails_closed_without_enqueuing(monkeypatch):
             ("VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7")
         ],
     )
-    monkeypatch.setattr(review_merge, "cascade_for", lambda _task_class: [])
+    monkeypatch.setattr(review_merge, "cascade_for", lambda _task_class, **_kwargs: [])
     calls = []
     report = review_merge.review_once(
         object(), lambda *args: calls.append(args), "/tmp"
@@ -108,6 +108,12 @@ def test_review_tick_stops_when_global_review_wip_is_full(monkeypatch):
 
     def rows(_factory, sql, params=()):
         queries.append((sql, params))
+        # VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: review_once's own credential-
+        # window check (`_claude_window`, routed through this same `_rows`
+        # seam) runs before the WIP-count query; a fleet with no observed
+        # Claude-window fact yet reports no rows.
+        if "work_attempt_public" in sql:
+            return []
         if "count(DISTINCT task_id)" in sql:
             return [(8,)]
         raise AssertionError("a full review WIP must stop before scanning tasks")
@@ -123,7 +129,7 @@ def test_review_tick_stops_when_global_review_wip_is_full(monkeypatch):
 
     assert report.reviewed == []
     assert calls == []
-    assert len(queries) == 1
+    assert len(queries) == 2
 
 
 def test_review_tick_only_fills_available_global_wip(monkeypatch):
@@ -133,6 +139,8 @@ def test_review_tick_only_fills_available_global_wip(monkeypatch):
     ]
 
     def rows(_factory, sql, params=()):
+        if "work_attempt_public" in sql:
+            return []
         if "count(DISTINCT task_id)" in sql:
             return [(7,)]
         return tasks

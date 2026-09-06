@@ -73,10 +73,11 @@ import urllib.parse
 import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from command_center.orchestrator import github_app_auth
+from command_center.orchestrator import credential_window, github_app_auth
 from command_center.orchestrator.routing import cascade_for
 
 __all__ = [
@@ -103,6 +104,18 @@ class ReviewConfig:
     #: Count distinct tasks rather than chunks so one large diff does not
     #: consume the whole PR-level concurrency budget by itself.
     max_active_reviews: int = 8
+    #: VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: mirrors `PlanLimits.burst_window_
+    #: seconds` -- a Claude-window reset observed this recently in the past
+    #: makes this tick a "burst" tick, so `burst_max_per_tick`/
+    #: `burst_max_active_reviews` replace `max_per_tick`/`max_active_reviews`
+    #: for it. Review and merge run on a uniform 5-minute timer regardless of
+    #: fleet capacity (`deploy/systemd/aicc-backlog-review.timer`), so the
+    #: review backlog that piled up while the window was closed would
+    #: otherwise trickle out `max_per_tick` at a time for several ticks after
+    #: capacity was already back, instead of draining in the reopening tick.
+    burst_window_seconds: int = 120
+    burst_max_per_tick: int = 32
+    burst_max_active_reviews: int = 32
     #: Per-tick cap on merge-train branch updates (BEHIND PRs brought current
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
@@ -433,8 +446,24 @@ _MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
 )
 
 
-def _model_only_review_cascade() -> list[dict[str, Any]]:
-    route = cascade_for("review")
+def _claude_window(factory: Any) -> tuple[bool, datetime | None]:
+    """``(exhausted_now, last_reset_at)`` -- VOYN-W0-AICC-WINDOW-AWARE-
+    SCHEDULING, mirroring `orchestrator.planner.Planner._claude_window` so
+    review and verification dispatch make the same "is Claude worth trying
+    right now" decision the planner and the worker already make, before
+    either enqueues a cascade that still ends in a claude link. ``factory``
+    can be a non-callable stub in hermetic tests; callers check
+    ``callable(factory)`` before reaching here."""
+    reset_at = credential_window.claude_window_reset_at(factory, rows_fn=_rows)
+    if reset_at is None:
+        return False, None
+    return reset_at > datetime.now(timezone.utc), reset_at
+
+
+def _model_only_review_cascade(
+    *, claude_window_exhausted: bool = False
+) -> list[dict[str, Any]]:
+    route = cascade_for("review", claude_window_exhausted=claude_window_exhausted)
     return [
         {**link, "task_type": "independent_review", "capability": "model_only"}
         for link in route
@@ -443,12 +472,14 @@ def _model_only_review_cascade() -> list[dict[str, Any]]:
     ]
 
 
-def _verification_review_cascade() -> list[dict[str, Any]]:
+def _verification_review_cascade(
+    *, claude_window_exhausted: bool = False
+) -> list[dict[str, Any]]:
     """Same executor route as the reviews, different task type: a
     `verification_review` run resolves to the read-only profile (Claude:
     Read/Grep/Glob; Codex: `--sandbox read-only`) instead of MODEL_ONLY's
     zero tools -- verification is exactly the task that must read the tree."""
-    route = cascade_for("review")
+    route = cascade_for("review", claude_window_exhausted=claude_window_exhausted)
     return [
         {**link, "task_type": "verification_review", "capability": "read_only"}
         for link in route
@@ -1095,7 +1126,23 @@ def review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    action_limit = cfg.max_per_tick
+    # VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: one read for the whole tick,
+    # exactly like the planner's own `_claude_window` -- `claude_exhausted`
+    # keeps this tick's cascades off a Claude link already known closed, and
+    # a reset observed within `burst_window_seconds` widens this tick's own
+    # caps so review work held back while the window was closed (or simply
+    # produced in bulk by the planner's own burst tick) drains now instead of
+    # trickling out over several more 5-minute ticks at the ordinary pace.
+    claude_exhausted, claude_reset_at = (
+        _claude_window(factory) if callable(factory) else (False, None)
+    )
+    burst = (
+        not claude_exhausted
+        and claude_reset_at is not None
+        and datetime.now(timezone.utc) - claude_reset_at
+        <= timedelta(seconds=cfg.burst_window_seconds)
+    )
+    action_limit = cfg.burst_max_per_tick if burst else cfg.max_per_tick
     if task_id is None and callable(factory):
         active_rows = _rows(
             factory,
@@ -1104,9 +1151,10 @@ def review_once(
             "AND idempotency_key LIKE 'review:%%'",
         )
         active_reviews = int(active_rows[0][0]) if active_rows else 0
+        active_cap = cfg.burst_max_active_reviews if burst else cfg.max_active_reviews
         action_limit = min(
             action_limit,
-            max(cfg.max_active_reviews - active_reviews, 0),
+            max(active_cap - active_reviews, 0),
         )
         if action_limit == 0:
             return report
@@ -1149,7 +1197,7 @@ def review_once(
             (), cfg.scan_cap,
         )
     last_processed = None
-    cascade = _model_only_review_cascade()
+    cascade = _model_only_review_cascade(claude_window_exhausted=claude_exhausted)
     actions = 0
     for task_id, pr_url in tasks:  # noqa: PLR1704
         if actions >= action_limit:
@@ -1265,7 +1313,13 @@ def reconcile_review_once(
         "WHERE t.status = 'READY_TO_REVIEW'" + where + " ORDER BY t.task_id LIMIT %s",
         params,
     )
-    cascade = _model_only_review_cascade()
+    # VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: a retry of a malformed result is
+    # still a fresh cascade dispatch -- it must not re-offer a claude link
+    # the control plane already knows is closed.
+    claude_exhausted, _claude_reset_at = (
+        _claude_window(factory) if callable(factory) else (False, None)
+    )
+    cascade = _model_only_review_cascade(claude_window_exhausted=claude_exhausted)
     actions = 0
     for current_task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
@@ -2013,7 +2067,13 @@ def _verified_rejection_outcome(
     repo = _repo_from_pr_url(pr_url)
     route = repo_route(repo) if repo else None
     parsed_url = _owner_repo_number_from_pr_url(pr_url)
-    cascade = _verification_review_cascade()
+    # VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: same reasoning as the review
+    # cascade above -- a verification run enqueued while the window is known
+    # closed must not still carry a claude link.
+    claude_exhausted, _claude_reset_at = (
+        _claude_window(factory) if callable(factory) else (False, None)
+    )
+    cascade = _verification_review_cascade(claude_window_exhausted=claude_exhausted)
     if route is None or parsed_url is None or not cascade:
         return "REMEDIATE", findings
     project_id, repository_path = route
