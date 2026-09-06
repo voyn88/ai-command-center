@@ -37,6 +37,7 @@ from command_center.ui import (
     aml_panel,
     case_panel,
     compliance_dashboard,
+    console_identity,
     customer_panel,
     rules_panel,
     sar_panel,
@@ -690,6 +691,18 @@ def build_commands() -> list[dict]:
     return commands
 
 
+# The console performs privileged git/gh and subprocess operations, so every
+# run is blocked behind a signed-in platform identity before anything else
+# executes — including loading task data, which nothing downstream of this
+# call may see without a verified credential (VOYN-W0-AICC-CONSOLE-NO-AUTH).
+# `require_identity` also owns the one `st.set_page_config` call for both the
+# login screen and the authenticated app: see `shell.render_shell`.
+console_principal = console_identity.require_identity(
+    page_title="AI Command Center",
+    page_icon="🧭",
+    sidebar_state="collapsed" if st.session_state.get("nav_page") == "focus" else "expanded",
+)
+
 # Data loading happens before the shell render so the top command bar (search,
 # live glyph, Inspector) has the task map + api available without a second pass.
 tasks = load_tasks()
@@ -698,9 +711,6 @@ task_counts = read_model.task_snapshot(tasks)
 project_configs = project_config.load_project_configs()
 
 page_key = shell.render_shell(
-    page_title="AI Command Center",
-    page_icon="🧭",
-    sidebar_collapsed=st.session_state.get("nav_page") == "focus",
     title="🧭 AI Command Center",
     caption="Единый центр управления проектами, задачами и AI-процессами",
     nav=NAV,
@@ -1940,6 +1950,7 @@ elif page_key == "create":
             )
             st.success(f"Задача создана и добавлена в Kanban (статус «{initial_status}»).")
 
+            console_identity.require_console_operation("console:start_task")
             with st.spinner("Выполняется scripts/start-task.sh..."):
                 ok, stdout, stderr = run_start_task_script(project, task_type, objective_clean)
 

@@ -34,7 +34,9 @@ def inject_global_css() -> None:
     Emitted on every run: Streamlit drops any ``st.markdown`` a rerun does not
     re-emit, so a once-per-session guard would leave the page unstyled after
     the first interaction (audit H6 on ``home_dashboard.inject_css``). Called
-    once from ``shell.render_shell`` after ``st.set_page_config``.
+    from ``shell.render_shell`` once signed in, and from
+    ``console_identity.require_identity``'s login screen before that, always
+    after ``st.set_page_config``.
     """
     st.markdown(
         """

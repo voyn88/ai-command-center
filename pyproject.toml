@@ -53,4 +53,5 @@ dev = [
 markers = [
     "serial: must not run concurrently with other tests (excluded from pytest-xdist runs; see README Validation)",
     "e2e: requires the real Playwright browser and runs in the dedicated E2E partition",
+    "console_identity_gate: opts out of tests/conftest.py's bypass_console_identity_gate fixture to exercise the real Streamlit console sign-in gate",
 ]
