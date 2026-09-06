@@ -125,6 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan.add_argument("--wip-limit", type=int, default=4)
     plan.add_argument(
+        "--review-backlog-limit",
+        type=int,
+        default=8,
+        help="Do not dispatch while this many tasks await PR review (default 8).",
+    )
+    plan.add_argument(
         "--dry-run",
         action="store_true",
         help="Report the eligible set without dispatching.",
@@ -461,11 +467,21 @@ def main(argv: list[str] | None = None) -> int:
                             )
                     return 0
                 report = plan_once(
-                    lambda: _nc(conn), PlanLimits(wip_limit=args.wip_limit)
+                    lambda: _nc(conn),
+                    PlanLimits(
+                        wip_limit=args.wip_limit,
+                        review_backlog_limit=args.review_backlog_limit,
+                    ),
                 )
                 if report.planner_busy:
                     print("planner lease held elsewhere; nothing done")
                     return 0
+                if report.review_window_full is not None:
+                    print(
+                        "PR-WINDOW full: "
+                        f"{report.review_window_full}/{args.review_backlog_limit}; "
+                        "implementation dispatch paused"
+                    )
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
@@ -487,12 +503,26 @@ def main(argv: list[str] | None = None) -> int:
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
+                    reconcile_pr_window,
                     reconcile_review_once,
                     review_once,
                 )
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
+                # Labels are a durable review-window state, not a dashboard
+                # decoration. Targeted operator runs leave the global window
+                # untouched; the timer's ordinary full tick reconciles it.
+                if args.task_id is None:
+                    window = reconcile_pr_window(args.repo_path)
+                    for pr_number, pr_url in window.promoted:
+                        print(f"PR-ACTIVE {pr_number} -> {pr_url}")
+                    for pr_number, reason in window.demoted:
+                        print(f"PR-WAIT   {pr_number}: {reason}")
+                    for pr_number, reason in window.blocked:
+                        print(f"PR-BLOCK  {pr_number}: {reason}")
+                    for pr_number, reason in window.skipped:
+                        print(f"PR-WINDOW-SKIP {pr_number}: {reason}")
                 # Before selecting anything: a task whose PR exists but was
                 # never recorded is invisible to every gate downstream. This
                 # derives that evidence from the task's own branch, so a pull

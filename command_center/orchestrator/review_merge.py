@@ -72,6 +72,7 @@ import urllib.error
 import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -80,11 +81,14 @@ from command_center.orchestrator.routing import cascade_for
 
 __all__ = [
     "LoopReport",
+    "PrWindowConfig",
+    "PrWindowReport",
     "ReconcileReport",
     "ReviewConfig",
     "merge_once",
     "publish_review_verdicts",
     "reconcile_merge_evidence",
+    "reconcile_pr_window",
     "reconcile_review_once",
     "review_once",
 ]
@@ -112,6 +116,28 @@ class ReviewConfig:
     #: in the tick functions (review of ce948c0: an unbounded scan meant
     #: unbounded API traffic and runtime regardless of the action cap).
     scan_cap: int = 40
+
+
+@dataclass(frozen=True, slots=True)
+class PrWindowConfig:
+    """Persistent GitHub-side review window, independent of worker leases."""
+
+    target_active: int = 5
+    max_active: int = 8
+    scan_limit: int = 200
+    stale_seconds: int = 1800
+    active_label: str = "queue-active"
+    waiting_label: str = "queue-waiting-review"
+    blocked_label: str = "queue-blocked"
+
+
+@dataclass
+class PrWindowReport:
+    promoted: list[tuple[str, str]] = field(default_factory=list)
+    demoted: list[tuple[str, str]] = field(default_factory=list)
+    blocked: list[tuple[str, str]] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+    skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -375,6 +401,202 @@ def _rows(factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
     with factory() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchall() if cur.description else []
+
+
+_FAILED_CHECK_CONCLUSIONS = {
+    "ACTION_REQUIRED",
+    "CANCELLED",
+    "FAILURE",
+    "STARTUP_FAILURE",
+    "STALE",
+    "TIMED_OUT",
+}
+
+
+def _pr_age_seconds(pr: dict[str, Any], now: datetime) -> float:
+    # A new push refreshes updatedAt. Using createdAt alone would demote an
+    # old PR while its freshly-triggered exact-head checks are legitimately
+    # still running.
+    raw = str(pr.get("updatedAt") or pr.get("createdAt") or "")
+    try:
+        created = datetime.fromisoformat(raw)
+    except ValueError:
+        return float("inf")
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return max((now - created.astimezone(UTC)).total_seconds(), 0.0)
+
+
+def _window_block_reason(
+    pr: dict[str, Any], cfg: PrWindowConfig, now: datetime
+) -> str | None:
+    """Return a stable reason why an open PR must not hold an active slot.
+
+    Pending checks and a fresh missing marker remain active work. Definitive
+    failures, conflicts, or an exact-head acceptance that never arrives past
+    the grace period rotate out, leaving review/merge free to repair them.
+    """
+    if pr.get("isDraft"):
+        return "draft"
+    if pr.get("mergeStateStatus") == "DIRTY":
+        return "merge_conflict"
+    checks = _latest_checks_by_name(pr.get("statusCheckRollup") or [])
+    failed = [
+        str(check.get("name") or "?")
+        for check in checks
+        if str(check.get("conclusion") or check.get("state") or "").upper()
+        in _FAILED_CHECK_CONCLUSIONS
+    ]
+    if failed:
+        return f"checks_failed:{','.join(failed[:3])}"
+    age = _pr_age_seconds(pr, now)
+    if not checks and age >= cfg.stale_seconds:
+        return "checks_missing"
+    pending = any(not _check_is_green(check) for check in checks)
+    if pending:
+        return "checks_stale" if age >= cfg.stale_seconds else None
+    head = str(pr.get("headRefOid") or "")
+    author = str((pr.get("author") or {}).get("login") or "")
+    reviews = pr.get("reviews") or []
+    latest_review = max(reviews, key=lambda item: item.get("submittedAt") or "") if reviews else {}
+    if f"ACCEPTANCE: REJECT {head}" in str(latest_review.get("body") or ""):
+        return "acceptance_rejected"
+    accepted = _accept_marker_on_latest_review(reviews, head, author)
+    if not accepted and age >= cfg.stale_seconds:
+        return "stale_exact_head_acceptance"
+    return None
+
+
+def _set_pr_window_labels(
+    repo_path: str,
+    pr: dict[str, Any],
+    *,
+    active: bool,
+    blocked: bool,
+    cfg: PrWindowConfig,
+) -> tuple[bool, str]:
+    existing = {
+        str(label.get("name") or "")
+        for label in pr.get("labels") or []
+        if isinstance(label, dict)
+    }
+    wanted = {cfg.active_label} if active else {cfg.waiting_label}
+    if blocked:
+        wanted.add(cfg.blocked_label)
+    managed = {cfg.active_label, cfg.waiting_label, cfg.blocked_label}
+    add = sorted(wanted - existing)
+    remove = sorted((existing & managed) - wanted)
+    if not add and not remove:
+        return True, "unchanged"
+    argv = ["pr", "edit", str(pr.get("url") or pr.get("number"))]
+    for label in add:
+        argv.extend(["--add-label", label])
+    for label in remove:
+        argv.extend(["--remove-label", label])
+    result = _gh(argv, repo_path)
+    if result.returncode != 0:
+        return False, f"label_update_failed:{result.stderr.strip()[:100]}"
+    return True, "updated"
+
+
+def reconcile_pr_window(
+    repo_path: str,
+    cfg: PrWindowConfig | None = None,
+    *,
+    now: datetime | None = None,
+) -> PrWindowReport:
+    """Rotate the repository's open PRs through a bounded active window.
+
+    The selection is deterministic and label writes are delta-only, making
+    concurrent/repeated timer ticks converge on the same state. This function
+    never merges or weakens a gate; review and merge continue to require their
+    exact-head acceptance and required-check evidence.
+    """
+    cfg = cfg or PrWindowConfig()
+    report = PrWindowReport()
+    if cfg.target_active < 1 or cfg.max_active < cfg.target_active:
+        report.skipped.append(("window", "invalid_window_config"))
+        return report
+    for name, color, description in (
+        (cfg.active_label, "0E8A16", "One of the bounded PRs currently being reviewed or merged"),
+        (cfg.waiting_label, "FBCA04", "Open PR waiting behind the active review window"),
+        (cfg.blocked_label, "B60205", "PR needs remediation before it can re-enter the active window"),
+    ):
+        ensured = _gh(
+            ["label", "create", name, "--color", color, "--description", description, "--force"],
+            repo_path,
+        )
+        if ensured.returncode != 0:
+            report.skipped.append(("window", f"label_setup_failed:{name}"))
+            return report
+    listed = _gh(
+        [
+            "pr", "list", "--state", "open", "--limit", str(max(cfg.scan_limit, 1)),
+            "--json",
+            (
+                "number,url,createdAt,updatedAt,isDraft,mergeStateStatus,labels,"
+                "statusCheckRollup,reviews,headRefOid,author,state"
+            ),
+        ],
+        repo_path,
+    )
+    if listed.returncode != 0:
+        report.skipped.append(("window", f"pr_list_failed:{listed.stderr.strip()[:100]}"))
+        return report
+    try:
+        decoded = json.loads(listed.stdout or "[]")
+    except json.JSONDecodeError:
+        report.skipped.append(("window", "pr_list_malformed"))
+        return report
+    if not isinstance(decoded, list):
+        report.skipped.append(("window", "pr_list_malformed"))
+        return report
+    observed = now or datetime.now(UTC)
+    prs = [pr for pr in decoded if isinstance(pr, dict) and pr.get("state") == "OPEN"]
+    reasons = {str(pr.get("url")): _window_block_reason(pr, cfg, observed) for pr in prs}
+    eligible = [pr for pr in prs if reasons[str(pr.get("url"))] is None]
+    eligible.sort(key=lambda pr: (str(pr.get("createdAt") or ""), int(pr.get("number") or 0)))
+
+    def has_active(pr: dict[str, Any]) -> bool:
+        return any(
+            isinstance(label, dict) and label.get("name") == cfg.active_label
+            for label in pr.get("labels") or []
+        )
+
+    current = [pr for pr in eligible if has_active(pr)]
+    selected = current[: cfg.max_active]
+    selected_urls = {str(pr.get("url")) for pr in selected}
+    if len(selected) < cfg.target_active:
+        for pr in eligible:
+            url = str(pr.get("url"))
+            if url in selected_urls:
+                continue
+            selected.append(pr)
+            selected_urls.add(url)
+            if len(selected) >= cfg.target_active:
+                break
+
+    for pr in prs:
+        url = str(pr.get("url") or "")
+        number = str(pr.get("number") or url)
+        reason = reasons[url]
+        active = url in selected_urls
+        was_active = has_active(pr)
+        ok, detail = _set_pr_window_labels(
+            repo_path, pr, active=active, blocked=reason is not None, cfg=cfg
+        )
+        if not ok:
+            report.skipped.append((number, detail))
+            continue
+        if reason is not None:
+            report.blocked.append((number, reason))
+        if detail == "unchanged":
+            report.unchanged.append(number)
+        elif active and not was_active:
+            report.promoted.append((number, url))
+        elif was_active and not active:
+            report.demoted.append((number, reason or "active_window_cap"))
+    return report
 
 
 # -- Part 2: review -----------------------------------------------------------

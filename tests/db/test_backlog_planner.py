@@ -914,3 +914,47 @@ def test_resume_budget_is_a_window_not_a_lifetime_score(
 
     ok, reason, _ = store.resume_deferred(task)
     assert not ok and reason == "resume_budget_exhausted"
+
+
+def test_durable_review_backlog_stops_new_implementation_dispatch(rig) -> None:
+    """READY_TO_REVIEW, not short-lived writer leases, is the PR WIP fence."""
+    app_factory, store, _worker = rig
+    for index in range(3):
+        task_id = f"VOYN-W0-PR-WINDOW-{index}"
+        assert store.upsert_task(_task(task_id, repo=f"repo-{index}"))[0]
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            revision = cur.fetchone()[0]
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)",
+                (task_id, revision),
+            )
+            cur.execute(
+                "SELECT backlog_record_evidence(%s,'pr',%s)",
+                (task_id, f"https://github.com/o/r/pull/{index + 1}"),
+            )
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            revision = cur.fetchone()[0]
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)",
+                (task_id, revision),
+            )
+            conn.commit()
+    candidate = "VOYN-W0-PR-WINDOW-CANDIDATE"
+    assert store.upsert_task(_task(candidate, repo="repo-candidate"))[0]
+
+    report = plan_once(
+        app_factory,
+        PlanLimits(
+            planner="window-planner",
+            review_backlog_limit=3,
+            max_resumes_per_tick=0,
+        ),
+    )
+
+    assert report.review_window_full == 3
+    assert report.dispatched == []
+    assert store.get_task(candidate)["status"] == "OPEN"
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM work_item_public")
+        assert cur.fetchone()[0] == 0
