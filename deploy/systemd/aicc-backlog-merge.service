@@ -2,8 +2,18 @@
 Description=AICC backlog merge tick (BO-S3b)
 After=postgresql.service
 
+# VOYN-W0-AICC-MERGE-GATEWAY-REM: `backlog-merge` is the only process that
+# ever calls `gh pr merge`/the merge REST endpoint (review_merge.merge_once);
+# neither the worker nor the planner units can. Its merge credentials
+# (VOYN_MERGE_APP_ID / VOYN_MERGE_INSTALLATION_ID / VOYN_MERGE_PRIVATE_KEY_
+# PATH -- a GitHub App installation distinct from both the worker's ambient
+# `gh` token and the acceptance identity that only posts the ACCEPT/REJECT
+# marker) belong in a file this unit alone reads, not the shared
+# /etc/ai-command-center.env the worker and backlog-review also read: a
+# credential no other unit's environment carries cannot leak through one.
 [Service]
 Type=oneshot
 User=aicc-worker
 EnvironmentFile=-/etc/ai-command-center.env
+EnvironmentFile=-/etc/aicc/merge-gateway.env
 ExecStart=/usr/bin/python -m command_center.db backlog-merge --repo-path /srv/ai-command-center

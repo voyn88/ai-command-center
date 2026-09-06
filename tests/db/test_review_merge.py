@@ -266,12 +266,18 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
+    def fake_merge(creds, pr_url_arg, expected_head, method="squash"):
+        merged_state["merged"] = True
+        return True, "", False
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_merge_pull_request_as_bot", fake_merge)
     report = merge_once(app_factory, "/tmp")
     # Evidence is the TARGET-BRANCH merge commit, never the PR head
     # (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY).
@@ -346,12 +352,18 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
+    def fake_merge(creds, pr_url_arg, expected_head, method="squash"):
+        merged_state["merged"] = True
+        return True, "", False
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_merge_pull_request_as_bot", fake_merge)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1C", merge_oid) in report.merged
 
@@ -485,6 +497,36 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
+
+
+def test_merge_a_dismissed_accept_no_longer_authorizes_merge(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-MERGE-GATEWAY-REM: dismissal leaves a review's
+    `submittedAt` and `body` untouched, so the ONLY review being the most
+    recent one by time is not enough -- a review anyone with repo write
+    access dismissed must not still authorize merge just because nothing
+    newer was ever posted."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M5D", "https://github.com/x/y/pull/23")
+    head = "9d" * 20
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [
+                {
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "submittedAt": "2026-01-01T00:00:00Z",
+                    "state": "DISMISSED",
+                },
+            ],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M5D", "no_accept_marker_on_head") in report.skipped
 
 
 def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811, E501
@@ -974,6 +1016,243 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
     assert any(t == "VOYN-W0-M3" and "checks_not_green" in r for t, r in report.skipped)
 
 
+def test_merge_skips_when_the_merge_bot_is_not_configured(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-MERGE-GATEWAY-REM: a host with no merge-identity
+    credentials must refuse to merge, never fall back to the ambient `gh`
+    credential every read in this module uses -- that is exactly the
+    shared-credential gap this component exists to close."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MNC", "https://github.com/x/y/pull/40")
+    head = "5e" * 20
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "mergeStateStatus": "CLEAN",
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_merge_app_credentials", lambda: None)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MNC", "merge_bot_not_configured") in report.skipped
+    assert not report.merged
+
+
+def test_merge_reports_an_unreachable_github_api_as_an_error_not_a_skip(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-MERGE-GATEWAY-REM acceptance: GitHub being unreachable
+    must fail closed as a distinct, surfaced refusal -- never look identical
+    to an ordinary "not ready yet" skip that silently retries forever."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MERR", "https://github.com/x/y/pull/41")
+
+    def fake_gh(argv, repo):
+        import subprocess
+        return subprocess.CompletedProcess(argv, 1, "", "connection reset")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert any(
+        t == "VOYN-W0-MERR" and r.startswith("gh_view_failed") for t, r in report.errors
+    )
+    assert not any(t == "VOYN-W0-MERR" for t, _ in report.skipped)
+
+
+def test_merge_call_transport_failure_is_reported_as_an_error(rig, monkeypatch):  # noqa: F811, E501
+    """A ready, accepted PR whose merge *call* itself fails to reach GitHub
+    (network/5xx/timeout, distinct from a definite 405/409 refusal) is an
+    error, not a skip -- see `_merge_pull_request_as_bot`'s `is_api_error`."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MTX", "https://github.com/x/y/pull/42")
+    head = "7f" * 20
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "mergeStateStatus": "CLEAN",
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    def fake_merge(creds, pr_url_arg, expected_head, method="squash"):
+        return False, "merge_api_unreachable: timed out", True
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_merge_pull_request_as_bot", fake_merge)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MTX", "merge_api_unreachable: timed out") in report.errors
+    assert not report.merged
+    assert not any(t == "VOYN-W0-MTX" for t, _ in report.skipped)
+
+
+def test_merge_transaction_rolls_back_before_restoring_autocommit_on_error(monkeypatch):
+    """VOYN-W0-AICC-MERGE-GATEWAY-REM: an exception raised while recording
+    the merge evidence/DONE transition must be rolled back BEFORE autocommit
+    is restored. Flipping autocommit back to True while a transaction is
+    still open is itself invalid on psycopg-family drivers, so without an
+    explicit rollback-then-reraise the ORIGINAL exception would be replaced
+    by an unrelated secondary one -- and this happens only AFTER GitHub has
+    already merged the PR, so the failure must propagate, never be
+    swallowed."""
+    events = []
+
+    class _FakeCursor:
+        def __init__(self):
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=()):
+            self.calls += 1
+            if self.calls == 3:
+                raise RuntimeError("simulated db failure")
+
+        def fetchone(self):
+            return (1,) if self.calls == 1 else None
+
+    class _FakeConn:
+        def __init__(self):
+            self._autocommit = True
+
+        @property
+        def autocommit(self):
+            return self._autocommit
+
+        @autocommit.setter
+        def autocommit(self, value):
+            events.append(("autocommit", value))
+            self._autocommit = value
+
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self):
+            events.append(("commit",))
+
+        def rollback(self):
+            events.append(("rollback",))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    conn = _FakeConn()
+    monkeypatch.setattr(
+        review_merge, "_scan_tasks",
+        lambda *a, **k: ([("T1", "https://github.com/x/y/pull/1")], None),
+    )
+    monkeypatch.setattr(review_merge, "_scan_commit", lambda *a, **k: None)
+    monkeypatch.setattr(review_merge, "_merged_target_sha", lambda *a, **k: ("a" * 40, ""))
+
+    with pytest.raises(RuntimeError, match="simulated db failure"):
+        review_merge.merge_once(lambda: conn, "/tmp")
+
+    assert ("rollback",) in events
+    rollback_index = events.index(("rollback",))
+    autocommit_restores = [i for i, e in enumerate(events) if e == ("autocommit", True)]
+    assert autocommit_restores and autocommit_restores[-1] > rollback_index
+
+
+def test_merge_retries_the_done_transition_after_a_transaction_failure(monkeypatch):
+    """VOYN-W0-AICC-MERGE-GATEWAY-REM (adversarial review of #618, chunk
+    3/7): a task must never be permanently wedged in READY_TO_REVIEW after
+    GitHub has already merged its PR. If the evidence+DONE transaction
+    fails on the tick that first observes the merge (e.g. a concurrent
+    optimistic-revision conflict), a later tick must retry -- and succeed --
+    because `_merged_target_sha` re-derives "already merged" from GitHub
+    itself on every tick rather than from any local state, so the exact
+    same merged PR is seen again. This must happen WITHOUT calling `gh pr
+    merge` a second time: the merge already happened, only the bookkeeping
+    is being retried."""
+    merge_bot_calls = []
+
+    class _FakeCursor:
+        def __init__(self, transition_outcome):
+            self._last_sql = ""
+            self._transition_outcome = transition_outcome
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=()):
+            self._last_sql = sql
+
+        def fetchone(self):
+            if "backlog_transition" in self._last_sql:
+                return self._transition_outcome
+            return (1,)  # revision
+
+    class _FakeConn:
+        def __init__(self, transition_outcome):
+            self._transition_outcome = transition_outcome
+            self.autocommit = True
+            self.committed = False
+            self.rolledback = False
+
+        def cursor(self):
+            return _FakeCursor(self._transition_outcome)
+
+        def commit(self):
+            self.committed = True
+
+        def rollback(self):
+            self.rolledback = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    head = "a" * 40
+    monkeypatch.setattr(
+        review_merge, "_scan_tasks",
+        lambda *a, **k: ([("T1", "https://github.com/x/y/pull/1")], None),
+    )
+    monkeypatch.setattr(review_merge, "_scan_commit", lambda *a, **k: None)
+    monkeypatch.setattr(review_merge, "_merged_target_sha", lambda *a, **k: (head, ""))
+    monkeypatch.setattr(
+        review_merge, "_merge_pull_request_as_bot",
+        lambda *a, **k: merge_bot_calls.append(1) or (True, "", False),
+    )
+
+    # Tick 1: the transition reports a conflict (e.g. a concurrent writer)
+    # -- the task must stay READY_TO_REVIEW, not raise, and not be dropped.
+    conn1 = _FakeConn((False, "stale_revision"))
+    report1 = review_merge.merge_once(lambda: conn1, "/tmp")
+    assert ("T1", "transition:stale_revision") in report1.skipped
+    assert not report1.merged
+    assert conn1.rolledback and not conn1.committed
+
+    # Tick 2: GitHub still reports the same PR merged; this time the
+    # transition succeeds -- no re-merge was ever attempted.
+    conn2 = _FakeConn((True, None))
+    report2 = review_merge.merge_once(lambda: conn2, "/tmp")
+    assert ("T1", head) in report2.merged
+    assert conn2.committed and not conn2.rolledback
+    assert merge_bot_calls == []
+
+
 def test_mergeability_uses_latest_check_rerun(monkeypatch):
     import subprocess
 
@@ -1091,6 +1370,89 @@ def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, ch
     )
     assert not ready
     assert reason == "checks_not_green: ['Acceptance gate']"
+
+
+def test_merge_pull_request_as_bot_pins_the_exact_head_sha(monkeypatch):
+    """VOYN-W0-AICC-MERGE-GATEWAY-REM: the merge call must go out under the
+    dedicated merge identity's own token (never `_gh()`) and must pin `sha`
+    to the exact head this call was told to merge -- GitHub itself then
+    refuses with 409 if the branch moved since the caller last read it."""
+    captured = {}
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["auth"] = req.get_header("Authorization")
+        captured["body"] = json.loads(req.data.decode())
+        return _FakeResponse()
+
+    monkeypatch.setattr(
+        review_merge.github_app_auth, "installation_token", lambda creds: "ghs_fake"
+    )
+    monkeypatch.setattr(review_merge.urllib.request, "urlopen", fake_urlopen)
+    creds = review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null")
+    head = "a" * 40
+    ok, reason, is_api_error = review_merge._merge_pull_request_as_bot(
+        creds, "https://github.com/x/y/pull/9", head,
+    )
+    assert (ok, reason, is_api_error) == (True, "", False)
+    assert captured["method"] == "PUT"
+    assert captured["url"] == "https://api.github.com/repos/x/y/pulls/9/merge"
+    assert captured["auth"] == "token ghs_fake"
+    assert captured["body"] == {"merge_method": "squash", "sha": head}
+
+
+def test_merge_pull_request_as_bot_treats_a_409_as_a_definite_refusal(monkeypatch):
+    """A sha mismatch/conflict is GitHub's considered answer, not an outage
+    -- a later tick re-evaluating readiness from scratch is the right
+    response, so this must land in `skipped`, never `errors`."""
+    import io
+    import urllib.error
+
+    def raise_409(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url, 409, "sha mismatch", {}, io.BytesIO(b"conflict")
+        )
+
+    monkeypatch.setattr(
+        review_merge.github_app_auth, "installation_token", lambda creds: "ghs_fake"
+    )
+    monkeypatch.setattr(review_merge.urllib.request, "urlopen", raise_409)
+    creds = review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null")
+    ok, reason, is_api_error = review_merge._merge_pull_request_as_bot(
+        creds, "https://github.com/x/y/pull/9", "a" * 40,
+    )
+    assert ok is False
+    assert reason.startswith("merge_rejected_409")
+    assert is_api_error is False
+
+
+def test_merge_pull_request_as_bot_treats_a_network_error_as_an_api_error(monkeypatch):
+    """A transport failure (network down, GitHub unreachable) must be
+    distinguishable from a definite refusal so the caller can fail closed
+    instead of silently retrying forever as an ordinary skip."""
+    import urllib.error
+
+    def raise_it(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(
+        review_merge.github_app_auth, "installation_token", lambda creds: "ghs_fake"
+    )
+    monkeypatch.setattr(review_merge.urllib.request, "urlopen", raise_it)
+    creds = review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null")
+    ok, reason, is_api_error = review_merge._merge_pull_request_as_bot(
+        creds, "https://github.com/x/y/pull/9", "a" * 40,
+    )
+    assert ok is False
+    assert is_api_error is True
 
 
 def test_repo_from_pr_url():
@@ -1852,12 +2214,18 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return sp.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merge_calls.append(argv)
-            return sp.CompletedProcess(argv, 0, "queued", "")  # enqueued, NOT merged
         return sp.CompletedProcess(argv, 1, "", "?")
 
+    def fake_merge(creds, pr_url_arg, expected_head, method="squash"):
+        merge_calls.append((pr_url_arg, expected_head))
+        return True, "", False  # enqueued, NOT merged
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_merge_pull_request_as_bot", fake_merge)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-MQ", "merge_queued_awaiting_target") in report.skipped
     assert not report.merged
@@ -2393,14 +2761,20 @@ def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch)
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 "mergeStateStatus": "CLEAN",
             }), "")
-        if argv[:2] == ["pr", "merge"]:
-            if url == victim_url:
-                merged_prs.append(url)
-                return sp.CompletedProcess(argv, 0, "merged", "")
-            return sp.CompletedProcess(argv, 1, "", "spurious merge failure")
         return sp.CompletedProcess(argv, 0, "", "")
 
+    def fake_merge(creds, pr_url_arg, expected_head, method="squash"):
+        if pr_url_arg == victim_url:
+            merged_prs.append(pr_url_arg)
+            return True, "", False
+        return False, "merge_rejected_409: spurious merge failure", False
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_merge_pull_request_as_bot", fake_merge)
     merged_tasks = []
     # cap 1: each invocation advances the cursor by 1 -> the victim is
     # FIRST within 6 invocations and merges despite five eternal hogs.
