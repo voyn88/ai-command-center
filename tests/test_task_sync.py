@@ -21,7 +21,20 @@ def _make_task(**overrides) -> dict:
     return task
 
 
-def _make_run(db_path, *, state: str, task_id: str = "task-1", provider_id: str = "claude_code", **fields) -> dict:
+def _make_run(
+    db_path,
+    *,
+    state: str,
+    task_id: str = "task-1",
+    provider_id: str = "claude_code",
+    finalized: bool = True,
+    **fields,
+) -> dict:
+    """`finalized=True` (the default) models the ordinary case every existing
+    caller of `sync_task_from_run` relies on: a run whose finalization already
+    completed by the time it is synced. Pass `finalized=False` to build the
+    terminal-but-unfinalized row `run.finalized_at` exists to make visible —
+    e.g. from a sync pass racing a different process's finalization."""
     task = db.create_task(db_path, project="AIOS", title="t", task_type="implementation", task_id=task_id)
     session = db.create_session(db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
     run = db.create_run(
@@ -41,6 +54,18 @@ def _make_run(db_path, *, state: str, task_id: str = "task-1", provider_id: str 
         run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="RUNNING")
     if state not in ("PREPARED", "QUEUED", "RUNNING"):
         run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state=state, fields=fields)
+        if finalized and state in db.TERMINAL_STATES:
+            # Bypasses the finalization-claim protocol on purpose: these tests
+            # exercise `task_sync`'s projection logic, not claim ownership,
+            # and stamping the marker directly is the same shortcut
+            # `test_run_finalized_at.py` uses to clear it for the opposite case.
+            with db.connect(db_path) as conn:
+                conn.execute(
+                    "UPDATE run SET finalized_at = ? WHERE id = ?",
+                    (db.iso_now(), run["id"]),
+                )
+                conn.commit()
+            run = db.get_run(db_path, run["id"])
     return run
 
 
@@ -480,6 +505,54 @@ def test_sync_task_from_run_is_idempotent_for_the_same_terminal_run(tmp_path, mo
     # "APPROVED FOR COMMIT" is a passing verdict with no PR URL -> stage
     # advances to "Validation" ("tests_passed") in addition to "completed".
     assert [event["type"] for event in task["timeline"]] == ["tests_passed", "completed"]
+
+
+def test_sync_task_from_run_does_not_project_a_terminal_run_before_it_is_finalized(tmp_path):
+    """A sync pass racing a different process's finalization must not latch
+    an empty report/verdict onto the task, nor mark this run as already
+    projected — `run.finalized_at` is exactly the durable signal that
+    distinguishes "no report yet" from "no report, ever" (VOYN-W0-AICC-
+    FLAKE-03b). Before this gate, `derive_status` alone (COMPLETED) was
+    enough to run `_apply_terminal_fields` and set
+    `terminal_projection_run_id`, which would then make the idempotency
+    check above skip this exact run forever — so the real report/verdict
+    would never be picked up once finalization actually completed."""
+    db_path = tmp_path / "runtime.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00", finalized=False
+    )
+    db.append_run_event(
+        db_path, run["id"], "result",
+        {"result": "Verdict: APPROVED FOR COMMIT\nPR: https://example.invalid/pr/1"},
+    )
+    db.create_report(db_path, run["id"], f"reports/AIOS/{run['id'][:8]}.md")
+    task = _make_task()
+
+    mutated = task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert mutated is True  # current_run_id still gets recorded
+    assert "terminal_projection_run_id" not in task
+    assert "latest_verdict" not in task
+    assert "pull_request_url" not in task
+    assert "report_path" not in task
+    assert task.get("current_stage") != "PR Ready"
+    assert task["progress"] == 0
+
+    # Finalization completes; a later sync pass must now pick up the real
+    # terminal facts instead of remaining latched on the unfinalized read.
+    with db.connect(db_path) as conn:
+        conn.execute("UPDATE run SET finalized_at = ? WHERE id = ?", (db.iso_now(), run["id"]))
+        conn.commit()
+    run = db.get_run(db_path, run["id"])
+
+    mutated_after_finalization = task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert mutated_after_finalization is True
+    assert task["terminal_projection_run_id"] == run["id"]
+    assert task["latest_verdict"] == "APPROVED_FOR_COMMIT"
+    assert task["pull_request_url"] == "https://example.invalid/pr/1"
+    assert task["launch_status"] == "Needs Review"
 
 
 def test_sync_task_from_run_running_with_output_advances_to_implementation(tmp_path):
