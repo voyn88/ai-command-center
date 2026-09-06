@@ -136,6 +136,7 @@ from command_center.runtime.db.execution import (  # noqa: F401
     tail_run_events,
     update_run_fields,
     update_run_state,
+    wait_for_run_finalized,
 )
 from command_center.runtime.db.provenance import (  # noqa: F401
     backfill_run_provenance,
