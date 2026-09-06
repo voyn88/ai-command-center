@@ -29,6 +29,16 @@ fails closed against any active or unfinalized run, which means running A0b
 exactly as originally written, before admission freeze, now stops partway.
 See the corrected §4 and §8, and Appendix A's second pass, below.
 
+**Re-verification pass 3 (2026-09-06, against `92470bc`):** 39 commits ahead
+of the second pass's baseline. Most are unrelated to cutover (mirror-contract
+test-coverage widening, an ops-monitor rewrite, a backlog auto-resume
+tweak). Two are not: `VOYN-W0-AICC-DEFER-AUTO-RESUME-REM` (#605) landed
+migration `0017`, one more PostgreSQL migration file than either prior pass
+or this document's own A0 checklist accounts for; and
+`VOYN-W0-AICC-QUERY-DIALECT-FIX` (#610) — one of this task's own listed
+Phase B dependencies — partially landed. See the corrected §2, §4, and §13,
+and Appendix A's third pass, below.
+
 ## 1. Purpose and scope
 
 Cut the server deployment's runtime store over from SQLite (authority
@@ -53,16 +63,25 @@ this document.** See §13.
   mechanism `READ-POOL` would build on, and it means a credential change no
   longer implies a process restart. The draft's pooling model (one pool,
   opened once, restart to change it) is stale.
-- Migrations applied: `0001_initial` through `0016_run_finalization_claim`
+- Migrations applied: `0001_initial` through `0017_backlog_resume_window`
   (was `0014` when this revision was first written — `0015` and `0016`
-  landed after). Migrations `0005`–`0016` add tables (`backlog_store`, the
-  work-queue control plane, credential-expiry tracking, the tick-scheduler
-  scan cursor, the run-finalization claim fence, ...) that are **outside**
-  the 33-table correspondence map in `docs/srv01b-schema-map.md`. That map is
-  still accurate for the tables it covers — it just no longer covers the
-  whole schema, and it covers less of it with every wave. A reconciliation
-  plan scoped to "the 33 tables in the map" now undercounts what PostgreSQL
-  actually holds, by a growing margin.
+  landed before the second pass, `0017` before the third). Migrations
+  `0005`–`0016` add tables (`backlog_store`, the work-queue control plane,
+  credential-expiry tracking, the tick-scheduler scan cursor, the
+  run-finalization claim fence, ...) that are **outside** the 33-table
+  correspondence map in `docs/srv01b-schema-map.md`. That map is still
+  accurate for the tables it covers — it just no longer covers the whole
+  schema, and it covers less of it with every wave. A reconciliation plan
+  scoped to "the 33 tables in the map" now undercounts what PostgreSQL
+  actually holds, by a growing margin. `0017`
+  (`VOYN-W0-AICC-DEFER-AUTO-RESUME-REM`, #605) is the exception in this list:
+  it adds no table, it only replaces the resume-budget query inside an
+  existing `backlog_task`/`backlog_event` `SECURITY DEFINER` function
+  (lifetime cap → sliding 48h window) — no new `UNMIRRORED_SCHEMA_TABLES`
+  entry required. It still moves `EXPECTED_SCHEMA_VERSION`
+  (`command_center/db/health.py`, `len(migrations.discover())`) from 16 to
+  17, which is the number §4 step 1 and Appendix A row 54 need re-reading
+  against.
 - Generic PostgreSQL machinery still lives in `aios-db`, still consumed
   only through `command_center/db/adapter.py` — unchanged.
 - The mutating HTTP surface now requires authentication
@@ -98,10 +117,10 @@ mirrored.
 ## 4. Preflight (A0)
 
 1. Confirm `python -m command_center.db status` reports every PostgreSQL
-   migration applied through `0016` (was `0014` at this revision's first
-   pass — re-check the current highest-numbered file in
-   `command_center/db/sql/` before relying on this digit) and its checksum
-   verified.
+   migration applied through `0017` (was `0014` at this revision's first
+   pass, `0016` at the second — re-check the current highest-numbered file
+   in `command_center/db/sql/` before relying on this digit, it has moved on
+   every pass so far) and its checksum verified.
 2. Confirm `GET /readyz` is `200`.
 3. Confirm the three-role grant matrix with
    `tests/db/test_postgres_integration.py` — now also covering the
@@ -184,6 +203,17 @@ Do not confuse this with the "16 domain tables" figure in
 early-snapshot table *count*, not a schema *version*. Same digit, two
 different measurements; the map itself already calls its own figure
 obsolete.
+
+As of the third pass, this exact confusion has its own writeup:
+`docs/operations/SCHEMA_VERSION_DRIFT.md`
+(`VOYN-W0-AICC-SCHEMA-VERSION-DRIFT-REM`, #580) resolves three
+commonly-conflated numbers — the retired "16 domain tables" survey count
+above, the live SQLite `SCHEMA_VERSION`, and the live, independently-numbered
+PostgreSQL `EXPECTED_SCHEMA_VERSION` — and states outright that the two live
+counters must never be diffed against each other. Its own snapshot value for
+`EXPECTED_SCHEMA_VERSION` (16, taken 2026-09-02) was itself two days stale by
+the time `0017` landed (2026-09-03, §2 above): read it for the model it
+gives, not the digit it happened to hold when written.
 
 ## 5. Backfill / dual-write posture
 
@@ -350,8 +380,9 @@ this document (§13).
 
 **Not authorized.** The mechanisms Phase B depends on are designed and
 prototyped, not built, in this codebase as of `67a996b` — still true as of
-the second pass's `f799f78`; none of the six items below were touched by
-the drift documented in Appendix A's second pass:
+the second pass's `f799f78` for five of the six; the third pass's `92470bc`
+found the sixth, `QUERY-DIALECT-FIX`, partially landed (below). None of the
+other five moved:
 
 - `READ-SWITCH-MISSING` — no read-path selector exists (§7).
 - `REVERSE-MIRROR` — no PostgreSQL → SQLite mirror exists (§9); this is
@@ -361,8 +392,17 @@ the drift documented in Appendix A's second pass:
 - `DAILY-AUDIT-UNMIRRORED` — no scheduled job audits for rows that reached
   PostgreSQL without a mirrored SQLite counterpart (or the reverse, once
   `REVERSE-MIRROR` exists).
-- `QUERY-DIALECT-FIX` — SQL dialect differences between the two engines'
-  query paths are not yet reconciled outside the mirrored-write path.
+- `QUERY-DIALECT-FIX` — **partially landed.** #610 (2026-09-05) fixed two
+  of the four known SQLite-only query constructs: a bare `WHERE 0`
+  (PostgreSQL rejects a non-boolean `WHERE` expression; SQLite does not) in
+  `list_runs` / `count_runs`, replaced with the dialect-neutral `1 = 0`; and
+  an untyped `LIKE` directly against the `jsonb` `payload_json` column in
+  `daily_spend_usd`, fixed by casting to text first. The other two —
+  `rowid` tiebreaks and `sqlite_master` existence guards — are explicitly
+  left to two other, still-unlanded tickets (`INSERT-SEQ`,
+  `TABLE-EXISTS-HELPER`). SQL dialect differences between the two engines'
+  query paths are therefore reconciled in part, not reconciled, outside the
+  mirrored-write path.
 - `PARITY-QUERY-EQUIVALENCE` — no proof exists that reads against either
   engine return equivalent results for the same logical query.
 
@@ -473,3 +513,28 @@ revision's own baseline commit is a claim with a shelf life, not a fact.**
 Treat the `f799f78` baseline above the same way this document treats
 `67a996b` — re-run this check against current `main` before executing this
 runbook, don't trust either date.
+
+### Third pass (2026-09-06, against `92470bc`) — this revision re-verified again
+
+`f799f78` is 39 commits behind `92470bc`. As with the second pass, most of
+that drift does not touch a claim this document makes (mirror-contract
+test-coverage widening across `owner_item`/`completion`/`proposal`/
+`run_children`, an ops-monitor rewrite, dead-letter alerting, worker
+credential handling in that monitor) and is omitted below. Two commits did
+touch a live claim.
+
+| # | Reference | Second-pass claim | Now |
+| --- | --- | --- | --- |
+| 58 | `command_center/db/sql/` file count / `EXPECTED_SCHEMA_VERSION` (`command_center/db/health.py`) | 16 (`0001`–`0016`) | **17** (`0001`–`0017`) — `0017_backlog_resume_window` (`VOYN-W0-AICC-DEFER-AUTO-RESUME-REM`, #605) landed 2026-09-03; it modifies an existing `SECURITY DEFINER` function (resume-budget query), adds no table, so no new `UNMIRRORED_SCHEMA_TABLES` entry follows from it |
+| 59 | §13 `QUERY-DIALECT-FIX` | designed/prototyped, not built | **partially landed** — #610 (2026-09-05) fixed the bare `WHERE 0` in `list_runs`/`count_runs` and the untyped `jsonb` `LIKE` in `daily_spend_usd`; `rowid` tiebreaks and `sqlite_master` existence guards remain open under `INSERT-SEQ` / `TABLE-EXISTS-HELPER`, neither landed as of `92470bc` |
+| 60 | `docs/srv01b-schema-map.md` | no pointer to a schema-version explainer | gained a banner (from #580) pointing at `docs/operations/SCHEMA_VERSION_DRIFT.md`, which resolves the "16 domain tables" vs `SCHEMA_VERSION` vs `EXPECTED_SCHEMA_VERSION` conflation this document's own A0b section already warned about (row 50) |
+
+The third pass's addition to the lesson the second pass drew:
+`docs/operations/SCHEMA_VERSION_DRIFT.md` — a document written specifically
+to resolve schema-version staleness — went stale on its own headline number
+within 48 hours of being written (row 58, above). The shelf-life warning
+this document keeps giving applies to sibling documents exactly as much as
+to itself. Re-run this check against current `main` before executing this
+runbook; that instruction has now outlived three baselines (`67a996b`,
+`f799f78`, `92470bc`) without becoming less true, and there is no reason to
+expect a fourth baseline to be different.
