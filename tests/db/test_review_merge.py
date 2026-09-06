@@ -1701,8 +1701,15 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
 
 def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
     """A PR only BEHIND main (base advanced after it branched) is brought
-    current with `gh pr update-branch` so it re-enters the merge path instead
-    of gridlocking; nothing is merged this tick."""
+    current via the REST update-branch endpoint (`gh api -X PUT
+    repos/{owner}/{repo}/pulls/{n}/update-branch`) so it re-enters the merge
+    path instead of gridlocking; nothing is merged this tick.
+
+    The REST call is used instead of the `gh pr update-branch` subcommand
+    because that subcommand postdates the `gh` version pinned on control-01,
+    so every attempt failed with "unknown command" and burned a cap slot
+    without ever updating a branch (live 2026-08-26,
+    VOYN-W0-AICC-MERGE-TRAIN-UPDATE-BRANCH-BROKEN)."""
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-MT1", "https://github.com/x/y/pull/41")
     head = "a" * 40
@@ -1710,7 +1717,7 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
 
     def fake_gh(argv, repo):
         import subprocess
-        calls.append(argv[:2])
+        calls.append(argv)
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
@@ -1720,13 +1727,14 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "update-branch"]:
+        if argv[:2] == ["api", "-X"]:
             return subprocess.CompletedProcess(argv, 0, "updated", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] in calls
+    assert ["api", "-X", "PUT", "repos/x/y/pulls/41/update-branch"] in calls
+    assert ["pr", "update-branch", "https://github.com/x/y/pull/41"] not in calls
     assert ("VOYN-W0-MT1", "branch_updated_behind_main") in report.skipped
     assert not report.merged
 
@@ -1821,7 +1829,7 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "update-branch"]:
+        if argv[:2] == ["api", "-X"]:
             updates.append(argv)
             return subprocess.CompletedProcess(argv, 0, "updated", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
@@ -1829,8 +1837,45 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp", review_merge.ReviewConfig(max_branch_updates_per_tick=2))
     assert len(updates) == 2
+    assert all(u[:3] == ["api", "-X", "PUT"] for u in updates)
     assert sum(1 for _, r in report.skipped if r == "branch_updated_behind_main") == 2
     assert sum(1 for _, r in report.skipped if r == "branch_behind_update_capped") == 2
+
+
+def test_merge_train_skips_a_behind_pr_whose_url_has_no_repo_route(rig, monkeypatch):  # noqa: F811
+    """A BEHIND, accepted PR whose stored evidence URL does not match the
+    owner/repo/number shape the REST update-branch endpoint needs (unrouted
+    host, malformed path, ...) is skipped with a diagnostic reason instead of
+    calling `_gh` with an unparseable path or crashing -- and it does not
+    spend a branch-update slot, since nothing was attempted."""
+    app_factory, store, _ = rig
+    bad_url = "https://git.example.com/x/y/pull/41"
+    _ready(store, app_factory, "VOYN-W0-MT4", bad_url)
+    head = "e" * 40
+    calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        calls.append(argv)
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp", review_merge.ReviewConfig(max_branch_updates_per_tick=2))
+    assert not any(argv[:2] == ["api", "-X"] for argv in calls)
+    assert any(
+        task_id == "VOYN-W0-MT4" and reason.startswith("branch_update_failed: no_repo_route")
+        for task_id, reason in report.skipped
+    )
+    assert not report.merged
 
 
 def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch):
