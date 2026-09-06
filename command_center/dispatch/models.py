@@ -471,6 +471,47 @@ class DispatchDecision:
         }
 
 
+# --------------------------------------------------------------------------
+# Spend measurement provenance
+# --------------------------------------------------------------------------
+
+# The trailing-24h spend was actually read.
+SPEND_MEASURED = "measured"
+# The read failed (e.g. a DB outage): there is nothing to report.
+SPEND_UNAVAILABLE = "unavailable"
+
+# `daily_spend_usd`/`projected_spend_usd` are backed by a real reading.
+SPEND_KIND_ACTUAL = "actual"
+# There is no reading and nothing stands in for it: the spend/projected/
+# remaining fields are all `None`. There is deliberately no "assumed ceiling"
+# (or any other stand-in) kind — this contract never substitutes a fabricated
+# figure for one that could not be read, in any field.
+SPEND_KIND_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SpendMeasurement:
+    """Provenance for `DispatchPlan.daily_spend_usd`/`projected_spend_usd`.
+
+    Exists so a consumer can tell "this number is a real trailing-24h
+    reading" from "there is no reading" without inferring it from `None`
+    alone — and so that inference is impossible to get wrong, because every
+    `DispatchPlan` must state it explicitly (see the field below: there is no
+    default that could silently claim "measured" for a plan built outside
+    `plan_dispatch`).
+    """
+
+    status: str
+    kind: str
+
+    def as_dict(self) -> dict:
+        return {"status": self.status, "kind": self.kind}
+
+
+SPEND_MEASUREMENT_ACTUAL = SpendMeasurement(SPEND_MEASURED, SPEND_KIND_ACTUAL)
+SPEND_MEASUREMENT_UNAVAILABLE = SpendMeasurement(SPEND_UNAVAILABLE, SPEND_KIND_UNKNOWN)
+
+
 @dataclass(frozen=True)
 class DispatchPlan:
     """The whole plan: one decision per task plus the budget arithmetic."""
@@ -483,7 +524,15 @@ class DispatchPlan:
     # never a fabricated `0.0` that reads as "nothing spent today".
     daily_spend_usd: float | None
     max_daily_spend_usd: float
+    # None in lockstep with `daily_spend_usd`: whatever is unmeasured never
+    # flows into a derived figure either, so `budget_remaining_usd` below
+    # reads "unknown" too rather than a confident (and fabricated) number.
     projected_spend_usd: float | None
+    # No default: every `DispatchPlan` must say explicitly whether its spend
+    # figures are a real reading, so a caller constructed outside
+    # `plan_dispatch` can't silently inherit a "measured" claim it never
+    # earned.
+    spend_measurement: SpendMeasurement
     # True when the trailing-24h spend could not be read (e.g. a DB outage):
     # dispatch is refused wholesale rather than guessing a spend figure that a
     # zero/unset daily cap or a free executor could silently sail past.
@@ -513,6 +562,7 @@ class DispatchPlan:
             "daily_spend_usd": self.daily_spend_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,
+            "spend_measurement": self.spend_measurement.as_dict(),
             "budget_remaining_usd": (
                 None if remaining is None or remaining == float("inf") else remaining
             ),
