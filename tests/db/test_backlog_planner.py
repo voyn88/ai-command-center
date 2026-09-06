@@ -854,3 +854,63 @@ def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
                 ("VOYN-W0-RSS",),
             )
             assert cur.fetchone()[0] == 1
+
+
+def test_resume_budget_is_a_window_not_a_lifetime_score(
+    rig, admin_conn
+) -> None:
+    """0017 (VOYN-W0-AICC-DEFER-AUTO-RESUME-REM): three granted resumes
+    OLDER than the 48h window must not exhaust the budget — a fixed
+    pipeline reclaims its old parks; three recent ones still refuse.
+
+    Grants are seeded through the real machine (park -> resume cycles),
+    never by raw INSERT: no role holds INSERT on backlog tables by design
+    (0005), and a grant fabricated after the park would trip the unchanged
+    superseded_park_evidence check anyway (independent review of 29d2152,
+    findings 1-2). Only created_at is backdated, via the admin connection —
+    the one property 0017's window reads."""
+    app_factory, store, worker = rig
+    task = "VOYN-W0-RSW"
+
+    # Three real park->resume cycles: the first park needs the fresh-task
+    # double exhaustion, every later one goes straight to DEFER via the
+    # repark path (prior granted returns >= 1 — live-confirmed by the
+    # independent verification of 4af6832 on real PostgreSQL). Each
+    # grant's event_id precedes the next park, so superseded_park_evidence
+    # never trips.
+    _park_technically(app_factory, store, worker, task)
+    ok, reason, _ = store.resume_deferred(task)
+    assert ok and reason == "OPEN"
+    for _ in range(2):
+        _repark(app_factory, store, task, "cascade_exhausted: again")
+        ok, reason, _ = store.resume_deferred(task)
+        assert ok and reason == "OPEN"
+    _repark(app_factory, store, task, "cascade_exhausted: again")
+
+    # Lifetime budget is now spent (3 grants). Prove the OLD behaviour is
+    # gone by aging those grants out of the window.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_event SET created_at = now() - interval '3 days' "
+            "WHERE task_id = %s AND event = 'resume_deferred' "
+            "AND outcome = 'granted'",
+            (task,),
+        )
+        assert cur.rowcount == 3
+    admin_conn.commit()
+
+    ok, reason, _ = store.resume_deferred(task)
+    assert ok and reason == "OPEN", (
+        "stale resume history must not bury the task forever"
+    )
+
+    # Three RECENT grants (the one above plus two more cycles) refuse the
+    # fourth — the window still stops a park that re-arms itself.
+    for _ in range(2):
+        _repark(app_factory, store, task, "cascade_exhausted: again")
+        ok, reason, _ = store.resume_deferred(task)
+        assert ok and reason == "OPEN"
+    _repark(app_factory, store, task, "cascade_exhausted: again")
+
+    ok, reason, _ = store.resume_deferred(task)
+    assert not ok and reason == "resume_budget_exhausted"
