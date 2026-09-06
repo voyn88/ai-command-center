@@ -503,6 +503,10 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Atomic cap check + reservation for bounded per-head Acceptance-gate
+    # reconciliation (0018): the row lock it takes on backlog_task is what
+    # makes the cap concurrency-safe across ticks.
+    "backlog_reserve_gate_rerun(text, text, integer)",
 )
 
 # The enrolment surface (0003), split by who may do what.
