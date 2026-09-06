@@ -1969,6 +1969,563 @@ def test_no_rerun_without_an_accept_marker(rig, monkeypatch):  # noqa: F811
     assert reruns == []
 
 
+# --- VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY: stale-gate reconciliation --------
+#
+# `merge_once`'s bounded backstop for a definitively-red Acceptance gate
+# standing under an already-accepted head: classification of "definitively
+# red" (`_acceptance_gate_conclusion`), locating the exact run to rerun
+# (`_find_failing_gate_run`), the concurrency-safe per-head cap
+# (`_reserve_gate_rerun_attempt` / `backlog_reserve_gate_rerun`), and the
+# reconciliation itself never spending budget on a lookup miss and never
+# refunding an ambiguous dispatch failure (`_reconcile_stale_acceptance_gate`).
+
+
+def test_acceptance_gate_conclusion_never_treats_incomplete_as_red(monkeypatch):
+    """A queued/in-progress run reports `conclusion: None` -- treating that
+    as red would burn a rerun attempt on a check that has not even finished
+    (independent review, CONFIRMED)."""
+    import subprocess as sp
+
+    head = "9" * 40
+
+    def fake_gh(argv, repo):
+        return sp.CompletedProcess(argv, 0, json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "statusCheckRollup": [{"name": "Acceptance gate", "conclusion": None}],
+        }), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    # head is still reported (it names the check looked at), but "" for the
+    # conclusion is what the merge tick's `if gate_head and gate_conclusion`
+    # gate actually keys reconciliation off of -- an incomplete check must
+    # never be treated as eligible.
+    assert review_merge._acceptance_gate_conclusion(
+        "/tmp", "https://github.com/x/y/pull/1"
+    ) == (head, "")
+
+
+def test_acceptance_gate_conclusion_never_treats_ambiguous_ordering_as_red(monkeypatch):
+    """Two reruns with no timestamps cannot be ordered by
+    `_latest_checks_by_name`, which substitutes the synthetic AMBIGUOUS
+    conclusion -- an ordering ambiguity is not evidence the check is red."""
+    import subprocess as sp
+
+    head = "8" * 40
+
+    def fake_gh(argv, repo):
+        return sp.CompletedProcess(argv, 0, json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "statusCheckRollup": [
+                {"name": "Acceptance gate", "conclusion": "FAILURE"},
+                {"name": "Acceptance gate", "conclusion": "SUCCESS"},
+            ],
+        }), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._acceptance_gate_conclusion(
+        "/tmp", "https://github.com/x/y/pull/1"
+    ) == (head, "")
+
+
+def test_acceptance_gate_conclusion_reports_a_completed_failure_by_exact_name(monkeypatch):
+    """A similarly-named check (e.g. 'Acceptance gate integration') must
+    never be classified as the gate itself -- only the exact
+    `ACCEPTANCE_GATE_CHECK_NAME` (independent review, CONFIRMED: a substring
+    match let an unrelated check spend the per-head budget on a workflow
+    that was never actually red)."""
+    import subprocess as sp
+
+    head = "7" * 40
+
+    def fake_gh(argv, repo):
+        return sp.CompletedProcess(argv, 0, json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "statusCheckRollup": [
+                {"name": "Acceptance gate integration", "conclusion": "FAILURE"},
+                {"name": "Acceptance gate", "conclusion": "FAILURE"},
+            ],
+        }), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._acceptance_gate_conclusion(
+        "/tmp", "https://github.com/x/y/pull/1"
+    ) == (head, "FAILURE")
+
+
+def test_find_failing_gate_run_matches_the_exact_head_and_workflow(monkeypatch):
+    import subprocess as sp
+
+    head = "3" * 40
+    workflows_requested = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefName": "backlog/x"}), "")
+        if argv[:2] == ["run", "list"]:
+            workflows_requested.append(argv[argv.index("--workflow") + 1])
+            return sp.CompletedProcess(argv, 0, json.dumps([
+                {"databaseId": 1, "headSha": head, "status": "completed", "conclusion": "success"},
+                {"databaseId": 2, "headSha": "b" * 40, "status": "completed", "conclusion": "failure"},
+                {"databaseId": 3, "headSha": head, "status": "in_progress", "conclusion": None},
+                {"databaseId": 4, "headSha": head, "status": "completed", "conclusion": "failure"},
+            ]), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    run_id, reason = review_merge._find_failing_gate_run(
+        "/tmp", "https://github.com/x/y/pull/1", head
+    )
+    assert (run_id, reason) == (4, "")
+    assert workflows_requested == [review_merge.ACCEPTANCE_GATE_WORKFLOW]
+
+
+@pytest.mark.parametrize("failure_step,expected_reason", [
+    ("pr_view", "pr_view_failed"),
+    ("no_branch", "no_head_branch"),
+    ("run_list", "run_list_failed"),
+    ("no_match", "no_matching_failing_run"),
+])
+def test_find_failing_gate_run_reports_every_lookup_miss_distinctly(
+    monkeypatch, failure_step, expected_reason
+):
+    """None of these dispatch anything, so `_reconcile_stale_acceptance_gate`
+    must never treat any of them as a spent attempt (independent review,
+    CONFIRMED: transient `gh run list` failures silently exhausted the
+    three-attempt budget without ever requeueing anything)."""
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            if failure_step == "pr_view":
+                return sp.CompletedProcess(argv, 1, "", "boom")
+            if failure_step == "no_branch":
+                return sp.CompletedProcess(argv, 0, json.dumps({"headRefName": None}), "")
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefName": "backlog/x"}), "")
+        if argv[:2] == ["run", "list"]:
+            if failure_step == "run_list":
+                return sp.CompletedProcess(argv, 1, "", "boom")
+            return sp.CompletedProcess(argv, 0, "[]", "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    run_id, reason = review_merge._find_failing_gate_run(
+        "/tmp", "https://github.com/x/y/pull/1", "a" * 40
+    )
+    assert (run_id, reason) == (None, expected_reason)
+
+
+def test_reserve_gate_rerun_attempt_is_capped_and_numbered_per_head(rig):  # noqa: F811
+    from tests.db.test_backlog_planner import _task
+
+    app_factory, store, _ = rig
+    assert store.upsert_task(_task("VOYN-W0-GR1", repo="repo-x"))[0]
+    head = "9" * 40
+
+    got = [
+        review_merge._reserve_gate_rerun_attempt(app_factory, "VOYN-W0-GR1", head)
+        for _ in range(review_merge.MAX_GATE_RERUNS_PER_HEAD + 1)
+    ]
+    assert got == [1, 2, 3, None]
+
+    # A different head on the same task gets its own independent budget.
+    assert review_merge._reserve_gate_rerun_attempt(app_factory, "VOYN-W0-GR1", "a" * 40) == 1
+
+
+def test_reserve_gate_rerun_attempt_is_concurrency_safe(rig):  # noqa: F811
+    """Independent review, CONFIRMED: counting attempts and recording the
+    next evidence row in separate transactions let two concurrent merge
+    ticks against the same head both observe room under the cap and both
+    reserve the same slot, exceeding the promised per-head cap.
+    `backlog_reserve_gate_rerun`'s row lock on `backlog_task` makes the
+    count-and-insert one atomic operation, so forcing every caller to reserve
+    at the exact same instant must still grant exactly the cap, no more, no
+    duplicates."""
+    import threading
+
+    from tests.db.test_backlog_planner import _task
+
+    app_factory, store, _ = rig
+    assert store.upsert_task(_task("VOYN-W0-GR2", repo="repo-x"))[0]
+    head = "8" * 40
+    contenders = 6
+    barrier = threading.Barrier(contenders)
+    results = [None] * contenders
+
+    def worker(i):
+        barrier.wait()
+        results[i] = review_merge._reserve_gate_rerun_attempt(app_factory, "VOYN-W0-GR2", head)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(contenders)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    granted = sorted(r for r in results if r is not None)
+    assert granted == list(range(1, review_merge.MAX_GATE_RERUNS_PER_HEAD + 1))
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence WHERE task_id=%s AND kind='gate_rerun'",
+            ("VOYN-W0-GR2",),
+        )
+        assert cur.fetchone()[0] == review_merge.MAX_GATE_RERUNS_PER_HEAD
+
+
+def test_reconcile_stale_gate_lookup_failure_spends_no_budget(rig, monkeypatch):  # noqa: F811
+    """A transient `gh run list`/`gh pr view` failure -- or simply no
+    matching run yet -- must be retried for free forever, not silently
+    exhaust the three-attempt budget (independent review, CONFIRMED)."""
+    import subprocess as sp
+
+    from tests.db.test_backlog_planner import _task
+
+    app_factory, store, _ = rig
+    assert store.upsert_task(_task("VOYN-W0-GR3", repo="repo-x"))[0]
+    head = "7" * 40
+
+    def fake_gh(argv, repo):
+        return sp.CompletedProcess(argv, 1, "", "transient failure")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    for _ in range(review_merge.MAX_GATE_RERUNS_PER_HEAD + 2):
+        result = review_merge._reconcile_stale_acceptance_gate(
+            app_factory, "/tmp", "VOYN-W0-GR3", "https://github.com/x/y/pull/1", head
+        )
+        assert result == "acceptance_gate_rerun_lookup_failed:pr_view_failed"
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence WHERE task_id=%s AND kind='gate_rerun'",
+            ("VOYN-W0-GR3",),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_reconcile_stale_gate_reserves_before_dispatch_and_never_refunds(rig, monkeypatch):  # noqa: F811, E501
+    """The attempt is reserved durably BEFORE the GitHub rerun is dispatched
+    (so a crash between the two cannot under-count), and once reserved it is
+    never refunded even though every dispatch in this test returns an
+    ambiguous nonzero exit -- a timeout or dropped response can follow a
+    rerun GitHub already accepted, so refunding on it is exactly what would
+    let a later tick exceed the promised cap (independent reviews of two
+    earlier attempts at this task, both CONFIRMED)."""
+    import subprocess as sp
+
+    from tests.db.test_backlog_planner import _task
+
+    app_factory, store, _ = rig
+    assert store.upsert_task(_task("VOYN-W0-GR4", repo="repo-x"))[0]
+    head = "6" * 40
+    dispatches = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefName": "backlog/x"}), "")
+        if argv[:2] == ["run", "list"]:
+            return sp.CompletedProcess(argv, 0, json.dumps([
+                {"databaseId": 42, "headSha": head, "status": "completed", "conclusion": "failure"},
+            ]), "")
+        if argv[:2] == ["run", "rerun"]:
+            dispatches.append(argv[2])
+            return sp.CompletedProcess(argv, 1, "", "timeout")  # ambiguous failure
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    for expected in range(1, review_merge.MAX_GATE_RERUNS_PER_HEAD + 1):
+        result = review_merge._reconcile_stale_acceptance_gate(
+            app_factory, "/tmp", "VOYN-W0-GR4", "https://github.com/x/y/pull/1", head
+        )
+        assert result == f"acceptance_gate_rerun_requeued:{expected}"
+    assert dispatches == ["42"] * review_merge.MAX_GATE_RERUNS_PER_HEAD
+
+    # The cap now stands: no further reservation, and no further dispatch.
+    dispatches.clear()
+    result = review_merge._reconcile_stale_acceptance_gate(
+        app_factory, "/tmp", "VOYN-W0-GR4", "https://github.com/x/y/pull/1", head
+    )
+    assert result == "acceptance_gate_rerun_cap_reached"
+    assert dispatches == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence WHERE task_id=%s AND kind='gate_rerun'",
+            ("VOYN-W0-GR4",),
+        )
+        assert cur.fetchone()[0] == review_merge.MAX_GATE_RERUNS_PER_HEAD
+
+
+def test_gate_reconciliation_ignores_a_similarly_named_check(rig, monkeypatch):  # noqa: F811
+    """A check whose name merely CONTAINS 'Acceptance gate' (e.g.
+    'Acceptance gate integration') must never trigger a rerun of
+    `acceptance-gate.yml` -- classification and the rerun target must agree
+    on the exact same check (independent review, CONFIRMED)."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "5" * 40
+    pr_url = "https://github.com/x/y/pull/33"
+    _ready(store, app_factory, "VOYN-W0-GR5", pr_url)
+    reruns = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"] and "headRefName" in argv[-1]:
+            return sp.CompletedProcess(argv, 0, json.dumps(
+                {"headRefName": "backlog/x", "headRefOid": head}), "")
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [
+                    {"name": "Acceptance gate integration", "conclusion": "FAILURE"},
+                ],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "list"]:
+            return sp.CompletedProcess(argv, 0, "[]", "")
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv)
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    skip = dict(report.skipped)["VOYN-W0-GR5"]
+    assert skip.startswith("checks_not_green")
+    assert "acceptance_gate_rerun" not in skip
+    assert reruns == []
+
+
+def test_gate_reconciliation_reruns_a_definitively_red_gate_under_accept(rig, monkeypatch):  # noqa: F811, E501
+    """The end-to-end tick path (VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY): the
+    exact-name Acceptance gate check is COMPLETED and non-green under a
+    standing ACCEPT marker, the flaky-retry pass finds nothing to dispatch
+    (the gate run is already past attempt 1), and the bounded backstop
+    reruns the exact failing run and records the numbered evidence."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head = "4" * 40
+    pr_url = "https://github.com/x/y/pull/34"
+    _ready(store, app_factory, "VOYN-W0-GR6", pr_url)
+    reruns = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            fields = argv[-1]
+            if fields == "headRefName,headRefOid":
+                return sp.CompletedProcess(argv, 0, json.dumps(
+                    {"headRefName": "backlog/x", "headRefOid": head}), "")
+            if fields == "headRefName":
+                return sp.CompletedProcess(argv, 0, json.dumps(
+                    {"headRefName": "backlog/x"}), "")
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head,
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "statusCheckRollup": [{"name": "Acceptance gate", "conclusion": "FAILURE"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "list"] and "acceptance-gate.yml" in argv:
+            return sp.CompletedProcess(argv, 0, json.dumps([
+                {"databaseId": 77, "headSha": head, "status": "completed", "conclusion": "failure"},
+            ]), "")
+        if argv[:2] == ["run", "list"]:
+            # The flaky retry's own unscoped run list: nothing at attempt 1.
+            return sp.CompletedProcess(argv, 0, "[]", "")
+        if argv[:2] == ["run", "rerun"]:
+            reruns.append(argv[2])
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    skip = dict(report.skipped)["VOYN-W0-GR6"]
+    assert skip.startswith("checks_not_green") and "acceptance_gate_rerun_requeued:1" in skip
+    assert reruns == ["77"]
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='gate_rerun'",
+            ("VOYN-W0-GR6",),
+        )
+        assert cur.fetchone()[0] == f"{head}:1"
+
+
+# --- VOYN-W0-AICC-ACCEPTANCE-TAIL-LATENCY: verdict->merge latency evidence --
+
+
+def test_accept_marker_submitted_at_survives_malformed_review_shapes():
+    """Defensive against shapes `_accept_marker_on_latest_review` is never
+    asked to survive: this feeds best-effort telemetry computed AFTER
+    GitHub has already merged the PR, so it must return None rather than
+    raise (independent review, CONFIRMED: a non-list `reviews`, or a list
+    holding a non-dict entry, raised TypeError/AttributeError here and
+    escaped before the DONE evidence and transition committed)."""
+    head = "3" * 40
+    assert review_merge._accept_marker_submitted_at("not-a-list", head, "author") is None
+    assert review_merge._accept_marker_submitted_at([None, "x", 5], head, "author") is None
+    assert review_merge._accept_marker_submitted_at([], head, "author") is None
+
+    good = [{
+        "body": f"ACCEPTANCE: ACCEPT {head}",
+        "author": {"login": "reviewer"},
+        "submittedAt": "2026-01-01T00:00:00Z",
+    }]
+    assert (
+        review_merge._accept_marker_submitted_at(good, head, "author")
+        == "2026-01-01T00:00:00Z"
+    )
+
+    # Same-author marker never counts, matching `_accept_marker_on_latest_review`.
+    same_author = [{
+        "body": f"ACCEPTANCE: ACCEPT {head}",
+        "author": {"login": "author"},
+        "submittedAt": "2026-01-01T00:00:00Z",
+    }]
+    assert review_merge._accept_marker_submitted_at(same_author, head, "author") is None
+
+    # A non-dict `author` on the marker review must not raise either.
+    bad_author = [{
+        "body": f"ACCEPTANCE: ACCEPT {head}", "author": "reviewer",
+        "submittedAt": "2026-01-01T00:00:00Z",
+    }]
+    assert review_merge._accept_marker_submitted_at(bad_author, head, "author") is None
+
+
+def test_persist_verdict_merge_latency_normalizes_naive_timestamps(rig, monkeypatch):  # noqa: F811, E501
+    """Independent review, CONFIRMED: a parseable timestamp without a UTC
+    offset makes `datetime.fromisoformat` return a naive datetime;
+    subtracting it from an aware `merged_at` raised `TypeError`, but only
+    `ValueError` was caught, escaping after the merge and before the DONE
+    evidence. Naive timestamps are normalized to UTC instead of merely
+    tolerated, so the subtraction can never raise."""
+    import subprocess as sp
+
+    from tests.db.test_backlog_planner import _task
+
+    app_factory, store, _ = rig
+    assert store.upsert_task(_task("VOYN-W0-ML1", repo="repo-x"))[0]
+    head = "2" * 40
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "headRefOid": head,
+            "mergedAt": "2026-01-01T01:00:00Z",
+            "author": {"login": "task-author"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "reviewer"},
+                "submittedAt": "2026-01-01T00:30:00",  # naive -- no UTC offset
+            }],
+        })
+        return sp.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    review_merge._persist_verdict_merge_latency(
+        app_factory, "/tmp", "VOYN-W0-ML1", "https://github.com/x/y/pull/1"
+    )
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='merge_latency'",
+            ("VOYN-W0-ML1",),
+        )
+        value = json.loads(cur.fetchone()[0])
+    assert value == {
+        "verdict_at": "2026-01-01T00:30:00",
+        "merged_at": "2026-01-01T01:00:00Z",
+        "seconds": 1800.0,
+    }
+
+
+def test_persist_verdict_merge_latency_never_raises_on_malformed_reviews(rig, monkeypatch):  # noqa: F811, E501
+    """Independent review, CONFIRMED: a successful JSON response with
+    `reviews` as a non-list, or containing a null/non-object entry, raised
+    TypeError/AttributeError -- escaping before the DONE evidence and
+    transition committed, stranding an already-merged PR in
+    READY_TO_REVIEW. Every step here must be wholly exception-contained."""
+    import subprocess as sp
+
+    from tests.db.test_backlog_planner import _task
+
+    app_factory, store, _ = rig
+    assert store.upsert_task(_task("VOYN-W0-ML2", repo="repo-x"))[0]
+
+    def _fake_gh_with_reviews(reviews):
+        def fake_gh(argv, repo):
+            body = json.dumps({
+                "headRefOid": "1" * 40, "mergedAt": "2026-01-01T01:00:00Z",
+                "author": {"login": "a"}, "reviews": reviews,
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        return fake_gh
+
+    for reviews in ("not-a-list", [None, "x", 5], [{"author": "not-a-dict", "body": "x"}]):
+        monkeypatch.setattr(review_merge, "_gh", _fake_gh_with_reviews(reviews))
+        # Must not raise.
+        review_merge._persist_verdict_merge_latency(
+            app_factory, "/tmp", "VOYN-W0-ML2", "https://github.com/x/y/pull/1"
+        )
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence WHERE task_id=%s AND kind='merge_latency'",
+            ("VOYN-W0-ML2",),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_merge_once_persists_verdict_to_merge_latency_evidence(rig, monkeypatch):  # noqa: F811, E501
+    """The full tick path: a DONE merge records a best-effort verdict->merge
+    latency sample as evidence, strictly after the transition (acceptance
+    criterion: per-PR verdict->merge latency evidence persisted)."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "1" * 40, "2" * 40
+    pr_url = "https://github.com/x/y/pull/35"
+    _ready(store, app_factory, "VOYN-W0-ML3", pr_url)
+    verdict_at, merged_at = "2026-01-01T00:00:00Z", "2026-01-01T00:10:00Z"
+    reviews = [{
+        "body": f"ACCEPTANCE: ACCEPT {head}",
+        "author": {"login": "reviewer"},
+        "submittedAt": verdict_at,
+    }]
+    state = {"merged": False}
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            if argv[-1] == "reviews,mergedAt,headRefOid,author":
+                return sp.CompletedProcess(argv, 0, json.dumps({
+                    "headRefOid": head, "mergedAt": merged_at,
+                    "author": {"login": "task-author"}, "reviews": reviews,
+                }), "")
+            if state["merged"]:
+                body = json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                    "headRefOid": head, "author": {"login": "task-author"},
+                    "reviews": reviews,
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            else:
+                body = json.dumps({
+                    "state": "OPEN", "headRefOid": head, "mergeStateStatus": "CLEAN",
+                    "author": {"login": "task-author"}, "reviews": reviews,
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "merge"]:
+            state["merged"] = True
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-ML3", merge_oid) in report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='merge_latency'",
+            ("VOYN-W0-ML3",),
+        )
+        value = json.loads(cur.fetchone()[0])
+    assert value == {"verdict_at": verdict_at, "merged_at": merged_at, "seconds": 600.0}
+
+
 def _fake_reconcile_gh(default_branch, statuses):
     """statuses: {sha: compare-status}. `--jq` mocking is by-hand since the
     real `gh` process never runs in these tests."""
