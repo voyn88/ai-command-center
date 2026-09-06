@@ -173,6 +173,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remote branch to deploy from (the repository's default branch).",
     )
 
+    reconcile = sub.add_parser(
+        "srv07-reconcile",
+        help="Report-only volume and orphan check for the runtime-store "
+        "migration (VOYN-W0-AICC-SRV-07): a real COUNT(*) per table on both "
+        "the SQLite authority and this database, plus a source-side anti-join "
+        "for every declared foreign key. Never estimates a count and never "
+        "changes a row.",
+    )
+    reconcile.add_argument("sqlite_path", help="Path to the SQLite runtime store (runtime.db).")
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -449,6 +459,27 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "srv07-reconcile":
+                from pathlib import Path
+
+                from command_center.db.srv07_reconciliation import reconcile
+
+                report = reconcile(Path(args.sqlite_path), lambda: nullcontext(conn))
+                for table_result in report.tables:
+                    rc = table_result.row_count
+                    status = "OK" if table_result.matched else "MISMATCH"
+                    print(
+                        f"{status:8} {table_result.table:24} "
+                        f"authority={rc.authority_count} mirror={rc.mirror_count}"
+                    )
+                    for orphan in table_result.orphans:
+                        if not orphan.matched:
+                            print(
+                                f"         orphaned {orphan.table}.{orphan.column} "
+                                f"-> {orphan.parent_table}: {len(orphan.orphaned_keys)} row(s)"
+                            )
+                return 0 if report.matched else 1
 
             if args.command == "downgrade":
                 if not args.confirmed:

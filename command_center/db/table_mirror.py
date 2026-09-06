@@ -221,6 +221,21 @@ class PostgresTableMirror:
 
     # --- reads -------------------------------------------------------------
 
+    def count(self) -> int:
+        """This table's row count, measured with `COUNT(*)` -- never estimated.
+
+        `pg_class.reltuples` and `pg_stat_user_tables.n_live_tup` are planner
+        statistics on an `ANALYZE` cadence, not a live count: immediately after
+        a bulk load -- exactly when a migration's reconciliation report needs
+        to be trusted -- they can read zero, stale, or simply wrong. A count a
+        cutover gate relies on has to be the one PostgreSQL will actually
+        answer a query against, not the one it last remembered.
+        """
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {self.spec.table}")
+                return int(cur.fetchone()[0])
+
     def list_records(self) -> list[dict]:
         """Every mirrored record, shaped like the authority's own row."""
         spec = self.spec
