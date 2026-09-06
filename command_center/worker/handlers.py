@@ -547,6 +547,17 @@ def _run_agent(
                     owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
                     session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
                     task=backlog_task,
+                    # VOYN-W0-AICC-DEAD-QUEUE-THREE-WRITER-CONTENTION-CLASSES
+                    # class 3: how long `writer_lease.hold` retries the
+                    # initial acquire against the SAME task's own
+                    # still-running previous attempt before giving up (see
+                    # `WriterLeaseConfig.acquire_wait_seconds`'s docstring).
+                    # Overridable so a test (or an operator who wants fail-
+                    # fast behaviour) is not stuck with the production
+                    # default's real wall-clock wait.
+                    acquire_wait_seconds=float(
+                        os.environ.get("AICC_LEASE_ACQUIRE_WAIT_SECONDS", "30")
+                    ),
                 )
                 try:
                     stack.enter_context(

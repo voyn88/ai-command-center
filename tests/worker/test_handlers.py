@@ -18,6 +18,7 @@ import pytest
 
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
+from command_center.worker import writer_lease
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
 
@@ -1606,12 +1607,59 @@ def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+    # A lease that is refused on every single try (as opposed to the
+    # transient-then-clears case covered below) must still fail once the
+    # retry budget elapses -- pinned at 0 here so this test observes that
+    # outcome without paying the production default's real wall-clock wait.
+    monkeypatch.setenv("AICC_LEASE_ACQUIRE_WAIT_SECONDS", "0")
 
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok
     assert outcome.retryable
     assert "writer lease unavailable" in outcome.reason
     assert runs == [], "the agent must not run without the writer lease held"
+
+
+def test_writer_lease_acquire_retries_transient_contention_then_dispatches(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-DEAD-QUEUE-THREE-WRITER-CONTENTION-CLASSES class 3 (161 of
+    712 dead `work_item`s): `writer lease unavailable: acquire_failed`. This
+    lease is task-scoped, so "another writer" refusing the first acquire is
+    routinely the SAME task's own still-running previous attempt -- not a
+    permanent conflict. The queue's own redelivery backoff (2s/4s for a short
+    cascade) is far shorter than a run that can hold the lease for minutes,
+    so a single-shot acquire dead-letters ordinary overlap. The fix retries
+    the initial acquire for a bounded budget; a lease that clears within it
+    must let dispatch proceed instead of refusing the whole delivery."""
+    run_agent, runs = handler
+    calls = tmp_path / "calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire)\n"
+        f"    n=$(grep -c . {calls} 2>/dev/null || echo 0)\n"
+        f'    echo "$*" >> {calls}\n'
+        '    if [ "$n" -lt 2 ]; then echo "lease held by prior attempt" >&2; exit 1; fi\n'
+        "    exit 0 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+    # A budget generous enough that two retries comfortably fit; the retry
+    # interval itself is shrunk so the test doesn't pay real wall-clock time
+    # for it.
+    monkeypatch.setenv("AICC_LEASE_ACQUIRE_WAIT_SECONDS", "5")
+    monkeypatch.setattr(writer_lease, "_ACQUIRE_RETRY_INTERVAL_SECONDS", 0.01)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+    assert calls.read_text().count("acquire") >= 3, "expected retries before success"
 
 
 def test_no_configured_authority_leaves_the_writer_lease_inert_too(
