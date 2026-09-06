@@ -38,6 +38,22 @@
 --   winner committed, so the next tick's outer scan will not pick it up
 --   again.
 --
+--   Same function, separate defect surfaced by adversarial review of PR
+--   #442: its terminal branch released `repo:<repo>` unconditionally on
+--   every task that reached a terminal state, but that lease is
+--   repo-scoped and may be held by ONE planner across SEVERAL of its own
+--   dispatched tasks in the same repo
+--   (`test_one_writer_per_repository_across_planners`). A poisoned or
+--   merely-finished row sharing a repo with another still-`IN_PROGRESS`
+--   task released that task's lease too, opening the repo to a second
+--   writer. Fixed by checking for a sibling `IN_PROGRESS` row in the same
+--   repo, inside the SAME transaction as the release, before releasing --
+--   not a point-in-time flag captured earlier (that shape is exactly what
+--   made `backlog_dispatch`'s own compensating release TOCTOU-unsafe under
+--   concurrency, below). Erring toward NOT releasing when a sibling check
+--   is ambiguous only delays the lease's return to the pool until TTL
+--   expiry; erring the other way is the second-writer hazard itself.
+--
 -- * `backlog_dispatch` — believed unreachable: the row lock taken at entry
 --   is held continuously across `backlog_transition`'s own re-read, so
 --   nothing can move the row out from under this call between the two
@@ -247,9 +263,30 @@ BEGIN
                                          'task_status', v_task_status);
         END IF;
 
-        lv := backlog_lease_release('repo:' || r.repo, p_planner);
+        -- The repo lease is repo-scoped, not task-scoped: this same planner
+        -- may hold it across more than one dispatched task in this repo
+        -- (test_one_writer_per_repository_across_planners). Releasing it
+        -- here unconditionally, just because THIS task reached a terminal
+        -- state, opens the repo to a second writer while a sibling task is
+        -- still IN_PROGRESS under the very same lease -- the "High" finding
+        -- against PR #442. Checked, not assumed: a sibling's status update
+        -- and this release both live inside this call's own transaction, so
+        -- either the sibling is still visibly IN_PROGRESS (skip the
+        -- release, safe direction) or it has already left that state
+        -- (release is correct). The failure mode of a missed release is a
+        -- lease outliving its last task until TTL expiry -- self-healing,
+        -- unlike the two-writer hazard a wrong release would open.
+        IF EXISTS (SELECT 1 FROM backlog_task b
+                    WHERE b.repo = r.repo AND b.status = 'IN_PROGRESS'
+                      AND b.task_id <> r.t_id) THEN
+            lv.ok := false; lv.reason := 'sibling_in_progress';
+        ELSE
+            lv := backlog_lease_release('repo:' || r.repo, p_planner);
+        END IF;
         PERFORM _backlog_audit(r.t_id, 'ingest', 'granted', action,
-                               detail || jsonb_build_object('lease_released', lv.ok));
+                               detail || jsonb_build_object(
+                                   'lease_released', lv.ok,
+                                   'lease_release_reason', lv.reason));
         RETURN NEXT;
     END LOOP;
 END
