@@ -128,8 +128,8 @@ checks whatever the two schemas happen to be when it runs.
 
 **Where 16 turns up as a real, live number.** Not in this branch's checkout —
 here, `command_center/db/sql/` holds 14 migrations and `EXPECTED_SCHEMA_VERSION
-== 14`, as stated above. But on `main`'s current tip, ahead of this branch's
-base (`67a996b`), it is real: `VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY`
+== 14`, as stated above. But at one specific point on `main`, ahead of this
+branch's base (`67a996b`), it was real: `VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY`
 (`ad5425f`, PR #473, 2026-08-30) added `command_center/db/sql/0016_run_finalization_claim.up.sql`,
 bringing the PostgreSQL side to 16 migration files — the first point in this
 codebase's history where 16 is a genuine, machine-derived migration count
@@ -141,19 +141,30 @@ SQLite side by design — `0016_run_finalization_claim.up.sql`'s header notes
 "the current SQLite authority does not dual-write this row" — so the table
 count assertions were widened to source from `INITIAL_MIGRATION` plus
 `CORRESPONDING_MIGRATIONS` together, not `INITIAL_MIGRATION` alone). If that
-is what a reading of "the gate" turned up 16 at, it is accurate, but:
+is what a reading of "the gate" turned up 16 at, it is accurate for that
+commit, but:
 
 - it is `EXPECTED_SCHEMA_VERSION` (PostgreSQL), not `SCHEMA_VERSION` (SQLite) —
   the same category error as the earlier "16" fossil, just against a live
   number this time instead of a retired one;
-- it belongs to `main`, not to this branch's checkout, which is still pinned
-  to the pre-#473 state (14/24);
+- it belonged to `main` at `ad5425f`, not to this branch's checkout, which is
+  still pinned to the pre-#473 state (14/24);
 - on that same `main` commit, SQLite's `SCHEMA_VERSION` is 25 (`fix(runtime):
   fence process identity and v25 cutover`, folded into #473) — so the live
-  pair there is (25, 16), two counters that moved independently and stayed
+  pair there was (25, 16), two counters that moved independently and stayed
   uncorrelated, exactly the by-design shape this document already describes.
   Nothing about the gate was lifted to produce that pair; it passed, checked,
-  on the wider table set.
+  on the wider table set;
+- it is already stale itself. As of 2026-09-06, `main` has moved 60 commits
+  past `ad5425f`; `VOYN-W0-AICC-DEFER-AUTO-RESUME-REM` (`d3aec4c`, PR #605)
+  added a 17th PostgreSQL migration
+  (`command_center/db/sql/0017_backlog_resume_window.up.sql`), so `main`'s
+  live pair is now (25, 17), not (25, 16) — `SCHEMA_VERSION` held still while
+  `EXPECTED_SCHEMA_VERSION` moved again. Treat "16" on `main` the same way as
+  the retired SRV-01b "16": a number that was briefly true and has since been
+  superseded. Anyone re-reading this section should re-run
+  `python -m command_center.db status` against whatever `main` tip they
+  actually have rather than trusting either "16" or "17" here.
 
 ## Takeaways for whoever reads this next
 
@@ -164,11 +175,12 @@ is what a reading of "the gate" turned up 16 at, it is accurate, but:
 2. "16" is not, and has never been, a `runtime.db` migration state on this
    branch. It is the retired early-survey table count from the SRV-01b
    correspondence map. On `main`, ahead of this branch, "16" separately became
-   the real, live PostgreSQL `EXPECTED_SCHEMA_VERSION` after PR #473 — a
-   coincidence of timing between an unrelated retired literal and a genuine
-   migration count, not the same fact twice. Resolve any future appearance of
-   "16" by checking which of the two it is, against whichever tree it was
-   read from, rather than assuming either.
+   the real, live PostgreSQL `EXPECTED_SCHEMA_VERSION` for one window after PR
+   #473, and has since moved on to 17 (PR #605) — a coincidence of timing
+   between an unrelated retired literal and a genuine, still-moving migration
+   count, not the same fact twice. Resolve any future appearance of "16" (or
+   "17") by checking which of these it is, against whichever tree it was
+   read from, rather than assuming any of them.
 3. The SRV-07 parity gate (`tests/db/test_schema_correspondence.py`) has never
    been removed, disabled, or version-pinned at 16 or any other number. It
    re-derives both schemas live on every run and currently passes against
