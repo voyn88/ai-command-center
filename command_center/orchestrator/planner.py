@@ -20,8 +20,10 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from command_center.orchestrator import credential_window
 from command_center.orchestrator.routing import cascade_for
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
@@ -47,6 +49,20 @@ class PlanLimits:
     #: RESUME). Bounded so a large parked backlog drains gradually across
     #: ticks instead of flooding OPEN in one; 0 disables the reconcile.
     max_resumes_per_tick: int = 10
+    #: VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: when the Claude credential
+    #: window's most recently observed reset time is within this many
+    #: seconds in the PAST, this tick is a "burst" tick --
+    #: `burst_max_dispatches_per_tick` replaces `max_dispatches_per_tick` so
+    #: the eligible work that piled up (or was routed around Claude, never
+    #: touching it) while the window was closed drains in the reopening
+    #: tick instead of trickling out `max_dispatches_per_tick` candidates
+    #: per future tick regardless of the fresh capacity now sitting idle.
+    burst_window_seconds: int = 120
+    #: The per-tick dispatch cap used only during a burst tick. Still well
+    #: under `wip_limit`'s own ceiling (backlog_dispatch's real gate) for
+    #: any repo whose WIP is already near-full -- this widens the tick's
+    #: OWN throttle, it does not widen WIP.
+    burst_max_dispatches_per_tick: int = 16
 
 
 @dataclass(slots=True)
@@ -104,7 +120,11 @@ def repo_route(repo: str) -> tuple[str, str] | None:
 
 
 def _payload_for(
-    task: dict[str, Any], limits: PlanLimits, route: tuple[str, str]
+    task: dict[str, Any],
+    limits: PlanLimits,
+    route: tuple[str, str],
+    *,
+    claude_window_exhausted: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """The agent_run payload plus the attempt budget (= cascade length).
 
@@ -113,7 +133,9 @@ def _payload_for(
     ``untrusted=False`` is on the authority of the planner being the control
     plane acting on the canonical store.
     """
-    cascade = cascade_for("implementation")
+    cascade = cascade_for(
+        "implementation", claude_window_exhausted=claude_window_exhausted
+    )
     project_id, repository_path = route
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"
@@ -166,6 +188,16 @@ class Planner:
 
     def _row(self, sql: str, params: tuple[Any, ...]) -> tuple:
         return self._rows(sql, params)[0]
+
+    def _claude_window(self) -> tuple[bool, datetime | None]:
+        """``(exhausted_now, last_reset_at)`` — VOYN-W0-AICC-WINDOW-AWARE-
+        SCHEDULING. ``last_reset_at`` is returned even when the window is
+        NOT currently exhausted (it closed and has since reopened) so
+        ``plan_once``'s burst-tick check does not need a second query."""
+        reset_at = credential_window.claude_window_reset_at(self._factory)
+        if reset_at is None:
+            return False, None
+        return reset_at > datetime.now(timezone.utc), reset_at
 
     def plan_once(self, limits: PlanLimits = PlanLimits()) -> PlanReport:
         report = PlanReport()
@@ -242,12 +274,29 @@ class Planner:
                     if ok:
                         report.resumed.append((task_id, park_reason))
 
+            # VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: one read for the whole
+            # tick — `claude_exhausted` keeps every dispatch this tick off a
+            # Claude link known-closed (routing.cascade_for), and a reset
+            # observed within the last `burst_window_seconds` widens this
+            # tick's own dispatch cap so work held back while the window was
+            # closed drains now instead of trickling out over the next
+            # several ticks at the ordinary pace.
+            claude_exhausted, claude_reset_at = self._claude_window()
+            dispatch_cap = limits.max_dispatches_per_tick
+            if (
+                not claude_exhausted
+                and claude_reset_at is not None
+                and datetime.now(timezone.utc) - claude_reset_at
+                <= timedelta(seconds=limits.burst_window_seconds)
+            ):
+                dispatch_cap = max(dispatch_cap, limits.burst_max_dispatches_per_tick)
+
             candidates = self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable "
                 "FROM backlog_eligible"
             )
             for task_id, wave, priority, title, body, repo, dispatchable in candidates:
-                if len(report.dispatched) >= limits.max_dispatches_per_tick:
+                if len(report.dispatched) >= dispatch_cap:
                     break
                 task = {
                     "task_id": task_id,
@@ -267,7 +316,9 @@ class Planner:
                     # worker refuses unknown projects three times, honestly).
                     report.undispatchable.append((task_id, "unknown_repo_route"))
                     continue
-                payload, budget = _payload_for(task, limits, route)
+                payload, budget = _payload_for(
+                    task, limits, route, claude_window_exhausted=claude_exhausted
+                )
                 ok, reason, work_item_id, _revision = self._row(
                     "SELECT * FROM backlog_dispatch(%s, %s, %s, %s, %s::jsonb, %s)",
                     (

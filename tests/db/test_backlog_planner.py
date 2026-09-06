@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -277,6 +278,97 @@ def test_planner_tick_end_to_end_with_a_real_worker(rig) -> None:
                 ("VOYN-W0-P1",),
             )
             assert cur.fetchone()[0] == 2, "a fresh dispatch epoch, not a re-run"
+
+
+def test_plan_once_drops_claude_from_a_fresh_cascade_while_window_exhausted(
+    rig,
+) -> None:
+    """VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING (a): once ANY worker attempt has
+    reported the Claude credential window is closed -- the marker lands in
+    `work_attempt.outcome_reason`, read back by
+    `orchestrator.credential_window.claude_window_reset_at` -- a FRESH
+    dispatch for an unrelated task must not still hand out a cascade that
+    starts with `claude`. The window is fleet-wide, shared by every task,
+    not a fact scoped to the task whose delivery happened to observe it;
+    and the whole point is that a worker process which never itself saw the
+    failure (a cold process, another host) must not have to spend a real
+    CLI invocation rediscovering it."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-WX", repo="repo-p1"))[0]
+    assert store.upsert_task(_task("VOYN-W0-WY", repo="repo-p3"))[0]
+
+    limits = PlanLimits(planner="planner-window", wip_limit=4, max_dispatches_per_tick=4)
+    report = plan_once(app_factory, limits)
+    assert "VOYN-W0-WX" in [t for t, _ in report.dispatched]
+
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert isinstance(claimed, ClaimedWork)
+    assert claimed.payload["cascade"][0]["executor"] == "claude"
+    future_reset = (
+        datetime.now(timezone.utc) + timedelta(hours=1)
+    ).isoformat()
+    assert worker.fail(
+        claimed,
+        reason=(
+            "executor infrastructure failure (provider/auth/quota): boom "
+            f"[CREDENTIAL_WINDOW_RESET=claude:{future_reset}]"
+        ),
+        retryable=False,
+    )
+
+    report2 = plan_once(app_factory, limits)
+    assert "VOYN-W0-WY" in [t for t, _ in report2.dispatched]
+
+    seen_any = False
+    while True:
+        claimed = worker.claim("execution", visibility_seconds=60)
+        if not isinstance(claimed, ClaimedWork):
+            break
+        seen_any = True
+        assert all(
+            link["executor"] != "claude" for link in claimed.payload["cascade"]
+        ), claimed.payload["cascade"]
+    assert seen_any, "the fresh dispatches must have reached the queue"
+
+
+def test_plan_once_bursts_dispatches_once_the_window_reopens(rig) -> None:
+    """VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING (b): a Claude-window reset
+    observed in the recent past widens THIS tick's own dispatch cap so
+    backlog held back while the window was closed drains in the reopening
+    tick instead of trickling out `max_dispatches_per_tick` candidates per
+    future tick regardless of the fresh capacity now sitting idle."""
+    app_factory, store, worker = rig
+    repos = ["repo-ga", "repo-gb", "repo-gc", "repo-in", "repo-nm", "repo-one"]
+    for i, repo in enumerate(repos):
+        assert store.upsert_task(_task(f"VOYN-W0-BURST{i}", repo=repo))[0]
+
+    limits = PlanLimits(
+        planner="planner-burst",
+        wip_limit=6,
+        max_dispatches_per_tick=2,
+        burst_max_dispatches_per_tick=6,
+        burst_window_seconds=120,
+    )
+    report1 = plan_once(app_factory, limits)
+    assert len(report1.dispatched) == 2, "no window observation yet: ordinary cap"
+
+    claimed = worker.claim("execution", visibility_seconds=60)
+    assert isinstance(claimed, ClaimedWork)
+    recent_reset = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+    assert worker.fail(
+        claimed,
+        reason=(
+            "executor infrastructure failure (provider/auth/quota): boom "
+            f"[CREDENTIAL_WINDOW_RESET=claude:{recent_reset}]"
+        ),
+        retryable=True,
+    )
+
+    report2 = plan_once(app_factory, limits)
+    assert len(report2.dispatched) == 4, (
+        "the window reopened moments ago: the burst cap must drain the rest "
+        "in this one tick"
+    )
 
 
 def test_two_planner_ticks_cannot_run_concurrently(rig) -> None:

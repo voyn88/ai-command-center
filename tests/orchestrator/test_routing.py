@@ -62,6 +62,25 @@ def test_unknown_task_class_falls_back_to_implementation():
     assert cascade_for("martian") == cascade_for("implementation")
 
 
+def test_claude_window_exhausted_drops_every_claude_link():
+    """VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: a cascade built while the
+    control plane already knows Claude's window is closed must never carry
+    a claude link -- spending a real CLI invocation (and its round-trip
+    latency) to rediscover a fact already known is exactly the dead attempt
+    this feature exists to eliminate."""
+    for task_class in ROUTING_MATRIX:
+        cascade = cascade_for(task_class, claude_window_exhausted=True)
+        assert all(link["executor"] != "claude" for link in cascade)
+        assert cascade, "a claude-free cascade must still exist"
+
+
+def test_claude_window_open_keeps_the_ordinary_cascade():
+    for task_class in ROUTING_MATRIX:
+        assert cascade_for(
+            task_class, claude_window_exhausted=False
+        ) == cascade_for(task_class)
+
+
 def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> None:
     """VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP (found live 2026-08-30).
 
@@ -97,3 +116,28 @@ def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> Non
     assert "HEAD_SHA: <the branch head commit sha>" in prompt
     # The instruction that asked the agent to publish its own work is gone.
     assert "When you open or update a pull request" not in prompt
+
+
+def test_payload_for_drops_claude_when_window_is_exhausted() -> None:
+    """VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING: the planner-built cascade
+    (`orchestrator.planner._payload_for`) is where a known-exhausted Claude
+    window must stop costing a dispatch, not just the worker's own
+    in-process circuit -- a different worker process (or host) picking up
+    this delivery has no memory of the earlier failure otherwise."""
+    task = {
+        "task_id": "VOYN-W0-WINDOW-CONTRACT",
+        "wave": "0",
+        "priority": "P0",
+        "title": "t",
+        "body": "b",
+    }
+    payload, budget = _payload_for(
+        task,
+        PlanLimits(),
+        ("AICC", "/srv/repo"),
+        claude_window_exhausted=True,
+    )
+    cascade = payload["cascade"]
+    assert cascade == cascade_for("implementation", claude_window_exhausted=True)
+    assert all(link["executor"] != "claude" for link in cascade)
+    assert budget == len(cascade)
