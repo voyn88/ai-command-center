@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -901,6 +902,36 @@ def list_unfinalized_runs(db_path: Path, *, limit: int = 100) -> list[dict]:
             (*db.TERMINAL_STATES, limit),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def wait_for_run_finalized(
+    db_path: Path, run_id: str, *, timeout: float, poll_interval: float = 0.1
+) -> dict | None:
+    """Block until `run_id`'s durable `finalized_at` marker is set, or `timeout`
+    elapses. The cross-process counterpart to `Supervisor.wait_for_run`.
+
+    That method watches `self._active`, an in-memory registry private to the
+    process that launched the run: for a run this process did not launch,
+    `active is None` on the very first check and it returns immediately,
+    without waiting at all — which reads as "already settled" to a caller who
+    has no way to tell the difference. A separate status invocation or a UI
+    refresh running in another process is exactly such a caller, and reading
+    a terminal-but-unfinalized run as final is the report/auto-commit loss
+    `finalized_at` exists to make visible instead of silent.
+
+    This polls the same durable marker `count_unfinalized_runs` reads, so any
+    process that can open the database can wait on it. Returns the run row at
+    the moment waiting stops (finalized, still unfinalized after `timeout`, or
+    already outside the terminal set), or `None` if the run does not exist.
+    """
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        row = get_run(db_path, run_id)
+        if row is None or row["state"] not in db.TERMINAL_STATES or row.get("finalized_at"):
+            return row
+        if time.monotonic() >= deadline:
+            return row
+        time.sleep(poll_interval)
 
 
 def set_run_result_fields(
