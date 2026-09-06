@@ -252,6 +252,29 @@ def _record_document(record: BackupRecord) -> dict[str, object]:
     return document
 
 
+def _manifest_version_for(records: list[BackupRecord]) -> int:
+    """The lowest manifest version that losslessly holds every record.
+
+    `_record_document` already omits a version-3 field a record does not use;
+    this is the same trigger applied to the top-level stamp `_generation_records`
+    gates on. An already-deployed reader that predates version 3 -- or version
+    2 -- refuses on that stamp before it ever inspects a record, so a
+    generation that never exercises a newer field must not claim a newer
+    version than it needs, or the compatibility every per-record default
+    exists for never actually reaches an older reader.
+    """
+    if any(
+        record.directory or record.sensitive or record.sensitive_retired
+        for record in records
+    ):
+        return 3
+    if any(
+        record.original_symlink is not None or record.remove for record in records
+    ):
+        return 2
+    return 1
+
+
 def _record_from_document(value: object) -> BackupRecord:
     if not isinstance(value, dict):
         raise RuntimeError("generation manifest record is malformed")
@@ -2880,7 +2903,7 @@ class FileTransaction:
                 manifest,
                 json.dumps(
                     {
-                        "version": MANIFEST_VERSION,
+                        "version": _manifest_version_for(records),
                         "generation": transaction.name,
                         "records": [
                             _record_document(record) for record in records

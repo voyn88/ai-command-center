@@ -2854,12 +2854,25 @@ def test_the_control_purge_drains_the_workers_before_it_closes_the_socket(tmp_pa
         "aicc-agent-launcher.socket"
     )
     assert "aicc-agent-launcher@7.service" not in disabled
-    assert any(
-        call[1] == "show"
+    socket_closed_at = next(
+        index
+        for index, call in enumerate(calls)
+        if call[1] == "disable" and call[3] == "aicc-agent-launcher.socket"
+    )
+    launcher_probes = [
+        index
+        for index, call in enumerate(calls)
+        if call[1] == "show"
         and call[2] == "aicc-agent-launcher@7.service"
         and "--property=ControlGroup" in call
-        for call in calls
-    ), "accepted sessions are observed to natural completion, never stopped"
+    ]
+    assert launcher_probes, "accepted sessions are observed to natural completion, never stopped"
+    assert min(launcher_probes) > socket_closed_at, (
+        "every accepted-session probe must come after admission closes, not just some of "
+        "them -- an implementation that enumerates or probes a launcher instance before "
+        "closing the socket reopens the accept-after-snapshot race this ordering exists "
+        "to close"
+    )
 
 
 def test_a_session_opened_during_the_drain_is_observed_after_admission_closes(
@@ -2923,7 +2936,9 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
     drain_probes = [
         index
         for index, call in enumerate(calls)
-        if call[1] == "show" and "--property=ControlGroup" in call
+        if call[1] == "show"
+        and call[2] == "aicc-agent-launcher@7.service"
+        and "--property=ControlGroup" in call
     ]
     closed = [
         index
@@ -2935,7 +2950,12 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
         call[1] == "disable" and call[3] == "aicc-agent-launcher@7.service"
         for call in calls
     )
-    assert max(drain_probes) > closed[0]
+    assert min(drain_probes) > closed[0], (
+        "every cgroup drain probe, not merely the last one, must follow admission "
+        "closing -- an implementation that enumerates or probes launcher instances "
+        "before closing the socket and only waits for the outstanding ones afterward "
+        "would still leave `max(drain_probes) > closed[0]` true"
+    )
 
 
 def test_an_accepted_session_can_outlive_the_short_client_drain(tmp_path):
@@ -5189,7 +5209,18 @@ def test_a_generation_with_nothing_version_three_still_loads_in_an_older_reader(
 ):
     """The version-3 fields are emitted only on the records that use them, so
     an ordinary install generation is still exactly what an already-deployed
-    exact-SHA reader expects."""
+    exact-SHA reader expects.
+
+    Field omission alone does not deliver that promise: an already-deployed
+    reader gates on the manifest's TOP-LEVEL version before it ever looks at a
+    record (`_generation_records` does exactly this in the current build, and
+    `UNINSTALL_JOURNAL_VERSION`/`RELEASE_MANIFEST_VERSION` show the same
+    pattern is used elsewhere for other journals). A manifest unconditionally
+    stamped `MANIFEST_VERSION` would fail that gate on every plain install,
+    regardless of which fields its records actually carry. So the stamp must
+    fall as low as the fields do -- checked here directly, because
+    `_older_reader` only ever models the field-decoding half of that
+    contract."""
     module = _module()
     source = tmp_path / "source"
     source.write_bytes(b"installed")
@@ -5198,7 +5229,29 @@ def test_a_generation_with_nothing_version_three_still_loads_in_an_older_reader(
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
 
-    assert payload["version"] == module.MANIFEST_VERSION
+    assert payload["version"] == 1, (
+        "a generation using none of the version-2 or version-3 fields must "
+        "not stamp a version an old reader would refuse on sight"
+    )
+    _older_reader(VERSION_TWO_RECORD_FIELDS)(payload)
+
+
+def test_a_generation_using_only_version_two_fields_stamps_version_two(tmp_path):
+    """A removal exercises `remove` (a version-2 field) but none of the
+    version-3 fields, so the manifest must stamp exactly the version that
+    introduced the field it actually uses -- not the newest one this build
+    knows, and not one field version older than what it needs either."""
+    module = _module()
+    root = tmp_path / "root"
+    existing = root / "etc/existing"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"before")
+    _transaction, manifest = _one_generation(
+        module, tmp_path, (module.removal_spec("/etc/existing"),)
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+
+    assert payload["version"] == 2
     _older_reader(VERSION_TWO_RECORD_FIELDS)(payload)
 
 
