@@ -367,6 +367,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REFUSED   {task_id}: {reason}")
                 for task_id, reason in report.undispatchable:
                     print(f"NO-REPO   {task_id}: {reason}")
+                for task_id, reason in report.blocked_authority:
+                    print(f"BLOCKED   {task_id}: {reason}")
                 return 0
 
             if args.command == "backlog-review":
