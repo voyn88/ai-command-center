@@ -146,6 +146,10 @@ def handler(monkeypatch, tmp_path):
     # has one. Unset it here so the default fixture stays hermetic -- the
     # gate's own tests opt back in explicitly.
     monkeypatch.delenv("VOYN_LEASE_DSN", raising=False)
+    # The Claude window circuit (VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING) is
+    # worker-process-global state, so a test that opens it must not leak the
+    # open circuit into whichever test runs next in the same process.
+    agent_runner.clear_claude_window()
     return build_handlers()["agent_run"], runs
 
 
@@ -427,6 +431,125 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(
     assert outcome.retryable
     assert "executor infrastructure failure" in outcome.reason
     assert "session limit" in outcome.reason
+
+
+def test_claude_session_limit_opens_the_window_and_marks_the_reason(
+    handler, monkeypatch
+) -> None:
+    """The same incident, but asserting the new window-tracking side effect
+    (VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING): this delivery has no cascade
+    (a single implicit Claude link), so the reset time can only reach the
+    planner through the labelled `outcome_reason` trailer -- there is no
+    later cascade link to attach a structured `route_failovers` entry to."""
+    run_agent, _ = handler
+    rate_limited_stdout = json.dumps(
+        {
+            "is_error": True,
+            "api_error_status": 429,
+            "terminal_reason": "api_error",
+            "result": "You've hit your session limit · resets 4:10pm (UTC)",
+            "type": "result",
+        }
+    )
+
+    def rate_limited(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=rate_limited_stdout,
+            stderr="",
+            duration_seconds=0.41,
+            started_at="2026-08-21T16:09:00+00:00",
+            completed_at="2026-08-21T16:09:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", rate_limited)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "[CREDENTIAL_WINDOW_RESET=claude:2026-08-21T16:10:00+00:00]" in outcome.reason
+    state = agent_runner.claude_window_state()
+    assert state is not None
+    assert state["reset_at"] == "2026-08-21T16:10:00+00:00"
+    available, _ = agent_runner.claude_window_preflight()
+    assert available is False
+
+
+def test_claude_window_preflight_skips_to_fallback_without_spending_attempt(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "implementation"},
+        {"executor": "codex", "task_type": "implementation"},
+    ]
+    monkeypatch.setattr(
+        agent_runner,
+        "claude_window_preflight",
+        lambda: (False, "Claude usage window exhausted until 2026-08-21T21:09:00+00:00"),
+    )
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert runs[0]["executor"] == "codex"
+
+
+def test_claude_provider_failure_records_window_and_route_failovers_carry_reset_at(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    rate_limited_stdout = json.dumps(
+        {
+            "is_error": True,
+            "api_error_status": 429,
+            "terminal_reason": "api_error",
+            "result": "You've hit your session limit · resets 4:10pm (UTC)",
+            "type": "result",
+        }
+    )
+
+    def quota_then_success(**kwargs):
+        runs.append(kwargs)
+        if kwargs["executor"] == "claude":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=1,
+                stdout=rate_limited_stdout,
+                stderr="",
+                duration_seconds=0.1,
+                started_at="2026-08-21T16:09:00+00:00",
+                completed_at="2026-08-21T16:09:00+00:00",
+            )
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-21T16:09:01+00:00",
+            completed_at="2026-08-21T16:09:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", quota_then_success)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "review"},
+        {"executor": "codex", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "claude",
+            "reason": "provider_auth_or_quota",
+            "credential_reset_at": "2026-08-21T16:10:00+00:00",
+        }
+    ]
+    state = agent_runner.claude_window_state()
+    assert state is not None and state["reset_at"] == "2026-08-21T16:10:00+00:00"
 
 
 def test_bwrap_loopback_result_is_retryable_infrastructure_failure(

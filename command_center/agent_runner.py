@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -97,7 +98,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from command_center import models, openai_exec, project_config, storage
@@ -188,6 +189,166 @@ def disable_codex_workspace_write(detail: str = "") -> None:
         reason = f"{reason}: {detail[-400:]}"
     with _codex_workspace_write_preflight_lock:
         _codex_workspace_write_preflight_result = (False, reason)
+
+
+# --------------------------------------------------------------------------
+# Claude credential window tracking (VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING).
+#
+# The fleet's Claude credential is a Max *subscription*, whose 5-hour rolling
+# window is a hard cap (see `build_codex_command`'s docstring and
+# `orchestrator.routing`'s ROUTING_MATRIX comment: 142 of 167 parked
+# `task_status_failed` tasks were literally "You've hit your session limit").
+# The executor cascade already fails over to the next account WITHIN one
+# attempt once that happens (see the provider-failure branch in
+# `worker.handlers._run_agent`) -- what it does not do on its own is stop the
+# NEXT dispatch from trying Claude again while the window is provably still
+# closed, spending a real CLI invocation (and the real-world latency of a
+# round trip to Anthropic) just to rediscover the same fact.
+#
+# This is the same shape as `disable_codex_workspace_write` /
+# `codex_workspace_write_preflight` above: a worker-process-local circuit
+# breaker, consulted by `worker.handlers._executor_preflight` before Claude is
+# ever invoked again. It is deliberately NOT a cross-host authority -- a
+# worker process handles its deliveries one at a time (`worker.daemon`'s own
+# docstring), so in-memory state here is visible to every later dispatch on
+# THIS host without needing a lock server or a migration. Cross-host/-process
+# visibility (the planner deciding not to route new work onto Claude, and
+# bursting dispatches once the window reopens) is carried a different way:
+# `record_claude_window_exhaustion` returns a plain dict the caller attaches
+# to the queue result/reason it already writes, and
+# `orchestrator.planner.Planner` reads it back from there — see that
+# module's `_claude_window_reset_at`.
+CLAUDE_CREDENTIAL_ID = "claude"
+#: The Max plan's rolling window length. Used only as the FALLBACK reset
+#: estimate when the CLI's own diagnostic text carries no parseable reset
+#: time -- the primary source is always what was actually observed.
+CLAUDE_ROLLING_WINDOW_SECONDS = 5 * 60 * 60
+# A generic "provider/auth/quota" signal (`RunResult.is_executor_api_error`)
+# is not by itself proof of a 5-hour session-limit event: the same structural
+# fields also cover a transient 5xx/overload response, which clears on its
+# own in seconds and must not open a 5-hour circuit. These phrases are the
+# CLI's own wording for the account-exhausted case specifically (captured
+# verbatim from the 2026-08-21 incident: "You've hit your session limit").
+_CLAUDE_SESSION_LIMIT_SIGNATURES = (
+    "session limit",
+    "usage limit",
+    "5-hour limit",
+)
+# The labelled trailer this module writes into worker-observable outcomes so
+# a DIFFERENT process (the planner, on a different host) can learn the same
+# fact without a shared database table. Same idea as the `HEAD_SHA:` trailer
+# `worker.handlers` already asks agents for: a fixed, grep-able marker beats
+# guessing meaning out of free text.
+CREDENTIAL_WINDOW_MARKER = "CREDENTIAL_WINDOW_RESET"
+# "resets 4:10pm (UTC)" / "resets at 4:10 pm" -- the CLI's own wording,
+# wall-clock time only (no date), optionally followed by a bracketed zone
+# abbreviation. Parsed against the OBSERVATION's own calendar date/zone.
+_CLAUDE_RESET_CLOCK_RE = re.compile(
+    r"resets?\s+(?:at\s+)?(\d{1,2}):(\d{2})\s*([ap])\.?m\.?", re.IGNORECASE
+)
+
+_claude_window_lock = threading.Lock()
+_claude_window_state: dict[str, str] | None = None
+
+
+def claude_diagnostic_is_session_limit(diagnostic: str) -> bool:
+    """Whether `diagnostic` (already-bounded stdout/stderr/result text) names
+    Claude's own account-level session/usage-limit response, as opposed to
+    some other provider/auth/quota failure that also sets
+    `is_executor_api_error`."""
+    text = diagnostic.lower()
+    return any(signature in text for signature in _CLAUDE_SESSION_LIMIT_SIGNATURES)
+
+
+def parse_claude_window_reset(diagnostic: str, *, observed_at: str) -> str:
+    """The best estimate of when Claude's rolling window reopens, as an ISO
+    timestamp.
+
+    Prefers an explicit clock time parsed out of the CLI's own diagnostic
+    text (`_CLAUDE_RESET_CLOCK_RE`), anchored to the OBSERVATION's own
+    calendar date and UTC offset and rolled to the next day if the parsed
+    time-of-day has already passed today (the window can straddle
+    midnight). A parse that lands outside `(observed_at, observed_at +
+    6h]` is treated as noise, not a reset time — the rolling window is
+    documented at 5 hours, and trusting an out-of-band parse over that
+    would let one garbled CLI line reopen (or indefinitely widen) the
+    circuit. Falls back to `observed_at + CLAUDE_ROLLING_WINDOW_SECONDS`
+    whenever nothing usable was parsed.
+    """
+    observed = _parse_iso(observed_at) or datetime.now(UTC)
+    match = _CLAUDE_RESET_CLOCK_RE.search(diagnostic)
+    if match:
+        hour = int(match.group(1)) % 12
+        if match.group(3).lower() == "p":
+            hour += 12
+        minute = int(match.group(2))
+        candidate = observed.replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if candidate <= observed:
+            candidate = candidate + timedelta(days=1)
+        delta = candidate - observed
+        if timedelta(0) < delta <= timedelta(hours=6):
+            return candidate.isoformat()
+    return (observed + timedelta(seconds=CLAUDE_ROLLING_WINDOW_SECONDS)).isoformat()
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def credential_window_marker(credential_id: str, reset_at: str) -> str:
+    """The grep-able trailer embedded in a queue-visible reason string."""
+    return f"[{CREDENTIAL_WINDOW_MARKER}={credential_id}:{reset_at}]"
+
+
+def record_claude_window_exhaustion(*, diagnostic: str, observed_at: str) -> dict[str, str]:
+    """Open the worker-local Claude circuit and return the structured fact
+    (`credential_id`/`exhausted_at`/`reset_at`/`detail`) for the caller to
+    fold into whatever it reports back to the queue."""
+    reset_at = parse_claude_window_reset(diagnostic, observed_at=observed_at)
+    state = {
+        "credential_id": CLAUDE_CREDENTIAL_ID,
+        "exhausted_at": observed_at,
+        "reset_at": reset_at,
+        "detail": diagnostic.strip()[-400:],
+    }
+    global _claude_window_state
+    with _claude_window_lock:
+        _claude_window_state = state
+    return dict(state)
+
+
+def claude_window_state() -> dict[str, str] | None:
+    with _claude_window_lock:
+        return dict(_claude_window_state) if _claude_window_state else None
+
+
+def clear_claude_window() -> None:
+    """Close the circuit. Used by tests; a live process otherwise closes it
+    naturally once `claude_window_preflight` observes `reset_at` has passed."""
+    global _claude_window_state
+    with _claude_window_lock:
+        _claude_window_state = None
+
+
+def claude_window_preflight() -> tuple[bool, str]:
+    """`(available, message)`, mirroring `codex_workspace_write_preflight`'s
+    shape: unavailable exactly while the last-recorded reset time is still
+    in the future."""
+    state = claude_window_state()
+    if state is None:
+        return True, ""
+    reset_at = _parse_iso(state["reset_at"])
+    if reset_at is None or datetime.now(UTC) >= reset_at:
+        return True, ""
+    return False, f"Claude usage window exhausted until {state['reset_at']}"
 
 
 # --------------------------------------------------------------------------
