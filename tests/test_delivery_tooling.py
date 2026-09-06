@@ -368,7 +368,12 @@ def test_the_marker_names_a_missing_driver_instead_of_reading_as_a_postgres_run(
 
     monkeypatch.setattr(module, "_driver_reachable", lambda: False)
     unreachable = module._evidence_line(["tests/db"], counts, "clean")
-    assert "driver missing" in unreachable
+    # Exact, not a substring, for the same reason `reachable` is checked whole
+    # below: `"driver missing" in unreachable` also matches
+    # `PostgreSQL requested, **driver missing, but maybe not**` or any other
+    # text appended around the phrase, so a fourth state could grow out of the
+    # third with this assertion still green.
+    assert unreachable.endswith("(PostgreSQL requested, **driver missing**).")
 
     monkeypatch.setattr(module, "_driver_reachable", lambda: True)
     reachable = module._evidence_line(["tests/db"], counts, "clean")
