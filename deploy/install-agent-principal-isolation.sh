@@ -282,7 +282,22 @@ fi
 # snapshotted even when absent from the installed lane registry. The two
 # legacy units below mirror LEGACY_WORKER_UNITS in
 # ops/aicc_staged_worker_rollout.py -- keep the lists in lockstep.
-run_rollout snapshot --lanes "$repo_root/deploy/aicc/worker-lanes" \
+#
+# The registry itself must be the CURRENTLY INSTALLED one, not the incoming
+# repository's copy: /etc/aicc/worker-lanes still holds whatever ran before
+# this transaction's `apply` overwrites it, and a host-specific lane absent
+# from the new manifest is only in that installed file. Reading the repo's
+# copy here left such a lane's prior unit state uncaptured, so rollback could
+# not restore it (independent review on 988de49). Fall back to the repo's
+# copy only when nothing is installed yet -- a fresh host has no prior state
+# to capture and /etc/aicc/worker-lanes does not exist for
+# `snapshot`/`_read_lane_registry` to open.
+if [ -f /etc/aicc/worker-lanes ]; then
+  attempt_lanes=/etc/aicc/worker-lanes
+else
+  attempt_lanes="$repo_root/deploy/aicc/worker-lanes"
+fi
+run_rollout snapshot --lanes "$attempt_lanes" \
   --state "$attempt_units" \
   --include-unit aicc-agent-launcher.socket \
   --include-unit aicc-principal-recovery.service \

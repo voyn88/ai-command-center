@@ -135,6 +135,64 @@ def test_git_blob_oid_fails_closed_when_trusted_git_cannot_execute(monkeypatch, 
         module._git_blob_oid(b"payload")
 
 
+def _sha1_call_lines(source: str, filename: str = "<test>") -> list[int]:
+    """Line numbers of in-process SHA-1 computation, however it is spelled:
+    `hashlib.sha1(...)`, `hashlib.new("sha1", ...)`, `hashlib.new(name="sha1")`,
+    an aliased `import hashlib as h`, or `from hashlib import sha1` / `from
+    hashlib import new` (with or without `as`) used unqualified. A prior
+    version only matched attribute calls `hashlib.sha1(...)` and positional
+    `hashlib.new("sha1", ...)`, so `from hashlib import sha1; sha1(...)`, an
+    aliased import, or `hashlib.new(name="sha1")` stayed undetected
+    (independent review on 988de49).
+    """
+    tree = ast.parse(source, filename=filename)
+
+    def is_sha1_argument(call: ast.Call) -> bool:
+        if call.args and isinstance(call.args[0], ast.Constant):
+            if str(call.args[0].value).lower() == "sha1":
+                return True
+        for keyword in call.keywords:
+            if keyword.arg == "name" and isinstance(keyword.value, ast.Constant):
+                if str(keyword.value.value).lower() == "sha1":
+                    return True
+        return False
+
+    hashlib_aliases = {"hashlib"}
+    sha1_call_names = set()
+    new_call_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "hashlib":
+                    hashlib_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "hashlib":
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if alias.name == "sha1":
+                    sha1_call_names.add(bound)
+                elif alias.name == "new":
+                    new_call_names.add(bound)
+
+    forbidden = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            if func.value.id not in hashlib_aliases:
+                continue
+            if func.attr == "sha1":
+                forbidden.append(node.lineno)
+            elif func.attr == "new" and is_sha1_argument(node):
+                forbidden.append(node.lineno)
+        elif isinstance(func, ast.Name):
+            if func.id in sha1_call_names:
+                forbidden.append(node.lineno)
+            elif func.id in new_call_names and is_sha1_argument(node):
+                forbidden.append(node.lineno)
+    return forbidden
+
+
 def test_privileged_release_modules_do_not_compute_sha1_in_process():
     root = Path(__file__).parents[2]
     for relative in (
@@ -142,21 +200,19 @@ def test_privileged_release_modules_do_not_compute_sha1_in_process():
         "ops/aicc_install_transaction.py",
     ):
         source = (root / relative).read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=relative)
-        forbidden = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr == "sha1":
-                forbidden.append(node.lineno)
-            if (
-                node.func.attr == "new"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and str(node.args[0].value).lower() == "sha1"
-            ):
-                forbidden.append(node.lineno)
-        assert forbidden == []
+        assert _sha1_call_lines(source, filename=relative) == []
+
+
+def test_sha1_detection_catches_aliases_and_keyword_new():
+    """Regression pin for the detector itself: the bypasses named in the
+    988de49 review (aliased import, unqualified `from hashlib import sha1`,
+    and `hashlib.new(name="sha1")`) must each be flagged."""
+    assert _sha1_call_lines("import hashlib as hl\nhl.sha1(b'x')\n") == [2]
+    assert _sha1_call_lines("from hashlib import sha1\nsha1(b'x')\n") == [2]
+    assert _sha1_call_lines("from hashlib import sha1 as h\nh(b'x')\n") == [2]
+    assert _sha1_call_lines('import hashlib\nhashlib.new(name="sha1")\n') == [2]
+    assert _sha1_call_lines("from hashlib import new\nnew('sha1')\n") == [2]
+    assert _sha1_call_lines("import hashlib\nhashlib.sha256(b'x')\n") == []
 
 
 def _trusted(module, path: Path, manifest: Path, release_id: str = RELEASE_ID):
@@ -498,6 +554,32 @@ def committed(tmp_path):
     (tree / ".venv").mkdir()
     (tree / ".venv" / "marker").write_text("venv\n")
     return repo, tree, sha
+
+
+def test_git_tree_blobs_recurses_into_nested_directories(tmp_path):
+    """`_git_tree_blobs` must invoke `ls-tree` recursively (`-r`): without
+    it, a commit containing a subdirectory emits top-level `tree` entries,
+    and `GIT_TREE_ENTRY_RE` (which accepts only `blob`/`commit`) fails
+    closed on those with "unparseable Git tree entry" -- blocking release
+    verification/selection for any commit with directories (independent
+    review on 988de49). Exercised against a real, multi-level nested
+    repository rather than the flag alone, so a call-site regression that
+    dropped `-r` while leaving the flag defined elsewhere still fails this."""
+    module = _module()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "--initial-branch=main")
+    (repo / "a" / "b" / "c").mkdir(parents=True)
+    (repo / "a" / "b" / "c" / "leaf.py").write_text("leaf\n")
+    (repo / "a" / "sibling.py").write_text("sibling\n")
+    (repo / "top.py").write_text("top\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "nested")
+    sha = _git(repo, "rev-parse", "HEAD")
+
+    blobs = module._git_tree_blobs(repo, sha)
+
+    assert set(blobs) == {"a/b/c/leaf.py", "a/sibling.py", "top.py"}
 
 
 def test_release_built_from_the_commit_verifies_against_git(committed, tmp_path):

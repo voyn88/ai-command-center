@@ -595,6 +595,21 @@ def test_transaction_host_lock_contends_and_adopts_the_inherited_inode(tmp_path)
 
 
 def test_transaction_host_lock_handoff_is_cross_process_and_same_ofd(tmp_path):
+    """The handoff must be proven, not merely inferred from an inode match:
+    inode equality holds whether the child truly adopted the SAME open file
+    description (`os.dup` of the inherited fd, which shares `flock` state)
+    or instead reopened the path into an independent OFD -- a real inode
+    match either way. A prior version of this test never kept the child
+    alive past the adoption call, so the contention check that followed ran
+    while the PARENT still held its own descriptor; it proved nothing about
+    the child's adopted descriptor at all (independent review on 988de49).
+
+    This version keeps the child alive holding only its adopted (dup'd)
+    descriptor, closes the parent's own descriptor so the lock is held
+    exclusively via the handoff, proves a contender is refused while the
+    child holds it, then proves a fresh acquire succeeds only once the
+    child closes its adopted descriptor.
+    """
     module = _module()
     lock = tmp_path / "state" / "install-recovery.lock"
     lock.parent.mkdir(mode=0o700)
@@ -606,7 +621,12 @@ def test_transaction_host_lock_handoff_is_cross_process_and_same_ofd(tmp_path):
         "m=runpy.run_path(sys.argv[1]); fd=int(sys.argv[3]); "
         "adopt=m['_install_lock_fd'](Path(sys.argv[2]),fd,"
         "trusted_uid=os.geteuid(),trusted_gid=os.getegid()); "
-        "assert os.fstat(adopt).st_ino==os.fstat(fd).st_ino; os.close(adopt)"
+        "assert os.fstat(adopt).st_ino==os.fstat(fd).st_ino; "
+        "os.close(fd); "
+        "sys.stdout.write('ready\\n'); sys.stdout.flush(); "
+        "sys.stdin.readline(); "
+        "os.close(adopt); "
+        "sys.stdout.write('closed\\n'); sys.stdout.flush()"
     )
     contender = (
         "import os,runpy,sys; from pathlib import Path; "
@@ -616,15 +636,28 @@ def test_transaction_host_lock_handoff_is_cross_process_and_same_ofd(tmp_path):
         "\nexcept RuntimeError: raise SystemExit(0)"
         "\nraise SystemExit(9)"
     )
+    acquire = (
+        "import os,runpy,sys; from pathlib import Path; "
+        "m=runpy.run_path(sys.argv[1]); "
+        "fd=m['_install_lock_fd'](Path(sys.argv[2]),"
+        "trusted_uid=os.geteuid(),trusted_gid=os.getegid()); "
+        "os.close(fd)"
+    )
+    child_process = subprocess.Popen(
+        [sys.executable, "-c", child, script, str(lock), str(held)],
+        pass_fds=(held,),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    held_closed = False
     try:
-        adopted = subprocess.run(
-            [sys.executable, "-c", child, script, str(lock), str(held)],
-            pass_fds=(held,),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert adopted.returncode == 0, adopted.stderr
+        ready = child_process.stdout.readline()
+        assert ready == "ready\n"
+        # Only the child's adopted (dup'd) descriptor keeps the lock alive
+        # from here on -- this is the actual cross-process handoff.
+        os.close(held)
+        held_closed = True
         blocked = subprocess.run(
             [sys.executable, "-c", contender, script, str(lock)],
             capture_output=True,
@@ -632,8 +665,26 @@ def test_transaction_host_lock_handoff_is_cross_process_and_same_ofd(tmp_path):
             check=False,
         )
         assert blocked.returncode == 0, blocked.stderr
+
+        child_process.stdin.write("release\n")
+        child_process.stdin.flush()
+        closed = child_process.stdout.readline()
+        assert closed == "closed\n"
+        assert child_process.wait(timeout=5) == 0
+
+        released = subprocess.run(
+            [sys.executable, "-c", acquire, script, str(lock)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert released.returncode == 0, released.stderr
     finally:
-        os.close(held)
+        if child_process.poll() is None:
+            child_process.kill()
+            child_process.wait()
+        if not held_closed:
+            os.close(held)
 
 
 def test_bootstrap_and_transaction_use_one_fixed_host_lock_path():
@@ -839,6 +890,63 @@ def test_boot_recovery_completes_armed_uninstall_from_capsule(
     assert not snapshot.exists()
     assert restored == [(state / "baseline-units.json", True)]
     assert closure_checks == [snapshot, snapshot, snapshot]
+
+
+def test_armed_uninstall_recovery_keeps_wal_while_a_queued_start_is_unconfirmed(
+    monkeypatch, tmp_path
+):
+    """Mirrors FileTransaction.recover(): a successful `--no-block` enqueue
+    of the baseline's units is not proof of restoration, so
+    recover_uninstall(boot=True) must not consume the ARMED uninstall WAL or
+    its snapshot via complete_uninstall() while restore_service_snapshot
+    reports any baseline unit as still unconfirmed (independent review on
+    988de49)."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.install((_spec(module, source, "/etc/aicc-installed"),))
+    current = root / "opt/aicc/current"
+    current.parent.mkdir(parents=True)
+    current.symlink_to(f"releases/{'b' * 40}")
+    lanes = root / "etc/aicc/worker-lanes"
+    lanes.parent.mkdir(parents=True)
+    lanes.write_text("blue\n", encoding="utf-8")
+    lanes.chmod(0o644)
+    (state / "baseline-units.json").write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    snapshot = state / "uninstall-units.json"
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    snapshot.chmod(0o600)
+    module.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=current,
+        lane_registry=lanes,
+    )
+    module.arm_uninstall(state, snapshot)
+    monkeypatch.setattr(
+        module, "verify_service_snapshot_closure", lambda path: None
+    )
+    monkeypatch.setattr(module, "quiesce_service_snapshot", lambda path: None)
+    monkeypatch.setattr(
+        module,
+        "restore_service_snapshot",
+        lambda path, *, defer_starts=False: ("voyn-aicc-worker@blue.service",),
+    )
+
+    module.recover_uninstall(state, root=root, boot=True)
+
+    assert not current.exists()
+    assert (state / "uninstall.json").exists()
+    assert snapshot.exists()
+    assert (state / "baseline-units.json").exists()
 
 
 @pytest.mark.parametrize("boot", [False, True])
@@ -1318,6 +1426,49 @@ def test_failed_boot_service_restore_keeps_journal_for_retry(monkeypatch, tmp_pa
     assert not transaction.pending.exists()
 
 
+def test_boot_recovery_keeps_wal_while_a_queued_start_is_unconfirmed(
+    monkeypatch, tmp_path
+):
+    """A successful `--no-block` enqueue is not proof of restoration: the
+    queued job cannot even run until this early-boot process exits, and it
+    can still fail afterward. recover(boot=True) must not delete the WAL,
+    the service snapshot, or the generation backup while
+    restore_service_snapshot reports any unit as still unconfirmed --
+    otherwise a later failure leaves a previously active service inactive
+    with no recovery evidence left (independent review on 988de49)."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/new"),))
+    transaction.apply()
+    snapshot = state / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        module, "verify_service_snapshot_closure", lambda path: None
+    )
+    monkeypatch.setattr(module, "quiesce_service_snapshot", lambda path: None)
+    monkeypatch.setattr(
+        module,
+        "restore_service_snapshot",
+        lambda path, *, defer_starts=False: ("voyn-aicc-worker@blue.service",),
+    )
+
+    transaction.recover(boot=True)
+
+    # The file generation itself was already rolled back before the deferred
+    # service restore ran -- only the WAL, snapshot and backup that would let
+    # a retry finish confirming service state must survive.
+    assert not (root / "etc/new").exists()
+    assert transaction.pending.exists()
+    assert snapshot.exists()
+    assert list(state.glob("generation-*"))
+
+
 def test_compare_and_restore_refuses_changed_generation_target(tmp_path):
     module = _module()
     root = tmp_path / "root"
@@ -1433,7 +1584,7 @@ def test_boot_restore_queues_active_worker_without_dependency_deadlock(tmp_path)
             return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+    deferred = module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
 
     assert [
         "/usr/bin/systemctl",
@@ -1446,6 +1597,12 @@ def test_boot_restore_queues_active_worker_without_dependency_deadlock(tmp_path)
         "start",
         "voyn-aicc-worker@blue.service",
     ] not in calls
+    # A queued `--no-block start` is not proof of restoration -- the job
+    # cannot even run until this process exits, and it can still fail
+    # afterward. The unit must come back as unconfirmed so a caller does not
+    # discard recovery evidence based on the enqueue alone (independent
+    # review on 988de49).
+    assert deferred == ("voyn-aicc-worker@blue.service",)
 
 
 def test_boot_restore_never_synchronously_stops_its_own_recovery_service(

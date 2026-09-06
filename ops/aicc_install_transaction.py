@@ -660,12 +660,22 @@ def _matches(state: FileState, sha256: str, mode: int, uid: int, gid: int) -> bo
 
 def restore_service_snapshot(
     path: Path, *, run=subprocess.run, defer_starts: bool = False
-) -> None:
-    """Restore the pre-attempt unit state after file generation recovery."""
+) -> tuple[str, ...]:
+    """Restore the pre-attempt unit state after file generation recovery.
+
+    Returns the units whose start was only enqueued with ``--no-block``, not
+    confirmed. A caller queuing starts (``defer_starts=True``, the early-boot
+    path that cannot synchronously wait without deadlocking on its own
+    dependents) must not treat that enqueue as proof of restoration and must
+    not discard WAL/snapshot evidence while any unit here is unconfirmed
+    (independent review on 988de49): the queued job cannot even run until
+    this call's process exits, and it can still fail afterward.
+    """
+    deferred: list[str] = []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return
+        return ()
     units = payload.get("units")
     version = payload.get("version")
     if version not in {2, 3} or not isinstance(units, dict):
@@ -808,9 +818,11 @@ def restore_service_snapshot(
         if not self_recovery:
             if queued_start:
                 systemctl("--no-block", "start", unit)
+                deferred.append(unit)
             else:
                 systemctl("start" if state["active"] else "stop", unit)
         assert_restored(unit, state, queued_start=queued_start)
+    return tuple(deferred)
 
 
 def quiesce_service_snapshot(path: Path, *, run=subprocess.run) -> None:
@@ -1499,9 +1511,19 @@ class FileTransaction:
         self._restore_release_selector()
         if snapshot_present:
             if boot:
-                restore_service_snapshot(snapshot, defer_starts=True)
+                deferred = restore_service_snapshot(snapshot, defer_starts=True)
             else:
-                restore_service_snapshot(snapshot)
+                deferred = restore_service_snapshot(snapshot)
+            if deferred:
+                # A queued `--no-block start` is not proof of restoration: it
+                # cannot even run until this early-boot process exits, and it
+                # can still fail afterward. Keep the WAL, snapshot and
+                # generation backup so the next recover() pass -- another
+                # boot, or the installer's own synchronous, non-deferred
+                # `run_transaction recover` -- proves and finalizes recovery
+                # instead of committing an unconfirmed state (independent
+                # review on 988de49).
+                return
             verify_service_snapshot_closure(snapshot)
         self._clear_pending(manifest)
         if snapshot_present:
@@ -1707,11 +1729,19 @@ def recover_uninstall(
         raise TypeError("uninstall baseline selector is invalid")
     transaction.select_uninstall_baseline(baseline)
     if boot:
-        restore_service_snapshot(
+        deferred = restore_service_snapshot(
             state_dir / "baseline-units.json", defer_starts=True
         )
     else:
-        restore_service_snapshot(state_dir / "baseline-units.json")
+        deferred = restore_service_snapshot(state_dir / "baseline-units.json")
+    if deferred:
+        # Mirrors FileTransaction.recover(): a queued `--no-block start` is
+        # not proof of restoration, so the ARMED uninstall WAL and its
+        # snapshot must survive to prove and finalize on the next recovery
+        # pass rather than being consumed by complete_uninstall() while the
+        # baseline's units are still unconfirmed (independent review on
+        # 988de49).
+        return
     verify_service_snapshot_closure(snapshot)
     complete_uninstall(state_dir, snapshot)
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import stat
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,8 +41,10 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _trusted_repo(module, tmp_path: Path) -> tuple[Path, str, dict[str, str]]:
-    repo = tmp_path / "repo"
+def _trusted_repo(
+    module, tmp_path: Path, *, repo_dir: Path | None = None
+) -> tuple[Path, str, dict[str, str]]:
+    repo = repo_dir if repo_dir is not None else tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "--initial-branch=main")
     for relative in module.REQUIRED_ENTRYPOINTS:
@@ -338,12 +342,70 @@ def test_real_install_lock_refuses_closed_or_negative_inherited_fd(tmp_path):
 
 
 def test_unfinished_uninstall_blocks_before_authority_mutation(monkeypatch, tmp_path):
+    """Calling `_refuse_unfinished_uninstall` in isolation proves nothing
+    about the real `install` workflow in `main()`, where it must run before
+    `_prepare_authority_file` ever touches host state. A `mutated = []` that
+    nothing could append to passed even if `main()` reordered the two calls,
+    or dropped the guard entirely, since it never drove `main()`'s own
+    install path at all (independent review on 988de49).
+    """
     module = _module()
+    sha = "a" * 40
     journal = tmp_path / "uninstall.json"
     journal.write_text("{}", encoding="utf-8")
-    mutated = []
+    monkeypatch.setattr(module, "UNINSTALL_JOURNAL", journal)
+    # `_refuse_unfinished_uninstall`'s `path` default is bound to
+    # `UNINSTALL_JOURNAL` at import time, so patching the module attribute
+    # above does not reach the zero-argument call `main()` makes. Rebind it
+    # through the real function so the actual guard logic still runs, just
+    # against this test's journal instead of the real host path.
+    real_refuse = module._refuse_unfinished_uninstall
+    monkeypatch.setattr(
+        module, "_refuse_unfinished_uninstall", lambda: real_refuse(journal)
+    )
+    repo = tmp_path / "attempt" / "repo"
+    repo.mkdir(parents=True)
+    attestation = module.TreeAttestation(
+        expected_sha=sha,
+        remote_main_sha=sha,
+        tree_manifest_sha256="b" * 64,
+        file_count=1,
+        repository=module.TRUSTED_REMOTE,
+        attempt_id="attempt-test",
+    )
+    mutated: list[Path] = []
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(module.os, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module, "_install_lock_fd", lambda *a, **k: os.open("/dev/null", os.O_RDONLY)
+    )
+    (tmp_path / "attempts").mkdir(mode=0o700, exist_ok=True)
+    monkeypatch.setattr(module, "_require_private_root_directory", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_fetch_exact_checkout", lambda *a, **k: repo)
+    monkeypatch.setattr(module, "_verify_checkout", lambda *a, **k: attestation)
+    monkeypatch.setattr(module, "_atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module, "_prepare_authority_file", lambda path: mutated.append(path)
+    )
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda *a, **k: pytest.fail(
+            "installer must not run while an uninstall journal is unfinished"
+        ),
+    )
+
     with pytest.raises(module.BootstrapRefused, match="unfinished uninstall"):
-        module._refuse_unfinished_uninstall(journal)
+        module.main(
+            [
+                "install",
+                "--expected-sha",
+                sha,
+                "--state-root",
+                str(tmp_path),
+            ],
+            install_lock_path=tmp_path / "install-recovery.lock",
+        )
     assert mutated == []
 
 
@@ -384,19 +446,47 @@ def test_environment_git_config_injection_is_ignored(tmp_path, monkeypatch):
     assert _verify(module, repo, env, sha).expected_sha == sha
 
 
-def test_checkout_replaced_after_attestation_is_detected(tmp_path):
-    """Attestation-then-use is a TOCTOU window: the installer re-verifies the
-    checkout against the recorded attestation instead of trusting the file."""
+def test_checkout_replaced_after_attestation_is_detected(monkeypatch, tmp_path):
+    """Attestation-then-use is a TOCTOU window.
+
+    Driven through `_verify_existing_attestation` -- the function `main()`'s
+    `--verify-attestation` path calls, which is the installer script's very
+    first action against the checkout it is about to execute as root -- so a
+    regression that stopped re-verifying the checkout there and started
+    trusting the recorded JSON blindly fails this test. A test that only
+    calls `_verify_checkout` twice, as this one previously did, passes even
+    under that regression: it never drives the attestation-consuming call
+    site at all (independent review on 988de49).
+    """
     module = _module()
-    repo, sha, env = _trusted_repo(module, tmp_path)
+    monkeypatch.setattr(
+        module, "_require_private_root_directory", lambda *a, **k: None
+    )
+    attempt = tmp_path / "attempt"
+    attempt.mkdir(mode=0o700)
+    repo, sha, env = _trusted_repo(module, attempt, repo_dir=attempt / "repo")
+    uid, gid = os.getuid(), os.getgid()
+
     attestation = _verify(module, repo, env, sha)
+    attestation_path = attempt / "attestation.json"
+    attestation_path.write_text(
+        json.dumps(asdict(attestation), sort_keys=True) + "\n", encoding="utf-8"
+    )
+    attestation_path.chmod(0o600)
+
+    # The attestation is genuinely consumable before the checkout is touched.
+    module._verify_existing_attestation(
+        attestation_path, repo, sha, trusted_uid=uid, trusted_gid=gid
+    )
 
     implanted = repo / module.REQUIRED_ENTRYPOINTS[0]
     implanted.chmod(0o755)
     implanted.write_text("trusted:implanted\n", encoding="utf-8")
 
     with pytest.raises(module.BootstrapRefused):
-        _verify(module, repo, env, sha)
+        module._verify_existing_attestation(
+            attestation_path, repo, sha, trusted_uid=uid, trusted_gid=gid
+        )
     assert attestation.expected_sha == sha
 
 
