@@ -620,7 +620,11 @@ def list_runs(
             clauses.append(f"state IN ({placeholders})")
             params.extend(states_list)
         else:
-            clauses.append("0")
+            # A bare `0` is a SQLite-ism: SQLite accepts any non-zero
+            # expression in a `WHERE` as "true", but PostgreSQL requires the
+            # expression to actually be boolean-typed and raises on `WHERE
+            # 0`. `1 = 0` evaluates to `false` in both dialects.
+            clauses.append("1 = 0")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     limit_clause = " LIMIT ?" if limit is not None else ""
     if limit is not None:
@@ -653,7 +657,9 @@ def count_runs(
             clauses.append(f"state IN ({placeholders})")
             params.extend(states_list)
         else:
-            clauses.append("0")
+            # See the matching comment in `list_runs`: PostgreSQL rejects a
+            # bare `0` as a `WHERE` expression, unlike SQLite.
+            clauses.append("1 = 0")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.connect(db_path) as conn:
         (n,) = conn.execute(f"SELECT COUNT(*) FROM run {where}", params).fetchone()
