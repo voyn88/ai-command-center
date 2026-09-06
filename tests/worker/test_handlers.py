@@ -470,6 +470,18 @@ def test_claude_session_limit_opens_the_window_and_marks_the_reason(
     state = agent_runner.claude_window_state()
     assert state is not None
     assert state["reset_at"] == "2026-08-21T16:10:00+00:00"
+
+    # `claude_window_preflight` compares the recorded reset time against
+    # `datetime.now(UTC)`, so asserting "still exhausted" must not depend on
+    # the real wall clock still being before the fixed 2026-08-21 reset time
+    # this test hardcodes -- freeze "now" to a moment inside the window
+    # instead of relying on the suite happening to run before the reset.
+    class _FrozenBeforeReset(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 21, 16, 9, 30, tzinfo=UTC)
+
+    monkeypatch.setattr(agent_runner, "datetime", _FrozenBeforeReset)
     available, _ = agent_runner.claude_window_preflight()
     assert available is False
 
@@ -488,6 +500,13 @@ def test_claude_window_preflight_skips_to_fallback_without_spending_attempt(
         agent_runner,
         "claude_window_preflight",
         lambda: (False, "Claude usage window exhausted until 2026-08-21T21:09:00+00:00"),
+    )
+    # The fallback link is codex/implementation (a MUTATING task type), whose
+    # preflight is the real `codex_workspace_write_preflight` sandbox probe --
+    # fake it available so this test exercises the cascade-skip decision, not
+    # whether a codex CLI/bwrap sandbox happens to be present on this host.
+    monkeypatch.setattr(
+        agent_runner, "_codex_workspace_write_preflight_result", (True, "")
     )
     outcome = run_agent(payload, _event(), 1)
     assert outcome.ok
