@@ -453,6 +453,22 @@ def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
     return match.group(1), match.group(2), match.group(3)
 
 
+def _clear_pr_evidence(factory: Any, task_id: str, pr_url: str, reason: str) -> str:
+    """Remove a 'pr' evidence row this tick has already proven can never
+    resolve (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE) -- e.g. not even
+    shaped like a GitHub PR URL. `backlog_clear_evidence` is idempotent (a
+    row another tick already cleared is `already_absent`, not an error) and,
+    if this was the task's last 'pr' row, sends a READY_TO_REVIEW task back
+    for a fresh attempt itself; the returned verdict reason is folded into
+    the caller's own skip line rather than re-derived here."""
+    rows = _rows(
+        factory,
+        "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+        (task_id, pr_url, reason),
+    )
+    return rows[0][0] if rows else "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class _PRSnapshot:
     text: str
@@ -1073,7 +1089,17 @@ def review_once(
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
         repo = _repo_from_pr_url(pr_url)
-        route = repo_route(repo) if repo else None
+        if repo is None:
+            # Not even shaped like a GitHub PR URL -- can never resolve
+            # through any gh call below, so there is nothing to retry
+            # (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE). A shape-valid
+            # URL whose repo simply has no route table entry is left alone
+            # below: that is an operator fact (add the route), not bogus
+            # evidence.
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
+        route = repo_route(repo)
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
@@ -1883,6 +1909,14 @@ def publish_review_verdicts(
             break
         prev_processed = last_processed
         last_processed = (task_id, pr_url)
+        if _repo_from_pr_url(pr_url) is None:
+            # Same shape gate as review_once -- a malformed pr_url would
+            # otherwise fail `gh pr view` and read as an ordinary
+            # `pr_view_failed`, retried forever alongside genuine transient
+            # lookup failures (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE).
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
         already, current_head = _has_accept_marker(repo_path, pr_url)
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
@@ -2280,6 +2314,13 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         if actions >= cfg.max_per_tick:
             break
         last_processed = (task_id, pr_url)
+        if _repo_from_pr_url(pr_url) is None:
+            # Same shape gate as review_once/publish_review_verdicts -- a
+            # malformed pr_url fails every `gh pr view` below identically
+            # forever otherwise (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE).
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
         # Readiness FIRST: only a PR that already carries an independent ACCEPT
         # marker on its head with green required checks is the merge tick's
         # business. An un-accepted or failing PR is reviewed by the review tick

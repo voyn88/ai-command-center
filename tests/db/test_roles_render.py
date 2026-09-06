@@ -236,6 +236,10 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE (0017): park a
+        # sustained-unroutable task and clear proven-unresolvable evidence.
+        "backlog_park_unroutable",
+        "backlog_clear_evidence",
     }
 
 
