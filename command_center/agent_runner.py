@@ -83,6 +83,19 @@ Security model:
   orphan-child reason, rather than only the CLI's own PID as the previous
   `subprocess.run(timeout=...)` form did). "Cancelled" is a valid
   `RUN_STATUSES` value, returned only via this path.
+
+- Cancellation (setsid escape, VOYN-W0-AICC-SETSID-ORPHAN): `os.killpg` only
+  reaches processes that still share the launch-time pgid. A descendant that
+  calls `os.setsid()` on itself — the same call this module uses to make the
+  CLI a process-group leader in the first place, and something a sandbox
+  wrapper started deeper in the tree (by the CLI or one of its tools) can do
+  internally for its own isolation — leaves that pgid and survives the
+  group-wide SIGTERM/SIGKILL untouched, orphaned exactly like the
+  unaccounted-for mutation this whole mechanism exists to prevent, just one
+  level deeper. `_terminate_process_group` closes this by pairing each
+  `os.killpg` call with `_signal_descendants_outside_group`, which walks the
+  live process tree by *ppid* (unaffected by session/pgid changes, unlike
+  pgid) and signals directly any descendant `killpg` could not have reached.
 """
 
 from __future__ import annotations
@@ -1250,6 +1263,89 @@ def _popen_new_process_group_kwargs() -> dict:
     }  # POSIX: equivalent to a preexec_fn calling os.setsid()
 
 
+def _live_process_tree(root_pid: int) -> list[tuple[int, int]] | None:
+    """Return `(pid, pgid)` for every live descendant of `root_pid`, at any
+    depth, found by walking `ps`'s *ppid* column — not by process-group
+    membership.
+
+    A descendant's ppid does not change when it calls `os.setsid()` (only its
+    pgid/sid do), so this still finds a descendant that has escaped
+    `os.killpg`'s pgid-scoped reach by starting its own session — e.g. a
+    sandbox wrapper the CLI or one of its tools spawns that calls `setsid()`
+    internally, which is otherwise indistinguishable from any other
+    grandchild until the moment `os.killpg` fails to reach it. Returns `None`
+    if the process table could not be inspected; `_terminate_process_group`
+    already made a best-effort `killpg` call before this runs, so a lookup
+    failure here means this sweep comes up empty, not that termination itself
+    was skipped.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,state="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode != 0:
+            return None
+    except _OS_SUBPROCESS_ERRORS:
+        return None
+    children: dict[int, list[tuple[int, int, str]]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) != 4:
+            continue
+        try:
+            pid, ppid, pgid = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append((pid, pgid, parts[3]))
+    descendants: list[tuple[int, int]] = []
+    frontier = [root_pid]
+    while frontier:
+        parent = frontier.pop()
+        for pid, pgid, state in children.get(parent, []):
+            if not state.startswith("Z"):
+                descendants.append((pid, pgid))
+            frontier.append(pid)
+    return descendants
+
+
+def _signal_descendants_outside_group(
+    descendants: list[tuple[int, int]] | None,
+    group_pgid: int,
+    sig: signal.Signals,
+) -> None:
+    """Directly signal every `(pid, pgid)` in a *pre-captured* descendant
+    snapshot whose pgid is not `group_pgid` — i.e. every process `os.killpg`
+    could not have reached.
+
+    The snapshot must be taken by the caller *before* `os.killpg` runs, not
+    after: the group leader typically dies within microseconds of receiving
+    SIGTERM (nothing in this codebase installs a handler for it), and the
+    kernel reparents the leader's children to the nearest subreaper the
+    instant it exits. Walking the tree by ppid *after* sending the signal
+    would, in that common case, find the leader already gone and its
+    children already reparented away from it — silently returning an empty
+    tree and masking exactly the escape this defends against. `descendants`
+    is `None` when the process table could not be inspected; a no-op is the
+    correct response, matching `_live_process_tree`'s own fail-open
+    contract. Best-effort and run *in addition to* `os.killpg`, never instead
+    of it: a race that loses a PID to reuse between the snapshot and the
+    signal is far less costly than leaving a live, escaped descendant
+    unsignaled."""
+    if not descendants:
+        return
+    for pid, pgid in descendants:
+        if pgid == group_pgid:
+            continue  # already reached by the os.killpg call above
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
 def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) -> None:
     """Escalating termination of `proc`'s entire process group: SIGTERM (POSIX)
     / CTRL_BREAK_EVENT (Windows), wait up to `grace_seconds`, then SIGKILL
@@ -1259,6 +1355,12 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
     kwargs` and the module docstring: a plain `proc.kill()` would leave any
     child the CLI spawned (tool subprocesses, MCP servers) running and
     unaccounted for, which is the exact defect class this change closes.
+    `os.killpg` alone is scoped to the launch-time pgid, which does not
+    follow a descendant that calls `os.setsid()` on itself — e.g. a sandbox
+    wrapper started deeper in the tree — so each POSIX signal below is
+    followed by `_signal_descendants_outside_group`, which walks the live
+    process tree by ppid (unaffected by session/pgid changes) and signals
+    directly any descendant `killpg` could not have reached.
     Never raises: a process that already exited (race between our poll and
     its own completion) is treated as success, not an error.
     """
@@ -1270,12 +1372,18 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
         except _OS_VALUE_ERRORS:
             pass
     else:
+        # `_popen_new_process_group_kwargs` starts `proc` with
+        # `start_new_session=True`, so `proc.pid` is its own pgid by
+        # construction — no `os.getpgid` round trip needed to know the
+        # group `os.killpg` below is about to target.
+        descendants = _live_process_tree(proc.pid)
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
             return  # already gone
         except OSError:
             pass
+        _signal_descendants_outside_group(descendants, proc.pid, signal.SIGTERM)
     try:
         proc.wait(timeout=grace_seconds)
         return
@@ -1288,12 +1396,14 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
         except OSError:
             pass
     else:
+        descendants = _live_process_tree(proc.pid)
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             return  # already gone
         except OSError:
             pass
+        _signal_descendants_outside_group(descendants, proc.pid, signal.SIGKILL)
     try:
         proc.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
