@@ -444,6 +444,32 @@ def test_lease_refusal_does_not_push(repo, monkeypatch):
     assert "backlog" not in out  # never pushed
 
 
+def test_lease_refusal_names_the_holder_from_stdout_when_stderr_is_empty(
+    repo, monkeypatch
+):
+    """Live 2026-09-06 (wki_55f316db): a guarded publish lost the writer-lease
+    race and the refusal reached the caller with an EMPTY detail --
+    `voyn-lease acquire` had written the holder onto stdout, not stderr, for
+    this refusal shape, and the reason string only ever read `stderr`.
+    `writer_lease._acquire_and_provision_hooks` already falls back to stdout
+    for exactly this; `publish_run` must do the same so a lease refusal
+    always names the holder when the tool reports one."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "c.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "w")
+    (bin_ / "voyn-lease").write_text(
+        f'#!/bin/sh\necho "lease $*" >> {calls}\n'
+        'echo "held by server-worker-b pid 4242" ; exit 3\n'
+    )
+    (bin_ / "voyn-lease").chmod(0o755)
+
+    r = publish_run(work, _cfg(bin_))
+    assert not r.ok and r.reason.startswith("lease_unavailable")
+    assert "held by server-worker-b pid 4242" in r.reason
+
+
 def test_stale_hook_identity_fails_closed_without_pushing(repo, monkeypatch):
     """VOYN-W0-AICC-LEASE-VERIFY-MISMATCH-BLOCKS-ALL-PUBLISH, live-reproduced
     2026-08-21: `install-hooks` is what re-provisions the pre-push hook's

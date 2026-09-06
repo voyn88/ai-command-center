@@ -1120,10 +1120,23 @@ def _run_agent(
                 # ok=True here used to make the queue mark `pr_create_failed`
                 # as succeeded even though no PR existed, permanently
                 # disconnecting a pushed branch from review.
+                #
+                # `lease_unavailable` names no fault in this run's own work --
+                # another writer's lane won the race for this repository's
+                # single writer-lease row (live 2026-09-06, wki_55f316db:
+                # sibling publishes succeeded 04:57-04:58Z while this one lost
+                # the race). Routing it through the ordinary retryable path
+                # spent this item's `max_attempts` on contention it had no
+                # part in causing, dead-lettering already-finished work.
+                # `lease_wait=True` instead refunds the attempt and bounds
+                # retries against a separate lease-wait budget (see
+                # `queue_fail_lease_wait`,
+                # VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT).
                 return HandlerOutcome(
                     ok=False,
                     reason=f"publish failed: {pub.reason}",
                     retryable=True,
+                    lease_wait=pub.reason.startswith("lease_unavailable"),
                     result=result,
                 )
         elif isolated_workspace is not None:

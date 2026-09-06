@@ -1017,9 +1017,9 @@ def test_completion_without_a_result_is_refused_by_the_signature_itself(
             "WHERE n.nspname = 'public' AND p.proname LIKE 'queue\\_%%' "
             "AND p.proname NOT IN "
             "('queue_enqueue','queue_claim','queue_heartbeat','queue_complete',"
-            "'queue_fail','queue_reap','queue_redrive')"
+            "'queue_fail','queue_fail_lease_wait','queue_reap','queue_redrive')"
         )
-        assert cur.fetchone()[0] == 0, "an eighth queue entry point appeared"
+        assert cur.fetchone()[0] == 0, "a ninth queue entry point appeared"
 
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         token, token_hash = _token()
