@@ -28,6 +28,21 @@ functional application milestones of `app.py`.
   are cross-host claims (SIGKILL failover consistency, network-partition
   arbitration) a single host cannot honestly exercise, tracked as follow-up
   requiring a second real host.
+- `tests/ops/crosshost/`: the cross-host follow-up. Proves property 12
+  (SIGKILL failover consistency) against a real second host over SSH and a
+  Postgres database both hosts reach: a negative control (a claim alive
+  inside its visibility window excludes a second host), then the positive
+  case (`SIGKILL` the remote holder, `queue_reap()` from the local host,
+  confirm exactly one host reclaims the item and the killed host's stale
+  claim token cannot retroactively complete it). Self-skips unless
+  `AICC_CROSSHOST_SSH_TARGET` has a live `systemd --user` session and
+  `AICC_CROSSHOST_PG_ADMIN_DSN` is set. Property 13 (network-partition
+  arbitration) stays unproven: `IPAddressDeny=` on a `--user` unit is a
+  measured no-op without root, and unprivileged network namespaces are
+  blocked here by `kernel.apparmor_restrict_unprivileged_userns=1` — the
+  test is written and gated behind a live capability probe so it
+  self-activates the moment either constraint lifts, but is not itself
+  implemented yet. 12 of 13 runtime-platform properties now proven.
 
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract

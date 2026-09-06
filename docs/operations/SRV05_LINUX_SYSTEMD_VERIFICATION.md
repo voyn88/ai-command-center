@@ -5,8 +5,8 @@
 `voyn-aicc-worker@.service`). This records which of the runtime guarantees that
 deployment leans on are mechanically proven against a real kernel and a real
 systemd — not asserted in a comment, not asserted in a design doc — and which
-two are not, because they need a second host this repo's test suite cannot
-assume it has.
+one is not, because it needs root or a hardening exception on a host this
+repo's test suite cannot assume it has.
 
 The proof lives in
 [`tests/ops/test_worker_systemd_runtime_platform.py`](../../tests/ops/test_worker_systemd_runtime_platform.py):
@@ -19,7 +19,7 @@ The suite self-skips (`skip_without_live_systemd`) unless
 it, so it stays inert on a CI runner or container without a reachable
 `systemd --user` session instead of failing there.
 
-## Proven (11 of 13)
+## Proven (12 of 13)
 
 | # | Property | What the test proves |
 |---|----------|------------------------|
@@ -34,35 +34,57 @@ it, so it stays inert on a CI runner or container without a reachable
 | 9 | journald trusted fields | `_UID`, `_SYSTEMD_UNIT`, `_SYSTEMD_INVOCATION_ID` etc. come from the kernel/systemd side of the journal socket, not from parsing the message body — a message that merely *contains* the text `_UID=0` does not forge the trusted `_UID` field. |
 | 10 | `StateDirectory` + `StateDirectoryMode` | The mode `aicc-worker.service` actually declares (`StateDirectoryMode=0700`, read from the unit file rather than hardcoded in the test) is the mode that lands on the created directory — the platform default is `0755`, so this is not a no-op assertion. |
 | 11 | `Type=notify` + `WatchdogSec` | A handler that sends `READY=1` once and then stops pinging the watchdog is aborted (`SIGABRT`) once `WatchdogSec` elapses, and systemd reports `Result=watchdog`. This is the exact failure mode the worker's heartbeat thread (`command_center/worker/daemon.py`) exists to avoid triggering. |
+| 12 | Cross-host failover consistency | A worker `SIGKILL`ed on a real second host over SSH has its claimed queue item picked up by *exactly one* other real host, against a shared Postgres database both hosts reach — not simulated, not mocked. The negative control comes first: while the remote holder is alive and inside its visibility window, a second host claiming the same queue gets `no_work`. Then: `SIGKILL` the remote holder, let the visibility window lapse, `queue_reap()` from the local host, and confirm the local host — and only the local host — reclaims the item; the killed host's original claim token cannot retroactively complete it (`attempt_expired`), because it's the queue's bookkeeping that's authoritative, not either host's memory of what it once held. See [`tests/ops/crosshost/test_queue_claim_crosshost.py`](../../tests/ops/crosshost/test_queue_claim_crosshost.py). |
 
-Run it directly on a host with a real `systemd --user` session:
+Run the single-host suite directly on a host with a real `systemd --user` session:
 
 ```
 pytest tests/ops/test_worker_systemd_runtime_platform.py -v
 ```
 
-## Not proven here (2 of 13): the multi-host negative controls
+Run the cross-host suite (property 12) with a second real host and a shared
+Postgres reachable from both:
 
-Two guarantees the deployed system depends on are cross-host claims by
-construction, and a single machine — this test host included — cannot
-exercise them honestly:
+```
+AICC_CROSSHOST_SSH_TARGET=voyn-worker-01 \
+AICC_CROSSHOST_PG_ADMIN_DSN=postgresql://... \
+pytest tests/ops/crosshost/ -v
+```
 
-1. **Cross-host failover consistency.** A worker `SIGKILL`ed on one host must
-   have its claimed item picked up by *exactly one* other host, and any
-   worktree/lease state it orphaned must be reclaimed only by the host that
-   actually owns it — not raced, not duplicated. Proving this needs two real
-   hosts sharing the same queue (the way `voyn-worker-01` and
-   `voyn-control-01` are meant to pair), each independently observing the
-   `SIGKILL`ed peer and racing to reclaim.
-2. **Network-partition arbitration.** When a worker is cut off from the
-   queue, the queue's lease-expiry decision — not the partitioned worker's
-   local judgment — must be what determines whether its claim is still valid,
-   and the partitioned worker must not publish a result after that. Proving
-   this needs an actual induced network partition between two hosts, not a
-   simulated one on a single box (a single-process simulation can't
-   distinguish "the network is asymmetric" from "the test author assumed it
-   is").
+It self-skips (`remote_host` fixture) unless
+`ssh $AICC_CROSSHOST_SSH_TARGET systemd-run --user --wait -- /bin/true`
+actually succeeds and `AICC_CROSSHOST_PG_ADMIN_DSN` is set — the same
+non-mockable bar the single-host suite sets for its own host.
 
-Both are tracked as follow-up work requiring a second real host in the loop;
-this slice deliberately scopes to what one host can prove honestly rather
-than mocking the other host and calling it proven.
+## Not proven here (1 of 13): network-partition arbitration
+
+When a worker is cut off from the queue, the queue's lease-expiry decision —
+not the partitioned worker's local judgment — must be what determines
+whether its claim is still valid, and the partitioned worker must not
+publish a result after that. `tests/db/test_queue_claim.py`'s
+`test_a_partitioned_owner_is_alive_and_still_refused` already proves the
+queue-side half of this (a still-running, still-communicating owner is
+refused once its lease lapses) on one host. What's missing is the other
+half: an owner with real, total network connectivity loss while the rest of
+its host — and the test process observing it — keeps working, which needs a
+second host and a genuine partition, not a paused or idle process standing
+in for one.
+
+Two real constraints block that here, both confirmed by direct measurement
+rather than assumed:
+
+- `IPAddressDeny=` on a `systemd --user` unit is a silent no-op without root
+  (`systemctl --user` reports "unit configures an IP firewall, but not
+  running as root" and traffic is unaffected).
+- Unprivileged network namespaces (`unshare --net --user`) are blocked by
+  `kernel.apparmor_restrict_unprivileged_userns=1` on both hosts this repo
+  has access to.
+
+`tests/ops/crosshost/test_queue_claim_crosshost.py` carries the test for
+this (`test_network_partition_cannot_out_argue_the_queues_lease_expiry`)
+gated behind a live capability probe
+(`skip_without_root_network_isolation`) rather than a hardcoded skip, so it
+self-activates — and must then actually be implemented against the isolation
+primitive — the moment either constraint lifts on a host with the SSH
+partner this suite needs. Tracked as follow-up requiring root or a hardening
+exception on both hosts.
