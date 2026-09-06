@@ -8,6 +8,21 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a raising report write killed the whole daemon over one attempt (`VOYN-W0-AICC-SRV-05-C-RETRY`)
+
+`WorkerDaemon._execute` called `store.complete()`/`store.fail()` with no
+exception handling. A handler can successfully decide an outcome — what it
+admits — and still have persisting it raise (a dropped DB connection, a
+driver that can't encode the result); uncaught, that propagated out of
+`run_forever`'s loop and crashed the whole daemon over the one attempt it was
+reporting, taking every other queued item down with it. Mirrors the
+non-object-payload crash this module already closed once.
+
+- `command_center/worker/daemon.py` — the report write is now wrapped; on a
+  raise, the attempt's lease is left to lapse on its own (visibility expiry,
+  then the reaper) and a later delivery retries, exactly like the
+  stale-owner-refusal path beside it.
+
 ### Fixed — the worker admitted review-verification runs it could not execute under isolation (`VOYN-W0-AICC-SRV-05-C`)
 
 `ProtectSystem=strict` + `ReadWritePaths=/srv/aicc-workspaces` already closed the
