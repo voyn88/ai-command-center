@@ -22,7 +22,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1367,6 +1367,109 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invit
 """
 
 
+# Skill Acquisition (VOYN-W0-AICC-SKILL-ACQUISITION): the persistence tier
+# behind autonomous capability acquisition, modelled on the Wave-3 Marketplace
+# family (`skill_item`/`skill_acquisition_log` mirror `market_item`/
+# `market_install_log`) with a source allowlist and effect-measurement family
+# added. Four additive tables, wholly separate from every family above; see
+# `runtime.db.skills` module docstring for the full design rationale.
+#
+#   skill_source          -- the allowlist a candidate must resolve through.
+#                             `proposed -> approved -> revoked`
+#                             (`skills.SKILL_SOURCE_TRANSITIONS`); `origin` is
+#                             UNIQUE so the same origin cannot be proposed
+#                             twice under different ids.
+#   skill_item            -- one mutable current-state row per skill, guarded
+#                             by `lock_version` compare-and-set and an explicit
+#                             status allowlist (`skills.SKILL_ITEM_TRANSITIONS`,
+#                             `candidate -> acquired|rejected`,
+#                             `acquired -> revoked`). `version`+`content_hash`
+#                             are NOT NULL at the column level; the repository
+#                             additionally refuses an empty version or a
+#                             non-sha256-shaped hash before the INSERT ever
+#                             runs (the pinning invariant).
+#   skill_acquisition_log -- append-only audit trail: one immutable row per
+#                             lifecycle action (`acquire`/`reject`/`revoke`)
+#                             recording who, when, what version+hash, and (for
+#                             `acquire`) which isolated `executor` materialised
+#                             it.
+#   skill_outcome         -- append-only per-task evidence, tagged
+#                             `baseline`/`with_skill`, behind the
+#                             cost-per-accepted-change and first-pass-
+#                             acceptance-rate comparison the service tier
+#                             computes to decide whether a skill earned its
+#                             place in the registry.
+_SCHEMA_V26 = """
+CREATE TABLE IF NOT EXISTS skill_source (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    origin TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    proposed_by TEXT NOT NULL,
+    approved_by TEXT NOT NULL DEFAULT '',
+    lock_version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_source_kind ON skill_source(kind);
+CREATE INDEX IF NOT EXISTS idx_skill_source_status ON skill_source(status);
+
+CREATE TABLE IF NOT EXISTS skill_item (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    version TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    source_id TEXT NOT NULL REFERENCES skill_source(id),
+    provenance TEXT NOT NULL DEFAULT '',
+    task_class TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'candidate',
+    selection_rationale_json TEXT NOT NULL DEFAULT '{}',
+    lock_version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_item_kind ON skill_item(kind);
+CREATE INDEX IF NOT EXISTS idx_skill_item_status ON skill_item(status);
+CREATE INDEX IF NOT EXISTS idx_skill_item_task_class ON skill_item(task_class);
+CREATE INDEX IF NOT EXISTS idx_skill_item_source ON skill_item(source_id);
+
+CREATE TABLE IF NOT EXISTS skill_acquisition_log (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL REFERENCES skill_item(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    executor TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(skill_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_acquisition_log_skill ON skill_acquisition_log(skill_id);
+
+CREATE TABLE IF NOT EXISTS skill_outcome (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL REFERENCES skill_item(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    cost REAL NOT NULL,
+    accepted INTEGER NOT NULL DEFAULT 0,
+    first_pass INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_outcome_skill ON skill_outcome(skill_id);
+CREATE INDEX IF NOT EXISTS idx_skill_outcome_phase ON skill_outcome(skill_id, phase);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -1401,4 +1504,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
     (25, _migration_25_add_finalization_claim),
+    (26, _SCHEMA_V26),
 ]

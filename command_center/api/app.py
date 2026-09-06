@@ -44,6 +44,7 @@ from command_center.api import (
     networking_routes,
     schemas,
     service,
+    skills_routes,
     wave1_routes,
 )
 from command_center.http_auth.routing import enforce, validate_routing
@@ -159,6 +160,7 @@ def create_app() -> FastAPI:
     app.include_router(audit_routes.router, dependencies=guard)
     app.include_router(council_routes.router, dependencies=guard)
     app.include_router(marketplace_routes.router, dependencies=guard)
+    app.include_router(skills_routes.router, dependencies=guard)
     app.include_router(model_registry_routes.router, dependencies=guard)
     app.include_router(networking_routes.router, dependencies=guard)
     app.include_router(backlog_routes.router, dependencies=guard)
