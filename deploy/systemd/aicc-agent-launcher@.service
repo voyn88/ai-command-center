@@ -1,6 +1,5 @@
 [Unit]
 Description=AICC root-owned agent launcher connection %i
-Requires=aicc-agent-launcher.socket
 After=aicc-agent-launcher.socket
 
 [Service]
