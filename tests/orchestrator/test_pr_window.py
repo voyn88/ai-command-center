@@ -167,3 +167,14 @@ def test_pending_checks_are_active_work_not_a_false_failure(monkeypatch):
 
     assert report.promoted == [("1", pending["url"])]
     assert report.blocked == []
+
+
+def test_rfc3339_z_timestamp_keeps_fresh_pr_inside_grace_period():
+    fresh = _pr(1, accepted=False, created="2026-09-06T02:59:30Z")
+
+    assert review_merge._pr_age_seconds(fresh, NOW) == 30
+    assert review_merge._window_block_reason(
+        fresh,
+        review_merge.PrWindowConfig(stale_seconds=60),
+        NOW,
+    ) is None
