@@ -30,6 +30,17 @@ file. Deleting the call brings the frozen identity back; it is not redundant.
 Every outcome is data (a ``PublishResult``); this never raises into the
 worker loop. A run that produced no commit is reported as ``nothing_to_publish``,
 not an error — a review/analysis task legitimately changes no files.
+
+The `gh` OAuth credential above is scoped to what worker tasks ordinarily
+need (``gist, read:org, repo``), which does not include ``workflow`` —
+GitHub requires that separate scope to accept a push touching
+``.github/workflows/**``, and refuses it with no actionable diagnostic
+otherwise (live: worker-01, PR #502, 2026-08-30). ``_workflow_scope_gate``
+catches this before the lease is even acquired when it can, and
+``_classify_push_failure`` still names it correctly if it reaches GitHub
+anyway — see ADR-0011 for why the fix is a correctly-attributed
+refusal rather than widening the scope every autonomous worker's token
+carries.
 """
 
 from __future__ import annotations
@@ -355,6 +366,122 @@ def _static_quality_gate(repo_path: Path, head_sha: str) -> PublishResult | None
     )
 
 
+def _diff_touches_github_workflows(
+    repo_path: Path, base_sha: str, head_sha: str
+) -> bool | None:
+    """``True``/``False`` when the range diff is readable; ``None`` when it
+    is not. Callers must treat ``None`` as "cannot rule it out" rather than
+    "no workflow files changed" -- see ``_workflow_scope_gate``, which fails
+    open on it rather than misreporting an unreadable diff as a clean one."""
+    diff = _run(["git", "diff", "--name-only", base_sha, head_sha], repo_path)
+    if diff.returncode != 0:
+        return None
+    return any(
+        name.startswith(".github/workflows/") for name in diff.stdout.splitlines()
+    )
+
+
+def _gh_oauth_workflow_scope_missing(repo_path: Path) -> bool | None:
+    """``True`` when `gh`'s active OAuth credential's scope list is
+    readable and does not include ``workflow``; ``False`` when it does;
+    ``None`` when the scope list could not be read at all (``gh auth
+    status`` failed, or its output changed shape) -- distinct from
+    ``False`` so an unreadable scope list is never misreported as a
+    present one."""
+    status = _run(["gh", "auth", "status"], repo_path)
+    combined = f"{status.stdout}\n{status.stderr}"
+    for line in combined.splitlines():
+        line = line.strip()
+        if "token scopes" not in line.lower():
+            continue
+        _, _, raw = line.partition(":")
+        scopes = {token.strip().strip("'\"") for token in raw.split(",")}
+        return "workflow" not in scopes
+    return None
+
+
+def _workflow_scope_gate(
+    repo_path: Path, head_sha: str, base_sha: str, https_target: str | None
+) -> PublishResult | None:
+    """Preflight refusal for the failure mode found live on 2026-08-30
+    (worker-01, PR #502): a candidate touching ``.github/workflows/**``
+    pushed over `gh`'s OAuth credential (``_https_push_target``) with only
+    ``gist, read:org, repo`` scopes reached GitHub and came back
+    ``! [remote rejected] ... refusing to allow an OAuth App to create or
+    update workflow`` -- indistinguishable, before this gate, from every
+    other rejected push (``push_failed: <160 chars of stderr>``).
+
+    Only ever applies on the OAuth path (``https_target is not None``): the
+    SSH deploy-key fallback is a different credential with its own,
+    already-documented reliability problem (see ``_https_push_target``'s
+    docstring, 2026-08-21) and no OAuth "scope" concept to preflight.
+
+    Granting the worker token `workflow` scope is deliberately NOT what
+    this function does. That scope lets its holder rewrite this
+    repository's CI -- on every autonomous worker that shares the token,
+    for every future task, not just the one that needs it today.
+    Broadening a live credential used by unattended workers is an operator
+    decision with its own blast radius; it does not belong as a silent
+    side effect of unblocking one publish. What this function does instead:
+    turn a candidate that cannot go through this worker's credential into
+    a fast, correctly attributed refusal -- ``workflow_scope_missing`` --
+    before a lease is even acquired, instead of a wasted push cycle ending
+    in an opaque ``push_failed`` that looks identical to a lease race or a
+    dropped connection and would otherwise be retried forever unchanged.
+
+    Fails OPEN when either the diff or the scope list can't be read (both
+    ``None``): an unreadable precondition defers to the push attempt
+    itself, whose stderr ``_classify_push_failure`` still turns into the
+    same ``workflow_scope_missing`` reason on an actual GitHub-side
+    rejection. This gate is a fast-fail optimisation, not the only place
+    the condition is caught.
+    """
+    if https_target is None:
+        return None
+    if not _diff_touches_github_workflows(repo_path, base_sha, head_sha):
+        return None
+    if not _gh_oauth_workflow_scope_missing(repo_path):
+        return None
+    return PublishResult(ok=False, head_sha=head_sha, reason="workflow_scope_missing")
+
+
+_NETWORK_FAILURE_MARKERS = (
+    "could not resolve host",
+    "could not read from remote repository",
+    "connection timed out",
+    "connection refused",
+    "connection reset",
+    "empty reply from server",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "could not connect to server",
+    "ssl_error",
+)
+
+
+def _classify_push_failure(stderr: str) -> str:
+    """Turn a rejected `git push`'s stderr into a machine-distinguishable
+    reason instead of the single opaque ``push_failed`` bucket every
+    rejection used to fall into. A missing OAuth `workflow` scope, a stale
+    `--force-with-lease` (another writer's push landed first), and a
+    transient network failure each need a different response from whatever
+    consumes ``PublishResult.reason`` -- the first is a token-capability
+    problem no retry fixes, the second is safe to retry as-is once the
+    candidate rebases, and the third is safe to retry unchanged once the
+    network recovers. Falls back to the raw (truncated) stderr, prefixed
+    ``push_failed:``, when none of the known shapes match, so an
+    unrecognised rejection is still visible rather than silently
+    mis-classified as one of the three."""
+    lowered = stderr.lower()
+    if "oauth app" in lowered and "workflow" in lowered:
+        return "workflow_scope_missing"
+    if "stale info" in lowered:
+        return "push_rejected_stale_lease"
+    if any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS):
+        return "push_network_failed"
+    return f"push_failed: {stderr.strip()[:160]}"
+
+
 def _leak_guard_gate(
     repo_path: Path, head_sha: str, base_sha: str
 ) -> PublishResult | None:
@@ -491,6 +618,11 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         leak_failure = _leak_guard_gate(repo_path, head_sha, base_sha_value)
         if leak_failure is not None:
             return leak_failure
+        workflow_scope_failure = _workflow_scope_gate(
+            repo_path, head_sha, base_sha_value, _https_push_target(repo_path)
+        )
+        if workflow_scope_failure is not None:
+            return workflow_scope_failure
 
     branch = f"backlog/{cfg.task}"
     if already_durable:
@@ -607,7 +739,7 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
                 durable_env = ssh_env
         if push is not None and push.returncode != 0:
             return PublishResult(
-                ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}"
+                ok=False, reason=_classify_push_failure(push.stderr)
             )
         if push is not None:
             durable, durable_sha = _remote_branch_sha(
