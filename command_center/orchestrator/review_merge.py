@@ -2629,9 +2629,27 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                 if branch_updates >= cfg.max_branch_updates_per_tick:
                     report.skipped.append((task_id, "branch_behind_update_capped"))
                     continue
+                # `gh pr update-branch` is a subcommand, not the REST call --
+                # it postdates the `gh` version pinned on control-01, so every
+                # attempt failed with "unknown command" and burned a cap slot
+                # without ever updating a branch (live 2026-08-26). The REST
+                # endpoint underneath it (PUT .../pulls/{n}/update-branch) has
+                # been stable since GitHub shipped the feature, so calling it
+                # through `gh api` is version-independent -- no host pin needed.
+                parsed = _owner_repo_number_from_pr_url(pr_url)
+                if parsed is None:
+                    report.skipped.append(
+                        (task_id, f"branch_update_failed: no_repo_route: {pr_url!r}")
+                    )
+                    continue
+                owner, repo, number = parsed
                 branch_updates += 1
                 actions += 1
-                updated = _gh(["pr", "update-branch", pr_url], repo_path)
+                updated = _gh(
+                    ["api", "-X", "PUT",
+                     f"repos/{owner}/{repo}/pulls/{number}/update-branch"],
+                    repo_path,
+                )
                 if updated.returncode == 0:
                     report.skipped.append((task_id, "branch_updated_behind_main"))
                 else:
