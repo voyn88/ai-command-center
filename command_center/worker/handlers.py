@@ -276,6 +276,27 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     return available, detail, "claude cli unavailable"
 
 
+def _lease_lost_before_checkpoint_outcome() -> HandlerOutcome:
+    """The post-run `lease_lost.is_set()` check (see the comment above it)
+    only proves the agent subprocess is no longer running -- it says nothing
+    about the checkpoint/publish work that follows, which keeps mutating the
+    task-local workspace for as long as it takes (a trusted-clone network
+    fetch, an `fsck`, a push). The writer-lease renewal thread can still set
+    `lease_lost` during that stretch (a slow renewal, an authority restart),
+    and once it does, a redelivered second attempt is free to acquire the
+    now-unheld lease and start verifying/writing the SAME workspace while
+    this attempt's checkpoint code is still running -- the exact race behind
+    the `task_workspace_checkpoint` and `agent_worktree_clean` dead-letter
+    classes. Re-checking `lease_lost` immediately before every remaining
+    mutating step confines this attempt's writes to a window provably still
+    covered by its own lease."""
+    return HandlerOutcome(
+        ok=False,
+        reason="lease lost before checkpoint; writer lease was reclaimed mid-execution",
+        retryable=True,
+    )
+
+
 def _run_agent(
     payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1
 ) -> HandlerOutcome:
@@ -793,6 +814,8 @@ def _run_agent(
             """Authenticate the committed prefix before an infrastructure retry."""
             if isolated_workspace is None:
                 return None
+            if lease_lost.is_set():
+                return _lease_lost_before_checkpoint_outcome()
             try:
                 candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
                     run_repository,
@@ -983,6 +1006,8 @@ def _run_agent(
                     reason="guarded publish authority is incomplete",
                     retryable=True,
                 )
+            if lease_lost.is_set():
+                return _lease_lost_before_checkpoint_outcome()
             try:
                 candidate_sha, checkpointed_dirty_worktree = (
                     workspace_provisioning.checkpoint_dirty_task_workspace(
@@ -1043,6 +1068,8 @@ def _run_agent(
                     # the preserved task clone can therefore be verified and
                     # retried instead of being stranded behind the old signed
                     # start SHA.
+                    if lease_lost.is_set():
+                        return _lease_lost_before_checkpoint_outcome()
                     workspace_provisioning.checkpoint_task_workspace(
                         run_repository,
                         expected_branch=evidence.expected_branch,
@@ -1135,6 +1162,8 @@ def _run_agent(
             # local-only mode never cleans up -- the worktree accumulates
             # the same way the shared checkout used to, and an operator
             # enabling publishing later can still recover it.
+            if lease_lost.is_set():
+                return _lease_lost_before_checkpoint_outcome()
             try:
                 # Local-only mode still needs a trusted checkpoint.  The
                 # saved commit is the only durable task result here, and a
@@ -1161,6 +1190,8 @@ def _run_agent(
                     ),
                     expected_candidate_sha=candidate_sha,
                 ):
+                    if lease_lost.is_set():
+                        return _lease_lost_before_checkpoint_outcome()
                     workspace_provisioning.checkpoint_task_workspace(
                         run_repository,
                         expected_branch=evidence.expected_branch,

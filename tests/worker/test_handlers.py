@@ -866,6 +866,91 @@ def test_lease_lost_mid_run_discards_outcome_and_never_publishes(
     assert publish_calls == []
 
 
+def test_lease_lost_during_dirty_checkpoint_is_never_signed_or_published(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-DEAD-QUEUE-THREE-WRITER-CONTENTION-CLASSES: the post-run
+    `lease_lost.is_set()` check (test above) only proves the agent
+    subprocess exited -- it says nothing about the checkpoint/publish work
+    that follows, which can itself run long enough (a trusted-clone network
+    fetch, an `fsck`) for the writer-lease renewal thread to lose the lease.
+    A redelivered second attempt is then free to acquire the now-unheld
+    lease and verify/write the SAME workspace while this attempt's
+    checkpoint code is still running -- the exact race behind the
+    `task_workspace_checkpoint` and `agent_worktree_clean` dead-letter
+    classes. `checkpoint_dirty_task_workspace` here sets `lease_lost` as a
+    side effect, simulating the renewal thread losing the lease mid-call;
+    the handler must refuse to sign a new checkpoint or publish afterward."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    publish_calls: list = []
+
+    def fake_publish(repository, cfg):
+        publish_calls.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    event = _event()
+
+    def dirty_checkpoint_then_lose_lease(workspace, **kwargs):
+        event.set()
+        return "0" * 40, False
+
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_dirty_task_workspace",
+        dirty_checkpoint_then_lose_lease,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda *a, **kw: pytest.fail("must not sign a checkpoint after lease loss"),
+    )
+
+    outcome = run_agent(_payload(task_type="implementation"), event, 1)
+
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "lease lost" in outcome.reason
+    assert publish_calls == []
+
+
+def test_lease_lost_before_local_only_checkpoint_is_never_signed(
+    handler, monkeypatch
+) -> None:
+    """Same race as the guarded-publish case above, in the no-deploy-key
+    ("local commit only") path: `checkpoint_task_workspace` there is the
+    last remaining mutation, and it must not run once the lease is gone."""
+    run_agent, _runs = handler
+    monkeypatch.delenv("AICC_PUBLISH_DEPLOY_KEY", raising=False)
+
+    event = _event()
+
+    def candidate_sha_then_lose_lease(workspace, **kwargs):
+        event.set()
+        return "0" * 40
+
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        candidate_sha_then_lose_lease,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda *a, **kw: pytest.fail("must not sign a checkpoint after lease loss"),
+    )
+
+    outcome = run_agent(_payload(task_type="implementation"), event, 1)
+
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "lease lost" in outcome.reason
+
+
 def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
     run_agent, _ = handler
 
