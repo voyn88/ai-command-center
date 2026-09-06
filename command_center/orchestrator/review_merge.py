@@ -74,9 +74,11 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from command_center.orchestrator import github_app_auth
 from command_center.orchestrator.routing import cascade_for
+from scripts.assert_independent_acceptance import AcceptanceError, evaluate
 
 __all__ = [
     "LoopReport",
@@ -142,6 +144,34 @@ def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _gh_current_login(repo_path: str, pr_url: str) -> str | None:
+    """The login that will actually execute `gh pr merge <pr_url>` -- read
+    from the SAME host `pr_url` itself names, not from `gh`'s ambient default
+    host. `gh api user` with no `--hostname` always resolves against whatever
+    host is currently `gh`'s default (`gh auth switch`, `GH_HOST`, or the
+    first configured host); on a multi-host credential set that can be a
+    different account than the one `gh pr merge <pr_url>` authenticates as,
+    because that command resolves its host from the URL argument itself
+    (live risk identified in review of PR #454: a verdict issued by the true
+    merging identity could pass because it was compared against the wrong
+    host's identity). Resolving the host from `pr_url` first and passing it
+    explicitly keeps both commands pinned to the same account even when they
+    disagree about "default." Returns None on any failure -- callers must
+    fail closed, never silently skip the merger-independence check."""
+    host = urlparse(pr_url).hostname
+    if not host:
+        return None
+    result = _gh(["api", "user", "--hostname", host], repo_path)
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    login = data.get("login") if isinstance(data, dict) else None
+    return login if isinstance(login, str) and login else None
+
+
 def _acceptance_app_credentials() -> github_app_auth.GitHubAppCredentials | None:
     """The independent acceptance identity's credentials, gated on env
     the same way `VOYN_LEASE_DSN` gates the writer lease elsewhere in this
@@ -171,10 +201,10 @@ def _post_marker_as_bot(
     approval from the PR's own author, but the App reviewing is not
     self-review in the first place -- it never opens or authors anything,
     only ever posts this one marker. First line only, matching
-    `assert_independent_acceptance.py`'s own stricter parse (this
-    module's own `_accept_marker_on_latest_review` is more permissive for
-    the local fast-path check, but the marker itself is written to satisfy
-    the strict contract, not the loose one)."""
+    `assert_independent_acceptance.py`'s own strict parse -- this module's
+    own fast-path check (`_accepted_reviewer`) calls that same module's
+    `evaluate` directly rather than keeping a separate copy, so both sides
+    of this marker now share one contract."""
     parsed = _owner_repo_number_from_pr_url(pr_url)
     if parsed is None:
         return False, f"no_repo_route: {pr_url!r}"
@@ -1201,42 +1231,72 @@ def _chunk_payload_matches_envelope(
     )
 
 
-def _accept_marker_on_latest_review(
-    reviews: list[dict[str, Any]], head: str, pr_author_login: str | None
-) -> bool:
-    """Whether the marker stands on the MOST RECENT review, not merely
-    somewhere in the array. A superseded/earlier review carrying the marker
-    text must not count once a later review exists -- otherwise a stale
-    ACCEPT from before a rejected re-review (or before a dismissed review)
-    would still authorize merge. `submittedAt` is ISO 8601, so lexical max
-    is chronological max; a missing timestamp sorts first (never wins).
+def _reviews_from_gh_view(reviews: object) -> list[dict[str, Any]]:
+    """Adapt `gh pr view --json reviews`'s GraphQL-shaped review objects
+    (reviewer login at `author.login`) into the REST shape
+    `scripts.assert_independent_acceptance.verdicts_from` expects (reviewer
+    login at `user.login`) -- `gh`'s CLI JSON and the raw GitHub REST API
+    name the exact same field differently for the exact same review. Passing
+    one shape into code written for the other doesn't raise: `verdicts_from`
+    just reads a missing `user` as an unattributable review and silently
+    treats every review here as unattributed, so this adapter exists to
+    close that mismatch explicitly rather than leave it to be found live."""
+    if not isinstance(reviews, list):
+        return []
+    adapted = []
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        author = review.get("author")
+        adapted.append({
+            "body": review.get("body"),
+            "user": author if isinstance(author, dict) else None,
+            "state": review.get("state"),
+        })
+    return adapted
 
-    `pr_author_login` closes VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE
-    (found live 2026-08-22: PRs #354/#355 both merged by the same account
-    that had posted their own ACCEPT marker): a marker whose review author
-    is the SAME login as the PR's own author does not count, matching
-    `scripts/assert_independent_acceptance.py`'s own comparison exactly
-    (login against the pull request's author login, not text alone --
-    that script's docstring explains why `authorAssociation` is the wrong
-    field). None (author unknown/unfetched) skips this check rather than
-    refusing everything -- callers that cannot supply it keep prior
-    behavior; `_pr_is_mergeable` and `_has_accept_marker` below always can
-    and always do."""
-    if not reviews:
-        return False
-    latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
-    if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
-        return False
-    if pr_author_login is None:
-        return True
-    reviewer_login = (latest.get("author") or {}).get("login")
-    return reviewer_login is not None and reviewer_login != pr_author_login
+
+def _accepted_reviewer(
+    reviews: object,
+    head: str,
+    pr_author_login: str | None,
+    merger_login: str | None = None,
+) -> str | None:
+    """The independent reviewer login that accepted `head`, or None if no
+    verdict satisfies `scripts.assert_independent_acceptance.evaluate` --
+    the single implementation of every acceptance rule (position-anchored
+    marker text on the review's first line, DISMISSED/PENDING state
+    filtering, and author/merger identity independence). This module used to
+    carry its own, looser copy of this logic (`_accept_marker_on_latest_
+    review`: a marker matched anywhere in a review's body, not just its
+    first line, and neither DISMISSED nor PENDING reviews were excluded) --
+    it drifted from the shared implementation's actual contract instead of
+    reusing it (VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE-REM-REM). `None`
+    for `pr_author_login` or a malformed `head` means the author/commit is
+    unresolved, so this fails closed exactly like `evaluate` would if asked
+    to run without them, without needing to construct a fake call just to
+    trigger that error."""
+    if (
+        not pr_author_login
+        or not isinstance(head, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40}", head)
+    ):
+        return None
+    try:
+        return evaluate(
+            _reviews_from_gh_view(reviews), head, pr_author_login, merger=merger_login
+        )
+    except AcceptanceError:
+        return None
 
 
 def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
-    job). Returns (has_marker, head_sha)."""
+    job, including the merger-identity check: dedup here doesn't need it --
+    a marker that happens to equal the current merger login still means "a
+    marker already exists," it just won't be the one `_pr_is_mergeable`
+    ultimately accepts). Returns (has_marker, head_sha)."""
     view = _gh(
         ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
     )
@@ -1245,8 +1305,8 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     data = json.loads(view.stdout or "{}")
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
-    return accept, head
+    accepted_by = _accepted_reviewer(data.get("reviews", []), head, author_login)
+    return accepted_by is not None, head
 
 
 def _remediate_rejection(
@@ -1725,14 +1785,15 @@ def publish_review_verdicts(
         if creds is None:
             # No acceptance-bot credentials configured on this host.
             # VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE (2026-08-22)
-            # tightened `_accept_marker_on_latest_review` to require the
+            # tightened `_pr_is_mergeable`'s acceptance check to require the
             # marker's reviewer login differ from the PR's own author login
-            # -- so a same-identity marker posted under the old ambient
-            # `gh` credential can no longer satisfy `_pr_is_mergeable`
-            # under any circumstance; posting one would just be a review
-            # comment that goes nowhere. Skip loudly instead, so an
-            # operator sees exactly why nothing merges on this host rather
-            # than a silently-ineffective marker.
+            # (and, since VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE-REM-REM,
+            # from the merging identity too) -- so a same-identity marker
+            # posted under the old ambient `gh` credential can no longer
+            # satisfy `_pr_is_mergeable` under any circumstance; posting one
+            # would just be a review comment that goes nowhere. Skip loudly
+            # instead, so an operator sees exactly why nothing merges on
+            # this host rather than a silently-ineffective marker.
             report.skipped.append((task_id, "acceptance_bot_not_configured"))
             continue
         # EVERY external write attempt is one budget unit, success or not
@@ -1842,8 +1903,20 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
-    marker -- from a reviewer login that is NOT the PR's own author -- stands
-    on the head. `gh pr view` gives all of it in one call.
+    marker -- from a reviewer login that is NEITHER the PR's own author NOR
+    the identity that will execute the merge (`_gh_current_login`, resolved
+    on the PR's own host) -- stands on the head. `gh pr view` gives most of
+    it in one call; the merger identity is a second, cheap `gh api user`
+    lookup pinned to that same host.
+
+    The merger check closes VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE-REM-
+    REM: author-independence alone lets the SAME account both post the
+    ACCEPT marker and be the one `gh pr merge` runs as later, whenever that
+    account differs from the PR's own author (e.g. this orchestrator's own
+    bot posting an override marker for someone else's PR) -- self-approval
+    by a different name. The merger login is resolved fresh on every call
+    rather than cached, and its lookup failing fails the whole check closed
+    (`merger_identity_unresolved`) rather than silently skipping it.
 
     The GitHub Actions "Acceptance gate" check (`.github/workflows/
     acceptance-gate.yml`) used to be excluded here by a `"cceptance" not in
@@ -1856,7 +1929,12 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     live-verified) and `publish_review_verdicts` posts under its identity,
     so that check reflects reality again and is required like any other --
     removing the exclusion is not a relaxation, it is retiring a workaround
-    whose reason to exist is gone."""
+    whose reason to exist is gone. (No check is exempted here by name at
+    all -- an earlier attempt at this fix matched required checks with a
+    `name.startswith("Acceptance gate")` exemption, which also matched an
+    unrelated, legitimately-failing check named "Acceptance gatekeeper
+    tests" and let it merge red; every entry in the rollup is compared for
+    exact-green, none by name.)"""
     view = _gh(
         ["pr", "view", pr_url, "--json",
          "reviews,statusCheckRollup,mergeStateStatus,state,headRefOid,author"],
@@ -1869,8 +1947,13 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
-    if not accept:
+    merger_login = _gh_current_login(repo_path, pr_url)
+    if not merger_login:
+        return False, "merger_identity_unresolved"
+    accepted_by = _accepted_reviewer(
+        data.get("reviews", []), head, author_login, merger_login
+    )
+    if accepted_by is None:
         return False, "no_accept_marker_on_head"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
@@ -1916,11 +1999,12 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
 
     Completion additionally re-validates WHAT merged (verification of
     53c7b52, CONFIRMED): the merged head must carry the independent ACCEPT
-    marker (same author-independence rule as the live path) and its final
-    check rollup must be green -- an externally merged PR (an admin bypass,
-    a hand merge around the queue) must never be silently blessed DONE; it
-    skips loudly (``merged_without_acceptance_evidence``) for the operator
-    instead. Returns ``(merge_sha, "")`` or ``(None, reason)``."""
+    marker (same author- AND merger-independence rules as the live path,
+    `_pr_is_mergeable`) and its final check rollup must be green -- an
+    externally merged PR (an admin bypass, a hand merge around the queue)
+    must never be silently blessed DONE; it skips loudly
+    (``merged_without_acceptance_evidence``) for the operator instead.
+    Returns ``(merge_sha, "")`` or ``(None, reason)``."""
     view = _gh(
         ["pr", "view", pr_url, "--json",
          "state,mergeCommit,reviews,headRefOid,author,statusCheckRollup"],
@@ -1939,9 +2023,10 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
         return None, "merge_commit_missing"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    if not _accept_marker_on_latest_review(
-        data.get("reviews", []), head, author_login
-    ):
+    merger_login = _gh_current_login(repo_path, pr_url)
+    if not merger_login or _accepted_reviewer(
+        data.get("reviews", []), head, author_login, merger_login
+    ) is None:
         return None, "merged_without_acceptance_evidence"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     # An EMPTY rollup is inconclusive, not green (review of eabe0d3: `any()`
