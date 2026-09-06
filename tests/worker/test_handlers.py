@@ -1015,6 +1015,48 @@ def test_a_wired_executor_is_dispatched_under_its_own_name(handler) -> None:
     assert outcome.result["executor"] == "codex"
 
 
+def test_ollama_preflight_delegates_to_its_own_probe(handler, monkeypatch) -> None:
+    """VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR: the prescreen tier's one cascade
+    link must actually run under its own probe, not fall back to Claude's
+    (which would either wrongly gate on a claude binary or wrongly succeed
+    when ollama itself is down)."""
+    run_agent, runs = handler
+    checked = []
+    monkeypatch.setattr(
+        agent_runner,
+        "ollama_preflight",
+        lambda: (checked.append(True) or (True, "usable")),
+    )
+    payload = _cascade_payload()
+    payload["task_type"] = "review_prescreen"
+    payload["cascade"][0] = {"executor": "ollama", "task_type": "review_prescreen"}
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert checked == [True]
+    assert runs[0]["executor"] == "ollama"
+    assert outcome.result["executor"] == "ollama"
+
+
+def test_ollama_unavailable_falls_through_the_cascade_without_spending_attempt(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "ollama_preflight", lambda: (False, "daemon unreachable")
+    )
+    payload = _cascade_payload()
+    payload["task_type"] = "review_prescreen"
+    payload["cascade"] = [
+        {"executor": "ollama", "task_type": "review_prescreen"},
+        {"executor": "claude", "task_type": "review_prescreen"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert runs == [runs[0]]
+    assert runs[0]["executor"] == "claude"
+
+
 def test_malformed_cascade_is_a_non_retryable_payload_defect(handler) -> None:
     run_agent, runs = handler
     for bad in (

@@ -121,6 +121,13 @@ CLAUDE_BINARY = "claude"
 # the service already runs as that user), which systemd does not add for it.
 CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
 COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
+OLLAMA_BINARY = os.environ.get("AICC_OLLAMA_BINARY") or "ollama"
+#: Server-side default for the review PRESCREEN tier (VOYN-W0-AICC-OLLAMA-
+#: REVIEW-EXECUTOR) -- distinct from the desktop scheduler's own
+#: `runtime.providers.DEFAULT_OLLAMA_MODEL` (7b): voyn-worker-01 pulled 14b
+#: specifically for this lane. Both honour the same `AICC_OLLAMA_MODEL`
+#: override, so one env var retunes either face of Ollama.
+DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:14b"
 
 # The worker never elevates and keeps NoNewPrivileges=yes.  A root-owned,
 # socket-activated launcher is the sole bridge to the separate aicc-agent UID.
@@ -225,6 +232,18 @@ READ_ONLY_TASK_TYPES = {
 }
 MODEL_ONLY_TASK_TYPES = {"independent_review"}
 MUTATING_TASK_TYPES = {"implementation", "remediation"}
+
+#: PRESCREEN tier (VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR): a local Ollama model
+#: drafts findings plus a priority signal for whoever reviews for real; it
+#: never renders a verdict. Deliberately its OWN set, disjoint from
+#: MODEL_ONLY_TASK_TYPES/REVIEW_TASK_TYPES: nothing that consumes those sets
+#: (the metered review key, `review_merge._parse_verdict`, the ACCEPT
+#: marker) may ever be reachable from a prescreen result. BENCHMARK
+#: 2026-09-03: qwen2.5-coder:14b and deepseek-r1:8b both scored 0% recall
+#: against a three-PR known-truth holdout (#578 P1, #586 P1, #594 P2) --
+#: the 100%-recall promotion bar for verdict authority failed twice, so this
+#: tier is advisory-only by design, not a pending upgrade.
+PRESCREEN_TASK_TYPES = {"review_prescreen"}
 
 #: The verdict tier — the only task classes allowed to spend the metered
 #: review key (see run_claude_code). Matches the orchestrator's dispatch
@@ -997,6 +1016,7 @@ COMMAND_BUILDERS: dict[str, str] = {
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
     "openai_http": "build_openai_http_command",
+    "ollama": "build_ollama_command",
 }
 
 
@@ -1056,6 +1076,73 @@ def openai_http_preflight() -> tuple[bool, str]:
     if present:
         return True, "keys: " + ",".join(sorted(present))
     return False, "no provider key set (GROQ/OPENROUTER/MISTRAL_API_KEY)"
+
+
+def build_ollama_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """argv for the local Ollama CLI (VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR).
+
+    Serves PRESCREEN_TASK_TYPES only, refusing everything else exactly as
+    `build_openai_http_command` refuses non-MODEL_ONLY task types: this is a
+    zero-tool, zero-workspace, zero-network local model with no verdict
+    authority (see the BENCHMARK note on PRESCREEN_TASK_TYPES), so it has no
+    business running any other task class. `routing.ROUTING_MATRIX
+    ["review_prescreen"]` is the only cascade that ever names "ollama", so
+    this refusal should never fire outside a hand-typed/misrouted payload --
+    but the builder refuses on its own rather than trusting the caller,
+    exactly like the HTTP bridge above.
+
+    `ollama run MODEL -- PROMPT`: one non-interactive completion, the same
+    CLI shape and flags `runtime.providers.OllamaProvider` already uses for
+    the desktop scheduler's read-only reviewer (`--nowordwrap` keeps quoted
+    diff lines from being reflowed; `--hidethinking` drops chain-of-thought a
+    trailer parser must not see). The `--` terminator mirrors
+    `build_codex_command`: it stops flag parsing before the untrusted
+    prompt, so a diff chunk that happens to start with a string that looks
+    like a flag cannot be read as one by ollama's own argument parser.
+    """
+    if task_type not in PRESCREEN_TASK_TYPES:
+        raise ValueError(
+            f"ollama serves only prescreen task types, not {task_type!r}"
+        )
+    resolved_model = model or os.environ.get("AICC_OLLAMA_MODEL") or DEFAULT_OLLAMA_MODEL
+    return [
+        OLLAMA_BINARY,
+        "run",
+        resolved_model,
+        "--nowordwrap",
+        "--hidethinking",
+        "--",
+        prompt,
+    ]
+
+
+def ollama_preflight() -> tuple[bool, str]:
+    """Available iff the binary resolves and the local daemon answers.
+
+    Mirrors `runtime.providers.OllamaProvider.availability`'s two-step probe
+    (binary presence, then `ollama list` as the cheapest proof the daemon is
+    actually reachable) without importing that module: this one runs on the
+    worker host for the server-side prescreen tier, that one runs on the
+    desktop scheduler for an unrelated dispatch path -- duplicating two cheap
+    subprocess calls is simpler and safer than coupling the two runtimes.
+    """
+    resolved = shutil.which(OLLAMA_BINARY)
+    if resolved is None:
+        return False, f"ollama binary {OLLAMA_BINARY!r} not found"
+    try:
+        probe = subprocess.run(
+            [resolved, "list"], capture_output=True, text=True, timeout=15, check=False,
+        )
+    except _OS_SUBPROCESS_ERRORS as exc:
+        return False, f"ollama probe failed: {exc}"
+    if probe.returncode != 0:
+        return False, "ollama daemon unreachable (start it with `ollama serve`)"
+    return True, "usable"
 
 
 def _command_builder(executor: str) -> Callable[..., list[str]] | None:

@@ -1061,6 +1061,79 @@ def test_codex_runs_exec_the_non_interactive_subcommand():
     assert command[1] == "exec", command
 
 
+# --------------------------------------------------------------------------
+# Ollama PRESCREEN executor (VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR)
+#
+# Advisory-only by construction: PRESCREEN_TASK_TYPES is disjoint from
+# MODEL_ONLY_TASK_TYPES/REVIEW_TASK_TYPES, so nothing that reads those sets
+# (the metered review key, `_parse_verdict`, the ACCEPT marker) is reachable
+# from this executor. BENCHMARK 2026-09-03: qwen2.5-coder:14b and
+# deepseek-r1:8b both scored 0% recall against a three-PR known-truth
+# holdout, so this tier never earns verdict authority.
+
+
+def test_ollama_builder_serves_only_prescreen_task_types():
+    with pytest.raises(ValueError, match="prescreen"):
+        agent_runner.build_ollama_command("p", task_type="independent_review")
+    with pytest.raises(ValueError, match="prescreen"):
+        agent_runner.build_ollama_command("p", task_type="review")
+    with pytest.raises(ValueError, match="prescreen"):
+        agent_runner.build_ollama_command("p", task_type="implementation")
+    # Does not raise for the one task type it actually serves.
+    agent_runner.build_ollama_command("p", task_type="review_prescreen")
+
+
+def test_ollama_builder_argv_shape_and_flag_injection_guard(monkeypatch):
+    monkeypatch.delenv("AICC_OLLAMA_MODEL", raising=False)
+    hostile = "--verbose rest of the untrusted diff chunk"
+    argv = agent_runner.build_ollama_command(
+        hostile, task_type="review_prescreen"
+    )
+    assert argv[0] == agent_runner.OLLAMA_BINARY
+    assert argv[1] == "run"
+    assert argv[2] == agent_runner.DEFAULT_OLLAMA_MODEL
+    assert "--nowordwrap" in argv and "--hidethinking" in argv
+    separator = argv.index("--")
+    # Everything after `--` is the untrusted prompt, verbatim; a diff chunk
+    # that happens to start with a flag-shaped string cannot be read as one.
+    assert argv[separator + 1] == hostile
+    assert argv[-1] == hostile
+
+
+def test_ollama_builder_honours_explicit_and_env_model(monkeypatch):
+    monkeypatch.setenv("AICC_OLLAMA_MODEL", "qwen2.5-coder:7b")
+    argv = agent_runner.build_ollama_command("p", task_type="review_prescreen")
+    assert argv[2] == "qwen2.5-coder:7b"
+
+    argv = agent_runner.build_ollama_command(
+        "p", task_type="review_prescreen", model="deepseek-r1:8b"
+    )
+    assert argv[2] == "deepseek-r1:8b", "an explicit model wins over the env default"
+
+
+def test_ollama_preflight_reports_binary_absence_and_daemon_state(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _name: None)
+    available, detail = agent_runner.ollama_preflight()
+    assert available is False and "not found" in detail
+
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _name: "/usr/bin/ollama")
+    monkeypatch.setattr(
+        agent_runner.subprocess,
+        "run",
+        lambda *a, **kw: agent_runner.subprocess.CompletedProcess(a, 1, "", "err"),
+    )
+    available, detail = agent_runner.ollama_preflight()
+    assert available is False and "daemon unreachable" in detail
+
+    monkeypatch.setattr(
+        agent_runner.subprocess,
+        "run",
+        lambda *a, **kw: agent_runner.subprocess.CompletedProcess(a, 0, "qwen2.5-coder:14b", ""),
+    )
+    available, detail = agent_runner.ollama_preflight()
+    assert available is True
+
+
 def test_command_builders_table_covers_every_wired_executor():
     """The worker gates on this table (`handlers._run_agent`), and the routing
     matrix's own test derives its allowed set from it, so an entry here is the
@@ -1070,6 +1143,7 @@ def test_command_builders_table_covers_every_wired_executor():
         "codex",
         "copilot",
         "openai_http",
+        "ollama",
     }
     for name in agent_runner.COMMAND_BUILDERS:
         builder = agent_runner._command_builder(name)
@@ -1079,6 +1153,10 @@ def test_command_builders_table_covers_every_wired_executor():
             command = builder(
                 "x", task_type="independent_review", model="groq/m"
             )
+        elif name == "ollama":
+            # PRESCREEN-only by construction; "review" would rightly be
+            # refused (VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR).
+            command = builder("x", task_type="review_prescreen")
         else:
             command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name

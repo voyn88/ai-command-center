@@ -65,6 +65,22 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         {"executor": "copilot", "task_type": "review"},
         {"executor": "claude", "task_type": "review"},
     ],
+    # PRESCREEN tier (VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR), deliberately its
+    # own cascade rather than a link on "review" above: a link on "review"
+    # would let `review_merge._model_only_review_cascade` -- and therefore
+    # `_parse_verdict`/the ACCEPT marker -- see an ollama result. BENCHMARK
+    # 2026-09-03 measured qwen2.5-coder:14b and deepseek-r1:8b at 0% recall
+    # against a three-PR known-truth holdout (#578 P1, #586 P1, #594 P2),
+    # twice failing the 100%-recall bar `review_merge._MODEL_ONLY_REVIEW_
+    # EXECUTORS` implicitly assumes of every link it names -- so this tier
+    # never gets that link at all. `review_merge._prescreen_cascade` reads
+    # only this entry, and its only consumer (`publish_prescreen_findings`)
+    # posts an advisory-labeled PR comment, never a marker. Ollama runs
+    # server-side on voyn-worker-01 (CPU inference; no separate account to
+    # exhaust, so there is nothing to escalate to on failure -- one link).
+    "review_prescreen": [
+        {"executor": "ollama", "task_type": "review_prescreen"},
+    ],
 }
 
 

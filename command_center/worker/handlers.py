@@ -258,6 +258,18 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         # (next cascade link), never as executor absence.
         available, detail = agent_runner.openai_http_preflight()
         return available, detail, "openai_http provider key unavailable"
+    if executor == "ollama":
+        # Same reasoning as openai_http, for a different reason: ollama is a
+        # real local CLI, but it holds no external credential to isolate and
+        # never leaves this host (no network beyond localhost, no tools, no
+        # workspace) -- there is no principal boundary for the isolation
+        # branch below to usefully enforce, and PRINCIPAL_EXECUTOR_BINARIES
+        # deliberately does not list it. Availability is just "the local
+        # binary and daemon are up"; a daemon blip classifies as this
+        # attempt's failure, not executor absence (VOYN-W0-AICC-OLLAMA-
+        # REVIEW-EXECUTOR).
+        available, detail = agent_runner.ollama_preflight()
+        return available, detail, "ollama cli/daemon unavailable"
     if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
