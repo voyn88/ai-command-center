@@ -538,3 +538,30 @@ to itself. Re-run this check against current `main` before executing this
 runbook; that instruction has now outlived three baselines (`67a996b`,
 `f799f78`, `92470bc`) without becoming less true, and there is no reason to
 expect a fourth baseline to be different.
+
+### Audit of the third pass (2026-09-06, same baseline `92470bc`)
+
+`main` had not moved past `92470bc` since the third pass — no fourth baseline
+exists yet. Rather than a no-op, this checked whether the third pass itself
+had the second pass's failure mode: missing a relevant commit inside a window
+it had already scoped. Every file any claim in this document cites
+(`command_center/db/roles.py`, `provenance_store.py`,
+`runtime/db/core.py`, `runtime/db/execution.py`,
+`docs/postgres-foundation.md`, the backup/restore scripts, the mirror store
+family) was re-diffed across the full 39-commit `f799f78..92470bc` range, not
+just re-read from the third pass's own summary.
+
+Three more commits in that range touch a cited file and none change a
+claim: `VOYN-W0-AICC-RETENTION-NO-DRYRUN` (#419) rewrites
+`maybe_apply_runtime_retention` in `core.py` but leaves
+`current_schema_version()` (row 30) untouched; the audit-boundary
+corroboration commits (#583 and its `provenance_store.py` companion) are
+docstring-only, leaving the composite-key mirror behavior row 27 describes
+unchanged; and `VOYN-W0-AICC-GRANTS-ARE-CORRECTNESS-NOT-HYGIENE`'s comment
+update in `roles.py` touches the same lines row 40/55 cite without changing
+the grant matrix itself. `#553`'s test-only addition
+(`tests/db/test_backup_script_guards.py`) strengthens, rather than changes,
+the `--no-owner --no-privileges` claim in §11. No row above needed a
+correction. Confirms the third pass's own "two commits touched a live
+claim" count (#605, #610) was complete, not merely unrefuted — the
+distinction the second pass's row 57 gap exists to teach.
