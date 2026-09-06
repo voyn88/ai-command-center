@@ -9,6 +9,7 @@ between tests), so `root` below is unused for its own sake -- same pattern as
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from command_center.orchestrator import local_model_gates
@@ -42,7 +43,15 @@ def test_promotion_requires_both_sample_size_and_pass_rate():
 
 def test_promotion_is_withheld_below_the_pass_rate_bar():
     samples = local_model_gates.MIN_BENCHMARK_SAMPLES
-    failures = int(samples * (1 - local_model_gates.MIN_PASS_RATE)) + 1
+    # `math.floor(..., + 1e-9)` rather than plain `int(samples * (1 - MIN_PASS_RATE))`:
+    # `1 - 0.9` is `0.09999999999999998` in float, which silently undercounts the
+    # failures needed to land strictly below the bar and instead lands exactly ON
+    # it (`is_promoted` uses `>=`, so exactly-on-bar is promoted) -- caught by this
+    # test flipping green under that off-by-one before this fix.
+    max_passing_under_bar = math.floor(
+        samples * local_model_gates.MIN_PASS_RATE + 1e-9
+    )
+    failures = samples - max_passing_under_bar + 1
     for index in range(samples):
         local_model_gates.record_benchmark_run(
             ROOT, "bounded_implementation", passed=index >= failures
