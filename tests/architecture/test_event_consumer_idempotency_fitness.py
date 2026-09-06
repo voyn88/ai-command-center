@@ -1,4 +1,5 @@
-"""Architecture fitness gate: every event-bus consumer dedups by source_ref.
+"""VOYN-W0-AICC-ARCHITECTURE-FITNESS-GAPS fitness gate: all new event
+consumers are idempotent.
 
 ``command_center.events.EventBus`` makes no redelivery guarantee of its own
 (:mod:`command_center.events.bus`) — a subscriber may see the same logical
