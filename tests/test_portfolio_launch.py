@@ -550,6 +550,44 @@ def test_live_owner_claim_is_never_recovered_even_when_old(tmp_path, monkeypatch
     assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == "live-token"
 
 
+def test_claim_from_a_different_host_is_never_recovered(tmp_path, monkeypatch):
+    # `inspect_claim`'s own docstring names this exact scenario: a claim
+    # written by a different host has a PID that cannot be checked locally,
+    # so it must be reported unrecoverable regardless of age -- the same
+    # "a live owner is never displaced" guarantee the same-host tests above
+    # pin, extended across the cross-host branch that had no coverage at all.
+    task_id = "AICC-OTHER-HOST"
+    lock_path = portfolio_launch._claim_lock_path(tmp_path, task_id)
+    lock_path.parent.mkdir(parents=True)
+    metadata = {
+        "version": portfolio_launch.CLAIM_LOCK_VERSION,
+        "pid": 31337,
+        "hostname": "some-other-worker-host",
+        "process_identity": "remote-process",
+        "created_at": 1.0,
+        "token": "remote-token",
+    }
+    lock_path.write_text(json.dumps(metadata), encoding="utf-8")
+    os.utime(lock_path, (1, 1))
+
+    def _fail_if_called(pid):
+        raise AssertionError("a foreign host's PID must never be checked locally")
+
+    monkeypatch.setattr(portfolio_launch, "_pid_is_alive", _fail_if_called)
+
+    status = portfolio_launch.inspect_claim(tmp_path, task_id, now=10_000_000.0)
+    assert status.exists is True
+    assert status.age_seconds and status.age_seconds > 1_000_000
+    assert status.stale is False
+    assert status.recoverable is False
+    assert status.owner_pid == 31337
+    assert "some-other-worker-host" in status.reason
+
+    assert portfolio_launch.recover_stale_claim(tmp_path, task_id) is False
+    assert portfolio_launch._claim(tmp_path, task_id) is False
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == "remote-token"
+
+
 def test_claim_with_reused_pid_but_different_identity_is_recovered(tmp_path, monkeypatch):
     # The PID is alive, but the process running under it is a DIFFERENT one
     # than the claim recorded (PID reuse after a crash). This is the entire
