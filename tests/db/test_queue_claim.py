@@ -1277,6 +1277,134 @@ def test_a_refusal_is_audited_because_it_returned_rather_than_raised(
     assert [e[4] for e in events] == list(range(1, len(events) + 1))
 
 
+def _detail(admin_conn, item_id: str, event: str) -> dict:
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail FROM work_event WHERE work_item_id = %s AND event = %s "
+            "ORDER BY seq DESC LIMIT 1",
+            (item_id, event),
+        )
+        row = cur.fetchone()
+        assert row is not None, f"no {event!r} work_event for {item_id!r}"
+        return row[0]
+
+
+def test_quota_exhausted_telemetry_is_recorded_on_the_complete_audit_row(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "quota-then-success-2")
+
+    quota_exhausted = [
+        {
+            "cascade_step": 1,
+            "executor": "claude",
+            "signature": "hit your session limit",
+            "exhausted_until": "2026-09-06T13:00:00+00:00",
+        }
+    ]
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            result = {"cascade_step": 2, "quota_exhausted": quota_exhausted}
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_complete(%s, %s, %s::jsonb)",
+                (verdict[3], token, json.dumps(result)),
+            ) == (True, None)
+
+    detail = _detail(admin_conn, item_id, "complete")
+    assert detail["quota_exhausted"] == quota_exhausted
+    assert "result_id" in detail
+
+
+def test_an_ordinary_completion_leaves_the_complete_detail_untouched(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """No quota refusal happened, so the audit detail keeps its one-key shape
+    rather than growing a `quota_exhausted: []`/`null` key nobody asked for."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "no-quota-refusal")
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_complete(%s, %s, %s::jsonb)",
+                (verdict[3], token, json.dumps({"done": True})),
+            ) == (True, None)
+
+    detail = _detail(admin_conn, item_id, "complete")
+    assert set(detail) == {"result_id"}
+
+
+def test_quota_exhausted_reason_reaches_work_event_on_terminal_fail(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The terminal case -- no cascade link left to fail over to -- still
+    opens the worker's quota circuit, and the `[exhausted_until=...]`-suffixed
+    reason the worker attaches (`command_center/worker/handlers.py`) must
+    reach `work_event`, not just `work_attempt.outcome_reason`."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "quota-exhausted-terminal", max_attempts=1)
+
+    reason = (
+        "executor infrastructure failure (provider/auth/quota): "
+        "You've hit your session limit "
+        "[exhausted_until=2026-09-06T13:30:00+00:00]"
+    )
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (verdict[3], token, reason),
+            ) == (True, "dead_lettered")
+
+    detail = _detail(admin_conn, item_id, "fail")
+    assert detail["outcome_reason"] == reason
+    assert "[exhausted_until=2026-09-06T13:30:00+00:00]" in detail["outcome_reason"]
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT outcome_reason FROM work_attempt WHERE work_item_id = %s", (item_id,)
+        )
+        assert cur.fetchone()[0] == reason
+
+
+def test_a_requeued_fails_outcome_reason_also_reaches_work_event(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "requeue-with-reason", max_attempts=3, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (verdict[3], token, "transient boom"),
+            ) == (True, "requeued")
+
+    detail = _detail(admin_conn, item_id, "fail")
+    assert detail["outcome_reason"] == "transient boom"
+
+
 #: Every `_queue_audit()` call site in `0002_queue_claim.up.sql`, as the row it
 #: must produce. Deleting any one of them has to fail a test, which is the whole
 #: point: independent acceptance removed the reaper's audit write and the suite
