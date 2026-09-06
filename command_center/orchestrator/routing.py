@@ -15,13 +15,27 @@ IS the cascade budget), and the worker selects ``cascade[attempt_no - 1]``
 machinery (SRV-06) with no new tables and no new loop, and the audit trail
 is the existing ``work_event`` attempt history (attempt_no <-> cascade step
 is a bijection until the clamp).
+
+``bounded_implementation`` (VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR) is the one
+entry that is no longer purely static: its ``aider`` link is filtered out by
+``local_model_gates.is_promoted`` unless that task class has cleared its
+benchmark bar (owner decision 2026-09-03 — "benchmarked per task class before
+promotion"). ``cascade_for`` therefore does one small file read per call, the
+only I/O in an otherwise pure module; every other entry, and every other link
+in this one, is untouched by it. The claude/codex/copilot tail is never
+filtered — a benchmark gate can only ever REMOVE the free local-model link,
+never the proven cloud fallback a task still needs to complete.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-__all__ = ["ROUTING_MATRIX", "cascade_for"]
+from command_center import agent_runner
+from command_center.orchestrator import local_model_gates
+
+__all__ = ["ROUTING_MATRIX", "cascade_for", "classify_task_class"]
 
 #: task class -> ordered cascade. Each link: executor + the agent_run fields
 #: it pins. 'claude' is the headless CLI the worker's agent_runner already
@@ -55,6 +69,22 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         # three tries at one pool.
         {"executor": "copilot", "task_type": "implementation"},
     ],
+    # Bounded-implementation lane (VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR): the
+    # planner routes low-risk work here (see `classify_task_class`) instead
+    # of `implementation`. aider leads because it is free and structurally
+    # incapable of the mutations the other links can make (no shell tool at
+    # all — see `agent_runner.build_aider_command`), but it is a benchmark-
+    # gated link, not an unconditional one: `cascade_for` drops it unless
+    # `local_model_gates.is_promoted("bounded_implementation", ...)`. The
+    # exact same claude/codex/copilot tail as `implementation` follows it, so
+    # a task this lane misclassifies, or that aider genuinely cannot finish,
+    # still gets the full proven cascade rather than dead-ending.
+    "bounded_implementation": [
+        {"executor": "aider", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "copilot", "task_type": "implementation"},
+    ],
     "review": [
         # codex first: it is the only review pool currently reachable on the
         # fleet (copilot is org-blocked, the Claude subscription window is
@@ -68,10 +98,54 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
 }
 
 
-def cascade_for(task_class: str) -> list[dict[str, Any]]:
+def cascade_for(task_class: str, *, root: Path | None = None) -> list[dict[str, Any]]:
     """The cascade for a task class; unknown classes get the implementation
-    route rather than a refusal — routing chooses HOW, never WHETHER."""
-    return [
+    route rather than a refusal — routing chooses HOW, never WHETHER.
+
+    `root` is a test seam (points `local_model_gates` at an isolated data
+    dir); every real caller omits it and gets `agent_runner.ROOT`, the same
+    checkout every other promotion/config file in this project reads from.
+    """
+    resolved_root = root if root is not None else agent_runner.ROOT
+    cascade = [
         dict(link)
         for link in ROUTING_MATRIX.get(task_class, ROUTING_MATRIX["implementation"])
     ]
+    return [
+        link
+        for link in cascade
+        if link.get("executor") != "aider"
+        or local_model_gates.is_promoted(task_class, resolved_root)
+    ]
+
+
+#: Title/body substrings that mark a task as eligible for the bounded-
+#: implementation lane (docs, fixtures, small mechanical patches — the owner
+#: decision's own examples). Advisory input to routing, not the technical
+#: gate: `local_model_gates.is_promoted` is what actually decides whether
+#: `bounded_implementation`'s aider link survives `cascade_for`, and the
+#: cascade always keeps the full claude/codex/copilot tail regardless — so a
+#: task misclassified as bounded still completes on the proven chain, it
+#: just tries the free lane first once that lane is promoted.
+_BOUNDED_IMPLEMENTATION_MARKERS = (
+    "docs:",
+    "doc:",
+    "documentation:",
+    "readme",
+    "changelog",
+    "fixture",
+    "typo",
+    "chore:",
+)
+
+
+def classify_task_class(title: str, body: str) -> str:
+    """The planner's task-class vocabulary lookup: `bounded_implementation`
+    for low-risk work whose title/body names one of the markers above,
+    `implementation` otherwise. Kept a pure function of the task's own text
+    (no new backlog column) so it stays trivially testable and every
+    classification is explainable from the same words a human reads."""
+    haystack = f"{title}\n{body}".lower()
+    if any(marker in haystack for marker in _BOUNDED_IMPLEMENTATION_MARKERS):
+        return "bounded_implementation"
+    return "implementation"

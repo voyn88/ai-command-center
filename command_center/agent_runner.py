@@ -121,6 +121,17 @@ CLAUDE_BINARY = "claude"
 # the service already runs as that user), which systemd does not add for it.
 CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
 COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
+# aider bills nothing (VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR): it drives a local
+# Ollama model, not a metered account, so it is a free bounded-implementation
+# lane rather than a fourth quota pool. `AICC_OLLAMA_BINARY`/`AICC_OLLAMA_
+# MODEL` are read by `runtime.providers.OllamaProvider`; this module has its
+# own `AICC_AIDER_*` pair because the aider CLI is a different binary from
+# `ollama run` and the model string needs the `ollama_chat/` provider prefix
+# aider's own LiteLLM backend expects.
+AIDER_BINARY = os.environ.get("AICC_AIDER_BINARY") or "aider"
+DEFAULT_AIDER_MODEL = (
+    os.environ.get("AICC_AIDER_MODEL") or "ollama_chat/qwen2.5-coder:14b"
+)
 
 # The worker never elevates and keeps NoNewPrivileges=yes.  A root-owned,
 # socket-activated launcher is the sole bridge to the separate aicc-agent UID.
@@ -140,6 +151,13 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # b311666). The retry-loop hazard that once motivated listing it is
     # closed in handlers instead: an unavailable executor falls through the
     # cascade to the next link rather than respinning forever.
+    #
+    # aider is DELIBERATELY absent too (VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR):
+    # not for a credential-authority reason like Copilot's, but because the
+    # isolated launcher protocol (`build_principal_isolation_manifest`, the
+    # root-owned broker) has never been extended to it. Until that work
+    # exists, a host that requires principal isolation must refuse the aider
+    # link rather than run it un-isolated.
 }
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 
@@ -719,6 +737,44 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
         return _codex_workspace_write_preflight_result
 
 
+def aider_preflight(binary: str | None = None) -> tuple[bool, str]:
+    """`(available, message)` for the aider executor.
+
+    Two independent things must be true, and both are cheap enough to check
+    on every dispatch (no caching, unlike `codex_workspace_write_preflight`
+    -- there is no sandbox-namespace probe here, just two process launches):
+    the `aider` CLI must resolve, and the local Ollama daemon it talks to
+    must actually be reachable. Checking only the binary would report
+    "available" for a run that fails on its very first token with a
+    connection error -- the same daemon-liveness gap
+    `runtime.providers.OllamaProvider.availability` closes for the `ollama`
+    executor, reproduced here because this is a different code path (the
+    worker daemon's `COMMAND_BUILDERS`, not the v2 Session Supervisor).
+    """
+    resolved = binary or AIDER_BINARY
+    if shutil.which(resolved) is None:
+        return False, f"aider CLI {resolved!r} is not available on PATH"
+    ollama_binary = shutil.which(os.environ.get("AICC_OLLAMA_BINARY") or "ollama")
+    if ollama_binary is None:
+        return False, "ollama is not available on PATH; aider's local backend requires it"
+    try:
+        probe = subprocess.run(
+            [ollama_binary, "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except _OS_SUBPROCESS_ERRORS as exc:
+        return False, f"ollama daemon is unreachable: {exc}"
+    if probe.returncode != 0:
+        return False, (
+            "ollama daemon is unreachable; start it with `ollama serve` "
+            f"({probe.stderr.strip()[:200]})"
+        )
+    return True, f"aider CLI {resolved!r} available; ollama daemon reachable"
+
+
 def validate_repository(project_id: str, repository_path: str) -> Path:
     """Raise RunnerError unless `repository_path` is the configured path for `project_id`."""
     if not repository_path:
@@ -980,6 +1036,69 @@ def build_copilot_command(
     return command
 
 
+def build_aider_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """The `aider` argv (VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR): a bounded-
+    implementation executor over a local Ollama model, for the low-risk task
+    classes the planner routes to it (docs, fixtures, small mechanical
+    patches -- see `orchestrator.routing.classify_task_class`).
+
+    "Bounded" is structural, not a prompt instruction: unlike Claude/Codex/
+    Copilot, aider has no shell tool at all -- its entire interface is
+    SEARCH/REPLACE edits against the files it is given, applied through
+    LiteLLM's chat completion, never an ambient tool loop. A run therefore
+    cannot touch anything outside the files it edits, cannot run arbitrary
+    commands, and cannot reach git-write subcommands the way a Bash-capable
+    executor could -- there is no code path here to deny the way
+    `GIT_WRITE_DISALLOWED_TOOLS` denies one for Claude/Copilot, because none
+    exists to reach.
+
+    Refused outside `MUTATING_TASK_TYPES`, same as `openai_http`'s own refusal
+    for the inverse case: aider has no read-only reviewer mode distinct from
+    editing, so a review-type task would either silently edit files a
+    reviewer must not touch, or (with edits suppressed) produce a run that
+    "succeeds" having read nothing back to the caller. Refusing at the
+    builder is the honest failure, matching `runtime.providers.OllamaProvider.
+    build_launch`'s reasoning for the opposite restriction.
+
+    `--no-auto-commits`/`--no-dirty-commits`: aider's default behaviour is to
+    commit after every edit with an LLM-authored message. This project's own
+    commit is the one of record (the planner's prompt asks the executor for a
+    `HEAD_SHA:` trailer, and `worker.handlers` has its own checkpoint-commit
+    fallback for a dirty tree) -- so aider is told to leave the working tree
+    dirty and never call `git commit` itself, exactly the same division of
+    labour Claude/Codex/Copilot already observe.
+
+    `--message` rather than an interactive chat turn: one instruction, one
+    exit, no `/undo`-driven REPL loop -- the same "single non-interactive
+    pass" contract `-p`/`exec`/`-p` give Claude/Codex/Copilot.
+    """
+    if task_type not in MUTATING_TASK_TYPES:
+        raise ValueError(
+            f"aider serves only mutating task types, not {task_type!r}: it has "
+            "no read-only reviewer mode distinct from editing "
+            f"({', '.join(sorted(MUTATING_TASK_TYPES))} only)."
+        )
+    resolved_model = model or DEFAULT_AIDER_MODEL
+    return [
+        AIDER_BINARY,
+        "--model",
+        resolved_model,
+        "--yes-always",
+        "--no-auto-commits",
+        "--no-dirty-commits",
+        "--no-check-update",
+        "--no-analytics",
+        "--no-gitignore",
+        "--message",
+        prompt,
+    ]
+
+
 #: executor id -> the NAME of its argv builder in this module. The worker
 #: refuses any executor absent from this table (`handlers._run_agent`), so an
 #: unknown/unproven name can never silently burn a cascade attempt on a
@@ -997,6 +1116,7 @@ COMMAND_BUILDERS: dict[str, str] = {
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
     "openai_http": "build_openai_http_command",
+    "aider": "build_aider_command",
 }
 
 

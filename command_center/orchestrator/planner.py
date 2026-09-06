@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from command_center.orchestrator.routing import cascade_for
+from command_center.orchestrator.routing import cascade_for, classify_task_class
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
 __all__ = ["PlanLimits", "PlanReport", "plan_once"]
@@ -113,7 +113,15 @@ def _payload_for(
     ``untrusted=False`` is on the authority of the planner being the control
     plane acting on the canonical store.
     """
-    cascade = cascade_for("implementation")
+    # VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR: low-risk tasks (docs, fixtures,
+    # small mechanical patches) route to the bounded-implementation lane
+    # instead of the straight `implementation` cascade. `classify_task_class`
+    # is advisory text-matching, not the safety boundary — `cascade_for`
+    # itself drops the free aider link unless that class's benchmark
+    # promotion has cleared (`local_model_gates`), and the identical claude/
+    # codex/copilot tail follows either way, so a misclassification only
+    # ever costs an extra attempt, never a stranded task.
+    cascade = cascade_for(classify_task_class(task["title"], task["body"]))
     project_id, repository_path = route
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"

@@ -1070,6 +1070,7 @@ def test_command_builders_table_covers_every_wired_executor():
         "codex",
         "copilot",
         "openai_http",
+        "aider",
     }
     for name in agent_runner.COMMAND_BUILDERS:
         builder = agent_runner._command_builder(name)
@@ -1079,10 +1080,95 @@ def test_command_builders_table_covers_every_wired_executor():
             command = builder(
                 "x", task_type="independent_review", model="groq/m"
             )
+        elif name == "aider":
+            # aider has no read-only reviewer mode; "review" is rightly
+            # refused (see test_aider_refuses_non_mutating_task_types).
+            command = builder("x", task_type="implementation")
         else:
             command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
         assert all(isinstance(part, str) for part in command), name
+
+
+def test_build_aider_command_uses_ollama_backend_and_disables_auto_commit():
+    command = agent_runner.build_aider_command("do the thing", task_type="implementation")
+    assert command[0] == agent_runner.AIDER_BINARY
+    assert command[command.index("--model") + 1] == agent_runner.DEFAULT_AIDER_MODEL
+    assert "--no-auto-commits" in command
+    assert "--no-dirty-commits" in command
+    assert "--yes-always" in command
+    assert command[-2:] == ["--message", "do the thing"]
+
+
+def test_build_aider_command_honors_explicit_model():
+    command = agent_runner.build_aider_command(
+        "x", task_type="remediation", model="ollama_chat/other:7b"
+    )
+    assert command[command.index("--model") + 1] == "ollama_chat/other:7b"
+
+
+@pytest.mark.parametrize(
+    "task_type",
+    sorted(agent_runner.READ_ONLY_TASK_TYPES | agent_runner.MODEL_ONLY_TASK_TYPES),
+)
+def test_aider_refuses_non_mutating_task_types(task_type):
+    """aider has no read-only reviewer mode distinct from editing (unlike
+    Claude/Codex/Copilot's `--tools`/`--sandbox read-only`/`--allow-tool
+    read` profile), so it must refuse rather than silently either mutate
+    what a reviewer must not touch or produce an empty "success"."""
+    with pytest.raises(ValueError):
+        agent_runner.build_aider_command("x", task_type=task_type)
+
+
+def test_aider_prompt_is_a_single_argv_element_never_shell_interpreted():
+    prompt = "fix it; rm -rf / #$(whoami)`id`"
+    command = agent_runner.build_aider_command(prompt, task_type="implementation")
+    assert prompt in command, "the prompt must be one argv element, not spliced"
+    assert command[-1] == prompt
+
+
+def test_aider_preflight_reports_missing_binary(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _name: None)
+    available, message = agent_runner.aider_preflight()
+    assert available is False
+    assert "aider" in message
+
+
+def test_aider_preflight_reports_missing_ollama(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/aider" if name == agent_runner.AIDER_BINARY else None
+
+    monkeypatch.setattr(agent_runner.shutil, "which", fake_which)
+    available, message = agent_runner.aider_preflight()
+    assert available is False
+    assert "ollama" in message
+
+
+def test_aider_preflight_reports_unreachable_daemon(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv, returncode=1, stdout="", stderr="connection refused"
+        )
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+    available, message = agent_runner.aider_preflight()
+    assert available is False
+    assert "unreachable" in message
+
+
+def test_aider_preflight_available_when_binary_and_daemon_both_reachable(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout="qwen2.5-coder:14b\n", stderr=""
+        )
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+    available, message = agent_runner.aider_preflight()
+    assert available is True
 
 
 @pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
