@@ -1,0 +1,7 @@
+# PR-Agent (Qodo OSS) self-hosted review contour dependency
+# (VOYN-W0-AICC-PR-AGENT-INTEGRATION). Deliberately NOT merged into
+# requirements.txt: this is an optional control-plane tool invoked by
+# aicc-pr-agent-review.timer, not a dependency of the application itself,
+# exactly as requirements-companion.txt/requirements-gateway.txt keep their
+# own optional server contours separate.
+pr-agent>=0.45,<1.0

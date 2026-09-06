@@ -1,0 +1,17 @@
+# Schedule for aicc-pr-agent-review.service
+# (VOYN-W0-AICC-PR-AGENT-INTEGRATION).
+#
+# PR-Agent's findings are advisory, never a gate, so a missed or delayed
+# tick costs staleness, never correctness. The cadence matches
+# aicc-backlog-review.timer so both reviewers see a pull request's latest
+# head within the same window.
+
+[Unit]
+Description=Run the PR-Agent review tick periodically
+
+[Timer]
+OnBootSec=6min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
