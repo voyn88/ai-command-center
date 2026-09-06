@@ -105,6 +105,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    export = sub.add_parser(
+        "backlog-export",
+        help=(
+            "Render the canonical store as the master-file markdown "
+            "projection (the read format of backlog_client / the console's "
+            "Master Backlog panel)."
+        ),
+    )
+    export.add_argument(
+        "--output",
+        required=True,
+        help="Destination path; written atomically (tmp + rename), whole file.",
+    )
     plan = sub.add_parser(
         "backlog-plan",
         help="One planner tick (BO-S2): release finished lanes, dispatch "
@@ -413,6 +426,23 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{status}: {count}")
                 return 0
 
+            if args.command == "backlog-export":
+                from pathlib import Path as _Path
+
+                from command_center import projection_writer
+                from command_center.db import backlog_export
+
+                rows = backlog_export.fetch_rows(conn)
+                # Atomic whole-file replace lives in projection_writer — a
+                # reader (the console) must never see a half-written
+                # projection, and durable-write calls must stay out of this
+                # frozen-category module (AIOS boundary gate).
+                projection_writer.write_atomically(
+                    _Path(args.output), backlog_export.render_projection(rows)
+                )
+                print(f"rendered {len(rows)} records -> {args.output}")
+                return 0
+
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc
 
@@ -457,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
+                    reconcile_review_once,
                     review_once,
                 )
 
@@ -483,6 +514,16 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REVIEW    {task_id} -> {pr}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                retry_report = reconcile_review_once(
+                    lambda: _nc(conn),
+                    enqueue,
+                    args.repo_path,
+                    task_id=args.task_id,
+                )
+                for task_id, retry_key in retry_report.retried:
+                    print(f"RETRY     {task_id} -> {retry_key}")
+                for task_id, reason in retry_report.skipped:
+                    print(f"RETRY-SKIP {task_id}: {reason}")
                 marker_report = publish_review_verdicts(
                     lambda: _nc(conn), args.repo_path, task_id=args.task_id,
                     # The same queue writer review_once uses: a REJECT

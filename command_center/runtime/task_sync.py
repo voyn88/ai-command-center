@@ -231,7 +231,24 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
             models.set_current_stage(task, "Implementation")
             mutated = True
 
-    if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run:
+    # Gated on `run.finalized_at`, not just a terminal display `status`:
+    # `derive_status` maps the raw `run.state`, which a sync pass running in a
+    # *different* process from the one that launched the run (the UI, a
+    # backlog reconciliation pass, the debug CLI) can observe as terminal
+    # before finalization is durable — before the report exists and before the
+    # agent's work is committed. Applying terminal fields on that read would
+    # extract an empty/partial report+verdict+PR-url and then latch it via
+    # `terminal_projection_run_id`, which the idempotency check above uses to
+    # skip this run forever — so the task would never pick up the real
+    # terminal facts once finalization actually completes. Waiting for the
+    # marker means the resync *after* finalization is the one that projects
+    # them.
+    pending_finalization = (
+        status in session_view.TERMINAL_DISPLAY_STATUSES
+        and not already_finalized_for_this_run
+        and not run.get("finalized_at")
+    )
+    if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run and not pending_finalization:
         # Must run *before* `target_launch_status` is resolved below: a
         # `Completed` run's launch status depends on `task["progress"]`
         # *after* this call's own stage advancement, not before it.
@@ -320,7 +337,19 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         task.pop("failed_executors", None)
         mutated = True
 
-    if task.get("launch_status") != target_launch_status:
+    # `target_launch_status` may still be a genuinely terminal value here
+    # (e.g. `Failed`, `Needs Review`) for a `pending_finalization` run whose
+    # failure was never eligible for the executor-fallback rewrite above —
+    # that rewrite is the only thing allowed to move a terminal value while
+    # unfinalized, because it is based on `failure_reason`/`state`, which are
+    # durable at the same write that made the state terminal. Persisting any
+    # *other* terminal value here would latch it into `_TERMINAL_LAUNCH_
+    # STATUSES`, making `already_finalized_for_this_run` true on the next
+    # call and permanently skipping the terminal-field projection above once
+    # the run does finalize.
+    if pending_finalization and target_launch_status in _TERMINAL_LAUNCH_STATUSES:
+        pass
+    elif task.get("launch_status") != target_launch_status:
         task["launch_status"] = target_launch_status
         mutated = True
 

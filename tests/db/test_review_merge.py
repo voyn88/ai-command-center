@@ -310,6 +310,35 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch): 
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
+def test_merge_skips_a_self_issued_marker_that_only_differs_by_login_case(rig, monkeypatch):  # noqa: F811, E501
+    """GitHub logins are case-insensitive -- `Dimastov-Lab` and
+    `dimastov-lab` are the same account. An exact-string comparison would
+    let a same-account marker through whenever the PR author and the
+    review author fields happened to differ only in casing, which is
+    exactly the gap `scripts/assert_independent_acceptance.py`'s own
+    `casefold()`'d comparison already closes on the CI side."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1B2", "https://github.com/x/y/pull/25")
+    head = "e" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "Dimastov-Lab"},
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": "dimastov-lab"}}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1B2", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1B2",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
 def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):  # noqa: F811, E501
     """The positive case of the same check: a genuinely independent
     reviewer login (the acceptance bot's, in production) does authorize
@@ -485,6 +514,95 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
+
+
+def test_merge_skips_a_dismissed_review_even_when_it_is_the_only_one(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-REVIEWER-IDENTITY-INDEPENDENCE: a DISMISSED review no
+    longer represents its author's position (matching
+    `scripts/assert_independent_acceptance.py`'s `evaluate`, which drops
+    `state == DISMISSED` acceptances the same way). Unlike the superseded-
+    by-a-newer-review case above, a dismissed marker has no successor to be
+    outranked by -- it must still not authorize merge just for being the
+    only review left in the array."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M6", "https://github.com/x/y/pull/23")
+    head = "8" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "reviews": [
+                {
+                    "body": f"ACCEPTANCE: ACCEPT {head}",
+                    "submittedAt": "2026-01-01T00:00:00Z",
+                    "state": "DISMISSED",
+                    "author": {"login": "voyn88-acceptance-gate[bot]"},
+                },
+            ],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M6", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M6",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_falls_back_to_an_earlier_live_review_past_a_dismissed_one(rig, monkeypatch):  # noqa: F811, E501
+    """A DISMISSED review is excluded from ranking entirely rather than
+    merely losing to whatever is newest: an earlier, still-live ACCEPT from
+    an independent reviewer authorizes merge even though a later review on
+    the same head was dismissed."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M7", "https://github.com/x/y/pull/24")
+    head = "7" * 40
+
+    merge_oid = "6" * 40
+    merged_state = {"merged": False}
+
+    def fake_gh(argv, repo):
+        import subprocess
+        reviews = [
+            {
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "submittedAt": "2026-01-01T00:00:00Z",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            },
+            {
+                "body": "Hold on, let me take another look.",
+                "submittedAt": "2026-01-02T00:00:00Z",
+                "state": "DISMISSED",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            },
+        ]
+        if argv[:2] == ["pr", "view"]:
+            if merged_state["merged"]:
+                body = json.dumps({
+                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                    "headRefOid": head, "author": {"login": "dimastov-lab"},
+                    "reviews": reviews,
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            else:
+                body = json.dumps({
+                    "state": "OPEN", "headRefOid": head,
+                    "author": {"login": "dimastov-lab"},
+                    "reviews": reviews,
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "merge"]:
+            merged_state["merged"] = True
+            return subprocess.CompletedProcess(argv, 0, "merged", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M7", merge_oid) in report.merged
 
 
 def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811, E501
@@ -1401,6 +1519,32 @@ def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_
     assert any(f"AUTO-ACCEPT-AUDIT {head}" in argv[-1] for argv in fake_gh.posted_comments)
 
 
+def test_chunk_review_rows_is_empty_for_a_single_chunk_review(rig, monkeypatch):  # noqa: F811
+    """A single-chunk review is stored under the plain review-cycle key
+    (`review_once` only mints a `:chunk:`-suffixed key when `chunk.count >
+    1`), so `_chunk_review_rows`' prefix match against that suffix must come
+    back empty for it -- never a spurious one-row "chunk" result. That
+    distinction is exactly what routes a single-chunk REJECT through
+    `publish_review_verdicts`' plain-result branch (which itself enqueues
+    verification for ANY REJECT) instead of the chunk-aggregation branch,
+    which is the only branch review_once historically fed eagerly. Nothing
+    here mocks `_chunk_review_rows` itself, unlike `_force_chunk_reject`
+    above -- this exercises the real prefix match a single-chunk review
+    result rows through."""
+    app_factory, _store, worker = rig
+    task_id, pr_url, head = "VOYN-W0-ADJ-CR", "https://github.com/x/repo-d2/pull/29", "8" * 40
+    _ready(_store, app_factory, task_id, pr_url)
+    _complete_review(
+        app_factory, worker, task_id, pr_url, head,
+        f"Some finding.\nVERDICT: REJECT\nHEAD_SHA: {head}\n",
+    )
+    prefix, rows = review_merge._chunk_review_rows(
+        app_factory, task_id, pr_url, _snapshot(head)
+    )
+    assert prefix is not None
+    assert rows == []
+
+
 def test_verification_key_is_scoped_by_head_and_findings():
     snap_a = _snapshot("a" * 40)
     key = review_merge._verification_key("T", "https://github.com/x/y/pull/1", snap_a, "f1")
@@ -1717,28 +1861,28 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
 
 def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch):
     """After the marker is posted, the failing pull_request-triggered
-    Acceptance-gate run for the exact head is re-run so branch protection stops
-    seeing a red required check. (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)"""
+    Acceptance-gate run for the exact head AND this PR's own number is
+    re-run so branch protection stops seeing a red required check.
+    (VOYN-W0-AICC-ACCEPTANCE-GATE-AUTO-REEVAL)"""
     import subprocess
 
     sha = "a" * 40
     reran = []
-
-    branches = []
+    api_calls = []
 
     def fake_gh(argv, repo):
-        if argv[:2] == ["pr", "view"]:
-            return subprocess.CompletedProcess(
-                argv, 0, json.dumps({"headRefName": "feature/x"}), "")
-        if argv[:2] == ["run", "list"]:
-            branches.append(argv)  # must be scoped to the PR's branch
+        if argv[0] == "api":
+            api_calls.append(argv[1])
             body = json.dumps([
-                {"databaseId": 111, "headSha": sha, "event": "pull_request",
-                 "status": "completed", "conclusion": "failure"},
-                {"databaseId": 222, "headSha": sha, "event": "pull_request_review",
-                 "status": "completed", "conclusion": "success"},
-                {"databaseId": 333, "headSha": "b" * 40, "event": "pull_request",
-                 "status": "completed", "conclusion": "failure"},
+                {"id": 111, "status": "completed", "conclusion": "failure",
+                 "pull_requests": [{"number": 1}]},
+                {"id": 222, "status": "completed", "conclusion": "success",
+                 "pull_requests": [{"number": 1}]},
+                # Same head sha, but a DIFFERENT pull request (e.g. the same
+                # branch opened against a second base branch) -- must never
+                # be picked, even though sha and workflow both match.
+                {"id": 333, "status": "completed", "conclusion": "failure",
+                 "pull_requests": [{"number": 2}]},
             ])
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["run", "rerun"]:
@@ -1748,8 +1892,143 @@ def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/1", sha)
-    assert reran == ["111"]  # only the failing pull_request run for THIS head
-    assert branches and "--branch" in branches[0] and "feature/x" in branches[0]
+    assert reran == ["111"]  # only PR #1's own failing pull_request run
+    assert api_calls and f"head_sha={sha}" in api_calls[0]
+    assert "actions/workflows/acceptance-gate.yml/runs" in api_calls[0]
+    assert "event=pull_request" in api_calls[0]
+
+
+def test_marker_post_rerun_ignores_a_different_prs_run_on_the_same_sha(monkeypatch):
+    """Two PRs can share both a head sha and a head branch name when the
+    same branch is opened against two different base branches in the same
+    repo -- live defect confirmed by adversarial review of 487a78a. Only
+    THIS pull request's own failing run may ever be re-run; a same-sha
+    run belonging to a different PR number is left untouched, even when it
+    is the only failing run returned."""
+    import subprocess
+
+    sha = "c" * 40
+    reran = []
+
+    def fake_gh(argv, repo):
+        if argv[0] == "api":
+            body = json.dumps([
+                {"id": 999, "status": "completed", "conclusion": "failure",
+                 "pull_requests": [{"number": 42}]},  # belongs to a different PR
+            ])
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "rerun"]:
+            reran.append(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/7", sha)
+    assert reran == []
+
+
+def test_marker_post_rerun_paginates_past_the_first_page(monkeypatch):
+    """The intended run must not be missed just because it lands on a later
+    page -- a fixed client-side run-count limit was the earlier defect
+    (review of 487a78a). A full first page of non-matching runs is walked
+    before the matching run on page 2 is found and rerun."""
+    import subprocess
+
+    sha = "d" * 40
+    reran = []
+    pages_requested = []
+
+    def fake_gh(argv, repo):
+        if argv[0] == "api":
+            endpoint = argv[1]
+            page = int(endpoint.rsplit("page=", 1)[1])
+            pages_requested.append(page)
+            if page == 1:
+                filler = [
+                    {"id": i, "status": "completed", "conclusion": "success",
+                     "pull_requests": [{"number": 5}]}
+                    for i in range(100)
+                ]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(filler), "")
+            body = json.dumps([
+                {"id": 555, "status": "completed", "conclusion": "failure",
+                 "pull_requests": [{"number": 5}]},
+            ])
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "rerun"]:
+            reran.append(argv[2])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    review_merge._rerun_failing_acceptance_gate("/tmp", "https://github.com/x/y/pull/5", sha)
+    assert reran == ["555"]
+    assert pages_requested == [1, 2]
+
+
+def test_out_of_band_acceptance_pairs_marker_with_gate_rerun(monkeypatch):
+    """The one entry point for lanes outside the tick composes exactly the
+    tick's own pair: marker first, then the gate rerun for the same head --
+    an out-of-band marker without the rerun left five armed auto-merges
+    outside the merge queue (live, 2026-09-02).
+    (VOYN-W0-AICC-GATE-RED-SUITE-HOLDS-QUEUE-ENTRY)"""
+    sha = "a" * 40
+    calls = []
+    monkeypatch.setattr(
+        review_merge,
+        "_post_marker_as_bot",
+        lambda creds, pr_url, decision, marker_sha: (
+            calls.append(("marker", decision, marker_sha)) or (True, "")
+        ),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_rerun_failing_acceptance_gate",
+        lambda repo_path, pr_url, rerun_sha: calls.append(("rerun", rerun_sha)),
+    )
+
+    ok, reason = review_merge.publish_out_of_band_acceptance(
+        object(), "/tmp", "https://github.com/x/y/pull/1", "ACCEPT", sha
+    )
+
+    assert (ok, reason) == (True, "")
+    assert calls == [("marker", "ACCEPT", sha), ("rerun", sha)]
+
+
+def test_out_of_band_rejection_posts_marker_without_rerun(monkeypatch):
+    """A REJECT marker agrees with the red run; re-running the gate would
+    only spend a runner re-confirming the refusal, and a failed marker post
+    must not trigger any rerun at all."""
+    calls = []
+    monkeypatch.setattr(
+        review_merge,
+        "_post_marker_as_bot",
+        lambda creds, pr_url, decision, sha: (
+            calls.append(("marker", decision)) or (True, "")
+        ),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_rerun_failing_acceptance_gate",
+        lambda *a: calls.append(("rerun",)),
+    )
+
+    ok, _ = review_merge.publish_out_of_band_acceptance(
+        object(), "/tmp", "https://github.com/x/y/pull/1", "REJECT", "b" * 40
+    )
+    assert ok and calls == [("marker", "REJECT")]
+
+    calls.clear()
+    monkeypatch.setattr(
+        review_merge,
+        "_post_marker_as_bot",
+        lambda creds, pr_url, decision, sha: (False, "app_auth_failed: x"),
+    )
+    ok, reason = review_merge.publish_out_of_band_acceptance(
+        object(), "/tmp", "https://github.com/x/y/pull/1", "ACCEPT", "b" * 40
+    )
+    assert (ok, reason) == (False, "app_auth_failed: x")
+    assert calls == []
 
 
 # --- VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY + CI-FLAKE-AUTO-RERUN -----
@@ -1849,6 +2128,14 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
                  "conclusion": "failure", "attempt": 1},
                 {"databaseId": 14, "headSha": head, "status": "in_progress",
                  "conclusion": None, "attempt": 1},
+                # Concurrency-cancelled required run: strands the head out
+                # of the merge queue exactly like a failure (live: PR #602)
+                # and must get a FULL rerun -- `--failed` would rerun
+                # nothing, a cancelled run has no failed jobs.
+                {"databaseId": 15, "headSha": head, "status": "completed",
+                 "conclusion": "cancelled", "attempt": 1},
+                {"databaseId": 16, "headSha": head, "status": "completed",
+                 "conclusion": "cancelled", "attempt": 2},
             ]), "")
         if argv[:2] == ["run", "rerun"]:
             reruns.append(argv)
@@ -1858,8 +2145,11 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     skip = dict(report.skipped)["VOYN-W0-MF"]
-    assert skip.startswith("checks_not_green") and "flaky_rerun_dispatched:1" in skip
-    assert reruns == [["run", "rerun", "11", "--failed"]]
+    assert skip.startswith("checks_not_green") and "flaky_rerun_dispatched:2" in skip
+    assert reruns == [
+        ["run", "rerun", "11", "--failed"],
+        ["run", "rerun", "15"],
+    ]
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MF",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
