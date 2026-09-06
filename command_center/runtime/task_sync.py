@@ -20,6 +20,8 @@ implies progress == 100" and the literal shape of the reported defect
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from command_center import models, project_config, report_parser
 from command_center.runtime import completion as completion_states
 from command_center.runtime import db, providers, reports, session_view
@@ -40,9 +42,9 @@ _LAUNCH_STATUS_BY_DISPLAY_STATUS: dict[str, str] = {
     # They map to the active Kanban launch statuses ("Launching"/"Running"),
     # never to a terminal one: a successfully spawned run must never flip its
     # task to Failed/Requires-Attention merely because early output or a fresh
-    # probe has not arrived. Because neither is in
-    # `session_view.TERMINAL_DISPLAY_STATUSES`, `_apply_terminal_fields` never
-    # runs for them either.
+    # probe has not arrived. Both derive from the persisted `RUNNING` state,
+    # which is never in `db.TERMINAL_STATES`, so `_apply_terminal_fields`
+    # never runs for them either.
     session_view.STATUS_STARTING: "Launching",
     session_view.STATUS_RUNNING: "Running",
     session_view.STATUS_STALE: "Running",
@@ -86,6 +88,71 @@ _COMPLETION_REJECTION_STATES = frozenset(
 # Launch statuses that assert the delivered work landed. A rejected completion
 # must not be allowed to keep hiding behind one of these.
 _SUCCESS_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review"})
+
+# --- P0 remediation: terminal state published before finalization (VOYN-W0-
+# AICC-FLAKE-03) --------------------------------------------------------
+# How long past `completed_at` an unfinalized terminal run is still treated as
+# "in flight" rather than safe to project. `db.mark_run_finalized` is always
+# the *last* write of every finalization path (report, auto-commit, terminal
+# `run_event`s — see `run_finalizer.RunFinalizer.mark_finalized`), so its
+# presence is the authoritative signal. Its absence right after a run goes
+# terminal is the exact race this remediation closes: this grace period is a
+# compatibility floor under that signal, not a replacement for it — see
+# `_run_is_finalized_for_sync`. Five minutes is orders of magnitude past the
+# measured finalization window (6-152 ms, `schema._migration_24_add_
+# finalized_at`), so it never races a genuine in-flight finalization.
+_FINALIZATION_COMPATIBILITY_GRACE_SECONDS = 300.0
+
+
+def _seconds_since(timestamp: str | None, *, now: datetime) -> float | None:
+    """`now - timestamp` for a `models.iso_now()`-format string (naive local
+    time, second precision — see that function's docstring for why this
+    deliberately does not normalize to UTC: every timestamp this project
+    writes, including `now`, uses the same convention, so the delta is
+    correct without conversion). `None` for an unset or unparsable value —
+    never raises."""
+    if not timestamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except (ValueError, TypeError):
+        return None
+    return (now - parsed).total_seconds()
+
+
+def _run_is_finalized_for_sync(run: dict, *, now: datetime | None = None) -> bool:
+    """Whether `run`'s terminal facts (report row, auto-commit, result text —
+    everything `_apply_terminal_fields`/completion seeding read) are durable
+    and safe to project onto its task.
+
+    `run["finalized_at"]` is the authoritative signal: it is always the last
+    write of every finalization path, so its presence proves the report, the
+    auto-commit and the terminal `run_event`s are already durable. Its
+    absence immediately after a run reaches a terminal state is the exact
+    race this remediation exists to close — treated as "not yet safe", not as
+    grounds to strand the task; the caller defers and a later sync pass picks
+    it up once the marker lands.
+
+    But the column is nullable and **never backfilled** (`schema.
+    _migration_24_add_finalized_at`: "a pre-existing row finalized under a
+    supervisor that recorded nothing, and stamping it now would assert
+    durable evidence that was never checked") — so two classes of row carry
+    `None` forever: a legacy pre-migration-24 row, and any row finalized
+    before `RunFinalizer.mark_finalized` existed. Gating those shut
+    permanently would strand their tasks' terminal projection forever, which
+    is the regression this compatibility rule exists to avoid. Once a
+    terminal run's `completed_at` is older than
+    `_FINALIZATION_COMPATIBILITY_GRACE_SECONDS`, treat it as safe regardless
+    of the marker: either it is one of those historical rows, or it was
+    killed mid-finalization and this is the honest ceiling before its task
+    stops waiting for evidence that will never arrive.
+    """
+    if run.get("finalized_at"):
+        return True
+    elapsed = _seconds_since(run.get("completed_at"), now=now or datetime.now())
+    if elapsed is None:
+        return False
+    return elapsed >= _FINALIZATION_COMPATIBILITY_GRACE_SECONDS
 
 
 def _resolve_target_launch_status(status: str, task: dict) -> str:
@@ -189,10 +256,18 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     status = session_view.derive_status(run)
     mutated = False
 
+    # Gated on the *persisted* `run["state"]` (`db.TERMINAL_STATES`), not the
+    # display-only `status` (`session_view.TERMINAL_DISPLAY_STATUSES`):
+    # `INTERRUPTED`/`UNKNOWN` are terminal database states that both derive to
+    # the non-terminal-looking display `Requires Attention`, which is absent
+    # from that display set. Gating on the display set let an unfinalized
+    # interrupted/unknown run fall through every guard below untouched.
+    run_is_terminal = run.get("state") in db.TERMINAL_STATES
+
     is_new_run_for_task = task.get("current_run_id") != run["id"]
     if (
         not is_new_run_for_task
-        and status in session_view.TERMINAL_DISPLAY_STATUSES
+        and run_is_terminal
         and task.get("terminal_projection_run_id") == run["id"]
     ):
         return False
@@ -231,7 +306,19 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
             models.set_current_stage(task, "Implementation")
             mutated = True
 
-    if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run:
+    if run_is_terminal and not _run_is_finalized_for_sync(run):
+        # The run has exited but its report, auto-commit and terminal events
+        # are not yet proven durable (VOYN-W0-AICC-FLAKE-03) — every
+        # terminal-only effect below (terminal-field projection, launch-status
+        # resolution, executor failover/relaunch, timeline events) reads facts
+        # that may not exist yet. Defer the whole terminal branch to a later
+        # sync pass; only the bookkeeping already applied above (current_run_id
+        # pointer, RUNNING progress advancement) is safe to keep.
+        if mutated:
+            task["updated_at"] = models.iso_now()
+        return mutated
+
+    if run_is_terminal and not already_finalized_for_this_run:
         # Must run *before* `target_launch_status` is resolved below: a
         # `Completed` run's launch status depends on `task["progress"]`
         # *after* this call's own stage advancement, not before it.
@@ -483,6 +570,15 @@ def _seed_and_project_completion(
     completion = db.get_completion(api.db_path, run["id"])
     if completion is None:
         if run.get("state") != "COMPLETED":
+            return False
+        if not _run_is_finalized_for_sync(run):
+            # Seeding reads the *live* repository HEAD (`begin_completion` ->
+            # `repo_state.head_commit`) as the completion's starting commit.
+            # Before finalization that HEAD may not yet include the run's own
+            # auto-commit — the same terminal-state-before-finalization race
+            # `sync_task_from_run` guards against (VOYN-W0-AICC-FLAKE-03).
+            # Defer seeding to a later sync pass rather than seed against a
+            # commit the finalizing auto-commit is about to move past.
             return False
         cfg = project_config.get_project_config(run["project"])
         completion = CompletionOrchestrator(api.db_path).begin_completion(
