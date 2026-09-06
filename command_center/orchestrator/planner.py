@@ -51,7 +51,10 @@ class PlanLimits:
     #: executing *right now* and disappear before its PR is reviewed; using
     #: them as the sole WIP measure allowed every later tick to publish four
     #: more PRs. READY_TO_REVIEW is the durable handoff state and therefore
-    #: the planner's authoritative review-backlog fence.
+    #: the planner's authoritative review-backlog fence on new dispatch --
+    #: it gates candidate selection only, matching `max_resumes_per_tick`'s
+    #: own convention in this class: 0 disables the fence rather than
+    #: coercing to a threshold of 1.
     review_backlog_limit: int = 8
 
 
@@ -198,22 +201,6 @@ class Planner:
             ):
                 report.ingested.append((task_id, action))
 
-            # The writer-lease WIP bound below protects concurrent repository
-            # mutation, not delivery throughput.  Stop before selecting or
-            # resuming more implementation work while completed PRs already
-            # fill the persistent review window.  Count tasks rather than
-            # evidence rows: one task may carry multiple immutable PR facts.
-            review_rows = self._rows(
-                "SELECT count(DISTINCT t.task_id) FROM backlog_task t "
-                "JOIN backlog_evidence e ON e.task_id = t.task_id "
-                "AND e.kind = 'pr' "
-                "WHERE t.status = 'READY_TO_REVIEW'"
-            )
-            review_backlog = int(review_rows[0][0]) if review_rows else 0
-            if review_backlog >= max(limits.review_backlog_limit, 1):
-                report.review_window_full = review_backlog
-                return report
-
             # Reconcile technical DEFER_TO_USER parks back to OPEN (VOYN-W0-
             # AICC-DEFER-AUTO-RESUME) before selecting candidates, so a
             # resumed task is eligible in this very tick. The candidate query
@@ -267,7 +254,27 @@ class Planner:
                     if ok:
                         report.resumed.append((task_id, park_reason))
 
-            candidates = self._rows(
+            # The writer-lease WIP bound below protects concurrent repository
+            # mutation, not delivery throughput. Stop before selecting more
+            # implementation work while completed PRs already fill the
+            # persistent review window -- but only new dispatch: this fence
+            # must not also freeze the DEFER_TO_USER resume reconciliation
+            # above, which doesn't dispatch anything or consume review
+            # capacity. Count tasks rather than evidence rows: one task may
+            # carry multiple immutable PR facts.
+            window_full = False
+            if limits.review_backlog_limit > 0:
+                review_rows = self._rows(
+                    "SELECT count(DISTINCT t.task_id) FROM backlog_task t "
+                    "JOIN backlog_evidence e ON e.task_id = t.task_id "
+                    "AND e.kind = 'pr' "
+                    "WHERE t.status = 'READY_TO_REVIEW'"
+                )
+                review_backlog = int(review_rows[0][0]) if review_rows else 0
+                if review_backlog >= limits.review_backlog_limit:
+                    report.review_window_full = review_backlog
+                    window_full = True
+            candidates = [] if window_full else self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable "
                 "FROM backlog_eligible"
             )

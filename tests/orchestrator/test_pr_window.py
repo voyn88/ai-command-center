@@ -43,14 +43,20 @@ def _pr(
     }
 
 
-def _fake_github(monkeypatch, prs):
+def _fake_github(monkeypatch, prs, *, commit_dates: dict[str, str] | None = None):
     edits: list[list[str]] = []
+    commit_dates = commit_dates or {}
 
     def fake(argv, _repo):
         if argv[:2] == ["label", "create"]:
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:3] == ["pr", "list", "--state"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps(prs), "")
+        if argv[:1] == ["api"]:
+            sha = argv[1].rsplit("/", 1)[-1]
+            if sha in commit_dates:
+                return subprocess.CompletedProcess(argv, 0, commit_dates[sha], "")
+            return subprocess.CompletedProcess(argv, 1, "", "not found")
         if argv[:2] == ["pr", "edit"]:
             edits.append(list(argv))
             target = next(pr for pr in prs if pr["url"] == argv[2])
@@ -240,6 +246,28 @@ def test_rfc3339_z_timestamp_keeps_fresh_pr_inside_grace_period():
         review_merge.PrWindowConfig(stale_seconds=60),
         NOW,
     ) is None
+
+
+def test_truncated_commits_page_falls_back_to_direct_head_commit_lookup(monkeypatch):
+    # A PR with more commits than one GraphQL page holds -- `commits` here
+    # carries only an older commit, never `HEAD`, exactly as `gh pr list
+    # --json commits` would return for such a PR (oldest-first, one page).
+    active = _pr(1, labels=("queue-active",), accepted=False, created="2026-09-06T01:00:00Z")
+    active["commits"] = [{"oid": "b" * 40, "committedDate": "2026-09-01T00:00:00Z"}]
+    _fake_github(monkeypatch, [active], commit_dates={HEAD: "2026-09-06T02:59:30Z"})
+
+    report = review_merge.reconcile_pr_window(
+        "/repo",
+        review_merge.PrWindowConfig(target_active=1, max_active=2, stale_seconds=60),
+        now=NOW,
+    )
+
+    # If age had fallen back to `createdAt` (2026-09-06T01:00:00Z, 3600s old)
+    # this PR would be well past the 60s stale threshold and demoted; the
+    # direct head-commit lookup instead anchors it to 30s old, still fresh.
+    assert report.demoted == []
+    assert report.blocked == []
+    assert report.unchanged == ["1"]
 
 
 def test_label_write_cannot_reset_stale_clock_or_flap_pr_active(monkeypatch):

@@ -128,7 +128,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--review-backlog-limit",
         type=int,
         default=8,
-        help="Do not dispatch while this many tasks await PR review (default 8).",
+        help="Do not dispatch while this many tasks await PR review "
+        "(default 8; 0 disables the fence).",
     )
     plan.add_argument(
         "--dry-run",

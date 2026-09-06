@@ -958,3 +958,45 @@ def test_durable_review_backlog_stops_new_implementation_dispatch(rig) -> None:
     with app_factory() as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM work_item_public")
         assert cur.fetchone()[0] == 0
+
+
+def test_full_review_window_does_not_freeze_deferred_resume(rig) -> None:
+    """The review-backlog fence gates new dispatch only. A parked task that
+    needs no review slot -- it isn't being dispatched, only un-parked -- must
+    keep draining even while the fence blocks fresh candidates; otherwise a
+    backlog that's merely slow to review would also strand every technically
+    parked task for as long as it stays full."""
+    app_factory, store, worker = rig
+    _park_technically(app_factory, store, worker, "VOYN-W0-PRWIN-RESUME")
+    for index in range(2):
+        task_id = f"VOYN-W0-PRWIN-FULL-{index}"
+        assert store.upsert_task(_task(task_id, repo=f"repo-{index}"))[0]
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            revision = cur.fetchone()[0]
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)",
+                (task_id, revision),
+            )
+            cur.execute(
+                "SELECT backlog_record_evidence(%s,'pr',%s)",
+                (task_id, f"https://github.com/o/r/pull/{index + 1}"),
+            )
+            cur.execute("SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,))
+            revision = cur.fetchone()[0]
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)",
+                (task_id, revision),
+            )
+            conn.commit()
+
+    report = plan_once(
+        app_factory,
+        PlanLimits(planner="window-planner-resume", review_backlog_limit=2),
+    )
+
+    assert report.review_window_full == 2
+    assert report.dispatched == []
+    resumed_ids = [task_id for task_id, _reason in report.resumed]
+    assert "VOYN-W0-PRWIN-RESUME" in resumed_ids
+    assert store.get_task("VOYN-W0-PRWIN-RESUME")["status"] in ("OPEN", "IN_PROGRESS")

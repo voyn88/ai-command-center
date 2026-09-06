@@ -413,6 +413,38 @@ _FAILED_CHECK_CONCLUSIONS = {
 }
 
 
+def _head_commit_committed_date(repo_path: str, pr: dict[str, Any]) -> str | None:
+    """Look up the head commit's committer date directly by SHA via the
+    single-commit REST endpoint, which returns exactly that commit
+    regardless of how many commits the pull request has in total.
+
+    `gh pr list --json commits` returns one GraphQL page of the PR's
+    commits, oldest first -- a PR with more commits than that page holds
+    never includes `headRefOid` in it at all. That is not an edge case
+    here: this pipeline's own workers push many small fixup commits per
+    task across retries/dispatches. `_pr_age_seconds` falling back to
+    `createdAt` for those PRs would silently re-measure age from PR
+    creation instead of the last real push -- exactly the failure mode it
+    exists to avoid. One extra call per PR whose returned page happens to
+    miss the head, bounded by the same scan_limit as everything else in
+    `reconcile_pr_window`; PRs whose page already includes the head (the
+    common case) never pay it.
+    """
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    head = str(pr.get("headRefOid") or "")
+    if parsed is None or not head:
+        return None
+    owner, repo, _number = parsed
+    result = _gh(
+        ["api", f"repos/{owner}/{repo}/commits/{head}", "--jq", ".commit.committer.date"],
+        repo_path,
+    )
+    if result.returncode != 0:
+        return None
+    date = result.stdout.strip()
+    return date or None
+
+
 def _pr_age_seconds(pr: dict[str, Any], now: datetime) -> float:
     # GitHub bumps PR.updatedAt for label writes, including this reconciler's
     # own writes. It is therefore not a clock: using it makes a demotion reset
@@ -588,6 +620,13 @@ def reconcile_pr_window(
         return report
     observed = now or datetime.now(UTC)
     prs = [pr for pr in decoded if isinstance(pr, dict) and pr.get("state") == "OPEN"]
+    for pr in prs:
+        head = str(pr.get("headRefOid") or "")
+        commits = [item for item in pr.get("commits") or [] if isinstance(item, dict)]
+        if head and not any(str(item.get("oid") or "") == head for item in commits):
+            date = _head_commit_committed_date(repo_path, pr)
+            if date:
+                pr["commits"] = [*commits, {"oid": head, "committedDate": date}]
     reasons = {str(pr.get("url")): _window_block_reason(pr, cfg, observed) for pr in prs}
     eligible = [pr for pr in prs if reasons[str(pr.get("url"))] is None]
     eligible.sort(key=lambda pr: (str(pr.get("createdAt") or ""), int(pr.get("number") or 0)))
