@@ -18,6 +18,7 @@ import pytest
 
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
+from command_center.worker import prepush_prescreen
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
 
@@ -140,6 +141,16 @@ def handler(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         workspace_provisioning, "remove_workspace", lambda *a, **kw: "removed"
+    )
+    # The prescreen is a real subprocess-shelling seam (ruff, git, pytest, an
+    # optional ollama/aider binary) -- faked here at the same module-seam
+    # level as `run_claude_code`/provisioning above, so the default fixture
+    # stays hermetic. Its own subprocess plumbing is covered directly in
+    # tests/worker/test_prepush_prescreen.py.
+    monkeypatch.setattr(
+        prepush_prescreen,
+        "run_prepush_prescreen",
+        lambda *a, **kw: prepush_prescreen.PrescreenReport(),
     )
     # The writer-lease gate is a real external seam: it shells out to the
     # lease tool whenever VOYN_LEASE_DSN names an authority, and this host
@@ -1102,6 +1113,65 @@ def test_publish_falls_back_to_project_id_without_a_backlog_task_id(
 
     run_agent(_payload(task_type="implementation"), _event(), 1)
     assert captured[0].task == "proj"  # _payload()'s project_id
+
+
+def test_prescreen_runs_before_push_scoped_to_workspace_and_base_sha(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-PREPUSH-LOCAL-PRESCREEN: before checkpointing/pushing a
+    mutating task's branch, the worker runs a bounded local prescreen against
+    the exact isolated workspace that is about to be published, scoped to
+    what this task changed (`evidence.base_sha`) -- and its report must reach
+    the outcome so it is visible without digging through logs."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    monkeypatch.setattr(
+        handlers_module,
+        "publish_run",
+        lambda repository, cfg: PublishResult(ok=True, branch=f"backlog/{cfg.task}"),
+    )
+    calls: list = []
+
+    def fake_prescreen(workspace, *, base_sha=None, time_budget_seconds=None):
+        calls.append({"workspace": Path(workspace), "base_sha": base_sha})
+        return prepush_prescreen.PrescreenReport(
+            steps=[prepush_prescreen.StepResult("ruff", ran=True, passed=True)]
+        )
+
+    monkeypatch.setattr(prepush_prescreen, "run_prepush_prescreen", fake_prescreen)
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-REAL-TASK"),
+        _event(),
+        1,
+    )
+    assert outcome.ok
+    assert len(calls) == 1
+    assert calls[0]["workspace"] == isolated_path(tmp_path, "VOYN-W0-REAL-TASK")
+    assert calls[0]["base_sha"] == "0" * 40  # _FakeEvidence.base_sha
+    assert outcome.result["prepush_prescreen"]["summary"] == "prescreen: 1/1 steps clean"
+
+
+def test_prescreen_not_invoked_without_a_publish_deploy_key(
+    handler, monkeypatch
+) -> None:
+    """Local-only mode (no `AICC_PUBLISH_DEPLOY_KEY`) never pushes, so there is
+    nothing for a pre-*push* prescreen to protect -- it must not run there."""
+    run_agent, _runs = handler
+    monkeypatch.delenv("AICC_PUBLISH_DEPLOY_KEY", raising=False)
+    calls: list = []
+    monkeypatch.setattr(
+        prepush_prescreen,
+        "run_prepush_prescreen",
+        lambda *a, **kw: calls.append((a, kw)) or prepush_prescreen.PrescreenReport(),
+    )
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert outcome.ok
+    assert calls == []
+    assert "prepush_prescreen" not in outcome.result
 
 
 def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:

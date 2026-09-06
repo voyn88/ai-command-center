@@ -45,7 +45,7 @@ from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
 from command_center.orchestrator.publish import PublishConfig, publish_run
-from command_center.worker import writer_lease
+from command_center.worker import prepush_prescreen, writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
@@ -983,6 +983,18 @@ def _run_agent(
                     reason="guarded publish authority is incomplete",
                     retryable=True,
                 )
+            # VOYN-W0-AICC-PREPUSH-LOCAL-PRESCREEN: a bounded, best-effort local
+            # pass over the agent's own (still dirty) workspace, run before the
+            # checkpoint commit below so any ruff/aider fix it applies is swept
+            # into that same commit rather than needing one of its own. Runs
+            # only on the path that is actually about to push -- the local-only
+            # (`deploy_key` unset) branch further down never publishes, so there
+            # is nothing here for a prescreen to protect. Never raises and never
+            # blocks: `prepush_prescreen.run_prepush_prescreen`'s contract is
+            # advisory-only, matching `command_center.audit.checks.base.Check`.
+            result["prepush_prescreen"] = prepush_prescreen.run_prepush_prescreen(
+                run_repository, base_sha=evidence.base_sha
+            ).as_payload()
             try:
                 candidate_sha, checkpointed_dirty_worktree = (
                     workspace_provisioning.checkpoint_dirty_task_workspace(
