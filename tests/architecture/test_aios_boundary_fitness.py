@@ -197,20 +197,161 @@ def test_a_file_backed_store_is_an_engine_even_with_no_driver():
 
 
 def test_corroboration_leaves_the_uncorroborated_categories_alone():
-    """Two signatures are corroborated, not the gate.
+    """`orchestration` and `authz` still classify on the name alone.
 
-    `orchestration`, `authz` and `audit` names still classify on the name
-    alone: those tokens name what a module *is*, and unlike `memory` and
-    `queue` they have no behavioural substitute that could replace the name
-    without losing a home-grown engine.
+    Those tokens name what a module *is*, and unlike `memory`/`queue`/`audit`
+    they have no behavioural substitute and no positively-validated exemption
+    that could replace the name without losing a home-grown engine.
     """
     empty = ast.parse("")
     for path, category in (
         ("command_center/task_scheduler.py", "orchestration"),
         ("command_center/rbac_rules.py", "authz"),
-        ("command_center/audit_trail.py", "audit"),
     ):
         assert category in boundary.classify_engine_categories(path, empty), path
+
+
+def test_an_audit_named_file_with_no_recognisable_shape_still_classifies():
+    """`audit` is corroborated narrowly: the default is still to classify.
+
+    Unlike `memory`/`queue`, an audit-named file with no behaviour at all (no
+    function, no mirror class, nothing) is not proven to be the one exempted
+    shape — a declarative `PostgresTableMirror` module — so it still
+    classifies, exactly as it did before corroboration existed.
+    """
+    empty = ast.parse("")
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/audit_trail.py", empty
+    )
+    docstring_only = ast.parse('"""An audit-named package with no mirrors."""\n__all__ = []\n')
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/audit/__init__.py", docstring_only
+    )
+
+
+def test_a_declarative_mirror_module_is_not_an_audit_engine():
+    """The false positive this corroboration exists to fix.
+
+    `db/audit_store.py` and `db/provenance_store.py` declare
+    `PostgresTableMirror` tables over rows that already exist elsewhere, add no
+    audit capability, and could not rename away from the `audit`/`provenance`
+    tokens without becoming dishonest about what they mirror.
+    """
+    mirror_module = ast.parse(
+        "from __future__ import annotations\n"
+        "from command_center.db.mirror_support import ColumnCodec\n"
+        "from command_center.db.table_mirror import MirroredTable, PostgresTableMirror, divergence_against\n"
+        "\n"
+        "__all__ = ['AUDIT_RUN_COLUMNS', 'PostgresAuditRunMirror', 'audit_run_divergence']\n"
+        "\n"
+        "AUDIT_RUN_COLUMNS: tuple[str, ...] = ('id', 'status', 'checks_json')\n"
+        "\n"
+        "AUDIT_RUN = MirroredTable(\n"
+        "    table='audit_run',\n"
+        "    columns=AUDIT_RUN_COLUMNS,\n"
+        "    codec=ColumnCodec(json_values=frozenset({'checks_json'})),\n"
+        ")\n"
+        "\n"
+        "class PostgresAuditRunMirror(PostgresTableMirror):\n"
+        "    '''The `audit_run` table.'''\n"
+        "\n"
+        "    spec = AUDIT_RUN\n"
+        "\n"
+        "audit_run_divergence = divergence_against(AUDIT_RUN)\n"
+    )
+    assert boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", mirror_module
+    ) == set()
+
+
+def test_an_audit_mirror_module_cannot_hide_behaviour_behind_the_exemption():
+    """Regression cases for the rejected first attempt at this corroboration.
+
+    That version exempted any audit-named module lacking a top-level `def` and
+    any class not literally subclassing `PostgresTableMirror` — a blocklist
+    that a bare module-level call, a lambda, a registration, or a mirror
+    subclass with extra logic in its body could all walk around without ever
+    writing a `def`. The fix must be a positive allow-list of the exact
+    declarative shape, so every one of these still classifies as `audit` —
+    each starts from a base module that, by itself, *is* exempt (asserted
+    first as a control), and adds exactly one disqualifying construct.
+    """
+    base_mirror_module = (
+        "from command_center.db.table_mirror import MirroredTable, PostgresTableMirror\n"
+        "AUDIT_RUN = MirroredTable(table='audit_run', columns=('id',))\n"
+        "class PostgresAuditRunMirror(PostgresTableMirror):\n"
+        "    spec = AUDIT_RUN\n"
+    )
+    # Control: without any addition, this shape is the exemption.
+    assert (
+        boundary.classify_engine_categories(
+            "command_center/db/audit_store.py", ast.parse(base_mirror_module)
+        )
+        == set()
+    )
+
+    # A bare call at import time — no `def` anywhere, exactly the shape the
+    # first attempt's `def`-only check let through.
+    module_level_call = ast.parse(base_mirror_module + "run_audit()\n")
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", module_level_call
+    )
+
+    # SQL executed on import, not inside any function.
+    sql_at_import = ast.parse(
+        base_mirror_module + "import sqlite3\n"
+        "sqlite3.connect(':memory:').execute('SELECT 1')\n"
+    )
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", sql_at_import
+    )
+
+    # A registration side effect.
+    registration = ast.parse(base_mirror_module + "registry.register(AUDIT_RUN)\n")
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", registration
+    )
+
+    # A lambda bound to a name — never a `def`, never caught by a `def`-only check.
+    lambda_handler = ast.parse(base_mirror_module + "on_write = lambda row: publish(row)\n")
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", lambda_handler
+    )
+
+    # A side-effectful assignment: a call to something outside the declarative
+    # factory allow-list.
+    side_effectful_assign = ast.parse(base_mirror_module + "_ENGINE = start_background_worker()\n")
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", side_effectful_assign
+    )
+
+    # A `PostgresTableMirror` subclass whose body is more than `spec = ...` —
+    # the first attempt accepted *any* subclass regardless of body content.
+    mirror_with_method = ast.parse(
+        "from command_center.db.table_mirror import MirroredTable, PostgresTableMirror\n"
+        "AUDIT_RUN = MirroredTable(table='audit_run', columns=('id',))\n"
+        "class PostgresAuditRunMirror(PostgresTableMirror):\n"
+        "    spec = AUDIT_RUN\n"
+        "    def on_upsert(self, conn, row):\n"
+        "        conn.execute('NOTIFY audit_run')\n"
+    )
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", mirror_with_method
+    )
+
+    # A `PostgresTableMirror` subclass with a bare statement in its body that
+    # is not a function definition — the first attempt's non-mirror-class
+    # check looked only at bases, never at body content.
+    mirror_with_bare_statement = ast.parse(
+        "from command_center.db.table_mirror import MirroredTable, PostgresTableMirror\n"
+        "AUDIT_RUN = MirroredTable(table='audit_run', columns=('id',))\n"
+        "class PostgresAuditRunMirror(PostgresTableMirror):\n"
+        "    spec = AUDIT_RUN\n"
+        "    print('constructed')\n"
+    )
+    assert "audit" in boundary.classify_engine_categories(
+        "command_center/db/audit_store.py", mirror_with_bare_statement
+    )
 
 
 def test_the_second_public_distribution_is_confined_to_its_own_adapter():
