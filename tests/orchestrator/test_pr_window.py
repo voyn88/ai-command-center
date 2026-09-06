@@ -183,7 +183,7 @@ def test_embedded_rejection_text_cannot_evict_pr_from_active_window(monkeypatch)
     assert report.unchanged == ["1"]
 
 
-def test_only_latest_review_can_supply_independent_rejection(monkeypatch):
+def test_verdictless_followup_cannot_mask_a_standing_rejection(monkeypatch):
     rejected = _pr(1, labels=("queue-active",), created="2026-09-06T02:59:30Z")
     rejected["reviews"] = [
         {
@@ -198,6 +198,56 @@ def test_only_latest_review_can_supply_independent_rejection(monkeypatch):
         },
     ]
     _fake_github(monkeypatch, [rejected])
+
+    report = review_merge.reconcile_pr_window(
+        "/repo",
+        review_merge.PrWindowConfig(target_active=1, max_active=2),
+        now=NOW,
+    )
+
+    assert report.demoted == [("1", "acceptance_rejected")]
+
+
+def test_unrelated_third_party_comment_cannot_mask_a_standing_rejection(monkeypatch):
+    rejected = _pr(1, labels=("queue-active",), created="2026-09-06T02:59:30Z")
+    rejected["reviews"] = [
+        {
+            "body": f"ACCEPTANCE: REJECT {HEAD}",
+            "submittedAt": "2026-09-06T02:00:00Z",
+            "author": {"login": "acceptance-bot"},
+        },
+        {
+            "body": "LGTM, nice work!",
+            "submittedAt": "2026-09-06T02:30:00Z",
+            "author": {"login": "drive-by-commenter"},
+        },
+    ]
+    _fake_github(monkeypatch, [rejected])
+
+    report = review_merge.reconcile_pr_window(
+        "/repo",
+        review_merge.PrWindowConfig(target_active=1, max_active=2),
+        now=NOW,
+    )
+
+    assert report.demoted == [("1", "acceptance_rejected")]
+
+
+def test_later_verdict_still_supersedes_an_earlier_rejection(monkeypatch):
+    corrected = _pr(1, labels=("queue-active",), created="2026-09-06T02:59:30Z")
+    corrected["reviews"] = [
+        {
+            "body": f"ACCEPTANCE: REJECT {HEAD}",
+            "submittedAt": "2026-09-06T02:00:00Z",
+            "author": {"login": "acceptance-bot"},
+        },
+        {
+            "body": f"ACCEPTANCE: ACCEPT {HEAD}",
+            "submittedAt": "2026-09-06T02:30:00Z",
+            "author": {"login": "acceptance-bot"},
+        },
+    ]
+    _fake_github(monkeypatch, [corrected])
 
     report = review_merge.reconcile_pr_window(
         "/repo",

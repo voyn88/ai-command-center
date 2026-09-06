@@ -437,6 +437,35 @@ def _pr_age_seconds(pr: dict[str, Any], now: datetime) -> float:
     return max((now - created.astimezone(UTC)).total_seconds(), 0.0)
 
 
+def _latest_verdict_review(
+    reviews: list[dict[str, Any]], head: str
+) -> tuple[dict[str, Any], str] | None:
+    """The most recent review that actually carries a first-line ACCEPTANCE
+    marker for the current head, ignoring reviews that carry none.
+
+    A drive-by comment or an unrelated follow-up review posted after a real
+    verdict is not itself a verdict, and must not be able to erase one merely
+    by being newer -- only a later marker (of either kind, e.g. a correcting
+    ACCEPT after a REJECT, or vice versa) supersedes a standing one. Without
+    this filter, `max(reviews, key=submittedAt)` would pick whatever review
+    happens to be chronologically last, silently dropping a genuine verdict
+    that an unrelated participant's later comment sits on top of.
+    """
+    candidates: list[tuple[dict[str, Any], str]] = []
+    for review in reviews:
+        body = review.get("body")
+        if not isinstance(body, str):
+            continue
+        first_line = body.replace("\r\n", "\n").split("\n", 1)[0]
+        if first_line == f"ACCEPTANCE: ACCEPT {head}":
+            candidates.append((review, "ACCEPT"))
+        elif first_line == f"ACCEPTANCE: REJECT {head}":
+            candidates.append((review, "REJECT"))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pair: pair[0].get("submittedAt") or "")
+
+
 def _independent_latest_reject_marker(
     reviews: list[dict[str, Any]], head: str, pr_author_login: str
 ) -> bool:
@@ -448,14 +477,10 @@ def _independent_latest_reject_marker(
     """
     if not reviews or not pr_author_login:
         return False
-    latest = max(reviews, key=lambda item: item.get("submittedAt") or "")
-    body = latest.get("body")
-    if not isinstance(body, str):
+    verdict = _latest_verdict_review(reviews, head)
+    if verdict is None or verdict[1] != "REJECT":
         return False
-    first_line = body.replace("\r\n", "\n").split("\n", 1)[0]
-    if first_line != f"ACCEPTANCE: REJECT {head}":
-        return False
-    reviewer_login = (latest.get("author") or {}).get("login")
+    reviewer_login = (verdict[0].get("author") or {}).get("login")
     return (
         isinstance(reviewer_login, str)
         and bool(reviewer_login)
