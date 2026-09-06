@@ -2359,6 +2359,13 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     if rerun:
                         detail = f"{detail}; {rerun}"
                 report.skipped.append((task_id, detail))
+                # `continue` here, before `state` is even read: BEHIND/DIRTY
+                # is only ever consulted for a PR that already cleared every
+                # other eligibility check. A version that fell through to
+                # `_merge_state` for ANY not-ready reason -- no ACCEPT marker,
+                # red checks, a transient `gh pr view` failure -- would
+                # branch-update an ineligible PR on nothing but happening to
+                # also be BEHIND (rejected review of 0dcc5788).
                 continue
             # Merge-ready. If it has merely fallen BEHIND main since it was
             # accepted, bring its branch current with a GitHub-side base merge

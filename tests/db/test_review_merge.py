@@ -1642,6 +1642,69 @@ def test_merge_train_does_not_update_an_unaccepted_behind_pr(rig, monkeypatch): 
     assert not report.merged
 
 
+def test_merge_train_does_not_update_a_behind_pr_with_failing_checks(rig, monkeypatch):  # noqa: F811
+    """A BEHIND PR that DOES carry an ACCEPT marker but has a failing required
+    check is still not merge-ready, so it must not be branch-updated either --
+    readiness (marker AND green checks) gates the BEHIND update, not the
+    marker alone. Rejected review of 0dcc5788: a version that consulted
+    mergeStateStatus for any not-ready PR, not only one that failed
+    specifically because it was BEHIND with every other eligibility check
+    passed, could update a branch whose checks were still red."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MT-CHK", "https://github.com/x/y/pull/62")
+    head = "e" * 40
+    calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        calls.append(argv[:2])
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["run", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ["pr", "update-branch"] not in calls
+    assert any(
+        task_id == "VOYN-W0-MT-CHK" and reason.startswith("checks_not_green")
+        for task_id, reason in report.skipped
+    )
+    assert not report.merged
+
+
+def test_merge_train_does_not_update_when_pr_view_fails_transiently(rig, monkeypatch):  # noqa: F811
+    """A transient `gh pr view` failure must not fall through to a
+    mergeStateStatus check (there is no snapshot to read one from) and must
+    never branch-update -- the readiness snapshot fetch failing is itself a
+    not-ready outcome, gated the same as any other."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MT-ERR", "https://github.com/x/y/pull/63")
+    calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+        calls.append(argv[:2])
+        return subprocess.CompletedProcess(argv, 1, "", "transient error")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ["pr", "update-branch"] not in calls
+    assert any(
+        task_id == "VOYN-W0-MT-ERR" and reason.startswith("gh_view_failed")
+        for task_id, reason in report.skipped
+    )
+    assert not report.merged
+
+
 def test_merge_state_treats_malformed_gh_output_as_a_failed_lookup(monkeypatch):
     """A zero-exit-but-unparseable `gh pr view` must return "" (a failed
     lookup), never raise and abort the merge tick.
