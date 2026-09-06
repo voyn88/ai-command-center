@@ -37,6 +37,7 @@ def _pr(
         "statusCheckRollup": [{"name": "CI", "conclusion": conclusion}],
         "reviews": reviews,
         "headRefOid": HEAD,
+        "commits": [{"oid": HEAD, "committedDate": created}],
         "author": {"login": "publisher"},
         "state": "OPEN",
     }
@@ -178,3 +179,28 @@ def test_rfc3339_z_timestamp_keeps_fresh_pr_inside_grace_period():
         review_merge.PrWindowConfig(stale_seconds=60),
         NOW,
     ) is None
+
+
+def test_label_write_cannot_reset_stale_clock_or_flap_pr_active(monkeypatch):
+    stale = _pr(
+        1,
+        labels=("queue-active",),
+        conclusion="",
+        created="2026-09-06T01:00:00Z",
+    )
+    stale["statusCheckRollup"][0] = {
+        "name": "CI", "status": "IN_PROGRESS", "conclusion": None
+    }
+    # GitHub label edits advance updatedAt; the head commit remains immutable.
+    stale["updatedAt"] = "2026-09-06T02:59:59Z"
+    edits = _fake_github(monkeypatch, [stale])
+    cfg = review_merge.PrWindowConfig(target_active=1, max_active=2, stale_seconds=60)
+
+    first = review_merge.reconcile_pr_window("/repo", cfg, now=NOW)
+    stale["updatedAt"] = "2026-09-06T03:00:01Z"
+    second = review_merge.reconcile_pr_window("/repo", cfg, now=NOW)
+
+    assert first.demoted == [("1", "checks_stale")]
+    assert second.promoted == []
+    assert second.blocked == [("1", "checks_stale")]
+    assert len(edits) == 1

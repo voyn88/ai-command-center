@@ -414,10 +414,16 @@ _FAILED_CHECK_CONCLUSIONS = {
 
 
 def _pr_age_seconds(pr: dict[str, Any], now: datetime) -> float:
-    # A new push refreshes updatedAt. Using createdAt alone would demote an
-    # old PR while its freshly-triggered exact-head checks are legitimately
-    # still running.
-    raw = str(pr.get("updatedAt") or pr.get("createdAt") or "")
+    # GitHub bumps PR.updatedAt for label writes, including this reconciler's
+    # own writes. It is therefore not a clock: using it makes a demotion reset
+    # its own stale threshold and the next tick re-promote the same stuck PR.
+    # The current head commit timestamp changes on a real push but not on
+    # labels/comments, exactly matching the state whose checks and acceptance
+    # are being timed.
+    head = str(pr.get("headRefOid") or "")
+    commits = [item for item in pr.get("commits") or [] if isinstance(item, dict)]
+    head_commit = next((item for item in commits if str(item.get("oid") or "") == head), None)
+    raw = str((head_commit or {}).get("committedDate") or pr.get("createdAt") or "")
     # RFC3339's UTC designator is explicit here rather than relying on the
     # Python-version-specific acceptance of a trailing ``Z`` by fromisoformat.
     if raw.endswith("Z"):
@@ -538,8 +544,8 @@ def reconcile_pr_window(
             "pr", "list", "--state", "open", "--limit", str(max(cfg.scan_limit, 1)),
             "--json",
             (
-                "number,url,createdAt,updatedAt,isDraft,mergeStateStatus,labels,"
-                "statusCheckRollup,reviews,headRefOid,author,state"
+                "number,url,createdAt,isDraft,mergeStateStatus,labels,"
+                "statusCheckRollup,reviews,headRefOid,commits,author,state"
             ),
         ],
         repo_path,
