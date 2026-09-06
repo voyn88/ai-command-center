@@ -70,7 +70,9 @@ def _rows(connection_factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
         return cur.fetchall() if cur.description else []
 
 
-def claude_window_reset_at(connection_factory: Any) -> datetime | None:
+def claude_window_reset_at(
+    connection_factory: Any, *, rows_fn: Any = _rows
+) -> datetime | None:
     """The reset time of the MOST RECENT Claude-window exhaustion this
     control plane can see, whether or not it has already passed.
 
@@ -79,8 +81,16 @@ def claude_window_reset_at(connection_factory: Any) -> datetime | None:
     exhausted, a past one means the window reopened (and how recently is
     exactly what burst/front-load dispatch decisions need). Returns None if
     no worker has ever reported one.
+
+    ``rows_fn`` defaults to this module's own row fetcher; the planner (its
+    only caller before VOYN-W0-AICC-WINDOW-AWARE-SCHEDULING) always leaves it
+    at that default. `orchestrator.review_merge` -- whose hermetic unit tests
+    already monkeypatch ITS OWN `_rows` to fake the queue reads `review_once`
+    makes -- passes its `_rows` here too, so this query goes through the same
+    seam those tests already control instead of silently reaching past it to
+    call `connection_factory` for real.
     """
-    rows = _rows(connection_factory, _QUERY, (_MARKER_PATTERN, _MARKER_PATTERN))
+    rows = rows_fn(connection_factory, _QUERY, (_MARKER_PATTERN, _MARKER_PATTERN))
     if not rows or rows[0][0] is None:
         return None
     reset_at = rows[0][0]
