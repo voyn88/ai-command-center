@@ -8,6 +8,25 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Security — dependency scan findings cleared (`VOYN-W0-AICC-TRIVY-DEPENDENCY-FINDINGS`)
+
+The `security-scans.yml` dependency-scan job (`trivy fs --scanners vuln,misconfig,secret
+--severity CRITICAL,HIGH`) only evaluates non-dev dependencies by default, which masked one
+HIGH finding: `nanoid@3.3.16` (CVE-2026-67213, denial of service via infinite loop in random ID
+generation), pulled in transitively as a `postcss` build-time dependency of `web/package-lock.json`.
+
+- `web/package-lock.json` — bumped `nanoid` to `3.3.18` (the fixed release on the same major line
+  already satisfying `postcss`'s `^3.3.16` requirement); confirmed clean via `npm audit` and
+  `trivy fs --include-dev-deps`.
+- Re-ran the exact CI command (vuln/misconfig/secret scanners, no `--include-dev-deps`, matching
+  `.github/workflows/security-scans.yml`) against the full tree plus `pip-audit` against all three
+  `requirements-*.lock` files: no other CRITICAL/HIGH findings. No accepted-risk exceptions were
+  needed.
+- Note for future scans: trivy's pip analyzer only recognizes `requirements*.txt` filenames, so
+  `requirements-ci-linux.lock`, `requirements-ci-windows.lock`, and `requirements-security.lock`
+  are invisible to the trivy job's `vuln` scanner; Python dependency coverage currently comes from
+  `pip-audit` in `ci.yml` (against `requirements-ci-linux.lock` only), not from this job.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,
