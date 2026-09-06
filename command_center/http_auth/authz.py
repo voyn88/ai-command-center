@@ -99,6 +99,15 @@ OPERATIONS: frozenset[str] = frozenset(
         # command_center/api/marketplace_routes.py
         "marketplace:item:create",
         "marketplace:item:install",
+        # command_center/api/skills_routes.py
+        "skills:source:propose",
+        "skills:source:approve",
+        "skills:source:revoke",
+        "skills:item:register",
+        "skills:item:acquire",
+        "skills:item:reject",
+        "skills:item:revoke",
+        "skills:outcome:record",
         # command_center/api/model_registry_routes.py
         "models:register",
         "models:download",

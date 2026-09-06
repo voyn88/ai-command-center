@@ -378,6 +378,132 @@ class MarketInstallLogEntry(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# Skill Acquisition — SkillSource / SkillItem / SkillAcquisitionLogEntry /
+# SkillOutcome (VOYN-W0-AICC-SKILL-ACQUISITION)
+# --------------------------------------------------------------------------
+
+#: The four reuse-before-creation forms the owner idea names: MCP-server
+#: registries, Claude Agent Skill catalogues, CLI-tool indices, and a
+#: repository's own ADR/runbook docs.
+SkillSourceKind = Literal[
+    "mcp_registry", "agent_skill_catalog", "cli_tool_index", "repo_doc"
+]
+
+#: ``proposed`` = a newly named origin, not yet trusted; ``approved`` = a
+#: human has explicitly gated it in; ``revoked`` = terminal, never searched
+#: again under this id.
+SkillSourceStatus = Literal["proposed", "approved", "revoked"]
+
+#: What an acquired skill *is*.
+SkillItemKind = Literal["mcp_server", "agent_skill", "cli_tool", "library"]
+
+#: ``candidate`` = registered, not yet trusted; ``acquired`` = live;
+#: ``rejected``/``revoked`` are terminal.
+SkillItemStatus = Literal["candidate", "acquired", "rejected", "revoked"]
+
+SkillAcquisitionAction = Literal["acquire", "reject", "revoke"]
+
+#: ``baseline`` = the task was done without this skill; ``with_skill`` = the
+#: skill was used — the raw evidence behind the before/after effect
+#: measurement.
+SkillOutcomePhase = Literal["baseline", "with_skill"]
+
+
+class SkillSource(BaseModel):
+    """One allowlisted origin a skill candidate may come from.
+
+    First connection of a new origin is a human gate: a source always starts
+    ``proposed`` and only moves to ``approved`` through an explicit call
+    naming the approving actor — never automatically, and never as a side
+    effect of a search or a registration.
+    """
+
+    id: str = ""
+    name: str = ""
+    kind: SkillSourceKind = "mcp_registry"
+    origin: str = ""
+    status: SkillSourceStatus = "proposed"
+    proposed_by: str = ""
+    approved_by: str = ""
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class SkillItem(BaseModel):
+    """One skill in the registry, pinned by ``version``+``content_hash`` and
+    attributed to an approved :class:`SkillSource` via ``source_id``.
+
+    ``selection_rationale`` carries the measurable justification the
+    selection step recorded when this candidate was registered (competing
+    candidates' scores, the weights used) — never free-text, always the
+    machine-checkable numbers a later audit can re-derive the choice from.
+    """
+
+    id: str = ""
+    name: str = ""
+    kind: SkillItemKind = "mcp_server"
+    version: str = ""
+    content_hash: str = ""
+    source_id: str = ""
+    provenance: str = ""
+    task_class: str = ""
+    status: SkillItemStatus = "candidate"
+    selection_rationale: dict = Field(default_factory=dict)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class SkillAcquisitionLogEntry(BaseModel):
+    """One append-only acquisition-audit line: *who* took *what action* on
+    *which* skill (pinned ``version``+``content_hash``), *when*, and — for an
+    ``acquire`` action — by which isolated ``executor`` implementation.
+    """
+
+    id: str = ""
+    skill_id: str = ""
+    actor: str = ""
+    action: SkillAcquisitionAction = "acquire"
+    version: str = ""
+    content_hash: str = ""
+    executor: str = ""
+    detail: str = ""
+    metadata: dict[str, str] = Field(default_factory=dict)
+    created_at: str | None = None
+
+
+class SkillOutcome(BaseModel):
+    """One raw per-task sample behind the effect measurement: the ``cost``
+    and whether the change was ``accepted``/``first_pass``, tagged
+    ``baseline`` or ``with_skill`` so before/after can be compared."""
+
+    id: str = ""
+    skill_id: str = ""
+    task_id: str = ""
+    phase: SkillOutcomePhase = "baseline"
+    cost: float = 0.0
+    accepted: bool = False
+    first_pass: bool = False
+    created_at: str | None = None
+
+
+class SkillEffectReport(BaseModel):
+    """Cost-per-accepted-change and first-pass-acceptance-rate, baseline vs
+    with-skill, for one skill. ``improved`` is ``None`` until both phases have
+    at least the minimum sample count required to judge; a skill that never
+    reaches ``improved is True`` is a candidate for retirement (see
+    ``skills.service.sweep_retire_underperforming``)."""
+
+    skill_id: str = ""
+    baseline_samples: int = 0
+    with_skill_samples: int = 0
+    baseline_cost_per_accepted: float | None = None
+    with_skill_cost_per_accepted: float | None = None
+    baseline_first_pass_rate: float | None = None
+    with_skill_first_pass_rate: float | None = None
+    improved: bool | None = None
+
+
+# --------------------------------------------------------------------------
 # «Мой день» — OwnerItem / DigestItem
 # --------------------------------------------------------------------------
 

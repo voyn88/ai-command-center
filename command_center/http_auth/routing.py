@@ -83,6 +83,15 @@ ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     # -- command_center/api/marketplace_routes.py -------------------------
     ("POST", "/api/v1/marketplace/items"): "marketplace:item:create",
     ("POST", "/api/v1/marketplace/items/{item_id}/install"): "marketplace:item:install",
+    # -- command_center/api/skills_routes.py -------------------------------
+    ("POST", "/api/v1/skills/sources"): "skills:source:propose",
+    ("POST", "/api/v1/skills/sources/{source_id}/approve"): "skills:source:approve",
+    ("POST", "/api/v1/skills/sources/{source_id}/revoke"): "skills:source:revoke",
+    ("POST", "/api/v1/skills/items"): "skills:item:register",
+    ("POST", "/api/v1/skills/items/{item_id}/acquire"): "skills:item:acquire",
+    ("POST", "/api/v1/skills/items/{item_id}/reject"): "skills:item:reject",
+    ("POST", "/api/v1/skills/items/{item_id}/revoke"): "skills:item:revoke",
+    ("POST", "/api/v1/skills/items/{item_id}/outcomes"): "skills:outcome:record",
     # -- command_center/api/model_registry_routes.py ----------------------
     ("POST", "/api/v1/models"): "models:register",
     ("POST", "/api/v1/models/{model_id}/download"): "models:download",
@@ -166,6 +175,52 @@ CLIENT_IDENTITY_CARVE_OUTS: dict[tuple[str, str], CarveOut] = {
             "is a genuine caller claim and should become the principal, but the "
             "field is non-optional, so deleting it is a breaking wire change that "
             "belongs with the other schema removals rather than in the mechanism."
+        ),
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/sources/{source_id}/approve"): CarveOut(
+        fields=("actor",),
+        reason=(
+            "`actor` is required here and is the human-gate approval record "
+            "written onto the source row (`approved_by`) -- a genuine caller "
+            "claim, not derivable from the principal today. Should become the "
+            "principal once a principal->operator mapping exists; the field is "
+            "non-optional, so removing it is a breaking wire change that "
+            "belongs with the other schema removals, not the mechanism."
+        ),
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/sources/{source_id}/revoke"): CarveOut(
+        fields=("actor",),
+        reason=(
+            "`actor` is required here and is written onto the acquisition-log "
+            "line for this revocation. Same governance-log attribution case as "
+            "the marketplace install carve-out above; see 01b."
+        ),
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/items/{item_id}/acquire"): CarveOut(
+        fields=("actor",),
+        reason=(
+            "`actor` is required here and is written into the acquisition-log "
+            "record alongside the isolated executor that materialised the "
+            "skill. Same governance-log attribution case as the marketplace "
+            "install carve-out above; see 01b."
+        ),
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/items/{item_id}/reject"): CarveOut(
+        fields=("actor",),
+        reason="Governance-log attribution; should become the principal. See 01b.",
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/items/{item_id}/revoke"): CarveOut(
+        fields=("actor",),
+        reason=(
+            "`actor` is required here and is written into the acquisition-log "
+            "revocation record -- who revoked a live skill and why. Same "
+            "governance-log attribution case as the marketplace install "
+            "carve-out above; see 01b."
         ),
         task="VOYN-W0-AICC-AUTH-HTTP-01b",
     ),
