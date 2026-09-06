@@ -43,7 +43,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from command_center import agent_runner, project_config, workspace_provisioning
+from command_center import agent_runner, authority_preflight, project_config, workspace_provisioning
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
@@ -269,6 +269,38 @@ def _run_agent(
     if isinstance(request, PayloadError):
         return HandlerOutcome(
             ok=False, reason=request.reason, retryable=request.retryable
+        )
+
+    # Authority preflight (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-
+    # UNPRIVILEGED-EXECUTOR): a task that needs root or the postgres OS/DB
+    # role and an executor that holds neither is a deterministic, provable
+    # mismatch -- string analysis, no subprocess, no model call. Checked
+    # before any cascade/executor selection below because the authority gap
+    # is a fact about *this worker host*, not about which model CLI a
+    # cascade link would have used; retrying the same host through a
+    # different cascade link can never cure it, so failing here spends
+    # exactly zero of the cascade's model-call budget. `retryable=True`:
+    # authority is a per-host grant (`AICC_WORKER_AUTHORITIES`), so
+    # redelivery lets a *different*, explicitly-granted host claim it
+    # instead -- this is the "route to an executor who has it" half of the
+    # fix. A host where nothing is ever granted keeps returning it
+    # unchanged, and the backlog's own technical-vs-owner-decision
+    # classification (0012) parks a non-technical, repeatedly-returned
+    # reason as `DEFER_TO_USER` rather than looping it forever -- the
+    # "explicitly marked as requiring an owner" half.
+    authority_decision = authority_preflight.decide(
+        request.prompt,
+        authority_preflight.worker_granted_authorities(),
+        declared=frozenset(request.required_authority),
+    )
+    if not authority_decision.ok:
+        return HandlerOutcome(
+            ok=False,
+            reason=(
+                f"{authority_preflight.failure_reason_code(authority_decision)}: "
+                f"{authority_decision.reason}"
+            ),
+            retryable=True,
         )
 
     link = _cascade_link(request, attempt_no)

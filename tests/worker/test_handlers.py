@@ -207,6 +207,23 @@ def test_provenance_defaults_to_untrusted() -> None:
     assert request.untrusted is True
 
 
+def test_required_authority_defaults_to_empty_and_parses_when_present() -> None:
+    absent = parse_agent_run(_payload())
+    assert absent.required_authority == ()
+
+    request = parse_agent_run(_payload(required_authority=["root", "postgres_role"]))
+    assert request.required_authority == ("root", "postgres_role")
+
+
+def test_required_authority_rejects_unknown_or_malformed_values() -> None:
+    error = parse_agent_run(_payload(required_authority=["root", "warp_drive"]))
+    assert isinstance(error, PayloadError) and not error.retryable
+    assert "warp_drive" in error.reason
+
+    error = parse_agent_run(_payload(required_authority="root"))
+    assert isinstance(error, PayloadError) and not error.retryable
+
+
 # -- outcome discipline -------------------------------------------------------
 
 
@@ -808,6 +825,84 @@ def test_cli_unavailable_is_retryable_and_runs_nothing(handler, monkeypatch) -> 
     outcome = run_agent(_payload(), _event(), 1)
     assert not outcome.ok and outcome.retryable
     assert "unavailable" in outcome.reason and runs == []
+
+
+# -- authority preflight (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-
+# EXECUTOR) -- a task demanding root/the postgres role is blocked before the
+# model is ever invoked, on an executor not explicitly granted that
+# authority. -----------------------------------------------------------------
+
+
+def test_missing_authority_blocks_before_any_model_call(handler, monkeypatch) -> None:
+    monkeypatch.delenv("AICC_WORKER_AUTHORITIES", raising=False)
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(prompt="Run sudo -u postgres psql -c 'select 1' to confirm connectivity."),
+        _event(),
+        1,
+    )
+    assert not outcome.ok
+    assert outcome.reason.startswith("missing_authority:")
+    assert "root" in outcome.reason and "postgres_role" in outcome.reason
+    assert runs == []  # no model call spent
+
+
+def test_missing_authority_block_is_retryable_for_a_differently_granted_host(
+    handler, monkeypatch
+) -> None:
+    monkeypatch.delenv("AICC_WORKER_AUTHORITIES", raising=False)
+    run_agent, _ = handler
+    outcome = run_agent(_payload(prompt="sudo systemctl restart nginx"), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+
+
+def test_declared_required_authority_blocks_even_with_a_benign_prompt(
+    handler, monkeypatch
+) -> None:
+    monkeypatch.delenv("AICC_WORKER_AUTHORITIES", raising=False)
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(prompt="Apply the configuration change.", required_authority=["postgres_role"]),
+        _event(),
+        1,
+    )
+    assert not outcome.ok
+    assert "postgres_role" in outcome.reason
+    assert runs == []
+
+
+def test_explicitly_granted_authority_lets_dispatch_proceed(handler, monkeypatch) -> None:
+    monkeypatch.setenv("AICC_WORKER_AUTHORITIES", "root,postgres_role")
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(prompt="Run sudo -u postgres psql -c 'select 1' to confirm connectivity."),
+        _event(),
+        1,
+    )
+    assert outcome.ok
+    assert runs and runs[0]["task_type"] == "review"
+
+
+def test_ordinary_prompt_is_unaffected_by_authority_preflight(handler, monkeypatch) -> None:
+    monkeypatch.delenv("AICC_WORKER_AUTHORITIES", raising=False)
+    run_agent, runs = handler
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok and runs
+
+
+def test_quoted_prohibited_command_in_prompt_does_not_block_dispatch(
+    handler, monkeypatch
+) -> None:
+    """The prose-mention guard, exercised end to end: a task about
+    *documenting* a prohibition on `sudo apt` needs no authority itself."""
+    monkeypatch.delenv("AICC_WORKER_AUTHORITIES", raising=False)
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(prompt="Document why users must not run `sudo apt` on this host."),
+        _event(),
+        1,
+    )
+    assert outcome.ok and runs
 
 
 # -- the executor cascade (BO-S2a) -------------------------------------------

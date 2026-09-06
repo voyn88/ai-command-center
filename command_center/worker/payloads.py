@@ -21,6 +21,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from command_center import authority_preflight
+
 __all__ = ["AgentRunRequest", "PayloadError", "parse_agent_run"]
 
 AGENT_RUN_SCHEMA_VERSION = 1
@@ -74,6 +76,15 @@ class AgentRunRequest:
     #: handler); absent keeps the historical behaviour byte-for-byte.
     review_head_pr_number: str | None = None
     review_head_sha: str | None = None
+    #: VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: the
+    #: authorities (`authority_preflight.ALL_AUTHORITIES`) this task is
+    #: already known to need -- e.g. the planner classified it as requiring
+    #: root or the postgres role. Optional and additive: the worker's own
+    #: prompt-text detection (`authority_preflight.required_authorities`)
+    #: still applies on top, so a payload that omits this field (every
+    #: payload enqueued before this field existed) keeps relying on that
+    #: fallback rather than silently skipping the check.
+    required_authority: tuple[str, ...] = ()
 
 
 def _string(payload: dict[str, Any], key: str) -> str | None:
@@ -184,6 +195,28 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         review_head_pr_number = pr_number
         review_head_sha = head_sha
 
+    raw_required_authority = payload.get("required_authority", [])
+    if not isinstance(raw_required_authority, list) or not all(
+        isinstance(item, str) for item in raw_required_authority
+    ):
+        return PayloadError(
+            reason=(
+                "required_authority must be a list of strings, got "
+                f"{raw_required_authority!r}"
+            )
+        )
+    unknown_authority = [
+        item for item in raw_required_authority if item not in authority_preflight.ALL_AUTHORITIES
+    ]
+    if unknown_authority:
+        return PayloadError(
+            reason=(
+                f"required_authority contains unknown values {unknown_authority}; "
+                f"known: {sorted(authority_preflight.ALL_AUTHORITIES)}"
+            )
+        )
+    required_authority = tuple(dict.fromkeys(raw_required_authority))
+
     return AgentRunRequest(
         project_id=project_id,
         repository_path=repository_path,
@@ -196,4 +229,5 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         backlog_task_id=backlog_task_id,
         review_head_pr_number=review_head_pr_number,
         review_head_sha=review_head_sha,
+        required_authority=required_authority,
     )
