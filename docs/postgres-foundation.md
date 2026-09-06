@@ -226,10 +226,12 @@ run behind it (`VOYN-W0-AICC-SRV-08B-RTO-UNVERIFIED`). The drill was reproduced
 against a real server with a seeded, production-shaped dataset (~400k rows,
 102 MB): **measured restore time 2s**, stable across repeated runs at that
 dataset size with `--jobs 1`. A second, independent run against a different
-PostgreSQL instance and a fresh seed landed at 2-3s, confirming the figure
-rather than merely repeating it. Full method, environment, and raw
-measurements are in `docs/audits/SRV08B_RTO_DRILL_2026-08-27.json` and
-`docs/audits/SRV08B_RTO_DRILL_2026-09-01.json` (`.md` for the narrative of
+PostgreSQL instance and a fresh seed landed at 2-3s, and a third, independent
+run with its own from-scratch provisioning script landed at a flat 3s,
+confirming the figure rather than merely repeating it. Full method,
+environment, and raw measurements are in `docs/audits/SRV08B_RTO_DRILL_2026-08-27.json`,
+`docs/audits/SRV08B_RTO_DRILL_2026-09-01.json`, and
+`docs/audits/SRV08B_RTO_DRILL_2026-09-06.json` (`.md` for the narrative of
 each). RTO scales with data volume and `--jobs`, so this is a measured data
 point at a stated size, not a fixed constant — re-run the drill against a real
 snapshot with `--measure-out` to get a current number.
