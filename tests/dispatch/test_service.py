@@ -203,6 +203,12 @@ def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
     assert plan.budget_unknown is True
     assert plan.assignments == ()
     assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+    # The measurement itself must read as "unknown", not as a fabricated
+    # `0.0` that a caller could mistake for "nothing spent today".
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.as_dict()["daily_spend_usd"] is None
+    assert plan.as_dict()["projected_spend_usd"] is None
 
 
 def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
