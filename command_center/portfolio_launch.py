@@ -109,7 +109,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from command_center import execution_queue, git_info, models, storage, worktree_launcher
+from command_center import execution_queue, git_info, models, storage, workspace_provisioning, worktree_launcher
 from command_center.portfolio_models import PortfolioCardError, PortfolioTask, unmet_requirements, validate_task_id
 from command_center.runtime import db as runtime_db
 
@@ -1394,8 +1394,11 @@ def attach_worktree(repo_root: Path, *, branch: str, worktree_path: Path) -> Non
 
 def remove_worktree(repo_root: Path, worktree_path: Path) -> None:
     """Best-effort rollback — never raises. Only called for a worktree this
-    launch attempt itself created (see `_rollback_worktree`)."""
-    _run_git_write(["worktree", "remove", "--force", str(worktree_path)], cwd=repo_root)
+    launch attempt itself created (see `_rollback_worktree`). Delegates to
+    the shared force-removal site (VOYN-W0-AICC-WORKTREE-LEAK-RETRY) so a
+    refused `git worktree remove` here falls back to `rmtree` + `prune`
+    instead of leaking the directory and its metadata forever."""
+    workspace_provisioning.force_remove_worktree(repo_root, worktree_path)
 
 
 def delete_branch(repo_root: Path, branch: str) -> None:
