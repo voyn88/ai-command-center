@@ -8,6 +8,24 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Ollama PRESCREEN tier for review (`VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR`)
+- `command_center/agent_runner.py`: `build_ollama_command`/`ollama_preflight` wire a local
+  `qwen2.5-coder:14b` (server-side, voyn-worker-01, CPU inference) as an executor scoped to a new
+  `PRESCREEN_TASK_TYPES` set (`review_prescreen`), disjoint from `MODEL_ONLY_TASK_TYPES`/
+  `REVIEW_TASK_TYPES` so no Ollama result is ever reachable from the metered review key,
+  `review_merge._parse_verdict`, or the ACCEPT marker.
+- `command_center/orchestrator/routing.py`: `"review_prescreen"` is its own cascade
+  (`ollama` only) — deliberately never a link on `"review"` — and
+  `command_center/orchestrator/review_merge.py` adds `prescreen_once`/`publish_prescreen_findings`,
+  which run alongside (not instead of) the real `review_once`/`publish_review_verdicts` and post an
+  advisory, plainly-labeled PR comment (findings + a `PRESCREEN_PRIORITY` signal) under a `prescreen:`
+  key namespace and a `PRESCREEN_PRIORITY:`/non-`VERDICT:` trailer contract — structurally unable to
+  post a marker or gate a merge.
+- BENCHMARK 2026-09-03: qwen2.5-coder:14b and deepseek-r1:8b scored 0/3 and 0/2 recall against a
+  known-truth holdout (#578 P1, #586 P1, #594 P2), failing the 100%-recall bar for verdict-authority
+  promotion twice — so this tier ships advisory-only (prescreen findings + priority signal for the
+  real reviewer), not as a codex fallback with acceptance authority.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,
