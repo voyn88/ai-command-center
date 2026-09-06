@@ -123,16 +123,49 @@ def _verify_immutable_object(path: Path) -> os.stat_result:
     return info
 
 
-def _ancestors_of(path: Path) -> tuple[Path, ...]:
-    """Every directory between `path` and `_TRUSTED_ROOT`, inclusive.
+def _ancestors_of(path: Path, *, hops: list[int]) -> tuple[Path, ...]:
+    """Every directory the kernel touches while resolving `path`'s ancestor
+    chain, from its immediate parent to `_TRUSTED_ROOT`, inclusive.
 
-    Terminates at the trusted root, and also when a parent stops changing, so
-    a path outside the trusted root still ends rather than looping at `/`.
+    An ancestor can itself be a symlink -- a merged-`/usr` layout where
+    `/usr/bin` is a symlink, or `/opt` mounted from elsewhere onto the release
+    host, are not hypothetical. Write permission on the symlink's own
+    directory lets the symlink be repointed, and that is covered by walking
+    *its* ancestors below -- but write permission on the REAL directory it
+    resolves to lets that directory's contents be replaced directly, and that
+    real directory is not reached by any lexical `.parent` walk: it is only
+    reached by following the link. Skipping that resolution is exactly the
+    gap independent review caught in `_interpreter_resolution_chain` when it
+    checked only a hop's immediate parent (`ab887b2`) -- here reappearing one
+    level removed, in an ancestor rather than a hop, once the immediate-parent
+    check was widened to the full lexical chain.
+
+    `hops` is the same counter `_interpreter_resolution_chain` decrements for
+    its own hops, so a cycle spread across ancestor symlinks and interpreter
+    hops is bounded once, not once per branch.
     """
     ancestors: list[Path] = []
     current = path.parent
     while True:
         ancestors.append(current)
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise RolloutError(f"AICC release path is unavailable: {current}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            hops[0] += 1
+            if hops[0] > _MAX_SYMLINK_HOPS:
+                raise RolloutError(
+                    f"AICC release interpreter symlink chain is too deep: {current}"
+                )
+            target_text = os.readlink(current)
+            target = (
+                Path(target_text)
+                if os.path.isabs(target_text)
+                else current.parent / target_text
+            )
+            ancestors.append(target)
+            ancestors.extend(_ancestors_of(target, hops=hops))
         if current == _TRUSTED_ROOT or current == current.parent:
             return tuple(ancestors)
         current = current.parent
@@ -157,18 +190,23 @@ def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
     """
     chain: list[Path] = []
     current = executable
-    for _ in range(_MAX_SYMLINK_HOPS + 1):
+    hops = [0]
+    while True:
         chain.append(current)
-        chain.extend(_ancestors_of(current))
+        chain.extend(_ancestors_of(current, hops=hops))
         try:
             info = current.lstat()
         except OSError as exc:
             raise RolloutError(f"AICC release path is unavailable: {current}") from exc
         if not stat.S_ISLNK(info.st_mode):
             return tuple(chain)
+        hops[0] += 1
+        if hops[0] > _MAX_SYMLINK_HOPS:
+            raise RolloutError(
+                f"AICC release interpreter symlink chain is too deep: {current}"
+            )
         target = os.readlink(current)
         current = Path(target) if os.path.isabs(target) else current.parent / target
-    raise RolloutError(f"AICC release interpreter symlink chain is too deep: {executable}")
 
 
 def verify_immutable_release() -> None:
