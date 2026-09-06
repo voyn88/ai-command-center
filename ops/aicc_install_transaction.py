@@ -1878,9 +1878,7 @@ def restore_service_snapshot(
                 property_rc, actual = probe(
                     "show", unit, f"--property={name}", "--value"
                 )
-                if property_rc or _normalise_property(actual) != _normalise_property(
-                    expected
-                ):
+                if property_rc or not _properties_match(name, actual, expected):
                     raise RuntimeError(
                         f"service snapshot property did not restore: {unit} {name}"
                     )
