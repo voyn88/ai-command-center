@@ -2,17 +2,19 @@
 # Reproduces VOYN-W0-AICC-SRV-08-TEMPO-SEARCH: single-binary Tempo 2.6 reports
 # a completed local block on disk (meta.json, data.parquet) but TraceQL search
 # returns zero results and its own request log shows `total_blocks=0`, while
+# `GET /api/traces/<id>` (trace-by-id) for the exact same trace succeeds, and
 # `GET /flush` (204) does not help.
 #
 # This is not an AICC-hosted service today: there is no Tempo deployment in
 # this repo. The script is the standalone, runnable evidence backing
-# docs/operations/TEMPO_TRACEQL_SEARCH_ROOT_CAUSE.md — download a real Tempo
-# 2.6.1 binary, drive it through the healthy case and the failure case, and
-# print the exact log lines that pin the cause.
+# docs/operations/TEMPO_TRACEQL_SEARCH_ROOT_CAUSE.md -- download a real Tempo
+# 2.6.1 binary, drive it through the failure case with an intentionally
+# mismatched config, confirm the exact defect, then apply the one-line config
+# fix and confirm recovery on the SAME on-disk block.
 #
 # Usage: scripts/repro_tempo_traceql_search.sh [--keep]
-#   --keep   leave WORKDIR and the running Tempo process behind for manual
-#            follow-up instead of stopping/cleaning at exit.
+#   --keep   leave WORKDIR behind for manual follow-up instead of deleting it
+#            at exit. The Tempo process is always stopped at exit either way.
 set -euo pipefail
 
 TEMPO_VERSION="2.6.1"
@@ -51,6 +53,21 @@ wait_http() {
   done
 }
 
+start_tempo() {
+  local config="$1" logfile="$2"
+  "$TEMPO_BIN" -config.file="$config" > "$logfile" 2>&1 &
+  TEMPO_PID=$!
+  wait_http "http://localhost:${HTTP_PORT}/ready"
+}
+
+stop_tempo() {
+  if [[ -n "$TEMPO_PID" ]] && kill -0 "$TEMPO_PID" 2>/dev/null; then
+    kill -9 "$TEMPO_PID" 2>/dev/null || true
+    wait "$TEMPO_PID" 2>/dev/null || true
+  fi
+  TEMPO_PID=""
+}
+
 send_trace() {
   local trace_id="$1" pr="$2"
   local span_id now
@@ -78,8 +95,17 @@ print(json.dumps({
 PY
 }
 
+# TraceQL search always takes an explicit start/end window in this repro.
+# Tempo's own docs (see step 8) show why a bare `q=` without a range is a
+# separate footgun -- observed here as range_seconds=0 matching nothing -- so
+# omitting the range would confound the config defect this script targets.
 search() {
-  curl -s "http://localhost:${HTTP_PORT}/api/search?q=$1"
+  local q="$1" start="$2" end="$3"
+  curl -s "http://localhost:${HTTP_PORT}/api/search?q=${q}&start=${start}&end=${end}"
+}
+
+matched_count() {
+  python3 -c "import json,sys;d=json.load(sys.stdin);print(len(d.get('traces',[])))"
 }
 
 log "1. Fetching Tempo ${TEMPO_VERSION} (single binary release)"
@@ -92,7 +118,12 @@ if [[ -z "$TEMPO_BIN" ]]; then
 fi
 "$TEMPO_BIN" --version
 
-log "2. Starting single-binary Tempo with local backend"
+log "2. Starting single-binary Tempo with the DEFECTIVE config"
+note "ingester.complete_block_timeout is set to 5s (a short value, typical of"
+note "a deployment tuned to keep local disk usage/WAL replay time down)."
+note "query_frontend.search.query_backend_after is left UNSET, i.e. Tempo's"
+note "documented default of 15m. That pairing is the defect: it is never"
+note "valid to have complete_block_timeout < query_backend_after (see step 8)."
 mkdir -p "$WORKDIR/data/traces" "$WORKDIR/data/wal"
 cat > "$WORKDIR/tempo.yaml" <<EOF
 server:
@@ -119,9 +150,7 @@ storage:
       path: ${WORKDIR}/data/wal
     blocklist_poll: 5s
 EOF
-"$TEMPO_BIN" -config.file="$WORKDIR/tempo.yaml" > "$WORKDIR/tempo.log" 2>&1 &
-TEMPO_PID=$!
-wait_http "http://localhost:${HTTP_PORT}/ready"
+start_tempo "$WORKDIR/tempo.yaml" "$WORKDIR/tempo.log"
 
 log "3. Sending a trace for PR 284 and forcing a block flush"
 TRACE_ID=$(python3 -c "import secrets;print(secrets.token_hex(16))")
@@ -133,78 +162,84 @@ sleep 8
 
 BLOCK_DIR=$(find "$WORKDIR/data/traces/single-tenant" -mindepth 1 -maxdepth 1 -type d | head -1)
 BLOCK_ID=$(basename "$BLOCK_DIR")
-note "completed block: $BLOCK_ID"
+note "completed block on disk: $BLOCK_ID"
+ls "$BLOCK_DIR"
 
-log "4. Baseline: the block's meta.json has no 'version' key at all"
+log "4. meta.json 'version' is a false lead, not the defect"
 note "$(cat "$BLOCK_DIR/meta.json")"
-note "-- a naive 'jq .version meta.json' returns null on this HEALTHY block too:"
-note "   jq .version -> $(python3 -c "import json;print(json.load(open('$BLOCK_DIR/meta.json')).get('version'))")"
-note "   (Tempo 2.6's on-disk field is named \"format\", not \"version\" -- see"
-note "   tempodb/backend/block_meta.go: 'Version string \`json:\"format\"\`'."
-note "   Grepping meta.json for \"version\" is a false alarm by itself; it proves"
-note "   nothing about block health.)"
+note "-- a naive 'jq .version meta.json' returns null on this block, exactly"
+note "   as reported. But Tempo 2.6's on-disk field is named \"format\", not"
+note "   \"version\" (tempodb/backend/block_meta.go: 'Version string"
+note "   \`json:\"format\"\`'). This block's format is a healthy vParquet4."
+note "   Grepping meta.json for \"version\" proves nothing about block health;"
+note "   every block, healthy or not, reports null there."
+python3 -c "import json;print('format field ->', json.load(open('$BLOCK_DIR/meta.json'))['format'])"
 
-log "5. Baseline TraceQL search WORKS (this is the healthy control)"
-RESP=$(search '%7Bresource.voyn.pr_number%3D%22284%22%7D')
-note "$RESP" | python3 -m json.tool
-MATCHED=$(python3 -c "import json,sys;d=json.loads('''$RESP''');print(len(d.get('traces',[])))")
-note "traces matched: $MATCHED"
-[[ "$MATCHED" == "1" ]] || { echo "expected the baseline search to find the trace" >&2; exit 1; }
+log "5. Trace-by-id for this trace WORKS right now"
+TID_CODE=$(curl -s -o /tmp/repro_traceid.$$ -w '%{http_code}' "http://localhost:${HTTP_PORT}/api/traces/${TRACE_ID}")
+note "GET /api/traces/<id> -> HTTP ${TID_CODE}"
+BYTES=$(wc -c < /tmp/repro_traceid.$$)
+rm -f /tmp/repro_traceid.$$
+note "response bytes: $BYTES"
+[[ "$TID_CODE" == "200" && "$BYTES" -gt 0 ]] || { echo "expected trace-by-id to succeed" >&2; exit 1; }
 
-log "6. Injecting the real defect: a second block with an EMPTY format field"
-note "This simulates a block that predates the deployed encoding registry (see"
-note "grafana/tempo#4612, 'vParquet is not a valid block version') or was left"
-note "behind by an interrupted/partial write -- either way, an on-disk block"
-note "whose format string the running Tempo does not recognize."
-BAD_ID=$(python3 -c "import uuid;print(uuid.uuid4())")
-BAD_DIR="$WORKDIR/data/traces/single-tenant/$BAD_ID"
-cp -r "$BLOCK_DIR" "$BAD_DIR"
-python3 - "$BAD_DIR/meta.json" "$BAD_ID" <<'PY'
-import json, sys
-path, block_id = sys.argv[1], sys.argv[2]
-meta = json.load(open(path))
-meta["blockID"] = block_id
-meta["format"] = ""
-json.dump(meta, open(path, "w"))
-PY
-note "$(cat "$BAD_DIR/meta.json")"
-
-log "7. Restarting Tempo so the poller picks up the bad block from the backend"
-kill -9 "$TEMPO_PID" 2>/dev/null || true
-sleep 1
-"$TEMPO_BIN" -config.file="$WORKDIR/tempo.yaml" > "$WORKDIR/tempo2.log" 2>&1 &
-TEMPO_PID=$!
-wait_http "http://localhost:${HTTP_PORT}/ready"
-sleep 6
-
-log "8. The block index still counts BOTH blocks..."
-curl -s "http://localhost:${HTTP_PORT}/metrics" | grep tempodb_blocklist_length
-
-log "9. ...but the same search that worked in step 5 now reports total_blocks=0"
-RESP=$(search '%7Bresource.voyn.pr_number%3D%22284%22%7D')
+log "6. TraceQL search over an explicit range covering the trace returns ZERO blocks"
+NOW=$(date +%s)
+START=$((NOW - 3600))
+END=$((NOW + 60))
+RESP=$(search '%7Bresource.voyn.pr_number%3D%22284%22%7D' "$START" "$END")
 note "$RESP"
-grep -F 'total_blocks=0' "$WORKDIR/tempo2.log" | tail -1
+grep -F 'total_blocks=0' "$WORKDIR/tempo.log" | tail -1
+MATCHED=$(printf '%s' "$RESP" | matched_count)
+note "traces matched: $MATCHED (expected 0 -- this is the bug)"
+[[ "$MATCHED" == "0" ]] || { echo "expected the defective config to fail this search" >&2; exit 1; }
 
-log "10. GET /flush (204) does not fix it -- it only cuts new WAL data"
+log "7. GET /flush (204) does not help -- it only cuts new WAL data"
 curl -s -o /dev/null -w 'GET /flush -> HTTP %{http_code}\n' "http://localhost:${HTTP_PORT}/flush"
-RESP=$(search '%7Bresource.voyn.pr_number%3D%22284%22%7D')
-MATCHED=$(python3 -c "import json,sys;d=json.loads('''$RESP''');print(len(d.get('traces',[])))")
-note "traces matched after /flush: $MATCHED"
+RESP=$(search '%7Bresource.voyn.pr_number%3D%22284%22%7D' "$START" "$END")
+MATCHED=$(printf '%s' "$RESP" | matched_count)
+note "traces matched after /flush: $MATCHED (still 0)"
 
-log "11. Root cause: trace-by-id on the SAME tenant now surfaces the real error"
-note "(TraceQL search swallows the per-block error and just reports"
-note "total_blocks=0 with HTTP 200; trace-by-id propagates it as a 500.)"
-curl -s -o /tmp/traceid_resp.$$ -w 'GET /api/traces/<id> -> HTTP %{http_code}\n' \
-  "http://localhost:${HTTP_PORT}/api/traces/${TRACE_ID}"
-cat /tmp/traceid_resp.$$; rm -f /tmp/traceid_resp.$$
-grep -F 'is not a valid block version' "$WORKDIR/tempo2.log" | tail -1
+log "8. Root cause: query_backend_after (15m default) outlives complete_block_timeout (5s)"
+curl -s "http://localhost:${HTTP_PORT}/status/config" > "$WORKDIR/effective-config.yaml"
+note "effective ingester.complete_block_timeout:"
+grep -A1 'complete_block_timeout' "$WORKDIR/effective-config.yaml" | head -2
+note "effective query_frontend.search.query_backend_after:"
+grep -A1 '^\s*query_backend_after' "$WORKDIR/effective-config.yaml" | head -2
+note ""
+note "Tempo's own docs (configuration/_index.md) define the contract:"
+note "  'Time ranges before query_ingesters_until will be searched in the"
+note "   ingesters only. Time ranges after query_backend_after will be"
+note "   searched in the backend/object storage only.'"
+note "The ingester purges its local copy of a flushed block after"
+note "complete_block_timeout (here: 5s). The query-frontend search sharder"
+note "does not even generate a backend job for a time range younger than"
+note "query_backend_after (here: the 15m default). Any block older than 5s"
+note "and younger than 15m is a dead zone: gone from the ingester, not yet"
+note "eligible on the backend path. TraceQL search silently reports"
+note "total_blocks=0 with HTTP 200 for that dead zone; it is not an error,"
+note "so nothing surfaces in alerting. Trace-by-id is unaffected because it"
+note "walks the full backend blocklist regardless of block age -- which is"
+note "exactly why it works while search does not."
 
-log "12. Fix: quarantine the bad block, then the tenant is searchable again"
-mv "$BAD_DIR" "$WORKDIR/quarantined-$BAD_ID"
+log "9. Fix: query_backend_after must be <= complete_block_timeout"
+note "Restarting Tempo against the SAME on-disk block with"
+note "query_frontend.search.query_backend_after lowered to 5s (matching"
+note "complete_block_timeout) instead of touching any data."
+stop_tempo
+cp "$WORKDIR/tempo.yaml" "$WORKDIR/tempo.fixed.yaml"
+cat >> "$WORKDIR/tempo.fixed.yaml" <<'EOF'
+query_frontend:
+  search:
+    query_backend_after: 5s
+EOF
+start_tempo "$WORKDIR/tempo.fixed.yaml" "$WORKDIR/tempo.fixed.log"
 sleep 6
-RESP=$(search '%7Bresource.voyn.pr_number%3D%22284%22%7D')
-MATCHED=$(python3 -c "import json,sys;d=json.loads('''$RESP''');print(len(d.get('traces',[])))")
-note "traces matched after quarantine: $MATCHED"
-[[ "$MATCHED" == "1" ]] || { echo "expected search to recover after quarantining the bad block" >&2; exit 1; }
 
-log "Reproduction complete: root cause confirmed, fix verified."
+RESP=$(search '%7Bresource.voyn.pr_number%3D%22284%22%7D' "$START" "$END")
+note "$RESP"
+MATCHED=$(printf '%s' "$RESP" | matched_count)
+note "traces matched after the fix: $MATCHED"
+[[ "$MATCHED" == "1" ]] || { echo "expected the fixed config to find the trace" >&2; exit 1; }
+
+log "Reproduction complete: root cause confirmed (config defect), fix verified."
