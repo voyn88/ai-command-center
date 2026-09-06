@@ -234,6 +234,10 @@ REMEDIATION_BY_REASON: dict[str, str] = {
         "Задача уже в статусе Done — запись очереди устарела, удалите её."
     ),
     execution_queue.LAUNCH_SKIP_TASK_NOT_FOUND: "Задача очереди больше не существует — очистите запись очереди.",
+    execution_queue.LAUNCH_SKIP_READ_ONLY_MASTER: (
+        "Задача из master backlog доступна только для чтения — "
+        "запускайте локальную задачу проекта, а не её master-проекцию."
+    ),
     execution_queue.LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED: (
         "Укажите workspace_path задачи или repository_path проекта."
     ),
@@ -2442,7 +2446,7 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             """
             SELECT run_event.payload_json AS payload FROM run_event
               JOIN run ON run.id = run_event.run_id
-               AND run_event.payload_json LIKE '%total_cost_usd%'
+               AND CAST(run_event.payload_json AS TEXT) LIKE '%total_cost_usd%'
                AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
             """,
             (cutoff, cutoff),

@@ -21,8 +21,13 @@ functional application milestones of `app.py`.
   `docs/operations/FLEET_STATUS.md`.
 
 ### Added (SRV-05 slice 2)
+- [`docs/adr/0011-headless-worker-service.md`](docs/adr/0011-headless-worker-service.md) — the
+  architecture record for the headless worker: the versioned payload contract, why its timeout bound
+  is `agent_runner`'s run-length ceiling and not the queue's own (continuously renewed) visibility
+  window, and why only `writer_lease.hold` — never `worktree_lease.blocking_lease` — confers mutation
+  authority for a dispatch.
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
-  (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
+  (v1): refusals as data, timeout bounded by `agent_runner`'s run-length ceiling,
   provenance defaults to untrusted.
 - `command_center/worker/handlers.py` — the payload→execution bridge through
   the existing `agent_runner.run_claude_code` (sandbox profiles, credential
