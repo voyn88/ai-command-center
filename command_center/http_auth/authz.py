@@ -108,6 +108,15 @@ OPERATIONS: frozenset[str] = frozenset(
         "networking:message:send",
         "networking:feedback:submit",
         "networking:invite",
+        # command_center/api/skills_routes.py
+        "skills:source:propose",
+        "skills:source:approve",
+        "skills:source:revoke",
+        "skills:item:register",
+        "skills:item:acquire",
+        "skills:item:reject",
+        "skills:item:revoke",
+        "skills:item:outcome:record",
         # command_center/webapi/queue_routes.py (VOYN-W0-APP-CONTROL-S1/S4)
         "queue:audit:enqueue",
         # command_center/dispatch/api.py

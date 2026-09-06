@@ -108,14 +108,18 @@ SKILL_LOG_ACTIONS: frozenset[str] = frozenset(
 )
 
 
-class InvalidSkillSourceTransitionError(Exception):
+class InvalidSkillSourceTransitionError(ValueError):
     """Raised when a source status change is not an allowed edge in
-    :data:`SKILL_SOURCE_TRANSITIONS`."""
+    :data:`SKILL_SOURCE_TRANSITIONS`. A :class:`ValueError` subclass so a
+    caller that funnels validation errors through a single ``except
+    ValueError`` (the pattern the rest of this db package uses) catches this
+    too, rather than needing a second, easily-forgotten clause."""
 
 
-class InvalidSkillItemTransitionError(Exception):
+class InvalidSkillItemTransitionError(ValueError):
     """Raised when a skill status change is not an allowed edge in
-    :data:`SKILL_ITEM_TRANSITIONS`."""
+    :data:`SKILL_ITEM_TRANSITIONS`. See :class:`InvalidSkillSourceTransitionError`
+    for why this is a :class:`ValueError` subclass."""
 
 
 _SKILL_SOURCE_COLUMNS: tuple[str, ...] = (
@@ -365,7 +369,12 @@ def create_skill_candidate(
                 "SELECT status FROM skill_source WHERE id = ?", (source_id,)
             ).fetchone()
             if source is None:
-                raise ValueError(f"no such skill_source: {source_id!r}")
+                # KeyError, not ValueError: "does not exist" and "exists but is
+                # not approved" are different failures (404 vs. 422 one layer
+                # up), and this module's convention elsewhere (e.g.
+                # `_transition_skill_item`) already reserves KeyError for the
+                # former.
+                raise KeyError(f"no such skill_source: {source_id!r}")
             if source["status"] != "approved":
                 raise ValueError(
                     f"skill_source {source_id!r} is not approved "
