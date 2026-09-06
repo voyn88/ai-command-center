@@ -418,6 +418,10 @@ def _pr_age_seconds(pr: dict[str, Any], now: datetime) -> float:
     # old PR while its freshly-triggered exact-head checks are legitimately
     # still running.
     raw = str(pr.get("updatedAt") or pr.get("createdAt") or "")
+    # RFC3339's UTC designator is explicit here rather than relying on the
+    # Python-version-specific acceptance of a trailing ``Z`` by fromisoformat.
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
     try:
         created = datetime.fromisoformat(raw)
     except ValueError:
