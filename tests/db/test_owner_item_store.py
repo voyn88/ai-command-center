@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from command_center import record_mirror
+from command_center.db import owner_item_store
 from command_center.db.owner_item_store import (
     MIRROR_UNAVAILABLE,
     OWNER_ITEM_COLUMNS,
@@ -22,6 +23,8 @@ from command_center.db.owner_item_store import (
     divergence,
 )
 from command_center.runtime.db import wave1
+
+from tests.db.mirror_probe import each_lost_write_is_noticed
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -287,3 +290,69 @@ def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
             cur.execute("SELECT created_at FROM owner_item WHERE id = 'tz'")
             stored = cur.fetchone()[0]
     assert stored == expected
+
+
+def test_every_lost_mirror_write_is_visible_to_reconciliation(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """The check the other tests above cannot substitute for.
+
+    Every test elsewhere in this module drives `_mirror_owner_item` and then
+    reads the mirror it actually wrote — none of them ever fails that write and
+    asks whether the *absence* is noticed. `each_lost_write_is_noticed` does,
+    failing each of the calls `_mirror_owner_item`'s two call sites make in
+    turn and checking reconciliation after each.
+
+    The first rejected version of this test used one row, created then marked
+    done, and failed for the create's write: `upsert` writes the whole row, so
+    `set_owner_item_done`'s upsert immediately after put the *complete* row —
+    the one it just read back from SQLite — into the mirror, healing the lost
+    create before `noticed()` ever ran. That is not a bug; a row whose last
+    write lands is genuinely reconciled. It does mean a scenario that revisits
+    the same row cannot prove `create_owner_item`'s call site is covered, so
+    this one uses two rows instead, each written to the mirror exactly once:
+    `untouched` only ever goes through `create_owner_item`, and `finished`'s
+    own create is done with the dual-write suppressed so the *only* mirror
+    write it makes is `set_owner_item_done`'s. Neither loss has a later write
+    to the same row available to heal it.
+    """
+    real_mirror = PostgresOwnerItemMirror(connection_factory=pg_connection_factory)
+    state: dict[str, object] = {"n": 0}
+
+    def scenario() -> None:
+        with pg_connection_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM owner_item")
+        db_path = tmp_path / f"runtime-{state['n']}.db"
+        state["n"] += 1
+        wave1.db.migrate(db_path)
+        state["db"] = db_path
+        # untouched: created once and never written again, so losing its
+        # create is never healed by a later write to the same row.
+        wave1.create_owner_item(db_path, title="untouched")
+        # finished: its own create is mirrored with the dual-write suppressed,
+        # so the row's *only* mirror write is set_owner_item_done's — losing
+        # that one is never healed either.
+        with monkeypatch.context() as suppress_create_mirror:
+            suppress_create_mirror.setattr(wave1, "_mirror_owner_item", lambda record: None)
+            finished = wave1.create_owner_item(db_path, title="finished")
+        wave1.set_owner_item_done(
+            db_path, finished["id"], expected_version=finished["version"], done=True
+        )
+
+    def noticed() -> bool:
+        db_path = state["db"]
+        return bool(divergence(wave1.list_owner_items(db_path, limit=1000), real_mirror))
+
+    results = each_lost_write_is_noticed(
+        monkeypatch,
+        targets=(
+            (owner_item_store, ("PostgresOwnerItemMirror",), lambda: real_mirror),
+        ),
+        scenario=scenario,
+        noticed=noticed,
+    )
+
+    assert len(results) == 2, [result.target for result in results]
+    missed = [result for result in results if not result.noticed]
+    assert not missed, f"lost writes nothing noticed: {missed}"
