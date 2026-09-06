@@ -276,7 +276,20 @@ prohibited, and convergence into AIOS Core remains this subsystem's stated
 end state once the core's dispatch contract (aios ADR-0022) is accepted and
 covers it.
 
-### SRV-02 `principal` — recorded as not placed here (2026-08-27, corrected 2026-09-01)
+### SRV-02 `principal` — recorded as not placed here (2026-08-27, corrected 2026-09-01, superseded 2026-09-06)
+
+**Superseded.** This record concluded SRV-02's registry is not placed here. A
+separate clone reached the opposite conclusion on the same open question —
+`VOYN-W0-AICC-SRV-02-PLACEMENT` (PR #574, merged to `main` 2026-09-02,
+predating this correction's last commit by one day) recorded SRV-03's
+`principal`/`principal_credential`/`principal_event` tables as SRV-02's
+identity registry, "finally placed," and that record was itself remediated
+once already (`VOYN-W0-AICC-SRV-02-PLACEMENT-RETRY-REM`, PR #581, same
+author). That is the resolution that is live and reviewed; this branch's
+analysis below is kept for its factual content (the SRV-03 evidence trail is
+accurate) but its conclusion — decline placement — is retracted in favor of
+the already-merged one. Do not republish this section's "not placed here"
+framing over `main`'s.
 
 `VOYN-W0-AICC-SRV-02` proposed an AICC-local `principal` table as the identity
 registry backing the SRV lane's HTTP/API surface — the thing `whoami` answers
