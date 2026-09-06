@@ -2378,15 +2378,24 @@ def checkpoint_dirty_task_workspace(
             failed_step="dirty_checkpoint_commit",
             input_text=message.rstrip() + "\n",
         ).stdout.strip()
-        objects = _run_trusted_worktree_git(
+        object_lines = _run_trusted_worktree_git(
             publisher,
             workspace,
             ["rev-list", "--objects", f"{candidate_sha}..{checkpoint_sha}"],
             expected_branch=expected_branch,
             failed_step="dirty_checkpoint_object_list",
         ).stdout.splitlines()
-        for line in objects:
-            oid = line.split(" ", 1)[0]
+        object_ids = [line.split(" ", 1)[0] for line in object_lines]
+        for oid in object_ids:
+            _copy_trusted_loose_object_to_agent(
+                publisher, workspace, oid, expected_branch=expected_branch
+            )
+        # Re-open and compare every destination object after the complete copy
+        # set is durable, before either index or branch ref can move.  The
+        # helper's existing-object path uses descriptor-pinned no-follow reads
+        # and compares through EOF, so a partial/corrupt copy fails here while
+        # the original dirty ref and index are still untouched.
+        for oid in object_ids:
             _copy_trusted_loose_object_to_agent(
                 publisher, workspace, oid, expected_branch=expected_branch
             )
@@ -2442,6 +2451,7 @@ def checkpoint_dirty_task_workspace(
         expected_remote_sha=expected_remote_sha,
         expected_inode=expected_inode,
         expected_candidate_sha=checkpoint_sha,
+        require_clean=True,
     ):
         pass
     return checkpoint_sha, True

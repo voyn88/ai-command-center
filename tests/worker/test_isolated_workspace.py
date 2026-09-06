@@ -543,10 +543,21 @@ def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
         return _fake_run(commit=False)(**kwargs)
 
     monkeypatch.setattr(agent_runner, "run_claude_code", leave_mixed_dirty_tree)
+    copied_objects: dict[str, int] = {}
+    copy_object = workspace_provisioning._copy_trusted_loose_object_to_agent
+
+    def count_copy(publisher, workspace, oid, **kwargs):
+        copied_objects[oid] = copied_objects.get(oid, 0) + 1
+        return copy_object(publisher, workspace, oid, **kwargs)
+
+    monkeypatch.setattr(
+        workspace_provisioning, "_copy_trusted_loose_object_to_agent", count_copy
+    )
 
     outcome = run_agent(_payload(), _event(), 1)
 
     assert outcome.ok and outcome.result["publish"]["checkpointed_dirty_worktree"]
+    assert copied_objects and set(copied_objects.values()) == {2}
     assert not sentinel.exists(), "agent-controlled Git config or hooks executed"
     _git(repo, "fetch", "-q", "origin", "backlog/VOYN-TASK-A")
     assert _git(repo, "show", "FETCH_HEAD:f.txt").stdout == "modified\n"
