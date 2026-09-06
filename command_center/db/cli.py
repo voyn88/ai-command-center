@@ -9,6 +9,8 @@ every deploy as the migrator. The application credential does neither.
     AICC_PG_USER=postgres       ... python -m command_center.db bootstrap
     AICC_PG_USER=aicc_migrator  ... python -m command_center.db upgrade
     AICC_PG_USER=aicc_app       ... python -m command_center.db status
+    AICC_PG_USER=aicc_app       ... python -m command_center.db fleet-status
+    AICC_PG_USER=aicc_operator  ... python -m command_center.db fleet-suspend <id> --reason ...
 """
 
 from __future__ import annotations
@@ -103,6 +105,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    export = sub.add_parser(
+        "backlog-export",
+        help=(
+            "Render the canonical store as the master-file markdown "
+            "projection (the read format of backlog_client / the console's "
+            "Master Backlog panel)."
+        ),
+    )
+    export.add_argument(
+        "--output",
+        required=True,
+        help="Destination path; written atomically (tmp + rename), whole file.",
+    )
     plan = sub.add_parser(
         "backlog-plan",
         help="One planner tick (BO-S2): release finished lanes, dispatch "
@@ -171,6 +186,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--branch",
         default="main",
         help="Remote branch to deploy from (the repository's default branch).",
+    )
+
+    # The fleet's single-panel view over enrolled worker-host devices
+    # (VOYN-MIN-FARM: "10 devices managed by one operational panel"). Reads
+    # run as whichever role connects (`aicc_app` or `aicc_operator`); suspend
+    # is `aicc_operator`-only, enforced by the grant on
+    # `identity_revoke_principal`, not by this CLI.
+    fleet_status = sub.add_parser(
+        "fleet-status",
+        help="List every enrolled worker-host device: state, host, live "
+        "credential expiry, and last audit event, in one query.",
+    )
+    fleet_status.add_argument(
+        "--state",
+        default=None,
+        choices=("active", "suspended", "retired"),
+        help="Restrict to one lifecycle state.",
+    )
+    fleet_status.add_argument(
+        "--limit", type=int, default=100, help="Rows to show (default 100)."
+    )
+    fleet_suspend = sub.add_parser(
+        "fleet-suspend",
+        help="Suspend a worker-host device and revoke its live credential(s) "
+        "(operator-only: an incident decision, not a routine one).",
+    )
+    fleet_suspend.add_argument(
+        "principal_id", help="The worker-host principal id from fleet-status."
+    )
+    fleet_suspend.add_argument(
+        "--reason", required=True, help="Audited reason for the suspension."
     )
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
@@ -296,6 +342,54 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
 
+            if args.command == "fleet-status":
+                from command_center.db.fleet_admin import FleetAdmin
+
+                devices = FleetAdmin(lambda: nullcontext(conn)).list_devices(
+                    state=args.state, limit=args.limit
+                )
+                if not devices:
+                    print("no worker-host devices enrolled")
+                    return 0
+                for device in devices:
+                    credential = device.credential_expires_at or "none issued"
+                    event = (
+                        f"{device.last_event_type}/{device.last_event_outcome}"
+                        f"@{device.last_event_at}"
+                        if device.last_event_type
+                        else "(no events)"
+                    )
+                    print(
+                        f"{device.principal_id}  state={device.state}  "
+                        f"host={device.host}  credential_expires={credential}  "
+                        f"last_event={event}"
+                    )
+                print(f"{len(devices)} device(s)")
+                return 0
+
+            if args.command == "fleet-suspend":
+                from command_center.db.fleet_admin import (
+                    FleetAdmin,
+                    UnknownDeviceError,
+                )
+
+                try:
+                    revoked = FleetAdmin(lambda: nullcontext(conn)).suspend(
+                        args.principal_id, args.reason
+                    )
+                except UnknownDeviceError:
+                    print(
+                        f"refused: {args.principal_id} is not an enrolled "
+                        "worker-host device",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(
+                    f"suspended {args.principal_id}; revoked {revoked} live "
+                    "credential(s)"
+                )
+                return 0
+
             if args.command == "backlog-import":
                 from pathlib import Path
 
@@ -330,6 +424,23 @@ def main(argv: list[str] | None = None) -> int:
                     BacklogStore(lambda: nullcontext(conn)).counts_by_status().items()
                 ):
                     print(f"{status}: {count}")
+                return 0
+
+            if args.command == "backlog-export":
+                from pathlib import Path as _Path
+
+                from command_center import projection_writer
+                from command_center.db import backlog_export
+
+                rows = backlog_export.fetch_rows(conn)
+                # Atomic whole-file replace lives in projection_writer — a
+                # reader (the console) must never see a half-written
+                # projection, and durable-write calls must stay out of this
+                # frozen-category module (AIOS boundary gate).
+                projection_writer.write_atomically(
+                    _Path(args.output), backlog_export.render_projection(rows)
+                )
+                print(f"rendered {len(rows)} records -> {args.output}")
                 return 0
 
             if args.command == "backlog-plan":
@@ -376,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
+                    reconcile_review_once,
                     review_once,
                 )
 
@@ -402,6 +514,16 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REVIEW    {task_id} -> {pr}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                retry_report = reconcile_review_once(
+                    lambda: _nc(conn),
+                    enqueue,
+                    args.repo_path,
+                    task_id=args.task_id,
+                )
+                for task_id, retry_key in retry_report.retried:
+                    print(f"RETRY     {task_id} -> {retry_key}")
+                for task_id, reason in retry_report.skipped:
+                    print(f"RETRY-SKIP {task_id}: {reason}")
                 marker_report = publish_review_verdicts(
                     lambda: _nc(conn), args.repo_path, task_id=args.task_id,
                     # The same queue writer review_once uses: a REJECT
