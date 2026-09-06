@@ -340,11 +340,7 @@ def _migration_25_add_finalization_claim(conn: sqlite3.Connection) -> None:
             return
         terminal_states = tuple(sorted(db.TERMINAL_STATES))
         terminal_placeholders = ",".join("?" for _ in terminal_states)
-        preexisting = conn.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'run_finalization_claim'"
-        ).fetchone()
-        if preexisting is not None:
+        if db._table_exists(conn, "run_finalization_claim"):
             raise FinalizationClaimCutoverRequired(
                 "runtime schema v25 found an unversioned finalization claim table"
             )
@@ -434,10 +430,7 @@ def _bootstrap_finalization_claim_cutover_unlocked(
                 raise FinalizationClaimCutoverRequired(
                     f"offline finalization cutover requires schema v24, found v{current}"
                 )
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = 'run_finalization_claim'"
-            ).fetchone() is not None:
+            if db._table_exists(conn, "run_finalization_claim"):
                 raise FinalizationClaimCutoverRequired(
                     "runtime schema v25 found an unversioned finalization claim table"
                 )
