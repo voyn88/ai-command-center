@@ -2079,8 +2079,13 @@ def _copy_trusted_loose_object_to_agent(
             detail="secure no-follow object persistence is unavailable on Windows",
         )
     source = publisher / ".git" / "objects" / oid[:2] / oid[2:]
+    source_fd: int | None = None
     try:
-        payload = source.read_bytes()
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        source_stat = os.fstat(source_fd)
+        payload = _read_pinned_regular(
+            source_fd, source_stat, max_bytes=_MAX_OBJECT_TRANSFER_BYTES
+        )
     except OSError as exc:
         raise WorkspaceVerificationError(
             failed_step="dirty_checkpoint_object_read",
@@ -2090,6 +2095,9 @@ def _copy_trusted_loose_object_to_agent(
             expected_branch=expected_branch,
             detail=f"cannot read trusted loose object {oid}: {exc}",
         ) from exc
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
 
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     git_fd = objects_fd = prefix_fd = target_fd = None
@@ -2181,12 +2189,13 @@ def _lock_agent_branch_ref(
             detail="secure descriptor-relative ref persistence is unavailable on Windows",
         )
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory_fd = os.open(
-        workspace / ".git", os.O_RDONLY | os.O_DIRECTORY | nofollow
-    )
+    directory_fd: int | None = None
     lock_name = f"{expected_branch.split('/')[-1]}.lock"
     lock_fd: int | None = None
     try:
+        directory_fd = os.open(
+            workspace / ".git", os.O_RDONLY | os.O_DIRECTORY | nofollow
+        )
         for component in ("refs", "heads", *expected_branch.split("/")[:-1]):
             try:
                 os.mkdir(component, mode=0o755, dir_fd=directory_fd)
@@ -2231,10 +2240,12 @@ def _lock_agent_branch_ref(
         if lock_fd is not None:
             os.close(lock_fd)
             try:
+                assert directory_fd is not None
                 os.unlink(lock_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
-        os.close(directory_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def _advance_agent_branch_ref(

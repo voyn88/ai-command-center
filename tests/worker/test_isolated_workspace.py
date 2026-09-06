@@ -597,6 +597,28 @@ def test_dirty_checkpoint_uses_one_shared_git_ref_lock(tmp_path):
     assert not (repo / ".git" / "refs" / "heads" / "main.lock").exists()
 
 
+def test_dirty_checkpoint_rejects_oversized_source_object_before_copy(
+    tmp_path, monkeypatch
+):
+    publisher = _make_repo(tmp_path / "publisher")
+    workspace = _make_repo(tmp_path / "workspace")
+    oid = "a" * 40
+    source = publisher / ".git" / "objects" / oid[:2] / oid[2:]
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"oversized")
+    monkeypatch.setattr(workspace_provisioning, "_MAX_OBJECT_TRANSFER_BYTES", 4)
+
+    with pytest.raises(
+        workspace_provisioning.WorkspaceVerificationError,
+        match="dirty_checkpoint_object_read",
+    ):
+        workspace_provisioning._copy_trusted_loose_object_to_agent(
+            publisher, workspace, oid, expected_branch="main"
+        )
+
+    assert not (workspace / ".git" / "objects" / oid[:2] / oid[2:]).exists()
+
+
 def test_dirty_checkpoint_failure_is_retryable_and_preserves_clone(
     agent_with_publish, monkeypatch
 ):
