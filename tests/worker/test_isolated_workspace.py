@@ -462,9 +462,8 @@ def test_no_cleanup_when_publish_fails(agent_with_publish, monkeypatch):
 
     outcome = run_agent(_payload(), _event(), 1)
 
-    assert (
-        outcome.ok
-    )  # the handler outcome is still ok=True (BO-S3b: publish failure is data)
+    assert not outcome.ok and outcome.retryable
+    assert "publish failed" in outcome.reason
     assert outcome.result["publish"]["ok"] is False
     workspace = _workspace(repo)
     assert workspace.is_dir()
@@ -539,7 +538,8 @@ def test_reused_clone_never_executes_agent_git_config_before_retry_publish(
     (bin_dir / "gh").write_text("#!/bin/sh\nexit 1\n")
     monkeypatch.setattr(agent_runner, "run_claude_code", first_run)
     first = run_agent(_payload(), _event(), 1)
-    assert first.ok and first.result["publish"]["ok"] is False
+    assert not first.ok and first.retryable
+    assert first.result["publish"]["ok"] is False
     assert not sentinel.exists()
 
     _write_exact_pr_gh(bin_dir / "gh", "https://github.com/o/r/pull/3")
@@ -566,7 +566,8 @@ def test_unpublished_commit_survives_never_started_retry_then_publishes(
     monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run())
     first = run_agent(_payload(), _event(), 1)
     workspace = _workspace(repo)
-    assert first.ok and first.result["publish"]["ok"] is False
+    assert not first.ok and first.retryable
+    assert first.result["publish"]["ok"] is False
     assert workspace.is_dir() and (workspace / "change.txt").exists()
 
     monkeypatch.setattr(agent_runner, "run_claude_code", _never_started_run)

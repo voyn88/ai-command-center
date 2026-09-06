@@ -80,12 +80,39 @@ _MARKER_READ_ERRORS = (OSError, ValueError, TypeError)
 # PEP 758's bare `except OSError, UnicodeDecodeError:`, which is a
 # SyntaxError on the Python 3.12/3.13 runtimes this code actually ships on.
 _HEAD_READ_ERRORS = (OSError, UnicodeDecodeError)
+_GITHUB_SCP_REMOTE = re.compile(r"^git@github\.com:(?P<path>[^?#]+)$", re.IGNORECASE)
+_GITHUB_URL_REMOTE = re.compile(
+    r"^(?:https://github\.com/|ssh://git@github\.com/)(?P<path>[^?#]+)$",
+    re.IGNORECASE,
+)
 
 # Branch names that denote a repository's main line rather than isolated
 # feature/audit work. A task whose expected branch is one of these (or equals
 # its own base branch) is treated as main-line work that may legitimately run
 # in the primary working tree; anything else must run in an isolated worktree.
 MAIN_BRANCH_NAMES = frozenset({"main", "master"})
+
+
+def _repository_remote_identity(value: str) -> tuple[str, str]:
+    """Return the repository identity used by task-local ownership checks.
+
+    Git may rewrite an HTTPS GitHub URL to its SSH form through ``insteadOf``
+    before ``remote get-url`` returns it. Those spellings identify the same
+    repository and must not invalidate an otherwise correctly signed task
+    marker. Only the three credential-free canonical GitHub forms are
+    collapsed; every other remote remains byte-for-byte distinct.
+    """
+    match = _GITHUB_SCP_REMOTE.fullmatch(value) or _GITHUB_URL_REMOTE.fullmatch(value)
+    if match is None:
+        return "literal", value
+    path = match.group("path").strip("/")
+    if path.lower().endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) != 2 or not all(parts):
+        return "literal", value
+    return "github", "/".join(part.lower() for part in parts)
+
 
 # Working-tree cleanliness policies a caller can require before launch.
 STATUS_POLICY_ALLOW_DIRTY = "allow_dirty"  # default — never blocks on dirtiness
@@ -1117,11 +1144,16 @@ def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
         "expected_branch": spec.expected_branch,
         "base_branch": spec.base_branch,
     }
-    static_failed = {
-        key: (marker.get(key), expected)
-        for key, expected in static_expected.items()
-        if marker.get(key) != expected
-    }
+    static_failed = {}
+    for key, expected in static_expected.items():
+        observed = marker.get(key)
+        matches = observed == expected
+        if key == "remote_url" and isinstance(observed, str):
+            matches = _repository_remote_identity(
+                observed
+            ) == _repository_remote_identity(expected)
+        if not matches:
+            static_failed[key] = (observed, expected)
     marker_base = str(marker.get("base_sha") or "").lower()
     marker_start = str(marker.get("start_sha") or "").lower()
     if (
@@ -1577,9 +1609,7 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
                 ref_fd, ref_stat = opened
                 try:
                     candidate = (
-                        _read_pinned_regular(
-                            ref_fd, ref_stat, max_bytes=_MAX_REF_BYTES
-                        )
+                        _read_pinned_regular(ref_fd, ref_stat, max_bytes=_MAX_REF_BYTES)
                         .decode("ascii", "strict")
                         .strip()
                     )
