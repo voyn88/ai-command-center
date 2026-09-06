@@ -67,6 +67,7 @@ from command_center.runtime.db import audit as audit_db
 from command_center.runtime.db import marketplace as market_db
 from command_center.runtime.db import networking as net_db
 from command_center.runtime.db import wave1
+from tests.db.reconcile_stage import reconciled_stage
 
 ROOT = Path(__file__).resolve().parents[2]
 

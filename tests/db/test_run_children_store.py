@@ -20,6 +20,7 @@ from command_center.db.run_children_store import (
 )
 from command_center.db.run_store import PostgresRunMirror
 from command_center.runtime.db import execution as exec_db
+from tests.db.reconcile_stage import reconciled_stage
 
 
 def _patch(monkeypatch, factory) -> None:
@@ -66,12 +67,14 @@ def test_the_journal_and_the_report_reconcile_after_every_write(
     exec_db.db.migrate(db_path)
     run = _launch(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert run_event_divergence(exec_db.list_run_events_stored(db_path, run["id"]), events) == [], (
-            stage
-        )
+    def _stored_report() -> list[dict]:
         stored_report = exec_db.get_report(db_path, run["id"])
-        assert report_divergence([stored_report] if stored_report else [], reports) == [], stage
+        return [stored_report] if stored_report else []
+
+    reconciled = reconciled_stage(
+        (run_event_divergence, lambda: exec_db.list_run_events_stored(db_path, run["id"]), events),
+        (report_divergence, _stored_report, reports),
+    )
 
     exec_db.append_run_event(db_path, run["id"], "stdout", {"line": "hello"})
     reconciled("first event")

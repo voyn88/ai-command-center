@@ -33,6 +33,7 @@ from command_center.db.council_store import (
 )
 from command_center.runtime.db import council as council_db
 from tests.db.mirror_probe import each_lost_write_is_noticed
+from tests.db.reconcile_stage import reconciled_stage
 
 TALLY = {"approve": 2, "reject": 0}
 ROLES = [{"role": "architect", "choice": "approve"}]
@@ -100,17 +101,16 @@ def test_the_family_reconciles_after_every_write(
     db_path = tmp_path / "runtime.db"
     council_db.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert motion_divergence(council_db.list_motions(db_path), mirrors["motion"]) == [], stage
-        assert vote_divergence(
-            council_db.list_votes(db_path, motion_id), mirrors["vote"]
-        ) == [], stage
-        assert decision_divergence(
-            council_db.list_decisions_stored(db_path), mirrors["decision"]
-        ) == [], stage
-        assert event_divergence(
-            council_db.list_events_stored(db_path), mirrors["event"]
-        ) == [], stage
+    reconciled = reconciled_stage(
+        (motion_divergence, lambda: council_db.list_motions(db_path), mirrors["motion"]),
+        (vote_divergence, lambda: council_db.list_votes(db_path, motion_id), mirrors["vote"]),
+        (
+            decision_divergence,
+            lambda: council_db.list_decisions_stored(db_path),
+            mirrors["decision"],
+        ),
+        (event_divergence, lambda: council_db.list_events_stored(db_path), mirrors["event"]),
+    )
 
     motion = council_db.create_motion(db_path, title="mirror the council", proposed_by="ops")
     motion_id = motion["id"]

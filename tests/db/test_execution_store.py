@@ -19,6 +19,7 @@ from command_center.db.execution_store import (
 )
 from command_center.runtime.db import execution as exec_db
 from tests.db.mirror_probe import each_lost_write_is_noticed
+from tests.db.reconcile_stage import reconciled_stage
 
 
 def _patch(monkeypatch, factory) -> None:
@@ -53,9 +54,10 @@ def test_the_family_reconciles_after_every_write(
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert task_divergence(exec_db.list_tasks(db_path), tasks) == [], stage
-        assert session_divergence(exec_db.list_sessions(db_path), sessions) == [], stage
+    reconciled = reconciled_stage(
+        (task_divergence, lambda: exec_db.list_tasks(db_path), tasks),
+        (session_divergence, lambda: exec_db.list_sessions(db_path), sessions),
+    )
 
     task = exec_db.create_task(db_path, project="AICC", title="mirror me", task_type="feature")
     reconciled("task created")

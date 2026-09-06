@@ -27,6 +27,7 @@ from command_center.db.execution_store import PostgresSessionMirror, PostgresTas
 from command_center.db.run_store import PostgresRunMirror
 from command_center.runtime.db import completion as completion_db
 from command_center.runtime.db import execution as exec_db
+from tests.db.reconcile_stage import reconciled_stage
 
 SAMPLE_AT = "2026-08-14T00:00:00"
 
@@ -87,21 +88,23 @@ def test_the_completion_family_reconciles_after_every_write(
     exec_db.db.migrate(db_path)
     run = _launch(db_path)
 
-    def reconciled(stage: str) -> None:
+    def _stored_completion() -> list[dict]:
         stored = completion_db.get_completion(db_path, run["id"])
-        assert completion_divergence([stored] if stored else [], completions) == [], stage
-        assert (
-            completion_event_divergence(
-                completion_db.list_completion_events_stored(db_path, run["id"]), events
-            )
-            == []
-        ), stage
-        assert (
-            completion_validation_divergence(
-                completion_db.list_validation_results(db_path, run["id"]), validations
-            )
-            == []
-        ), stage
+        return [stored] if stored else []
+
+    reconciled = reconciled_stage(
+        (completion_divergence, _stored_completion, completions),
+        (
+            completion_event_divergence,
+            lambda: completion_db.list_completion_events_stored(db_path, run["id"]),
+            events,
+        ),
+        (
+            completion_validation_divergence,
+            lambda: completion_db.list_validation_results(db_path, run["id"]),
+            validations,
+        ),
+    )
 
     created = completion_db.create_completion(
         db_path,

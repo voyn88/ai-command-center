@@ -14,6 +14,7 @@ from command_center.db.execution_store import PostgresSessionMirror, PostgresTas
 from command_center.db.run_store import PostgresRunMirror, run_divergence
 from command_center.runtime.db import execution as exec_db
 from tests.db.mirror_probe import each_lost_write_is_noticed
+from tests.db.reconcile_stage import reconciled_stage
 
 
 def _patch(monkeypatch, factory) -> None:
@@ -102,8 +103,7 @@ def test_runs_reconcile_after_every_write(pg_connection_factory, tmp_path, monke
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert run_divergence(exec_db.list_runs(db_path), runs) == [], stage
+    reconciled = reconciled_stage((run_divergence, lambda: exec_db.list_runs(db_path), runs))
 
     run = _launch(db_path)
     reconciled("run created")

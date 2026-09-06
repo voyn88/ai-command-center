@@ -29,6 +29,7 @@ from command_center.db.model_registry_store import (
     event_divergence,
 )
 from command_center.runtime.db import model_registry as mr_db
+from tests.db.reconcile_stage import reconciled_stage
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -285,9 +286,10 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
     db_path = tmp_path / "runtime.db"
     mr_db.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert entry_divergence(mr_db.list_model_entries(db_path), entries) == [], stage
-        assert event_divergence(mr_db.list_model_events_stored(db_path), events) == [], stage
+    reconciled = reconciled_stage(
+        (entry_divergence, lambda: mr_db.list_model_entries(db_path), entries),
+        (event_divergence, lambda: mr_db.list_model_events_stored(db_path), events),
+    )
 
     created = mr_db.create_model_entry(
         db_path, model_id="m1", name="Local 7B", kind="local", status="downloading"

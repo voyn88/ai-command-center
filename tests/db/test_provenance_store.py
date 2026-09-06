@@ -35,6 +35,7 @@ from command_center.db.provenance_store import (
 from command_center.db.run_store import PostgresRunMirror
 from command_center.runtime.db import execution as exec_db
 from command_center.runtime.db import provenance as prov_db
+from tests.db.reconcile_stage import reconciled_stage
 
 SAMPLE_OBSERVED_AT = "2026-08-14T00:00:00"
 
@@ -108,27 +109,28 @@ def test_the_provenance_family_reconciles_after_every_write(
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
+    def _stored_provenance() -> list[dict]:
         stored = prov_db.get_run_provenance(db_path, run["id"])
-        assert run_provenance_divergence([stored] if stored else [], provenance) == [], stage
-        assert (
-            provenance_evidence_divergence(
-                prov_db.list_provenance_evidence_stored(db_path), evidence
-            )
-            == []
-        ), stage
-        assert (
-            provider_attempt_divergence(
-                prov_db.list_provider_attempts(db_path, run["id"]), attempts
-            )
-            == []
-        ), stage
-        assert (
-            run_provider_route_divergence(
-                prov_db.list_provider_routes_stored(db_path), routes
-            )
-            == []
-        ), stage
+        return [stored] if stored else []
+
+    reconciled = reconciled_stage(
+        (run_provenance_divergence, _stored_provenance, provenance),
+        (
+            provenance_evidence_divergence,
+            lambda: prov_db.list_provenance_evidence_stored(db_path),
+            evidence,
+        ),
+        (
+            provider_attempt_divergence,
+            lambda: prov_db.list_provider_attempts(db_path, run["id"]),
+            attempts,
+        ),
+        (
+            run_provider_route_divergence,
+            lambda: prov_db.list_provider_routes_stored(db_path),
+            routes,
+        ),
+    )
 
     # Stage zero, and it is the stage acceptance said was missing. `create_run`
     # writes `run_provenance` and `run_provider_route` itself, and the first

@@ -32,6 +32,7 @@ from command_center.db.networking_store import (
     message_divergence,
 )
 from command_center.runtime.db import networking as net_db
+from tests.db.reconcile_stage import reconciled_stage
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -284,9 +285,10 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
     db_path = tmp_path / "runtime.db"
     net_db.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert contact_divergence(net_db.list_contacts(db_path), contacts) == [], stage
-        assert message_divergence(net_db.list_messages(db_path), messages) == [], stage
+    reconciled = reconciled_stage(
+        (contact_divergence, lambda: net_db.list_contacts(db_path), contacts),
+        (message_divergence, lambda: net_db.list_messages(db_path), messages),
+    )
 
     # A contact written once and never touched again — the write-once shape.
     quiet = net_db.create_contact(db_path, display_name="quiet", handle="@quiet")
