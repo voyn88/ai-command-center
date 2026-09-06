@@ -296,12 +296,31 @@ class WorkerDaemon:
                 work.attempt_id,
             )
             return
-        if outcome.ok:
-            accepted = self._store.complete(work, outcome.result)
-        else:
-            accepted = self._store.fail(
-                work, reason=outcome.reason, retryable=outcome.retryable
+        try:
+            if outcome.ok:
+                accepted = self._store.complete(work, outcome.result)
+            else:
+                accepted = self._store.fail(
+                    work, reason=outcome.reason, retryable=outcome.retryable
+                )
+        except Exception:
+            # The handler successfully decided an outcome -- what it admits --
+            # but persisting it raised (a DB hiccup, a dropped connection, a
+            # result the driver cannot encode): the same class of failure
+            # `_dispatch` already guards for a raising HANDLER. Uncaught here,
+            # it would propagate out of `run_forever`'s loop and kill the
+            # whole daemon over the one attempt it was reporting, taking every
+            # other queued item down with it -- mirroring the non-object-
+            # payload crash this module already closed once. The lease is
+            # left to lapse on its own (visibility expiry, then the reaper),
+            # exactly like the stale-owner refusal below; a later delivery
+            # retries.
+            logger.exception(
+                "attempt %s: writing the outcome raised; the attempt's lease "
+                "will lapse and a later delivery will retry",
+                work.attempt_id,
             )
+            return
         if not accepted:
             # The database refused the report: the lease lapsed between our
             # last successful beat and this write, and the attempt belongs to
