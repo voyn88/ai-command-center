@@ -91,6 +91,52 @@ class WorkQueueReadStore:
                 cur.execute(sql, tuple(params))
                 return _rows_to_dicts(_ITEM_COLUMNS, cur.fetchall())
 
+    def queue_metrics(self) -> list[dict[str, Any]]:
+        """One row per queue: state counts plus the claimable backlog's age.
+
+        ``ready`` counts only items that are actually claimable right now
+        (``state = 'ready' AND available_at <= now()``) — matching the
+        documented meaning of "backlog depth". An item sitting in `ready`
+        with a future `available_at` (a delayed retry, a scheduled task) is
+        not work a worker could pick up, so it is excluded from both `ready`
+        and the age calculation below; counting it would report backlog
+        that does not exist.
+
+        ``oldest_ready_seconds`` is the age of the longest-waiting claimable
+        item, in seconds, or ``None`` when the queue has no claimable ready
+        item. Restricting `min(available_at)` to the same claimable rows is
+        what keeps this non-negative: every row it considers already has
+        `available_at <= now()`, so there is nothing left to clamp.
+        """
+        sql = (
+            "SELECT queue,"
+            " count(*) FILTER (WHERE state = 'ready' AND available_at <= now())"
+            "   AS ready,"
+            " count(*) FILTER (WHERE state = 'claimed') AS claimed,"
+            " count(*) FILTER (WHERE state = 'succeeded') AS succeeded,"
+            " count(*) FILTER (WHERE state = 'dead') AS dead,"
+            " EXTRACT(EPOCH FROM (now() - min(available_at)"
+            "   FILTER (WHERE state = 'ready' AND available_at <= now())))"
+            "   AS oldest_ready_seconds"
+            " FROM work_item_public"
+            " GROUP BY queue"
+            " ORDER BY queue"
+        )
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                columns = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+        out = []
+        for row in rows:
+            entry = dict(zip(columns, row, strict=True))
+            for key in ("ready", "claimed", "succeeded", "dead"):
+                entry[key] = int(entry[key])
+            if entry["oldest_ready_seconds"] is not None:
+                entry["oldest_ready_seconds"] = float(entry["oldest_ready_seconds"])
+            out.append(entry)
+        return out
+
     def get_item(self, work_item_id: str) -> dict[str, Any] | None:
         """One item with its attempt trail and, when finished, its result.
 
