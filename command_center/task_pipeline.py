@@ -2404,23 +2404,50 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     }
 
 
+def _total_cost_usd_from_payload(payload: object, *, context: str) -> float | None:
+    """Decode one `run_event.payload_json` value — JSON text, or an
+    already-decoded `dict` from a `jsonb`-backed read (the PostgreSQL mirror,
+    VOYN-W0-AICC-SRV-01B) — into its `total_cost_usd`, or `None` when the row
+    carries none.
+
+    `context` (the caller's name) prefixes the log line for whichever of the
+    two failure shapes actually happened. A prior version caught `TypeError`
+    alongside `ValueError` and silently `continue`d past every row, which
+    zeroed the whole sum with no error and no log line — a spend cap that
+    reads 0 stops gating without ever saying so. Only malformed JSON *text* is
+    tolerated (and logged); a row of an unexpected shape is now visible
+    instead of silently dropped.
+    """
+    import json as _json
+
+    if isinstance(payload, (str, bytes, bytearray)):
+        try:
+            payload = _json.loads(payload)
+        except ValueError:
+            _LOG.warning(
+                "%s: skipping run_event with unparseable payload_json: %r",
+                context, payload[:200] if isinstance(payload, str) else payload,
+            )
+            return None
+    if not isinstance(payload, dict):
+        _LOG.warning(
+            "%s: skipping run_event whose payload is a %s, not an object",
+            context, type(payload).__name__,
+        )
+        return None
+    cost = payload.get("total_cost_usd")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        return float(cost)
+    return None
+
+
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
     work started in it). Reads only the final `result` stream events, which are
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
-
-    `payload` may already be a `dict` rather than JSON text — a `jsonb`-backed
-    read (the PostgreSQL mirror this table has, VOYN-W0-AICC-SRV-01B) hands
-    back a decoded object, not a string, and `json.loads` on a `dict` raises
-    `TypeError`. A prior version caught `TypeError` alongside `ValueError` and
-    silently `continue`d past every row, which zeroes the whole sum with no
-    error and no log line — a spend cap that reads 0 stops gating without
-    ever saying so. Only malformed JSON *text* is tolerated (and logged); a
-    row of an unexpected shape is now visible instead of silently dropped.
     """
-    import json as _json
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
@@ -2437,23 +2464,40 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             (cutoff, cutoff),
         ).fetchall()
     for row in rows:
-        payload = row["payload"]
-        if isinstance(payload, (str, bytes, bytearray)):
-            try:
-                payload = _json.loads(payload)
-            except ValueError:
-                _LOG.warning(
-                    "daily_spend_usd: skipping run_event with unparseable payload_json: %r",
-                    payload[:200] if isinstance(payload, str) else payload,
-                )
-                continue
-        if not isinstance(payload, dict):
-            _LOG.warning(
-                "daily_spend_usd: skipping run_event whose payload is a %s, not an object",
-                type(payload).__name__,
-            )
-            continue
-        cost = payload.get("total_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total += float(cost)
+        cost = _total_cost_usd_from_payload(row["payload"], context="daily_spend_usd")
+        if cost is not None:
+            total += cost
     return total
+
+
+def costs_usd_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, float]:
+    """Real per-run cost: the providers' own reported `total_cost_usd`,
+    summed per run and keyed by `run_id`. The same truthful source
+    `daily_spend_usd` reads, scoped to specific runs instead of a trailing
+    time window — the per-run primitive `dispatch.ledger_query` needs to
+    price each ledger entry with what that attempt actually cost, not an
+    estimate.
+
+    A run with no cost-bearing event is simply absent from the result (never
+    a fabricated 0 a caller could mistake for "confirmed zero cost") — same
+    "absent, not invented" posture `dispatch.ledger_feed` takes toward
+    `tokens`/`skills`.
+    """
+    if not run_ids:
+        return {}
+    totals: dict[str, float] = {}
+    placeholders = ", ".join("?" for _ in run_ids)
+    with runtime_db.connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT run_id, payload_json AS payload FROM run_event
+             WHERE run_id IN ({placeholders})
+               AND payload_json LIKE '%total_cost_usd%'
+            """,
+            tuple(run_ids),
+        ).fetchall()
+    for row in rows:
+        cost = _total_cost_usd_from_payload(row["payload"], context="costs_usd_for_runs")
+        if cost is not None:
+            totals[row["run_id"]] = totals.get(row["run_id"], 0.0) + cost
+    return totals
