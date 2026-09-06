@@ -503,6 +503,11 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Repo-route and evidence hygiene (0017): OPEN -> NEEDS_REFINEMENT for a
+    # sustained-unroutable repo, and removing 'pr' evidence proven to be
+    # unresolvable.
+    "backlog_park_unroutable(text, text, integer)",
+    "backlog_clear_evidence(text, text, text, text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
