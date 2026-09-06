@@ -155,6 +155,24 @@ def build_parser() -> argparse.ArgumentParser:
         "ancestor of the default branch (pre-fix rows recorded the PR head, "
         "not the merge commit). Never changes a task's status.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    dirty = sub.add_parser(
+        "backlog-dirty-remediate",
+        help="One dirty-PR remediation tick (VOYN-W0-AICC-DIRTY-PR-REBASE-"
+        "REMEDIATION): for every PR the merge tick would flag "
+        "branch_dirty_needs_rebase, attempt a local merge (never rebase) "
+        "in a disposable worktree -- push a clean merge through the same "
+        "guarded publish path on success, or dispatch a scoped rebase task "
+        "(or a DEFER_TO_USER triage task, for a huge/stale conflict) on a "
+        "real conflict. Needs --repo-path and a deploy key "
+        "(AICC_PUBLISH_DEPLOY_KEY) to publish a clean merge.",
+    )
+    dirty.add_argument("--repo-path", default=".", help="Local clone for git/gh calls.")
+    dirty.add_argument(
+        "--repository",
+        default=None,
+        help="Writer-lease repository id for a clean merge's guarded publish "
+        "(default: $VOYN_LEASE_REPOSITORY).",
+    )
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -547,6 +565,37 @@ def main(argv: list[str] | None = None) -> int:
                 report = merge_once(lambda: _nc(conn), args.repo_path)
                 for task_id, head in report.merged:
                     print(f"MERGED    {task_id} -> {head}")
+                for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
+                return 0
+
+            if args.command == "backlog-dirty-remediate":
+                import os
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.dirty_pr_remediation import (
+                    remediate_dirty_prs,
+                )
+                from command_center.orchestrator.publish import PublishConfig
+
+                publish_cfg = PublishConfig(
+                    lease_tool=os.environ.get("VOYN_LEASE_TOOL", "voyn-lease"),
+                    repository=args.repository
+                    or os.environ.get("VOYN_LEASE_REPOSITORY", ""),
+                    owner=os.environ.get("AICC_PUBLISH_OWNER", "server-worker"),
+                    session=os.environ.get("VOYN_LEASE_SESSION", "server-worker"),
+                    task="",  # overridden per PR inside remediate_dirty_prs
+                    deploy_key=os.environ.get("AICC_PUBLISH_DEPLOY_KEY", ""),
+                )
+                report = remediate_dirty_prs(
+                    lambda: _nc(conn), args.repo_path, publish_cfg
+                )
+                for task_id, head in report.healed:
+                    print(f"HEALED    {task_id} -> {head}")
+                for task_id, new_task_id in report.rebase_dispatched:
+                    print(f"REBASE    {task_id} -> {new_task_id}")
+                for task_id, new_task_id in report.deferred:
+                    print(f"DEFERRED  {task_id} -> {new_task_id}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 return 0
