@@ -549,7 +549,13 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
-                return 0
+                for task_id, reason in report.errors:
+                    print(f"ERROR     {task_id}: {reason}", file=sys.stderr)
+                # GitHub being unreachable (or the merge identity being
+                # unconfigured) must fail this tick loudly, not look like an
+                # ordinary "nothing to merge yet" run to whatever watches the
+                # timer/service (VOYN-W0-AICC-MERGE-GATEWAY-REM).
+                return 1 if report.errors else 0
 
             if args.command == "backlog-merge-reconcile":
                 from contextlib import nullcontext as _nc

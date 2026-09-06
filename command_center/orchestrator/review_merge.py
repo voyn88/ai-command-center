@@ -127,6 +127,16 @@ class LoopReport:
     #: Fresh, bounded identities dispatched to replace succeeded review runs
     #: whose final result cannot be parsed for the current PR head.
     retried: list[tuple[str, str]] = field(default_factory=list)
+    #: GitHub was unreachable, misconfigured, or refused an installation
+    #: token -- never "not ready yet" (that is `skipped`). VOYN-W0-AICC-
+    #: MERGE-GATEWAY-REM: a merge tick that cannot reach the GitHub API has
+    #: no basis to say whether a PR is mergeable at all, and folding that
+    #: into `skipped` made a real outage look exactly like an ordinary,
+    #: ignorable "checks not green yet" -- silent skip-and-retry-forever.
+    #: Kept apart from `skipped` so a caller can fail loudly (see
+    #: `backlog-merge`'s non-zero exit) instead of looking identical to a
+    #: PR that just isn't accepted yet.
+    errors: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -369,6 +379,86 @@ def _post_marker_as_bot(
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
         return False, f"marker_post_failed: {exc}"
     return True, ""
+
+
+def _merge_app_credentials() -> github_app_auth.GitHubAppCredentials | None:
+    """The dedicated merge identity's credentials -- a THIRD installation,
+    distinct from both the acceptance identity above (which only ever posts
+    the marker review) and the ambient `_gh()` credential every read in this
+    module uses. VOYN-W0-AICC-MERGE-GATEWAY-REM: before this, `merge_once`'s
+    `gh pr merge` ran under the same ambient credential as every other `gh`
+    call this process makes, so whatever token authored the pull request,
+    read it, and posted comments about it could also merge it -- there was
+    no single component that alone held merge authority. `VOYN_MERGE_APP_ID`
+    / `_INSTALLATION_ID` / `_PRIVATE_KEY_PATH` name that installation; a host
+    with none of the three set has no bot identity to merge as and
+    `merge_once` skips loudly (`merge_bot_not_configured`) rather than
+    falling back to the ambient credential, which would just recreate the
+    shared-credential gap this exists to close. All three or none, same
+    partial-set-is-a-misconfiguration discipline as the acceptance
+    credentials above."""
+    app_id = os.environ.get("VOYN_MERGE_APP_ID", "")
+    installation_id = os.environ.get("VOYN_MERGE_INSTALLATION_ID", "")
+    key_path = os.environ.get("VOYN_MERGE_PRIVATE_KEY_PATH", "")
+    if not (app_id and installation_id and key_path):
+        return None
+    return github_app_auth.GitHubAppCredentials(app_id, installation_id, Path(key_path))
+
+
+def _merge_pull_request_as_bot(
+    creds: github_app_auth.GitHubAppCredentials,
+    pr_url: str,
+    expected_head: str,
+    method: str = "squash",
+) -> tuple[bool, str, bool]:
+    """Merge under the dedicated merge identity's own installation token --
+    never `_gh()`, and never the acceptance identity that posts the marker.
+    `sha=expected_head` pins the request to the exact commit `_pr_is_mergeable`
+    just verified: GitHub itself refuses with 409 if the branch moved between
+    that read and this call, closing the check-then-act race no amount of
+    local re-reading could close on its own.
+
+    Returns ``(merged, reason, is_api_error)``. ``is_api_error`` is what lets
+    the caller route a transport/availability failure (network, timeout, a
+    5xx, a broken installation) into `LoopReport.errors` -- fail closed,
+    never silently retried forever as an ordinary skip -- while a definite
+    negative answer from GitHub itself (405 not mergeable, 409 sha mismatch
+    or conflict) stays a `skipped`, since a future tick re-evaluating
+    readiness from scratch is exactly the right response to those."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return False, f"no_repo_route: {pr_url!r}", True
+    owner, repo, number = parsed
+    try:
+        token = github_app_auth.installation_token(creds)
+    except github_app_auth.AppAuthError as exc:
+        return False, f"merge_app_auth_failed: {exc}", True
+    body = json.dumps({"merge_method": method, "sha": expected_head}).encode()
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/merge",
+        method="PUT",
+        data=body,
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            pass
+    except urllib.error.HTTPError as exc:
+        if exc.code in (405, 409):
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+            except OSError:
+                pass
+            return False, f"merge_rejected_{exc.code}: {detail}", False
+        return False, f"merge_api_error_{exc.code}", True
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, f"merge_api_unreachable: {exc}", True
+    return True, "", False
 
 
 def _rows(factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
@@ -1587,10 +1677,21 @@ def _accept_marker_on_latest_review(
     field). None (author unknown/unfetched) skips this check rather than
     refusing everything -- callers that cannot supply it keep prior
     behavior; `_pr_is_mergeable` and `_has_accept_marker` below always can
-    and always do."""
+    and always do.
+
+    A DISMISSED latest review never counts (VOYN-W0-AICC-MERGE-GATEWAY-REM):
+    dismissal keeps a review's `submittedAt` and `body` exactly as they were,
+    so an ACCEPT that is the most recent review by time but has since been
+    dismissed used to satisfy the body/author checks above and authorize
+    merge anyway -- withdrawing the marker was silently a no-op. Anyone with
+    write access to the pull request can dismiss a review, which is a much
+    lower bar than independently re-issuing a verdict, so this closes a real
+    bypass, not a theoretical one."""
     if not reviews:
         return False
     latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
+    if latest.get("state") == "DISMISSED":
+        return False
     if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
         return False
     if pr_author_login is None:
@@ -2555,6 +2656,13 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         if merge_sha is None:
             ready, detail = _pr_is_mergeable(repo_path, pr_url)
             if not ready:
+                if detail.startswith("gh_view_failed"):
+                    # Unreachable GitHub API, not "not ready yet" -- this
+                    # tick has no basis to say anything about the PR at all
+                    # (VOYN-W0-AICC-MERGE-GATEWAY-REM: fail closed, don't
+                    # let an outage look like an ordinary ignorable skip).
+                    report.errors.append((task_id, detail))
+                    continue
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake
                     # window: retry the failed jobs once (attempt-bounded)
@@ -2591,22 +2699,38 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                         (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
                     )
                 continue
+            # The merge itself is the one privileged write this whole module
+            # exists to gate: it runs under its OWN GitHub App installation,
+            # never `_gh()` (VOYN-W0-AICC-MERGE-GATEWAY-REM -- see
+            # `_merge_app_credentials`'s docstring for why a shared ambient
+            # credential across marker-posting and merging was the finding).
+            # No credentials configured is a refusal, not a fallback to the
+            # ambient token.
+            merge_creds = _merge_app_credentials()
+            if merge_creds is None:
+                report.skipped.append((task_id, "merge_bot_not_configured"))
+                continue
             actions += 1
-            merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
-            # On a merge-queue-protected repo a zero exit only ENQUEUED the
-            # PR; on a plain repo it merged synchronously. Either way the
-            # target branch, not the exit code, is the authority: DONE only
-            # once the PR reports MERGED with its merge commit AND the
-            # acceptance evidence re-validates on the merged head.
+            merge_ok, merge_call_reason, merge_is_api_error = (
+                _merge_pull_request_as_bot(merge_creds, pr_url, detail)
+            )
+            # On a merge-queue-protected repo the call above only ENQUEUES
+            # the PR; on a plain repo it merges synchronously. Either way the
+            # target branch, not the call's own outcome, is the authority:
+            # DONE only once the PR reports MERGED with its merge commit AND
+            # the acceptance evidence re-validates on the merged head.
             merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
             if merge_sha is None:
                 if merge_reason == "merged_without_acceptance_evidence":
                     reason = merge_reason
-                elif merged.returncode == 0:
+                elif merge_ok:
                     reason = "merge_queued_awaiting_target"
                 else:
-                    reason = f"merge_failed: {merged.stderr.strip()[:100]}"
-                report.skipped.append((task_id, reason))
+                    reason = merge_call_reason
+                if merge_is_api_error and merge_reason != "merged_without_acceptance_evidence":
+                    report.errors.append((task_id, reason))
+                else:
+                    report.skipped.append((task_id, reason))
                 continue
         head = merge_sha  # the TARGET-BRANCH merge commit, never the PR head
         # Evidence and the DONE transition are one act: the sha row and the
@@ -2619,31 +2743,44 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         with factory() as conn:
             conn.autocommit = False
             try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT revision FROM backlog_task WHERE task_id = %s",
-                        (task_id,),
-                    )
-                    row = cur.fetchone()
-                    if row is None:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT revision FROM backlog_task WHERE task_id = %s",
+                            (task_id,),
+                        )
+                        row = cur.fetchone()
+                        if row is None:
+                            conn.rollback()
+                            report.skipped.append((task_id, "task_vanished"))
+                            continue
+                        revision = row[0]
+                        cur.execute(
+                            "SELECT backlog_record_evidence(%s, 'sha', %s)", (task_id, head)
+                        )
+                        cur.execute(
+                            "SELECT ok, reason FROM backlog_transition(%s, 'DONE', %s)",
+                            (task_id, revision),
+                        )
+                        ok, reason = cur.fetchone()
+                    if ok:
+                        conn.commit()
+                        report.merged.append((task_id, head))
+                    else:
                         conn.rollback()
-                        report.skipped.append((task_id, "task_vanished"))
-                        continue
-                    revision = row[0]
-                    cur.execute(
-                        "SELECT backlog_record_evidence(%s, 'sha', %s)", (task_id, head)
-                    )
-                    cur.execute(
-                        "SELECT ok, reason FROM backlog_transition(%s, 'DONE', %s)",
-                        (task_id, revision),
-                    )
-                    ok, reason = cur.fetchone()
-                if ok:
-                    conn.commit()
-                    report.merged.append((task_id, head))
-                else:
+                        report.skipped.append((task_id, f"transition:{reason}"))
+                except BaseException:
+                    # An exception here (a dropped connection, an unexpected
+                    # DB error) leaves the transaction open. VOYN-W0-AICC-
+                    # MERGE-GATEWAY-REM: rolling back BEFORE the `finally`
+                    # below flips `autocommit` back to True is required --
+                    # changing isolation mode mid-transaction is itself
+                    # invalid on psycopg-family drivers, so without this the
+                    # original exception was replaced by an unrelated
+                    # secondary one and the connection left inconsistent,
+                    # after a merge that had ALREADY happened on GitHub.
                     conn.rollback()
-                    report.skipped.append((task_id, f"transition:{reason}"))
+                    raise
             finally:
                 conn.autocommit = True
     _scan_commit(factory, "scan:merge_once", scan_token, last_processed)
