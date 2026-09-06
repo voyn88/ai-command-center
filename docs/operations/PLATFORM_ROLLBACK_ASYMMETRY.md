@@ -41,16 +41,19 @@ own history with it.
 AICC never talks to that database directly. It shells out to the external
 `voyn-lease` CLI (named by `VOYN_LEASE_TOOL`, reached through
 `VOYN_LEASE_DSN` — a DSN naming the platform's database, not AICC's) from
-three call sites that share one identity/argv shape
-(`command_center/worker/lease_client.py`):
+three call sites:
 
 - `command_center/worker/writer_lease.py` — the full-lifecycle lease held
   from workspace provisioning through the agent run, tests and publish
   (`acquire`, periodic re-`acquire` as renewal, `release`).
 - `command_center/orchestrator/publish.py` — the lease held around the
   actual `git push` (`acquire`, `install-hooks`, `release`).
+
+  These two share one identity/argv shape, in
+  `command_center/worker/lease_client.py`.
 - `command_center/worker/worktree_lease.py` — read-only (`list` only); it
-  never acquires or writes anything.
+  never acquires or writes anything, and calls `voyn-lease list` directly
+  rather than through `lease_client.py`.
 
 Every `acquire`/`release` call is a write into `repo_lease` and a new row in
 `repo_lease_event`, on the platform's database, the instant the CLI returns
