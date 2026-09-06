@@ -9,6 +9,7 @@ actually compare the two stores.
 
 from __future__ import annotations
 
+from datetime import datetime
 import inspect
 from pathlib import Path
 
@@ -22,6 +23,11 @@ from command_center.db.owner_item_store import (
     divergence,
 )
 from command_center.runtime.db import wave1
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -45,7 +51,7 @@ def _row(item_id: str, **overrides: object) -> dict:
 
 @pytest.fixture
 def mirror(pg_connection_factory) -> PostgresOwnerItemMirror:
-    return PostgresOwnerItemMirror(connection_factory=pg_connection_factory)
+    return PostgresOwnerItemMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
 
 # --- contract and authority -------------------------------------------------

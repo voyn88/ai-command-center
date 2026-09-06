@@ -32,6 +32,7 @@ about both, which is the trade `record_mirror`'s docstring already refused.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import tzinfo
 from typing import Any, Iterable
 
 from command_center.db import mirror_support
@@ -101,10 +102,16 @@ class PostgresTableMirror:
         if not isinstance(getattr(cls, "spec", None), MirroredTable):
             raise TypeError(f"{cls.__name__} must declare `spec = MirroredTable(...)`")
 
-    def __init__(self, connection_factory: Any = None) -> None:
+    def __init__(self, connection_factory: Any = None, *, zone: tzinfo | None = None) -> None:
         # Injectable so tests can supply a connection without a process-wide
         # pool, and so this module never reaches for global state of its own.
         self._factory = connection_factory
+        # Only `list_records` needs this — `upsert` runs inline in the writer's
+        # own process, where the ambient zone already is the zone that matters
+        # (see `mirror_support.to_instant`). Reconciliation is a separate
+        # operation with no such guarantee, so `list_records` refuses to guess;
+        # see it for why (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+        self._zone = zone
 
     def _connection(self) -> Any:
         """Resolved on use, never at import.
@@ -222,7 +229,26 @@ class PostgresTableMirror:
     # --- reads -------------------------------------------------------------
 
     def list_records(self) -> list[dict]:
-        """Every mirrored record, shaped like the authority's own row."""
+        """Every mirrored record, shaped like the authority's own row.
+
+        Needs the zone this table's naive timestamps are declared on, supplied
+        at construction (`zone=`) rather than guessed from the calling
+        process — see `mirror_support.render_authority_timestamp` for what a
+        guess gets wrong. Raises rather than falling back to this process's own
+        zone, because a silent fallback is exactly the defect
+        `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS` closed: a reconciliation that
+        "happens" to run in the writer's zone looks identical to one that is
+        actually correct, right up until it doesn't. Resolve the zone from the
+        authority itself — `command_center.runtime.db.resolve_timestamp_zone
+        (db_path)` — rather than from whatever zone the operator's shell is in.
+        """
+        if self._zone is None:
+            raise ValueError(
+                f"{type(self).__name__}.list_records() needs the authority's "
+                "declared zone: construct with zone=<the writer's zone>, e.g. "
+                "from command_center.runtime.db.resolve_timestamp_zone(db_path) "
+                "— see mirror_support.render_authority_timestamp."
+            )
         spec = self.spec
         with self._connection() as conn:
             with conn.cursor() as cur:
@@ -233,7 +259,7 @@ class PostgresTableMirror:
                 rows = cur.fetchall()
         return [
             {
-                name: spec.codec.to_authority(name, value)
+                name: spec.codec.to_authority(name, value, zone=self._zone)
                 for name, value in zip(spec.columns, row, strict=True)
             }
             for row in rows
@@ -255,6 +281,11 @@ def divergence_against(spec: MirroredTable, doc: str | None = None) -> Any:
     that reconciliation takes the *stored* reader. The warning has to be
     readable where the mistake is made, which is a REPL at cutover time, not a
     source file.
+
+    The `mirror` passed to the returned function must be constructed with
+    `zone=` — a `PostgresTableMirror` built with no zone raises from
+    `list_records` rather than reconciling against a guess (see
+    `PostgresTableMirror.list_records`, `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`).
     """
 
     def divergence(authority_rows: Iterable[dict], mirror: Any) -> list[dict]:

@@ -8,6 +8,7 @@ measured against a known-good answer before it is trusted on a new table.
 
 from __future__ import annotations
 
+from datetime import datetime
 import pytest
 
 from command_center.db.networking_store import (
@@ -18,6 +19,11 @@ from command_center.db.networking_store import (
 )
 from command_center.runtime.db import networking as net_db
 from tests.db.mirror_probe import each_lost_write_is_noticed
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 
 def test_every_lost_mirror_write_is_visible_to_reconciliation(
@@ -36,8 +42,8 @@ def test_every_lost_mirror_write_is_visible_to_reconciliation(
     db_path = tmp_path / "runtime.db"
     net_db.db.migrate(db_path)
 
-    contacts = PostgresContactMirror(connection_factory=pg_connection_factory)
-    messages = PostgresMessageMirror(connection_factory=pg_connection_factory)
+    contacts = PostgresContactMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    messages = PostgresMessageMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     state: dict[str, str] = {}
 

@@ -8,6 +8,7 @@ assemble the stored record itself — and that `report` is keyed by `run_id`.
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
 
@@ -20,6 +21,11 @@ from command_center.db.run_children_store import (
 )
 from command_center.db.run_store import PostgresRunMirror
 from command_center.runtime.db import execution as exec_db
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 
 def _patch(monkeypatch, factory) -> None:
@@ -59,8 +65,8 @@ def test_the_journal_and_the_report_reconcile_after_every_write(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
     _patch(monkeypatch, pg_connection_factory)
-    events = PostgresRunEventMirror(connection_factory=pg_connection_factory)
-    reports = PostgresReportMirror(connection_factory=pg_connection_factory)
+    events = PostgresRunEventMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    reports = PostgresReportMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
