@@ -233,6 +233,70 @@ def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
     assert plan.decisions[0].reason == models.DEFER_KILL_SWITCH
 
 
+def test_unmeasured_spend_is_reported_as_null_under_kill_switch_too():
+    # The kill switch and an unreadable trailing-24h spend can be true at the
+    # same time (e.g. an operator flips the switch off during the same outage
+    # that broke the spend read). `daily_spend_usd` being unmeasured must
+    # never leave a concrete number in `projected_spend_usd` or
+    # `budget_remaining_usd` just because the kill switch also fired —
+    # every figure derived from the unmeasured spend must read "unknown".
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=1.0,
+        kill_switch_engaged=True,
+        budget_unknown=True,
+    )
+
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.budget_remaining_usd is None
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_UNAVAILABLE
+    assert plan.as_dict()["projected_spend_usd"] is None
+    assert plan.as_dict()["budget_remaining_usd"] is None
+    assert plan.as_dict()["spend_measurement"] == {
+        "status": "unavailable",
+        "kind": "unknown",
+    }
+
+
+def test_measured_spend_under_kill_switch_reports_the_real_figure():
+    # The mirror case: the kill switch is engaged but the spend WAS read
+    # successfully. `daily_spend_usd`/`projected_spend_usd` must report that
+    # real number (there is nothing fabricated here), and `spend_measurement`
+    # must say so.
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=0.42,
+        max_daily_spend_usd=1.0,
+        kill_switch_engaged=True,
+    )
+
+    assert plan.daily_spend_usd == 0.42
+    assert plan.projected_spend_usd == 0.42
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_ACTUAL
+
+
+def test_normal_plan_reports_spend_measurement_as_actual():
+    policy = DispatchPolicy(cost_matrix={"claude_code": 0.4})
+    executors = [_executor("claude_code", cost=0.4)]
+    plan = _plan([_task("t1")], executors, policy, max_daily_spend_usd=1.0)
+
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_ACTUAL
+    assert plan.as_dict()["spend_measurement"] == {
+        "status": "measured",
+        "kind": "actual",
+    }
+
+
 # --------------------------------------------------------------------------
 # Kill switch is respected — nothing is assigned while engaged
 # --------------------------------------------------------------------------
