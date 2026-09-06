@@ -574,3 +574,49 @@ def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeyp
 
     assert total == pytest.approx(5.5)
     assert "unparseable" in caplog.text
+
+
+def test_daily_spend_usd_skips_valid_json_that_is_not_an_object(tmp_path, monkeypatch, caplog):
+    """`payload_json` can be *valid* JSON text that decodes to something other
+    than an object — `[{"total_cost_usd": 1}]`, `"total_cost_usd"`, `42`,
+    `true`, `null` all satisfy the `LIKE '%total_cost_usd%'` row filter and
+    `json.loads` without error. Calling `.get` on the decoded result then
+    raises `AttributeError: 'list'/'str'/'int'/'bool'/'NoneType' object has
+    no attribute 'get'` unless it is outside the scope this row-shape check
+    guards. Each such row must be skipped and logged, not crash the whole
+    sum, and a well-formed row elsewhere in the batch must still be counted."""
+
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor(self._rows)
+
+    rows = [
+        {"payload": '[{"total_cost_usd": 1}]'},
+        {"payload": '"total_cost_usd"'},
+        {"payload": "42"},
+        {"payload": "true"},
+        {"payload": "null"},
+        {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
+    ]
+
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn(rows)
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+    with caplog.at_level("WARNING"):
+        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+    assert total == pytest.approx(2.0)
+    assert "not an object" in caplog.text
