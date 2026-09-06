@@ -1,0 +1,20 @@
+# Schedule for aicc-worktree-prune.service (VOYN-W0-AICC-ISOLATED-WORKTREE-
+# PER-ATTEMPT hardening follow-up).
+#
+# The cadence bounds metadata staleness, not correctness: a dangling
+# `.git/worktrees/<name>` entry costs nothing between sweeps (it blocks
+# nothing `provision_workspace` does — a fresh worktree gets its own name),
+# so unlike the queue reaper this does not need minute-level latency. Fifteen
+# minutes keeps `git worktree list`/`prune` output legible for an operator
+# without adding a meaningful poll cost.
+[Unit]
+Description=Run the AICC worktree metadata prune sweep every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

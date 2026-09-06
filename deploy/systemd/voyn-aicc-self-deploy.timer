@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the per-host self-deploy tick periodically (VOYN-W0-AICC-DEPLOY-AUTOMATION)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

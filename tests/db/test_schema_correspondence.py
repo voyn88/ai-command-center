@@ -41,6 +41,7 @@ INITIAL_MIGRATION = REPO_ROOT / "command_center" / "db" / "sql" / "0001_initial.
 #: sides"; a migration that only creates PostgreSQL-native objects stays out.
 CORRESPONDING_MIGRATIONS = (
     REPO_ROOT / "command_center" / "db" / "sql" / "0004_run_finalized_at.up.sql",
+    REPO_ROOT / "command_center" / "db" / "sql" / "0016_run_finalization_claim.up.sql",
 )
 
 #: The bookkeeping table; not a domain table on either side.
@@ -282,9 +283,11 @@ def _tables_declared_by_the_initial_migration() -> set[str]:
     test was written to defend — that the number stays defended on a laptop with
     no PostgreSQL — is preserved.
     """
+    sources = (INITIAL_MIGRATION, *CORRESPONDING_MIGRATIONS)
     return {
         line.split()[2].rstrip("(")
-        for line in INITIAL_MIGRATION.read_text(encoding="utf-8").splitlines()
+        for source in sources
+        for line in source.read_text(encoding="utf-8").splitlines()
         if line.startswith("CREATE TABLE ")
     }
 
@@ -445,7 +448,7 @@ def test_the_columns_needing_value_conversion_are_the_documented_ones(
 ) -> None:
     """The map's headline hazard, pinned.
 
-    115 of 396 columns change type, and 76 of them are `TEXT` -> `timestamptz`.
+    108 of 402 columns change type, and 78 of them are `TEXT` -> `timestamptz`.
     `command_center/models.py:iso_now` writes naive local time with no offset, so
     those strings are reinterpreted under the importer's session time zone —
     a silent, unrecoverable shift. The count is asserted so the migration cannot
@@ -466,9 +469,13 @@ def test_the_columns_needing_value_conversion_are_the_documented_ones(
             elif target == "boolean" and declared.startswith("INT"):
                 conversions["boolean"] += 1
 
-    assert conversions["timestamptz"] == 76
+    assert conversions["timestamptz"] == 78
     assert conversions["jsonb"] == 22
     assert conversions["boolean"] == 8
+    assert sum(conversions.values()) == 108
+    assert sum(
+        len(spec["columns"]) for spec in postgres_schema["tables"].values()
+    ) == 402
 
 
 def test_the_migration_order_is_derivable_and_acyclic(postgres_schema) -> None:
@@ -494,5 +501,5 @@ def test_the_migration_order_is_derivable_and_acyclic(postgres_schema) -> None:
     # five-wave shape was in fact unpinned. The sizes are pinned instead: a table
     # that changes wave has changed its dependency position, which is a planning
     # fact the map states and therefore has to defend.
-    assert [len(w) for w in waves] == [11, 9, 1, 10, 2]
+    assert [len(w) for w in waves] == [11, 9, 1, 11, 2]
     assert waves[2] == ["run"], "wave 3 is the bottleneck ten wave-4 tables depend on"

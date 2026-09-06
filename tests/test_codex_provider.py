@@ -4,14 +4,30 @@ import ast
 import json
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from command_center import launch, launch_service, models, project_config, storage
+from command_center import (
+    launch,
+    launch_service,
+    models,
+    project_config,
+    provider_route,
+    storage,
+)
 from command_center.runtime import api as runtime_api
-from command_center.runtime import db, identity, providers, reports, session_view, supervisor, task_sync
+from command_center.runtime import (
+    db,
+    identity,
+    providers,
+    reports,
+    session_view,
+    supervisor,
+    task_sync,
+)
 
 
 def _add_worktree(repo: Path, target: Path, branch: str = "feature/codex-test") -> Path:
@@ -222,6 +238,117 @@ def test_codex_ignored_termination_escalates(fake_codex, git_repo, tmp_path, mon
     assert any(event["payload"].get("lifecycle") == "cancel_sigkill_sent" for event in events)
 
 
+@pytest.mark.serial
+def test_cancel_waits_for_supervision_writer_after_process_exit(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    monkeypatch.setenv("FAKE_CODEX_EXTRA_SLEEP", "5")
+    monkeypatch.setenv("FAKE_CODEX_IGNORE_SIGTERM", "1")
+    finalizer_entered = threading.Event()
+    release_finalizer = threading.Event()
+    cancel_finished = threading.Event()
+    original_finish = db.finish_provider_attempt
+
+    def blocked_finish(*args, **kwargs):
+        finalizer_entered.set()
+        release_finalizer.wait()
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(db, "finish_provider_attempt", blocked_finish)
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    with sup._active_lock:
+        active = sup._active[run["id"]]
+    assert active.handshake_recorded.wait(timeout=3)
+    outcome = {}
+
+    def cancel_run():
+        try:
+            outcome["run"] = sup.cancel(run["id"], confirmed=True, grace_seconds=0.1)
+        except Exception as exc:  # noqa: BLE001 - thread outcome is asserted below
+            outcome["error"] = exc
+        finally:
+            cancel_finished.set()
+
+    thread = threading.Thread(target=cancel_run)
+    thread.start()
+    try:
+        assert finalizer_entered.wait(timeout=3)
+        assert not cancel_finished.wait(timeout=0.2)
+    finally:
+        release_finalizer.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert "error" not in outcome
+    assert outcome["run"]["state"] == "CANCELLED"
+    assert outcome["run"]["finalized_at"]
+    assert run["id"] not in sup.active_run_ids()
+
+
+@pytest.mark.serial
+def test_cancel_recovers_started_attempt_after_terminal_row_was_written(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    monkeypatch.setenv("FAKE_CODEX_EXTRA_SLEEP", "5")
+    original_finish = db.finish_provider_attempt
+    failures_remaining = 1
+
+    def fail_first_finish(*args, **kwargs):
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise sqlite3.OperationalError("injected attempt-finalization failure")
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(db, "finish_provider_attempt", fail_first_finish)
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    with sup._active_lock:
+        active = sup._active[run["id"]]
+    assert active.handshake_recorded.wait(timeout=3)
+
+    final = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
+
+    assert final["state"] == "CANCELLED"
+    assert final["finalized_at"]
+    attempts = db.list_provider_attempts(sup.db_path, run["id"])
+    assert attempts[-1]["outcome"] == "cancelled"
+    assert attempts[-1]["classification"] == provider_route.CANCELLED
+
+
+@pytest.mark.serial
+def test_cancel_recovers_transient_finalization_marker_failure(
+    fake_codex, git_repo, tmp_path, monkeypatch
+):
+    worktree = _add_worktree(git_repo, tmp_path / "worktree")
+    monkeypatch.setenv("FAKE_CODEX_EXTRA_SLEEP", "5")
+    original_mark = db.mark_run_finalized
+    failures_remaining = 1
+
+    def fail_first_mark(*args, **kwargs):
+        nonlocal failures_remaining
+        if failures_remaining:
+            failures_remaining -= 1
+            raise sqlite3.OperationalError("injected finalization-marker failure")
+        return original_mark(*args, **kwargs)
+
+    monkeypatch.setattr(db, "mark_run_finalized", fail_first_mark)
+    sup = supervisor.Supervisor()
+    run = _start_codex(sup, canonical=git_repo, worktree=worktree)
+    with sup._active_lock:
+        active = sup._active[run["id"]]
+    assert active.handshake_recorded.wait(timeout=3)
+
+    final = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
+
+    assert final["state"] == "CANCELLED"
+    assert final["finalized_at"]
+    assert run["id"] not in sup.active_run_ids()
+
+
 @pytest.mark.parametrize(
     ("scenario", "reason"),
     [("quota", "quota_limit"), ("auth", "authentication_failed"), ("startup_failure", "provider_exit_nonzero")],
@@ -332,6 +459,9 @@ def test_codex_restart_reconciliation_never_fabricates_success(tmp_path):
         prompt="[redacted]",
         is_resume=False,
         provider_id="codex",
+        finalization_owner_token="dead-owner",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     outcome = supervisor.Supervisor(db_path).reconcile()
     final = db.get_run(db_path, run["id"])
@@ -340,7 +470,7 @@ def test_codex_restart_reconciliation_never_fabricates_success(tmp_path):
     assert final["state"] != "COMPLETED"
 
 
-def test_codex_restart_reconciliation_uses_real_fake_process_identity(
+def test_codex_same_process_facade_preserves_real_fake_process_ownership(
     fake_codex, git_repo, tmp_path, monkeypatch
 ):
     worktree = _add_worktree(git_repo, tmp_path / "worktree")
@@ -357,13 +487,10 @@ def test_codex_restart_reconciliation_uses_real_fake_process_identity(
         time.sleep(0.02)
     restarted = supervisor.Supervisor(db_path)
     outcomes = restarted.reconcile()
-    assert outcomes == [
-        {
-            "run_id": run["id"],
-            "classification": "RUNNING",
-            "detail": "pid exists and identity matches; orphaned from this supervisor instance",
-        }
-    ]
+    # Supervisor ownership is process-scoped: another facade inside the same
+    # live backend is not a restart and must not orphan work owned by that
+    # process's real watcher.
+    assert outcomes == []
     assert db.get_run(db_path, run["id"])["state"] == "RUNNING"
     assert db.get_run(db_path, run["id"])["state"] != "COMPLETED"
     original.cancel(run["id"], confirmed=True, grace_seconds=1)

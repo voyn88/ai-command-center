@@ -1,0 +1,9 @@
+{
+  "schemaVersion":"1.0","revision":"fixture-001","generatedAt":"2026-08-24T00:00:00Z","freshness":"fresh",
+  "tasks":[
+    {"id":"VOYN-EXAMPLE-001","title":"Acceptance awaiting","blocker":null,"evidence":{"headSHA":"abc123","pullRequest":"#42","ci":"verified","acceptance":"pending","mergedSHA":null,"deployedSHA":null}},
+    {"id":"VOYN-EXAMPLE-002","title":"Evidence gap","blocker":"Canary has not been verified","evidence":{"headSHA":"def456","pullRequest":"#43","ci":"verified","acceptance":"verified","mergedSHA":"fedcba","deployedSHA":null}}
+  ],
+  "lanes":[{"id":"worker-01","state":"healthy","heartbeatAgeSeconds":3}],
+  "events":[{"id":"evt-001","occurredAt":"2026-08-24T00:00:00Z","summary":"CI completed on exact head","correlationID":"VOYN-EXAMPLE-001"}]
+}

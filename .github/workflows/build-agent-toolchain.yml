@@ -1,0 +1,162 @@
+name: build-agent-toolchain
+
+# Builds the content-addressed provider toolchain production executes.
+#
+# Why this exists: `deploy/install-agent-toolchain.sh` used to run
+# `npm install --global` as root on the production hosts. That made production
+# resolve npm online AND execute third-party package lifecycle scripts with
+# root privileges -- the finding that blocked VOYN-W0-AICC-AGENT-PUBLISHER-
+# PRINCIPAL-ISOLATION. Here the toolchain is assembled once, in CI, with
+# `--ignore-scripts`, and published as an immutable release asset addressed by
+# its own sha256. Production only verifies, extracts and selects it.
+#
+# The packages ship native binaries for linux-x64 as optional dependencies.
+# Those binaries run standalone -- verified: claude 2.1.231, codex 0.149.0 and
+# copilot 1.0.80 all report their version from a directory outside any
+# node_modules tree, with no Node runtime involved. That is what lets the
+# artifact carry no interpreter and lets production stop depending on the host
+# Node, which currently drifts between the two hosts (v18.19.1 vs v22.23.2).
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish the artifact under (e.g. toolchain-2026.08.30)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-agent-toolchain-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned versions
+        id: lock
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          lock = json.load(open("deploy/agent-toolchain.lock.json"))
+          print(f"platform={lock['platform']}")
+          PY
+
+      - name: Install from the committed lockfile, running no lifecycle script
+        run: |
+          set -euo pipefail
+          mkdir -p build/pkg
+          # `npm ci` from the committed lockfile, not `npm install` from version
+          # specs: the lockfile pins every transitive and optional dependency by
+          # integrity hash, so a rebuild resolves nothing from mutable registry
+          # metadata. Without it the artifact digest would be an accident of
+          # when the build ran rather than an identity (independent review on
+          # 58b50b9).
+          #
+          # --ignore-scripts is the other half: no preinstall/postinstall/
+          # prepare from any third-party package executes, here or on the hosts.
+          # A package's own postinstall normally fetches its native binary; that
+          # is unnecessary because the platform package carrying the binary is a
+          # declared optional dependency and the lockfile installs it directly.
+          cp deploy/agent-toolchain/package.json deploy/agent-toolchain/package-lock.json build/pkg/
+          npm ci --prefix build/pkg --ignore-scripts --omit=dev --no-audit --no-fund
+          # The lockfile must agree with the reviewed lock, or the artifact is
+          # not what the lock claims production will run.
+          python3 - <<'PY'
+          import json
+          declared = json.load(open("deploy/agent-toolchain.lock.json"))["packages"]
+          installed = json.load(open("deploy/agent-toolchain/package.json"))["dependencies"]
+          if declared != installed:
+              raise SystemExit(
+                  f"lock and package.json disagree: {declared} != {installed}"
+              )
+          print("pinned versions agree:", declared)
+          PY
+
+      - name: Prove every executable runs with no lifecycle script and no Node
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          lock = json.load(open("deploy/agent-toolchain.lock.json"))
+          failures = []
+          for name, relative in sorted(lock["executables"].items()):
+              path = relative.replace("pkg/", "build/pkg/", 1)
+              if not os.path.isfile(path):
+                  failures.append(f"{name}: missing at {path}")
+                  continue
+              os.chmod(path, 0o755)
+              # PATH is emptied so a Node on the runner cannot silently satisfy a
+              # binary that actually needs an interpreter. Production has no
+              # guarantee of Node at all, so a binary that needs one is a defect.
+              probe = subprocess.run(
+                  [os.path.abspath(path), "--version"],
+                  capture_output=True, text=True, timeout=120,
+                  env={"PATH": "", "HOME": os.environ.get("HOME", "/root")},
+              )
+              if probe.returncode != 0:
+                  failures.append(f"{name}: exit {probe.returncode}: {probe.stderr.strip()[:200]}")
+                  continue
+              print(f"{name}: {probe.stdout.strip().splitlines()[0]}")
+          if failures:
+              sys.exit("toolchain executables are not standalone:\n  " + "\n  ".join(failures))
+          PY
+
+      - name: Assemble the content-addressed artifact
+        id: artifact
+        run: |
+          set -euo pipefail
+          mkdir -p build/bin
+          python3 - <<'PY'
+          import json, os
+          lock = json.load(open("deploy/agent-toolchain.lock.json"))
+          for name, relative in sorted(lock["executables"].items()):
+              target = os.path.relpath(relative, "bin")
+              link = os.path.join("build", "bin", name)
+              if os.path.lexists(link):
+                  os.unlink(link)
+              os.symlink(target, link)
+              print(f"bin/{name} -> {target}")
+          PY
+          # Deterministic tar: fixed owner, sorted entries, no mtimes. Two builds
+          # of the same inputs must produce the same digest, otherwise the
+          # content address is not an identity.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime='UTC 2020-01-01' --format=gnu \
+              -C build -cf build/toolchain.tar bin pkg
+          gzip -9 -n build/toolchain.tar
+          digest=$(sha256sum build/toolchain.tar.gz | cut -d' ' -f1)
+          name="agent-toolchain-${{ steps.lock.outputs.platform }}-${digest}.tar.gz"
+          mv build/toolchain.tar.gz "build/${name}"
+          sha256sum "build/${name}" > "build/${name}.sha256"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          ls -la "build/${name}"
+
+      - name: Publish the immutable release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.release_tag }}'
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+                 --title "Agent toolchain $tag" --notes \
+                 "Content-addressed provider toolchain for ${{ steps.lock.outputs.platform }}.
+          Built from ${{ github.sha }} with --ignore-scripts; no package lifecycle
+          script ran. sha256: ${{ steps.artifact.outputs.digest }}"
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            "build/${{ steps.artifact.outputs.name }}" \
+            "build/${{ steps.artifact.outputs.name }}.sha256"
+
+      - name: Report the lock update the operator must review
+        run: |
+          echo "Record these in deploy/agent-toolchain.lock.json, as a reviewed change:"
+          echo "  \"artifact_sha256\": \"${{ steps.artifact.outputs.digest }}\""
+          echo "  \"release_tag\": \"${{ inputs.release_tag }}\""

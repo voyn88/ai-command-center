@@ -105,6 +105,20 @@ def test_unmapped_python_file_triggers_full_suite():
     assert trigger_all is True
 
 
+def test_a_ci_workflow_change_triggers_full_suite():
+    """VOYN-W0-AICC-CI-IMPACT-SELECTION-REQUIRED-GATE: before
+    `.github/workflows/` joined TRIGGER_ALL_PREFIXES, a workflow file (not
+    `.py`, not first-party) fell through `select()`'s `continue` branch --
+    silently unaccounted for, neither selecting anything nor widening.
+    Harmless while this selector only backed an advisory job; not harmless
+    once its output narrows the REQUIRED gate."""
+    module_to_path, reverse = _sample_graph()
+    _, trigger_all = select_tests.select(
+        [".github/workflows/ci.yml"], module_to_path, reverse
+    )
+    assert trigger_all is True
+
+
 def test_docs_only_change_selects_nothing_and_does_not_trigger_all():
     module_to_path, reverse = _sample_graph()
     selected, trigger_all = select_tests.select(

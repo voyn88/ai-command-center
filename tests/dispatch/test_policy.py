@@ -12,6 +12,7 @@ from command_center.dispatch.models import (
     DispatchPolicy,
     ExecutorProfile,
     QueuedTask,
+    TailRiskScenario,
 )
 from command_center.dispatch.policy import plan_dispatch
 
@@ -149,6 +150,87 @@ def test_zero_ceiling_means_no_budget_limit():
     plan = _plan([_task("t1")], executors, policy, max_daily_spend_usd=0.0)
 
     assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+# --------------------------------------------------------------------------
+# Unknown budget (cost data unavailable) blocks everything, like the kill
+# switch — never a simulated spend figure a zero cap or free executor could
+# silently absorb.
+# --------------------------------------------------------------------------
+
+
+def test_budget_unknown_defers_everything_even_with_zero_ceiling():
+    # The exact configuration that used to fail OPEN: no cap configured (the
+    # default) and a free local executor available.
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    tasks = [_task("t1", priority="Critical"), _task("t2", priority="High")]
+    plan = _plan(
+        tasks,
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=0.0,
+        budget_unknown=True,
+    )
+
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+
+
+def test_budget_unknown_reports_no_spend_figure_rather_than_a_fabricated_zero():
+    # The measurement fields must read as "unknown", never as "$0 spent
+    # today" — a caller that checks `daily_spend_usd == 0` without also
+    # checking `budget_unknown` must not be misled into thinking nothing was
+    # spent.
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=5.0,
+        budget_unknown=True,
+    )
+
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.budget_remaining_usd is None
+    assert plan.as_dict()["daily_spend_usd"] is None
+    assert plan.as_dict()["projected_spend_usd"] is None
+    assert plan.as_dict()["budget_remaining_usd"] is None
+
+
+def test_budget_unknown_defers_everything_with_a_nonzero_ceiling_and_free_executor():
+    # The other configuration that used to fail OPEN: a real cap is
+    # configured, but the only eligible executor costs $0.0, so "assume the
+    # ceiling is hit" (projected == max) never actually exceeds it.
+    policy = DispatchPolicy(cost_matrix={"ollama": 0.0})
+    executors = [_executor("ollama", cost=0.0)]
+    plan = _plan(
+        [_task("t1")], executors, policy, max_daily_spend_usd=5.0, budget_unknown=True
+    )
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
+
+
+def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        kill_switch_engaged=True,
+        budget_unknown=True,
+    )
+
+    assert plan.kill_switch_engaged is True
+    assert plan.budget_unknown is True
+    assert plan.decisions[0].reason == models.DEFER_KILL_SWITCH
 
 
 # --------------------------------------------------------------------------
@@ -311,3 +393,145 @@ def test_plan_is_deterministic_for_identical_input():
     assert [d.as_dict() for d in first.decisions] == [
         d.as_dict() for d in second.decisions
     ]
+
+
+# --------------------------------------------------------------------------
+# Tail-risk gate — a breaching scenario blocks its business path before
+# eligibility/budget is even considered, and never touches other paths.
+# --------------------------------------------------------------------------
+
+
+def _scenario(
+    sid: str,
+    *,
+    business_path: str,
+    probability: float,
+    impact_usd: float,
+    limit_usd: float,
+) -> TailRiskScenario:
+    return TailRiskScenario(
+        id=sid,
+        label=sid,
+        business_path=business_path,
+        probability=probability,
+        impact_usd=impact_usd,
+        assumptions="test scenario",
+        limit_usd=limit_usd,
+    )
+
+
+def test_default_policy_ships_five_tail_risk_scenarios_with_assumptions_and_limits():
+    policy = DispatchPolicy()
+
+    assert len(policy.tail_risk_scenarios) == 5
+    for scenario in policy.tail_risk_scenarios.values():
+        assert scenario.business_path
+        assert scenario.assumptions
+        assert scenario.limit_usd > 0
+        # Defaults ship with headroom: the baseline policy stays open.
+        assert not scenario.exceeds_limit()
+
+
+def test_breaching_scenario_blocks_its_business_path_before_budget():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "breach": _scenario(
+                "breach",
+                business_path="AICC",
+                probability=0.5,
+                impact_usd=100.0,
+                limit_usd=10.0,
+            )
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+    assert plan.assignments == ()
+    decision = plan.decisions[0]
+    assert decision.reason == models.DEFER_TAIL_RISK
+    assert decision.blocked_scenario_id == "breach"
+
+
+def test_tail_risk_block_is_scoped_to_its_own_business_path():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "breach": _scenario(
+                "breach",
+                business_path="AML",
+                probability=0.9,
+                impact_usd=100.0,
+                limit_usd=1.0,
+            )
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="OTHER")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_scenario_within_its_limit_does_not_block():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "fine": _scenario(
+                "fine",
+                business_path="AICC",
+                probability=0.01,
+                impact_usd=100.0,
+                limit_usd=1000.0,
+            )
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_zero_limit_means_scenario_never_blocks():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "unset": _scenario(
+                "unset",
+                business_path="AICC",
+                probability=1.0,
+                impact_usd=1_000_000.0,
+                limit_usd=0.0,
+            )
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_multiple_breaching_scenarios_report_the_lowest_id_deterministically():
+    policy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.0},
+        tail_risk_scenarios={
+            "zzz-later": _scenario(
+                "zzz-later",
+                business_path="AICC",
+                probability=0.5,
+                impact_usd=100.0,
+                limit_usd=10.0,
+            ),
+            "aaa-first": _scenario(
+                "aaa-first",
+                business_path="AICC",
+                probability=0.5,
+                impact_usd=100.0,
+                limit_usd=10.0,
+            ),
+        },
+    )
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+    assert plan.deferred[0].blocked_scenario_id == "aaa-first"

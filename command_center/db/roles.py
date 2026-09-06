@@ -122,6 +122,8 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_event",
     "backlog_evidence",
     "backlog_task",
+    "backlog_task_remediation",
+    "backlog_scan_cursor",
     "backlog_writer_lease",
     "completion",
     "completion_event",
@@ -153,6 +155,7 @@ ALL_TABLES: tuple[str, ...] = (
     "report",
     "run",
     "run_event",
+    "run_finalization_claim",
     "run_provenance",
     "run_provider_route",
     "schema_migration",
@@ -240,6 +243,12 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
     "work_attempt": _NONE,  # holds `claim_token_hash`; read via the view
 }
 
+# Host-local fencing state has no generic runtime reader or writer.  A future
+# PostgreSQL authority must expose a dedicated CAS function, never blanket DML.
+_FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
+    "run_finalization_claim": _NONE,
+}
+
 # The structured backlog store (0005, BO-S1), the queue-claim idiom again:
 # the control plane READS; every write travels through a SECURITY DEFINER
 # function so that it audits and the status machine cannot be bypassed —
@@ -247,18 +256,22 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
 # execution host has no business reading the programme's plan, and a
 # compromised one must not learn it.
 #
-# TODO(VOYN-W0-BACKLOG-ORCHESTRATOR BO-S1, after #321 merged): #321's grant
-# compliance checker now verifies this matrix against the live catalog;
-# extend tests/db/test_grant_compliance.py's provisioning coverage to the
-# backlog tables/functions in the first post-#321 slice. [#321 merged
-# 2026-08-19 as 8b9c89d — the extension rides the next BO slice to keep this
-# PR's surface reviewable.]
+# #321's grant compliance checker verifies this matrix against the live
+# catalog, and the generic MISSING/EXTRA diff already covers every table and
+# function declared below. VOYN-W0-AICC-GRANTS-ARE-CORRECTNESS-NOT-HYGIENE
+# added the same *reproduction* #321 gave queue_redrive — an under-privileged
+# role reaching a live escalation, not just a catalog diff — for
+# backlog_resume_deferred (tests/db/test_grant_compliance.py:
+# test_worker_can_call_backlog_resume_deferred_without_grants /
+# test_worker_cannot_call_backlog_resume_deferred_when_grants_are_applied).
 _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _READ,
     "backlog_dependency": _READ,
     "backlog_evidence": _READ,
     "backlog_event": _READ,
     "backlog_writer_lease": _READ,
+    "backlog_task_remediation": _READ,
+    "backlog_scan_cursor": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -267,6 +280,8 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_evidence": _NONE,
     "backlog_event": _NONE,
     "backlog_writer_lease": _NONE,
+    "backlog_task_remediation": _NONE,
+    "backlog_scan_cursor": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -470,6 +485,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_upsert_task(text, text, text, text, text, text, text, text)",
     "backlog_transition(text, text, bigint)",
     "backlog_record_evidence(text, text, text)",
+    "backlog_record_remediation(text, text, text, text)",
     "backlog_add_dependency(text, text)",
     "backlog_lease_acquire(text, text, integer)",
     "backlog_lease_heartbeat(text, text, integer)",
@@ -479,6 +495,12 @@ _APP_BACKLOG_FUNCTIONS = (
     # BO-S3, result ingest (0007; replaced 0006's backlog_release_terminal).
     "backlog_ingest_results(text)",
     "backlog_return_to_pool(text, text)",
+    # DEFER_TO_USER -> OPEN for technical parks only (0014); the function is
+    # the classification gate, so granting it does not grant a generic unpark.
+    "backlog_resume_deferred(text)",
+    # The persisted scan cursor for the tick windows (0015): returns this
+    # tick's offset and advances atomically per invocation.
+    "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
 )
@@ -493,6 +515,7 @@ _APP_BACKLOG_FUNCTIONS = (
 # enrolments), or revoke anything.
 _WORKER_ENROLMENT_FUNCTIONS = (
     "identity_assert(text)",
+    "identity_current_credential(text)",
     "enroll_rotate_self(text, text, text)",
 )
 
@@ -561,6 +584,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                         if table not in _APP_QUEUE_TABLES
                         and table not in _APP_ENROLMENT_TABLES
                         and table not in _APP_BACKLOG_TABLES
+                        and table not in _FINALIZATION_CLAIM_TABLES
                     },
                     # Declared policies. A second task adding rows here for a
                     # table this one already names must union with it, not
@@ -568,18 +592,22 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _APP_QUEUE_TABLES,
                     _APP_ENROLMENT_TABLES,
                     _APP_BACKLOG_TABLES,
+                    _FINALIZATION_CLAIM_TABLES,
                 )
             ),
             WORKER_ROLE: MappingProxyType(
                 merge_privileges(
-                    _WORKER_TABLES, _WORKER_ENROLMENT_TABLES, _WORKER_BACKLOG_TABLES
+                    _WORKER_TABLES,
+                    _WORKER_ENROLMENT_TABLES,
+                    _WORKER_BACKLOG_TABLES,
+                    _FINALIZATION_CLAIM_TABLES,
                 )
             ),
             # No blanket default: this role is not a general-purpose one, and
             # folding the default in would hand the admission lever DML on every
             # domain table in the schema.
             OPERATOR_ROLE: MappingProxyType(
-                merge_privileges(_OPERATOR_ENROLMENT_TABLES)
+                merge_privileges(_OPERATOR_ENROLMENT_TABLES, _FINALIZATION_CLAIM_TABLES)
             ),
         }
     )
@@ -593,11 +621,30 @@ def render_role_creation(role: str) -> str:
     provisioned by the operator (or by `docker-compose.server.yml` from the
     environment), so no credential can be committed to this repository or
     leak into a migration log.
+
+    Roles are cluster-level, not database-level: the test suite runs one
+    throwaway database per xdist worker, all sharing one cluster, and every
+    place that provisions roles (this repo has two: `render_bootstrap()`
+    below, and the test suite's own `role_passwords` fixture, which calls
+    this function directly to give the roles LOGIN -- found live,
+    2026-08-21, when a first fix that only guarded `render_bootstrap()`'s
+    call site did not close the flake, because that fixture's identical
+    "IF NOT EXISTS THEN CREATE ROLE" races it independently) can run this
+    concurrently from a different worker's connection. The check ("does the
+    role exist") and the act ("create it") are two statements, not one, so
+    they are not atomic across two *different* transactions racing each
+    other -- only within a single one. `pg_advisory_xact_lock` here, inside
+    the same DO block as the check and the create, is cluster-scoped like
+    the role it guards and is released automatically when this statement's
+    (or its enclosing transaction's) implicit transaction ends, so it
+    protects every caller by construction instead of depending on each call
+    site remembering to wrap itself (VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE).
     """
     _require_identifier(role)
     return (
         "DO $$\n"
         "BEGIN\n"
+        "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} NOLOGIN;\n"
         "    END IF;\n"
@@ -617,6 +664,9 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     would force every routine migration to run as a superuser.
     """
     _require_identifier(schema)
+    # Concurrency-safety for the CREATE ROLE statements lives inside
+    # render_role_creation() itself (see its docstring) rather than here, so
+    # every caller gets it, not just this one.
     statements: list[str] = [render_role_creation(role) for role in ALL_ROLES]
 
     # PUBLIC is granted CREATE and USAGE on `public` by default in PostgreSQL
@@ -649,18 +699,54 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     # once any function in the schema has a different owner (measured, not
     # assumed). Splitting the owner therefore needs this renderer to learn about
     # second owners first. Filed as VOYN-W0-AICC-SRV-03d.
-    statements.append(f"ALTER ROLE {MIGRATOR_ROLE} CREATEROLE;")
     # `ADMIN TRUE` is what lets `CREATE ROLE ... IN ROLE aicc_worker` grant the
     # membership; `INHERIT FALSE, SET FALSE` is what stops the migrator picking
-    # up the worker's privileges or becoming it as a side effect.
+    # up the worker's privileges or becoming it as a side effect. Terminating a
+    # revoked host's live backends needs `pg_signal_backend` — without it, a
+    # leaked password that is already connected keeps its connection until the
+    # credential's TTL runs out, so revocation would stop future authentication
+    # only.
+    #
+    # All three writes are guarded IF-NOT-ALREADY-SET, not just lock-guarded:
+    # apply_bootstrap() runs on every test in this suite (hundreds of calls per
+    # run), and an unconditional ALTER ROLE / GRANT re-issues a real catalog
+    # write on the shared cluster-level aicc_migrator row every single time,
+    # even though nothing changes after the first. The advisory lock (acquired
+    # above, in render_role_creation()) does serialize those writes correctly,
+    # but under sustained load across many xdist workers each producing
+    # hundreds of needless real writes to the SAME row, the write volume alone
+    # was enough to occasionally surface `tuple concurrently updated` even with
+    # every write serialized -- live-reproduced 2026-08-21, cleared by cutting
+    # the writes themselves down to once per fresh cluster instead of once per
+    # test. This mirrors render_role_creation()'s own IF-NOT-EXISTS discipline.
     statements.append(
-        f"GRANT {WORKER_ROLE} TO {MIGRATOR_ROLE} "
-        "WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;"
+        f"DO $$\n"
+        f"BEGIN\n"
+        f"    PERFORM pg_advisory_xact_lock(7823649102);\n"
+        f"    IF NOT (SELECT rolcreaterole FROM pg_roles WHERE rolname = '{MIGRATOR_ROLE}') THEN\n"
+        f"        ALTER ROLE {MIGRATOR_ROLE} CREATEROLE;\n"
+        f"    END IF;\n"
+        f"    IF NOT EXISTS (\n"
+        f"        SELECT 1 FROM pg_auth_members m\n"
+        f"        JOIN pg_roles r ON r.oid = m.roleid\n"
+        f"        JOIN pg_roles g ON g.oid = m.member\n"
+        f"        WHERE r.rolname = '{WORKER_ROLE}' AND g.rolname = '{MIGRATOR_ROLE}'\n"
+        f"          AND m.admin_option\n"
+        f"    ) THEN\n"
+        f"        GRANT {WORKER_ROLE} TO {MIGRATOR_ROLE} "
+        f"WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;\n"
+        f"    END IF;\n"
+        f"    IF NOT EXISTS (\n"
+        f"        SELECT 1 FROM pg_auth_members m\n"
+        f"        JOIN pg_roles r ON r.oid = m.roleid\n"
+        f"        JOIN pg_roles g ON g.oid = m.member\n"
+        f"        WHERE r.rolname = 'pg_signal_backend' AND g.rolname = '{MIGRATOR_ROLE}'\n"
+        f"    ) THEN\n"
+        f"        GRANT pg_signal_backend TO {MIGRATOR_ROLE};\n"
+        f"    END IF;\n"
+        f"END\n"
+        f"$$;"
     )
-    # Terminating a revoked host's live backends. Without it, a leaked password
-    # that is already connected keeps its connection until the credential's TTL
-    # runs out, so revocation would stop future authentication only.
-    statements.append(f"GRANT pg_signal_backend TO {MIGRATOR_ROLE};")
 
     return statements
 

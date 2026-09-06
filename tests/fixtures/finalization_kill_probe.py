@@ -104,8 +104,8 @@ if _WIDEN_SECONDS > 0:
 _original_mark_run_finalized = db.mark_run_finalized
 
 
-def _mark_run_finalized_timed(db_path, run_id):
-    result = _original_mark_run_finalized(db_path, run_id)
+def _mark_run_finalized_timed(db_path, run_id, **kwargs):
+    result = _original_mark_run_finalized(db_path, run_id, **kwargs)
     _window["closed"] = time.perf_counter()
     return result
 

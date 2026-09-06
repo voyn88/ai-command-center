@@ -174,7 +174,8 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "queue_complete",
         "queue_fail",
     }
-    # And the enrolment layer (0003): prove its own identity, rotate its own
+    # And the enrolment layer: prove its own identity, read only the
+    # server-authoritative expiry of that proved credential, rotate its own
     # secret, and nothing else — a worker cannot mint or redeem an enrolment.
     assert granted == {
         "queue_claim",
@@ -182,6 +183,7 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "queue_complete",
         "queue_fail",
         "identity_assert",
+        "identity_current_credential",
         "enroll_rotate_self",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
@@ -218,6 +220,7 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_upsert_task",
         "backlog_transition",
         "backlog_record_evidence",
+        "backlog_record_remediation",
         "backlog_add_dependency",
         "backlog_lease_acquire",
         "backlog_lease_heartbeat",
@@ -226,6 +229,12 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_dispatch",
         "backlog_ingest_results",
         "backlog_return_to_pool",
+        # VOYN-W0-AICC-DEFER-AUTO-RESUME (0014): the machine exit from
+        # DEFER_TO_USER for technical parks.
+        "backlog_resume_deferred",
+        # VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (0015): the persisted
+        # scan cursor for the tick windows.
+        "backlog_scan_claim",
         "backlog_triage",
     }
 

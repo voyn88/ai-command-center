@@ -73,6 +73,22 @@ TRIGGER_ALL_NAMES = {
 }
 TRIGGER_ALL_PREFIXES = (
     "scripts/ci/test_impact/",
+    # VOYN-W0-AICC-CI-IMPACT-SELECTION-REQUIRED-GATE (found live 2026-08-23,
+    # wiring this selector into the REQUIRED `quality-gates` job for the
+    # first time): `select()`'s own `is_first_party` fallback only trigger-
+    # alls a changed file outside the graph when it ends in `.py` --
+    # anything else outside the graph (including `.yml`) is silently
+    # `continue`d, neither selected nor widened. That was harmless while
+    # this selector only backed the *advisory* `impact-fast-check` job (a
+    # CI workflow change there just meant "the fast job didn't notice,"
+    # and the full required gate still covered it unconditionally). It
+    # stopped being harmless the moment this selector's own output could
+    # narrow the required gate: a PR touching `.github/workflows/` AND some
+    # first-party file with a narrow test footprint would have its CI
+    # config change go completely unaccounted for. Workflow changes are
+    # exactly the release/deployment-adjacent class CLAUDE.md's own
+    # portfolio rules already name for automatic full-matrix escalation.
+    ".github/workflows/",
 )
 
 

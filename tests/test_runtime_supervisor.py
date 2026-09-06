@@ -319,7 +319,7 @@ def test_report_never_truncates_large_assistant_output(git_repo, configure_proje
     assert huge_text in content
 
 
-def test_report_failure_releases_active_ownership_and_signals_waiters(
+def test_report_failure_retains_ownership_and_leaves_visible_unfinalized_run(
     git_repo, configure_project_repo, fake_claude, monkeypatch
 ):
     hold_file = git_repo.parent / "report-failure.hold"
@@ -344,12 +344,14 @@ def test_report_failure_releases_active_ownership_and_signals_waiters(
         active = sup._active[run["id"]]
 
     hold_file.unlink()
-    assert active.done_event.wait(timeout=10)
+    assert active.supervision_finished_event.wait(timeout=10)
+    assert not active.done_event.is_set()
 
     final = db.get_run(sup.db_path, run["id"])
     assert final["state"] == "COMPLETED"
     assert final["exit_code"] == 0
-    assert run["id"] not in sup.active_run_ids()
+    assert final["finalized_at"] is None
+    assert run["id"] in sup.active_run_ids()
     assert db.get_report(sup.db_path, run["id"]) is None
 
     events = db.list_run_events(sup.db_path, run["id"])
@@ -1130,10 +1132,11 @@ def test_terminal_persistence_respects_concurrent_terminal_owner(
     assert final["state"] == "FAILED"
     assert final["failure_reason"] == "concurrent_terminal_owner"
     assert run["id"] not in sup.active_run_ids()
-    assert db.get_report(sup.db_path, run["id"]) is None
+    assert db.get_report(sup.db_path, run["id"]) is not None
+    assert final["finalized_at"] is not None
 
     events = db.list_run_events(sup.db_path, run["id"])
-    assert not any(
+    assert any(
         event["event_type"] == "lifecycle"
         and event["payload"].get("lifecycle") == "process_exited"
         for event in events
@@ -1235,24 +1238,71 @@ def test_cancel_still_terminates_process_when_event_persistence_fails(
     assert run["id"] not in sup.active_run_ids()
 
 
+def _wait_for_text(path, needle: str, *, timeout: float = 10.0, interval: float = 0.02) -> bool:
+    """Wait until the fake process has actually written its change.
+
+    The tests below assert that cancellation leaves that change alone, which
+    says nothing at all if the change was never made. A fixed sleep raced it.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if needle in path.read_text():
+                return True
+        except OSError:
+            pass
+        time.sleep(interval)
+    try:
+        return needle in path.read_text()
+    except OSError:
+        return False
+
+
+def _wait_for_run_event(sup, run_id, event_type, *, timeout: float = 10.0, interval: float = 0.02) -> bool:
+    """Wait until the run has recorded an event of `event_type`.
+
+    The durable event row is the fact the test is about; a fixed sleep merely
+    guesses when it lands, and guesses lose on loaded shards.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        events = db.list_run_events(sup.db_path, run_id)
+        if any(e["event_type"] == event_type for e in events):
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _wait_for_file(path, *, timeout: float = 10.0, interval: float = 0.02) -> bool:
+    """Wait for a fixture-written marker instead of guessing with a sleep."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(interval)
+    return path.exists()
+
+
 def test_cancel_escalates_to_sigkill_after_grace_period_when_sigterm_ignored(
     git_repo, configure_project_repo, fake_claude
 ):
+    ready_file = git_repo.parent / "ignore-sigterm.ready"
     fake_claude["FAKE_CLAUDE_IGNORE_SIGTERM"] = "1"
+    fake_claude["FAKE_CLAUDE_READY_FILE"] = str(ready_file)
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "30"
     configure_project_repo("AIOS", git_repo)
     sup = supervisor.Supervisor()
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
     )
-    time.sleep(0.3)
+    # Not a fixed sleep: cancelling before the child has installed its SIGTERM
+    # handler kills it on the default disposition, so no escalation happens and
+    # the assertions below would describe a race rather than the product.
+    assert _wait_for_file(ready_file), "child never installed its SIGTERM handler"
 
-    started = time.monotonic()
     result = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
-    elapsed = time.monotonic() - started
 
     assert result["state"] == "CANCELLED"
-    assert elapsed >= 1, "SIGKILL must not fire before the grace period elapses"
 
     events = db.list_run_events(sup.db_path, run["id"])
     lifecycles = [e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"]
@@ -1286,7 +1336,13 @@ def test_cancel_preserves_output_received_before_cancellation(git_repo, configur
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
     )
-    time.sleep(0.5)
+    # Wait for the message to actually be recorded before cancelling: the test
+    # is about output received BEFORE cancellation surviving it, so cancelling
+    # before anything was received asserts nothing. A fixed 0.5s sleep raced
+    # the fake process and lost on loaded shards (post-merge main, 2026-08-31).
+    assert _wait_for_run_event(sup, run["id"], "assistant_message"), (
+        "fake process never produced its assistant message"
+    )
     sup.cancel(run["id"], confirmed=True, grace_seconds=2)
 
     events = db.list_run_events(sup.db_path, run["id"])
@@ -1304,8 +1360,11 @@ def test_cancel_never_runs_git_restore_and_flags_working_tree_change(git_repo, c
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
     )
-    # Give the fake process time to run past its lines and touch the file.
-    time.sleep(0.5)
+    # Wait for the modification itself rather than guessing how long it takes:
+    # cancelling first leaves nothing for the assertions below to be about.
+    assert _wait_for_text(git_repo / "f.txt", "modified by fake_claude"), (
+        "fake process never modified the working tree"
+    )
     result = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
     assert result["state"] == "CANCELLED"
     assert result["working_tree_changed"] == 1
@@ -1488,6 +1547,9 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
     snapshot_calls = {"count": 0}
     finalization_entered = threading.Event()
     release_finalization = threading.Event()
+    watchdog_started = threading.Event()
+    watchdog_clock: dict[str, float] = {}
+    real_timeout_watchdog = supervisor.Supervisor._timeout_watchdog
 
     def block_post_run_snapshot(path):
         snapshot_calls["count"] += 1
@@ -1496,8 +1558,24 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
             assert release_finalization.wait(timeout=5)
         return real_snapshot(path)
 
-    monkeypatch.setattr(supervisor.agent_runner, "git_snapshot", block_post_run_snapshot)
+    def observe_timeout_watchdog(self, run_id, active, timeout_seconds):
+        # This is the clock origin the product actually uses: immediately
+        # before `_timeout_watchdog` begins its timeout-sized event wait.
+        watchdog_clock["started"] = time.monotonic()
+        watchdog_started.set()
+        return real_timeout_watchdog(self, run_id, active, timeout_seconds)
 
+    monkeypatch.setattr(supervisor.agent_runner, "git_snapshot", block_post_run_snapshot)
+    monkeypatch.setattr(supervisor.Supervisor, "_timeout_watchdog", observe_timeout_watchdog)
+
+    # The watchdog's deadline starts when the process is spawned, so this
+    # budget has to clear interpreter startup with room to spare. At 0.5s it
+    # did not: on a loaded shard the child had not finished within the
+    # deadline, the watchdog correctly timed it out, and the test failed with
+    # `assert True is False` — reporting a product defect where there was only
+    # a runner slow enough to invalidate the test's own premise. That premise
+    # is now asserted explicitly instead of assumed.
+    timeout_seconds = 2.0
     sup = supervisor.Supervisor()
     run = sup.start_raw(
         project="AIOS",
@@ -1505,15 +1583,29 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
         task_type="implementation",
         prompt="p",
         confirmed=True,
-        timeout_seconds=0.5,
+        timeout_seconds=timeout_seconds,
     )
+    assert watchdog_started.wait(timeout=10), "timeout watchdog never started"
     with sup._active_lock:
         active = sup._active[run["id"]]
 
     try:
-        assert finalization_entered.wait(timeout=5)
+        assert finalization_entered.wait(timeout=10)
         assert active.process_exited_event.is_set()
-        time.sleep(0.7)
+        exited_after = time.monotonic() - watchdog_clock["started"]
+        assert exited_after < timeout_seconds, (
+            "premise not met: the process took "
+            f"{exited_after:.3f}s to exit, past its own {timeout_seconds}s "
+            "deadline, so a timeout here is correct behaviour and this test "
+            "cannot say anything about slow finalization"
+        )
+
+        # Wait past the deadline while finalization is still blocked: this is
+        # the whole scenario — the run is finished, the bookkeeping is not, and
+        # the watchdog must stay out of it.
+        remaining = (watchdog_clock["started"] + timeout_seconds + 0.5) - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
 
         assert active.timeout_triggered.is_set() is False
         events = db.list_run_events(sup.db_path, run["id"])
@@ -1712,9 +1804,18 @@ def test_launching_set_is_cleared_after_a_prepared_to_queued_transition_failure(
     assert observed["run_id_guarded_during_transition"] is True
     assert not sup._launching
 
-    runs = db.list_runs(sup.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES)
+    assert db.list_runs(sup.db_path, states=db.EXECUTION_CENTER_ACTIVE_STATES) == []
+    runs = db.list_runs(sup.db_path)
     assert len(runs) == 1
-    assert runs[0]["state"] == "PREPARED"
+    failed = runs[0]
+    assert failed["state"] == "FAILED"
+    assert failed["failure_reason"] == "launch_preparation_failed"
+    assert failed["finalized_at"] is not None
+    assert db.get_report(sup.db_path, failed["id"]) is not None
+    claim = db.get_run_finalization_claim(sup.db_path, failed["id"])
+    assert claim["completed_at"] is not None
+    with supervisor._PROCESS_OWNED_RUNS_GUARD:
+        assert failed["id"] not in supervisor._PROCESS_OWNED_RUNS
 
 
 def test_concurrent_reconcile_cannot_claim_a_just_created_live_launch(
@@ -2179,7 +2280,10 @@ def test_cancelled_run_is_never_auto_committed(git_repo, configure_project_repo,
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
     )
-    time.sleep(0.5)
+    assert _wait_for_text(git_repo / "f.txt", "modified by fake_claude"), (
+        "fake process never modified the working tree, so this test cannot say "
+        "anything about cancellation leaving that modification alone"
+    )
     result = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
 
     assert result["state"] == "CANCELLED"

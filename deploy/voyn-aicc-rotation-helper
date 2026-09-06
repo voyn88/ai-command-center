@@ -1,0 +1,131 @@
+#!/usr/bin/python3
+"""Root-owned rotation broker: the only systemctl surface sudo grants the rotator.
+
+Installed as /usr/local/sbin/voyn-aicc-rotation-helper (root:root 0755) from the
+merged SHA. The sudoers policy grants `aicc-rotator` exactly this binary per
+verb; the helper — not sudoers — decides which units are operable, by reading
+the root-owned lane registry. Adding a worker lane is an edit to the registry
+file alone: no sudoers change, no unit-name enumeration anywhere else.
+
+Fail-closed contract: any unreadable, unsafely-owned, empty or malformed
+registry refuses every request; a unit outside the registry is refused even
+when it matches the lane pattern; the tunnel unit is observable (`show`) but
+never drainable/restartable.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import stat
+import sys
+
+REGISTRY_PATH = "/etc/voyn/aicc-worker-lanes.conf"
+TUNNEL_UNIT = "voyn-aicc-pgtunnel.service"
+LANE_PATTERN = re.compile(r"^voyn-aicc-worker@[0-9]{1,4}\.service$")
+SYSTEMCTL = "/usr/bin/systemctl"
+
+VERB_ARGV = {
+    "show": lambda unit: [
+        "show",
+        unit,
+        "--property=ActiveState,SubState,StatusText,MainPID",
+        "--no-pager",
+    ],
+    "drain": lambda unit: ["kill", "--kill-whom=main", "--signal=SIGUSR1", unit],
+    "reload": lambda unit: ["reload", unit],
+    "restart": lambda unit: ["restart", unit],
+}
+
+
+def load_registry_lines(text: str) -> tuple[str, ...]:
+    """Strict parse: one lane unit per line; comments/blank allowed; anything
+    else refuses the whole registry rather than skipping it."""
+    lanes: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not LANE_PATTERN.fullmatch(line):
+            raise ValueError(f"malformed lane registry entry: {line!r}")
+        if line in lanes:
+            raise ValueError(f"duplicate lane registry entry: {line!r}")
+        lanes.append(line)
+    if not lanes:
+        raise ValueError("lane registry names no lanes")
+    return tuple(lanes)
+
+
+def read_registry(path: str = REGISTRY_PATH) -> tuple[str, ...]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("lane registry is not a regular file")
+        if info.st_uid != 0 or info.st_gid != 0:
+            raise ValueError("lane registry must be owned by root:root")
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError("lane registry must not be group/other writable")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            return load_registry_lines(handle.read())
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+
+
+def resolve(verb: str, unit: str, lanes: tuple[str, ...]) -> list[str]:
+    """Pure decision: exact systemctl argv, or ValueError. Tested directly."""
+    if verb not in VERB_ARGV:
+        raise ValueError(f"unknown verb: {verb!r}")
+    if unit == TUNNEL_UNIT:
+        if verb != "show":
+            raise ValueError("tunnel unit is observable only")
+    elif unit not in lanes:
+        raise ValueError(f"unit is not in the lane registry: {unit!r}")
+    return VERB_ARGV[verb](unit)
+
+
+def resolve_many(verb: str, units: tuple[str, ...], lanes: tuple[str, ...]) -> list[str]:
+    """Resolve a registry-derived multi-unit reload as one systemd transaction.
+
+    Only reload is batchable: drain/restart remain deliberately single-lane,
+    and show has a single response shape. Every unit is independently checked
+    before any argv is returned, so one injected/out-of-registry name refuses
+    the whole transaction.
+    """
+    if verb != "reload" or not units:
+        raise ValueError("only a non-empty reload may address multiple units")
+    for unit in units:
+        if unit not in lanes:
+            raise ValueError(f"unit is not in the lane registry: {unit!r}")
+    if len(set(units)) != len(units):
+        raise ValueError("duplicate unit in reload transaction")
+    return ["reload", *units]
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        print(
+            "usage: voyn-aicc-rotation-helper {show|drain|reload|restart} <unit>...",
+            file=sys.stderr,
+        )
+        return 64
+    try:
+        lanes = read_registry()
+        if len(argv) == 3:
+            arguments = resolve(argv[1], argv[2], lanes)
+        else:
+            arguments = resolve_many(argv[1], tuple(argv[2:]), lanes)
+    except (OSError, ValueError) as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 77
+    os.execv(SYSTEMCTL, [SYSTEMCTL, *arguments])
+    return 71  # pragma: no cover - execv does not return
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

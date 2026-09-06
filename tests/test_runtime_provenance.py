@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from command_center import run_lineage as provenance
-from command_center.runtime import db
+from command_center.runtime import db, identity
 
 
 def _run(db_path, **identity):
@@ -176,11 +178,26 @@ def test_migration_preserves_run_history_and_backfills_missing_rows(tmp_path):
         db.SCHEMA_VERSION = original_version - 1
         db.migrate(db_path)
         legacy = _run(db_path)
+        with db.connect(db_path) as conn:
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE run SET state = 'COMPLETED', completed_at = ?, "
+                    "finalized_at = ? WHERE id = ?",
+                    (db.iso_now(), db.iso_now(), legacy["id"]),
+                )
     finally:
         db.MIGRATIONS = original_migrations
         db.SCHEMA_VERSION = original_version
 
-    db.migrate(db_path)
+    process_identity = identity.capture_identity(os.getpid())
+    assert process_identity is not None
+    db.bootstrap_finalization_claim_cutover(
+        db_path,
+        owner_token="runtime-provenance-migration-test",
+        owner_pid=os.getpid(),
+        owner_identity=process_identity.as_string(),
+        offline_confirmed=True,
+    )
     db.migrate(db_path)
 
     assert db.get_run(db_path, legacy["id"])["prompt"] == "implement"
