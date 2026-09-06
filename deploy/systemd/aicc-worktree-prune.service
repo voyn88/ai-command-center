@@ -5,9 +5,10 @@
 # remove_workspace`'s own inline prune cannot reach (a dirty worktree left
 # in place, a refused removal, or a worker killed before cleanup ever ran).
 #
-# Install (same host as aicc-worker, beside it):
-#   cp deploy/systemd/aicc-worktree-prune.{service,timer} /etc/systemd/system/
-#   systemctl daemon-reload && systemctl enable --now aicc-worktree-prune.timer
+# Install (same host as aicc-worker, beside it): the `worker` profile of
+# ops/aicc_install_transaction.py /
+# deploy/install-agent-principal-isolation.sh
+# (VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS). Not a manual `cp`.
 #
 # Identity: runs as the same user as aicc-worker (not aicc-app) because it
 # needs read/write access to the configured repositories' `.git` directories
@@ -25,8 +26,8 @@ After=network.target
 Type=oneshot
 User=aicc-worker
 Group=aicc-worker
-WorkingDirectory=/opt/aicc
-ExecStart=/opt/aicc/.venv/bin/python -m command_center.worktree_sweep
+WorkingDirectory=/opt/aicc/current
+ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.worktree_sweep
 # A sweep tick that cannot finish in this window is a failed tick, not an
 # incident: the next tick retries against the same repositories.
 TimeoutStartSec=120s

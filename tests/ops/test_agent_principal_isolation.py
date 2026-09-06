@@ -967,6 +967,8 @@ def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
             authority_env=root / "x-authority.env",
             claude_auth=root / "x-claude.json",
             codex_auth=root / "x-codex.json",
+            app_env=root / "x-app.env",
+            pgtunnel_env=root / "x-pgtunnel.env",
             resolve_identities=False,
         )
         if str(spec.source).endswith("voyn-aicc-worker-principal-isolation.conf")
@@ -1092,6 +1094,8 @@ def _specs(profile, tmp_path):
             authority_env=tmp_path / "authority.env",
             claude_auth=tmp_path / "claude.json",
             codex_auth=tmp_path / "codex.json",
+            app_env=tmp_path / "app.env",
+            pgtunnel_env=tmp_path / "pgtunnel.env",
             resolve_identities=False,
             profile=profile,
         )
@@ -1109,6 +1113,8 @@ def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
             authority_env=tmp_path / "authority.env",
             claude_auth=tmp_path / "claude.json",
             codex_auth=tmp_path / "codex.json",
+            app_env=tmp_path / "app.env",
+            pgtunnel_env=tmp_path / "pgtunnel.env",
             resolve_identities=False,
         )
     }
@@ -1152,6 +1158,8 @@ def test_an_unknown_profile_is_refused_rather_than_treated_as_worker(tmp_path):
             authority_env=tmp_path / "authority.env",
             claude_auth=tmp_path / "claude.json",
             codex_auth=tmp_path / "codex.json",
+            app_env=tmp_path / "app.env",
+            pgtunnel_env=tmp_path / "pgtunnel.env",
             resolve_identities=False,
             profile="controlplane",
         )

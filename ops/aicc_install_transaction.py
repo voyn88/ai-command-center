@@ -2651,10 +2651,13 @@ def verify_release_manifest(
 
 #: Targets that exist only because a host runs untrusted coding agents: the
 #: launcher and its socket, the agent principal's sysusers/tmpfiles and env,
-#: the worker lanes and units, the staged-rollout tool, and the agent model
-#: credentials. A control-plane host runs none of them, and must not hold the
-#: credentials in particular -- one secret on two hosts destroys exactly the
-#: principal isolation this installer exists to create.
+#: the worker lanes and units, the staged-rollout tool, the agent model
+#: credentials, worktree hygiene for the agent's clones, and the worker-side
+#: credential rotation that turns those credentials over (including its own
+#: SSH tunnel to the control plane's PostgreSQL). A control-plane host runs
+#: none of them, and must not hold the agent model credentials in particular
+#: -- one secret on two hosts destroys exactly the principal isolation this
+#: installer exists to create.
 WORKER_ONLY_TARGETS = frozenset(
     {
         "/usr/lib/sysusers.d/aicc-agent.conf",
@@ -2672,6 +2675,43 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/aicc-worker.service.d/20-principal-isolation.conf",
         "/var/lib/aicc-agent/claude/.claude/.credentials.json",
         "/var/lib/aicc-agent/codex/.codex/auth.json",
+        "/etc/systemd/system/aicc-worktree-prune.service",
+        "/etc/systemd/system/aicc-worktree-prune.timer",
+        "/etc/systemd/system/voyn-aicc-credential-rotation.service",
+        "/etc/systemd/system/voyn-aicc-credential-rotation.timer",
+        "/etc/systemd/system/voyn-aicc-credential-rotation-alert@.service",
+        "/etc/systemd/system/voyn-aicc-pgtunnel.service",
+        "/etc/aicc/pgtunnel.env",
+        "/etc/voyn/aicc-worker-lanes.conf",
+    }
+)
+
+#: The control plane's own units: the backlog dispatch ticks (planner,
+#: review, merge) and the queue reaper, plus the app credential they share.
+#: These are the "control-plane's own units" VOYN-W0-AGENT-PUBLISHER-
+#: PRINCIPAL-ISOLATION deferred to VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-
+#: UNITS -- a worker host runs none of them: it holds no aicc_app PostgreSQL
+#: credential, and dispatching/reviewing/merging the backlog from a host that
+#: also executes untrusted agent tasks would let a compromised worker steer
+#: its own queue.
+CONTROL_ONLY_TARGETS = frozenset(
+    {
+        "/etc/systemd/system/aicc-backlog-planner.service",
+        "/etc/systemd/system/aicc-backlog-planner.timer",
+        "/etc/systemd/system/aicc-backlog-review.service",
+        "/etc/systemd/system/aicc-backlog-review.timer",
+        "/etc/systemd/system/aicc-backlog-merge.service",
+        "/etc/systemd/system/aicc-backlog-merge.timer",
+        "/etc/systemd/system/aicc-queue-reaper.service",
+        "/etc/systemd/system/aicc-queue-reaper.timer",
+        "/etc/aicc/app.env",
+        # The committed voyn-aicc-self-deploy.service ExecStart is the
+        # control-host variant; a worker host needs a different ExecStart
+        # (no --migrate, its own --restart list -- see the comment in
+        # deploy/systemd/voyn-aicc-self-deploy.service) that has no source
+        # file here yet. Only the timer, which is identical on both hosts,
+        # is common.
+        "/etc/systemd/system/voyn-aicc-self-deploy.service",
     }
 )
 
@@ -2684,33 +2724,39 @@ def default_specs(
     authority_env: Path,
     claude_auth: Path,
     codex_auth: Path,
+    app_env: Path,
+    pgtunnel_env: Path,
     resolve_identities: bool = True,
     profile: str = "worker",
 ) -> tuple[FileSpec, ...]:
     """The files one host role installs.
 
-    `worker` is every spec, unchanged -- the default, so an existing caller
-    that knows nothing about profiles installs exactly what it always did.
-
-    `control` drops `WORKER_ONLY_TARGETS`. Before this existed there was one
-    profile for every host, and it demanded the agent's Claude and Codex
-    credentials unconditionally: installing the control plane meant either
-    placing agent secrets on a host that must never hold them, or not
-    installing it at all. The live attempt on control-01 took the second
-    branch and stopped at `source is not a safe regular file:
+    Every spec is defined once; each profile drops the other's exclusive
+    set. `worker` drops `CONTROL_ONLY_TARGETS`, `control` drops
+    `WORKER_ONLY_TARGETS`. Before profiles existed there was one set for
+    every host, and it demanded the agent's Claude and Codex credentials
+    unconditionally: installing the control plane meant either placing agent
+    secrets on a host that must never hold them, or not installing it at
+    all. The live attempt on control-01 took the second branch and stopped
+    at `source is not a safe regular file:
     /home/voynadmin/.claude/.credentials.json` -- a file whose *absence* was
     correct (2026-08-31).
 
-    The control-plane's own units (planner, review, merge, reaper, rotation)
-    are not added here: they are still symlinks into the operator's home and
-    become repo-owned under VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. This
-    profile makes that installation possible; it does not pre-empt it.
+    The control plane's own units (planner, review, merge, reaper) and the
+    worker-side credential rotation were the next gap: installable by
+    neither profile, still reached only as symlinks into the operator's
+    home. VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS is what makes them
+    part of `specs` at all -- `CONTROL_ONLY_TARGETS` and the rotation/
+    pgtunnel/worktree-prune additions to `WORKER_ONLY_TARGETS` just route
+    them to the host that runs them.
     """
     if profile not in PROFILES:
         raise ValueError(f"unknown installation profile: {profile!r}")
     root_uid, root_gid = 0, 0
     agent_gid = grp.getgrnam("aicc-agent").gr_gid if resolve_identities else 0
     publisher_gid = grp.getgrnam("aicc-publisher").gr_gid if resolve_identities else 0
+    worker_gid = grp.getgrnam("aicc-worker").gr_gid if resolve_identities else 0
+    app_gid = grp.getgrnam("aicc-app").gr_gid if resolve_identities else 0
     specs = (
         # The recovery generator is a permanent bootstrap anchor installed
         # atomically before prepare(), not part of reversible generations.
@@ -2860,10 +2906,164 @@ def default_specs(
             root_uid,
             root_gid,
         ),
+        # Control-plane application identity (aicc-app runs the ticks below)
+        # and the drain-safe rotation identity (aicc-rotator, worker-only)
+        # both live here: neither is agent-principal-isolation machinery, so
+        # this file is common to both profiles like the transaction tool
+        # itself.
+        FileSpec(
+            repo_root / "deploy/sysusers.d/aicc-app.conf",
+            "/usr/lib/sysusers.d/aicc-app.conf",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        # The control plane's own dispatch ticks (CONTROL_ONLY_TARGETS).
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-backlog-planner.service",
+            "/etc/systemd/system/aicc-backlog-planner.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-backlog-planner.timer",
+            "/etc/systemd/system/aicc-backlog-planner.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-backlog-review.service",
+            "/etc/systemd/system/aicc-backlog-review.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-backlog-review.timer",
+            "/etc/systemd/system/aicc-backlog-review.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-backlog-merge.service",
+            "/etc/systemd/system/aicc-backlog-merge.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-backlog-merge.timer",
+            "/etc/systemd/system/aicc-backlog-merge.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-queue-reaper.service",
+            "/etc/systemd/system/aicc-queue-reaper.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-queue-reaper.timer",
+            "/etc/systemd/system/aicc-queue-reaper.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            app_env,
+            "/etc/aicc/app.env",
+            0o640,
+            root_uid,
+            app_gid,
+        ),
+        # Worker-side worktree hygiene and credential rotation
+        # (WORKER_ONLY_TARGETS additions).
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-worktree-prune.service",
+            "/etc/systemd/system/aicc-worktree-prune.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/aicc-worktree-prune.timer",
+            "/etc/systemd/system/aicc-worktree-prune.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-pgtunnel.service",
+            "/etc/systemd/system/voyn-aicc-pgtunnel.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            pgtunnel_env,
+            "/etc/aicc/pgtunnel.env",
+            0o640,
+            root_uid,
+            worker_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-credential-rotation.service",
+            "/etc/systemd/system/voyn-aicc-credential-rotation.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-credential-rotation.timer",
+            "/etc/systemd/system/voyn-aicc-credential-rotation.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-credential-rotation-alert@.service",
+            "/etc/systemd/system/voyn-aicc-credential-rotation-alert@.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        # credential_rotation.load_lane_registry()'s own view of the lane
+        # set -- root:root, LANE_UNIT_PATTERN-shaped, distinct from
+        # /etc/aicc/worker-lanes (see the comment in
+        # deploy/systemd/voyn-aicc-credential-rotation.service).
+        FileSpec(
+            repo_root / "deploy/aicc/voyn-worker-lanes.conf",
+            "/etc/voyn/aicc-worker-lanes.conf",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        # Per-host self-deploy tick. The timer is identical on both hosts;
+        # the committed service is the control variant (CONTROL_ONLY_TARGETS
+        # excludes it from the worker profile until a worker variant exists).
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-self-deploy.service",
+            "/etc/systemd/system/voyn-aicc-self-deploy.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-self-deploy.timer",
+            "/etc/systemd/system/voyn-aicc-self-deploy.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
     )
-    if profile == "control":
-        return tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
-    return specs
+    exclusive_targets = WORKER_ONLY_TARGETS if profile == "control" else CONTROL_ONLY_TARGETS
+    return tuple(spec for spec in specs if spec.target not in exclusive_targets)
 
 
 def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -2995,6 +3195,8 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             authority_env=args.authority_env,
             claude_auth=args.claude_auth,
             codex_auth=args.codex_auth,
+            app_env=args.app_env,
+            pgtunnel_env=args.pgtunnel_env,
             resolve_identities=args.action != "validate",
             profile=args.profile,
         )
@@ -3056,6 +3258,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--authority-env", type=Path, default=Path("/etc/aicc/workspace-authority.env")
+    )
+    parser.add_argument(
+        "--app-env", type=Path, default=Path("/etc/aicc/app.env")
+    )
+    parser.add_argument(
+        "--pgtunnel-env", type=Path, default=Path("/etc/aicc/pgtunnel.env")
     )
     parser.add_argument(
         "--profile",

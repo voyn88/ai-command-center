@@ -1184,6 +1184,8 @@ def test_recovery_generator_is_a_permanent_pretransaction_anchor(tmp_path):
         authority_env=tmp_path / "authority.env",
         claude_auth=tmp_path / "claude.json",
         codex_auth=tmp_path / "codex.json",
+        app_env=tmp_path / "app.env",
+        pgtunnel_env=tmp_path / "pgtunnel.env",
         resolve_identities=False,
     )
     assert module.RECOVERY_ANCHOR_TARGET not in {spec.target for spec in specs}

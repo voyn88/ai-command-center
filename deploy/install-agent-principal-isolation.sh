@@ -33,6 +33,8 @@ esac
 # open, so the lock spans rollout/systemctl gaps between transaction children.
 /usr/bin/flock -n "$AICC_INSTALL_LOCK_FD"
 workspace_authority_env=/etc/aicc/workspace-authority.env
+app_env=/etc/aicc/app.env
+pgtunnel_env=/etc/aicc/pgtunnel.env
 state_dir=/var/lib/aicc-principal-isolation
 baseline_units="$state_dir/baseline-units.json"
 baseline_release="$state_dir/baseline-release"
@@ -111,6 +113,8 @@ run_transaction() {
     --repo-root "$repo_root" \
     --state-dir "$state_dir" \
     --authority-env "$workspace_authority_env" \
+    --app-env "$app_env" \
+    --pgtunnel-env "$pgtunnel_env" \
     --lock-fd "$AICC_INSTALL_LOCK_FD" \
     --profile "$install_profile" \
     "$@"
