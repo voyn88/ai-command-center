@@ -243,7 +243,21 @@ def _cascade_link(request, attempt_no: int) -> dict[str, Any] | None:
     return request.cascade[min(attempt_no, len(request.cascade)) - 1]
 
 
+def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> bool:
+    """A route switch may change providers, never the workspace safety model."""
+    return (
+        current_task_type in agent_runner.MUTATING_TASK_TYPES
+    ) == (candidate_task_type in agent_runner.MUTATING_TASK_TYPES)
+
+
 def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
+    if executor == "openai_http":
+        # No CLI to probe and no principal to isolate: the bridge is this
+        # checkout's own module. Availability is exactly "a provider key is
+        # in the environment"; provider outages classify as attempt failures
+        # (next cascade link), never as executor absence.
+        available, detail = agent_runner.openai_http_preflight()
+        return available, detail, "openai_http provider key unavailable"
     if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
@@ -318,6 +332,8 @@ def _run_agent(
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
                 continue
             candidate_task_type = str(candidate.get("task_type", request.task_type))
+            if not _same_mutability_class(task_type, candidate_task_type):
+                continue
             candidate_available, candidate_detail, candidate_reason = (
                 _executor_preflight(candidate_executor, candidate_task_type)
             )
@@ -592,6 +608,7 @@ def _run_agent(
         # visibility-window expiry / supersession in `work_queue_store`,
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
+        route_failovers: list[dict[str, Any]] = []
         while True:
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
@@ -608,6 +625,79 @@ def _run_agent(
                 and isolated_workspace is not None
                 and not lease_lost.is_set()
             ):
+                result_text = agent_runner.extract_result_text(run.stdout)
+                provider_failure = run.is_executor_provider_error(executor) or (
+                    executor == "copilot"
+                    and task_type not in agent_runner.MUTATING_TASK_TYPES
+                    and run.status != "completed"
+                )
+                # A provider/auth/quota refusal happens before useful model work.
+                # For read-only work the execution policy already prevents writes;
+                # for mutating work prove the isolated workspace is untouched before
+                # allowing another provider to inherit it.  This keeps failover
+                # inside the current queue lease, so an exhausted account neither
+                # consumes an attempt nor creates a red work_attempt row.
+                safe_to_fail_over = task_type not in agent_runner.MUTATING_TASK_TYPES
+                if (
+                    provider_failure
+                    and not safe_to_fail_over
+                    and isolated_workspace is not None
+                ):
+                    safe_to_fail_over = workspace_provisioning.task_workspace_is_unchanged(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        remote_url=evidence.remote_url,
+                        start_sha=evidence.start_sha,
+                        trusted_base_sha=evidence.base_sha,
+                        expected_remote_sha=evidence.remote_task_sha,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                    )
+                fallback_selected = False
+                if (
+                    provider_failure
+                    and safe_to_fail_over
+                    and cascade_step is not None
+                    and not lease_lost.is_set()
+                ):
+                    for candidate_step in range(
+                        cascade_step + 1, len(request.cascade) + 1
+                    ):
+                        candidate = request.cascade[candidate_step - 1]
+                        candidate_executor = str(candidate.get("executor"))
+                        if candidate_executor not in agent_runner.COMMAND_BUILDERS:
+                            continue
+                        candidate_task_type = str(
+                            candidate.get("task_type", request.task_type)
+                        )
+                        if not _same_mutability_class(task_type, candidate_task_type):
+                            continue
+                        candidate_available, _, _ = _executor_preflight(
+                            candidate_executor, candidate_task_type
+                        )
+                        if not candidate_available:
+                            continue
+                        route_failovers.append(
+                            {
+                                "cascade_step": cascade_step,
+                                "executor": executor,
+                                "reason": "provider_auth_or_quota",
+                            }
+                        )
+                        executor = candidate_executor
+                        task_type = candidate_task_type
+                        model = request.model
+                        model_override = candidate.get("model")
+                        if isinstance(model_override, str) and model_override.strip():
+                            model = model_override
+                        link = candidate
+                        cascade_step = candidate_step
+                        fallback_selected = True
+                        break
+                if fallback_selected:
+                    continue
                 break
             agent_runner.disable_codex_workspace_write(_tail(run.stderr or run.stdout))
             unchanged = workspace_provisioning.task_workspace_is_unchanged(
@@ -628,11 +718,20 @@ def _run_agent(
                 if candidate_executor not in agent_runner.COMMAND_BUILDERS:
                     continue
                 candidate_task_type = str(candidate.get("task_type", request.task_type))
+                if not _same_mutability_class(task_type, candidate_task_type):
+                    continue
                 candidate_available, _, _ = _executor_preflight(
                     candidate_executor, candidate_task_type
                 )
                 if not candidate_available:
                     continue
+                route_failovers.append(
+                    {
+                        "cascade_step": cascade_step,
+                        "executor": executor,
+                        "reason": "codex_workspace_sandbox",
+                    }
+                )
                 executor = candidate_executor
                 task_type = candidate_task_type
                 model = request.model
@@ -678,6 +777,7 @@ def _run_agent(
         result = {
             "cascade_step": cascade_step,
             "executor": (link or {}).get("executor", "claude"),
+            "route_failovers": route_failovers,
             **_machine_outcome(result_text),
             "status": run.status,
             "exit_code": run.exit_code,
@@ -884,7 +984,25 @@ def _run_agent(
                     retryable=True,
                 )
             try:
-                candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
+                candidate_sha, checkpointed_dirty_worktree = (
+                    workspace_provisioning.checkpoint_dirty_task_workspace(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        remote_url=evidence.remote_url,
+                        start_sha=evidence.start_sha,
+                        trusted_base_sha=evidence.base_sha,
+                        expected_remote_sha=evidence.remote_task_sha,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                        message=f"{backlog_task}: checkpoint executor changes",
+                    )
+                )
+                # The checkpoint helper reads HEAD without invoking Git against
+                # agent-owned metadata.  Read it once more immediately before
+                # validation so a late writer cannot substitute the candidate.
+                observed_candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
                     run_repository,
                     expected_branch=evidence.expected_branch,
                     expected_inode=(
@@ -892,6 +1010,18 @@ def _run_agent(
                         evidence.workspace_inode,
                     ),
                 )
+                if observed_candidate_sha != candidate_sha:
+                    raise workspace_provisioning.WorkspaceVerificationError(
+                        failed_step="dirty_checkpoint_candidate_race",
+                        remediation="Stop the remaining writer and retry the preserved task clone.",
+                        expected_workspace=str(run_repository),
+                        actual_workspace=str(run_repository),
+                        expected_branch=evidence.expected_branch,
+                        detail=(
+                            f"checkpoint changed before publish validation: "
+                            f"expected={candidate_sha}, actual={observed_candidate_sha}"
+                        ),
+                    )
                 with workspace_provisioning.trusted_publish_clone(
                     run_repository,
                     expected_branch=evidence.expected_branch,
@@ -952,6 +1082,7 @@ def _run_agent(
                 "branch": pub.branch,
                 "pr_url": pub.pr_url,
                 "reason": pub.reason,
+                "checkpointed_dirty_worktree": checkpointed_dirty_worktree,
             }
             if pub.pr_url:
                 result["pr_url"] = pub.pr_url
@@ -981,24 +1112,17 @@ def _run_agent(
                         evidence.workspace_inode,
                     ),
                 )
-            if pub.reason in {
-                "uncommitted_changes",
-                "pinned_base_sha_missing",
-                "head_not_descendant_of_pinned_base",
-            }:
-                # Retryable on purpose. The task clone is preserved above and
-                # the next attempt's `provision_workspace` reuses it, so a
-                # later run can still commit what this one left behind -- the
-                # corrected dispatch prompt (VOYN-W0-AICC-AGENT-COMMIT-
-                # CONTRACT-GAP) is what makes that recovery likely rather than
-                # a lottery. A missing pinned base can likewise arrive with a
-                # later fetch. Independent review on c923ad33 rejected an
-                # earlier revision that made these terminal: it would have
-                # dead-lettered recoverable work in the name of saving a retry
-                # budget the prompt fix already stops wasting.
+            if not pub.ok and pub.reason != "nothing_to_publish":
+                # Every real publication failure is retryable. The candidate
+                # was checkpointed before the fallible push/PR handoff and the
+                # task clone is preserved above, so the next bounded attempt
+                # can resume without rerunning or losing agent work. Returning
+                # ok=True here used to make the queue mark `pr_create_failed`
+                # as succeeded even though no PR existed, permanently
+                # disconnecting a pushed branch from review.
                 return HandlerOutcome(
                     ok=False,
-                    reason=f"publish precondition failed: {pub.reason}",
+                    reason=f"publish failed: {pub.reason}",
                     retryable=True,
                     result=result,
                 )

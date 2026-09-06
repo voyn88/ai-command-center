@@ -69,6 +69,11 @@ def test_enqueue_refuses_done_task():
     assert entries == []
 
 
+def test_enqueue_refuses_master_projection_task():
+    task = _task(id="master", source="master", read_only=True)
+    assert execution_queue.enqueue([], task, {"master": task}) == []
+
+
 def test_dequeue_removes_entry_by_id():
     entries = [{"id": "q1", "task_id": "a"}, {"id": "q2", "task_id": "b"}]
     remaining = execution_queue.dequeue(entries, "q1")
@@ -109,6 +114,14 @@ def test_evaluate_readiness_cancels_entry_whose_task_no_longer_exists():
     assert reevaluated[0]["state"] == execution_queue.STATE_CANCELLED
 
 
+def test_evaluate_readiness_cancels_existing_master_projection_entry():
+    task = _task(id="master", source="master", read_only=True)
+    entry = {"id": "q1", "task_id": "master", "state": execution_queue.STATE_READY}
+    reevaluated = execution_queue.evaluate_readiness([entry], {"master": task})
+    assert reevaluated[0]["state"] == execution_queue.STATE_CANCELLED
+    assert "read-only" in reevaluated[0]["reason"]
+
+
 def test_evaluate_readiness_never_touches_terminal_entries():
     launched = {"id": "q1", "task_id": "a", "state": execution_queue.STATE_LAUNCHED, "run_id": "r1"}
     reevaluated = execution_queue.evaluate_readiness([launched], {})
@@ -142,6 +155,19 @@ def test_ready_and_waiting_entries_filter_correctly():
 # and only for entries already READY, only when explicitly called (never
 # from evaluate_readiness/reevaluate_and_persist).
 # --------------------------------------------------------------------------
+
+
+def test_launch_ready_refuses_persisted_master_projection_entry(tmp_path):
+    task = _task(id="master", source="master", read_only=True)
+    entry = {"id": "q1", "task_id": "master", "state": execution_queue.STATE_READY}
+
+    _, results = execution_queue.launch_ready(
+        tmp_path, [entry], [task], {"master": task}, {}, object()
+    )
+
+    assert len(results) == 1
+    assert results[0].launched is False
+    assert results[0].reason_code == execution_queue.LAUNCH_SKIP_READ_ONLY_MASTER
 
 
 def test_launch_ready_skips_entry_with_no_workspace_configured(tmp_path):
