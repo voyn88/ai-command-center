@@ -71,7 +71,12 @@ while [ $i -lt ${#args[@]} ]; do
         *) i=$((i+1)) ;;
     esac
 done
-port="$(printf '%s\n' "${opts}" | grep -oE 'port=[0-9]+' | cut -d= -f2)"
+# `|| true`: under `set -e -o pipefail`, `grep` finding no match (e.g. a
+# `status`/`stop` invocation, which passes no `-o` and so has no "port=" to
+# find) would otherwise abort this stub before it ever reaches the `case`
+# below -- turning every `pg_ctl status` call into a silent, wrong "not
+# running", regardless of whether the fake server is actually alive.
+port="$(printf '%s\n' "${opts}" | grep -oE 'port=[0-9]+' | cut -d= -f2)" || true
 pidfile="${datadir}/postmaster.pid"
 
 is_alive() {
@@ -89,7 +94,13 @@ case "${cmd}" in
             exit 1
         fi
         rm -f "${pidfile}"
-        python3 - "${port}" "${pidfile}" <<'PY' &
+        # Redirected away from the inherited stdout/stderr: this listener
+        # outlives pg_ctl's own exit (it runs until `stop` kills it), so if
+        # it kept those fds open, whatever captured pg_ctl's/the harness's
+        # output (e.g. Python's subprocess.run(capture_output=True)) would
+        # block reading for EOF until this background process itself exits --
+        # turning every `start` call into a hang until the test's timeout.
+        python3 - "${port}" "${pidfile}" <<'PY' >/dev/null 2>&1 &
 import os
 import socket
 import sys
