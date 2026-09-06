@@ -597,6 +597,18 @@ def test_dirty_checkpoint_uses_one_shared_git_ref_lock(tmp_path):
     assert not (repo / ".git" / "refs" / "heads" / "main.lock").exists()
 
 
+def test_dirty_checkpoint_ref_lock_does_not_relabel_body_io_errors(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+
+    with pytest.raises(OSError, match="index persistence failed"):
+        with workspace_provisioning._lock_agent_branch_ref(
+            repo, expected_branch="main"
+        ):
+            raise OSError("index persistence failed")
+
+    assert not (repo / ".git" / "refs" / "heads" / "main.lock").exists()
+
+
 def test_dirty_checkpoint_refuses_linked_worktree_gitdir_pointer(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

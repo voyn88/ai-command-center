@@ -2264,10 +2264,13 @@ def _lock_agent_branch_ref(
                 expected_branch=expected_branch,
                 detail=f"task branch lock is already held: {exc}",
             ) from exc
-        yield directory_fd, lock_fd, lock_name
     except WorkspaceVerificationError:
+        if directory_fd is not None:
+            os.close(directory_fd)
         raise
     except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
         raise WorkspaceVerificationError(
             failed_step="dirty_checkpoint_ref_lock",
             remediation="Preserve the task clone for ref-integrity inspection.",
@@ -2276,16 +2279,16 @@ def _lock_agent_branch_ref(
             expected_branch=expected_branch,
             detail=f"cannot securely lock the task branch: {exc}",
         ) from exc
+    assert directory_fd is not None and lock_fd is not None
+    try:
+        yield directory_fd, lock_fd, lock_name
     finally:
-        if lock_fd is not None:
-            os.close(lock_fd)
-            try:
-                assert directory_fd is not None
-                os.unlink(lock_name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
-        if directory_fd is not None:
-            os.close(directory_fd)
+        os.close(lock_fd)
+        try:
+            os.unlink(lock_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
 
 
 def _advance_agent_branch_ref(
