@@ -51,6 +51,16 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
 - ``merge_once``: for each PR that carries an ACCEPT marker AND whose required
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
+  The merge itself runs under ``_merge_app_credentials``' own GitHub App
+  installation -- a third identity, distinct from both the ambient ``gh``
+  credential every read in this module uses and the acceptance identity that
+  posts the marker -- so worker and planner code, which never sees that
+  identity's secrets, has no path to executing ``gh pr merge`` at all
+  (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM). Anything that keeps this tick from
+  even evaluating a merge -- the identity unconfigured, its token failing to
+  mint, a readiness read that never reached the GitHub API -- lands in
+  ``LoopReport.errors``, kept apart from ``skipped`` so a caller can fail
+  loudly instead of it looking like an ordinary not-yet-accepted PR.
 - ``reconcile_merge_evidence``: report-only audit of existing DONE tasks'
   'sha' evidence against the default branch, for rows written before
   VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY (when that evidence was the
@@ -128,6 +138,15 @@ class LoopReport:
     #: Fresh, bounded identities dispatched to replace succeeded review runs
     #: whose final result cannot be parsed for the current PR head.
     retried: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) the tick could not even evaluate, as opposed to
+    #: evaluated-and-not-ready: the merge identity is unconfigured or
+    #: misconfigured, its installation token could not be minted, or a
+    #: readiness lookup failed to reach the GitHub API at all. Kept apart
+    #: from `skipped` deliberately -- see `merge_once`'s docstring
+    #: (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM) -- so a caller can fail loudly
+    #: instead of this looking identical to a PR that just isn't accepted
+    #: yet.
+    errors: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -370,6 +389,61 @@ def _post_marker_as_bot(
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
         return False, f"marker_post_failed: {exc}"
     return True, ""
+
+
+def _merge_app_credentials() -> github_app_auth.GitHubAppCredentials | None:
+    """The merge identity's credentials -- a THIRD GitHub App installation,
+    distinct from both the ambient credential `_gh()` uses for every
+    read-only call in this module and the acceptance identity
+    `_acceptance_app_credentials` mints for posting the marker
+    (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM).
+
+    Before this identity existed, `merge_once` executed `gh pr merge`
+    under the same ambient `gh` credential every other call in this
+    module already shares -- confirmed by reading the code at f289127,
+    unchanged across #345-351: whichever token `gh` was configured with
+    on the host running the tick could both author a pull request and
+    merge it. Splitting the acceptance marker onto its own identity
+    (VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE) closed the self-approval
+    gap in *what gets posted*, but left the actual merge -- the
+    irreversible act -- on the same shared credential. This identity is
+    the sole holder of that capability: worker and planner code never
+    sees `VOYN_MERGE_APP_ID`/`_INSTALLATION_ID`/`_PRIVATE_KEY_PATH`, so
+    nothing outside this one call site in `merge_once` can ever execute
+    `gh pr merge`.
+
+    All three or none, exactly like `_acceptance_app_credentials`: a
+    partial set is a misconfiguration, and unlike that function's
+    same-tick fallback-free skip, an unconfigured or partially configured
+    merge identity here is reported to `LoopReport.errors`, not
+    `skipped` -- this tick's only job is merging, so failing to reach
+    that capability is never indistinguishable from "nothing to merge
+    yet." See `merge_once`."""
+    app_id = os.environ.get("VOYN_MERGE_APP_ID", "")
+    installation_id = os.environ.get("VOYN_MERGE_INSTALLATION_ID", "")
+    key_path = os.environ.get("VOYN_MERGE_PRIVATE_KEY_PATH", "")
+    if not (app_id and installation_id and key_path):
+        return None
+    return github_app_auth.GitHubAppCredentials(app_id, installation_id, Path(key_path))
+
+
+def _merge_pr_as_bot(
+    repo_path: str, pr_url: str, token: str
+) -> subprocess.CompletedProcess[str]:
+    """Run `gh pr merge` authenticated as the merge identity's freshly
+    minted installation token via `GH_TOKEN` -- which `gh` itself
+    prioritizes over any stored `gh auth login` credential for exactly
+    this one subprocess -- rather than switching to a raw REST call.
+    `gh pr merge` already knows how to enqueue a PR on a merge-queue-
+    protected repository instead of merging it synchronously (see
+    `_merged_target_sha`'s docstring); reimplementing that branch against
+    the REST/GraphQL merge endpoints directly would risk silently losing
+    it. The credential is what changes here, not the mechanism."""
+    return subprocess.run(
+        ["gh", "pr", "merge", pr_url, "--squash"],
+        cwd=repo_path, capture_output=True, text=True, check=False, timeout=120,
+        env={**os.environ, "GH_TOKEN": token},
+    )
 
 
 def _rows(factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
@@ -2548,7 +2622,29 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
     as evidence, only once GitHub reports the PR actually MERGED (see
-    `_merged_target_sha`; a queued merge is a wait, not a completion)."""
+    `_merged_target_sha`; a queued merge is a wait, not a completion).
+
+    This is the gateway VOYN-W0-AICC-MERGE-GATEWAY-REM-REM asks for: the
+    only call site anywhere in this codebase that executes `gh pr merge`,
+    and it does so under `_merge_app_credentials`'s dedicated identity --
+    never the ambient credential `_gh()` uses for everything else here,
+    and never the acceptance identity that posts the marker. Every
+    precondition below is re-read from GitHub on this tick, not trusted
+    from whatever produced the task's `READY_TO_REVIEW` status: PR still
+    OPEN, an ACCEPT marker from a reviewer login that is not the PR's own
+    author standing on the EXACT current head (`_pr_is_mergeable`), every
+    required check terminal-success rather than merely absent-of-failure
+    (`_check_is_green`), and -- on the merged head itself, after the
+    call -- that the marker and checks still hold (`_merged_target_sha`),
+    so an externally merged PR can never be silently blessed DONE.
+
+    Anything that keeps this tick from even EVALUATING those preconditions
+    -- the merge identity unconfigured or partially configured, its
+    installation token failing to mint, or a readiness lookup that never
+    reached the GitHub API at all -- is `errors`, not `skipped`: an
+    ordinary "not accepted yet" PR and "GitHub is unreachable" must never
+    look the same to whatever is watching this loop. See `LoopReport.
+    errors` and `_merge_app_credentials`."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
@@ -2603,6 +2699,14 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
         if merge_sha is None:
             ready, detail = _pr_is_mergeable(repo_path, pr_url)
             if not ready:
+                if detail.startswith("gh_view_failed"):
+                    # The GitHub API itself was unreachable for this
+                    # readiness read -- not "not accepted yet." Fail
+                    # closed and say so loudly (VOYN-W0-AICC-MERGE-
+                    # GATEWAY-REM-REM): a caller must be able to tell this
+                    # apart from an ordinary skip.
+                    report.errors.append((task_id, detail))
+                    continue
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake
                     # window: retry the failed jobs once (attempt-bounded)
@@ -2640,7 +2744,25 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     )
                 continue
             actions += 1
-            merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
+            # The one privileged mutation this whole module exists to
+            # gate: executed under the dedicated merge identity, never the
+            # ambient `_gh()` credential every read above used, and never
+            # the acceptance identity that posted the marker being relied
+            # on (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM). Unconfigured or
+            # partially configured is a misconfiguration of the gateway
+            # itself, not "nothing to do" -- `errors`, not `skipped`, and
+            # it fails closed rather than silently falling back to a
+            # shared credential.
+            merge_creds = _merge_app_credentials()
+            if merge_creds is None:
+                report.errors.append((task_id, "merge_bot_not_configured"))
+                continue
+            try:
+                merge_token = github_app_auth.installation_token(merge_creds)
+            except github_app_auth.AppAuthError as exc:
+                report.errors.append((task_id, f"merge_bot_auth_failed: {exc}"))
+                continue
+            merged = _merge_pr_as_bot(repo_path, pr_url, merge_token)
             # On a merge-queue-protected repo a zero exit only ENQUEUED the
             # PR; on a plain repo it merged synchronously. Either way the
             # target branch, not the exit code, is the authority: DONE only
@@ -2692,6 +2814,16 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                 else:
                     conn.rollback()
                     report.skipped.append((task_id, f"transition:{reason}"))
+            except Exception:
+                # Roll back WHILE the transaction is still open -- the
+                # `finally` below flips `autocommit` back to `True`, which
+                # is only valid once no transaction is in progress. Without
+                # this, an exception raised before either explicit
+                # commit/rollback above (e.g. a driver error mid-`execute`)
+                # would hit that `autocommit = True` on an open transaction
+                # and replace the real error with a secondary one.
+                conn.rollback()
+                raise
             finally:
                 conn.autocommit = True
     _scan_commit(factory, "scan:merge_once", scan_token, last_processed)
