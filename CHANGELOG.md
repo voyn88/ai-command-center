@@ -8,6 +8,37 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Fleet-wide executor quota visibility (`VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY`)
+- `command_center/db/sql/0018_executor_availability.up.sql`: `executor_availability`
+  (current verdict, one row per executor) and `executor_availability_event`
+  (durable audit trail), mutated only through `executor_mark_unavailable` /
+  `executor_mark_available` — the same queue-claim idiom `work_item` already
+  uses, so no role can forge "available" over an account another host just
+  proved exhausted.
+- `command_center/db/executor_availability.py` (`ExecutorAvailabilityStore`):
+  a short (5s) in-process TTL cache in front of the live verdict, mirroring
+  `runtime.providers._probe_cache` — the cooldown itself (minutes-to-hours,
+  `unavailable_until`) lives in Postgres and is compared against Postgres's
+  own `now()`, never a Python-side clock.
+- `command_center/worker/handlers.py`: `_executor_preflight` now composes the
+  existing local CLI check with this fleet-wide fact, before any process is
+  launched. A worker's own provider-failure classification
+  (`providers.classify_failure`, already detecting `"exceeded your monthly
+  quota"` and friends) reports durable failures fleet-wide via
+  `_classify_and_record_provider_failure`, so the NEXT claim — on any host —
+  skips the same exhausted account instead of re-discovering it. Quota
+  exhaustion surfaces as its own machine-readable reason,
+  `executor_quota_exhausted`, never folded into "CLI missing" reasons.
+- `command_center/db/work_queue_read.py`: `executor_availability()` and
+  `escalation_reasons()` — read-aggregations over the same durable tables and
+  the same `aicc_app` read grant `queue_metrics()` already uses, so fleet
+  executor health and escalation-reason counts sit in the same PostgreSQL
+  path as the rest of delivery metrics rather than a bespoke writer.
+- Closes the incident this task is named for: Copilot CLI 1.0.80 returning
+  "You have exceeded your monthly quota" mid-review, burning a queue attempt
+  and process-launch time for zero model work because nothing outlived that
+  one attempt to keep the next claim off the same account.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,
