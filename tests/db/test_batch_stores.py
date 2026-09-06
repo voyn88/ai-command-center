@@ -210,11 +210,10 @@ def test_the_audit_family_reconciles_after_every_write(
     db_path = tmp_path / "runtime.db"
     audit_db.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert audit_run_divergence(audit_db.list_audit_runs_stored(db_path), runs) == [], stage
-        assert audit_finding_divergence(audit_db.list_audit_findings(db_path), findings) == [], (
-            stage
-        )
+    reconciled = reconciled_stage(
+        (audit_run_divergence, lambda: audit_db.list_audit_runs_stored(db_path), runs),
+        (audit_finding_divergence, lambda: audit_db.list_audit_findings(db_path), findings),
+    )
 
     run = audit_db.create_audit_run(db_path, project_ref="AICC", checks=["lint"])
     reconciled("run created")
@@ -280,11 +279,10 @@ def test_the_marketplace_family_reconciles_after_every_write(
     db_path = tmp_path / "runtime.db"
     market_db.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert market_item_divergence(market_db.list_market_items(db_path), items) == [], stage
-        assert install_log_divergence(
-            market_db.list_install_log(db_path, item["id"]), logs
-        ) == [], stage
+    reconciled = reconciled_stage(
+        (market_item_divergence, lambda: market_db.list_market_items(db_path), items),
+        (install_log_divergence, lambda: market_db.list_install_log(db_path, item["id"]), logs),
+    )
 
     item = market_db.create_market_item(db_path, name="pack", kind="module", version="1.0")
     reconciled("item created")
@@ -372,8 +370,9 @@ def test_invitations_reconcile_after_every_write(
     net_db.db.migrate(db_path)
     contact = net_db.create_contact(db_path, display_name="invitee")
 
-    def reconciled(stage: str) -> None:
-        assert invitation_divergence(net_db.list_invitations(db_path), invitations) == [], stage
+    reconciled = reconciled_stage(
+        (invitation_divergence, lambda: net_db.list_invitations(db_path), invitations)
+    )
 
     created = net_db.create_invitation(db_path, contact_id=contact["id"], council_ref="c1")
     reconciled("invitation created")
@@ -404,8 +403,9 @@ def test_advisor_proposals_reconcile_after_every_write(
     db_path = tmp_path / "runtime.db"
     wave1.db.migrate(db_path)
 
-    def reconciled(stage: str) -> None:
-        assert advisor_divergence(wave1.list_advisor_proposals(db_path), proposals) == [], stage
+    reconciled = reconciled_stage(
+        (advisor_divergence, lambda: wave1.list_advisor_proposals(db_path), proposals)
+    )
 
     created = wave1.create_advisor_proposal(
         db_path, kind="trend", title="use jsonb", project_ref="AICC"
