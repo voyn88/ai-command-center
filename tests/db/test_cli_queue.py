@@ -52,6 +52,26 @@ def test_queue_redrive_requires_the_item_id() -> None:
         build_parser().parse_args(["queue-redrive"])
 
 
+def test_queue_reopen_requires_the_item_id_and_a_reason() -> None:
+    args = build_parser().parse_args(
+        ["queue-reopen", "wki_1", "--reason", "rate limit", "--extra-attempts", "2"]
+    )
+    assert args.work_item_id == "wki_1"
+    assert args.reason == "rate limit"
+    assert args.extra_attempts == 2
+    assert (
+        build_parser()
+        .parse_args(["queue-reopen", "wki_1", "--reason", "x"])
+        .extra_attempts
+        == 1
+    )
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["queue-reopen"])
+    with pytest.raises(SystemExit):
+        # A reason is required, not merely defaulted.
+        build_parser().parse_args(["queue-reopen", "wki_1"])
+
+
 def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
     args = build_parser().parse_args(["backlog-merge-reconcile"])
     assert args.command == "backlog-merge-reconcile"

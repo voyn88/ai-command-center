@@ -59,7 +59,7 @@ def publish(monkeypatch, snapshot, review_rows):
     monkeypatch.setattr(
         review_merge, "_latest_review_result",
         lambda _f, _t, key: (
-            {"result_text": f"VERDICT: REJECT\nHEAD_SHA: {HEAD}"}
+            ("wki_fake_verification", {"result_text": f"VERDICT: REJECT\nHEAD_SHA: {HEAD}"})
             if key.startswith("verify:") else None
         ),
     )

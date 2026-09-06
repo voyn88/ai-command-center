@@ -59,9 +59,12 @@ def _complete_review(app_factory, worker, task_id, pr_url, head_sha, result_text
         "prompt": "review it", "timeout_seconds": 900, "untrusted": False,
     }
     key = review_merge._review_key(task_id, pr_url, _snapshot(head_sha))
-    store.enqueue("execution", idempotency_key=key, payload=payload, task_id=task_id)
+    work_item_id = store.enqueue(
+        "execution", idempotency_key=key, payload=payload, task_id=task_id
+    )
     claimed = worker.claim("execution", visibility_seconds=60)
     assert worker.complete(claimed, {"status": "completed", "result_text": result_text})
+    return work_item_id
 
 
 def _ready(store, factory, task_id, pr):
@@ -845,7 +848,7 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
     real_head = "c" * 40
     pr_url = "https://github.com/x/y/pull/17"
     _ready(store, app_factory, "VOYN-W0-P7", pr_url)
-    _complete_review(
+    work_item_id = _complete_review(
         app_factory, worker, "VOYN-W0-P7", pr_url, real_head,
         "VERDICT: REJECT\n"
         "The stale-head check is buggy.\n\n"
@@ -863,8 +866,89 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert ("VOYN-W0-P7", "verdict_or_head_sha_missing_in_review_result") in report.skipped
+    # The skip names the stuck work_item_id and the operator command to
+    # unstick it (VOYN-W0-AICC-REVIEW-STUCK-ON-TRANSIENT-FAILURE): this item
+    # is `succeeded`, not dead-lettered, so nothing but an explicit
+    # `queue-reopen` can ever move it again while the PR's head stays put.
+    skip_reasons = dict(report.skipped)
+    assert skip_reasons["VOYN-W0-P7"] == (
+        f"verdict_or_head_sha_missing_in_review_result:{work_item_id} "
+        "(stuck: not dead-lettered; operator redrive is "
+        f"`queue-reopen {work_item_id} --reason <why>`)"
+    )
     assert not any(a[:2] == ["pr", "review"] for a in posted)
+
+
+def test_publish_verdict_recovers_after_operator_reopens_a_stuck_result(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-REVIEW-STUCK-ON-TRANSIENT-FAILURE, the mainline recovery
+    path: a run that formally executed (`queue_complete` ran, so the item is
+    `succeeded`) but whose output was a transient executor failure -- a rate
+    limit, here, but the same applies to any output a classifier does not
+    recognise -- leaves no parseable verdict. Because the review-cycle key is
+    deterministic on the PR's head sha and `queue_enqueue` no-ops on an
+    existing row regardless of its state, the exact same skip repeats on
+    every tick with the head unchanged: nothing here is a fluke of a single
+    tick. `work_dlq`'s own exit (`queue_redrive`) is gated on state='dead'
+    and correctly refuses a `succeeded` item -- the operator's actual lever
+    is `queue_reopen` (the CLI's `queue-reopen`, named in the skip reason),
+    after which a fresh run reaches the marker exactly as if nothing had
+    gone wrong the first time."""
+    import subprocess as sp
+
+    from command_center.db.work_queue_admin import WorkQueueAdmin
+
+    app_factory, store, worker = rig
+    real_head = "d1" + "e" * 38
+    pr_url = "https://github.com/x/y/pull/19"
+    _ready(store, app_factory, "VOYN-W0-P9", pr_url)
+    work_item_id = _complete_review(
+        app_factory, worker, "VOYN-W0-P9", pr_url, real_head,
+        "You've hit your session limit · resets 4:10pm (UTC)",
+    )
+
+    def fake_gh_stuck(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": real_head, "reviews": []}), "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh_stuck)
+
+    # Stuck: the identical skip repeats, nothing self-heals across ticks.
+    for _ in range(2):
+        report = publish_review_verdicts(app_factory, "/tmp")
+        assert dict(report.skipped)["VOYN-W0-P9"].startswith(
+            f"verdict_or_head_sha_missing_in_review_result:{work_item_id} "
+        )
+
+    admin = WorkQueueAdmin(app_factory)
+    # The DLQ's own exit refuses it -- it was never dead-lettered.
+    assert admin.redrive(work_item_id) is False
+    # A reason is not optional: this is a human override of a real ack.
+    assert admin.reopen(work_item_id, reason="") is False
+    assert admin.reopen(
+        work_item_id, reason="transient rate limit, confirmed by operator"
+    ) is True
+
+    _complete_review(
+        app_factory, worker, "VOYN-W0-P9", pr_url, real_head,
+        f"Reviewed the diff, found nothing wrong.\nVERDICT: ACCEPT\nHEAD_SHA: {real_head}\n",
+    )
+
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    posted = []
+
+    def fake_post(creds, pr_url_arg, decision, sha):
+        posted.append((pr_url_arg, decision, sha))
+        return True, ""
+
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot", fake_post)
+
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-P9", pr_url) in report.reviewed
+    assert posted == [(pr_url, "ACCEPT", real_head)]
 
 
 def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):  # noqa: F811
@@ -1173,7 +1257,9 @@ def _force_chunk_reject(monkeypatch, verification, findings="isolated-chunk find
         # REJECT path -- keyed to head + the exact rejecting findings.
         assert key.startswith("verify:"), key
         assert ":findings:" in key
-        return {"result_text": verification} if verification is not None else None
+        if verification is None:
+            return None
+        return "wki_fake_verification", {"result_text": verification}
 
     monkeypatch.setattr(review_merge, "_latest_review_result", fake_latest)
 
@@ -2725,7 +2811,10 @@ def test_a_deferred_marker_keeps_the_cursor_before_its_task(rig, monkeypatch):  
 
     def latest(factory, task_id, key):
         if key.startswith("verify:") and task_id == "VOYN-W0-DA":
-            return {"result_text": f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head_a}\n"}
+            return (
+                "wki_fake_verification",
+                {"result_text": f"FINDING 1: ARTIFACT -- cited.\nSECURITY_CLAIMS: NONE\nVERDICT: ACCEPT\nHEAD_SHA: {head_a}\n"},
+            )
         return real_latest(factory, task_id, key)
 
     monkeypatch.setattr(review_merge, "_latest_review_result", latest)

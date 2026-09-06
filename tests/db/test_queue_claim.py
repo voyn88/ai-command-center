@@ -1017,9 +1017,9 @@ def test_completion_without_a_result_is_refused_by_the_signature_itself(
             "WHERE n.nspname = 'public' AND p.proname LIKE 'queue\\_%%' "
             "AND p.proname NOT IN "
             "('queue_enqueue','queue_claim','queue_heartbeat','queue_complete',"
-            "'queue_fail','queue_reap','queue_redrive')"
+            "'queue_fail','queue_reap','queue_redrive','queue_reopen')"
         )
-        assert cur.fetchone()[0] == 0, "an eighth queue entry point appeared"
+        assert cur.fetchone()[0] == 0, "an unlisted queue entry point appeared"
 
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         token, token_hash = _token()
@@ -1232,6 +1232,154 @@ def test_redrive_of_an_unknown_item_is_refused_and_the_refusal_survives(
     assert [e[2] for e in _events(admin_conn, live_id) if e[1] == "rejected"] == [
         "not_dead_lettered"
     ]
+
+
+# ---------------------------------------------------------------------------
+# queue_reopen — the operator's exit for a `succeeded` item, 0017
+# (VOYN-W0-AICC-REVIEW-STUCK-ON-TRANSIENT-FAILURE).
+# ---------------------------------------------------------------------------
+
+
+def test_reopen_returns_a_succeeded_item_to_ready_and_clears_its_result(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """A `succeeded` item never reaches `work_dlq` (`WHERE state = 'dead'`),
+    so `queue_redrive`'s own state gate correctly refuses it -- nothing else
+    in the shipped protocol can move a `succeeded` item again. `result_id`
+    must clear: `work_item_succeeded_has_result` is a biconditional
+    (`(state = 'succeeded') = (result_id IS NOT NULL)`), so a `ready` row
+    with a leftover result_id would violate the very constraint that makes
+    'succeeded implies a result' airtight. The stale result itself is left
+    alone in `work_result` -- only the item's current pointer moves -- so an
+    operator can still read what the transient failure actually said.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "reopened", max_attempts=1)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            completed = _call(
+                worker,
+                "SELECT ok, reason FROM queue_complete(%s, %s, %s::jsonb)",
+                (verdict[3], token, json.dumps({"result_text": "session limit hit"})),
+            )
+            assert completed[0], completed[1]
+
+        state = _item(admin_conn, item_id)
+        assert state[0] == "succeeded"
+        assert state[4] is not None, "result_id must be set to have succeeded at all"
+        stale_result_id = state[4]
+
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            # work_dlq's own exit refuses a succeeded item.
+            assert _call(app, "SELECT queue_redrive(%s, 1)", (item_id,))[0] is False
+            reopened = _call(
+                app, "SELECT queue_reopen(%s, %s, %s)",
+                (item_id, "unparsable review verdict, confirmed transient", 2),
+            )
+            assert reopened[0] is True
+
+        state = _item(admin_conn, item_id)
+        assert state[0] == "ready"
+        assert state[1] == 1, "the attempt history is not reset"
+        assert state[2] == 3, "the budget is widened explicitly (1 + 2)"
+        assert state[3] is None
+        assert state[4] is None, "a ready row must carry no result"
+        assert state[5] is None
+
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT result_id FROM work_result WHERE result_id = %s", (stale_result_id,)
+            )
+            assert cur.fetchone() is not None, "the stale result is preserved for audit"
+
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            retaken = _claim(worker, _token()[1])
+            assert retaken[0] and retaken[2] == item_id
+            assert retaken[4] == 2, "the retry continues the numbering"
+
+
+def test_reopen_refuses_unknown_ready_and_dead_items_and_requires_a_reason(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """`queue_reopen` is narrowly scoped to `succeeded`: a `dead` item already
+    has its own audited exit (`queue_redrive`), and a `ready` item has no
+    result to override at all -- widening `queue_reopen` to accept either
+    would duplicate an existing transition under different rules. An empty
+    (or whitespace-only) reason is refused too: unlike `queue_fail`/
+    `queue_reap`, nothing calls `queue_reopen` on a timer, so a caller must
+    say why it is overriding a real acknowledgement.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        assert _call(
+            app, "SELECT queue_reopen(%s, %s, 1)", ("wki_does_not_exist", "why")
+        )[0] is False
+        doomed_id = _enqueue(app, "doomed", max_attempts=1)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0] and verdict[2] == doomed_id
+            _call(
+                worker, "SELECT ok FROM queue_fail(%s, %s, %s, false)",
+                (verdict[3], token, "boom"),
+            )
+        assert _item(admin_conn, doomed_id)[0] == "dead"
+
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            assert _call(
+                app, "SELECT queue_reopen(%s, %s, 1)", (doomed_id, "why")
+            )[0] is False
+
+            # A distinct queue so this item -- deliberately left `ready`
+            # forever -- cannot be claimed ahead of `succeeded_id` below by
+            # FIFO ordering within the shared default queue.
+            ready_id = _enqueue(app, "still-ready", queue="reopen-other")
+            assert _call(
+                app, "SELECT queue_reopen(%s, %s, 1)", (ready_id, "why")
+            )[0] is False
+
+            succeeded_id = _enqueue(app, "will-succeed")
+
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token2, token_hash2 = _token()
+            verdict2 = _claim(worker, token_hash2)
+            assert verdict2[0] and verdict2[2] == succeeded_id
+            _call(
+                worker, "SELECT ok FROM queue_complete(%s, %s, %s::jsonb)",
+                (verdict2[3], token2, json.dumps({"done": True})),
+            )
+
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            assert _call(app, "SELECT queue_reopen(%s, %s, 1)", (succeeded_id, ""))[0] is False
+            assert _call(
+                app, "SELECT queue_reopen(%s, %s, 1)", (succeeded_id, "   ")
+            )[0] is False
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, detail ->> 'requested_work_item_id' FROM work_event "
+            "WHERE event = 'reopen' AND outcome = 'rejected' AND work_item_id IS NULL"
+        )
+        assert cur.fetchall() == [("unknown_work_item", "wki_does_not_exist")]
+    assert [
+        e[2] for e in _events(admin_conn, doomed_id) if e[0] == "reopen" and e[1] == "rejected"
+    ] == ["not_succeeded"]
+    assert [
+        e[2] for e in _events(admin_conn, ready_id) if e[0] == "reopen" and e[1] == "rejected"
+    ] == ["not_succeeded"]
+    assert [
+        e[2] for e in _events(admin_conn, succeeded_id) if e[0] == "reopen" and e[1] == "rejected"
+    ] == ["reason_required", "reason_required"]
 
 
 # ---------------------------------------------------------------------------

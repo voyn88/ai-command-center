@@ -202,6 +202,9 @@ def test_the_control_plane_cannot_claim() -> None:
         "queue_enqueue",
         "queue_reap",
         "queue_redrive",
+        # 0017: queue_redrive's counterpart for a `succeeded` item whose
+        # result an operator has determined is unusable.
+        "queue_reopen",
     }
     # The enrolment layer (0003). `identity_revoke_principal` is deliberately
     # absent: taking a host offline is the operator's lever, so a compromised
@@ -212,6 +215,7 @@ def test_the_control_plane_cannot_claim() -> None:
         "queue_enqueue",
         "queue_reap",
         "queue_redrive",
+        "queue_reopen",
         "enroll_mint_ticket",
         "enroll_redeem_ticket",
         "enroll_revoke_ticket",

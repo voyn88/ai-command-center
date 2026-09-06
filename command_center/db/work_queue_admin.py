@@ -131,3 +131,27 @@ class WorkQueueAdmin:
                     (work_item_id, max(int(extra_attempts), 1)),
                 )
                 return bool(cur.fetchone()[0])
+
+    def reopen(
+        self, work_item_id: str, *, reason: str, extra_attempts: int = 1
+    ) -> bool:
+        """Return a `succeeded` item to 'ready' with a raised budget.
+
+        `queue_redrive`'s counterpart for the case `work_dlq` cannot see: an
+        item whose run formally executed (`queue_complete` was called, so it
+        is not dead-lettered and never will be by `queue_reap`) but whose
+        result an operator has determined is unusable — a transient
+        executor failure a classifier didn't recognise, surfaced as an
+        unparseable review verdict. ``reason`` is required and audited: this
+        overrides a real acknowledgement, so unlike a redrive it is never
+        something a timer decides on its own. ``False`` is a refusal, not an
+        error: the id is unknown, the item is not `succeeded`, or the reason
+        was empty — all audited by the function itself.
+        """
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT queue_reopen(%s, %s, %s)",
+                    (work_item_id, reason, max(int(extra_attempts), 1)),
+                )
+                return bool(cur.fetchone()[0])

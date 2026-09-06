@@ -68,8 +68,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # The queue's recovery surface (SRV-06). These run as `aicc_app` — the
-    # role the SQL protocol granted queue_reap/queue_redrive/work_dlq to —
-    # which is why they live in the db CLI beside `status`, not in the worker.
+    # role the SQL protocol granted queue_reap/queue_redrive/queue_reopen/
+    # work_dlq to — which is why they live in the db CLI beside `status`,
+    # not in the worker.
     sub.add_parser(
         "queue-reap",
         help="Expire lapsed leases: requeue items with attempt budget left, "
@@ -84,6 +85,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     redrive.add_argument("work_item_id", help="The wki_* id from queue-dlq.")
     redrive.add_argument(
+        "--extra-attempts",
+        type=int,
+        default=1,
+        help="Additional attempts to grant beyond those already burned (default 1).",
+    )
+    reopen = sub.add_parser(
+        "queue-reopen",
+        help="Return one 'succeeded' item to 'ready' whose result an operator "
+        "has determined is unusable (e.g. a review verdict that never "
+        "parsed) — the redrive path for a transient failure that a "
+        "classifier reported as ok, invisible to queue-dlq.",
+    )
+    reopen.add_argument("work_item_id", help="The wki_* id named in a SKIP log line.")
+    reopen.add_argument(
+        "--reason", required=True, help="Why this succeeded result is being discarded."
+    )
+    reopen.add_argument(
         "--extra-attempts",
         type=int,
         default=1,
@@ -292,6 +310,24 @@ def main(argv: list[str] | None = None) -> int:
                 # The refusal is already audited server-side with its cause.
                 print(
                     f"refused: {args.work_item_id} is unknown or not dead-lettered",
+                    file=sys.stderr,
+                )
+                return 1
+
+            if args.command == "queue-reopen":
+                from command_center.db.work_queue_admin import WorkQueueAdmin
+
+                accepted = WorkQueueAdmin(lambda: nullcontext(conn)).reopen(
+                    args.work_item_id,
+                    reason=args.reason,
+                    extra_attempts=args.extra_attempts,
+                )
+                if accepted:
+                    print(f"reopened: {args.work_item_id}")
+                    return 0
+                # The refusal is already audited server-side with its cause.
+                print(
+                    f"refused: {args.work_item_id} is unknown or not succeeded",
                     file=sys.stderr,
                 )
                 return 1

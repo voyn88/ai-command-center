@@ -475,6 +475,10 @@ _APP_FUNCTIONS = (
     "queue_enqueue(text, text, jsonb, text, text, integer, integer, integer, integer)",
     "queue_reap()",
     "queue_redrive(text, integer)",
+    # 0017: the operator's exit for a `succeeded` item whose result cannot be
+    # used (VOYN-W0-AICC-REVIEW-STUCK-ON-TRANSIENT-FAILURE) -- queue_redrive's
+    # counterpart for 'succeeded' instead of 'dead'.
+    "queue_reopen(text, text, integer)",
 )
 
 # The backlog store's whole write surface (0005, BO-S1). Control-plane

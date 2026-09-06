@@ -1176,7 +1176,9 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict_match.group(1), sha_match.group(1)
 
 
-def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any] | None:
+def _latest_review_result(
+    factory: Any, task_id: str, key: str
+) -> tuple[str, dict[str, Any]] | None:
     """The succeeded review-class work result for this exact review-cycle
     key (task, PR, head sha, policy version), or None if no review has
     completed for exactly this state yet -- covers both "still running" and
@@ -1185,10 +1187,18 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
     CURRENT head sha's key (computed via `_review_key`); nothing here
     guesses or falls back to "the most recent review for this task_id",
     which is what let a stale, superseded verdict be read as current before
-    the review-cycle key existed."""
+    the review-cycle key existed.
+
+    Returns ``(work_item_id, payload)``. The id travels alongside the
+    payload so a caller that cannot make sense of the result (e.g. an
+    unparseable review verdict) can name the exact item an operator would
+    run `queue-reopen` against -- otherwise that item is `succeeded`,
+    outside `work_dlq`, and re-enqueuing under the same deterministic
+    review-cycle key is a permanent no-op (VOYN-W0-AICC-REVIEW-STUCK-ON-
+    TRANSIENT-FAILURE)."""
     rows = _rows(
         factory,
-        "SELECT wr.payload FROM work_item i "
+        "SELECT i.work_item_id, wr.payload FROM work_item i "
         "JOIN work_result wr ON wr.result_id = i.result_id "
         "WHERE i.task_id = %s AND i.idempotency_key = %s AND i.state = 'succeeded' "
         "ORDER BY wr.created_at DESC LIMIT 1",
@@ -1196,8 +1206,8 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
     )
     if not rows:
         return None
-    payload = rows[0][0]
-    return json.loads(payload) if isinstance(payload, str) else payload
+    work_item_id, payload = rows[0]
+    return work_item_id, (json.loads(payload) if isinstance(payload, str) else payload)
 
 
 def _json_object(value: Any) -> dict[str, Any] | None:
@@ -1665,8 +1675,9 @@ def _verified_rejection_outcome(
     key = _verification_key(task_id, pr_url, snapshot, findings)
     if key is None or len(findings.encode("utf-8")) > _MAX_VERIFICATION_FINDINGS_BYTES:
         return "REMEDIATE", findings
-    result = _latest_review_result(factory, task_id, key)
-    if result is not None:
+    latest = _latest_review_result(factory, task_id, key)
+    if latest is not None:
+        _work_item_id, result = latest
         verification_text = result.get("result_text") or ""
         parsed = _parse_verdict(verification_text)
         if parsed is None or parsed[1] != snapshot.head:
@@ -1837,7 +1848,11 @@ def publish_review_verdicts(
     verification run; ``None`` (a legacy caller) disables verification and
     keeps the remediate-on-REJECT behavior. A missing verdict/sha in the
     result text or a marker already posted for the current head are skips,
-    not errors."""
+    not errors -- the former names the offending `work_item_id` in the skip
+    reason, because that item is `succeeded` (not dead-lettered) and this
+    exact skip otherwise repeats every tick with no operator recourse until
+    a new commit changes the review-cycle key; `queue-reopen` is that
+    recourse (VOYN-W0-AICC-REVIEW-STUCK-ON-TRANSIENT-FAILURE)."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
@@ -1910,14 +1925,29 @@ def publish_review_verdicts(
                 continue
             sha = current_head
         else:
-            result = _latest_review_result(factory, task_id, key)
-            if result is None:
+            latest = _latest_review_result(factory, task_id, key)
+            if latest is None:
                 report.skipped.append((task_id, "no_review_result_yet"))
                 continue
+            work_item_id, result = latest
             text = result.get("result_text") or ""
             parsed = _parse_verdict(text)
             if parsed is None:
-                report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
+                # This item is `succeeded` (queue_complete already ran), so
+                # it will never appear in `work_dlq` and this exact skip
+                # repeats every tick while the head sha stays put -- the
+                # review-cycle key is deterministic and re-enqueuing is a
+                # no-op against an existing row regardless of its state
+                # (VOYN-W0-AICC-REVIEW-STUCK-ON-TRANSIENT-FAILURE). Name the
+                # item so an operator who has confirmed the failure was
+                # transient (rate limit, garbled output) can run:
+                #   queue-reopen <work_item_id> --reason <why>
+                report.skipped.append((
+                    task_id,
+                    f"verdict_or_head_sha_missing_in_review_result:{work_item_id} "
+                    "(stuck: not dead-lettered; operator redrive is "
+                    f"`queue-reopen {work_item_id} --reason <why>`)",
+                ))
                 continue
             verdict, sha = parsed
             if sha != current_head:

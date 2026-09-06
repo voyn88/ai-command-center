@@ -177,3 +177,33 @@ def test_redrive_refusals_are_data_not_exceptions(queue_actors) -> None:
     assert admin.redrive(claimed.work_item_id) is False, (
         "a live item is not redriveable"
     )
+
+
+def test_reopen_round_trip_over_a_succeeded_item_not_visible_to_the_dlq(
+    queue_actors,
+) -> None:
+    """`queue_reopen`'s production seam (SRV-06 / VOYN-W0-AICC-REVIEW-STUCK-
+    ON-TRANSIENT-FAILURE): a `succeeded` item is invisible to `dead_letters()`
+    and refused by `redrive()`, which is exactly the gap that left a review
+    result permanently stuck when its verdict never parsed. `reopen()` is
+    the operator's actual lever."""
+    store, admin, psycopg, app_dsn = queue_actors
+    _enqueue(psycopg, app_dsn, "review-stuck-1", {"kind": "review"})
+
+    claimed = store.claim(QUEUE, visibility_seconds=60)
+    assert isinstance(claimed, ClaimedWork)
+    assert store.complete(claimed, {"result_text": "session limit hit"})
+
+    assert admin.dead_letters(QUEUE) == [], "succeeded is not dead-lettered"
+    assert admin.redrive(claimed.work_item_id) is False
+    assert admin.reopen(claimed.work_item_id, reason="") is False, (
+        "a reason is required"
+    )
+    assert admin.reopen(
+        claimed.work_item_id, reason="transient rate limit", extra_attempts=2
+    ) is True
+
+    retaken = store.claim(QUEUE, visibility_seconds=60)
+    assert isinstance(retaken, ClaimedWork)
+    assert retaken.work_item_id == claimed.work_item_id
+    assert retaken.attempt_no == claimed.attempt_no + 1
