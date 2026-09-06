@@ -2056,6 +2056,44 @@ def _run_trusted_worktree_git(
     return result
 
 
+def _open_standalone_agent_git_dir(
+    workspace: Path, *, expected_branch: str
+) -> int:
+    """Open the task clone's real `.git` directory without following pointers.
+
+    Mutating AICC tasks are provisioned by `_provision_task_local_clone` as
+    standalone clones.  A linked-worktree `gitdir:` file is deliberately not
+    followed: its target is workspace-controlled data and would widen every
+    descriptor-relative write outside the verified clone root.
+    """
+    git_path = workspace / ".git"
+    try:
+        path_stat = git_path.lstat()
+        if not stat.S_ISDIR(path_stat.st_mode):
+            raise OSError("expected a standalone task clone; .git is not a directory")
+        descriptor = os.open(
+            git_path,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_stat = os.fstat(descriptor)
+        if (
+            opened_stat.st_dev != path_stat.st_dev
+            or opened_stat.st_ino != path_stat.st_ino
+        ):
+            os.close(descriptor)
+            raise OSError("task clone .git directory changed while opening")
+        return descriptor
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_workspace_layout",
+            remediation="Re-provision the task as an AICC standalone task-local clone.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot open standalone task-clone Git directory: {exc}",
+        ) from exc
+
+
 def _copy_trusted_loose_object_to_agent(
     publisher: Path, workspace: Path, oid: str, *, expected_branch: str
 ) -> None:
@@ -2103,7 +2141,9 @@ def _copy_trusted_loose_object_to_agent(
     git_fd = objects_fd = prefix_fd = target_fd = None
     temporary = f".aicc-object-{secrets.token_hex(16)}"
     try:
-        git_fd = os.open(workspace / ".git", os.O_RDONLY | os.O_DIRECTORY | nofollow)
+        git_fd = _open_standalone_agent_git_dir(
+            workspace, expected_branch=expected_branch
+        )
         objects_fd = os.open("objects", os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=git_fd)
         try:
             os.mkdir(oid[:2], mode=0o755, dir_fd=objects_fd)
@@ -2193,8 +2233,8 @@ def _lock_agent_branch_ref(
     lock_name = f"{expected_branch.split('/')[-1]}.lock"
     lock_fd: int | None = None
     try:
-        directory_fd = os.open(
-            workspace / ".git", os.O_RDONLY | os.O_DIRECTORY | nofollow
+        directory_fd = _open_standalone_agent_git_dir(
+            workspace, expected_branch=expected_branch
         )
         for component in ("refs", "heads", *expected_branch.split("/")[:-1]):
             try:

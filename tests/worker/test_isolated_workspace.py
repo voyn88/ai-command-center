@@ -597,6 +597,24 @@ def test_dirty_checkpoint_uses_one_shared_git_ref_lock(tmp_path):
     assert not (repo / ".git" / "refs" / "heads" / "main.lock").exists()
 
 
+def test_dirty_checkpoint_refuses_linked_worktree_gitdir_pointer(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.git"
+    outside.mkdir()
+    (workspace / ".git").write_text(f"gitdir: {outside}\n")
+
+    with pytest.raises(
+        workspace_provisioning.WorkspaceVerificationError,
+        match="dirty_checkpoint_workspace_layout",
+    ):
+        workspace_provisioning._open_standalone_agent_git_dir(
+            workspace, expected_branch="main"
+        )
+
+    assert list(outside.iterdir()) == []
+
+
 def test_dirty_checkpoint_rejects_oversized_source_object_before_copy(
     tmp_path, monkeypatch
 ):
