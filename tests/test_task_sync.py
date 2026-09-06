@@ -1,7 +1,9 @@
 import json
 import subprocess
 
-from command_center import report_parser
+import pytest
+
+from command_center import models, report_parser
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db, task_sync
 
@@ -426,6 +428,155 @@ def test_sync_task_from_run_waiting_maps_to_requires_attention(tmp_path):
     task_sync.sync_task_from_run(task, run, db_path=db_path)
 
     assert task["launch_status"] == "Requires Attention"
+
+
+# --------------------------------------------------------------------------
+# P0 remediation: terminal state published before finalization
+# (VOYN-W0-AICC-FLAKE-03) — a terminal run's report/auto-commit/events are not
+# guaranteed durable until `run["finalized_at"]` is set. `sync_task_from_run`
+# must defer every terminal-only effect until then, for *every* persisted
+# terminal state (`db.TERMINAL_STATES`) — not just the ones the display-only
+# `session_view.TERMINAL_DISPLAY_STATUSES` happens to cover.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("state", ["COMPLETED", "FAILED", "INTERRUPTED", "UNKNOWN"])
+def test_sync_task_from_run_defers_all_terminal_effects_until_finalized(tmp_path, state):
+    """A run that just went terminal, with no `finalized_at` yet and a fresh
+    `completed_at`, must not have any terminal effect projected onto its task
+    — including `INTERRUPTED`/`UNKNOWN`, which are terminal *database* states
+    but derive to the display status `Requires Attention`, absent from
+    `TERMINAL_DISPLAY_STATUSES`. Only the cheap `current_run_id` pointer
+    bookkeeping is safe to apply while finalization is still in flight."""
+    db_path = tmp_path / f"runtime-defer-{state}.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state=state, completed_at=models.iso_now())
+    task = _make_task(launch_status="Running")
+
+    mutated = task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert mutated is True  # only the current_run_id pointer moved
+    assert task["current_run_id"] == run["id"]
+    assert task["launch_status"] == "Running"  # unchanged — not yet projected
+    assert task.get("terminal_projection_run_id") is None
+    assert task["timeline"] == []
+    assert not task.get("failed_executors")
+    assert task.get("relaunch_requested") is None
+
+
+def test_sync_task_from_run_interrupted_defers_executor_failover_until_finalized(tmp_path):
+    """The concrete race this remediation closes for INTERRUPTED specifically:
+    before this fix, `TERMINAL_DISPLAY_STATUSES` never covered INTERRUPTED, so
+    the executor-failover branch below fired immediately regardless of
+    finalization. An unfinalized dead-on-startup run must not record a failed
+    executor or flip the task to "Ready" until its evidence is durable."""
+    db_path = tmp_path / "runtime-defer-interrupted.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="INTERRUPTED", completed_at=models.iso_now())
+    task = _make_task(launch_status="Running")
+
+    task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert task["launch_status"] == "Running"
+    assert not task.get("failed_executors")
+
+    db.mark_run_finalized(db_path, run["id"])
+    refreshed_run = db.get_run(db_path, run["id"])
+    task_sync.sync_task_from_run(task, refreshed_run, db_path=db_path)
+
+    assert task["launch_status"] == "Ready"
+    assert task.get("failed_executors") == ["claude_code"]
+
+
+def test_sync_task_from_run_projects_once_finalized_at_lands(tmp_path):
+    """Once `finalized_at` is stamped, a later sync pass applies exactly the
+    terminal projection that was deferred — the run is not stranded, just
+    delayed until its evidence is durable."""
+    db_path = tmp_path / "runtime-projects-once-finalized.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="COMPLETED", completed_at=models.iso_now())
+    db.append_run_event(db_path, run["id"], "result", {"result": "Verdict: APPROVED FOR COMMIT"})
+    task = _make_task()
+
+    mutated = task_sync.sync_task_from_run(task, run, db_path=db_path)
+    assert mutated is True
+    assert task.get("terminal_projection_run_id") is None
+
+    db.mark_run_finalized(db_path, run["id"])
+    refreshed_run = db.get_run(db_path, run["id"])
+    mutated = task_sync.sync_task_from_run(task, refreshed_run, db_path=db_path)
+
+    assert mutated is True
+    assert task["terminal_projection_run_id"] == run["id"]
+    assert task["launch_status"] == "Needs Review"
+
+
+def test_sync_task_from_run_historical_row_with_no_finalized_at_is_not_stranded(tmp_path):
+    """A pre-migration-24 (or otherwise never-finalized) terminal row has
+    `finalized_at` permanently `NULL` — the column is intentionally never
+    backfilled. Once `completed_at` is older than the compatibility grace
+    window, the run must still be projected onto its task in a single sync
+    pass instead of being stranded forever waiting for a marker that will
+    never arrive."""
+    db_path = tmp_path / "runtime-historical-row.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00")
+    assert run.get("finalized_at") is None
+    task = _make_task()
+
+    mutated = task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert mutated is True
+    assert task["terminal_projection_run_id"] == run["id"]
+    assert task["launch_status"] == "Needs Review"
+
+
+@pytest.mark.parametrize(
+    "finalized_at,completed_at,expected",
+    [
+        ("2026-01-01T00:00:00", "2026-01-01T00:00:00", True),  # marker present -> always safe
+        (None, None, False),  # neither present -> not safe
+        (None, "not-a-timestamp", False),  # unparsable -> not safe, never raises
+    ],
+)
+def test_run_is_finalized_for_sync_marker_and_missing_data(finalized_at, completed_at, expected):
+    run = {"finalized_at": finalized_at, "completed_at": completed_at}
+    assert task_sync._run_is_finalized_for_sync(run) is expected
+
+
+def test_run_is_finalized_for_sync_recent_completion_without_marker_is_not_safe():
+    now = models.iso_now()
+    run = {"finalized_at": None, "completed_at": now}
+    from datetime import datetime
+
+    assert task_sync._run_is_finalized_for_sync(run, now=datetime.fromisoformat(now)) is False
+
+
+def test_run_is_finalized_for_sync_past_grace_window_without_marker_is_safe():
+    from datetime import datetime, timedelta
+
+    now = datetime.fromisoformat(models.iso_now())
+    old_completed_at = (now - timedelta(seconds=task_sync._FINALIZATION_COMPATIBILITY_GRACE_SECONDS + 1)).isoformat()
+    run = {"finalized_at": None, "completed_at": old_completed_at}
+
+    assert task_sync._run_is_finalized_for_sync(run, now=now) is True
+
+
+def test_seed_and_project_completion_defers_seeding_until_finalized(tmp_path):
+    """Seeding reads the live repository HEAD as the completion's starting
+    commit; before finalization that HEAD may not include the run's own
+    auto-commit yet. An unfinalized COMPLETED run must not seed a completion
+    row at all."""
+    db_path = tmp_path / "runtime-seed-defer.db"
+    db.migrate(db_path)
+    run = _make_run(db_path, state="COMPLETED", completed_at=models.iso_now())
+    task = _make_task(task_type="implementation")
+    api = runtime_api.ExecutionCenterAPI(db_path=db_path)
+
+    mutated = task_sync._seed_and_project_completion(api, task, run)
+
+    assert mutated is False
+    assert db.get_completion(db_path, run["id"]) is None
 
 
 # --------------------------------------------------------------------------
