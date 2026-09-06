@@ -220,7 +220,7 @@ def list_customers(
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _db(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM customers {where} ORDER BY created_at DESC", params
+            f"SELECT * FROM customers {where} ORDER BY created_at DESC", params  # nosec B608 - `where` is built only from a fixed set of hardcoded clause literals ("risk_tier = ?", "kyc_status = ?", "customer_type = ?"); all actual values are bound via `params` and `?` placeholders
         ).fetchall()
     return [dict(r) for r in rows]
 

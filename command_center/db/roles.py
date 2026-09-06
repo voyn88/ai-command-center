@@ -642,7 +642,7 @@ def render_role_creation(role: str) -> str:
     """
     _require_identifier(role)
     return (
-        "DO $$\n"
+        "DO $$\n"  # nosec B608 - `role` passed `_require_identifier()` above; only a plain alnum/underscore identifier reaches this DDL string.
         "BEGIN\n"
         "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
@@ -720,7 +720,7 @@ def render_bootstrap(schema: str = "public") -> list[str]:
     # the writes themselves down to once per fresh cluster instead of once per
     # test. This mirrors render_role_creation()'s own IF-NOT-EXISTS discipline.
     statements.append(
-        f"DO $$\n"
+        f"DO $$\n"  # nosec B608 - only MIGRATOR_ROLE/WORKER_ROLE module constants are interpolated here, never caller input.
         f"BEGIN\n"
         f"    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT (SELECT rolcreaterole FROM pg_roles WHERE rolname = '{MIGRATOR_ROLE}') THEN\n"
@@ -881,7 +881,7 @@ def render_worker_host_role(role: str) -> list[str]:
     """
     _require_identifier(role)
     return [
-        "DO $$\n"
+        "DO $$\n"  # nosec B608 - `role` passed `_require_identifier()` above; only a plain alnum/underscore identifier reaches this DDL string.
         "BEGIN\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"

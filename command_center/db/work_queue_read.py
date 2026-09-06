@@ -74,7 +74,7 @@ class WorkQueueReadStore:
         an HTTP caller's typo is not a server error."""
         if state is not None and state not in _STATES:
             return []
-        sql = f"SELECT {_ITEM_COLUMNS} FROM work_item_public"
+        sql = f"SELECT {_ITEM_COLUMNS} FROM work_item_public"  # nosec B608 - _ITEM_COLUMNS is a hardcoded module-level constant; queue/state/limit are bound via %s placeholders below.
         clauses, params = [], []
         if queue is not None:
             clauses.append("queue = %s")
@@ -149,7 +149,7 @@ class WorkQueueReadStore:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT {_ITEM_COLUMNS} FROM work_item_public WHERE work_item_id = %s",
+                    f"SELECT {_ITEM_COLUMNS} FROM work_item_public WHERE work_item_id = %s",  # nosec B608 - _ITEM_COLUMNS is a hardcoded module-level constant; work_item_id is bound via a %s placeholder.
                     (work_item_id,),
                 )
                 rows = cur.fetchall()
@@ -157,7 +157,7 @@ class WorkQueueReadStore:
                     return None
                 item = _rows_to_dicts(_ITEM_COLUMNS, rows)[0]
                 cur.execute(
-                    f"SELECT {_ATTEMPT_COLUMNS} FROM work_attempt_public "
+                    f"SELECT {_ATTEMPT_COLUMNS} FROM work_attempt_public "  # nosec B608 - _ATTEMPT_COLUMNS is a hardcoded module-level constant; work_item_id is bound via a %s placeholder.
                     "WHERE work_item_id = %s ORDER BY attempt_no",
                     (work_item_id,),
                 )
