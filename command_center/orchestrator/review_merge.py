@@ -1385,10 +1385,15 @@ def _accept_marker_on_latest_review(
     `scripts/assert_independent_acceptance.py`'s own comparison exactly
     (login against the pull request's author login, not text alone --
     that script's docstring explains why `authorAssociation` is the wrong
-    field). None (author unknown/unfetched) skips this check rather than
-    refusing everything -- callers that cannot supply it keep prior
-    behavior; `_pr_is_mergeable` and `_has_accept_marker` below always can
-    and always do."""
+    field). `casefold()` on both sides, because GitHub logins are
+    case-insensitive (`Dimastov-Lab` and `dimastov-lab` are the same
+    account) -- `evaluate()` in that script already casefolds its own
+    comparison; an exact-string comparison here would silently accept a
+    same-account marker whenever the two API responses happened to differ
+    only in casing. None (author unknown/unfetched) skips this check
+    rather than refusing everything -- callers that cannot supply it keep
+    prior behavior; `_pr_is_mergeable` and `_has_accept_marker` below
+    always can and always do."""
     live = [review for review in reviews if review.get("state") != "DISMISSED"]
     if not live:
         return False
@@ -1398,7 +1403,10 @@ def _accept_marker_on_latest_review(
     if pr_author_login is None:
         return True
     reviewer_login = (latest.get("author") or {}).get("login")
-    return reviewer_login is not None and reviewer_login != pr_author_login
+    return (
+        reviewer_login is not None
+        and reviewer_login.casefold() != pr_author_login.casefold()
+    )
 
 
 def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:

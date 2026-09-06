@@ -310,6 +310,35 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch): 
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
+def test_merge_skips_a_self_issued_marker_that_only_differs_by_login_case(rig, monkeypatch):  # noqa: F811, E501
+    """GitHub logins are case-insensitive -- `Dimastov-Lab` and
+    `dimastov-lab` are the same account. An exact-string comparison would
+    let a same-account marker through whenever the PR author and the
+    review author fields happened to differ only in casing, which is
+    exactly the gap `scripts/assert_independent_acceptance.py`'s own
+    `casefold()`'d comparison already closes on the CI side."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1B2", "https://github.com/x/y/pull/25")
+    head = "e" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "Dimastov-Lab"},
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": "dimastov-lab"}}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1B2", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1B2",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
 def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):  # noqa: F811, E501
     """The positive case of the same check: a genuinely independent
     reviewer login (the acceptance bot's, in production) does authorize
