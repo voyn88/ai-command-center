@@ -74,7 +74,7 @@ import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from command_center.orchestrator import github_app_auth
 from command_center.orchestrator.routing import cascade_for
@@ -83,11 +83,14 @@ __all__ = [
     "LoopReport",
     "ReconcileReport",
     "ReviewConfig",
+    "median_and_p95",
     "merge_once",
+    "percentile",
     "publish_review_verdicts",
     "reconcile_merge_evidence",
     "reconcile_review_once",
     "review_once",
+    "review_verdict_latencies",
 ]
 
 
@@ -419,6 +422,128 @@ _MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
 _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 
+
+# -- Risk-tiered review (VOYN-W0-AICC-REVIEW-RISK-TIER) ----------------------
+#
+# review_once always chunks the *whole* diff to fit `_MAX_REVIEW_PROMPT_BYTES`
+# regardless of what changed -- a correct default, but one that pays the full
+# multi-chunk fan-out (every chunk independently ACCEPTs before a marker
+# posts) even for a diff that touches nothing but docs or tests. Verdicts,
+# not CI (~5.5 min), are the measured bottleneck on review throughput, and
+# fan-out is what multiplies verdict latency: N chunks means N round trips
+# through the review queue before the last one lands.
+#
+# `_review_pr_risk` is a pure function of the diff's OWN changed paths -- no
+# repo state, no PR metadata beyond what the diff already carries -- exactly
+# as deterministic and testable as `_review_chunks`'s byte-budget math
+# itself. It only ever widens the single-chunk budget for a diff that is
+# provably safe (every changed path is docs or tests, and none matches an
+# explicit high-risk category); everything else, including a diff this
+# function cannot classify at all, keeps the exact existing multi-chunk
+# contract. That asymmetry -- generous in one direction, unchanged in the
+# other -- is what keeps this from being a weakened gate: a high-risk PR's
+# review is bit-for-bit what it was before this feature existed, and CI /
+# the acceptance gate remain required exactly as configured regardless of
+# either class.
+_REVIEW_RISK_LOW = "low"
+_REVIEW_RISK_HIGH = "high"
+
+# Matches a `diff --git a/X b/Y` header line, with or without the quoting git
+# applies when a path contains a character its own `core.quotepath` treats as
+# special. The two capture groups nearest the shared `\1`/`\3` backreference
+# are the paths themselves; the (optional) quote characters are not part of
+# either path.
+_DIFF_GIT_HEADER = re.compile(r'(?m)^diff --git ("?)a/(.+?)\1 ("?)b/(.+?)\3$')
+
+#: Path prefixes that force HIGH regardless of extension -- CI workflow
+#: config and the SQL migration set are the two classes here that are
+#: neither a keyword match below nor safely inferred from a file extension.
+_HIGH_RISK_PATH_PREFIXES = (
+    ".github/workflows/",       # CI
+    "command_center/db/sql/",   # schema migrations
+)
+
+#: Substrings anywhere in a lower-cased path that force HIGH. Deliberately
+#: broad (a doc merely *about* auth, e.g. docs/AUTHORITY_MAP.md, still
+#: escalates) -- the cost of a false positive here is one PR keeping the
+#: review cycle it would have had anyway; the cost of a false negative is a
+#: security- or release-relevant change getting the shortened path.
+_HIGH_RISK_PATH_KEYWORDS = (
+    "auth",
+    "security",
+    "migration",
+    "schema",
+    "release",
+    "deploy",
+    "packaging",
+)
+
+
+def _diff_changed_paths(diff: str) -> tuple[str, ...]:
+    """Every path named on a `diff --git a/X b/Y` header line, deduplicated
+    and covering both sides (a rename or delete must classify by both its old
+    and new name). Anything the diff does not express this way -- an empty
+    diff, or one with no recognisable header at all -- yields no paths, which
+    `_review_pr_risk` fails closed on."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for match in _DIFF_GIT_HEADER.finditer(diff):
+        for path in (match.group(2), match.group(4)):
+            if path not in seen:
+                seen.add(path)
+                ordered.append(path)
+    return tuple(ordered)
+
+
+def _path_is_high_risk(path: str) -> bool:
+    lowered = path.lower()
+    return any(
+        lowered.startswith(prefix) for prefix in _HIGH_RISK_PATH_PREFIXES
+    ) or any(keyword in lowered for keyword in _HIGH_RISK_PATH_KEYWORDS)
+
+
+def _path_is_docs_or_test(path: str) -> bool:
+    """Mirrors `ci.yml`'s own "Detect docs-only change scope" step (README.md
+    / CHANGELOG.md / anything under docs/ / any `.md`) plus this
+    repository's one test root (`tests/`, per
+    `scripts/ci/test_impact/select_tests.py`'s `TEST_ROOT`) -- the same two
+    safe-by-convention classes CI already trusts, not a new definition of
+    "safe" invented for this feature."""
+    return (
+        path in ("README.md", "CHANGELOG.md")
+        or path.startswith("docs/")
+        or path.endswith(".md")
+        or path.startswith("tests/")
+    )
+
+
+def _review_pr_risk(diff: str) -> str:
+    """The deterministic risk class this feature hangs everything off of: a
+    pure function of the diff's changed paths, so identical bytes in always
+    produce the identical class out -- no clock, no network, no queue state.
+    HIGH is the default and the fail-closed answer for a diff with no
+    recognisable paths at all (a diff this parser cannot read is exactly the
+    diff this feature must not special-case), and any single high-risk path
+    forces HIGH even alongside an otherwise docs/test-only change set."""
+    paths = _diff_changed_paths(diff)
+    if not paths:
+        return _REVIEW_RISK_HIGH
+    if any(_path_is_high_risk(path) for path in paths):
+        return _REVIEW_RISK_HIGH
+    if all(_path_is_docs_or_test(path) for path in paths):
+        return _REVIEW_RISK_LOW
+    return _REVIEW_RISK_HIGH
+
+
+#: Single-chunk budget for a deterministically LOW-risk diff -- three times
+#: the standard budget, so a docs/test-only PR large enough to need chunking
+#: under the normal budget can still clear review in one round trip instead
+#: of several. Still bounded, not unlimited: a LOW-risk diff too large even
+#: for this budget falls through to the exact same multi-chunk splitting
+#: `_review_chunks` already did, at the exact same per-chunk budget.
+_MAX_LOW_RISK_REVIEW_PROMPT_BYTES = 3 * _MAX_REVIEW_PROMPT_BYTES
+
+
 # Bumped whenever _REVIEW_PROMPT's contract changes in a way that makes an
 # old verdict untrustworthy under the new policy (e.g. what the agent is
 # asked to check, or the required VERDICT/HEAD_SHA format itself) -- baked
@@ -556,6 +681,11 @@ def _review_input_envelope(
         "head_sha": snapshot.head,
         "diff_sha256": snapshot.digest,
         "scope": "complete_diff" if chunk.count == 1 else "partial_chunk",
+        # The deterministic class from `_review_pr_risk`, carried into the
+        # PR manifest sent to the reviewer purely for audit -- nothing here
+        # or downstream branches the review contract on it; only the
+        # orchestrator's own single-chunk budget (`_review_chunks`) does.
+        "risk_class": _review_pr_risk(snapshot.text),
         "chunk": {
             "index": chunk.index,
             "count": chunk.count,
@@ -834,12 +964,22 @@ def _review_chunks(
     snapshot: _PRSnapshot, task_id: str, pr_url: str
 ) -> tuple[_DiffChunk, ...]:
     diff = snapshot.text
+    single_chunk_budget = (
+        _MAX_LOW_RISK_REVIEW_PROMPT_BYTES
+        if _review_pr_risk(diff) == _REVIEW_RISK_LOW
+        else _MAX_REVIEW_PROMPT_BYTES
+    )
     whole = _make_diff_chunks([diff])
     if _prompt_size_bytes(_render_review_prompt(task_id, pr_url, snapshot, whole[0])) <= (
-        _MAX_REVIEW_PROMPT_BYTES
+        single_chunk_budget
     ):
         return whole
 
+    # Falls through to the exact standard multi-chunk contract below, at the
+    # exact standard per-chunk budget, whether that is because the diff is
+    # HIGH risk or because it is LOW risk but too large even for the widened
+    # single-chunk budget above -- there is no path here that reviews a diff
+    # in fewer bytes than the pre-existing cycle already did.
     def fits(text: str) -> bool:
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         candidate = _DiffChunk(
@@ -1614,6 +1754,131 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     author_login = (data.get("author") or {}).get("login")
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     return accept, head
+
+
+# -- Part 2c: verdict-latency measurement (VOYN-W0-AICC-REVIEW-RISK-TIER) ----
+#
+# The risk-tiered chunk budget above exists to cut verdict latency; this is
+# the measurement that lets a before/after comparison say whether it did.
+# `scripts/review_verdict_latency.py` is the operator-facing entry point --
+# this is only the aggregation, kept dependency-free (no database import at
+# module scope) so it is testable with plain synthetic rows.
+#
+# A review cycle's own idempotency-key contract (`_review_key` /
+# `_chunk_review_key` above) already carries everything needed to group
+# every attempt at every chunk of one (task, PR, head, diff) review back
+# together:
+#
+#     review:<task>:<pr>:<head>:<policy>:base:<sha>:diff:<digest>
+#         [:chunk:NNNN:<hash>][:retry:N]
+#
+# so grouping needs nothing beyond `work_item_public` (idempotency_key,
+# task_id, created_at) joined to `work_result` (created_at) -- no new
+# column, no new table, no new writer.
+
+_LATENCY_RETRY_SUFFIX = re.compile(r":retry:\d+\Z")
+_LATENCY_CHUNK_SUFFIX = re.compile(r":chunk:(\d{4}):[0-9a-f]{64}\Z")
+
+
+def _review_cycle_and_chunk(idempotency_key: str) -> tuple[str, str]:
+    """(review-cycle id, chunk id) for a review-class key -- collapsing a
+    `:retry:N` attempt suffix always, and a `:chunk:NNNN:<hash>` suffix when
+    present (a non-chunked, single-diff review has exactly one implicit
+    chunk, `"0000"`, which can never collide with a real zero-padded index
+    since real chunk ids are followed by `:<64-hex-hash>`)."""
+    without_retry = _LATENCY_RETRY_SUFFIX.sub("", idempotency_key)
+    match = _LATENCY_CHUNK_SUFFIX.search(without_retry)
+    if match is None:
+        return without_retry, "0000"
+    return without_retry[: match.start()], match.group(1)
+
+
+@dataclass(frozen=True, slots=True)
+class _ChunkTiming:
+    requested_at: Any
+    completed_at: Any | None
+
+
+def review_verdict_latencies(
+    rows: Sequence[tuple[str, str, Any, Any]],
+) -> list[float]:
+    """One float (seconds) per review cycle that has FULLY landed -- every
+    distinct chunk it ever needed has at least one attempt that reached
+    `work_item.state = 'succeeded'`.
+
+    ``rows``: ``(task_id, idempotency_key, enqueued_at, completed_at)`` for
+    every work item in the queue (``idempotency_key`` not starting with
+    ``"review:"`` is ignored, so a caller can pass an unfiltered scan);
+    ``completed_at`` is ``None`` for an item with no result yet. Both
+    timestamps must already be directly subtractable (e.g. ``datetime``
+    objects, as ``psycopg`` returns for ``timestamptz`` -- not strings).
+
+    A cycle still missing even one chunk's result contributes nothing: not a
+    zero, not a partial estimate -- the same "wait, don't guess" contract
+    `_aggregate_chunk_verdict` applies via its own ``WAIT`` outcome. This is
+    a monitoring signal, not a second adjudicator: for a chunk that needed a
+    retry, it uses that chunk's EARLIEST completed attempt, not necessarily
+    the one whose text parsed as a well-formed verdict -- confirming that
+    would require the result payload, which this function deliberately does
+    not need.
+    """
+    cycles: dict[tuple[str, str], dict[str, _ChunkTiming]] = {}
+    for task_id, key, enqueued_at, completed_at in rows:
+        if not key.startswith("review:"):
+            continue
+        cycle_id, chunk_id = _review_cycle_and_chunk(key)
+        chunks = cycles.setdefault((task_id, cycle_id), {})
+        existing = chunks.get(chunk_id)
+        if existing is None:
+            chunks[chunk_id] = _ChunkTiming(enqueued_at, completed_at)
+            continue
+        requested_at = min(existing.requested_at, enqueued_at)
+        earliest_completed = existing.completed_at
+        if completed_at is not None and (
+            earliest_completed is None or completed_at < earliest_completed
+        ):
+            earliest_completed = completed_at
+        chunks[chunk_id] = _ChunkTiming(requested_at, earliest_completed)
+
+    latencies: list[float] = []
+    for chunks in cycles.values():
+        if not chunks or any(timing.completed_at is None for timing in chunks.values()):
+            continue
+        requested_at = min(timing.requested_at for timing in chunks.values())
+        verdicted_at = max(timing.completed_at for timing in chunks.values())
+        latencies.append((verdicted_at - requested_at).total_seconds())
+    return latencies
+
+
+def percentile(values: Sequence[float], fraction: float) -> float:
+    """Linear-interpolation percentile (the same method numpy's default
+    ``interpolation="linear"`` uses) -- deterministic and dependency-free.
+    ``values`` need not be pre-sorted. Raises ``ValueError`` on an empty
+    sequence or an out-of-range fraction, matching ``statistics.median``'s
+    own fail-loud contract rather than inventing a placeholder a caller
+    could mistake for a real measurement.
+    """
+    if not values:
+        raise ValueError("percentile() arg is an empty sequence")
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("fraction must be within [0, 1]")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = fraction * (len(ordered) - 1)
+    lower = int(rank)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = rank - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def median_and_p95(values: Sequence[float]) -> tuple[float, float] | None:
+    """(median, p95) in the caller's own units, or ``None`` for no data --
+    never ``(0.0, 0.0)``, which a caller could otherwise misread as "every
+    verdict landed instantly" rather than "there was nothing to measure"."""
+    if not values:
+        return None
+    return percentile(values, 0.5), percentile(values, 0.95)
 
 
 #: How many remediation links may stand above a task before the chain stops
