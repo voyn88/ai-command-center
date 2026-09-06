@@ -2,8 +2,53 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from command_center.db import pool
+import pytest
+
+from command_center.db import adapter, pool
 from command_center.db.config import PostgresConfig
+
+
+class FakeCursor:
+    def __init__(self, session_user: str) -> None:
+        self._session_user = session_user
+
+    def __enter__(self) -> "FakeCursor":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def execute(self, sql: str, params: tuple[object, ...] | None = None) -> None:
+        pass
+
+    def fetchone(self) -> tuple[str]:
+        return (self._session_user,)
+
+
+class FakeIdentityConnection:
+    def __init__(self, session_user: str) -> None:
+        self._session_user = session_user
+
+    def cursor(self) -> FakeCursor:
+        return FakeCursor(self._session_user)
+
+
+class FakeBuiltPool:
+    """Stands in for what `adapter.open_pool()` returns: a real pool object
+    whose `.connection()` yields something with a `.cursor()`, unlike
+    `FakePool` below which stands in for `pool._build_pool()`'s own return
+    value and is deliberately cruder."""
+
+    def __init__(self, session_user: str) -> None:
+        self._session_user = session_user
+        self.closed = False
+
+    @contextmanager
+    def connection(self):
+        yield FakeIdentityConnection(self._session_user)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakePool:
@@ -174,3 +219,30 @@ def test_replace_pool_refuses_to_resurrect_a_concurrently_closed_pool(
         raise AssertionError("replacement must be refused after shutdown")
     assert replacement.closed, "orphaned replacement must be closed"
     assert pool._pool is None, "shutdown must stay shut down"
+
+
+def test_build_pool_accepts_a_session_user_matching_the_authenticated_role(
+    monkeypatch,
+) -> None:
+    built = FakeBuiltPool("aicc_worker")
+    monkeypatch.setattr(adapter, "open_pool", lambda *a, **kw: built)
+    result = pool._build_pool(_config("a" * 64))
+    assert result is built
+    assert not built.closed
+
+
+def test_build_pool_refuses_a_pooler_that_hides_the_authenticated_role(
+    monkeypatch,
+) -> None:
+    """A transaction-mode pooler in front of PostgreSQL can authenticate
+    under its own shared role and hand every caller that role's
+    `session_user` back, regardless of who connected to the pooler. That
+    silently breaks the session_user-is-the-claimant identity model (see
+    `command_center/db/pool.py`'s module docstring), so `_build_pool()` must
+    fail startup instead of returning a pool that will make every claim
+    unattributable."""
+    built = FakeBuiltPool("shared_pooler_role")
+    monkeypatch.setattr(adapter, "open_pool", lambda *a, **kw: built)
+    with pytest.raises(pool.PoolIdentityError):
+        pool._build_pool(_config("a" * 64))
+    assert built.closed, "a pool that fails the identity check must not leak"
