@@ -5,9 +5,14 @@
 [tool.ruff]
 line-length = 88
 target-version = "py314"
-# No explicit rule selection: `ruff check .` keeps using its built-in default
-# selection (the same one CI already enforces), so adding this file cannot
-# introduce new failures.
+
+[tool.ruff.lint]
+# Explicit select pinned to ruff's own built-in default (E4, E7, E9, F) so this
+# is a no-op for `ruff check .` today. Making the selection explicit stops a
+# 0.15->0.16 upgrade (or any future ruff release) from silently changing what
+# CI enforces out from under this pin; migrating to a wider rule set is a
+# separate, deliberate step (see VOYN-W0-AICC-RUFF-EXPLICIT-SELECT plan).
+select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
 # Permissive, opt-in configuration. The codebase predates type hints in several
