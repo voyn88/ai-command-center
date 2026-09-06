@@ -26,11 +26,17 @@ from aicc_install_transaction import SNAPSHOT_PROPERTIES
 
 LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 UNIT_RE = re.compile(r"voyn-aicc-worker@([A-Za-z0-9][A-Za-z0-9_-]{0,62})\.service")
+# One instance per accepted broker connection. These have no unit file of
+# their own -- they run off /etc/systemd/system/aicc-agent-launcher@.service,
+# which the control generation removes -- so they must be discovered,
+# snapshotted and restored exactly like the worker lanes.
+LAUNCHER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/@\s]+\.service")
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 RESTORABLE_UNIT_RE = re.compile(
     r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
     r"voyn-aicc-worker(?:-2)?\.service|"
     r"aicc-worker\.service|"
+    r"aicc-agent-launcher@[^/@\s]+\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
 )
 LEGACY_WORKER_UNITS = (
@@ -211,18 +217,22 @@ class UnitState:
 
 
 class Systemd:
-    def run(self, *args: str, check: bool = True) -> str:
+    def probe(self, *args: str) -> tuple[int, str, str]:
         result = subprocess.run(
             ["/usr/bin/systemctl", *args],
             capture_output=True,
             check=False,
             text=True,
         )
-        if check and result.returncode:
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+    def run(self, *args: str, check: bool = True) -> str:
+        returncode, stdout, stderr = self.probe(*args)
+        if check and returncode:
             raise RolloutError(
-                result.stderr.strip() or f"systemctl {' '.join(args)} failed"
+                stderr or f"systemctl {' '.join(args)} failed"
             )
-        return result.stdout.strip()
+        return stdout
 
     def property(self, unit: str, name: str) -> str:
         return self.run("show", unit, f"--property={name}", "--value")
@@ -338,26 +348,67 @@ def _configured_users(path: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(users))
 
 
-def _listed_template_units(systemd: Systemd, *, check: bool) -> frozenset[str]:
+def _listed_instances(
+    systemd: Systemd, pattern: str, accepts: re.Pattern[str], *, check: bool
+) -> frozenset[str]:
     units: set[str] = set()
     for command in (
-        ("list-unit-files", "voyn-aicc-worker@*.service", "--no-legend", "--no-pager"),
-        (
-            "list-units",
-            "voyn-aicc-worker@*.service",
-            "--all",
-            "--no-legend",
-            "--no-pager",
-        ),
+        ("list-unit-files", pattern, "--no-legend", "--no-pager"),
+        ("list-units", pattern, "--all", "--no-legend", "--no-pager"),
     ):
-        for line in systemd.run(*command, check=check).splitlines():
+        if check and command[0] == "list-unit-files":
+            # `list-unit-files` exits 1 with no output at all when the
+            # pattern matches no unit file. That is the answer "none", not a
+            # failure: a pre-launcher worker, a control host, and the
+            # post-uninstall closure check all legitimately have zero
+            # matching templates (same contract, and the same live incident,
+            # as the tolerant lane enumerator in aicc_install_transaction).
+            # Only that exact shape is tolerated; any output or any other
+            # status stays fail-closed, and `list-units` below never gets
+            # this tolerance.
+            returncode, stdout, stderr = systemd.probe(*command)
+            if returncode and not (
+                returncode == 1 and not stdout and not stderr
+            ):
+                raise RolloutError(
+                    stderr or f"systemctl {' '.join(command)} failed"
+                )
+            output = stdout
+        else:
+            output = systemd.run(*command, check=check)
+        for line in output.splitlines():
             fields = line.split()
             if fields and fields[0] == "●":
                 fields = fields[1:]
             candidate = fields[0] if fields else ""
-            if UNIT_RE.fullmatch(candidate):
+            if accepts.fullmatch(candidate):
                 units.add(candidate)
     return frozenset(units)
+
+
+def _listed_template_units(systemd: Systemd, *, check: bool) -> frozenset[str]:
+    return _listed_instances(
+        systemd, "voyn-aicc-worker@*.service", UNIT_RE, check=check
+    )
+
+
+def _listed_launcher_units(systemd: Systemd, *, check: bool) -> frozenset[str]:
+    return _listed_instances(
+        systemd, "aicc-agent-launcher@*.service", LAUNCHER_UNIT_RE, check=check
+    )
+
+
+def discover_launcher_units(systemd: Systemd) -> tuple[str, ...]:
+    """Every live broker instance, for the snapshot only.
+
+    Deliberately not part of `discover_units`: that set is what `rollout()`
+    drains, starts and verifies as worker lanes, and a launcher instance is
+    neither. What it is, is a running unit whose fragment the control
+    generation deletes -- so it belongs in the snapshot that rollback
+    restores, and in the closure check that refuses to proceed while one
+    exists outside it.
+    """
+    return tuple(sorted(_listed_launcher_units(systemd, check=False)))
 
 
 def discover_units(
@@ -381,9 +432,14 @@ def verify_snapshot_closure(systemd: Systemd, state: dict[str, object]) -> None:
         for unit in expected
     ):
         raise RolloutError("invalid service snapshot unit")
-    extras = sorted(_listed_template_units(systemd, check=True) - expected)
+    discovered = _listed_template_units(systemd, check=True) | _listed_launcher_units(
+        systemd, check=True
+    )
+    extras = sorted(discovered - expected)
     if extras:
-        raise RolloutError(f"worker lanes exist outside service snapshot: {extras}")
+        raise RolloutError(
+            f"template units exist outside service snapshot: {extras}"
+        )
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
@@ -459,27 +515,61 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
         ):
             raise RolloutError("invalid service snapshot unit")
         if raw["exists"] is False:
-            systemd.run("stop", unit, check=False)
-            systemd.run("disable", unit, check=False)
-            active = systemd.run("is-active", unit, check=False)
-            enabled = systemd.run("is-enabled", unit, check=False)
-            load_state = systemd.run(
-                "show", unit, "--property=LoadState", "--value", check=False
+            # A template instance can disappear after its connection closes.
+            # `stop`/`disable` then return non-zero on real systemd; treating
+            # that as success in a fake hid the mismatch.  Prove absence first
+            # and avoid mutating an object that no longer exists.  A loaded
+            # unit is still driven to the snapshotted absent state below.
+            load_returncode, load_before, _load_stderr = systemd.probe(
+                "show", unit, "--property=LoadState", "--value"
             )
-            main_pid = systemd.run(
-                "show", unit, "--property=MainPID", "--value", check=False
+            if load_returncode or not load_before:
+                raise RolloutError(
+                    f"cannot prove absent service load state: {unit}"
+                )
+            initially_not_found = load_before == "not-found"
+            if not initially_not_found:
+                systemd.run("stop", unit, check=False)
+                systemd.run("disable", unit, check=False)
+            active_rc, active, _active_stderr = systemd.probe("is-active", unit)
+            enabled_rc, enabled, _enabled_stderr = systemd.probe(
+                "is-enabled", unit
             )
+            load_rc, load_state, _post_load_stderr = systemd.probe(
+                "show", unit, "--property=LoadState", "--value"
+            )
+            pid_rc, main_pid, _pid_stderr = systemd.probe(
+                "show", unit, "--property=MainPID", "--value"
+            )
+            if (
+                active_rc not in {0, 3, 4}
+                or enabled_rc not in {0, 1, 4}
+                or load_rc
+                or pid_rc
+                or not active
+                or not enabled
+                or not load_state
+                or not main_pid
+            ):
+                raise RolloutError(
+                    f"cannot prove absent service state after restore: {unit}"
+                )
             self_recovery = (
                 unit == "aicc-principal-recovery.service"
                 and active == "active"
                 and main_pid == str(os.getpid())
             )
-            if (
-                enabled == "enabled"
-                or (active == "active" and not self_recovery)
-                or (load_state not in {"", "not-found"} and not self_recovery)
-                or (active != "active" and main_pid not in {"", "0"})
-            ):
+            enablement_absent = enabled in {"disabled", "not-found"}
+            runtime_absent = (
+                active == "inactive"
+                and load_state == "not-found"
+                and main_pid == "0"
+            )
+            # The generator may be executing inside its own recovery service,
+            # so it cannot prove that service inactive/unloaded until it exits.
+            # That exception never covers enablement: leaving the absent-
+            # baseline unit enabled would revive it at the next boot.
+            if not enablement_absent or (not runtime_absent and not self_recovery):
                 raise RolloutError(f"service snapshot did not restore exactly: {unit}")
             continue
         if version == 3:
@@ -968,7 +1058,13 @@ def main() -> int:
         if any(not RESTORABLE_UNIT_RE.fullmatch(unit) for unit in included):
             parser.error("--include-unit is not allowlisted")
         payload = json.dumps(
-            snapshot(systemd, (*units, *included)), sort_keys=True
+            snapshot(
+                systemd,
+                tuple(
+                    sorted({*units, *included, *discover_launcher_units(systemd)})
+                ),
+            ),
+            sort_keys=True,
         ).encode()
         temporary = args.state.with_name(f".{args.state.name}.{os.getpid()}")
         temporary.write_bytes(payload)
