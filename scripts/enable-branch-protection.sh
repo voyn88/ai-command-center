@@ -12,8 +12,12 @@
 # SHA (`Acceptance gate (independent verdict on exact SHA)` below).
 #
 # This script does not enable the merge queue itself — that toggle
-# (Settings → Branches → Require merge queue) is a repository-owner-only
-# action outside the `branches/.../protection` endpoint this script calls.
+# (Settings → Branches → Require merge queue) lives outside the
+# `branches/.../protection` endpoint this script calls, and is a
+# repository-owner-only action. The owner switched it on for `main`
+# separately on 2026-08-23 (squash, maximumEntriesToBuild: 5); re-running
+# this script only re-asserts the protection rule above, it has no effect
+# on the queue toggle.
 #
 # Requires: gh CLI authenticated with admin:repo_hook / repo scope.
 # Usage:   bash scripts/enable-branch-protection.sh
@@ -47,4 +51,4 @@ echo "  - Strict (branch must be up to date): yes"
 echo "  - Force-push: denied"
 echo "  - Deletion: denied"
 echo "  - Admins enforced: yes"
-echo "  - Note: enabling the merge queue itself still requires a manual repository-owner step."
+echo "  - Note: this does not touch the separate merge-queue toggle (Settings → Branches → Require merge queue)."
