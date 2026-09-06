@@ -260,6 +260,14 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
     if agent_runner.principal_isolation_required():
+        # aider is deliberately absent from `PRINCIPAL_EXECUTOR_BINARIES`
+        # (same treatment as Copilot, ADR-0010): it edits files in the
+        # trusted workspace, and staging it through the isolated launcher
+        # protocol is unbuilt work (no manifest path, no allowlisted
+        # root-owned binary). `principal_executor_preflight` therefore
+        # reports it unallowlisted here, so a host that requires isolation
+        # fails this link closed and the cascade falls through, rather than
+        # running aider un-isolated.
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
     if executor == "codex":
@@ -270,6 +278,9 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
             agent_runner.COPILOT_BINARY
         )
         return available, detail, "copilot cli unavailable"
+    if executor == "aider":
+        available, detail = agent_runner.aider_preflight()
+        return available, detail, "aider unavailable (cli or local ollama daemon)"
     available, detail = agent_runner.claude_cli_preflight()
     return available, detail, "claude cli unavailable"
 

@@ -528,6 +528,55 @@ def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
     assert runs == []
 
 
+def test_aider_preflight_checks_the_aider_cli_and_ollama_daemon(handler, monkeypatch):
+    run_agent, runs = handler
+    checked = []
+
+    def preflight():
+        checked.append("called")
+        return False, "aider not found"
+
+    monkeypatch.setattr(agent_runner, "aider_preflight", preflight)
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "aider", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert checked == ["called"]
+    assert runs[-1]["executor"] == "claude"
+
+
+def test_aider_is_refused_under_principal_isolation(handler, monkeypatch):
+    """aider is DELIBERATELY absent from `PRINCIPAL_EXECUTOR_BINARIES` (no
+    isolated-launcher manifest support exists for it yet): a host that
+    requires principal isolation must fail this link closed through
+    `principal_executor_preflight`, the same generic path Claude/Codex use
+    under isolation, never fall back to the un-isolated binary+daemon probe
+    `aider_preflight` performs on a host that does not require it."""
+    run_agent, runs = handler
+    checked = []
+
+    def preflight(executor):
+        checked.append(executor)
+        return False, f"{executor} not allowlisted"
+
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(agent_runner, "principal_executor_preflight", preflight)
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "aider", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert checked == ["aider", "claude"]
+    assert runs == []
+
+
 @pytest.mark.parametrize(
     "diagnostic",
     [
