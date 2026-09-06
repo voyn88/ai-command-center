@@ -1430,6 +1430,30 @@ def test_worker_to_control_guard_check_rejects_an_intervening_fi():
         )
 
 
+def test_worker_to_control_guard_check_rejects_an_intervening_else_or_elif():
+    """A command in the ELSE (or ELIF) branch of the guard runs when the
+    guard's condition is false -- the opposite of what the guard proves.
+    `if worker; then :; else systemctl start ...; fi` must not be classified
+    as guarded just because no `fi` sits between the `if` and the command:
+    an independent review on 6578a0b caught exactly this shape passing."""
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+
+    behind_else = f'{guard}\n:\nelse\nsystemctl start aicc-principal-recovery.service\nfi'
+    with pytest.raises(AssertionError, match="escaped"):
+        _assert_command_inside_shell_if(
+            behind_else, "systemctl start aicc-principal-recovery.service", guard
+        )
+
+    behind_elif = (
+        f'{guard}\n:\nelif [ "$install_profile" = "control" ]; then\n'
+        'systemctl start aicc-principal-recovery.service\nfi'
+    )
+    with pytest.raises(AssertionError, match="escaped"):
+        _assert_command_inside_shell_if(
+            behind_elif, "systemctl start aicc-principal-recovery.service", guard
+        )
+
+
 def test_the_agent_sysusers_and_tmpfiles_side_effects_are_worker_only():
     """Both configs build the agent layer outside the transaction:
     sysusers.d/aicc-agent.conf creates the `aicc-agent` principal, and
@@ -1445,10 +1469,7 @@ def test_the_agent_sysusers_and_tmpfiles_side_effects_are_worker_only():
         'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"',
         'systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"',
     ):
-        assert line in text
-        before = text[: text.rindex(line)]
-        assert guard in before, f"{line} is not behind the worker-profile guard"
-        assert "\nfi\n" not in before[before.rindex(guard):]
+        _assert_command_inside_shell_if(text, line, guard)
 
     # The control host still provisions the one identity its own specs
     # install against, and nothing else: no agent user, no workspace group,
@@ -1476,14 +1497,39 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
         "run_rollout rollout --lanes /etc/aicc/worker-lanes",
         '"$repo_root/ops/verify-agent-principal-boundary.sh"',
     ):
-        assert line in text
-        # The last occurrence: the boundary verifier is also named earlier,
-        # where it is only being checked for existence.
-        before = text[: text.rindex(line)]
-        assert guard in before, f"{line} is not behind the worker-profile guard"
-        # The guard must still be open where the line sits: no `fi` may close
-        # it between the two, or the line runs unconditionally after all.
-        assert "\nfi\n" not in before[before.rindex(guard):]
+        # The boundary verifier is also named earlier as `sh -n "..."`, a
+        # different full line, so this still resolves to the one bare
+        # invocation and the uniqueness check inside the helper holds.
+        _assert_command_inside_shell_if(text, line, guard)
+
+
+def test_the_recovery_capsule_only_starts_on_the_worker_profile():
+    """aicc-principal-recovery.service is a WORKER_ONLY_TARGETS unit: a
+    control profile turns its FileSpec into a removal, so a control host
+    never has the persistent unit file the transaction installs. Starting it
+    unconditionally at either call site -- the fresh boot-anchor activation
+    before any generation exists, and the INTENT-abort reactivation on the
+    uninstall path -- is exactly the worker-only side effect a control
+    install must not perform, and on a first control install would fail
+    outright against a unit file that was never written.
+
+    The command text is identical at both sites, so
+    `_assert_command_inside_shell_if`'s exact-one-occurrence contract (which
+    exists so a duplicated *unconditional* call can't hide behind one
+    correctly-guarded occurrence) would reject the legitimate second call if
+    applied to the whole file. Each call site is instead checked against an
+    isolated slice containing only that one occurrence.
+    """
+    text = _installer_text()
+    command = "systemctl start aicc-principal-recovery.service"
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+
+    assert text.count(command) == 2, (
+        f"expected exactly two call sites, found {text.count(command)}"
+    )
+    before_first, after_first = text.split(command, 1)
+    _assert_command_inside_shell_if(before_first + command, command, guard)
+    _assert_command_inside_shell_if(after_first, command, guard)
 
 
 # ---------------------------------------------------------------------------
