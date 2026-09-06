@@ -804,6 +804,109 @@ def test_runtime_bwrap_failure_opens_codex_workspace_write_circuit(monkeypatch):
     assert "loopback" in reason
 
 
+# --------------------------------------------------------------------------
+# Quota-exhaustion signature recognition and the exhausted_until circuit
+# (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING)
+# --------------------------------------------------------------------------
+
+
+def _failed_run(*, stdout: str = "", stderr: str = "", exit_code: int = 1) -> agent_runner.RunResult:
+    return agent_runner.RunResult(
+        status="failed",
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=0.1,
+        started_at="2026-09-06T00:00:00+00:00",
+        completed_at="2026-09-06T00:00:01+00:00",
+    )
+
+
+@pytest.mark.parametrize(
+    ("executor", "diagnostic"),
+    [
+        ("claude", "You've hit your session limit · resets 4:10pm (UTC)"),
+        ("copilot", "You've exceeded your monthly quota. Upgrade your plan."),
+        ("codex", "usage limit reached; check your quota"),
+    ],
+)
+def test_executor_quota_signature_recognizes_each_executors_refusal_text(
+    executor, diagnostic
+):
+    run = _failed_run(stderr=diagnostic)
+    assert run.executor_quota_signature(executor) is not None
+
+
+def test_executor_quota_signature_is_none_for_a_different_executors_phrase():
+    # Claude's phrase must not be recognized as a Copilot or Codex refusal —
+    # each executor's account is independent, and misattributing the
+    # signature would open the WRONG executor's circuit.
+    run = _failed_run(stderr="You've hit your session limit")
+    assert run.executor_quota_signature("copilot") is None
+    assert run.executor_quota_signature("codex") is None
+
+
+def test_executor_quota_signature_ignores_a_successful_runs_own_text():
+    """A completed task whose own report happens to discuss a quota (in
+    free text) must never be misclassified as an infrastructure refusal —
+    the same guard `is_executor_provider_error` already applies."""
+    run = agent_runner.RunResult(
+        status="completed",
+        exit_code=0,
+        stdout='{"result": "The user hit their session limit yesterday."}',
+        stderr="",
+        duration_seconds=0.1,
+        started_at="2026-09-06T00:00:00+00:00",
+        completed_at="2026-09-06T00:00:01+00:00",
+    )
+    assert run.executor_quota_signature("claude") is None
+
+
+def test_executor_quota_signature_is_none_without_a_failed_nonzero_exit():
+    run = agent_runner.RunResult(
+        status="failed",
+        exit_code=None,
+        stdout="",
+        stderr="You've hit your session limit",
+        duration_seconds=0.1,
+        started_at="2026-09-06T00:00:00+00:00",
+        completed_at="2026-09-06T00:00:01+00:00",
+    )
+    assert run.executor_quota_signature("claude") is None
+
+
+def test_executor_quota_signature_is_none_for_unrecognized_executor():
+    run = _failed_run(stderr="You've hit your session limit")
+    assert run.executor_quota_signature("openai_http") is None
+
+
+def test_record_executor_exhausted_opens_a_self_clearing_circuit():
+    until = agent_runner.record_executor_exhausted(
+        "claude", signature="hit your session limit", now=1_000_000.0
+    )
+    assert until == agent_runner.executor_exhausted_until("claude", now=1_000_000.0)
+    # Still open a moment later, inside the cooldown window.
+    assert agent_runner.executor_exhausted_until("claude", now=1_000_001.0) == until
+    # Elapsed cooldown: the circuit self-clears rather than staying open
+    # forever, and the second call for the SAME already-elapsed instant must
+    # not resurrect a stale entry.
+    cleared_at = 1_000_000.0 + agent_runner.EXECUTOR_QUOTA_COOLDOWN_SECONDS
+    assert agent_runner.executor_exhausted_until("claude", now=cleared_at) is None
+    assert agent_runner.executor_exhausted_until("claude", now=cleared_at) is None
+
+
+def test_executor_exhausted_until_is_none_when_never_marked():
+    assert agent_runner.executor_exhausted_until("codex") is None
+
+
+def test_record_executor_exhausted_is_scoped_per_executor():
+    agent_runner.record_executor_exhausted(
+        "copilot", signature="exceeded your monthly quota", now=1_000_000.0
+    )
+    assert agent_runner.executor_exhausted_until("copilot", now=1_000_000.0) is not None
+    assert agent_runner.executor_exhausted_until("claude", now=1_000_000.0) is None
+
+
 def test_claude_cli_preflight_names_the_missing_binary_and_how_to_fix_it():
     available, message = agent_runner.claude_cli_preflight(
         "claude-not-installed-for-test"

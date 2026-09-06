@@ -251,6 +251,21 @@ def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> 
 
 
 def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
+    # Quota-aware routing (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING): checked
+    # before any CLI/binary probe, for every executor, so a link this host
+    # already knows is quota-exhausted is skipped exactly like an absent
+    # binary -- via the SAME candidate-selection loops in `_run_agent` below,
+    # which already advance the cascade without spending an attempt. A CLI
+    # being reachable says nothing about whether the ACCOUNT behind it still
+    # has quota; re-probing it anyway would spend a real model call just to
+    # relearn what `agent_runner.record_executor_exhausted` already recorded.
+    exhausted_until = agent_runner.executor_exhausted_until(executor)
+    if exhausted_until is not None:
+        return (
+            False,
+            f"quota circuit open until {exhausted_until}",
+            f"{executor} quota exhausted",
+        )
     if executor == "openai_http":
         # No CLI to probe and no principal to isolate: the bridge is this
         # checkout's own module. Availability is exactly "a provider key is
@@ -609,6 +624,15 @@ def _run_agent(
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
         route_failovers: list[dict[str, Any]] = []
+        # VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING telemetry: every recognized
+        # quota refusal this delivery observed, regardless of whether a
+        # healthy candidate existed to fail over to. Kept separate from
+        # `route_failovers` (which records only an ACTUAL executor switch)
+        # because the terminal case -- every remaining link also exhausted or
+        # no cascade left to try -- never appends to that list, yet the
+        # `exhausted_until` circuit was still opened and belongs in this
+        # attempt's own telemetry.
+        quota_exhaustions: list[dict[str, Any]] = []
         while True:
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
@@ -631,6 +655,33 @@ def _run_agent(
                     and task_type not in agent_runner.MUTATING_TASK_TYPES
                     and run.status != "completed"
                 )
+                # Quota specifically (a NAMED subset of `provider_failure`,
+                # see `RunResult.executor_quota_signature`): open this host's
+                # circuit so a LATER dispatch -- this task's redelivery, or
+                # another task's -- skips the same exhausted account at
+                # `_executor_preflight` instead of spending another model
+                # call to relearn it. Recorded regardless of whether a
+                # healthy fallback exists below: the account is exhausted
+                # either way.
+                quota_signature = (
+                    run.executor_quota_signature(executor) if provider_failure else None
+                )
+                exhausted_until = (
+                    agent_runner.record_executor_exhausted(
+                        executor, signature=quota_signature
+                    )
+                    if quota_signature is not None
+                    else None
+                )
+                if quota_signature is not None:
+                    quota_exhaustions.append(
+                        {
+                            "cascade_step": cascade_step,
+                            "executor": executor,
+                            "signature": quota_signature,
+                            "exhausted_until": exhausted_until,
+                        }
+                    )
                 # A provider/auth/quota refusal happens before useful model work.
                 # For read-only work the execution policy already prevents writes;
                 # for mutating work prove the isolated workspace is untouched before
@@ -679,13 +730,14 @@ def _run_agent(
                         )
                         if not candidate_available:
                             continue
-                        route_failovers.append(
-                            {
-                                "cascade_step": cascade_step,
-                                "executor": executor,
-                                "reason": "provider_auth_or_quota",
-                            }
-                        )
+                        route_failover_entry = {
+                            "cascade_step": cascade_step,
+                            "executor": executor,
+                            "reason": "provider_auth_or_quota",
+                        }
+                        if quota_signature is not None:
+                            route_failover_entry["exhausted_until"] = exhausted_until
+                        route_failovers.append(route_failover_entry)
                         executor = candidate_executor
                         task_type = candidate_task_type
                         model = request.model
@@ -778,6 +830,7 @@ def _run_agent(
             "cascade_step": cascade_step,
             "executor": (link or {}).get("executor", "claude"),
             "route_failovers": route_failovers,
+            "quota_exhausted": quota_exhaustions,
             **_machine_outcome(result_text),
             "status": run.status,
             "exit_code": run.exit_code,
@@ -915,13 +968,25 @@ def _run_agent(
             checkpoint_failure = checkpoint_preserved_candidate()
             if checkpoint_failure is not None:
                 return checkpoint_failure
+            reason = (
+                "executor infrastructure failure "
+                f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
+            )
+            if quota_exhaustions:
+                # No healthy cascade link remained to fail over to (the
+                # circuit still opened -- see the loop above -- it just had
+                # nowhere left to route to), so this is the only durable
+                # place `exhausted_until` reaches: `queue_fail` folds `reason`
+                # into `work_attempt.outcome_reason`, unlike `result`, which
+                # the daemon only persists on an `ok=True` outcome.
+                reason += (
+                    f" [exhausted_until={quota_exhaustions[-1]['exhausted_until']}]"
+                )
             return HandlerOutcome(
                 ok=False,
-                reason=(
-                    "executor infrastructure failure "
-                    f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
-                ),
+                reason=reason,
                 retryable=True,
+                result=result,
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.
