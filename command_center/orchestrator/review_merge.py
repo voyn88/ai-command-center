@@ -437,6 +437,32 @@ def _pr_age_seconds(pr: dict[str, Any], now: datetime) -> float:
     return max((now - created.astimezone(UTC)).total_seconds(), 0.0)
 
 
+def _independent_latest_reject_marker(
+    reviews: list[dict[str, Any]], head: str, pr_author_login: str
+) -> bool:
+    """Match the repository's independent acceptance-gate contract.
+
+    A quoted or embedded marker is not a verdict, and a PR author cannot
+    reject their own change for scheduling purposes. Unknown identities fail
+    closed so an untrusted review cannot evict a PR from the active window.
+    """
+    if not reviews or not pr_author_login:
+        return False
+    latest = max(reviews, key=lambda item: item.get("submittedAt") or "")
+    body = latest.get("body")
+    if not isinstance(body, str):
+        return False
+    first_line = body.replace("\r\n", "\n").split("\n", 1)[0]
+    if first_line != f"ACCEPTANCE: REJECT {head}":
+        return False
+    reviewer_login = (latest.get("author") or {}).get("login")
+    return (
+        isinstance(reviewer_login, str)
+        and bool(reviewer_login)
+        and reviewer_login.casefold() != pr_author_login.casefold()
+    )
+
+
 def _window_block_reason(
     pr: dict[str, Any], cfg: PrWindowConfig, now: datetime
 ) -> str | None:
@@ -468,8 +494,7 @@ def _window_block_reason(
     head = str(pr.get("headRefOid") or "")
     author = str((pr.get("author") or {}).get("login") or "")
     reviews = pr.get("reviews") or []
-    latest_review = max(reviews, key=lambda item: item.get("submittedAt") or "") if reviews else {}
-    if f"ACCEPTANCE: REJECT {head}" in str(latest_review.get("body") or ""):
+    if _independent_latest_reject_marker(reviews, head, author):
         return "acceptance_rejected"
     accepted = _accept_marker_on_latest_review(reviews, head, author)
     if not accepted and age >= cfg.stale_seconds:

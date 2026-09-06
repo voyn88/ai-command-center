@@ -148,6 +148,67 @@ def test_explicit_rejection_rotates_out_without_waiting_for_stale_timeout(monkey
     assert report.demoted == [("1", "acceptance_rejected")]
 
 
+def test_self_authored_rejection_cannot_evict_pr_from_active_window(monkeypatch):
+    rejected = _pr(1, labels=("queue-active",), created="2026-09-06T02:59:30Z")
+    rejected["reviews"][0].update({
+        "body": f"ACCEPTANCE: REJECT {HEAD}",
+        "author": {"login": "PUBLISHER"},
+    })
+    _fake_github(monkeypatch, [rejected])
+
+    report = review_merge.reconcile_pr_window(
+        "/repo",
+        review_merge.PrWindowConfig(target_active=1, max_active=2),
+        now=NOW,
+    )
+
+    assert report.demoted == []
+    assert report.unchanged == ["1"]
+
+
+def test_embedded_rejection_text_cannot_evict_pr_from_active_window(monkeypatch):
+    rejected = _pr(1, labels=("queue-active",), created="2026-09-06T02:59:30Z")
+    rejected["reviews"][0]["body"] = (
+        "Review notes\n\nQuoted old verdict: " f"ACCEPTANCE: REJECT {HEAD}"
+    )
+    _fake_github(monkeypatch, [rejected])
+
+    report = review_merge.reconcile_pr_window(
+        "/repo",
+        review_merge.PrWindowConfig(target_active=1, max_active=2),
+        now=NOW,
+    )
+
+    assert report.demoted == []
+    assert report.unchanged == ["1"]
+
+
+def test_only_latest_review_can_supply_independent_rejection(monkeypatch):
+    rejected = _pr(1, labels=("queue-active",), created="2026-09-06T02:59:30Z")
+    rejected["reviews"] = [
+        {
+            "body": f"ACCEPTANCE: REJECT {HEAD}",
+            "submittedAt": "2026-09-06T02:00:00Z",
+            "author": {"login": "acceptance-bot"},
+        },
+        {
+            "body": "Superseding review without a live verdict",
+            "submittedAt": "2026-09-06T02:30:00Z",
+            "author": {"login": "acceptance-bot"},
+        },
+    ]
+    _fake_github(monkeypatch, [rejected])
+
+    report = review_merge.reconcile_pr_window(
+        "/repo",
+        review_merge.PrWindowConfig(target_active=1, max_active=2),
+        now=NOW,
+    )
+
+    assert report.demoted == []
+    assert report.unchanged == ["1"]
+
+
 def test_pending_checks_are_active_work_not_a_false_failure(monkeypatch):
     pending = _pr(
         1,
