@@ -12,12 +12,10 @@ they did against the single module.
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
-_LOG = logging.getLogger(__name__)
+from command_center.db.mirror_support import record_mirror_failure
 
 # --------------------------------------------------------------------------
 # Canonical run provenance (schema 13)
@@ -179,8 +177,8 @@ def _mirror(mirror_name: str, record: dict, table: str) -> None:
         from command_center.db import provenance_store
 
         getattr(provenance_store, mirror_name)().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror %s into PostgreSQL", table, exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure(table, record, exc)
 
 
 def set_run_provenance_once(

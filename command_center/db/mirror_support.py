@@ -22,6 +22,8 @@ promise `command_center.db.__init__` makes to the desktop and CLI entry points.
 from __future__ import annotations
 
 import json
+import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable
@@ -30,12 +32,88 @@ __all__ = [
     "MIRROR_UNAVAILABLE",
     "ColumnCodec",
     "divergence",
+    "mirror_failure_counts",
+    "record_mirror_failure",
     "render_authority_timestamp",
     "to_instant",
 ]
 
+_LOG = logging.getLogger(__name__)
+
 #: Sentinel id used when the mirror itself could not be read.
 MIRROR_UNAVAILABLE = "__mirror_unavailable__"
+
+#: One counter per mirrored table, incremented by `record_mirror_failure` and
+#: never reset — a process-lifetime tally, not a rate. Guarded by `_failure_lock`
+#: because every `_mirror_*` hook can run from a different request thread.
+_failure_lock = threading.Lock()
+_failure_counts: dict[str, int] = {}
+
+
+def record_mirror_failure(table: str, row: Any, exc: Exception) -> None:
+    """Make one rejected mirror write observable, in place of a swallowed `DEBUG` log.
+
+    `VOYN-W0-AICC-MIRROR-SILENT-DROP`: every `_mirror_*` hook catches
+    `Exception` broadly and, until now, logged it at `DEBUG` — a level nothing
+    ships to an operator by default. That is the right call for the *write*
+    (dual-write is not load-bearing; the authoritative row must survive a
+    mirror that cannot), but it left the *failure* undetectable short of
+    running reconciliation by hand. A value every mirrored column happens to
+    avoid today (`models.iso_now()` never emits `""`) made that gap look
+    theoretical; it stops being theoretical the moment any table mirrors a
+    column not sourced that way.
+
+    Called from the `except` block itself, so it must not raise: a check that
+    can break the write it is checking is worse than no check. `row` is the
+    record dict the mirror tried to write, or the bare identifier for a
+    hook that never had a whole record (e.g. a deletion) — either way, what
+    reaches the log and the counter is something an operator can find the row
+    from, not a table name alone.
+    """
+    identity = _row_identity(row) if isinstance(row, dict) else row
+    with _failure_lock:
+        _failure_counts[table] = _failure_counts.get(table, 0) + 1
+    _LOG.warning(
+        "Mirror write rejected for %s id=%r (%s: %s)",
+        table,
+        identity,
+        type(exc).__name__,
+        exc,
+    )
+
+
+def mirror_failure_counts() -> dict[str, int]:
+    """Rejected mirror writes observed by this process, by table name.
+
+    A process-lifetime snapshot, not a persisted metric: a restart clears it,
+    same as `pool.pool_stats()`. That is enough to answer "is the dual-write
+    silently dropping rows right now" without running reconciliation, which is
+    the acceptance this exists for — it does not replace `divergence()`, which
+    is still the only check that can name which *columns* disagree.
+    """
+    with _failure_lock:
+        return dict(_failure_counts)
+
+
+def _row_identity(record: dict) -> Any:
+    """The value that identifies `record` in a log line, whatever its key shape.
+
+    Most mirrored tables have an `id` column; `provider_attempt` does not; and
+    the few callers that never assembled a full record (a deletion by id, a
+    whole-day delete by `day`) call `record_mirror_failure` with that bare
+    value directly rather than through here. Falling back to the whole record
+    is still useful to an operator when none of the known shapes match — better
+    than a log line that names the table and nothing else.
+    """
+    if "id" in record:
+        return record["id"]
+    if "run_id" in record and "attempt_number" in record:
+        return (record["run_id"], record["attempt_number"])
+    if "run_id" in record:
+        return record["run_id"]
+    if "motion_id" in record:
+        return record["motion_id"]
+    return record
 
 
 def to_instant(value: str) -> datetime:

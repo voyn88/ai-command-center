@@ -11,7 +11,6 @@ they did against the single module.
 
 from __future__ import annotations
 
-import logging
 
 import json
 from pathlib import Path
@@ -19,8 +18,7 @@ from typing import Any, Iterable
 
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
-_LOG = logging.getLogger(__name__)
+from command_center.db.mirror_support import record_mirror_failure
 
 # --------------------------------------------------------------------------
 # Task
@@ -67,8 +65,8 @@ def _mirror_task(record: dict) -> None:
         from command_center.db.execution_store import PostgresTaskMirror
 
         PostgresTaskMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror task into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("task", record, exc)
 
 
 def _mirror_task_deletion(task_id: str) -> None:
@@ -83,8 +81,8 @@ def _mirror_task_deletion(task_id: str) -> None:
         from command_center.db.execution_store import PostgresTaskMirror
 
         PostgresTaskMirror().delete_task(task_id)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror task deletion into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("task", task_id, exc)
 
 
 def _mirror_session(record: dict) -> None:
@@ -93,8 +91,8 @@ def _mirror_session(record: dict) -> None:
         from command_center.db.execution_store import PostgresSessionMirror
 
         PostgresSessionMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror session into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("session", record, exc)
 
 
 
@@ -466,8 +464,8 @@ def _mirror_run_provenance(record: dict) -> None:
         from command_center.db.provenance_store import PostgresRunProvenanceMirror
 
         PostgresRunProvenanceMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror run_provenance into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("run_provenance", record, exc)
 
 
 def _mirror_run_provider_route(record: dict) -> None:
@@ -485,8 +483,8 @@ def _mirror_run_provider_route(record: dict) -> None:
         from command_center.db.provenance_store import PostgresRunProviderRouteMirror
 
         PostgresRunProviderRouteMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror run_provider_route into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("run_provider_route", record, exc)
 
 
 def _mirror_run(record: dict) -> None:
@@ -508,8 +506,8 @@ def _mirror_run(record: dict) -> None:
         from command_center.db.run_store import PostgresRunMirror
 
         PostgresRunMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror run into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("run", record, exc)
 
 
 def get_run(db_path: Path, run_id: str) -> dict | None:
@@ -868,8 +866,8 @@ def _mirror_run_event(record: dict) -> None:
         from command_center.db.run_children_store import PostgresRunEventMirror
 
         PostgresRunEventMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror run_event into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("run_event", record, exc)
 
 
 def _mirror_report(record: dict) -> None:
@@ -878,8 +876,8 @@ def _mirror_report(record: dict) -> None:
         from command_center.db.run_children_store import PostgresReportMirror
 
         PostgresReportMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror report into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("report", record, exc)
 
 
 

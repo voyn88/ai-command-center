@@ -12,7 +12,6 @@ they did against the single module.
 from __future__ import annotations
 
 import json
-import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,8 +19,7 @@ from typing import Any, Iterable
 from command_center.runtime import autonomy as autonomy_domain
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
-_LOG = logging.getLogger(__name__)
+from command_center.db.mirror_support import record_mirror_failure
 
 # --------------------------------------------------------------------------
 # Autonomy proposals (schema 7) — the pre-execution decision layer.
@@ -244,8 +242,8 @@ def _mirror(mirror_name: str, record: dict, table: str) -> None:
         from command_center.db import proposal_store
 
         getattr(proposal_store, mirror_name)().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror %s into PostgreSQL", table, exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure(table, record, exc)
 
 
 def _mirror_children(records: list[tuple[str, dict, str]]) -> None:
