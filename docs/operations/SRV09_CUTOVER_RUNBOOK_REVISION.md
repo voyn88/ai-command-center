@@ -565,3 +565,49 @@ the `--no-owner --no-privileges` claim in §11. No row above needed a
 correction. Confirms the third pass's own "two commits touched a live
 claim" count (#605, #610) was complete, not merely unrefuted — the
 distinction the second pass's row 57 gap exists to teach.
+
+### Fourth check (2026-09-06, same baseline `92470bc`) — full citation list, not just categories
+
+`main` still has not moved past `92470bc`. The prior audit named its
+coverage by category ("the mirror store family," "the backup/restore
+scripts") rather than enumerating every individual path Appendix A cites —
+which is itself the shape of gap the second pass's row 57 slipped through
+on (a true statement about the commits it looked at, resting on an
+implicitly incomplete file list). This check builds the literal path list
+instead — all 36 held references, all 12 changed, every script and test
+file A0/§8/§11 name — and re-runs `git log f799f78..92470bc -- <path>` per
+path individually.
+
+Three paths outside the "family" labels turned up commits:
+`docs/srv01b-schema-map.md` (#580 — already covered above, row 60),
+`command_center/db/roles.py` (#439, not the `GRANTS-ARE-CORRECTNESS`
+commit the third pass named — see below), and `command_center/runtime/db/execution.py`
+plus `command_center/task_pipeline.py` (both from #610, already covered
+above, row 59; `task_pipeline.py` is where `daily_spend_usd`'s `LIKE` fix
+actually lives, a file this document never names directly but whose change
+row 59 already describes accurately by behavior). Every other cited path —
+`adapter.py`, `postgres-foundation.md`, `record_mirror.py`,
+`table_mirror.py`, `mirror_support.py`, `queue_store.py`,
+`owner_item_store.py`, `digest_item_store.py`, `conflict_store.py`,
+`model_registry_store.py`, `council_store.py`, `pool.py`,
+`work_queue_store.py`, `run_finalizer.py`, `supervisor.py`, `preflight.sh`,
+`assert_independent_acceptance.py`, `webapi/app.py`,
+`credential_rotation.py`, both test-coverage gates, both backup/restore
+scripts, `health.py` — took zero commits in this range.
+
+On `roles.py`: the commit in this window is `714b9b4` (#439, "reproduce the
+queue_redrive escalation in the backlog domain"), not the
+`GRANTS-ARE-CORRECTNESS-NOT-HYGIENE` commit the third pass's audit named.
+Its diff is a comment-only edit — it resolves a `TODO` by pointing at
+`GRANTS-ARE-CORRECTNESS-NOT-HYGIENE` (already landed, already accounted
+for) and the new `test_worker_can/cannot_call_backlog_resume_deferred_*`
+tests it added — without touching the grant matrix itself, so row 40/55
+still hold. The third pass's conclusion was right; its attribution of
+*which* commit produced that comment was one commit off. Recorded here so
+the count stays honest: attribution errors are exactly the kind of thing a
+"trust the last pass's summary" reader would carry forward uncorrected.
+
+No claim needs correction. This does not add a fifth baseline — it is the
+same `92470bc` re-checked with a stricter method, the same relationship the
+"audit of the third pass" section above has to the third pass itself, one
+level further down.
