@@ -47,6 +47,12 @@ class PlanLimits:
     #: RESUME). Bounded so a large parked backlog drains gradually across
     #: ticks instead of flooding OPEN in one; 0 disables the reconcile.
     max_resumes_per_tick: int = 10
+    #: Persistent delivery backpressure. Writer leases only describe work
+    #: executing *right now* and disappear before its PR is reviewed; using
+    #: them as the sole WIP measure allowed every later tick to publish four
+    #: more PRs. READY_TO_REVIEW is the durable handoff state and therefore
+    #: the planner's authoritative review-backlog fence.
+    review_backlog_limit: int = 8
 
 
 @dataclass(slots=True)
@@ -60,6 +66,9 @@ class PlanReport:
     #: gate returned to OPEN this tick (VOYN-W0-AICC-DEFER-AUTO-RESUME).
     resumed: list[tuple[str, str]] = field(default_factory=list)
     planner_busy: bool = False
+    #: Number of durable READY_TO_REVIEW tasks observed when dispatch was
+    #: stopped by the review-backlog fence; None means the fence was open.
+    review_window_full: int | None = None
 
 
 # Repo → (canonical project_id, worker-host repository path). The worker's
@@ -188,6 +197,22 @@ class Planner:
                 "SELECT * FROM backlog_ingest_results(%s)", (limits.planner,)
             ):
                 report.ingested.append((task_id, action))
+
+            # The writer-lease WIP bound below protects concurrent repository
+            # mutation, not delivery throughput.  Stop before selecting or
+            # resuming more implementation work while completed PRs already
+            # fill the persistent review window.  Count tasks rather than
+            # evidence rows: one task may carry multiple immutable PR facts.
+            review_rows = self._rows(
+                "SELECT count(DISTINCT t.task_id) FROM backlog_task t "
+                "JOIN backlog_evidence e ON e.task_id = t.task_id "
+                "AND e.kind = 'pr' "
+                "WHERE t.status = 'READY_TO_REVIEW'"
+            )
+            review_backlog = int(review_rows[0][0]) if review_rows else 0
+            if review_backlog >= max(limits.review_backlog_limit, 1):
+                report.review_window_full = review_backlog
+                return report
 
             # Reconcile technical DEFER_TO_USER parks back to OPEN (VOYN-W0-
             # AICC-DEFER-AUTO-RESUME) before selecting candidates, so a
