@@ -371,6 +371,63 @@ def test_reconciling_against_a_decoded_reader_is_not_clean(
     assert [entry["fields"] for entry in reported] == [["refs_json"]]
 
 
+def test_list_digest_items_stored_streams_rather_than_materialising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`mirror_support.divergence` takes an iterator of authority rows on
+    purpose (`test_reconciliation_accepts_a_generator_of_authority_rows`):
+    materialising the authority to reconcile it would put the table this
+    migration exists to move into one process's memory. `digest_item` is small
+    today, but it is the first table wired into that reconciliation, and `run`
+    / `task` — where a `list` return would actually be felt — are next.
+
+    Pinned at the SQL layer rather than by type annotation: a cursor's
+    `fetchall()` would defeat the design regardless of what the function
+    returns, so this asserts it is never called, on a table sized well past any
+    reasonable in-memory reconciliation buffer.
+    """
+    import inspect
+    import sqlite3
+
+    class _NoFetchAllCursor(sqlite3.Cursor):
+        def fetchall(self, *args: object, **kwargs: object) -> list:
+            raise AssertionError("list_digest_items_stored must not fetchall()")
+
+    class _NoFetchAllConnection(sqlite3.Connection):
+        def cursor(self, factory: object = None) -> sqlite3.Cursor:
+            return super().cursor(factory or _NoFetchAllCursor)
+
+    real_connect = sqlite3.connect
+
+    def _patched_connect(database: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs.setdefault("factory", _NoFetchAllConnection)
+        return real_connect(database, *args, **kwargs)
+
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+
+    row_count = 5_000  # far past any reasonable in-memory reconciliation buffer
+    rows = [
+        (f"row-{n}", f"item {n}", "", None, "[]", "2026-08-14T00:00:00", "2026-08-14", n, None)
+        for n in range(row_count)
+    ]
+    with wave1.db.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO digest_item "
+            "(id, title, body, category, refs_json, created_at, day, position, project_ref) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+
+    monkeypatch.setattr(sqlite3, "connect", _patched_connect)
+
+    stored = wave1.list_digest_items_stored(db_path)
+    assert inspect.isgenerator(stored), "must stream, not hand back an already-built list"
+
+    seen = sum(1 for _ in stored)
+    assert seen == row_count
+
+
 def test_sqlite_remains_the_authority_for_digest_items() -> None:
     """Parity with slices 2 and 3, which this slice also shipped without.
 
