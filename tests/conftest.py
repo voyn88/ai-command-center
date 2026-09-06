@@ -140,6 +140,7 @@ def isolated_module_data_constants(isolated_data_dir, monkeypatch):
     on import ordering — makes isolation hold regardless of when/how each module was
     first imported into the test process."""
     from command_center import activity_log, agent_runner, chat_service, portfolio_config, project_config
+    from command_center.orchestrator import local_model_gates
 
     monkeypatch.setattr(project_config, "DATA_DIR", isolated_data_dir)
     monkeypatch.setattr(project_config, "CONFIG_FILE", isolated_data_dir / "project_config.json")
@@ -151,6 +152,11 @@ def isolated_module_data_constants(isolated_data_dir, monkeypatch):
     monkeypatch.setattr(chat_service, "CHATS_FILE", isolated_data_dir / "chats.json")
     monkeypatch.setattr(portfolio_config, "DATA_DIR", isolated_data_dir)
     monkeypatch.setattr(portfolio_config, "CONFIG_FILE", isolated_data_dir / "portfolio_config.json")
+    monkeypatch.setattr(local_model_gates, "DATA_DIR", isolated_data_dir)
+    monkeypatch.setattr(local_model_gates, "GATES_FILE", isolated_data_dir / "local_model_gates.jsonl")
+    monkeypatch.setattr(
+        local_model_gates, "GATES_LOCK_FILE", isolated_data_dir / "local_model_gates.jsonl.lock"
+    )
 
 
 @pytest.fixture(autouse=True)

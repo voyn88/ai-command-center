@@ -1070,6 +1070,7 @@ def test_command_builders_table_covers_every_wired_executor():
         "codex",
         "copilot",
         "openai_http",
+        "aider",
     }
     for name in agent_runner.COMMAND_BUILDERS:
         builder = agent_runner._command_builder(name)
@@ -1079,6 +1080,10 @@ def test_command_builders_table_covers_every_wired_executor():
             command = builder(
                 "x", task_type="independent_review", model="groq/m"
             )
+        elif name == "aider":
+            # aider has no read-only profile at all and refuses non-mutating
+            # task types outright — "review" would rightly raise.
+            command = builder("x", task_type="implementation")
         else:
             command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
@@ -1203,3 +1208,133 @@ def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
 
     monkeypatch.delenv("AICC_REVIEW_ANTHROPIC_API_KEY")
     assert "ANTHROPIC_API_KEY" not in run("independent_review")
+
+
+# -- aider (VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR) ------------------------------
+
+
+def test_aider_prompt_is_a_single_argv_element_never_shell_interpreted():
+    prompt = "fix it; rm -rf / #$(whoami)`id`"
+    command = agent_runner.build_aider_command(prompt, task_type="implementation")
+    assert prompt in command, "the prompt must be one argv element, not spliced"
+    assert command[command.index("--message") + 1] == prompt
+
+
+def test_aider_uses_yes_always_and_never_phones_home():
+    command = agent_runner.build_aider_command("x", task_type="implementation")
+    assert "--yes-always" in command
+    assert "--no-analytics" in command
+    assert "--no-check-update" in command
+
+
+def test_aider_defaults_to_the_documented_ollama_model():
+    command = agent_runner.build_aider_command("x", task_type="remediation")
+    model = command[command.index("--model") + 1]
+    assert model == f"ollama_chat/{agent_runner.DEFAULT_AIDER_MODEL}"
+
+
+def test_aider_honours_an_explicit_model_override():
+    command = agent_runner.build_aider_command(
+        "x", task_type="implementation", model="ollama_chat/other-model"
+    )
+    assert command[command.index("--model") + 1] == "ollama_chat/other-model"
+
+
+@pytest.mark.parametrize(
+    "task_type",
+    sorted(agent_runner.READ_ONLY_TASK_TYPES | agent_runner.MODEL_ONLY_TASK_TYPES),
+)
+def test_aider_refuses_non_mutating_task_types(task_type):
+    """aider has no read-only capability profile at all — unlike every other
+    executor here, there is no flag it could pass to make a read-only task
+    type safe, so it must fail closed with a ValueError instead of silently
+    running write-capable against a task type documented as
+    "must not modify any file"."""
+    with pytest.raises(ValueError):
+        agent_runner.build_aider_command("x", task_type=task_type)
+
+
+@pytest.mark.parametrize("task_type", sorted(agent_runner.MUTATING_TASK_TYPES))
+def test_aider_accepts_every_mutating_task_type(task_type):
+    command = agent_runner.build_aider_command("x", task_type=task_type)
+    assert isinstance(command, list) and command
+
+
+def test_aider_preflight_checks_the_aider_cli_and_ollama_daemon(monkeypatch):
+    checked = []
+
+    def fake_which(name):
+        checked.append(name)
+        return f"/usr/bin/{name}"
+
+    def fake_run(command, **kwargs):
+        assert command == [agent_runner.OLLAMA_BINARY, "list"]
+
+        class _Result:
+            returncode = 0
+            stdout = f"NAME\n{agent_runner.DEFAULT_AIDER_MODEL}\n"
+            stderr = ""
+
+        return _Result()
+
+    monkeypatch.setattr(agent_runner.shutil, "which", fake_which)
+    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+    available, detail = agent_runner.aider_preflight()
+    assert available, detail
+    assert checked == [agent_runner.AIDER_BINARY, agent_runner.OLLAMA_BINARY]
+
+
+def test_aider_preflight_unavailable_when_cli_missing(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda name: None)
+    available, _detail = agent_runner.aider_preflight()
+    assert available is False
+
+
+def test_aider_preflight_unavailable_when_ollama_daemon_unreachable(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(command, **kwargs):
+        class _Result:
+            returncode = 1
+            stdout = ""
+            stderr = "connection refused"
+
+        return _Result()
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+    available, detail = agent_runner.aider_preflight()
+    assert available is False
+    assert "unreachable" in detail
+
+
+def test_aider_preflight_unavailable_when_model_not_pulled(monkeypatch):
+    """The daemon being reachable is not enough — closes the gap flagged in
+    independent review of PR #700 (b280dfc2, chunk 6/6): a fake `ollama
+    list` stdout that happens to already contain the model string proves
+    nothing about the negative case. This pins that `aider_preflight`
+    genuinely checks for the model's presence, not merely daemon
+    reachability."""
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fake_run(command, **kwargs):
+        class _Result:
+            returncode = 0
+            stdout = "NAME\nsome-other-model:latest\n"
+            stderr = ""
+
+        return _Result()
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", fake_run)
+    available, detail = agent_runner.aider_preflight()
+    assert available is False
+    assert agent_runner.DEFAULT_AIDER_MODEL in detail
+
+
+def test_aider_preflight_handles_a_missing_ollama_binary_without_raising(monkeypatch):
+    def fake_which(name):
+        return f"/usr/bin/{name}" if name == agent_runner.AIDER_BINARY else None
+
+    monkeypatch.setattr(agent_runner.shutil, "which", fake_which)
+    available, detail = agent_runner.aider_preflight()
+    assert available is False
+    assert agent_runner.OLLAMA_BINARY in detail

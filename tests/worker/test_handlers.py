@@ -1015,6 +1015,76 @@ def test_a_wired_executor_is_dispatched_under_its_own_name(handler) -> None:
     assert outcome.result["executor"] == "codex"
 
 
+def _aider_cascade_payload(**overrides):
+    payload = _payload(task_type="implementation")
+    payload["cascade"] = [
+        {"executor": "aider", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+    payload.update(overrides)
+    return payload
+
+
+def test_aider_preflight_checks_the_aider_cli_and_ollama_daemon(handler, monkeypatch) -> None:
+    """Fix for the review finding on PR #700 (b280dfc2, chunk 6/6): the
+    original test here only asserted `runs[-1]["executor"] == "claude"`,
+    which would still pass even if a dispatch bug invoked `aider` FIRST
+    (mutating the worktree) before falling through to claude. `aider` has
+    no dry-run/read-only mode, so that is exactly the safety-critical case
+    to pin: the assertion below is the full ordered list, proving aider was
+    never invoked at all, not merely that claude ran last."""
+    run_agent, runs = handler
+    checked = []
+
+    def preflight():
+        checked.append("called")
+        return False, "ollama daemon unreachable"
+
+    monkeypatch.setattr(agent_runner, "aider_preflight", preflight)
+    outcome = run_agent(_aider_cascade_payload(), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert checked == ["called"]
+    assert runs == [
+        {
+            "repository_path": runs[0]["repository_path"],
+            "prompt": "do the thing",
+            "task_type": "implementation",
+            "timeout_seconds": 120,
+            "model": None,
+            "cancel_event": runs[0]["cancel_event"],
+            "executor": "claude",
+        }
+    ], "aider must never have been invoked once its preflight failed"
+
+
+def test_aider_preflight_available_when_binary_and_daemon_both_reachable(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "aider_preflight", lambda: (True, "ok"))
+    outcome = run_agent(_aider_cascade_payload(), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert runs[0]["executor"] == "aider"
+
+
+def test_aider_is_refused_under_principal_isolation(handler, monkeypatch) -> None:
+    """`aider` is deliberately absent from `agent_runner.
+    PRINCIPAL_EXECUTOR_BINARIES` (like Copilot, for the same reason: no
+    read-only capability profile to stage safely under isolation). Under
+    principal isolation the generic preflight branch must refuse it before
+    `aider_preflight` (the CLI/daemon probe) is ever consulted, and with no
+    other healthy link the cascade must exhaust having run nothing."""
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(agent_runner, "aider_preflight", lambda: (True, "ok"))
+    payload = _payload(task_type="implementation")
+    payload["cascade"] = [{"executor": "aider", "task_type": "implementation"}]
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "isolated aider cli unavailable" in outcome.reason
+    assert runs == []
+
+
 def test_malformed_cascade_is_a_non_retryable_payload_defect(handler) -> None:
     run_agent, runs = handler
     for bad in (

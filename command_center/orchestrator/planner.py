@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from command_center.orchestrator.routing import cascade_for
+from command_center.orchestrator.routing import cascade_for, classify_task_class
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
 __all__ = ["PlanLimits", "PlanReport", "plan_once"]
@@ -112,8 +112,16 @@ def _payload_for(
     travel verbatim; the worker's provenance gate still applies, and
     ``untrusted=False`` is on the authority of the planner being the control
     plane acting on the canonical store.
+
+    The cascade is chosen by ``classify_task_class`` (VOYN-W0-AICC-AIDER-
+    OLLAMA-EXECUTOR): a task explicitly labelled low-risk (docs/fixtures/
+    small mechanical patches) routes through ``bounded_implementation``,
+    whose cascade leads with the free ``aider``/local-Ollama executor once
+    that class's benchmark ledger has promoted it (`routing.cascade_for`
+    enforces the gate; every other task still gets the plain
+    ``implementation`` route it always has).
     """
-    cascade = cascade_for("implementation")
+    cascade = cascade_for(classify_task_class(task["title"], task["body"]))
     project_id, repository_path = route
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"

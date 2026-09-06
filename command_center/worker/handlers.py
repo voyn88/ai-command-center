@@ -260,8 +260,20 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
     if agent_runner.principal_isolation_required():
+        # `aider` is deliberately absent from `agent_runner.
+        # PRINCIPAL_EXECUTOR_BINARIES` -- same reasoning as Copilot there:
+        # it has no read-only capability profile at all (see
+        # `build_aider_command`), so staging it under principal isolation
+        # would hand untrusted model code write authority the isolation
+        # boundary exists to withhold. This generic branch already refuses
+        # it (`principal_executor_preflight` returns unavailable for any
+        # executor absent from that table), so no aider-specific isolation
+        # carve-out is needed here.
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
+    if executor == "aider":
+        available, detail = agent_runner.aider_preflight()
+        return available, detail, "aider preflight failed (aider CLI / ollama daemon unavailable)"
     if executor == "codex":
         available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
         return available, detail, "codex cli unavailable"
