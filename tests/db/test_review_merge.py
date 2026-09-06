@@ -1571,6 +1571,32 @@ def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_
     assert any(f"AUTO-ACCEPT-AUDIT {head}" in argv[-1] for argv in fake_gh.posted_comments)
 
 
+def test_chunk_review_rows_is_empty_for_a_single_chunk_review(rig, monkeypatch):  # noqa: F811
+    """A single-chunk review is stored under the plain review-cycle key
+    (`review_once` only mints a `:chunk:`-suffixed key when `chunk.count >
+    1`), so `_chunk_review_rows`' prefix match against that suffix must come
+    back empty for it -- never a spurious one-row "chunk" result. That
+    distinction is exactly what routes a single-chunk REJECT through
+    `publish_review_verdicts`' plain-result branch (which itself enqueues
+    verification for ANY REJECT) instead of the chunk-aggregation branch,
+    which is the only branch review_once historically fed eagerly. Nothing
+    here mocks `_chunk_review_rows` itself, unlike `_force_chunk_reject`
+    above -- this exercises the real prefix match a single-chunk review
+    result rows through."""
+    app_factory, _store, worker = rig
+    task_id, pr_url, head = "VOYN-W0-ADJ-CR", "https://github.com/x/repo-d2/pull/29", "8" * 40
+    _ready(_store, app_factory, task_id, pr_url)
+    _complete_review(
+        app_factory, worker, task_id, pr_url, head,
+        f"Some finding.\nVERDICT: REJECT\nHEAD_SHA: {head}\n",
+    )
+    prefix, rows = review_merge._chunk_review_rows(
+        app_factory, task_id, pr_url, _snapshot(head)
+    )
+    assert prefix is not None
+    assert rows == []
+
+
 def test_verification_key_is_scoped_by_head_and_findings():
     snap_a = _snapshot("a" * 40)
     key = review_merge._verification_key("T", "https://github.com/x/y/pull/1", snap_a, "f1")
