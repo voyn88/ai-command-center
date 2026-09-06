@@ -96,6 +96,41 @@ def _done(store, factory, task_id, pr, sha):
         c.commit()
 
 
+def _stub_merge_gateway(monkeypatch, decide):
+    """Replace `review_merge.merge_gateway.evaluate_and_merge` with `decide`
+    (pr_url, expected_head_sha) -> `review_merge.merge_gateway.MergeResult`,
+    and return the list of (pr_url, expected_head_sha) calls actually made
+    through it. `merge_once` no longer calls `gh pr merge` itself
+    (VOYN-W0-AICC-PRIVILEGED-MERGE-GATEWAY-REM) -- it delegates the write to
+    the gateway, so these tests exercise merge_once's OWN orchestration
+    (the readiness pre-check, branch-behind updates, target-branch
+    re-verification) against a stand-in gateway; the gateway's own
+    pagination/independence/checks logic has its exhaustive coverage in
+    tests/test_merge_gateway.py, not here."""
+    calls = []
+
+    def fake(pr_url, expected_head_sha, **kwargs):
+        calls.append((pr_url, expected_head_sha))
+        return decide(pr_url, expected_head_sha)
+
+    monkeypatch.setattr(review_merge.merge_gateway, "evaluate_and_merge", fake)
+    return calls
+
+
+def _gateway_merged(*, returncode=0, stdout="merged", stderr="", reviewer="acceptance-bot"):
+    return review_merge.merge_gateway.MergeResult(
+        attempted=True, returncode=returncode, stdout=stdout, stderr=stderr,
+        refusal_reason="", reviewer=reviewer,
+    )
+
+
+def _gateway_refused(reason="gateway_test_stub_refused"):
+    return review_merge.merge_gateway.MergeResult(
+        attempted=False, returncode=None, stdout="", stderr="",
+        refusal_reason=reason, reviewer=None,
+    )
+
+
 def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypatch):  # noqa: F811
 
     app_factory, store, _ = rig
@@ -266,13 +301,20 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
+    def decide(pr_url, expected_head_sha):
+        assert expected_head_sha == head
+        merged_state["merged"] = True
+        return _gateway_merged()
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    gateway_calls = _stub_merge_gateway(monkeypatch, decide)
     report = merge_once(app_factory, "/tmp")
+    # The write itself goes through the gateway, not `_gh` -- confirmed by
+    # having actually recorded the call, not merely by the absence of a
+    # "pr merge" branch in the fake above.
+    assert gateway_calls == [("https://github.com/x/y/pull/8", head)]
     # Evidence is the TARGET-BRANCH merge commit, never the PR head
     # (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY).
     assert ("VOYN-W0-M1", merge_oid) in report.merged
@@ -346,12 +388,15 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
+    def decide(pr_url, expected_head_sha):
+        assert expected_head_sha == head
+        merged_state["merged"] = True
+        return _gateway_merged()
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _stub_merge_gateway(monkeypatch, decide)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1C", merge_oid) in report.merged
 
@@ -1769,7 +1814,6 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
     pr_url = "https://github.com/x/y/pull/30"
     _ready(store, app_factory, "VOYN-W0-MQ", pr_url)
     queue_state = {"merged": False}
-    merge_calls = []
 
     def fake_gh(argv, repo):
         if argv[:2] == ["pr", "view"]:
@@ -1787,12 +1831,18 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return sp.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merge_calls.append(argv)
-            return sp.CompletedProcess(argv, 0, "queued", "")  # enqueued, NOT merged
         return sp.CompletedProcess(argv, 1, "", "?")
 
+    def decide(pr_url, expected_head_sha):
+        # The gateway attempted the merge, but a merge-queue-protected repo
+        # only ENQUEUED it (`gh pr merge` exits 0 without landing) --
+        # `merge_once` must not treat that exit code as proof of anything
+        # beyond "dispatched"; only `_merged_target_sha`'s own read of the
+        # target branch is authoritative.
+        return _gateway_merged(stdout="queued")
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    gateway_calls = _stub_merge_gateway(monkeypatch, decide)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-MQ", "merge_queued_awaiting_target") in report.skipped
     assert not report.merged
@@ -1801,12 +1851,13 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
     # The queue lands the PR between ticks; the next tick completes DONE
-    # without calling `gh pr merge` again.
+    # without calling the gateway again -- `_merged_target_sha` already
+    # resolves the task before the readiness/merge path is even reached.
     queue_state["merged"] = True
-    calls_before = len(merge_calls)
+    calls_before = len(gateway_calls)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-MQ", merge_oid) in report.merged
-    assert len(merge_calls) == calls_before
+    assert len(gateway_calls) == calls_before
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MQ",))
         assert cur.fetchone()[0] == "DONE"

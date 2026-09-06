@@ -75,7 +75,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from command_center.orchestrator import github_app_auth
+from command_center.orchestrator import github_app_auth, merge_gateway
+from command_center.orchestrator.github_shared import (
+    check_is_green as _check_is_green,
+    latest_checks_by_name as _latest_checks_by_name,
+    owner_repo_number_from_pr_url as _owner_repo_number_from_pr_url,
+)
+from command_center.orchestrator.github_shared import PR_URL as _PR_URL
 from command_center.orchestrator.routing import cascade_for
 
 __all__ = [
@@ -400,8 +406,6 @@ _REVIEW_INPUT_MARKER = "\nINPUT_ENVELOPE_JSON:\n"
 _MAX_REVIEW_PROMPT_BYTES = 60_000
 _MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
-_PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
-
 # Bumped whenever _REVIEW_PROMPT's contract changes in a way that makes an
 # old verdict untrustworthy under the new policy (e.g. what the agent is
 # asked to check, or the required VERDICT/HEAD_SHA format itself) -- baked
@@ -441,16 +445,6 @@ def _verification_review_cascade() -> list[dict[str, Any]]:
 def _repo_from_pr_url(pr_url: str) -> str | None:
     match = _PR_URL.match(pr_url)
     return match.group(2) if match else None
-
-
-def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
-    """(owner, repo, pr_number) for the GitHub REST API path -- unlike
-    `_repo_from_pr_url` (only the repo name, for the review-cycle key), the
-    bot-identity marker post below needs the owner too."""
-    match = _PR_URL.match(pr_url)
-    if match is None:
-        return None
-    return match.group(1), match.group(2), match.group(3)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2029,57 +2023,13 @@ def publish_review_verdicts(
 
 
 # -- Part 3: merge ------------------------------------------------------------
-
-
-def _check_is_green(check: dict[str, Any]) -> bool:
-    """A single `statusCheckRollup` entry is green iff it is DEFINITIVELY
-    successful -- never on absence of information. GitHub's rollup mixes two
-    shapes: a CheckRun (`status`: QUEUED/IN_PROGRESS/COMPLETED, `conclusion`
-    set only once `status == COMPLETED`) and a legacy StatusContext (`state`:
-    PENDING/SUCCESS/FAILURE/ERROR, no `status`/`conclusion` keys at all).
-    The prior check only ever looked at `conclusion` and treated `None` as
-    passing -- which is exactly the value a CheckRun has while still queued
-    or running, and also what `.get()` returns for a StatusContext that
-    never had the key, silently waving through a still-pending required
-    check on either shape. Fail closed: anything not explicitly SUCCESS
-    (via conclusion) or SUCCESS (via legacy state) is not green."""
-    conclusion = check.get("conclusion")
-    if conclusion is not None:
-        return conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED")
-    state = check.get("state")
-    if state is not None:
-        return state == "SUCCESS"
-    return False
-
-
-def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return the latest run for every check name, failing closed on ambiguity.
-
-    GitHub retains reruns in ``statusCheckRollup``. A prior failure must not
-    block the latest successful run, and a prior success must not mask the
-    latest pending or failed run. Duplicate runs without timestamps cannot be
-    ordered safely, so they remain non-green.
-    """
-    latest: dict[str, dict[str, Any]] = {}
-    ambiguous: set[str] = set()
-    for check in rollup:
-        name = str(check.get("name") or "?")
-        previous = latest.get(name)
-        if previous is None:
-            latest[name] = check
-            continue
-        previous_at = previous.get("startedAt") or previous.get("completedAt")
-        current_at = check.get("startedAt") or check.get("completedAt")
-        if not previous_at or not current_at:
-            ambiguous.add(name)
-            continue
-        if str(current_at) == str(previous_at):
-            ambiguous.add(name)
-        elif str(current_at) > str(previous_at):
-            latest[name] = check
-    for name in ambiguous:
-        latest[name] = {"name": name, "conclusion": "AMBIGUOUS"}
-    return list(latest.values())
+#
+# `_check_is_green` and `_latest_checks_by_name` now live in
+# `github_shared.py` (imported above as `_check_is_green`/
+# `_latest_checks_by_name`) so `merge_gateway.py` can reuse the exact same
+# "what counts as green" rule against its own REST-fetched check data,
+# without importing this module and creating an import cycle (this module
+# imports `merge_gateway` below, to hand it the actual merge write).
 
 
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
@@ -2340,7 +2290,23 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     )
                 continue
             actions += 1
-            merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
+            # The privileged write, and only it: `merge_once` no longer
+            # calls `gh pr merge` itself under the ambient credential this
+            # module's other reads use. `detail` here is exactly the head
+            # sha `_pr_is_mergeable` just observed the marker and green
+            # checks on; the gateway re-derives everything (open state,
+            # exact head, independent non-author ACCEPT with no active
+            # REJECT anywhere in the FULL paginated review history, green
+            # checks) under its OWN GitHub App identity before ever
+            # attempting the merge -- see `merge_gateway`'s module
+            # docstring for why this credential separation exists and why
+            # its own reads are never trusted from this module's.
+            gateway_result = merge_gateway.evaluate_and_merge(pr_url, detail)
+            if not gateway_result.attempted:
+                report.skipped.append(
+                    (task_id, f"merge_gateway_refused: {gateway_result.refusal_reason}")
+                )
+                continue
             # On a merge-queue-protected repo a zero exit only ENQUEUED the
             # PR; on a plain repo it merged synchronously. Either way the
             # target branch, not the exit code, is the authority: DONE only
@@ -2350,10 +2316,10 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             if merge_sha is None:
                 if merge_reason == "merged_without_acceptance_evidence":
                     reason = merge_reason
-                elif merged.returncode == 0:
+                elif gateway_result.returncode == 0:
                     reason = "merge_queued_awaiting_target"
                 else:
-                    reason = f"merge_failed: {merged.stderr.strip()[:100]}"
+                    reason = f"merge_failed: {gateway_result.stderr.strip()[:100]}"
                 report.skipped.append((task_id, reason))
                 continue
         head = merge_sha  # the TARGET-BRANCH merge commit, never the PR head
