@@ -34,7 +34,8 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     ]
     _queue, key, payload, task_id, max_attempts = calls[0]
     assert task_id == "VOYN-W0-X"
-    assert ":v6:base:" in key and ":diff:" in key
+    assert f":{review_merge._REVIEW_POLICY_VERSION}:base:" in key
+    assert ":diff:" in key
     assert [link["executor"] for link in payload["cascade"]] == [
         "codex",
         "copilot",
@@ -100,3 +101,64 @@ def test_empty_review_route_fails_closed_without_enqueuing(monkeypatch):
     )
     assert calls == []
     assert report.skipped == [("VOYN-W0-X", "no_review_executor_route")]
+
+
+def test_review_tick_stops_when_global_review_wip_is_full(monkeypatch):
+    queries = []
+
+    def rows(_factory, sql, params=()):
+        queries.append((sql, params))
+        if "count(DISTINCT task_id)" in sql:
+            return [(8,)]
+        raise AssertionError("a full review WIP must stop before scanning tasks")
+
+    monkeypatch.setattr(review_merge, "_rows", rows)
+    calls = []
+    report = review_merge.review_once(
+        lambda: None,
+        lambda *args: calls.append(args),
+        "/srv/aicc",
+        review_merge.ReviewConfig(max_active_reviews=8),
+    )
+
+    assert report.reviewed == []
+    assert calls == []
+    assert len(queries) == 1
+
+
+def test_review_tick_only_fills_available_global_wip(monkeypatch):
+    tasks = [
+        ("VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7"),
+        ("VOYN-W0-Y", "https://github.com/o/ai-command-center/pull/8"),
+    ]
+
+    def rows(_factory, sql, params=()):
+        if "count(DISTINCT task_id)" in sql:
+            return [(7,)]
+        return tasks
+
+    monkeypatch.setattr(review_merge, "_rows", rows)
+    monkeypatch.setattr(
+        review_merge, "_scan_tasks", lambda *args, **kwargs: (tasks, None)
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create(
+            "diff --git a/x b/x\n+ok\n", "b" * 40, "a" * 40
+        ),
+    )
+    monkeypatch.setattr(
+        "command_center.orchestrator.planner.repo_route",
+        lambda repo: ("AICC", "/srv/aicc"),
+    )
+    calls = []
+    report = review_merge.review_once(
+        lambda: None,
+        lambda *args: calls.append(args),
+        "/srv/aicc",
+        review_merge.ReviewConfig(max_per_tick=8, max_active_reviews=8),
+    )
+
+    assert report.reviewed == [tasks[0]]
+    assert len(calls) == 1

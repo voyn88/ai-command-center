@@ -78,6 +78,11 @@ def _launch(db_path: Path) -> dict:
 def test_the_completion_family_reconciles_after_every_write(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
+    """Two runs, not one. A hook that only mirrors the run it was written
+    against would still pass a single-run check — the second run's rows are
+    the only thing that can catch that, which is why every stage below
+    reconciles both runs' children against the complete table rather than one
+    run's slice of it."""
     _patch(monkeypatch, pg_connection_factory)
     completions = PostgresCompletionMirror(connection_factory=pg_connection_factory)
     events = PostgresCompletionEventMirror(connection_factory=pg_connection_factory)
@@ -85,43 +90,60 @@ def test_the_completion_family_reconciles_after_every_write(
 
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
-    run = _launch(db_path)
+    run_a = _launch(db_path)
+    run_b = _launch(db_path)
 
     def reconciled(stage: str) -> None:
-        stored = completion_db.get_completion(db_path, run["id"])
-        assert completion_divergence([stored] if stored else [], completions) == [], stage
-        assert (
-            completion_event_divergence(
-                completion_db.list_completion_events_stored(db_path, run["id"]), events
-            )
-            == []
-        ), stage
+        assert completion_divergence(completion_db.list_completions(db_path), completions) == [], (
+            stage
+        )
+        stored_events = [
+            *completion_db.list_completion_events_stored(db_path, run_a["id"]),
+            *completion_db.list_completion_events_stored(db_path, run_b["id"]),
+        ]
+        assert completion_event_divergence(stored_events, events) == [], stage
         assert (
             completion_validation_divergence(
-                completion_db.list_validation_results(db_path, run["id"]), validations
+                completion_db.list_validation_results_stored(db_path), validations
             )
             == []
         ), stage
 
-    created = completion_db.create_completion(
+    created_a = completion_db.create_completion(
         db_path,
-        run_id=run["id"],
-        task_id=run["task_id"],
+        run_id=run_a["id"],
+        task_id=run_a["task_id"],
         project="AICC",
         repository_path="/tmp/repo",
         completion_state="EXECUTION_FINISHED",
         branch="feat/x",
     )
-    reconciled("completion created")
+    reconciled("completion created for run a")
+
+    completion_db.create_completion(
+        db_path,
+        run_id=run_b["id"],
+        task_id=run_b["task_id"],
+        project="AICC",
+        repository_path="/tmp/repo",
+        completion_state="EXECUTION_FINISHED",
+        branch="feat/y",
+    )
+    reconciled("completion created for run b")
 
     completion_db.append_completion_event(
-        db_path, run["id"], "validation_started", message="running"
+        db_path, run_a["id"], "validation_started", message="running"
     )
-    reconciled("first event")
+    reconciled("first event for run a")
+
+    completion_db.append_completion_event(
+        db_path, run_b["id"], "validation_started", message="running"
+    )
+    reconciled("first event for run b")
 
     completion_db.record_validation_result(
         db_path,
-        run["id"],
+        run_a["id"],
         attempt=1,
         command="pytest -q",
         exit_code=0,
@@ -130,21 +152,34 @@ def test_the_completion_family_reconciles_after_every_write(
         stdout_summary="ok",
         stderr_summary=None,
     )
-    reconciled("validation recorded")
+    reconciled("validation recorded for run a")
+
+    completion_db.record_validation_result(
+        db_path,
+        run_b["id"],
+        attempt=1,
+        command="pytest -q",
+        exit_code=1,
+        started_at=SAMPLE_AT,
+        finished_at=SAMPLE_AT,
+        stdout_summary=None,
+        stderr_summary="boom",
+    )
+    reconciled("validation recorded for run b")
 
     # The whole-row update that would repair a dropped create: a mirror that
     # lost the row above and caught this one reconciles clean at the end, which
     # is why the check runs per write.
     completion_db.update_completion(
         db_path,
-        run["id"],
-        expected_version=created["version"],
+        run_a["id"],
+        expected_version=created_a["version"],
         fields={"completion_state": "VALIDATING_RESULT"},
     )
-    reconciled("completion updated")
+    reconciled("completion updated for run a")
 
-    completion_db.append_completion_event(db_path, run["id"], "validated", message="done")
-    reconciled("second event")
+    completion_db.append_completion_event(db_path, run_a["id"], "validated", message="done")
+    reconciled("second event for run a")
 
 
 def test_a_mirror_failure_cannot_break_a_completion_write(tmp_path, monkeypatch) -> None:
