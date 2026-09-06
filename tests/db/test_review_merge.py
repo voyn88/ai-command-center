@@ -2158,6 +2158,77 @@ def test_permanent_skips_do_not_starve_the_publish_window(rig, monkeypatch):  # 
     assert len(report.skipped) == 10
 
 
+def test_permanent_skips_do_not_starve_the_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-REVIEW-WINDOW-STARVATION (live 2026-08-27): with
+    `ORDER BY t.task_id LIMIT max_per_tick`, the alphabetically-first
+    READY_TO_REVIEW tasks -- here, ones with no routed repo, a permanent
+    skip that costs no gh call at all -- filled review_once's window every
+    tick, so a task sorting after them (like the real VOYN-W0-AICC-SRV-*
+    cohort behind VOYN-ARCH-*/VOYN-OPS-*/VOYN-PLAT-*) was never even
+    scanned. Examinations are bounded by scan_cap and only a fresh enqueue
+    counts toward max_per_tick, so the real task standing behind any number
+    of eternal skips still gets its review enqueued this tick."""
+    app_factory, store, _ = rig
+    for i in range(10):
+        _ready(
+            store, app_factory, f"VOYN-ARCH-{i:02d}",
+            f"https://github.com/x/unrouted-repo/pull/{i}",
+        )
+    head = "d" * 40
+    real_pr = "https://github.com/x/repo-d2/pull/50"
+    _ready(store, app_factory, "VOYN-W0-ZREAL", real_pr)
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[0] == "api" and "/pulls/50" in argv[1]:
+            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": head}, "changed_files": 1,
+                    "additions": 1, "deletions": 0}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api":
+            return subprocess.CompletedProcess(argv, 0, DIFF, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
+    calls = []
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        "/tmp",
+        ReviewConfig(max_per_tick=2),
+    )
+    # All ten eternal (unrouted) skips were scanned AND the real task still
+    # got its review enqueued -- not starved behind its alphabetically-prior
+    # neighbors.
+    assert ("VOYN-W0-ZREAL", real_pr) in report.reviewed
+    assert len(calls) == 1
+    assert len(report.skipped) == 10
+
+
+def test_review_once_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa: F811, E501
+    """Same GUARANTEE as test_partition_schedule_guarantees_full_coverage,
+    for review_once's own scan window: with N tasks and scan_cap C,
+    cycling through ceil(N/C) ticks examines every task exactly once per
+    cycle, regardless of which alphabetical slice of task_ids the eternal
+    skips occupy."""
+    ids = [f"VOYN-W0-PG{i:02d}" for i in range(15)]
+    app_factory, store, _ = rig
+    for i, tid in enumerate(ids):
+        _ready(store, app_factory, tid, f"https://github.com/x/unrouted-repo/pull/{200 + i}")
+
+    examined: list[str] = []
+    for _tick in range(3):  # cursor advances per invocation: 3 calls cover 15
+        report = review_once(
+            app_factory, lambda *a: None, "/tmp",
+            ReviewConfig(max_per_tick=5, scan_cap=5),
+        )
+        examined += [task_id for task_id, _ in report.skipped]
+    # Every task exactly ONCE per full cycle -- set coverage alone would
+    # hide duplicate examinations.
+    assert sorted(examined) == sorted(ids)
+
+
 def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):  # noqa: F811
     """The other half of the same change: mutations per tick stay bounded --
     with max_per_tick=1 and two acceptable tasks, exactly one marker posts
