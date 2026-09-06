@@ -62,6 +62,29 @@ def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
     assert scoped.repo_path == "/srv/aicc"
 
 
+def test_fleet_status_defaults_to_the_whole_fleet() -> None:
+    args = build_parser().parse_args(["fleet-status"])
+    assert args.command == "fleet-status"
+    assert args.state is None and args.limit == 100
+    scoped = build_parser().parse_args(
+        ["fleet-status", "--state", "suspended", "--limit", "5"]
+    )
+    assert scoped.state == "suspended" and scoped.limit == 5
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["fleet-status", "--state", "bogus"])
+
+
+def test_fleet_suspend_requires_the_principal_id_and_a_reason() -> None:
+    args = build_parser().parse_args(
+        ["fleet-suspend", "worker:edge-00", "--reason", "incident"]
+    )
+    assert args.principal_id == "worker:edge-00" and args.reason == "incident"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["fleet-suspend", "worker:edge-00"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["fleet-suspend"])
+
+
 def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
     """A review-class enqueue must outrank the priority=0 implementation
     dispatch enqueues (`backlog_dispatch`), or it queues FIFO behind runs
