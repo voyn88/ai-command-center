@@ -2109,7 +2109,12 @@ def publish_review_verdicts(
     verification run; ``None`` (a legacy caller) disables verification and
     keeps the remediate-on-REJECT behavior. A missing verdict/sha in the
     result text or a marker already posted for the current head are skips,
-    not errors."""
+    not errors. A single-chunk review missing its verdict/sha skips as
+    ``retry_pending:<n>`` while `reconcile_review_once` still has a fresh
+    `:retry:N` identity budget left for this attempt, or ``exhausted:<n>``
+    once that budget (`_MAX_RESULT_RETRY_ATTEMPTS`) is spent -- the task
+    then stays in READY_TO_REVIEW, distinguishable in the tick journal from
+    a review still in flight, for a human to disposition separately."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
@@ -2182,14 +2187,32 @@ def publish_review_verdicts(
                 continue
             sha = current_head
         else:
-            result = _latest_review_result(factory, task_id, key)
-            if result is None:
+            latest = _latest_attempt(factory, task_id, key)
+            if latest is None or latest[1] != "succeeded":
                 report.skipped.append((task_id, "no_review_result_yet"))
                 continue
-            text = result.get("result_text") or ""
+            attempt, _state, payload_value = latest
+            # An unreadable payload is malformed the same as a readable one
+            # missing its verdict trailer -- `_json_object` returning None
+            # just means `.get("result_text")` below sees no text at all.
+            result = _json_object(payload_value)
+            text = (result or {}).get("result_text") or ""
             parsed = _parse_verdict(text)
             if parsed is None:
-                report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
+                # `reconcile_review_once` dispatches a fresh, bounded
+                # `:retry:N` identity for exactly this attempt while
+                # attempt < _MAX_RESULT_RETRY_ATTEMPTS; once that budget is
+                # spent, no future tick will ever produce a verdict for this
+                # head from this reviewer. The two are operator-visible as
+                # distinct skips -- "will retry" vs "spend on this reviewer
+                # stopped" -- instead of the same message recurring forever
+                # in the tick journal either way.
+                report.skipped.append((
+                    task_id,
+                    f"retry_pending:{attempt}"
+                    if attempt < _MAX_RESULT_RETRY_ATTEMPTS
+                    else f"exhausted:{attempt}",
+                ))
                 continue
             verdict, sha = parsed
             if sha != current_head:

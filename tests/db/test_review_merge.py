@@ -863,8 +863,60 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
-    assert ("VOYN-W0-P7", "verdict_or_head_sha_missing_in_review_result") in report.skipped
+    assert ("VOYN-W0-P7", "retry_pending:0") in report.skipped
     assert not any(a[:2] == ["pr", "review"] for a in posted)
+
+
+def test_publish_verdict_names_exhaustion_after_bounded_malformed_retries(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-MALFORMED-REVIEW-RESULT-STALLS-FOREVER-REM: a reviewer
+    that fails the VERDICT/HEAD_SHA contract on every attempt for the same
+    head must not recur behind the same skip message forever. While fresh
+    `:retry:N` identities remain within `_MAX_RESULT_RETRY_ATTEMPTS`, the
+    skip names the attempt as `retry_pending:<n>`; once that budget is
+    spent, it names `exhausted:<n>` instead -- so a human reading the tick
+    journal can tell "another attempt is coming" from "this reviewer is
+    done, decide what to do with this task" without querying the queue."""
+    from command_center.db.work_queue_store import WorkQueueStore
+
+    app_factory, store, worker = rig
+    head = "d" * 40
+    pr_url = "https://github.com/x/y/pull/19"
+    _ready(store, app_factory, "VOYN-W0-P9", pr_url)
+    SNAPSHOTS[pr_url] = _snapshot(head)
+    base_key = review_merge._review_key("VOYN-W0-P9", pr_url, _snapshot(head))
+    queue = WorkQueueStore(app_factory)
+    payload = {
+        "kind": "agent_run", "v": 1, "project_id": "VOYN-W0-P9",
+        "repository_path": "", "task_type": "review",
+        "prompt": "review it", "timeout_seconds": 900, "untrusted": False,
+    }
+    for attempt in range(review_merge._MAX_RESULT_RETRY_ATTEMPTS + 1):
+        key = base_key if attempt == 0 else f"{base_key}:retry:{attempt}"
+        queue.enqueue(
+            "execution", idempotency_key=key, payload=payload, task_id="VOYN-W0-P9"
+        )
+        claimed = worker.claim("execution", visibility_seconds=60)
+        assert worker.complete(
+            claimed,
+            {"status": "completed", "result_text": "tool transcript only, no verdict"},
+        )
+
+    posted = []
+
+    def fake_gh(argv, repo):
+        import subprocess as sp
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"headRefOid": head, "reviews": []}), "")
+        posted.append(argv)
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert (
+        "VOYN-W0-P9",
+        f"exhausted:{review_merge._MAX_RESULT_RETRY_ATTEMPTS}",
+    ) in report.skipped
+    assert not posted
 
 
 def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):  # noqa: F811
