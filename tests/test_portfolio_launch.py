@@ -618,6 +618,103 @@ def test_legacy_claim_is_reported_but_not_unsafely_removed_by_age(tmp_path):
     assert lock_path.exists()
 
 
+# --------------------------------------------------------------------------
+# Worktree-path-keyed claim lock (as opposed to the task_id-keyed one above)
+# --------------------------------------------------------------------------
+
+
+def test_claim_workspace_prevents_concurrent_double_launch_of_same_path(tmp_path):
+    path = tmp_path / "some-worktree"
+    assert portfolio_launch._claim_workspace(tmp_path, path) is True
+    assert portfolio_launch._claim_workspace(tmp_path, path) is False
+    portfolio_launch._release_workspace(tmp_path, path)
+    assert portfolio_launch._claim_workspace(tmp_path, path) is True
+    portfolio_launch._release_workspace(tmp_path, path)
+
+
+def test_claim_workspace_is_keyed_on_the_resolved_path_not_the_literal_string(tmp_path):
+    """Two different spellings of the same on-disk location (an extra `./`
+    segment here) must collide on the same lock -- the whole point of keying
+    this claim on `Path.resolve()` rather than the raw string is that two
+    launches referencing "the same place" written differently still contend
+    for one lock, the same way two task_ids referencing the same worktree
+    path do."""
+    target = tmp_path / "nested" / "worktree"
+    target.parent.mkdir(parents=True)
+    spelled_differently = tmp_path / "nested" / "." / "worktree"
+
+    assert portfolio_launch._claim_workspace(tmp_path, target) is True
+    assert portfolio_launch._claim_workspace(tmp_path, spelled_differently) is False
+    portfolio_launch._release_workspace(tmp_path, target)
+    assert portfolio_launch._claim_workspace(tmp_path, spelled_differently) is True
+    portfolio_launch._release_workspace(tmp_path, spelled_differently)
+
+
+def test_claim_workspace_for_different_paths_never_blocks_each_other(tmp_path):
+    path_a = tmp_path / "worktree-a"
+    path_b = tmp_path / "worktree-b"
+    assert portfolio_launch._claim_workspace(tmp_path, path_a) is True
+    assert portfolio_launch._claim_workspace(tmp_path, path_b) is True
+    portfolio_launch._release_workspace(tmp_path, path_a)
+    portfolio_launch._release_workspace(tmp_path, path_b)
+
+
+def test_orphaned_workspace_claim_is_detected_and_recovered_automatically(tmp_path, monkeypatch):
+    path = tmp_path / "crashed-worktree"
+    lock_path = portfolio_launch._workspace_lock_path(tmp_path, path)
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text(
+        json.dumps(
+            {
+                "version": portfolio_launch.CLAIM_LOCK_VERSION,
+                "pid": 424242,
+                "hostname": portfolio_launch.socket.gethostname(),
+                "process_identity": "dead-process",
+                "created_at": 1.0,
+                "token": "orphan-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(portfolio_launch, "_pid_is_alive", lambda pid: False)
+
+    status = portfolio_launch.inspect_workspace_claim(tmp_path, path, now=100.0)
+    assert status.stale is True
+    assert status.recoverable is True
+    assert status.owner_pid == 424242
+
+    assert portfolio_launch._claim_workspace(tmp_path, path) is True
+    replacement = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert replacement["pid"] == os.getpid()
+    assert replacement["token"] != "orphan-token"
+    portfolio_launch._release_workspace(tmp_path, path)
+
+
+def test_live_owner_workspace_claim_is_never_recovered_even_when_old(tmp_path, monkeypatch):
+    path = tmp_path / "live-worktree"
+    lock_path = portfolio_launch._workspace_lock_path(tmp_path, path)
+    lock_path.parent.mkdir(parents=True)
+    metadata = {
+        "version": portfolio_launch.CLAIM_LOCK_VERSION,
+        "pid": 31337,
+        "hostname": portfolio_launch.socket.gethostname(),
+        "process_identity": "same-live-process",
+        "created_at": 1.0,
+        "token": "live-token",
+    }
+    lock_path.write_text(json.dumps(metadata), encoding="utf-8")
+    os.utime(lock_path, (1, 1))
+    monkeypatch.setattr(portfolio_launch, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(portfolio_launch, "_process_identity", lambda pid: "same-live-process")
+
+    status = portfolio_launch.inspect_workspace_claim(tmp_path, path, now=10_000_000.0)
+    assert status.stale is False
+    assert status.recoverable is False
+    assert portfolio_launch.recover_stale_workspace_claim(tmp_path, path) is False
+    assert portfolio_launch._claim_workspace(tmp_path, path) is False
+    assert json.loads(lock_path.read_text(encoding="utf-8"))["token"] == "live-token"
+
+
 def test_create_worktree_raises_portfolio_launch_error_on_git_failure(git_repo, tmp_path):
     with pytest.raises(portfolio_launch.PortfolioLaunchError):
         portfolio_launch.create_worktree(
@@ -672,9 +769,58 @@ def test_launch_portfolio_task_rolls_back_worktree_and_branch_on_launch_failure(
     assert execution_queue.load_queue(tmp_path) == []
     assert persisted_calls == ["enqueue", "dequeue"]
 
-    # The claim must have been released so a retry is possible.
+    # Both claims -- task_id and worktree-path -- must have been released so
+    # a retry is possible.
     assert portfolio_launch._claim(tmp_path, task.task_id) is True
     portfolio_launch._release(tmp_path, task.task_id)
+    assert portfolio_launch._claim_workspace(tmp_path, Path(result.plan.worktree)) is True
+    portfolio_launch._release_workspace(tmp_path, Path(result.plan.worktree))
+
+
+def test_launch_portfolio_task_is_blocked_when_a_different_task_id_holds_the_same_worktree_path(
+    git_repo, tmp_path, portfolio_worktrees_root, monkeypatch
+):
+    """VOYN-W0-AICC-WORKSPACE-LOCK-KEY: the per-task_id claim lock only
+    serializes two launches of the *same* task_id -- it does nothing for two
+    *different* task_ids whose card overrides both resolve to the same
+    worktree path, so before this lock existed both could reach
+    `create_worktree`/`attach_worktree` for the identical path concurrently.
+    Simulates task A already holding the path claim (exactly as it would
+    mid-launch) and proves task B's launch is refused by the new
+    worktree-path lock before it ever touches git, not merely reported as a
+    conflict afterward in the registry."""
+    base_branch = _current_branch(git_repo)
+    shared_worktree = tmp_path / "shared-worktree"
+    task_b = _write_card(
+        tmp_path, task_id="AICC-PATH-B", base_branch=base_branch, repository=str(git_repo),
+        branch="task/aicc-path-b-branch", worktree=str(shared_worktree),
+    )
+    api = runtime_api.ExecutionCenterAPI(db_path=tmp_path / "runtime.db")
+
+    assert portfolio_launch._claim_workspace(tmp_path, shared_worktree) is True
+    try:
+        def unexpected_worktree_mutation(*args, **kwargs):
+            pytest.fail("git worktree add/attach must not run while another launch holds the path claim")
+
+        monkeypatch.setattr(portfolio_launch, "create_worktree", unexpected_worktree_mutation)
+        monkeypatch.setattr(portfolio_launch, "attach_worktree", unexpected_worktree_mutation)
+
+        result = portfolio_launch.launch_portfolio_task(
+            tmp_path, task_b, tasks_by_id={}, repository_paths={"AICC": str(git_repo)},
+            execution_center_api=api, confirmed=True,
+        )
+    finally:
+        portfolio_launch._release_workspace(tmp_path, shared_worktree)
+
+    assert result.launched is False
+    assert "уже выполняется параллельно" in result.message
+    assert not shared_worktree.exists()
+    assert task_b.task_id not in portfolio_launch.load_registry(tmp_path)
+
+    # The task_id claim must have been released too, so a retry is possible
+    # once the path is free.
+    assert portfolio_launch._claim(tmp_path, task_b.task_id) is True
+    portfolio_launch._release(tmp_path, task_b.task_id)
 
 
 def test_concurrent_rollback_does_not_lose_a_parallel_successful_registration(
