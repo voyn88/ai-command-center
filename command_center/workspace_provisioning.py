@@ -449,6 +449,7 @@ def _run_provision_git(
     spec: WorkspaceSpec,
     failed_step: str,
     timeout: int = 120,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -458,6 +459,7 @@ def _run_provision_git(
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
     except _GIT_OPERATION_ERRORS as exc:
         raise WorkspaceVerificationError(
@@ -1864,6 +1866,7 @@ def trusted_publish_clone(
         )
     with tempfile.TemporaryDirectory(prefix="aicc-trusted-publisher-") as raw:
         publisher = Path(raw) / "repo"
+        trusted_git_environment = _trusted_git_environment(Path(raw))
         spec = WorkspaceSpec(
             workspace_path=str(publisher), expected_branch=expected_branch
         )
@@ -1880,6 +1883,7 @@ def trusted_publish_clone(
             spec=spec,
             failed_step="provision_trusted_publisher_clone",
             timeout=180,
+            env=trusted_git_environment,
         )
         if trusted_base_sha is not None:
             _run_provision_git(
@@ -1887,6 +1891,7 @@ def trusted_publish_clone(
                 cwd=publisher,
                 spec=spec,
                 failed_step="trusted_base_present",
+                env=trusted_git_environment,
             )
         if current_base_sha is not None:
             _run_provision_git(
@@ -1894,6 +1899,7 @@ def trusted_publish_clone(
                 cwd=publisher,
                 spec=spec,
                 failed_step="current_base_present",
+                env=trusted_git_environment,
             )
         if trusted_base_sha is not None and current_base_sha is not None:
             _run_provision_git(
@@ -1901,6 +1907,7 @@ def trusted_publish_clone(
                 cwd=publisher,
                 spec=spec,
                 failed_step="trusted_base_ancestry",
+                env=trusted_git_environment,
             )
         if expected_remote_sha is not None:
             _run_provision_git(
@@ -1908,6 +1915,7 @@ def trusted_publish_clone(
                 cwd=publisher,
                 spec=spec,
                 failed_step="expected_remote_present",
+                env=trusted_git_environment,
             )
         _copy_agent_objects(workspace, publisher)
         checks = [
@@ -1936,12 +1944,19 @@ def trusted_publish_clone(
                 )
             )
         for argv, step in checks:
-            _run_provision_git(argv, cwd=publisher, spec=spec, failed_step=step)
+            _run_provision_git(
+                argv,
+                cwd=publisher,
+                spec=spec,
+                failed_step=step,
+                env=trusted_git_environment,
+            )
         _run_provision_git(
             ["switch", "-c", expected_branch, candidate_sha],
             cwd=publisher,
             spec=spec,
             failed_step="checkout_trusted_candidate",
+            env=trusted_git_environment,
         )
         clean = subprocess.run(
             [
@@ -1961,7 +1976,7 @@ def trusted_publish_clone(
             text=True,
             timeout=120,
             check=False,
-            env=_trusted_git_environment(),
+            env=trusted_git_environment,
         )
         if clean.returncode != 0 or (require_clean and clean.stdout.strip()):
             detail = (
@@ -1980,7 +1995,7 @@ def trusted_publish_clone(
         yield publisher
 
 
-def _trusted_git_environment() -> dict[str, str]:
+def _trusted_git_environment(trusted_root: Path) -> dict[str, str]:
     """Return an environment that cannot redirect trusted Git operations.
 
     The worker environment is allowed to carry credentials for the later push,
@@ -1988,11 +2003,18 @@ def _trusted_git_environment() -> dict[str, str]:
     particular, inherited ``GIT_*`` variables must not replace the trusted
     clone's object database, index, work tree, configuration, or executable.
     """
+    config_home = trusted_root / ".aicc-git-home"
+    config_home.mkdir(mode=0o700, exist_ok=True)
     environment = {
         key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
     environment.update(
         {
+            # HOME/XDG are pinned as well as GIT_CONFIG_GLOBAL so Git versions
+            # predating that variable cannot fall back to worker-controlled
+            # ~/.gitconfig or $XDG_CONFIG_HOME/git/config.
+            "HOME": str(config_home),
+            "XDG_CONFIG_HOME": str(config_home),
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
@@ -2033,7 +2055,7 @@ def _run_trusted_worktree_git(
             text=True,
             timeout=120,
             check=False,
-            env=_trusted_git_environment(),
+            env=_trusted_git_environment(publisher),
         )
     except _GIT_OPERATION_ERRORS as exc:
         raise WorkspaceVerificationError(

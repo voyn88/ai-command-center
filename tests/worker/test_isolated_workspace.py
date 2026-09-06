@@ -524,7 +524,6 @@ def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
     hooks.mkdir()
     (hooks / "post-commit").write_text(f"#!/bin/sh\ntouch '{sentinel}'\n")
     (hooks / "post-commit").chmod(0o755)
-
     def leave_mixed_dirty_tree(**kwargs):
         target = Path(kwargs["repository_path"])
         (target / "f.txt").write_text("modified\n")
@@ -576,6 +575,38 @@ def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
         check=False,
     )
     assert deleted.returncode != 0
+
+
+def test_trusted_git_environment_ignores_ambient_home_and_xdg_config(
+    tmp_path, monkeypatch
+):
+    hostile_home = tmp_path / "hostile-home"
+    hostile_home.mkdir()
+    (hostile_home / ".gitconfig").write_text("[filter \"evil\"]\nclean = exploit\n")
+    hostile_xdg = tmp_path / "hostile-xdg"
+    (hostile_xdg / "git").mkdir(parents=True)
+    (hostile_xdg / "git" / "config").write_text(
+        "[filter \"evil\"]\nclean = exploit\n"
+    )
+    monkeypatch.setenv("HOME", str(hostile_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(hostile_xdg))
+    trusted_root = tmp_path / "trusted"
+    trusted_root.mkdir()
+
+    environment = workspace_provisioning._trusted_git_environment(trusted_root)
+
+    assert environment["HOME"] == str(trusted_root / ".aicc-git-home")
+    assert environment["XDG_CONFIG_HOME"] == str(
+        trusted_root / ".aicc-git-home"
+    )
+    lookup = subprocess.run(
+        ["git", "config", "--global", "--get", "filter.evil.clean"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert lookup.returncode == 1 and lookup.stdout == ""
 
 
 def test_dirty_checkpoint_uses_one_shared_git_ref_lock(tmp_path):
