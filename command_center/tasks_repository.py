@@ -211,15 +211,28 @@ def load_tasks(root: Path, *, example_file: Path | None = None, strict: bool = F
         # writer reported success — VOYN-W0-AICC-TASK-IMPORT-CONCURRENCY-FLAKE).
         # `create_json_if_absent` publishes only when the file is still absent,
         # so losing this race costs nothing but an unused temp file.
-        if example_file and example_file.exists():
-            # Copied verbatim, never parsed. Decoding the example here would
-            # move its decode error *outside* the handler below, so a malformed
-            # example would raise from a read that `strict=False` promises will
-            # not (independent review of `4b058ff`). Copying keeps the failure
-            # exactly where it was before: in `_decode_tasks`, under `strict`.
-            storage.create_bytes_if_absent(tasks_file, example_file.read_bytes())
-        else:
-            storage.create_json_if_absent(tasks_file, [])
+        try:
+            if example_file and example_file.exists():
+                # Copied verbatim, never parsed. Decoding the example here
+                # would move its decode error *outside* the handler below, so
+                # a malformed example would raise from a read that
+                # `strict=False` promises will not (independent review of
+                # `4b058ff`). Copying keeps the failure exactly where it was
+                # before: in `_decode_tasks`, under `strict`.
+                storage.create_bytes_if_absent(tasks_file, example_file.read_bytes())
+            else:
+                storage.create_json_if_absent(tasks_file, [])
+        except OSError:
+            # The example passed `.exists()` above but became unreadable
+            # before this line -- permissions changed, or it was removed in
+            # the same race `create_json_if_absent` already guards on the
+            # write side. That is the same "unreadable" case the same review
+            # flagged for `json.loads`/`read_text`, just moved to
+            # `read_bytes`: a read must not raise under `strict=False`, and
+            # must still refuse under `strict=True` (`mutate_tasks`).
+            if strict:
+                raise
+            return []
     try:
         tasks = _decode_tasks(tasks_file)
     except (json.JSONDecodeError, OSError, ValueError):
