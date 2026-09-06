@@ -55,6 +55,50 @@ def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
     return _enqueue
 
 
+def _defer_evidence(events: list[dict[str, Any]]) -> tuple[str | None, int]:
+    """(latest park reason, prior granted resumes) from one task's own
+    ``backlog_event`` history (newest first, as ``BacklogStore.list_events``
+    returns it) -- the same two facts ``backlog_resume_deferred`` (0014)
+    itself keys its grant on.
+
+    A read, not a re-decision: the SECURITY DEFINER function remains the
+    only authority on whether a resume is granted (it re-derives both facts
+    itself under the row lock). This exists so an operator -- or
+    ``backlog-defer-sweep``'s own operator, deciding whether to run it --
+    can see what the gate would see without guessing from the raw event
+    stream.
+    """
+    park_reason = next(
+        (
+            event["reason"]
+            for event in events
+            if event["event"] == "return_to_pool"
+            and event["outcome"] == "granted"
+            and (event.get("detail") or {}).get("target") == "DEFER_TO_USER"
+        ),
+        None,
+    )
+    resumes = sum(
+        1
+        for event in events
+        if event["event"] == "resume_deferred" and event["outcome"] == "granted"
+    )
+    return park_reason, resumes
+
+
+def _defer_sweep(store: Any, task_ids: list[str]) -> list[tuple[str, bool, str]]:
+    """Attempt ``resume_deferred`` for each id and collect what the gate
+    said -- one (task_id, granted, reason) per attempt, in order. The gate
+    decides and audits every grant or refusal itself; this only reports it,
+    the same division ``queue-redrive`` keeps with ``WorkQueueAdmin.redrive``.
+    """
+    results: list[tuple[str, bool, str]] = []
+    for task_id in task_ids:
+        ok, reason, _revision = store.resume_deferred(task_id)
+        results.append((task_id, ok, reason))
+    return results
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m command_center.db")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -142,6 +186,33 @@ def build_parser() -> argparse.ArgumentParser:
         "ancestor of the default branch (pre-fix rows recorded the PR head, "
         "not the merge commit). Never changes a task's status.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+
+    # Evidence-and-sweep for DEFER_TO_USER (0014's mechanical exit is
+    # automatic but capped and tick-scoped -- see planner.py's
+    # `max_resumes_per_tick`; these give an operator the same two
+    # primitives on demand, matching the `queue-dlq` / `queue-redrive` pair
+    # this backlog store's own recovery surface still lacked).
+    defer_status = sub.add_parser(
+        "backlog-defer-status",
+        help="Evidence for every DEFER_TO_USER task: the reason its latest "
+        "park recorded and how many mechanical resumes (0014) it has "
+        "already used, read from backlog_event -- no writes.",
+    )
+    defer_status.add_argument(
+        "--limit", type=int, default=50, help="Rows to show (default 50)."
+    )
+    defer_sweep = sub.add_parser(
+        "backlog-defer-sweep",
+        help="Attempt backlog_resume_deferred for one or every DEFER_TO_USER "
+        "task -- e.g. after a fix lands for a reason backlog-defer-status "
+        "showed. The SECURITY DEFINER gate revalidates and audits every "
+        "grant or refusal; this only reports the outcome.",
+    )
+    defer_sweep_target = defer_sweep.add_mutually_exclusive_group(required=True)
+    defer_sweep_target.add_argument("--task-id", help="Attempt exactly this task.")
+    defer_sweep_target.add_argument(
+        "--all", action="store_true", help="Attempt every DEFER_TO_USER task."
+    )
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -412,6 +483,50 @@ def main(argv: list[str] | None = None) -> int:
                 ):
                     print(f"{status}: {count}")
                 return 0
+
+            if args.command == "backlog-defer-status":
+                from command_center.db.backlog_store import BacklogStore
+
+                store = BacklogStore(lambda: nullcontext(conn))
+                tasks, total = store.list_tasks(status="DEFER_TO_USER", limit=args.limit)
+                if not tasks:
+                    print("no tasks parked in DEFER_TO_USER")
+                    return 0
+                for task in tasks:
+                    park_reason, resumes = _defer_evidence(
+                        store.list_events(task["task_id"])
+                    )
+                    print(
+                        f"{task['task_id']}  wave={task['wave']} "
+                        f"priority={task['priority'] or '-'}  "
+                        f"park_reason={park_reason or '(none recorded)'}  "
+                        f"resumes={resumes}/3"
+                    )
+                print(f"{len(tasks)} of {total} DEFER_TO_USER task(s) shown")
+                return 0
+
+            if args.command == "backlog-defer-sweep":
+                from command_center.db.backlog_store import BacklogStore
+
+                store = BacklogStore(lambda: nullcontext(conn))
+                if args.task_id:
+                    task_ids = [args.task_id]
+                else:
+                    tasks, _total = store.list_tasks(status="DEFER_TO_USER", limit=10_000)
+                    task_ids = [task["task_id"] for task in tasks]
+                if not task_ids:
+                    print("no tasks parked in DEFER_TO_USER")
+                    return 0
+                results = _defer_sweep(store, task_ids)
+                granted = 0
+                for task_id, ok, reason in results:
+                    print(f"{'RESUMED ' if ok else 'REFUSED '}{task_id}: {reason}")
+                    granted += int(ok)
+                print(f"{granted}/{len(results)} resumed")
+                # A named --task-id that was refused is worth a non-zero
+                # exit (mirrors queue-redrive); --all sweeps expect some
+                # refusals -- an owner-decision park is not a defect.
+                return 1 if (args.task_id and granted == 0) else 0
 
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc
