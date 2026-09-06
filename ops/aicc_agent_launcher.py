@@ -61,6 +61,13 @@ MODEL_AUTH_SOURCES = {
     # an unknown executor into a clean LaunchRefused (review findings on
     # 63cb072 and b311666).
 }
+# quality_band (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) needs no model credential
+# at all -- it never talks to a model. _prepare_agent_home skips the
+# credential copy for exactly these executors instead of refusing them the
+# way the MODEL_AUTH_SOURCES.get() guard refuses an unlisted one (that guard
+# is what keeps copilot disabled; this allowlist is the opposite polarity,
+# for a profile that never needed a credential in the first place).
+NO_MODEL_AUTH_EXECUTORS = frozenset({"quality_band"})
 MODEL_AUTH_TARGETS = {
     "claude": Path(".claude/.credentials.json"),
     "codex": Path(".codex/auth.json"),
@@ -73,9 +80,19 @@ EPHEMERAL_HOME_ROOT = Path("/run/aicc-agent-homes")
 # root-owned content manifest, so this path resolves to verified bytes or to
 # nothing at all -- never to a half-installed package tree.
 TOOLCHAIN_BIN = "/opt/aicc/toolchains/current/bin"
+# The trusted, reviewed copy of the impacted-test band script
+# (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS), deployed by the installer to this
+# fixed root-owned path -- never the candidate workspace's own copy of
+# scripts/ci/prepush/quality_band.sh. Every other publish-path check treats
+# candidate content strictly as data (see command_center/orchestrator/
+# publish.py); this profile is the one place that content is deliberately
+# EXECUTED, and only inside this broker's own isolated, unprivileged
+# transient unit -- never in the credentialed worker/publisher process.
+QUALITY_BAND_SCRIPT = "/usr/libexec/aicc-agent-quality-band"
 EXECUTOR_BINARIES = {
     "claude": f"{TOOLCHAIN_BIN}/claude",
     "codex": f"{TOOLCHAIN_BIN}/codex",
+    "quality_band": QUALITY_BAND_SCRIPT,
 }
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -97,7 +114,11 @@ MAX_OUTPUT_BYTES = 512 * 1024
 MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
-PROFILES = frozenset({"read_only", "trusted_development"})
+# "quality_band" is a third, distinct kind of profile: not a permission level
+# for an LLM run (the other two), but the allowlisted fixed-script impacted-
+# test run (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS). _load_manifest enforces that
+# it is paired only with the "quality_band" executor.
+PROFILES = frozenset({"read_only", "trusted_development", "quality_band"})
 MODEL_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 RUN_ID_RE = re.compile(r"[a-f0-9]{32}")
 BROKER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/]{1,200}\.service")
@@ -224,6 +245,8 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
         raise LaunchRefused("executor is not allowlisted")
     if value["profile"] not in PROFILES:
         raise LaunchRefused("profile is not allowlisted")
+    if (value["executor"] == "quality_band") != (value["profile"] == "quality_band"):
+        raise LaunchRefused("quality_band executor and profile must be paired")
     prompt = value["prompt"]
     if not isinstance(prompt, str) or not prompt or "\x00" in prompt:
         raise LaunchRefused("prompt must be a non-empty NUL-free string")
@@ -387,7 +410,10 @@ def _validated_workspace(value: str, roots: tuple[Path, ...]) -> Path:
 def _validate_environment_file(path: Path, executor: str) -> bool:
     if not _private_agent_environment(path, optional=True):
         return False
-    allowed = COMMON_AGENT_ENV_KEYS | PROVIDER_AGENT_ENV_KEYS[executor]
+    # .get(): quality_band has no provider-specific key set at all (it is
+    # never called with a provider env file -- see the env_files selection in
+    # _systemd_command -- but stays defensive rather than relying on that).
+    allowed = COMMON_AGENT_ENV_KEYS | PROVIDER_AGENT_ENV_KEYS.get(executor, frozenset())
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -440,47 +466,57 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
         auth_gid = grp.getgrnam("aicc-agent-auth").gr_gid
     except KeyError as exc:
         raise LaunchRefused("aicc-agent-auth group does not exist") from exc
-    source = MODEL_AUTH_SOURCES.get(executor)
-    if source is None:
-        raise LaunchRefused(f"no model auth source for executor {executor!r}")
-    source_payload = _read_exact_protected_file(
-        source, expected_uid=0, expected_gid=0, exact_mode=0o600
-    )
+    needs_model_auth = executor not in NO_MODEL_AUTH_EXECUTORS
+    source_payload: bytes | None = None
+    if needs_model_auth:
+        source = MODEL_AUTH_SOURCES.get(executor)
+        if source is None:
+            raise LaunchRefused(f"no model auth source for executor {executor!r}")
+        source_payload = _read_exact_protected_file(
+            source, expected_uid=0, expected_gid=0, exact_mode=0o600
+        )
 
     home = EPHEMERAL_HOME_ROOT / run_id
     try:
         home.mkdir(mode=0o700)
-        target = home / MODEL_AUTH_TARGETS[executor]
-        target.parent.mkdir(mode=0o700, parents=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(target, flags, 0o660)
-        try:
-            os.fchmod(descriptor, 0o660)
-            os.fchown(descriptor, 0, auth_gid)
-            with os.fdopen(descriptor, "wb", closefd=False) as stream:
-                stream.write(source_payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            target_info = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(target_info.st_mode)
-                or target_info.st_nlink != 1
-                or target_info.st_uid != 0
-                or target_info.st_gid != auth_gid
-                # 0660: Claude/Codex rewrite their auth file on token
-                # refresh; 0640 broke refresh mid-run while the 0770 home
-                # let the agent replace the file anyway (review on 67a0a96).
-                or stat.S_IMODE(target_info.st_mode) != 0o660
-                or target_info.st_size != len(source_payload)
-            ):
-                raise LaunchRefused("ephemeral model auth target failed validation")
-        finally:
-            os.close(descriptor)
-        for path in (home, target.parent):
-            os.chown(path, 0, auth_gid)
-            os.chmod(path, 0o770)
+        if needs_model_auth:
+            assert source_payload is not None
+            target = home / MODEL_AUTH_TARGETS[executor]
+            target.parent.mkdir(mode=0o700, parents=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(target, flags, 0o660)
+            try:
+                os.fchmod(descriptor, 0o660)
+                os.fchown(descriptor, 0, auth_gid)
+                with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                    stream.write(source_payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                target_info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(target_info.st_mode)
+                    or target_info.st_nlink != 1
+                    or target_info.st_uid != 0
+                    or target_info.st_gid != auth_gid
+                    # 0660: Claude/Codex rewrite their auth file on token
+                    # refresh; 0640 broke refresh mid-run while the 0770 home
+                    # let the agent replace the file anyway (review on 67a0a96).
+                    or stat.S_IMODE(target_info.st_mode) != 0o660
+                    or target_info.st_size != len(source_payload)
+                ):
+                    raise LaunchRefused("ephemeral model auth target failed validation")
+            finally:
+                os.close(descriptor)
+            for path in (home, target.parent):
+                os.chown(path, 0, auth_gid)
+                os.chmod(path, 0o770)
+        else:
+            # No credential of any kind for this executor (VOYN-W0-AICC-
+            # SANDBOX-PREPUSH-TESTS): an empty, still non-world-readable home.
+            os.chown(home, 0, auth_gid)
+            os.chmod(home, 0o770)
     except (FileExistsError, OSError) as exc:
         shutil.rmtree(home, ignore_errors=True)
         raise LaunchRefused("cannot prepare ephemeral model home") from exc
@@ -823,6 +859,13 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
     prompt = manifest["prompt"]
     model = manifest["model"]
     binary = EXECUTOR_BINARIES[executor]
+    if executor == "quality_band":
+        # Fixed command, full stop (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS): the
+        # manifest's prompt/model are caller-supplied and therefore never
+        # trusted to shape an argv that runs candidate code. Nothing from the
+        # manifest reaches this command; it is exactly the trusted script
+        # path resolved via EXECUTOR_BINARIES, with no arguments at all.
+        return [binary]
     if executor == "claude":
         command = [
             binary,
@@ -911,6 +954,11 @@ def _systemd_command(
 ) -> list[str]:
     executor = manifest["executor"]
     timeout = int(manifest["timeout_seconds"])
+    # quality_band never talks to a model or a remote: no model-auth group,
+    # no network address family at all (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS).
+    # The other two profiles keep AF_INET/AF_INET6 -- their CLIs must reach
+    # the model API.
+    is_quality_band = executor == "quality_band"
     # No nesting hazard in this list: EPHEMERAL_HOME_ROOT is
     # /run/aicc-agent-homes -- a SIBLING of /run/aicc-agent-launcher, not a
     # child, so systemd never overmounts a parent before lstat'ing a nested
@@ -949,7 +997,26 @@ def _systemd_command(
         "--setenv=GIT_CONFIG_GLOBAL=/dev/null",
         "--setenv=GIT_TERMINAL_PROMPT=0",
         "--setenv=GCM_INTERACTIVE=never",
-        "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
+        *(
+            # quality_band.sh normally cds relative to its OWN path
+            # (interactive/agent-sandbox use, where it runs from within the
+            # tree it tests). Here it runs from its trusted deployed copy
+            # (EXECUTOR_BINARIES["quality_band"]), which has no such tree
+            # beside it -- this override points it at the one tree that
+            # matters, the bind-mounted candidate workspace.
+            ["--setenv=VOYN_QUALITY_BAND_REPO_ROOT=/workspace"]
+            if is_quality_band
+            else []
+        ),
+        (
+            "--property=SupplementaryGroups=aicc-workspace"
+            if is_quality_band
+            # aicc-agent-auth grants access to the ephemeral model-credential
+            # copy; quality_band's ephemeral home never carries one, so the
+            # group would be dead weight -- omitted rather than granted and
+            # unused.
+            else "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth"
+        ),
         "--property=UMask=0007",
         "--property=NoNewPrivileges=yes",
         "--property=CapabilityBoundingSet=",
@@ -971,7 +1038,17 @@ def _systemd_command(
         "--property=LockPersonality=yes",
         "--property=KeyringMode=private",
         "--property=RemoveIPC=yes",
-        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        (
+            # No network at all for quality_band: it runs a local test suite
+            # against the bind-mounted workspace, nothing else. AF_UNIX stays
+            # so systemd's own service plumbing keeps working; IPAddressDeny
+            # is belt-and-suspenders against any AF_UNIX-permitted path that
+            # still carries IP traffic (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS).
+            "--property=RestrictAddressFamilies=AF_UNIX"
+            if is_quality_band
+            else "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+        ),
+        *(["--property=IPAddressDeny=any"] if is_quality_band else []),
         "--property=KillMode=control-group",
         "--property=Delegate=no",
         "--property=MemoryMax=6G",
@@ -988,7 +1065,16 @@ def _systemd_command(
         f"--property=BindPaths={agent_home}:/agent-home",
         "--property=ReadWritePaths=/workspace /agent-home",
     ]
-    for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor]):
+    # quality_band has no provider env file at all (PROVIDER_ENV_FILES has no
+    # entry for it, by design: it authenticates to nothing). COMMON_ENV_FILE
+    # alone can still carry locale/cert settings, none of which are a
+    # credential.
+    env_files = (
+        (COMMON_ENV_FILE,)
+        if is_quality_band
+        else (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor])
+    )
+    for env_file in env_files:
         if _validate_environment_file(env_file, executor):
             command.append(f"--property=EnvironmentFile={env_file}")
     command += ["--", *_provider_command(manifest)]

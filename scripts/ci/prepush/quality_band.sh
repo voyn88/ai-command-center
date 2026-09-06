@@ -19,18 +19,32 @@
 # missing .venv therefore defer to CI instead of blocking the push - the
 # band must never be able to reduce coverage, only to fail sooner.
 #
-# TRUST BOUNDARY (v2): this script is for contexts that already execute the
-# tree's own code -- an interactive writer (`make prepush`) or the agent's
-# sandboxed run. `publish_run` deliberately does NOT execute it (it is
-# candidate content in that credentialed context -- verification finding on
-# 254154a); the publish side runs only the non-executing ruff gate from the
-# worker's trusted interpreter (`_static_quality_gate` in
-# command_center/orchestrator/publish.py).
+# TRUST BOUNDARY (v3, VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS): this script is for
+# contexts that already execute the tree's own code -- an interactive writer
+# (`make prepush`), the agent's own sandboxed run, or the root broker's
+# isolated "quality_band" launcher profile (ops/aicc_agent_launcher.py),
+# which runs a TRUSTED copy of this exact file (deployed to
+# /usr/libexec/aicc-agent-quality-band) against the candidate workspace
+# inside its own unprivileged transient unit -- never inside `publish_run`'s
+# credentialed process. `publish_run` (`command_center/orchestrator/
+# publish.py`) itself still never executes this script directly (that
+# remains the v2 rejection on 254154a: candidate-controlled host command
+# execution in the credentialed context); it only sends a fixed manifest to
+# the broker over the launcher's Unix socket and reads back an exit code --
+# see `_quality_band_isolated_gate` in publish.py and
+# `agent_runner.run_quality_band_gate`. The publish side additionally still
+# runs the non-executing ruff gate from the worker's trusted interpreter
+# (`_static_quality_gate`).
 #
 # VOYN_QUALITY_BAND=off bypasses the band; the bypass is printed, never
 # silent. VOYN_QUALITY_BAND_BASE overrides the selection base.
+# VOYN_QUALITY_BAND_REPO_ROOT overrides the tree this script tests: it
+# normally `cd`s relative to its own path (correct when it runs from inside
+# the tree it tests), but the broker's trusted deployed copy has no such
+# tree beside it, so the broker points this explicitly at the bind-mounted
+# candidate workspace (`/workspace`) instead.
 set -uo pipefail
-cd "$(dirname "$0")/../../.."
+cd "${VOYN_QUALITY_BAND_REPO_ROOT:-$(dirname "$0")/../../..}"
 
 say() { echo "QUALITY_BAND: $*"; }
 

@@ -1128,3 +1128,163 @@ def test_independent_review_is_model_only_for_both_review_providers():
     assert "--available-tools=" in copilot
     assert "--allow-tool" not in copilot
     assert "--allow-all-tools" not in copilot
+
+
+# --------------------------------------------------------------------------
+# quality_band gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) -- the isolated
+# impacted-test launcher profile publish_run calls before the writer lease.
+# --------------------------------------------------------------------------
+
+
+def test_build_quality_band_manifest_is_a_fixed_placeholder_payload(tmp_path):
+    manifest = agent_runner.build_quality_band_manifest(
+        repository_path=tmp_path, timeout_seconds=123
+    )
+    assert manifest["version"] == 1
+    assert manifest["workspace"] == str(tmp_path.resolve(strict=True))
+    assert manifest["executor"] == "quality_band"
+    assert manifest["profile"] == "quality_band"
+    assert manifest["model"] is None
+    assert manifest["timeout_seconds"] == 123
+    # prompt is present (the manifest schema requires a non-empty string) but
+    # is an unused placeholder -- the broker's quality_band executor ignores
+    # it outright and always runs a fixed, argument-free command.
+    assert isinstance(manifest["prompt"], str) and manifest["prompt"]
+
+
+def test_quality_band_gate_defers_when_principal_isolation_is_not_required(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: False)
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("must not spawn the broker when isolation is off")
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", _unexpected)
+
+    refused, detail = agent_runner.run_quality_band_gate(tmp_path)
+
+    assert refused is False
+    assert detail == ""
+
+
+def test_quality_band_gate_defers_when_the_profile_is_not_deployed(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_executor_preflight",
+        lambda executor: (False, "not deployed"),
+    )
+
+    def _unexpected(*args, **kwargs):
+        raise AssertionError("must not spawn the broker when the profile is absent")
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", _unexpected)
+
+    refused, detail = agent_runner.run_quality_band_gate(tmp_path)
+
+    assert refused is False
+    assert detail == ""
+
+
+def _stub_isolation_available(monkeypatch):
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+
+
+def test_quality_band_gate_passes_on_a_clean_isolated_run(monkeypatch, tmp_path):
+    _stub_isolation_available(monkeypatch)
+    captured = {}
+
+    def _fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs.get("input")
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", _fake_run)
+
+    refused, detail = agent_runner.run_quality_band_gate(tmp_path)
+
+    assert refused is False
+    assert detail == ""
+    assert captured["command"] == [agent_runner.PRINCIPAL_ISOLATION_LAUNCHER, "--client"]
+    manifest = agent_runner.json.loads(captured["input"])
+    assert manifest["executor"] == "quality_band"
+    assert manifest["workspace"] == str(tmp_path.resolve(strict=True))
+    # The client env is the same closed allowlist run_claude_code's isolated
+    # path uses -- no publisher/lease/GitHub credential can reach it.
+    assert set(captured["env"]) == {"PATH", "LANG", "LC_ALL"}
+
+
+def test_quality_band_gate_refuses_on_a_red_isolated_run(monkeypatch, tmp_path):
+    _stub_isolation_available(monkeypatch)
+
+    def _fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="QUALITY_BAND: fail phase=tests\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", _fake_run)
+
+    refused, detail = agent_runner.run_quality_band_gate(tmp_path)
+
+    assert refused is True
+    assert "fail phase=tests" in detail
+
+
+def test_quality_band_gate_defers_on_broker_infrastructure_failure(monkeypatch, tmp_path):
+    """Exit 125 with the transport-envelope marker is the broker refusing to
+    even attempt the run (quarantine, socket unavailable, ...) -- not a
+    finding in the candidate tree. Matches `RunResult.is_principal_isolation_
+    error`'s exact envelope check, never a substring search over content the
+    trusted script produced."""
+    _stub_isolation_available(monkeypatch)
+
+    def _fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            125,
+            stdout="",
+            stderr=f"{agent_runner._PRINCIPAL_ISOLATION_FAILURE}: workspace is quarantined\n",
+        )
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", _fake_run)
+
+    refused, detail = agent_runner.run_quality_band_gate(tmp_path)
+
+    assert refused is False
+    assert detail == ""
+
+
+def test_quality_band_gate_refuses_on_timeout_like_the_sibling_gates(monkeypatch, tmp_path):
+    _stub_isolation_available(monkeypatch)
+
+    def _fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", _fake_run)
+
+    refused, detail = agent_runner.run_quality_band_gate(tmp_path)
+
+    assert refused is True
+    assert "timeout" in detail
+
+
+def test_quality_band_gate_defers_when_the_launcher_binary_is_missing(monkeypatch, tmp_path):
+    _stub_isolation_available(monkeypatch)
+
+    def _fake_run(command, **kwargs):
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(agent_runner.subprocess, "run", _fake_run)
+
+    refused, detail = agent_runner.run_quality_band_gate(tmp_path)
+
+    assert refused is False
+    assert detail == ""

@@ -41,6 +41,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from command_center import agent_runner
 from command_center.worker import lease_client
 
 _PR_VIEW_DECODE_ERRORS = (TypeError, ValueError)
@@ -411,6 +412,44 @@ def _leak_guard_gate(
     )
 
 
+def _quality_band_isolated_gate(repo_path: Path, head_sha: str) -> PublishResult | None:
+    """Pre-push IMPACTED-TEST gate under the isolated principal
+    (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS). Returns a refusal ``PublishResult``
+    on a red result, ``None`` to proceed.
+
+    `_static_quality_gate` above deliberately never executes candidate code
+    in this credentialed process -- that trust boundary is unchanged here.
+    This gate does not execute anything either: it hands a fixed manifest to
+    the root broker over its Unix socket (`agent_runner.run_quality_band_gate`,
+    the same `--client` protocol `run_claude_code` uses to launch
+    `claude`/`codex`) and reads back an exit code. The candidate's own tests
+    run only inside the broker's unprivileged transient unit, under the
+    trusted, reviewed copy of `scripts/ci/prepush/quality_band.sh` the
+    broker itself resolves (`EXECUTOR_BINARIES["quality_band"]` in
+    ops/aicc_agent_launcher.py) -- never the candidate worktree's copy.
+
+    Same opt-in and bypass contract as the ruff gate: repositories without
+    `scripts/ci/prepush/` are unaffected, and `VOYN_QUALITY_BAND=off` skips
+    both. Also fails open when principal isolation (or its `quality_band`
+    profile) is not deployed on this host, or the broker reports an
+    infrastructure failure rather than a candidate-tree finding: this
+    remains an economy device layered in front of the authoritative CI
+    suite, never a wider gate than CI.
+    """
+    if os.environ.get("VOYN_QUALITY_BAND") == "off":
+        return None
+    if not (repo_path / "scripts" / "ci" / "prepush").is_dir():
+        return None
+    refused, detail = agent_runner.run_quality_band_gate(repo_path)
+    if not refused:
+        return None
+    return PublishResult(
+        ok=False,
+        head_sha=head_sha,
+        reason=f"quality_band_failed: {detail}",
+    )
+
+
 def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
     """Acquire the lease, push a branch, open a PR. Idempotent on the branch
     name (``backlog/<task>``): a re-run force-updates the same branch and
@@ -461,29 +500,34 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
                 ok=False, reason="head_not_descendant_of_pinned_base", head_sha=head_sha
             )
 
-    # Pre-push static quality gate (VOYN-W0-AICC-PREPUSH-FAST-GATE, v2 after
-    # the verification REJECT on 254154a): red PR CI runs cost an agent a
+    # Pre-push quality gates (VOYN-W0-AICC-PREPUSH-FAST-GATE, v2 after the
+    # verification REJECT on 254154a; impacted tests added by
+    # VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS): red PR CI runs cost an agent a
     # full diagnose->fix->SHA->CI->review round-trip, so the cheap part of
-    # that verdict is taken here, before the push. v2 is deliberately
-    # NON-EXECUTING. The v1 ran `scripts/ci/prepush/quality_band.sh` FROM
-    # THE CANDIDATE WORKTREE inside this credentialed worker context --
+    # that verdict is taken here, before the push.
+    #
+    # `_static_quality_gate` stays deliberately NON-EXECUTING in THIS
+    # process. The v1 ran `scripts/ci/prepush/quality_band.sh` FROM THE
+    # CANDIDATE WORKTREE inside this credentialed worker context --
     # candidate-controlled host command execution (verification finding 1),
     # and its env `setdefault` let an inherited variable override the
-    # validated selection base (finding 2). Candidate code only ever
-    # executes inside the agent's isolated principal, so the publish side
-    # keeps exactly the checks that treat the tree as DATA (ruff: parse +
-    # lint, which also catches syntax errors), run by the worker's own
-    # trusted interpreter with explicit argv and a minimal explicit env --
-    # nothing inherited or worktree-resident can redirect them. NOTHING on
-    # this publish path runs the impacted-TEST phase: enforcing it for
-    # agents requires an allowlisted profile in the privileged
-    # principal-isolation launcher (candidate code may only execute under
-    # the isolated principal), which is VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS
-    # -- a separate security-designed task. Until it lands, tests pre-push
-    # exist only in interactive `make prepush`, and the authoritative
-    # enforcement remains the required CI suite. `already_durable`
-    # redeliveries skip the gate: that head's verdict was taken before the
-    # original push.
+    # validated selection base (finding 2). Candidate code must never
+    # execute in this process; `_static_quality_gate` keeps exactly the
+    # checks that treat the tree as DATA (ruff: parse + lint, which also
+    # catches syntax errors), run by the worker's own trusted interpreter
+    # with explicit argv and a minimal explicit env -- nothing inherited or
+    # worktree-resident can redirect it.
+    #
+    # `_quality_band_isolated_gate` is the impacted-TEST phase that
+    # `_static_quality_gate` cannot cover without executing candidate code.
+    # It still never executes anything in this process: it hands a fixed
+    # manifest to the root broker's allowlisted `quality_band` profile
+    # (ops/aicc_agent_launcher.py) over a Unix socket, and the candidate's
+    # own tests run only inside the broker's separate unprivileged transient
+    # unit -- the same isolation boundary that already runs the agent's own
+    # coding session, never this credentialed publish process. `already_
+    # durable` redeliveries skip all three gates: that head's verdict was
+    # taken before the original push.
     if not already_durable:
         gate_failure = _static_quality_gate(repo_path, head_sha)
         if gate_failure is not None:
@@ -491,6 +535,9 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
         leak_failure = _leak_guard_gate(repo_path, head_sha, base_sha_value)
         if leak_failure is not None:
             return leak_failure
+        quality_band_failure = _quality_band_isolated_gate(repo_path, head_sha)
+        if quality_band_failure is not None:
+            return quality_band_failure
 
     branch = f"backlog/{cfg.task}"
     if already_durable:

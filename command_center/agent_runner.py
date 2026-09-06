@@ -140,6 +140,12 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # b311666). The retry-loop hazard that once motivated listing it is
     # closed in handlers instead: an unavailable executor falls through the
     # cascade to the next link rather than respinning forever.
+    # The trusted quality-band script (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS),
+    # kept in lockstep with QUALITY_BAND_SCRIPT / EXECUTOR_BINARIES in
+    # ops/aicc_agent_launcher.py -- the broker re-validates this path itself;
+    # this entry only lets a preflight avoid spending a queue attempt when
+    # the deploy is visibly incomplete.
+    "quality_band": "/usr/libexec/aicc-agent-quality-band",
 }
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 
@@ -438,6 +444,33 @@ def build_principal_isolation_manifest(
     }
 
 
+def build_quality_band_manifest(
+    *,
+    repository_path: Path,
+    timeout_seconds: int,
+) -> dict[str, object]:
+    """Build the fixed-command manifest for the "quality_band" launcher
+    profile (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS).
+
+    Unlike `build_principal_isolation_manifest`, this never carries agent
+    output or a caller-chosen model: `prompt`/`model` are unused placeholders
+    the broker's `quality_band` executor ignores outright -- it always runs
+    its own trusted script with a fixed, argument-free command (see
+    `_provider_command` in ops/aicc_agent_launcher.py). `workspace` is the
+    only manifest field this profile actually uses.
+    """
+    return {
+        "version": 1,
+        "run_id": uuid.uuid4().hex,
+        "workspace": str(repository_path.resolve(strict=True)),
+        "executor": "quality_band",
+        "profile": "quality_band",
+        "prompt": "quality-band",
+        "model": None,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
 def principal_isolation_required() -> bool:
     return os.environ.get(PRINCIPAL_ISOLATION_REQUIRED_ENV) == "required"
 
@@ -497,6 +530,80 @@ MAX_TIMEOUT_SECONDS = 3600
 
 class RunnerError(Exception):
     """Raised when a run cannot even be attempted (validation failure)."""
+
+
+def run_quality_band_gate(
+    repository_path: Path, *, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+) -> tuple[bool, str]:
+    """Run the trusted, fixed impacted-test script against `repository_path`
+    under the isolated `aicc-agent` principal, and report whether the
+    candidate tree should be refused (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS).
+
+    This function itself never executes candidate content: it only sends a
+    manifest to the root broker over its Unix socket (`--client`, the exact
+    protocol `run_claude_code` already uses for `claude`/`codex`) and reads
+    back an exit code. The candidate's own code runs solely inside the
+    broker's unprivileged transient unit.
+
+    Returns `(False, "")` both when the tree is genuinely clean AND when
+    principal isolation or its `quality_band` profile is unavailable on this
+    host, or the broker itself failed for an infrastructure reason -- an
+    economy device that can only fail a publish *sooner* than CI, never
+    replace it (see scripts/ci/prepush/README.md). Only an actual red result
+    from the isolated run -- the trusted script's own non-zero exit --
+    refuses, returning `(True, <detail>)`.
+    """
+    if not principal_isolation_required():
+        return False, ""
+    available, _detail = principal_executor_preflight("quality_band")
+    if not available:
+        return False, ""
+    try:
+        manifest = build_quality_band_manifest(
+            repository_path=repository_path, timeout_seconds=timeout_seconds
+        )
+    except (OSError, RunnerError):
+        return False, ""
+    try:
+        run = subprocess.run(
+            [PRINCIPAL_ISOLATION_LAUNCHER, "--client"],
+            input=json.dumps(manifest, separators=(",", ":")) + "\n",
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_principal_launcher_environment(),
+            timeout=timeout_seconds + 60,
+        )
+    except subprocess.TimeoutExpired:
+        # Same convention as `_static_quality_gate`/`_leak_guard_gate` in
+        # publish.py: an explicit refusal, not a silent defer -- a hang here
+        # is exactly as informative as a red result.
+        return True, "quality_band_isolated_timeout"
+    except OSError:
+        # The launcher binary itself is missing/unexecutable: a deployment
+        # gap `principal_executor_preflight` above did not catch (it checks
+        # the quality_band SCRIPT path, not the launcher client). Missing
+        # tooling defers to CI, same as every other gate in this family.
+        return False, ""
+    if run.returncode == 0:
+        return False, ""
+    stdout = run.stdout or ""
+    stderr = run.stderr or ""
+    # Same transport-envelope match as `RunResult.is_principal_isolation_
+    # error`: exit 125, empty stdout, marker-prefixed stderr line -- never a
+    # substring search over content the trusted script itself produced.
+    if (
+        run.returncode == 125
+        and not stdout
+        and any(
+            line.startswith(f"{_PRINCIPAL_ISOLATION_FAILURE}:")
+            for line in stderr.splitlines()
+        )
+    ):
+        return False, ""
+    tail = (stdout + stderr).strip().splitlines()
+    detail = " | ".join(tail[-3:]) if tail else "no output"
+    return True, detail[:160]
 
 
 def claude_cli_available(binary: str | None = None) -> bool:
