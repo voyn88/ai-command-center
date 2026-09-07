@@ -26,14 +26,21 @@ final class AICCAppModel: ObservableObject {
     @Published private(set) var dialogs: [DialogSummary] = []
     @Published private(set) var connection: ConnectionState = .fixture
 
+    // Whether `snapshot` reflects a real, previously-observed picture (cache
+    // or a prior live fetch) rather than the demo fixture. Haptics must never
+    // fire by diffing real data against the fixture's placeholder tasks.
+    private var hasObservedRealSnapshot: Bool
+
     init() {
         // Start from the owner's last real picture when we have one; the
         // demo fixture is only the very-first-launch fallback.
         if let cached = SnapshotCache.load() {
             snapshot = cached
             connection = .offline
+            hasObservedRealSnapshot = true
         } else {
             snapshot = (try? Fixture.healthySnapshot()) ?? .preview
+            hasObservedRealSnapshot = false
         }
     }
 
@@ -83,10 +90,19 @@ final class AICCAppModel: ObservableObject {
 
         connection = .connecting
         let store = SnapshotRemoteStore(configuration: configuration)
+        // Only diff against a genuine prior picture; the demo fixture is not
+        // real data and must never be compared against a live fetch.
+        let previousSnapshot = hasObservedRealSnapshot ? snapshot : nil
         do {
             snapshot = try await store.fetchSnapshot(revision: snapshot.revision)
             connection = .live
+            hasObservedRealSnapshot = true
             SnapshotCache.save(snapshot)
+            // Ambient haptics: a small, criticality-aware nudge per incident
+            // or workflow-stage change, never on the very first load.
+            for cue in HapticAdvisor.cues(previous: previousSnapshot, current: snapshot) {
+                HapticPlayer.play(cue.severity)
+            }
         } catch GatewayError.notModified {
             connection = .live
         } catch GatewayError.unauthorized {

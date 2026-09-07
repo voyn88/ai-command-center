@@ -86,6 +86,78 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+private func makeTask(id: String, title: String = "T", blocker: String? = nil, state: TaskState? = nil) -> AICCNativeCore.Task {
+    AICCNativeCore.Task(id: id, title: title, blocker: blocker, state: state, evidence: DeliveryEvidence(headSHA: nil, pullRequest: nil, ci: .unknown, acceptance: .unknown, mergedSHA: nil, deployedSHA: nil))
+}
+
+private func makeSnapshot(tasks: [AICCNativeCore.Task]) -> Snapshot {
+    Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: tasks, lanes: [], events: [])
+}
+
+@Test func hapticAdvisorStaysSilentOnFirstLoad() {
+    let current = makeSnapshot(tasks: [makeTask(id: "A", blocker: "boom")])
+    #expect(HapticAdvisor.cues(previous: nil, current: current).isEmpty)
+}
+
+@Test func hapticAdvisorStaysSilentWhenNothingChanges() {
+    let tasks = [makeTask(id: "A", state: .inProgress)]
+    let snapshot = makeSnapshot(tasks: tasks)
+    #expect(HapticAdvisor.cues(previous: snapshot, current: snapshot).isEmpty)
+}
+
+@Test func hapticAdvisorFlagsANewBlockerAsCritical() {
+    let previous = makeSnapshot(tasks: [makeTask(id: "A", state: .inProgress)])
+    let current = makeSnapshot(tasks: [makeTask(id: "A", blocker: "CI red", state: .inProgress)])
+    let cues = HapticAdvisor.cues(previous: previous, current: current)
+    #expect(cues.count == 1)
+    #expect(cues[0].severity == .critical)
+    #expect(cues[0].taskID == "A")
+}
+
+@Test func hapticAdvisorFlagsABrandNewTaskWithABlockerAsCritical() {
+    let previous = makeSnapshot(tasks: [])
+    let current = makeSnapshot(tasks: [makeTask(id: "A", blocker: "boom")])
+    let cues = HapticAdvisor.cues(previous: previous, current: current)
+    #expect(cues == [HapticCue(severity: .critical, taskID: "A", reason: "Новая задача с блокером: T")])
+}
+
+@Test func hapticAdvisorIgnoresBrandNewTaskWithoutABlocker() {
+    let previous = makeSnapshot(tasks: [])
+    let current = makeSnapshot(tasks: [makeTask(id: "A", state: .backlog)])
+    #expect(HapticAdvisor.cues(previous: previous, current: current).isEmpty)
+}
+
+@Test func hapticAdvisorCollapsesMultipleRoutineChangesIntoOneCueToAvoidDistraction() {
+    let previous = makeSnapshot(tasks: [
+        makeTask(id: "A", state: .inProgress),
+        makeTask(id: "B", state: .next),
+        makeTask(id: "C", blocker: "flaky test", state: .inProgress),
+    ])
+    let current = makeSnapshot(tasks: [
+        makeTask(id: "A", state: .review),   // notice
+        makeTask(id: "B", state: .deferred),  // warning
+        makeTask(id: "C", state: .inProgress), // blocker cleared -> warning
+    ])
+    let cues = HapticAdvisor.cues(previous: previous, current: current)
+    #expect(cues.count == 1)
+    #expect(cues[0].severity == .warning)
+}
+
+@Test func hapticAdvisorNeverSuppressesCriticalCuesEvenAlongsideRoutineOnes() {
+    let previous = makeSnapshot(tasks: [
+        makeTask(id: "A", state: .inProgress),
+        makeTask(id: "B", state: .inProgress),
+    ])
+    let current = makeSnapshot(tasks: [
+        makeTask(id: "A", blocker: "prod incident", state: .inProgress),
+        makeTask(id: "B", state: .review),
+    ])
+    let cues = HapticAdvisor.cues(previous: previous, current: current)
+    #expect(cues.count == 2)
+    #expect(cues.contains { $0.severity == .critical && $0.taskID == "A" })
+    #expect(cues.contains { $0.severity == .notice && $0.taskID == "B" })
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
