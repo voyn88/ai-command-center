@@ -167,6 +167,155 @@ def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
             launcher._load_manifest((json.dumps(poisoned) + "\n").encode())
 
 
+def test_quality_band_executor_and_profile_must_be_paired(launcher, tmp_path):
+    """VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS: the quality_band executor and the
+    quality_band profile only ever admit each other -- one without the other
+    is refused rather than silently falling back to some other combination
+    of model-auth/network grants."""
+    mismatched_executor = _manifest(
+        tmp_path, executor="quality_band", profile="trusted_development"
+    )
+    with pytest.raises(launcher.LaunchRefused, match="paired"):
+        launcher._load_manifest((json.dumps(mismatched_executor) + "\n").encode())
+
+    mismatched_profile = _manifest(
+        tmp_path, executor="codex", profile="quality_band"
+    )
+    with pytest.raises(launcher.LaunchRefused, match="paired"):
+        launcher._load_manifest((json.dumps(mismatched_profile) + "\n").encode())
+
+    paired = _manifest(
+        tmp_path,
+        executor="quality_band",
+        profile="quality_band",
+        prompt="quality-band-gate",
+        model=None,
+    )
+    assert launcher._load_manifest((json.dumps(paired) + "\n").encode()) == paired
+
+
+def test_quality_band_provider_command_is_fixed_argv(launcher, tmp_path):
+    """No manifest-derived argv at all: a hostile `prompt`/`model` value must
+    not be able to add a single argument to the trusted script's argv."""
+    manifest = _manifest(
+        tmp_path,
+        executor="quality_band",
+        profile="quality_band",
+        prompt="; rm -rf / #",
+        model="attacker-controlled-model",
+    )
+    assert launcher._provider_command(manifest) == [
+        launcher.EXECUTOR_BINARIES["quality_band"]
+    ]
+
+
+def test_quality_band_systemd_properties_deny_network_and_the_auth_group(
+    launcher, monkeypatch, tmp_path
+):
+    """The quality_band transient unit gets no model-credential group and no
+    network beyond the broker's own AF_UNIX control socket -- IPAddressDeny
+    is the belt-and-braces companion to the narrowed
+    RestrictAddressFamilies."""
+    monkeypatch.setattr(
+        launcher, "_validate_environment_file", lambda *args, **kwargs: False
+    )
+    manifest = _manifest(
+        tmp_path, executor="quality_band", profile="quality_band"
+    )
+    command = launcher._systemd_command(
+        manifest,
+        Path("/run/aicc-agent-homes/qband"),
+        "aicc-agent-qband.service",
+        "aicc-agent-launcher@qband.service",
+        tmp_path.parent,
+        tmp_path,
+    )
+    assert "--property=SupplementaryGroups=aicc-workspace" in command
+    assert "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth" not in command
+    assert "--property=RestrictAddressFamilies=AF_UNIX" in command
+    assert (
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+        not in command
+    )
+    assert "--property=IPAddressDeny=any" in command
+
+
+def test_non_quality_band_systemd_properties_are_unchanged(
+    launcher, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        launcher, "_validate_environment_file", lambda *args, **kwargs: False
+    )
+    manifest = _manifest(tmp_path, executor="codex", profile="trusted_development")
+    command = launcher._systemd_command(
+        manifest,
+        Path("/run/aicc-agent-homes/codex"),
+        "aicc-agent-codex.service",
+        "aicc-agent-launcher@codex.service",
+        tmp_path.parent,
+        tmp_path,
+    )
+    assert "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth" in command
+    assert (
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+        in command
+    )
+    assert "--property=IPAddressDeny=any" not in command
+
+
+def test_prepare_agent_home_quality_band_home_matches_its_granted_group(
+    launcher, monkeypatch, tmp_path
+):
+    """Regression for the rejected-PR review finding: `_systemd_command`
+    deliberately omits `aicc-agent-auth` from `SupplementaryGroups` for
+    `quality_band` (it needs no model credential), so the ephemeral home
+    this profile is given must be owned by the group it actually keeps
+    (`aicc-workspace`) -- reusing the model-auth group's gid here regardless
+    left the transient unit unable to even traverse its own mode-0770
+    `/agent-home`, a functional regression that would break every
+    quality_band launch."""
+    monkeypatch.setattr(launcher, "EPHEMERAL_HOME_ROOT", tmp_path)
+    gids = {"aicc-workspace": 4242, "aicc-agent-auth": 9999}
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=gids[name])
+    )
+    chowned: list[tuple[str, int, int]] = []
+    monkeypatch.setattr(
+        launcher.os,
+        "chown",
+        lambda path, uid, gid: chowned.append((str(path), uid, gid)),
+    )
+
+    home = launcher._prepare_agent_home("quality_band", "b" * 32)
+
+    assert home == tmp_path / ("b" * 32)
+    assert chowned == [(str(home), 0, 4242)]
+
+
+def test_quality_band_exit_code_125_is_remapped_away_from_the_broker_sentinel(
+    launcher,
+):
+    """125 is the broker's OWN reserved infra-failure sentinel
+    (`_serve_connected_socket`'s `except` clause, `_client`'s local
+    equivalent). Unlike every other executor, quality_band's trusted script
+    wraps and runs the candidate's OWN test files, so a candidate could
+    engineer its own test run to exit exactly 125 to be misread as a broker
+    failure (defer) rather than a genuine red run (refuse) -- review finding
+    on the rejected VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS PR #776. The remap
+    must apply regardless of what the executed process printed."""
+    assert launcher._executed_exit_code("quality_band", 125) == 124
+    assert launcher._executed_exit_code("quality_band", 0) == 0
+    assert launcher._executed_exit_code("quality_band", 1) == 1
+
+
+def test_non_quality_band_exit_codes_are_never_remapped(launcher):
+    """125 stays meaningful as an ordinary exit code for the model
+    executors, whose argv the launcher fully controls and never wraps
+    arbitrary candidate-authored test execution."""
+    assert launcher._executed_exit_code("codex", 125) == 125
+    assert launcher._executed_exit_code("claude", 125) == 125
+
+
 @pytest.mark.parametrize(
     ("executor", "task_type"),
     [

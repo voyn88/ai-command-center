@@ -1076,9 +1076,7 @@ def test_command_builders_table_covers_every_wired_executor():
         if name == "openai_http":
             # The bridge is model-only by construction and demands an
             # explicit provider/model; "review" would rightly be refused.
-            command = builder(
-                "x", task_type="independent_review", model="groq/m"
-            )
+            command = builder("x", task_type="independent_review", model="groq/m")
         else:
             command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
@@ -1170,9 +1168,7 @@ def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
         return _Proc()
 
     monkeypatch.setattr(agent_runner.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(
-        agent_runner, "principal_isolation_required", lambda: False
-    )
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: False)
     monkeypatch.setenv("AICC_REVIEW_ANTHROPIC_API_KEY", "sk-ant-meter")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
@@ -1203,3 +1199,172 @@ def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
 
     monkeypatch.delenv("AICC_REVIEW_ANTHROPIC_API_KEY")
     assert "ANTHROPIC_API_KEY" not in run("independent_review")
+
+
+# --------------------------------------------------------------------------
+# quality_band gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS): the executable
+# half of the impacted-test sandbox gate, run under the isolated principal.
+# --------------------------------------------------------------------------
+
+
+def test_build_quality_band_manifest_is_fixed_and_never_derived_from_candidate(
+    tmp_path,
+):
+    manifest = agent_runner.build_quality_band_manifest(
+        repository_path=tmp_path, timeout_seconds=60
+    )
+    assert manifest["executor"] == agent_runner.QUALITY_BAND_EXECUTOR
+    assert manifest["profile"] == agent_runner.QUALITY_BAND_PROFILE
+    assert manifest["workspace"] == str(tmp_path.resolve(strict=True))
+    assert manifest["timeout_seconds"] == 60
+    # prompt/model are inert for this executor (shared schema only); they
+    # must never encode anything read from the candidate tree.
+    assert manifest["model"] is None
+    assert isinstance(manifest["prompt"], str) and manifest["prompt"]
+
+
+def test_run_quality_band_gate_defers_when_principal_isolation_not_required(
+    monkeypatch, tmp_path
+):
+    """Not `is_principal_isolation_error` (that's the exact broker-transport
+    envelope, exit 125) -- this is the separate "launcher client never even
+    started" bucket (`status == "failed" and exit_code is None`) that
+    `_quality_band_sandbox_gate` also treats as a deferral."""
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: False)
+    result = agent_runner.run_quality_band_gate(repository_path=tmp_path)
+    assert result.status == "failed"
+    assert result.exit_code is None
+    assert not result.is_principal_isolation_error
+
+
+def test_run_quality_band_gate_defers_when_executor_not_deployed(monkeypatch, tmp_path):
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_executor_preflight",
+        lambda executor: (False, "not deployed"),
+    )
+    result = agent_runner.run_quality_band_gate(repository_path=tmp_path)
+    assert result.status == "failed"
+    assert result.exit_code is None
+    assert not result.is_principal_isolation_error
+
+
+def _fake_launcher(tmp_path, body):
+    """A stand-in for the isolated launcher client: a real, executable
+    script so `run_quality_band_gate`'s own `subprocess.run` call (argv,
+    stdin, capture_output, timeout) is exercised unmodified — only the
+    launcher's fixed path is redirected."""
+    script = tmp_path / "fake-launcher-client"
+    script.write_text(f"#!/usr/bin/env python3\n{body}\n")
+    script.chmod(0o755)
+    return script
+
+
+def _prep_gate(monkeypatch, tmp_path, body):
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "PRINCIPAL_ISOLATION_LAUNCHER",
+        str(_fake_launcher(tmp_path, body)),
+    )
+
+
+def test_run_quality_band_gate_clean_run_uses_the_restricted_env(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _prep_gate(
+        monkeypatch,
+        tmp_path,
+        "import os, sys\n"
+        "assert set(os.environ) == {'PATH', 'LANG', 'LC_ALL'}, os.environ\n"
+        "sys.stdin.read()\n"
+        "sys.exit(0)\n",
+    )
+    result = agent_runner.run_quality_band_gate(repository_path=workspace)
+    assert result.status == "completed"
+    assert result.exit_code == 0
+    assert not result.is_principal_isolation_error
+
+
+def test_run_quality_band_gate_red_run_is_refused_not_deferred(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _prep_gate(
+        monkeypatch,
+        tmp_path,
+        "import sys\nsys.stdin.read()\n"
+        "sys.stdout.write('2 failed, 3 passed')\n"
+        "sys.exit(1)\n",
+    )
+    result = agent_runner.run_quality_band_gate(repository_path=workspace)
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert "2 failed" in result.stdout
+    assert not result.is_principal_isolation_error
+
+
+def test_run_quality_band_gate_times_out_and_fails_closed(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _prep_gate(
+        monkeypatch,
+        tmp_path,
+        "import sys, time\nsys.stdin.read()\ntime.sleep(30)\n",
+    )
+    result = agent_runner.run_quality_band_gate(
+        repository_path=workspace, timeout_seconds=0
+    )
+    assert result.status == "timed_out"
+    assert not result.is_principal_isolation_error
+
+
+def test_run_quality_band_gate_broker_transport_failure_is_deferred(
+    monkeypatch, tmp_path
+):
+    """The genuine broker-infra-failure envelope (exit 125, empty stdout, a
+    marker-prefixed stderr line) IS correctly recognized as a deferral."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _prep_gate(
+        monkeypatch,
+        tmp_path,
+        "import sys\nsys.stdin.read()\n"
+        f"sys.stderr.write({agent_runner._PRINCIPAL_ISOLATION_FAILURE!r} + "
+        "': broker socket unavailable\\n')\n"
+        "sys.exit(125)\n",
+    )
+    result = agent_runner.run_quality_band_gate(repository_path=workspace)
+    assert result.status == "failed"
+    assert result.exit_code == 125
+    assert result.is_principal_isolation_error
+
+
+def test_run_quality_band_gate_candidate_cannot_spoof_a_deferral(monkeypatch, tmp_path):
+    """Adversarial regression test requested by review on 8e667b0b (chunk
+    4/5): a candidate whose own (untrusted) test run prints the exact
+    broker marker string to STDOUT, with an ordinary non-125 failing exit
+    code, must still be REFUSED — never misread as a broker transport
+    deferral. Only the exact envelope (exit 125 AND empty stdout AND the
+    marker on stderr) may defer; a substring match anywhere in output must
+    never be sufficient, because stdout here stands in for output a
+    malicious/broken candidate test suite fully controls."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _prep_gate(
+        monkeypatch,
+        tmp_path,
+        "import sys\nsys.stdin.read()\n"
+        f"sys.stdout.write({agent_runner._PRINCIPAL_ISOLATION_FAILURE!r} + "
+        "': broker socket unavailable\\n')\n"
+        "sys.exit(1)\n",
+    )
+    result = agent_runner.run_quality_band_gate(repository_path=workspace)
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    # The marker is present in stdout, but the envelope does not match
+    # (wrong exit code, non-empty stdout, nothing on stderr) -> refused.
+    assert not result.is_principal_isolation_error

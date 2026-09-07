@@ -130,6 +130,15 @@ COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
 PRINCIPAL_ISOLATION_LAUNCHER = "/usr/libexec/aicc-agent-launcher"
 PRINCIPAL_ISOLATION_REQUIRED_ENV = "AICC_AGENT_PRINCIPAL_ISOLATION"
 PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
+# The impacted-test sandbox gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS): a
+# fixed executor/profile pairing the launcher recognizes, runs no model, and
+# grants no credential or network beyond what the trusted script needs.
+QUALITY_BAND_EXECUTOR = "quality_band"
+QUALITY_BAND_PROFILE = "quality_band"
+# Operator escape hatch, same contract as the interactive band script
+# (scripts/ci/prepush/quality_band.sh): VOYN_QUALITY_BAND=off skips the gate.
+QUALITY_BAND_OFF_ENV = "VOYN_QUALITY_BAND"
+DEFAULT_QUALITY_BAND_TIMEOUT_SECONDS = 300
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     "claude": "/usr/local/bin/claude",
     "codex": "/usr/local/bin/codex",
@@ -140,6 +149,13 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # b311666). The retry-loop hazard that once motivated listing it is
     # closed in handlers instead: an unavailable executor falls through the
     # cascade to the next link rather than respinning forever.
+    #
+    # quality_band (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) runs no model at
+    # all -- a fixed, trusted, non-interactive impacted-test script -- so
+    # this path only mirrors the launcher's own
+    # ops.aicc_agent_launcher.EXECUTOR_BINARIES entry for a cheap worker-side
+    # deployment check; the broker repeats ownership/mode validation.
+    QUALITY_BAND_EXECUTOR: "/opt/aicc/toolchains/current/bin/quality-band-gate",
 }
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 
@@ -441,6 +457,39 @@ def build_principal_isolation_manifest(
         "profile": profile_for_task_type(task_type),
         "prompt": prompt,
         "model": model,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def build_quality_band_manifest(
+    *, repository_path: Path, timeout_seconds: int
+) -> dict[str, object]:
+    """Build the manifest for the quality-band impacted-test sandbox gate.
+
+    Fixed executor/profile pairing (``quality_band``/``quality_band``): the
+    launcher (``ops.aicc_agent_launcher``) recognizes only that pairing,
+    refuses any manifest that pairs one without the other, and never derives
+    its argv from ``prompt``/``model`` for this executor -- both fields stay
+    in the manifest only because the schema is closed and shared with the
+    model executors above, not because anything reads them for this one.
+    The candidate worktree at ``repository_path`` is the workspace bind
+    (data the trusted script inspects and runs tests against); the script
+    itself ships in the content-addressed toolchain, never the candidate
+    tree -- a prior version of this gate resolved its executed script from
+    inside the candidate worktree it was meant to police, which let a
+    candidate remove or replace it to skip the gate entirely (verification
+    finding on 1b23b226).
+    """
+    return {
+        "version": 1,
+        "run_id": uuid.uuid4().hex,
+        "workspace": str(repository_path.resolve(strict=True)),
+        "executor": QUALITY_BAND_EXECUTOR,
+        "profile": QUALITY_BAND_PROFILE,
+        # Inert for this executor (see docstring): kept non-empty only to
+        # satisfy the manifest schema shared with the model executors.
+        "prompt": "quality-band-gate",
+        "model": None,
         "timeout_seconds": timeout_seconds,
     }
 
@@ -1217,6 +1266,147 @@ class RunResult:
                 for line in self.stderr.splitlines()
             )
         )
+
+
+def run_quality_band_gate(
+    *,
+    repository_path: Path,
+    timeout_seconds: int = DEFAULT_QUALITY_BAND_TIMEOUT_SECONDS,
+) -> RunResult:
+    """Run the impacted-test sandbox gate under the isolated principal.
+
+    This is the executable half of VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS: a
+    fixed, trusted, non-interactive script runs the impacted-test phase
+    against the candidate worktree bind-mounted at ``/workspace`` inside the
+    `quality_band` transient unit -- no model, no provider credential, no
+    network (`ops.aicc_agent_launcher._systemd_command` denies
+    `AF_INET`/`AF_INET6`/`AF_NETLINK` and sets `IPAddressDeny=any` for this
+    profile specifically). The candidate tree is DATA the trusted script
+    reads and executes tests against; it is never itself the executed
+    payload.
+
+    Callers (`command_center.orchestrator.publish._quality_band_sandbox_gate`)
+    must distinguish two outcomes that look similar on the wire:
+
+    * A REFUSAL: the sandbox actually ran the gate and it came back red, or
+      it timed out -- the candidate must not be published.
+    * A DEFERRAL: the broker itself could not run the gate at all (not
+      deployed, socket unavailable, transport failure) -- the publish must
+      proceed and let the required CI suite be the authority, exactly as it
+      already does when this feature is absent.
+
+    The only signal that distinguishes them is `RunResult.
+    is_principal_isolation_error`'s *exact* transport-envelope check (status
+    "failed", exit code 125, empty stdout, a marker-prefixed stderr line) --
+    never a substring search over `stdout`/`stderr` content. That distinction
+    matters here specifically because the candidate worktree is untrusted:
+    its own test files run inside this sandbox and could freely print the
+    literal marker string or force an exit code of 125 on their own stdout in
+    an attempt to be misread as a broker failure and waved through. Because
+    the check requires the *combination* of exit 125 AND empty stdout AND
+    the marker on stderr -- and this function forwards the sandbox's real
+    stdout/stderr/exit_code unmodified from the launcher's response, exactly
+    like every model executor -- a candidate that engineers that string into
+    its own stdout (with a non-125 exit code, the ordinary case for a failing
+    test run) is not deferred; it is refused like any other red run. Only the
+    broker's own internal failure path (`_serve_connected_socket`'s
+    `except` clause in `ops.aicc_agent_launcher`) ever produces the exact
+    4-way combination, and it never runs when the gate itself executed.
+    """
+    if not principal_isolation_required():
+        now = models.iso_now()
+        return RunResult(
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr=(
+                f"{_PRINCIPAL_ISOLATION_FAILURE}: principal isolation is not "
+                "enabled on this worker"
+            ),
+            duration_seconds=0.0,
+            started_at=now,
+            completed_at=now,
+        )
+    available, detail = principal_executor_preflight(QUALITY_BAND_EXECUTOR)
+    if not available:
+        now = models.iso_now()
+        return RunResult(
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr=f"{_PRINCIPAL_ISOLATION_FAILURE}: {detail}",
+            duration_seconds=0.0,
+            started_at=now,
+            completed_at=now,
+        )
+    try:
+        manifest = build_quality_band_manifest(
+            repository_path=repository_path, timeout_seconds=timeout_seconds
+        )
+    except OSError as exc:
+        now = models.iso_now()
+        return RunResult(
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr=f"{_PRINCIPAL_ISOLATION_FAILURE}: invalid manifest: {exc}",
+            duration_seconds=0.0,
+            started_at=now,
+            completed_at=now,
+        )
+    launcher_input = json.dumps(manifest, separators=(",", ":")) + "\n"
+    started_at = models.iso_now()
+    started_monotonic = time.monotonic()
+    # A bounded margin over the manifest's own timeout: the launcher enforces
+    # `timeout_seconds` itself (RuntimeMaxSec) and always answers on the
+    # socket, success or `LaunchRefused`; this client-side timeout exists only
+    # to fail closed if the broker process itself wedges or the host is
+    # otherwise unresponsive, not to race the broker's own deadline.
+    client_timeout = timeout_seconds + 30
+    try:
+        completed = subprocess.run(
+            [PRINCIPAL_ISOLATION_LAUNCHER, "--client"],
+            cwd=Path("/"),
+            input=launcher_input,
+            capture_output=True,
+            text=True,
+            env=_principal_launcher_environment(),
+            close_fds=True,
+            timeout=client_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        duration = time.monotonic() - started_monotonic
+        return RunResult(
+            status="timed_out",
+            exit_code=None,
+            stdout=exc.stdout or "",
+            stderr=exc.stderr or "",
+            duration_seconds=duration,
+            started_at=started_at,
+            completed_at=models.iso_now(),
+        )
+    except OSError as exc:
+        duration = time.monotonic() - started_monotonic
+        return RunResult(
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr=f"{_PRINCIPAL_ISOLATION_FAILURE}: cannot start isolated launcher client: {exc}",
+            duration_seconds=duration,
+            started_at=started_at,
+            completed_at=models.iso_now(),
+        )
+    duration = time.monotonic() - started_monotonic
+    status = "completed" if completed.returncode == 0 else "failed"
+    return RunResult(
+        status=status,
+        exit_code=completed.returncode,
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+        duration_seconds=duration,
+        started_at=started_at,
+        completed_at=models.iso_now(),
+    )
 
 
 # How often the mid-run poll loop wakes to re-check `cancel_event` and the
