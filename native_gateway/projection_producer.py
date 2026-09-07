@@ -37,9 +37,11 @@ from pathlib import Path
 from command_center import backlog_client, read_model, storage, tasks_repository
 from command_center.runtime import runs_read
 
+from .redaction import PathRedactingFilter
 from .task_titles import load_cache, title_for
 
 _LOG = logging.getLogger(__name__)
+_LOG.addFilter(PathRedactingFilter())
 
 PROJECTION_VERSION = "1"
 _EVENT_LIMIT = 50
