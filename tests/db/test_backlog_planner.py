@@ -821,6 +821,78 @@ def test_plan_once_reconciles_technical_parks_without_audit_spam(rig) -> None:
     assert store.get_task("VOYN-W0-RZ")["status"] == "DEFER_TO_USER"
 
 
+# --- review_backlog_limit: dispatch-only backpressure, not a whole-tick gate
+
+
+def _ready_to_review_with_pr(app_factory, store, task_id, pr_url) -> None:
+    """A READY_TO_REVIEW task carrying `pr` evidence -- what
+    `review_backlog_limit` counts."""
+    assert store.upsert_task(_task(task_id, repo="repo-d2", status="OPEN"))[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            def _rev():
+                cur.execute(
+                    "SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,)
+                )
+                return cur.fetchone()[0]
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)",
+                (task_id, _rev()),
+            )
+            cur.execute(
+                "SELECT backlog_record_evidence(%s,'pr',%s)", (task_id, pr_url)
+            )
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)",
+                (task_id, _rev()),
+            )
+
+
+def test_review_backlog_fence_pauses_dispatch_but_not_resume_reconcile(rig) -> None:
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM: an earlier version of this
+    fence was a blanket `return report` placed ABOVE the DEFER_TO_USER
+    resume reconcile, so a full review backlog silently froze parked-task
+    recovery too -- a control whose blast radius (the whole rest of the
+    tick) was wider than its stated purpose (gate new dispatch). This pins
+    that ingest and resume both still happen when the fence trips, and only
+    the dispatch loop is skipped."""
+    app_factory, store, worker = rig
+    _ready_to_review_with_pr(
+        app_factory, store, "VOYN-W0-BL1", "https://github.com/x/repo-d2/pull/101"
+    )
+    _ready_to_review_with_pr(
+        app_factory, store, "VOYN-W0-BL2", "https://github.com/x/repo-d2/pull/102"
+    )
+    _park_technically(app_factory, store, worker, "VOYN-W0-BL3")
+    assert store.upsert_task(_task("VOYN-W0-BL4", repo="repo-d2"))[0]  # OPEN
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4, review_backlog_limit=2))
+
+    assert report.review_window_full == 2
+    assert report.dispatched == []
+    assert "VOYN-W0-BL3" in [task_id for task_id, _reason in report.resumed]
+    assert store.get_task("VOYN-W0-BL3")["status"] in ("OPEN", "IN_PROGRESS")
+    # The candidate loop never ran at all -- the OPEN task the fence was
+    # supposed to hold back stays exactly where it was, not merely un-
+    # dispatched-but-examined.
+    assert store.get_task("VOYN-W0-BL4")["status"] == "OPEN"
+
+
+def test_review_backlog_limit_zero_disables_the_fence(rig) -> None:
+    """0 disables, matching `max_resumes_per_tick`'s convention on this same
+    dataclass -- not silently coerced to a threshold of 1."""
+    app_factory, store, _worker = rig
+    _ready_to_review_with_pr(
+        app_factory, store, "VOYN-W0-BL5", "https://github.com/x/repo-d2/pull/103"
+    )
+    assert store.upsert_task(_task("VOYN-W0-BL6", repo="repo-d2"))[0]
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4, review_backlog_limit=0))
+
+    assert report.review_window_full is None
+    assert "VOYN-W0-BL6" in [task_id for task_id, _work_item in report.dispatched]
+
+
 def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
     """Independent review of PR #401 at 2bc73ac: a task technically parked,
     later resumed, and then hand-upserted BACK into DEFER_TO_USER (an owner
