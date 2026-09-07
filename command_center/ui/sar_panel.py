@@ -7,6 +7,7 @@ from pathlib import Path
 import streamlit as st
 
 from command_center import sar_store
+from command_center.ui import confirm_dialog
 from command_center.sar_store import (
     SAR_STATES,
     SAR_TYPES,
