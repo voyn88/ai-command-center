@@ -83,10 +83,16 @@ final class AICCAppModel: ObservableObject {
 
         connection = .connecting
         let store = SnapshotRemoteStore(configuration: configuration)
+        let previousSnapshot = snapshot
         do {
             snapshot = try await store.fetchSnapshot(revision: snapshot.revision)
             connection = .live
             SnapshotCache.save(snapshot)
+            // Ambient haptics: a small, criticality-aware nudge per incident
+            // or workflow-stage change, never on the very first load.
+            for cue in HapticAdvisor.cues(previous: previousSnapshot, current: snapshot) {
+                HapticPlayer.play(cue.severity)
+            }
         } catch GatewayError.notModified {
             connection = .live
         } catch GatewayError.unauthorized {

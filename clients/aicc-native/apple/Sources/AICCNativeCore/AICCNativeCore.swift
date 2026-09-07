@@ -139,6 +139,77 @@ public struct Snapshot: Codable, Equatable, Sendable {
     }
 }
 
+// MARK: - Ambient haptics (incident criticality × workflow stage)
+
+/// Ordered from quietest to loudest so severities can be compared and the
+/// single strongest cue in a batch can be picked with `max(by:)`.
+public enum IncidentSeverity: Int, Comparable, Sendable, CaseIterable {
+    case info, notice, warning, critical
+    public static func < (lhs: IncidentSeverity, rhs: IncidentSeverity) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+/// A single ambient nudge: what happened, how loud it should feel, and which
+/// task (if any) it is about.
+public struct HapticCue: Equatable, Sendable {
+    public let severity: IncidentSeverity
+    public let taskID: String?
+    public let reason: String
+
+    public init(severity: IncidentSeverity, taskID: String?, reason: String) {
+        self.severity = severity; self.taskID = taskID; self.reason = reason
+    }
+}
+
+/// Decides which snapshot transitions deserve a haptic nudge.
+///
+/// The rule that keeps this "ambient" instead of noisy: every *critical*
+/// finding (a new blocker) gets its own cue — those must never be missed —
+/// while routine workflow motion (stage changes, a blocker clearing) is
+/// collapsed into at most one gentle cue per refresh, using the strongest of
+/// the batch. A first load (`previous == nil`) never buzzes: there is no
+/// transition to react to yet, only a starting picture.
+public enum HapticAdvisor {
+    public static func cues(previous: Snapshot?, current: Snapshot) -> [HapticCue] {
+        guard let previous else { return [] }
+
+        var criticalCues: [HapticCue] = []
+        var ambientCues: [HapticCue] = []
+        let previousTasks = Dictionary(uniqueKeysWithValues: previous.tasks.map { ($0.id, $0) })
+
+        for task in current.tasks {
+            guard let prior = previousTasks[task.id] else {
+                // A brand-new task that already needs attention is itself an incident.
+                if task.blocker != nil {
+                    criticalCues.append(HapticCue(severity: .critical, taskID: task.id, reason: "Новая задача с блокером: \(task.title)"))
+                }
+                continue
+            }
+
+            if prior.blocker == nil, task.blocker != nil {
+                criticalCues.append(HapticCue(severity: .critical, taskID: task.id, reason: "Новый блокер: \(task.title)"))
+            } else if prior.blocker != nil, task.blocker == nil {
+                ambientCues.append(HapticCue(severity: .warning, taskID: task.id, reason: "Блокер снят: \(task.title)"))
+            }
+
+            if prior.state != task.state {
+                switch task.state {
+                case .review:
+                    ambientCues.append(HapticCue(severity: .notice, taskID: task.id, reason: "На проверке: \(task.title)"))
+                case .done where prior.state != .done:
+                    ambientCues.append(HapticCue(severity: .notice, taskID: task.id, reason: "Завершено: \(task.title)"))
+                case .deferred:
+                    ambientCues.append(HapticCue(severity: .warning, taskID: task.id, reason: "Отложено: \(task.title)"))
+                default:
+                    break
+                }
+            }
+        }
+
+        guard let strongestAmbient = ambientCues.max(by: { $0.severity < $1.severity }) else { return criticalCues }
+        return criticalCues + [strongestAmbient]
+    }
+}
+
 public struct OverviewModel: Equatable, Sendable { public let freshness: Freshness; public let activeTasks: Int; public let needsAttention: Int }
 public struct TasksModel: Equatable, Sendable { public let tasks: [Task] }
 public struct AgentsModel: Equatable, Sendable { public let lanes: [AgentLane] }
