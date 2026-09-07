@@ -59,7 +59,7 @@ struct AICCNativeShell: View {
                 .tabItem { Label(AppTab.dialogues.title, systemImage: AppTab.dialogues.icon) }.tag(AppTab.dialogues)
             DecisionsView()
                 .tabItem { Label(AppTab.decisions.title, systemImage: AppTab.decisions.icon) }.tag(AppTab.decisions)
-            MoreView(events: model.snapshot.events, connection: model.connection)
+            MoreView(model: model, events: model.snapshot.events, connection: model.connection)
                 .tabItem { Label(AppTab.more.title, systemImage: AppTab.more.icon) }.tag(AppTab.more)
         }
         .tint(AICCTheme.plum)
@@ -378,13 +378,37 @@ private struct DecisionsView: View {
 }
 
 private struct MoreView: View {
+    @ObservedObject var model: AICCAppModel
     let events: [TimelineEvent]
     let connection: AICCAppModel.ConnectionState
+
     var body: some View {
         CompanionPage(title: "Ещё", subtitle: "Всё остальное уже предусмотрено, но не мешает вам каждый день.") {
             CompanionCard(title: "Подключение", detail: connection.title, tint: connection == .offline ? .orange : AICCTheme.forest)
             CompanionCard(title: "Помощники и память", detail: "Команда AI, объяснения и успешные решения.", tint: AICCTheme.plum)
             CompanionCard(title: "Проверки и происшествия", detail: "Картина качества, рисков и восстановления.", tint: AICCTheme.forest)
+            VStack(alignment: .leading, spacing: 9) {
+                Toggle(
+                    "Face ID / Touch ID для критичных действий",
+                    isOn: Binding(
+                        get: { model.biometricLockEnabled },
+                        set: { newValue in _Concurrency.Task { await model.setBiometricLock(enabled: newValue) } }
+                    )
+                )
+                Text("Опционально: подключение и удаление устройства потребуют биометрической проверки и подтверждения сессии.")
+                    .font(.footnote).foregroundStyle(.secondary)
+                if model.lastCriticalActionDenied {
+                    Text("Действие отклонено: биометрическая проверка не пройдена.")
+                        .font(.footnote).foregroundStyle(.orange)
+                }
+                if model.hasCredential {
+                    Button("Отключить это устройство", role: .destructive) {
+                        _Concurrency.Task { await model.unpair() }
+                    }
+                    .padding(.top, 4)
+                }
+            }
+            .padding(18).background(.background, in: RoundedRectangle(cornerRadius: 19)).overlay { RoundedRectangle(cornerRadius: 19).stroke(.quaternary) }
             CompanionCard(title: "Сводки, совет и настройки", detail: "Всё для спокойной картины и управления.", tint: .gray)
         }
     }

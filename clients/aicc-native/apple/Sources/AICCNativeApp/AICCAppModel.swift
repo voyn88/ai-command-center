@@ -25,8 +25,22 @@ final class AICCAppModel: ObservableObject {
     @Published private(set) var snapshot: Snapshot
     @Published private(set) var dialogs: [DialogSummary] = []
     @Published private(set) var connection: ConnectionState = .fixture
+    /// Owner-facing flag: optional hardware binding for credential
+    /// operations. Persisted locally (not sensitive) so the choice survives
+    /// relaunch; the actual secret is never stored here.
+    @Published private(set) var biometricLockEnabled: Bool
+    /// Set when a critical action (pairing/unpairing) was refused because
+    /// biometric authorization failed or was unavailable, so the UI can
+    /// surface it without a crash or silent no-op.
+    @Published private(set) var lastCriticalActionDenied = false
 
-    init() {
+    /// Gates pairing/unpairing behind Face ID / Touch ID + a live confirmed
+    /// session when `biometricLockEnabled` is on. Disabled by default so the
+    /// biometric requirement is strictly opt-in, per the task.
+    private let criticalActionGuard: CriticalActionGuard
+    private static let biometricLockDefaultsKey = "AICCBiometricLockEnabled"
+
+    init(biometricAuthenticator: BiometricAuthenticating = DeviceBiometricAuthenticator()) {
         // Start from the owner's last real picture when we have one; the
         // demo fixture is only the very-first-launch fallback.
         if let cached = SnapshotCache.load() {
@@ -35,6 +49,12 @@ final class AICCAppModel: ObservableObject {
         } else {
             snapshot = (try? Fixture.healthySnapshot()) ?? .preview
         }
+        let enabled = UserDefaults.standard.bool(forKey: Self.biometricLockDefaultsKey)
+        biometricLockEnabled = enabled
+        criticalActionGuard = CriticalActionGuard(
+            authenticator: biometricAuthenticator,
+            policy: enabled ? .required : .disabled
+        )
     }
 
     /// Whether any device credential is available (env override or Keychain).
@@ -43,13 +63,53 @@ final class AICCAppModel: ObservableObject {
             || DeviceTokenStore.load() != nil
     }
 
+    /// Turns the optional Secure Enclave / Face ID binding on or off for
+    /// critical, credential-affecting actions. Re-saves any existing token
+    /// under the matching Keychain protection so the hardware binding
+    /// actually covers the stored secret, not just the in-app flow.
+    func setBiometricLock(enabled: Bool) async {
+        biometricLockEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.biometricLockDefaultsKey)
+        await criticalActionGuard.setPolicy(enabled ? .required : .disabled)
+        if let existing = DeviceTokenStore.load() {
+            DeviceTokenStore.save(existing, protectedByBiometrics: enabled)
+        }
+    }
+
     /// Store the operator-issued device token in the Keychain and reconnect.
-    /// The token text itself never touches UserDefaults, files or logs.
+    /// The token text itself never touches UserDefaults, files or logs. When
+    /// the owner opted into the biometric lock, this is a critical action:
+    /// it requires a fresh Face ID / Touch ID confirmation (or a still-live
+    /// confirmed session) before the Keychain write happens.
     func pair(token: String) async {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        DeviceTokenStore.save(trimmed)
+        lastCriticalActionDenied = false
+        do {
+            try await criticalActionGuard.perform(reason: "Подтвердите подключение устройства") {
+                DeviceTokenStore.save(trimmed, protectedByBiometrics: self.biometricLockEnabled)
+            }
+        } catch {
+            lastCriticalActionDenied = true
+            return
+        }
         await refresh()
+    }
+
+    /// Removes the stored device credential and cached snapshot. Critical
+    /// action: same biometric + session-confirmation gate as pairing.
+    func unpair() async {
+        lastCriticalActionDenied = false
+        do {
+            try await criticalActionGuard.perform(reason: "Подтвердите удаление устройства") {
+                DeviceTokenStore.delete()
+                SnapshotCache.clear()
+            }
+        } catch {
+            lastCriticalActionDenied = true
+            return
+        }
+        connection = .unauthorized
     }
 
     func refresh() async {

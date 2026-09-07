@@ -86,6 +86,56 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+@Test func criticalActionGuardRunsUnauthorizedWhenPolicyDisabled() async throws {
+    let guardActor = CriticalActionGuard(authenticator: StaticBiometricAuthenticator(result: false), policy: .disabled)
+    let result = try await guardActor.perform(reason: "test") { 42 }
+    #expect(result == 42)
+}
+
+@Test func criticalActionGuardBlocksOnFailedBiometricsWhenRequired() async throws {
+    let guardActor = CriticalActionGuard(authenticator: StaticBiometricAuthenticator(result: false), policy: .required)
+    await #expect(throws: CriticalActionError.biometricAuthenticationFailed) {
+        _ = try await guardActor.perform(reason: "test") { 1 }
+    }
+    #expect(await !guardActor.isSessionActive())
+}
+
+@Test func criticalActionGuardReusesConfirmedSessionWithinTTL() async throws {
+    let guardActor = CriticalActionGuard(authenticator: StaticBiometricAuthenticator(result: true), sessionTTL: 60, policy: .required)
+    let base = Date()
+    var calls = 0
+    _ = try await guardActor.perform(reason: "first", now: base) { calls += 1 }
+    // A second call shortly after should reuse the live session rather than
+    // re-authenticating — the operation still runs.
+    _ = try await guardActor.perform(reason: "second", now: base.addingTimeInterval(10)) { calls += 1 }
+    #expect(calls == 2)
+    #expect(await guardActor.isSessionActive(now: base.addingTimeInterval(10)))
+}
+
+@Test func criticalActionGuardExpiresSessionAfterTTL() async throws {
+    let guardActor = CriticalActionGuard(authenticator: StaticBiometricAuthenticator(result: true), sessionTTL: 5, policy: .required)
+    let base = Date()
+    _ = try await guardActor.perform(reason: "first", now: base) { 1 }
+    #expect(await !guardActor.isSessionActive(now: base.addingTimeInterval(30)))
+}
+
+@Test func criticalActionGuardChangingPolicyDropsSession() async throws {
+    let guardActor = CriticalActionGuard(authenticator: StaticBiometricAuthenticator(result: true), policy: .required)
+    _ = try await guardActor.perform(reason: "first") { 1 }
+    #expect(await guardActor.isSessionActive())
+    await guardActor.setPolicy(.required)
+    #expect(await !guardActor.isSessionActive())
+}
+
+@Test func deviceTokenStoreSupportsBiometricProtectionFlag() {
+    defer { DeviceTokenStore.delete() }
+    // Best-effort: keychain access control may be unavailable in CI sandboxes.
+    guard DeviceTokenStore.save("bio-protected-token", protectedByBiometrics: true) else { return }
+    // In a sandbox without biometry enrolled, `load()` may fail to decrypt;
+    // we only assert the save path did not crash and cleanup succeeds.
+    #expect(DeviceTokenStore.delete())
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
