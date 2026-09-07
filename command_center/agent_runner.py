@@ -121,6 +121,18 @@ CLAUDE_BINARY = "claude"
 # the service already runs as that user), which systemd does not add for it.
 CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
 COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
+# aider (OSS) driving a LOCAL Ollama model (VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR):
+# the free, bounded-implementation executor lane. Same PATH-resolution caveat
+# as CODEX_BINARY/COPILOT_BINARY above -- the worker service's PATH is not a
+# login shell's.
+AIDER_BINARY = os.environ.get("AICC_AIDER_BINARY") or "aider"
+OLLAMA_BINARY = os.environ.get("AICC_OLLAMA_BINARY") or "ollama"
+# The one model this lane is benchmarked against (owner decision 2026-09-03).
+# Overridable so a differently-tagged local pull does not require a code
+# change, but never silently — `aider_preflight` checks for this EXACT
+# string in `ollama list`'s output, so an override here must match what is
+# actually pulled on the worker host.
+DEFAULT_AIDER_MODEL = os.environ.get("AICC_AIDER_MODEL") or "qwen2.5-coder:14b"
 
 # The worker never elevates and keeps NoNewPrivileges=yes.  A root-owned,
 # socket-activated launcher is the sole bridge to the separate aicc-agent UID.
@@ -980,6 +992,92 @@ def build_copilot_command(
     return command
 
 
+def build_aider_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """argv for `aider` (OSS) driving a local Ollama model
+    (VOYN-W0-AICC-AIDER-OLLAMA-EXECUTOR): the free, bounded-implementation
+    lane for low-risk task classes (docs/fixtures/small mechanical patches),
+    gated on a per-class benchmark promotion
+    (`orchestrator.local_model_gates`) before `routing.cascade_for` ever
+    offers it a real dispatch.
+
+    Unlike every other executor here, aider has NO read-only capability
+    profile at all -- there is no `--tools`/`--sandbox read-only`/
+    `--allow-tool read`-shaped flag that removes its write capability, so
+    there is nothing this builder could pass to make a read-only task type
+    safe. It fails closed instead: any `task_type` outside
+    `MUTATING_TASK_TYPES` is refused with `ValueError` rather than silently
+    handed a write-capable run under a task type documented as
+    "must not modify any file" (the exact hole `agent_runner`'s read-only
+    profiles exist to close for every other executor).
+
+    `--message` (not aider's interactive REPL) makes this a single
+    non-interactive turn, and the prompt travels as ONE argv element --
+    never shell-interpreted, mirroring the same guarantee every other
+    builder in this module gives (see the module docstring). `--yes-always`
+    auto-confirms aider's own edit-application prompts (there is no operator
+    present in a headless worker run). `--no-analytics` and
+    `--no-check-update` keep a worker host from ever phoning home or
+    blocking on a version nag it cannot interactively dismiss.
+    """
+    if task_type not in MUTATING_TASK_TYPES:
+        raise ValueError(
+            f"aider has no read-only capability profile; refusing task_type {task_type!r}"
+        )
+    return [
+        AIDER_BINARY,
+        "--yes-always",
+        "--no-analytics",
+        "--no-check-update",
+        "--model",
+        model or f"ollama_chat/{DEFAULT_AIDER_MODEL}",
+        "--message",
+        prompt,
+    ]
+
+
+def aider_preflight(binary: str | None = None) -> tuple[bool, str]:
+    """`(available, message)` for the aider executor: both the `aider` CLI
+    AND a reachable Ollama daemon actually serving `DEFAULT_AIDER_MODEL`
+    must be true.
+
+    A CLI-only probe (mirroring `claude_cli_preflight`) would pass while the
+    Ollama daemon is down or the model was never pulled -- aider would then
+    fail deep into a real task attempt, burning a cascade attempt on an
+    infrastructure gap this preflight exists to catch before dispatch, the
+    same class of hazard `codex_workspace_write_preflight` closes for Codex.
+    `ollama list`'s stdout is checked for the EXACT `DEFAULT_AIDER_MODEL`
+    string -- a daemon that is merely reachable but serving a DIFFERENT
+    model is not "available" for this lane, since `build_aider_command`
+    would then dispatch a prompt at a model that was never benchmarked.
+    """
+    resolved = binary or AIDER_BINARY
+    if shutil.which(resolved) is None:
+        return False, f"aider CLI {resolved!r} is not available on PATH"
+    if shutil.which(OLLAMA_BINARY) is None:
+        return False, f"ollama CLI {OLLAMA_BINARY!r} is not available on PATH"
+    try:
+        listed = subprocess.run(
+            [OLLAMA_BINARY, "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except _OS_SUBPROCESS_ERRORS as exc:
+        return False, f"ollama daemon unreachable: {exc}"
+    if listed.returncode != 0:
+        detail = listed.stderr.strip() or listed.stdout.strip() or "non-zero exit"
+        return False, f"ollama daemon unreachable: {detail}"
+    if DEFAULT_AIDER_MODEL not in listed.stdout:
+        return False, f"ollama model {DEFAULT_AIDER_MODEL!r} is not pulled"
+    return True, "ok"
+
+
 #: executor id -> the NAME of its argv builder in this module. The worker
 #: refuses any executor absent from this table (`handlers._run_agent`), so an
 #: unknown/unproven name can never silently burn a cascade attempt on a
@@ -997,6 +1095,7 @@ COMMAND_BUILDERS: dict[str, str] = {
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
     "openai_http": "build_openai_http_command",
+    "aider": "build_aider_command",
 }
 
 
