@@ -22,6 +22,7 @@ For local development, generate a self-signed localhost certificate with
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -61,6 +62,16 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     from .app import build_default_app
+    from .redaction import install_path_redaction
+
+    # Every log record's `pathname` is an absolute path on this machine; make
+    # sure it (and any message/traceback text) is relativized/redacted before
+    # any handler can emit it, regardless of how uvicorn/logging.basicConfig
+    # end up wiring handlers on the root logger.
+    logging.basicConfig(level=logging.INFO)
+    install_path_redaction()
+    for uvicorn_logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        install_path_redaction(logging.getLogger(uvicorn_logger_name))
 
     uvicorn.run(
         build_default_app(),
