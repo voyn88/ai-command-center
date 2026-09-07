@@ -252,6 +252,9 @@ def test_pr_snapshot_uses_only_atomic_pr_and_immutable_compare(monkeypatch):
                 "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
                 "changed_files": 1, "additions": 0, "deletions": 0}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "-H" not in argv:
+            body = {"merge_base_commit": {"sha": BASE}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
         assert f"compare/{BASE}...{HEAD}" in argv[1]
         return subprocess.CompletedProcess(argv, 0, diff, "")
 
@@ -282,8 +285,13 @@ def test_pr_snapshot_rejects_truncated_or_file_count_mismatch(monkeypatch, stats
         "changed_files": stats[0], "additions": stats[1], "deletions": stats[2]}
 
     def gh(argv, _repo):
-        text = json.dumps(body) if "/pulls/" in argv[1] else "diff --git a/x b/x\n"
-        return subprocess.CompletedProcess(argv, 0, text, "")
+        if "/pulls/" in argv[1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "-H" not in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"merge_base_commit": {"sha": BASE}}), ""
+            )
+        return subprocess.CompletedProcess(argv, 0, "diff --git a/x b/x\n", "")
 
     monkeypatch.setattr(review_merge, "_gh", gh)
     assert review_merge._pr_diff_and_head("/repo", PR) is None
@@ -293,9 +301,18 @@ def test_pr_snapshot_rejects_oversize(monkeypatch):
     body = {"base": {"sha": BASE, "repo": {
         "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
         "changed_files": 1, "additions": 0, "deletions": 0}
+
+    def gh(argv, _repo):
+        if "/pulls/" in argv[1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "-H" not in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"merge_base_commit": {"sha": BASE}}), ""
+            )
+        return subprocess.CompletedProcess(argv, 0, "diff --git a/x b/x\n", "")
+
     monkeypatch.setattr(review_merge, "_MAX_REVIEW_DIFF_BYTES", 1)
-    monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
-        argv, 0, json.dumps(body) if "/pulls/" in argv[1] else "diff --git a/x b/x\n", ""))
+    monkeypatch.setattr(review_merge, "_gh", gh)
     assert review_merge._pr_diff_and_head("/repo", PR) is None
 
 
@@ -304,6 +321,15 @@ def test_pr_snapshot_rejects_binary_diff_even_when_stats_match(monkeypatch):
         "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
         "changed_files": 1, "additions": 0, "deletions": 0}
     binary = "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
-    monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
-        argv, 0, json.dumps(body) if "/pulls/" in argv[1] else binary, ""))
+
+    def gh(argv, _repo):
+        if "/pulls/" in argv[1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "-H" not in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"merge_base_commit": {"sha": BASE}}), ""
+            )
+        return subprocess.CompletedProcess(argv, 0, binary, "")
+
+    monkeypatch.setattr(review_merge, "_gh", gh)
     assert review_merge._pr_diff_and_head("/repo", PR) is None
