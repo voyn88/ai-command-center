@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import subprocess
@@ -1203,3 +1204,208 @@ def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
 
     monkeypatch.delenv("AICC_REVIEW_ANTHROPIC_API_KEY")
     assert "ANTHROPIC_API_KEY" not in run("independent_review")
+
+
+# --------------------------------------------------------------------------
+# run_quality_band_gate / build_quality_band_manifest — the impacted-test
+# phase of the pre-push quality band, run under the isolated principal
+# (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS). REAL subprocesses throughout, same
+# rationale as the run_claude_code section above: this is a trust-boundary
+# component, and the property under test -- the broker's exact bytes on
+# stdout/stderr/exit-code -- cannot be proven by a mocked Popen.
+# --------------------------------------------------------------------------
+
+
+def _write_fake_launcher(dir_path, body: str) -> str:
+    """A real, runnable stand-in for `aicc-agent-launcher --client`. `body`
+    decides what it prints/exits with; none of these fakes need to read the
+    manifest off stdin -- it is small enough to sit in the pipe buffer, so
+    the real process never blocks on an unread write."""
+    script = dir_path / "fake-launcher.py"
+    script.write_text(f"#!{sys.executable}\n{body}\n", encoding="utf-8")
+    script.chmod(0o700)
+    return str(script)
+
+
+def test_build_quality_band_manifest_is_a_fixed_executor_profile_pair(tmp_path):
+    manifest = agent_runner.build_quality_band_manifest(repository_path=tmp_path)
+    assert manifest["executor"] == "quality_band"
+    assert manifest["profile"] == "quality_band"
+    assert manifest["workspace"] == str(tmp_path.resolve(strict=True))
+    assert manifest["model"] is None
+    assert isinstance(manifest["prompt"], str) and manifest["prompt"]
+    assert (
+        manifest["timeout_seconds"] == agent_runner.DEFAULT_QUALITY_BAND_TIMEOUT_SECONDS
+    )
+    other = agent_runner.build_quality_band_manifest(repository_path=tmp_path)
+    assert other["run_id"] != manifest["run_id"]
+
+
+def test_quality_band_gate_available_false_when_isolation_not_required(monkeypatch):
+    monkeypatch.delenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, raising=False)
+    available, detail = agent_runner.quality_band_gate_available()
+    assert available is False
+    assert "not required" in detail
+
+
+def test_quality_band_gate_available_false_when_launcher_binary_is_missing(
+    monkeypatch,
+):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    monkeypatch.setattr(
+        agent_runner, "PRINCIPAL_ISOLATION_LAUNCHER", "/no/such/launcher-for-test"
+    )
+    available, detail = agent_runner.quality_band_gate_available()
+    assert available is False
+    assert "unavailable" in detail
+
+
+def test_quality_band_gate_available_true_when_isolation_required_and_launcher_present(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    launcher = _write_fake_launcher(tmp_path, "import sys\nsys.exit(0)")
+    monkeypatch.setattr(agent_runner, "PRINCIPAL_ISOLATION_LAUNCHER", launcher)
+    assert agent_runner.quality_band_gate_available() == (True, "")
+
+
+def test_run_quality_band_gate_reports_a_clean_pass_with_a_restricted_env(tmp_path):
+    captured = tmp_path / "captured-env.json"
+    launcher = _write_fake_launcher(
+        tmp_path,
+        "import json, os\n"
+        f"json.dump(dict(os.environ), open({str(captured)!r}, 'w'))\n"
+        "raise SystemExit(0)",
+    )
+    result = agent_runner.run_quality_band_gate(
+        repository_path=tmp_path, launcher=launcher
+    )
+    assert result.status == "completed"
+    assert result.exit_code == 0
+    assert not result.is_principal_isolation_error
+    env = json.loads(captured.read_text())
+    # LANG/LC_ALL/PATH only -- no HOME, no XDG, no SSH/Git variable, and
+    # nothing inherited from this test process's own environment.
+    assert set(env) == {"PATH", "LANG", "LC_ALL"}
+    assert env["PATH"] == "/usr/bin:/bin"
+
+
+def test_run_quality_band_gate_reports_a_genuine_red_run(tmp_path):
+    launcher = _write_fake_launcher(
+        tmp_path,
+        "import sys\nsys.stdout.write('2 failed, 4 passed\\n')\nsys.exit(1)",
+    )
+    result = agent_runner.run_quality_band_gate(
+        repository_path=tmp_path, launcher=launcher
+    )
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert "failed" in result.stdout
+    assert not result.is_principal_isolation_error
+
+
+def test_run_quality_band_gate_timeout_fails_closed(tmp_path, monkeypatch):
+    # Zero out the worker-side transport grace so the test doesn't have to
+    # wait out the real DEFAULT_QUALITY_BAND_TIMEOUT_SECONDS headroom.
+    monkeypatch.setattr(agent_runner, "_QUALITY_BAND_TRANSPORT_GRACE_SECONDS", 0)
+    launcher = _write_fake_launcher(tmp_path, "import time\ntime.sleep(60)")
+    started = time.monotonic()
+    result = agent_runner.run_quality_band_gate(
+        repository_path=tmp_path, launcher=launcher, timeout_seconds=1
+    )
+    elapsed = time.monotonic() - started
+    assert result.status == "timed_out"
+    assert result.exit_code is None
+    assert not result.is_principal_isolation_error
+    assert elapsed < 10
+
+
+def test_run_quality_band_gate_defers_on_broker_infrastructure_failure(tmp_path):
+    marker = agent_runner._PRINCIPAL_ISOLATION_FAILURE
+    launcher = _write_fake_launcher(
+        tmp_path,
+        "import sys\n"
+        f"sys.stderr.write({marker!r} + ': quarantined\\n')\n"
+        "sys.exit(125)",
+    )
+    result = agent_runner.run_quality_band_gate(
+        repository_path=tmp_path, launcher=launcher
+    )
+    assert result.status == "failed"
+    assert result.exit_code == 125
+    assert result.stdout == ""
+    assert result.is_principal_isolation_error
+
+
+def test_quality_band_gate_defers_when_the_launcher_binary_is_missing(tmp_path):
+    result = agent_runner.run_quality_band_gate(
+        repository_path=tmp_path, launcher=str(tmp_path / "no-such-launcher")
+    )
+    assert result.status == "failed"
+    assert result.exit_code == 125
+    assert result.stdout == ""
+    assert result.is_principal_isolation_error
+
+
+def test_run_quality_band_gate_does_not_defer_when_a_red_run_echoes_the_marker_to_stdout(
+    tmp_path,
+):
+    """Regression for the chunk-4 REJECT on 8e667b0b: the workspace under
+    test here is untrusted candidate content, and its own quality_band.sh
+    can print anything at all to stdout on a genuinely failing run --
+    including, if it is broken or adversarial, the literal transport-
+    envelope marker text. That must never be read as broker infrastructure
+    failure and silently deferred: the marker is only ever trusted on
+    stderr, paired with exit 125 and empty stdout (see
+    `RunResult.is_principal_isolation_error`). A naive substring search over
+    combined stdout+stderr would let exactly this case spoof a defer."""
+    marker = agent_runner._PRINCIPAL_ISOLATION_FAILURE
+    launcher = _write_fake_launcher(
+        tmp_path,
+        "import sys\n"
+        f"sys.stdout.write({marker!r} + ': quarantined\\n')\n"
+        "sys.stdout.write('3 failed, 1 passed\\n')\n"
+        "sys.exit(1)",
+    )
+    result = agent_runner.run_quality_band_gate(
+        repository_path=tmp_path, launcher=launcher
+    )
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert marker in result.stdout
+    assert not result.is_principal_isolation_error
+
+
+@pytest.mark.parametrize(
+    "status,exit_code,stdout,stderr,expected",
+    [
+        # The one true shape: exit 125, empty stdout, marker at the start
+        # of a stderr line.
+        ("failed", 125, "", "{marker}: quarantined\n", True),
+        # Adversarial: a red run's own untrusted stdout happens to contain
+        # the marker text verbatim.
+        ("failed", 1, "{marker}: fake\n", "", False),
+        # Correctly-placed stderr marker, but the wrong exit code.
+        ("failed", 1, "", "{marker}: quarantined\n", False),
+        # Otherwise-correct envelope, but stdout is not empty.
+        ("failed", 125, "junk", "{marker}: quarantined\n", False),
+        # Marker present on stderr but not at the start of a line.
+        ("failed", 125, "", "noise {marker}: quarantined\n", False),
+        # A "completed" status never counts, even with a matching envelope.
+        ("completed", 125, "", "{marker}: quarantined\n", False),
+    ],
+)
+def test_is_principal_isolation_error_matches_only_the_exact_transport_envelope(
+    status, exit_code, stdout, stderr, expected
+):
+    marker = agent_runner._PRINCIPAL_ISOLATION_FAILURE
+    result = agent_runner.RunResult(
+        status=status,
+        exit_code=exit_code,
+        stdout=stdout.format(marker=marker),
+        stderr=stderr.format(marker=marker),
+        duration_seconds=0.1,
+        started_at="2026-09-07T00:00:00+00:00",
+        completed_at="2026-09-07T00:00:01+00:00",
+    )
+    assert result.is_principal_isolation_error is expected
