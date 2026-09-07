@@ -36,6 +36,7 @@ from command_center.ui import (
     agent_launcher,
     alert_panel,
     aml_panel,
+    board_view,
     case_panel,
     compliance_dashboard,
     customer_panel,
@@ -191,6 +192,7 @@ NAV: dict[str, tuple[str, str]] = {
     "command": ("Командный центр", ":material/space_dashboard:"),
     "workspace_home": ("Workspace Home", ":material/home_work:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
+    "board_view": ("Сводка для руководства", ":material/summarize:"),
     "compliance": ("Compliance Dashboard", ":material/security:"),
     "alerts": ("Алерты", ":material/notifications_active:"),
     "customers": ("Клиенты", ":material/people:"),
@@ -1657,6 +1659,19 @@ elif page_key == "sar":
 
 elif page_key == "aml":
     aml_panel.render()
+
+
+# --------------------------------------------------------------------------
+# Board/Investor view — weekly one-page summary and risks for a non-technical
+# board member or investor (VOYN-MIN-BOARD-LAUNCH). Deliberately reads the
+# same `tasks` list as every operator screen instead of a separate "board
+# truth", so it can never disagree with Kanban about what is actually true.
+# --------------------------------------------------------------------------
+
+elif page_key == "board_view":
+    board_view.render_board_view(
+        board_view.build_weekly_summary(tasks, parse_project_statuses(), now=datetime.now())
+    )
 
 
 # --------------------------------------------------------------------------
