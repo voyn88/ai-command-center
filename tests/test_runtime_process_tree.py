@@ -59,6 +59,40 @@ def test_grandchild_process_tree_terminates_on_process_group_cancellation(
     assert result_events and result_events[0]["payload"]["result"] == "tree started"
 
 
+def test_grandchild_that_calls_setsid_does_not_survive_process_group_cancellation(
+    git_repo, configure_project_repo, fake_claude_tree
+):
+    """A descendant that runs `setsid()` leaves the launch process group and
+    becomes the leader of its own session — the classic technique for
+    escaping a supervisor that only ever signals the pgid it started. It
+    stays a live child of `child` throughout (its `ppid` is untouched), so
+    cancellation must still reach and terminate it via that surviving link,
+    not leave it running as an orphan."""
+    env_overrides, pidfile_base = fake_claude_tree
+    env_overrides["FAKE_CLAUDE_TREE_GRANDCHILD_SETSID"] = "1"
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
+    )
+
+    pids = _wait_for_tree_pids(pidfile_base)
+    assert identity.process_exists(pids["grandchild"])
+    assert os.getpgid(pids["grandchild"]) != os.getpgid(pids["parent"]), (
+        "the fixture must actually have escaped the launch process group, or this test proves nothing"
+    )
+
+    result = sup.cancel(run["id"], confirmed=True, grace_seconds=2)
+
+    assert result["state"] == "CANCELLED"
+    assert identity.process_exists(pids["parent"]) is False, "parent must not survive cancellation"
+    assert identity.process_exists(pids["child"]) is False, "child must not survive cancellation"
+    assert identity.process_exists(pids["grandchild"]) is False, (
+        "the setsid-escaped grandchild must not survive cancellation as an orphan"
+    )
+
+
 def test_grandchild_process_tree_terminates_even_when_parent_ignores_sigterm(
     git_repo, configure_project_repo, fake_claude_tree
 ):
