@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from command_center import agent_runner
 from command_center.orchestrator.publish import PublishConfig, publish_run
 
 
@@ -672,9 +673,7 @@ def test_committed_ruff_package_cannot_shadow_the_tool(repo, monkeypatch):
     shadow = work / "ruff" / "__main__.py"
     shadow.parent.mkdir()
     (work / "ruff" / "__init__.py").write_text("")
-    shadow.write_text(
-        f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n"
-    )
+    shadow.write_text(f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n")
     (work / "ok.py").write_text("X = 1\n")
     _git(work, "add", ".")
     _git(work, "commit", "-m", "shadow attempt")
@@ -743,3 +742,249 @@ def test_candidate_leak_guard_copy_is_never_executed(repo, monkeypatch):
 
     assert r.ok, r.reason
     assert not marker.exists(), "candidate leak_guard executed in publisher"
+
+
+# --- quality_band impacted-test sandbox gate (VOYN-W0-AICC-SANDBOX-PREPUSH-
+# TESTS): the executable half of the pre-push quality band. Applicability is
+# decided ENTIRELY by host configuration (principal isolation required +
+# quality_band executor deployed) -- never by anything read from the
+# candidate tree, unlike the earlier `scripts/ci/prepush` directory-presence
+# check that verification on 1b23b226 found let a candidate delete that
+# directory to silently skip the whole gate.
+
+
+def test_quality_band_gate_is_never_consulted_when_host_isolation_is_off(
+    repo, monkeypatch
+):
+    """Default host posture (as in every fixture repo above): principal
+    isolation is not required, so the gate must defer WITHOUT ever invoking
+    the isolated-launcher client -- proven here by making that call raise."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    monkeypatch.delenv("AICC_AGENT_PRINCIPAL_ISOLATION", raising=False)
+
+    def _boom(**kwargs):
+        raise AssertionError("run_quality_band_gate must not be called")
+
+    monkeypatch.setattr(agent_runner, "run_quality_band_gate", _boom)
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_quality_band_gate_env_off_bypasses_even_with_isolation_enabled(
+    repo, monkeypatch
+):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    monkeypatch.setenv("AICC_AGENT_PRINCIPAL_ISOLATION", "required")
+    monkeypatch.setenv("VOYN_QUALITY_BAND", "off")
+
+    def _boom(**kwargs):
+        raise AssertionError("run_quality_band_gate must not be called")
+
+    monkeypatch.setattr(agent_runner, "run_quality_band_gate", _boom)
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_quality_band_gate_defers_when_executor_not_deployed_on_host(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    monkeypatch.setenv("AICC_AGENT_PRINCIPAL_ISOLATION", "required")
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_executor_preflight",
+        lambda executor: (False, "not deployed"),
+    )
+
+    def _boom(**kwargs):
+        raise AssertionError("run_quality_band_gate must not be called")
+
+    monkeypatch.setattr(agent_runner, "run_quality_band_gate", _boom)
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def _isolated(monkeypatch):
+    monkeypatch.setenv("AICC_AGENT_PRINCIPAL_ISOLATION", "required")
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+
+
+def _fake_result(**overrides):
+    fields = {
+        "status": "completed",
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": "",
+        "duration_seconds": 1.0,
+        "started_at": "2026-01-01T00:00:00Z",
+        "completed_at": "2026-01-01T00:00:01Z",
+    }
+    fields.update(overrides)
+    return agent_runner.RunResult(**fields)
+
+
+def test_quality_band_gate_defers_on_broker_infrastructure_failure(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    _isolated(monkeypatch)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda **kw: _fake_result(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr=f"{agent_runner._PRINCIPAL_ISOLATION_FAILURE}: socket unavailable",
+        ),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_quality_band_gate_refuses_a_red_run_before_lease(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    _isolated(monkeypatch)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda **kw: _fake_result(
+            status="failed", exit_code=1, stdout="", stderr="2 tests failed"
+        ),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_gate_failed:")
+    assert not calls.exists()  # zero lease/gh traffic on a red gate
+
+
+def test_quality_band_gate_refuses_on_timeout(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    _isolated(monkeypatch)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda **kw: _fake_result(status="timed_out", exit_code=None),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason == "quality_band_gate_timeout"
+
+
+def test_quality_band_gate_passes_a_clean_run(repo, monkeypatch):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    _isolated(monkeypatch)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda **kw: _fake_result(status="completed", exit_code=0),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_quality_band_gate_survives_a_deleted_prepush_directory(repo, monkeypatch):
+    """Regression test for the verification finding on 1b23b226: an earlier
+    version decided whether to run this gate by checking for
+    `scripts/ci/prepush` INSIDE the candidate's own worktree -- adversary-
+    controlled state deciding whether the adversary-facing control applies.
+    The candidate tree here has no such directory at all (deleted/never
+    existed) and the gate still runs and refuses a red result, because
+    applicability comes only from host configuration."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    assert not (work / "scripts" / "ci" / "prepush").exists()
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean, no prepush dir")
+    _isolated(monkeypatch)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda **kw: _fake_result(
+            status="failed", exit_code=1, stdout="", stderr="1 test failed"
+        ),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_gate_failed:")
+    assert not calls.exists()
+
+
+def test_quality_band_gate_full_chain_candidate_cannot_spoof_a_deferral(
+    repo, monkeypatch, tmp_path
+):
+    """End-to-end adversarial regression (review on 8e667b0b, chunk 4/5):
+    a real fake launcher client -- standing in for a candidate test run that
+    prints the broker's own infra-failure marker to its STDOUT with an
+    ordinary non-125 failing exit code -- must still cause a REFUSAL
+    (`quality_band_gate_failed:`), never a silent deferral. This exercises
+    `agent_runner.run_quality_band_gate`'s real subprocess call through the
+    entire `publish_run` path, not a mocked `RunResult`."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    _isolated(monkeypatch)
+    fake_launcher = tmp_path / "fake-launcher-client"
+    fake_launcher.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stdin.read()\n"
+        f"sys.stdout.write({agent_runner._PRINCIPAL_ISOLATION_FAILURE!r} + "
+        "': broker socket unavailable\\n')\n"
+        "sys.exit(1)\n"
+    )
+    fake_launcher.chmod(0o755)
+    monkeypatch.setattr(
+        agent_runner, "PRINCIPAL_ISOLATION_LAUNCHER", str(fake_launcher)
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_gate_failed:")
+    assert not calls.exists()
