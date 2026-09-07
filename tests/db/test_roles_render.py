@@ -236,6 +236,11 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # VOYN-W0-AICC-INVALIDATED-VERDICT-PRIORITY-REREVIEW (0018): the
+        # invalidated-verdict priority queue merge_once marks and
+        # review_once drains ahead of the rotating scan.
+        "backlog_review_priority_mark",
+        "backlog_review_priority_pop",
     }
 
 
