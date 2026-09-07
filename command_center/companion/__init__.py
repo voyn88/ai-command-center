@@ -16,12 +16,17 @@ Layering, mirroring `docs/mobile/API_REQUIREMENTS.md` §1:
                    this package computing it independently.
     auth.py      — device pairing and token lifecycle (M1D).
     api.py       — the HTTP boundary (M1D).
-    notify.py    — notification detection and push delivery (Phase C).
+    notify.py    — run state-transition detection, an offline per-device
+                   notification queue, and bidirectional sync (`sync`/`ack`)
+                   (Phase C).
 
-Only `adapters.py` exists today; the rest are deliberate stubs so the package
-shape matches the specification before any HTTP surface is written.
+`adapters.py` and `notify.py` exist today; `auth.py` and `api.py` remain
+deliberate stubs — `notify.py`'s queue and sync functions take an
+`execution_center_api` and a `device_id` directly rather than depending on
+either, so they work standalone (a script, a test) today and slot under the
+HTTP boundary unchanged once `api.py` exists.
 """
 
 from __future__ import annotations
 
-__all__ = ["adapters"]
+__all__ = ["adapters", "notify"]

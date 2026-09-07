@@ -61,11 +61,19 @@ def test_importing_the_package_starts_nothing():
 
 def test_unimplemented_modules_are_importable_stubs():
     """The package shape matches the specification before behaviour exists, so
-    a reader can see what is planned without guessing."""
-    from command_center.companion import api, auth, notify
+    a reader can see what is planned without guessing. `notify` has since
+    graduated from stub to implementation (Phase C) — see
+    `tests/test_companion_notify.py` — so it is checked separately below."""
+    from command_center.companion import api, auth
 
-    for module in (api, auth, notify):
+    for module in (api, auth):
         assert module.__doc__ and "not implemented" in module.__doc__.lower()
+
+
+def test_notify_module_is_no_longer_a_stub():
+    from command_center.companion import notify
+
+    assert notify.__doc__ and "not implemented" not in notify.__doc__.lower()
 
 
 # --------------------------------------------------------------------------
