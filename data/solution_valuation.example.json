@@ -1,0 +1,20 @@
+{
+  "AML": {
+    "label": "AML risk-management platform",
+    "cost_per_decision_usd": 120.0,
+    "value_per_decision_usd": 950.0,
+    "assumptions": "Cost: analyst + Board review time per motion. Value: one avoided compliance finding, priced from the smallest historical remediation engagement."
+  },
+  "ESF": {
+    "label": "ESF corporate platform",
+    "cost_per_decision_usd": 90.0,
+    "value_per_decision_usd": 400.0,
+    "assumptions": "Cost: Board review time per motion. Value: incremental deal-desk throughput unlocked by the decision, priced from the lowest observed deal size."
+  },
+  "BUSINESS": {
+    "label": "Business operations",
+    "cost_per_decision_usd": 60.0,
+    "value_per_decision_usd": 60.0,
+    "assumptions": "Placeholder 1:1 cost/value until BizDev supplies a real estimate for this solution."
+  }
+}
