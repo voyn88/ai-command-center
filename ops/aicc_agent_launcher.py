@@ -73,9 +73,20 @@ EPHEMERAL_HOME_ROOT = Path("/run/aicc-agent-homes")
 # root-owned content manifest, so this path resolves to verified bytes or to
 # nothing at all -- never to a half-installed package tree.
 TOOLCHAIN_BIN = "/opt/aicc/toolchains/current/bin"
+# The quality-band impacted-test gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS).
+# Unlike the model executors, this "binary" is a FIXED, non-interactive
+# script -- the same content as this repository's own
+# scripts/ci/prepush/quality_band.sh, released into the content-addressed
+# toolchain exactly like the provider CLIs above so `_validate_binary`
+# proves it root-owned and immutable independent of any candidate tree.
+# `_provider_command` never derives its argv from the manifest for this
+# executor, so nothing a caller sends can redirect what actually runs.
+QUALITY_BAND_EXECUTOR = "quality_band"
+QUALITY_BAND_PROFILE = "quality_band"
 EXECUTOR_BINARIES = {
     "claude": f"{TOOLCHAIN_BIN}/claude",
     "codex": f"{TOOLCHAIN_BIN}/codex",
+    QUALITY_BAND_EXECUTOR: f"{TOOLCHAIN_BIN}/quality-band-gate",
 }
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -97,7 +108,7 @@ MAX_OUTPUT_BYTES = 512 * 1024
 MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
-PROFILES = frozenset({"read_only", "trusted_development"})
+PROFILES = frozenset({"read_only", "trusted_development", QUALITY_BAND_PROFILE})
 MODEL_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 RUN_ID_RE = re.compile(r"[a-f0-9]{32}")
 BROKER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/]{1,200}\.service")
@@ -224,6 +235,18 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
         raise LaunchRefused("executor is not allowlisted")
     if value["profile"] not in PROFILES:
         raise LaunchRefused("profile is not allowlisted")
+    # quality_band is a fixed, credential-free, network-free pairing: the
+    # executor determines that the trusted quality-band script runs (never
+    # a model), and the profile is what strips model auth and network from
+    # the transient unit (_prepare_agent_home, _systemd_command). Neither
+    # side may appear without the other -- a mismatched pairing would let
+    # a manifest ask for the model-free profile with a model executor (or
+    # vice versa), which is not a combination anything below is designed
+    # to handle safely.
+    if (value["executor"] == QUALITY_BAND_EXECUTOR) != (
+        value["profile"] == QUALITY_BAND_PROFILE
+    ):
+        raise LaunchRefused("quality_band executor and profile must be paired")
     prompt = value["prompt"]
     if not isinstance(prompt, str) or not prompt or "\x00" in prompt:
         raise LaunchRefused("prompt must be a non-empty NUL-free string")
@@ -387,7 +410,7 @@ def _validated_workspace(value: str, roots: tuple[Path, ...]) -> Path:
 def _validate_environment_file(path: Path, executor: str) -> bool:
     if not _private_agent_environment(path, optional=True):
         return False
-    allowed = COMMON_AGENT_ENV_KEYS | PROVIDER_AGENT_ENV_KEYS[executor]
+    allowed = COMMON_AGENT_ENV_KEYS | PROVIDER_AGENT_ENV_KEYS.get(executor, frozenset())
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -423,64 +446,89 @@ def _validate_binary(path: str) -> None:
 
 
 def _prepare_agent_home(executor: str, run_id: str) -> Path:
-    """Create one non-persistent provider home with a private auth copy.
+    """Create one non-persistent provider home, with a private auth copy for
+    executors that need model authentication.
 
     The model process necessarily reads its provider credential, but it must
     not be able to persist plugins, instructions, config or a modified token
     into a later task. The root broker copies only the one allowlisted auth
     file into a per-run tmpfs-backed path and removes it after cgroup exit.
+
+    `quality_band` (and any future credential-free executor) takes neither
+    branch below: it has no `MODEL_AUTH_SOURCES` entry, so it gets a bare
+    home owned by the group `_systemd_command` actually grants it
+    (`aicc-workspace`) rather than the model-credential group
+    (`aicc-agent-auth`), which that profile's `SupplementaryGroups`
+    deliberately omits. Reusing the auth group's gid here regardless would
+    leave the transient unit unable to even traverse its own `/agent-home`
+    (mode 0770, group-only access) -- a functional regression caught by
+    review on a rejected VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS chunk.
     """
-    try:
-        # A DEDICATED group for ephemeral model-credential homes. The shared
-        # aicc-workspace output group also contains the guarded publisher and
-        # operators; keying the live provider token to it let every one of
-        # them read every agent's credential (review finding on 363e91d).
-        # aicc-agent-auth has no human or publisher members -- only the
-        # transient agent units join it.
-        auth_gid = grp.getgrnam("aicc-agent-auth").gr_gid
-    except KeyError as exc:
-        raise LaunchRefused("aicc-agent-auth group does not exist") from exc
-    source = MODEL_AUTH_SOURCES.get(executor)
-    if source is None:
-        raise LaunchRefused(f"no model auth source for executor {executor!r}")
-    source_payload = _read_exact_protected_file(
-        source, expected_uid=0, expected_gid=0, exact_mode=0o600
-    )
+    needs_model_auth = executor in MODEL_AUTH_SOURCES
+    auth_gid = None
+    source_payload = b""
+    if needs_model_auth:
+        try:
+            # A DEDICATED group for ephemeral model-credential homes. The
+            # shared aicc-workspace output group also contains the guarded
+            # publisher and operators; keying the live provider token to it
+            # let every one of them read every agent's credential (review
+            # finding on 363e91d). aicc-agent-auth has no human or publisher
+            # members -- only the transient agent units that need it join it.
+            auth_gid = grp.getgrnam("aicc-agent-auth").gr_gid
+        except KeyError as exc:
+            raise LaunchRefused("aicc-agent-auth group does not exist") from exc
+        source = MODEL_AUTH_SOURCES[executor]
+        source_payload = _read_exact_protected_file(
+            source, expected_uid=0, expected_gid=0, exact_mode=0o600
+        )
 
     home = EPHEMERAL_HOME_ROOT / run_id
     try:
         home.mkdir(mode=0o700)
-        target = home / MODEL_AUTH_TARGETS[executor]
-        target.parent.mkdir(mode=0o700, parents=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(target, flags, 0o660)
-        try:
-            os.fchmod(descriptor, 0o660)
-            os.fchown(descriptor, 0, auth_gid)
-            with os.fdopen(descriptor, "wb", closefd=False) as stream:
-                stream.write(source_payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            target_info = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(target_info.st_mode)
-                or target_info.st_nlink != 1
-                or target_info.st_uid != 0
-                or target_info.st_gid != auth_gid
-                # 0660: Claude/Codex rewrite their auth file on token
-                # refresh; 0640 broke refresh mid-run while the 0770 home
-                # let the agent replace the file anyway (review on 67a0a96).
-                or stat.S_IMODE(target_info.st_mode) != 0o660
-                or target_info.st_size != len(source_payload)
-            ):
-                raise LaunchRefused("ephemeral model auth target failed validation")
-        finally:
-            os.close(descriptor)
-        for path in (home, target.parent):
-            os.chown(path, 0, auth_gid)
-            os.chmod(path, 0o770)
+        if needs_model_auth:
+            assert auth_gid is not None
+            target = home / MODEL_AUTH_TARGETS[executor]
+            target.parent.mkdir(mode=0o700, parents=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(target, flags, 0o660)
+            try:
+                os.fchmod(descriptor, 0o660)
+                os.fchown(descriptor, 0, auth_gid)
+                with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                    stream.write(source_payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                target_info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(target_info.st_mode)
+                    or target_info.st_nlink != 1
+                    or target_info.st_uid != 0
+                    or target_info.st_gid != auth_gid
+                    # 0660: Claude/Codex rewrite their auth file on token
+                    # refresh; 0640 broke refresh mid-run while the 0770 home
+                    # let the agent replace the file anyway (review on
+                    # 67a0a96).
+                    or stat.S_IMODE(target_info.st_mode) != 0o660
+                    or target_info.st_size != len(source_payload)
+                ):
+                    raise LaunchRefused(
+                        "ephemeral model auth target failed validation"
+                    )
+            finally:
+                os.close(descriptor)
+            for path in (home, target.parent):
+                os.chown(path, 0, auth_gid)
+                os.chmod(path, 0o770)
+        else:
+            try:
+                workspace_gid = grp.getgrnam("aicc-workspace").gr_gid
+            except KeyError as exc:
+                raise LaunchRefused("aicc-workspace group does not exist") from exc
+            os.chown(home, 0, workspace_gid)
+            os.chmod(home, 0o770)
     except (FileExistsError, OSError) as exc:
         shutil.rmtree(home, ignore_errors=True)
         raise LaunchRefused("cannot prepare ephemeral model home") from exc
@@ -823,6 +871,15 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
     prompt = manifest["prompt"]
     model = manifest["model"]
     binary = EXECUTOR_BINARIES[executor]
+    if executor == QUALITY_BAND_EXECUTOR:
+        # Fixed argv, full stop: `prompt`/`model` are validated manifest
+        # fields (every manifest carries them, closed schema) but are NEVER
+        # read here. This profile exists to run one trusted, non-interactive
+        # script against the workspace as data; nothing the caller sends can
+        # add a single argv element to it. Returning immediately also skips
+        # the `--model`/codex-specific appends below, which is required, not
+        # merely harmless, for this executor.
+        return [binary]
     if executor == "claude":
         command = [
             binary,
@@ -901,6 +958,30 @@ def _current_broker_unit(cgroup_file: Path = Path("/proc/self/cgroup")) -> str:
     raise LaunchRefused("process is not inside an AICC launcher service")
 
 
+def _executed_exit_code(executor: str, raw_exit_code: int) -> int:
+    """Reserve exit code 125 exclusively for the BROKER'S OWN internal
+    failure path (`_serve_connected_socket`'s `except` clause, and
+    `_client`'s local equivalent) -- never for an actually-executed run's
+    real outcome.
+
+    Every other executor's command is a fixed, well-understood provider CLI
+    invocation. `quality_band` is different: its trusted script wraps and
+    executes the CANDIDATE'S OWN test files (the whole point of the gate),
+    so its real exit status is not fully within the trusted script's
+    control -- a candidate could engineer its own test run to exit exactly
+    125. Left unremapped, a caller matching the exact broker-failure
+    envelope (`RunResult.is_principal_isolation_error`: exit 125 + empty
+    stdout + marker-prefixed stderr) could misread a genuine, candidate-
+    triggered red run as "the broker failed, defer" instead of "refuse" --
+    review finding on the rejected VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS PR
+    #776. 124 collides with no shell or pytest exit-status convention this
+    codebase relies on elsewhere.
+    """
+    if executor == QUALITY_BAND_EXECUTOR and raw_exit_code == 125:
+        return 124
+    return raw_exit_code
+
+
 def _systemd_command(
     manifest: dict[str, Any],
     agent_home: Path,
@@ -911,6 +992,7 @@ def _systemd_command(
 ) -> list[str]:
     executor = manifest["executor"]
     timeout = int(manifest["timeout_seconds"])
+    is_quality_band = executor == QUALITY_BAND_EXECUTOR
     # No nesting hazard in this list: EPHEMERAL_HOME_ROOT is
     # /run/aicc-agent-homes -- a SIBLING of /run/aicc-agent-launcher, not a
     # child, so systemd never overmounts a parent before lstat'ing a nested
@@ -949,7 +1031,15 @@ def _systemd_command(
         "--setenv=GIT_CONFIG_GLOBAL=/dev/null",
         "--setenv=GIT_TERMINAL_PROMPT=0",
         "--setenv=GCM_INTERACTIVE=never",
-        "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
+        "--property=SupplementaryGroups=aicc-workspace"
+        if is_quality_band
+        # quality_band never authenticates as a model provider (no
+        # MODEL_AUTH_SOURCES entry, no credential file), so it does not join
+        # aicc-agent-auth -- the group would be dead weight -- omitted
+        # rather than granted and unused. `_prepare_agent_home` chowns this
+        # profile's ephemeral home to aicc-workspace precisely so that
+        # omission does not leave the process locked out of its own home.
+        else "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
         "--property=UMask=0007",
         "--property=NoNewPrivileges=yes",
         "--property=CapabilityBoundingSet=",
@@ -971,7 +1061,16 @@ def _systemd_command(
         "--property=LockPersonality=yes",
         "--property=KeyringMode=private",
         "--property=RemoveIPC=yes",
-        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        "--property=RestrictAddressFamilies=AF_UNIX"
+        if is_quality_band
+        # No network at all for the impacted-test gate: it never needs a
+        # model API, a remote, or any other host -- AF_UNIX only still lets
+        # it use e.g. abstract sockets a test harness might open locally,
+        # while AF_INET/AF_INET6/AF_NETLINK are refused outright.
+        # IPAddressDeny=any below is the belt-and-braces companion: even a
+        # process that somehow obtained an AF_INET socket cannot originate
+        # or accept a single packet.
+        else "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "--property=KillMode=control-group",
         "--property=Delegate=no",
         "--property=MemoryMax=6G",
@@ -988,8 +1087,13 @@ def _systemd_command(
         f"--property=BindPaths={agent_home}:/agent-home",
         "--property=ReadWritePaths=/workspace /agent-home",
     ]
-    for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor]):
-        if _validate_environment_file(env_file, executor):
+    if is_quality_band:
+        command.append("--property=IPAddressDeny=any")
+    # PROVIDER_ENV_FILES has no quality_band entry (no provider credential to
+    # stage): `.get()` skips it rather than raising, so this executor gets no
+    # EnvironmentFile beyond the common one (LANG/SSL_CERT*, no secrets).
+    for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES.get(executor)):
+        if env_file is not None and _validate_environment_file(env_file, executor):
             command.append(f"--property=EnvironmentFile={env_file}")
     command += ["--", *_provider_command(manifest)]
     return command
@@ -1708,9 +1812,10 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         if "error" in result:
             raise LaunchRefused(str(result["error"]))
         stdout, stderr = result.get("value", (b"", b""))  # type: ignore[assignment]
+        exit_code = _executed_exit_code(manifest["executor"], proc.returncode)
         response = {
             "version": 1,
-            "exit_code": proc.returncode,
+            "exit_code": exit_code,
             "stdout_b64": base64.b64encode(stdout).decode("ascii"),
             "stderr_b64": base64.b64encode(stderr).decode("ascii"),
         }
