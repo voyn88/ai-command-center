@@ -497,6 +497,168 @@ def _principal_launcher_environment() -> dict[str, str]:
     }
 
 
+# --------------------------------------------------------------------------
+# quality_band gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) — the impacted-test
+# phase of the pre-push quality band, run under the isolated principal.
+#
+# `command_center.orchestrator.publish`'s `_static_quality_gate` treats the
+# candidate tree as DATA specifically because publish_run executes in the
+# credentialed worker context, where running candidate code at all is the
+# exact hazard PREPUSH-FAST-GATE v1 was rejected for. That constraint does
+# not apply to the isolated principal: executing untrusted candidate code
+# under `NoNewPrivileges`, no model credential and no network is precisely
+# what this broker exists to do safely. `run_quality_band_gate` below is
+# therefore the one place the pre-push band's actual test run — the
+# candidate's own `scripts/ci/prepush/quality_band.sh` — is enforced for an
+# agent's publish, rather than only ever running in an interactive
+# `make prepush`.
+QUALITY_BAND_EXECUTOR = "quality_band"
+QUALITY_BAND_PROFILE = "quality_band"
+# Unused by the broker's fixed argv (ops/aicc_agent_launcher.py's
+# `_provider_command` ignores prompt/model for this executor entirely) —
+# present only because the manifest schema requires a non-empty prompt.
+_QUALITY_BAND_PROMPT = "quality-band-gate"
+DEFAULT_QUALITY_BAND_TIMEOUT_SECONDS = 900
+# Headroom over the manifest's own timeout, which the broker itself enforces
+# (RuntimeMaxSec). This is only the worker-side backstop against a broker
+# that never replies at all.
+_QUALITY_BAND_TRANSPORT_GRACE_SECONDS = 30
+
+
+def quality_band_gate_available() -> tuple[bool, str]:
+    """Is the isolated principal deployed and ready to run the quality_band
+    gate on this host?
+
+    Unlike `principal_executor_preflight` (which checks a specific
+    provider's own CLI binary), `quality_band` has no provider CLI at all —
+    its fixed command is a system shell (`ops/aicc_agent_launcher.py`'s
+    `EXECUTOR_BINARIES["quality_band"]`), present on every host regardless
+    of whether principal isolation is deployed at all. The meaningful
+    signal here is instead whether isolation is *required* on this host and
+    whether the launcher binary — the actual bridge to the broker — exists.
+    """
+    if not principal_isolation_required():
+        return False, "principal isolation is not required on this host"
+    if not (
+        Path(PRINCIPAL_ISOLATION_LAUNCHER).is_file()
+        and os.access(PRINCIPAL_ISOLATION_LAUNCHER, os.X_OK)
+    ):
+        return False, f"isolated launcher is unavailable: {PRINCIPAL_ISOLATION_LAUNCHER}"
+    return True, ""
+
+
+def build_quality_band_manifest(
+    *,
+    repository_path: Path,
+    timeout_seconds: int = DEFAULT_QUALITY_BAND_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """Build the launcher manifest for the quality_band profile.
+
+    Fixed executor/profile pair, enforced again by the broker
+    (`_load_manifest`'s pairing check). No provider credential is
+    requested — `quality_band` carries no entry in the broker's
+    `MODEL_AUTH_SOURCES` — and the broker's own fixed argv for this
+    executor ignores `prompt`/`model` entirely.
+    """
+    return {
+        "version": 1,
+        "run_id": uuid.uuid4().hex,
+        "workspace": str(repository_path.resolve(strict=True)),
+        "executor": QUALITY_BAND_EXECUTOR,
+        "profile": QUALITY_BAND_PROFILE,
+        "prompt": _QUALITY_BAND_PROMPT,
+        "model": None,
+        "timeout_seconds": timeout_seconds,
+    }
+
+
+def run_quality_band_gate(
+    *,
+    repository_path: Path,
+    timeout_seconds: int = DEFAULT_QUALITY_BAND_TIMEOUT_SECONDS,
+    launcher: str = PRINCIPAL_ISOLATION_LAUNCHER,
+) -> "RunResult":
+    """Run the candidate's impacted-test quality band under the isolated
+    principal and report the outcome.
+
+    Callers distinguish a genuine red run from broker infrastructure
+    failure exclusively through `RunResult.is_principal_isolation_error` —
+    the exact transport-envelope check (status "failed", exit code 125,
+    empty stdout, a marker-prefixed stderr line), never a substring search
+    over combined output. That distinction matters specifically because the
+    workspace under test is untrusted: a broken or adversarial candidate's
+    `quality_band.sh` run can print anything at all to its own stdout, and a
+    naive substring search over stdout+stderr would let a genuinely red run
+    spoof a defer by echoing the marker text itself. A timeout is reported
+    as `status="timed_out"`, never as the isolation-marker envelope: it is
+    ambiguous (a hung broker vs. a genuinely slow red run), and treating
+    ambiguity as a defer would let a stuck/adversarial run through silently.
+    `is_principal_isolation_error` requires `status == "failed"`, so a
+    timeout always fails closed (refused, never deferred) at the call site.
+    """
+    started_at = models.iso_now()
+    started_monotonic = time.monotonic()
+    manifest = build_quality_band_manifest(
+        repository_path=repository_path, timeout_seconds=timeout_seconds
+    )
+    launcher_input = json.dumps(manifest, separators=(",", ":")) + "\n"
+    try:
+        proc = subprocess.Popen(
+            [launcher, "--client"],
+            cwd=Path("/"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_principal_launcher_environment(),
+            close_fds=True,
+        )
+    except OSError as exc:
+        now = models.iso_now()
+        # The launcher binary vanished between preflight and this call (a
+        # race, or a rollback mid-deploy) — the same bucket as "not
+        # deployed": defer to CI rather than refuse every publish for a
+        # host-local infrastructure gap.
+        return RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr=f"{_PRINCIPAL_ISOLATION_FAILURE}: launcher unavailable: {exc}",
+            duration_seconds=0.0,
+            started_at=now,
+            completed_at=now,
+        )
+    try:
+        stdout, stderr = proc.communicate(
+            input=launcher_input,
+            timeout=timeout_seconds + _QUALITY_BAND_TRANSPORT_GRACE_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        duration = time.monotonic() - started_monotonic
+        return RunResult(
+            status="timed_out",
+            exit_code=None,
+            stdout="",
+            stderr="quality_band_gate_timeout",
+            duration_seconds=duration,
+            started_at=started_at,
+            completed_at=models.iso_now(),
+        )
+    duration = time.monotonic() - started_monotonic
+    exit_code = proc.returncode
+    return RunResult(
+        status="completed" if exit_code == 0 else "failed",
+        exit_code=exit_code,
+        stdout=stdout or "",
+        stderr=stderr or "",
+        duration_seconds=duration,
+        started_at=started_at,
+        completed_at=models.iso_now(),
+    )
+
+
 DEFAULT_TIMEOUT_SECONDS = 900
 MIN_TIMEOUT_SECONDS = 30
 MAX_TIMEOUT_SECONDS = 3600

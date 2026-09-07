@@ -43,6 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from command_center import agent_runner
 from command_center.worker import lease_client
 
 _PR_VIEW_DECODE_ERRORS = (TypeError, ValueError)
@@ -454,6 +455,52 @@ def _leak_guard_gate(
     )
 
 
+def _quality_band_sandbox_gate(repo_path: Path, head_sha: str) -> PublishResult | None:
+    """Impacted-test phase of the pre-push quality band
+    (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS), executed under the isolated
+    principal. Returns a refusal ``PublishResult`` on a red run, ``None``
+    to proceed.
+
+    ``_static_quality_gate`` above only ever treats the candidate tree as
+    DATA because it runs in this credentialed worker context, where
+    executing candidate code at all is the exact hazard PREPUSH-FAST-GATE
+    v1 was rejected for. That constraint does not apply to the isolated
+    principal (``ops/aicc_agent_launcher.py``'s ``quality_band`` profile):
+    no model credential, no network, a fixed argv running the candidate's
+    own ``scripts/ci/prepush/quality_band.sh``. This is therefore the one
+    place the band's actual test run is enforced for an agent's publish,
+    rather than only ever running in an interactive ``make prepush``.
+
+    Fail-open when principal isolation is not deployed/required on this
+    host (dev machines, hosts mid-rollout): the gate stays entirely inert
+    and publish behaves exactly as before it existed, deferring to
+    interactive ``make prepush`` and the required CI suite. A broker
+    infrastructure failure (``RunResult.is_principal_isolation_error``)
+    defers for the same reason the ruff gate defers on missing tooling --
+    never the candidate's fault. Everything else -- a genuine red run, or
+    an ambiguous timeout -- refuses the publish before the lease.
+    """
+    if os.environ.get("VOYN_QUALITY_BAND") == "off":
+        return None
+    if not (repo_path / "scripts" / "ci" / "prepush").is_dir():
+        return None
+    available, _detail = agent_runner.quality_band_gate_available()
+    if not available:
+        return None
+    run = agent_runner.run_quality_band_gate(repository_path=repo_path)
+    if run.is_principal_isolation_error:
+        return None
+    if run.status == "completed" and run.exit_code == 0:
+        return None
+    tail = f"{run.stdout}\n{run.stderr}".strip().splitlines()
+    detail = " | ".join(tail[-3:]) if tail else "no output"
+    return PublishResult(
+        ok=False,
+        head_sha=head_sha,
+        reason=f"quality_band_sandbox_failed: {detail[:160]}",
+    )
+
+
 def publish_run(
     repo_path: Path,
     cfg: PublishConfig,
@@ -522,19 +569,19 @@ def publish_run(
     # candidate-controlled host command execution (verification finding 1),
     # and its env `setdefault` let an inherited variable override the
     # validated selection base (finding 2). Candidate code only ever
-    # executes inside the agent's isolated principal, so the publish side
+    # executes inside the agent's isolated principal, so this static gate
     # keeps exactly the checks that treat the tree as DATA (ruff: parse +
     # lint, which also catches syntax errors), run by the worker's own
     # trusted interpreter with explicit argv and a minimal explicit env --
-    # nothing inherited or worktree-resident can redirect them. NOTHING on
-    # this publish path runs the impacted-TEST phase: enforcing it for
-    # agents requires an allowlisted profile in the privileged
-    # principal-isolation launcher (candidate code may only execute under
-    # the isolated principal), which is VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS
-    # -- a separate security-designed task. Until it lands, tests pre-push
-    # exist only in interactive `make prepush`, and the authoritative
-    # enforcement remains the required CI suite. `already_durable`
-    # redeliveries skip the gate: that head's verdict was taken before the
+    # nothing inherited or worktree-resident can redirect them. The
+    # impacted-TEST phase now runs separately, under the isolated principal
+    # (`_quality_band_sandbox_gate`, VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS): a
+    # dedicated `quality_band` profile in the privileged launcher, no model
+    # credential, no network, fixed argv. It stays inert wherever principal
+    # isolation is not deployed, so a host without it behaves exactly as
+    # before this gate existed: `make prepush` interactively and the
+    # required CI suite remain the authority. `already_durable` redeliveries
+    # skip every gate here: that head's verdict was taken before the
     # original push.
     if not already_durable:
         gate_failure = _static_quality_gate(repo_path, head_sha)
@@ -543,6 +590,9 @@ def publish_run(
         leak_failure = _leak_guard_gate(repo_path, head_sha, base_sha_value)
         if leak_failure is not None:
             return leak_failure
+        sandbox_failure = _quality_band_sandbox_gate(repo_path, head_sha)
+        if sandbox_failure is not None:
+            return sandbox_failure
 
     branch = f"backlog/{cfg.task}"
     if already_durable:
