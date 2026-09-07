@@ -144,6 +144,15 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
     ),
+    "backlog_duplicate": Exclusion(
+        reason=(
+            "PostgreSQL-native (migration 0018): the canonical-duplicate link is "
+            "written only by backlog_mark_duplicate in the same transaction as "
+            "the OPEN -> DECIDED transition it justifies; no SQLite authority "
+            "ever held it, so there is nothing to mirror."
+        ),
+        task="VOYN-W0-AICC-BGE-M3-DEDUP-SCAN",
+    ),
     "queue_entry": Exclusion(
         reason=(
             "Mirrored under a contract of its own rather than the shared one: the "
