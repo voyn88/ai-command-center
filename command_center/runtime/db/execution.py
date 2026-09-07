@@ -314,12 +314,25 @@ def create_run(
                 (session_id,),
             ).fetchone()
             sequence = row["next_seq"]
+            # Built once, up front: reused below both to guard the optional
+            # `insert_seq` computation (absent on a database migrated only
+            # part-way — see `_migration_25_add_insert_seq`) and, further down,
+            # to build the INSERT's column list.
+            table_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
+            insert_seq = None
+            if "insert_seq" in table_columns:
+                insert_seq_row = conn.execute(
+                    "SELECT COALESCE(MAX(insert_seq), 0) + 1 AS next_seq FROM run WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                insert_seq = insert_seq_row["next_seq"]
             now = db.iso_now()
             record = {
                 "id": run_id or db.new_id(),
                 "session_id": session_id,
                 "task_id": task_id,
                 "sequence": sequence,
+                "insert_seq": insert_seq,
                 "is_resume": 1 if is_resume else 0,
                 "state": "PREPARED",
                 "project": project,
@@ -360,8 +373,8 @@ def create_run(
             # is exactly what the historical-schema migration tests construct —
             # has no `provider_*` columns yet, and naming them unconditionally
             # would make `create_run` unusable against any schema older than
-            # the one that introduced them.
-            table_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
+            # the one that introduced them. `table_columns` was already read
+            # above, before `insert_seq` was computed.
             insert_columns = [name for name in record if name in table_columns]
             conn.execute(
                 f"""INSERT INTO run ({", ".join(insert_columns)})
@@ -524,14 +537,15 @@ def get_latest_run_for_task(db_path: Path, task_id: str) -> dict | None:
     Distinct from `list_runs(task_id=..., limit=1)`: that path orders only by
     `created_at DESC`, and `created_at` is second-granularity (`iso_now()`),
     so two runs created in the same second tie and SQLite returns them in
-    unspecified rowid order. We add `rowid DESC` as a stable tiebreak — rowid
-    is insertion order, so the higher rowid is the newer row — guaranteeing
-    the actually-newest run is returned. Used by `task_sync.sync_tasks` to
-    self-heal tasks whose `current_run_id` was orphaned by a lost update.
+    unspecified order. We add `insert_seq DESC` as a stable tiebreak — a
+    monotonic per-task insertion counter (`_migration_25_add_insert_seq`),
+    higher means newer — guaranteeing the actually-newest run is returned.
+    Used by `task_sync.sync_tasks` to self-heal tasks whose `current_run_id`
+    was orphaned by a lost update.
     """
     with db.connect(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM run WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            "SELECT * FROM run WHERE task_id = ? ORDER BY created_at DESC, insert_seq DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         return db._row_to_dict(row)

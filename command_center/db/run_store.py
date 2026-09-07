@@ -1,7 +1,7 @@
 """The `run` table's PostgreSQL mirror (VOYN-W0-AICC-SRV-01B, slice 11).
 
 The bottleneck of the correspondence map's FK graph: ten tables reference
-`run`, so it moves alone. Forty-two columns, and not one new conversion class —
+`run`, so it moves alone. Forty-three columns, and not one new conversion class —
 two `jsonb` (slice 4), three `INTEGER 0/1` -> `boolean` (slice 2), seven
 `timestamptz` including five nullable (slice 3, plus `finalized_at` from
 `0004_run_finalized_at`), two foreign keys (slice 5). The machinery carries all
@@ -14,7 +14,7 @@ is the write-side sibling of slice 4's reader trap. `create_run` builds its
 returns is missing whatever it never set.
 
 Measured rather than asserted, because the first version of this docstring
-overstated it: the record has 38 keys and the stored row 42, and the four that
+overstated it: the record has 39 keys and the stored row 43, and the four that
 differ are `failure_reason`, `first_output_at`, `pre_run_head` and
 `finalized_at` — the last of which cannot be otherwise, since it is written
 only at the end of finalization, long after `create_run` has returned. All four
@@ -97,6 +97,9 @@ RUN_COLUMNS: tuple[str, ...] = (
     # a new column at the end of the ordinal order, so the position here is the
     # position the databases have.
     "finalized_at",
+    # Added by `0010_run_completion_insert_seq` (VOYN-W0-AICC-INSERT-SEQ) —
+    # same append-at-the-end rule as `finalized_at` above.
+    "insert_seq",
 )
 
 #: Three flags, six timestamps (four of them nullable — a run is created before

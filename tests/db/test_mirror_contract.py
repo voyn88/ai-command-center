@@ -143,7 +143,10 @@ def test_the_migration_scan_finds_a_column_added_after_0001() -> None:
     only 0001 — and every mirror would still be green until the next migration
     added a column, which is exactly the failure mode this scan replaces.
     """
-    assert _added_columns()["run"] == (("finalized_at", "timestamptz"),)
+    assert _added_columns()["run"] == (
+        ("finalized_at", "timestamptz"),
+        ("insert_seq", "integer"),
+    )
     assert _declared_columns("run")["finalized_at"] == "timestamptz"
 
 

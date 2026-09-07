@@ -46,8 +46,18 @@ def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
         if table is None:
             return 0
         with db.transaction(conn):
+            # `insert_seq` (migration 25) is the durable, cross-mirror
+            # insertion-order column that replaced `rowid` as the tiebreak
+            # here — but a database migrated only part-way (exactly what
+            # `test_upgrade_from_every_supported_historical_schema` builds,
+            # for every historical version >= 13) may have `run_provenance`
+            # (migration 13) without yet having `run.insert_seq` (migration
+            # 25). Fall back to `rowid` on such a schema so this backfill
+            # keeps working against every historical version it always has.
+            run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
+            order_column = "r.insert_seq" if "insert_seq" in run_columns else "r.rowid"
             cursor = conn.execute(
-                """INSERT INTO run_provenance (
+                f"""INSERT INTO run_provenance (
                        run_id, task_id, repository_path, worktree_path, branch,
                        base_branch, base_sha, head_sha, pull_request_number,
                        pull_request_url, pull_request_head_sha, accepted_sha,
@@ -73,7 +83,7 @@ def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
                    WHERE NOT EXISTS (
                        SELECT 1 FROM run_provenance AS p WHERE p.run_id = r.id
                    )
-                   ORDER BY r.created_at, r.rowid
+                   ORDER BY r.created_at, {order_column}
                    LIMIT ?
                    RETURNING *""",
                 (now, limit),

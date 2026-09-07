@@ -41,6 +41,7 @@ INITIAL_MIGRATION = REPO_ROOT / "command_center" / "db" / "sql" / "0001_initial.
 #: sides"; a migration that only creates PostgreSQL-native objects stays out.
 CORRESPONDING_MIGRATIONS = (
     REPO_ROOT / "command_center" / "db" / "sql" / "0004_run_finalized_at.up.sql",
+    REPO_ROOT / "command_center" / "db" / "sql" / "0010_run_completion_insert_seq.up.sql",
 )
 
 #: The bookkeeping table; not a domain table on either side.

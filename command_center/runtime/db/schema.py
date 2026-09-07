@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1127,6 +1127,53 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invit
 """
 
 
+def _migration_25_add_insert_seq(conn: sqlite3.Connection) -> None:
+    """Adds `run.insert_seq` / `completion.insert_seq` — a monotonic,
+    per-`task_id` insertion-order column, replacing `rowid` as the thing
+    `get_latest_run_for_task`/`get_completion_by_task` tiebreak on
+    (VOYN-W0-AICC-INSERT-SEQ).
+
+    Neither existing candidate works as an insertion-order marker: `run.sequence`
+    is `MAX(sequence)+1` scoped to `session_id` (see `create_run`), and
+    `supervisor.start` mints a brand-new session for every non-resume launch, so
+    a task with N restarts has N runs each reading `sequence = 1` — not a usable
+    ordering across a task's history. `completion` carries no sequence column at
+    all. A text tiebreak is equally unusable: both `run.id` and `completion`'s
+    `run_id` are `uuid4().hex` — pure randomness — and `create_run` accepts a
+    caller-supplied `run_id`, so nothing about the id encodes when the row was
+    written.
+
+    `rowid` — SQLite's own monotonic insertion counter — already answers this
+    correctly (see the `rowid DESC` tiebreak these two lookups used before this
+    migration) but is an implementation detail of the on-disk row, invisible on
+    the PostgreSQL mirror and lost on any `VACUUM`/dump-restore that renumbers
+    rows. `insert_seq` makes that ordering an explicit, durable column instead:
+    seeded once here from `rowid` (the only place `rowid` is read from after
+    this migration lands — every future insert computes its own value), then
+    maintained going forward by `create_run`/`create_completion` via the same
+    `SELECT COALESCE(MAX(insert_seq), 0) + 1 FROM <table> WHERE task_id = ?`
+    inside the existing `BEGIN IMMEDIATE` transaction that `run.sequence` and
+    `run_event.seq` already use — not a new locking pattern, just the
+    established one scoped to `task_id` instead of `session_id`/`run_id`.
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as the earlier
+    callable migrations, wrapped in one `BEGIN IMMEDIATE` transaction — safe to
+    re-run and safe under genuine concurrent first-application. The backfill
+    (`UPDATE ... WHERE insert_seq IS NULL`) is likewise safe to re-run: a second
+    pass finds nothing left to fill.
+    """
+    with db.transaction(conn):
+        for table in ("run", "completion"):
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "insert_seq" not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN insert_seq INTEGER")
+            conn.execute(f"UPDATE {table} SET insert_seq = rowid WHERE insert_seq IS NULL")
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_task_insert_seq "
+                f"ON {table}(task_id, insert_seq)"
+            )
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -1160,4 +1207,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (22, _SCHEMA_V22),
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
+    (25, _migration_25_add_insert_seq),
 ]

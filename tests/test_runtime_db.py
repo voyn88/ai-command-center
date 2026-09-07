@@ -735,6 +735,29 @@ def test_session_can_have_multiple_runs_with_incrementing_sequence(tmp_path):
     assert {r["id"] for r in runs} == {r1["id"], r2["id"]}
 
 
+def test_insert_seq_stays_monotonic_across_restarts_where_sequence_resets(tmp_path):
+    """The bug VOYN-W0-AICC-INSERT-SEQ fixes: `sequence` is scoped to
+    `session_id`, and a non-resume launch always starts a new session (see
+    `supervisor.start`), so a task with N restarts has N runs each reading
+    `sequence == 1` — unusable as an insertion-order marker across a task's
+    history. `insert_seq` is scoped to `task_id` instead, so it keeps climbing
+    across those restarts even though `sequence` keeps resetting."""
+    path = _fresh_db(tmp_path)
+    task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
+    runs = []
+    for i in range(3):
+        session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
+        runs.append(
+            db.create_run(
+                path, session_id=session["id"], task_id=task["id"], project="AIOS",
+                task_type="implementation", repository_path="/tmp/x", prompt=f"p{i}", is_resume=False,
+            )
+        )
+    assert [r["sequence"] for r in runs] == [1, 1, 1]
+    assert [r["insert_seq"] for r in runs] == [1, 2, 3]
+    assert db.get_latest_run_for_task(path, task["id"])["id"] == runs[-1]["id"]
+
+
 # --------------------------------------------------------------------------
 # Workspace locking — `create_run(enforce_workspace_lock=True)`
 # --------------------------------------------------------------------------

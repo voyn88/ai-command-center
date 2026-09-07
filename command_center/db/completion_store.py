@@ -7,9 +7,13 @@ No new conversion class: two identity columns (slice 6), three `jsonb` columns
 between them (slice 4), two booleans on `completion` (slice 2), nullable
 lifecycle timestamps (slice 3), and keys that are not `id` (slice 9). The
 declarations below were derived from `0001_initial.up.sql` by script rather than
-transcribed, because thirty-five columns copied by hand is a transcription error
+transcribed, because thirty-six columns copied by hand is a transcription error
 waiting to be found by reconciliation — and the shared contract checks every one
 of them against the DDL anyway.
+
+`completion.insert_seq` (`0010_run_completion_insert_seq`, VOYN-W0-AICC-INSERT-SEQ)
+is likewise no new class: a plain application-computed `integer` mirrored as
+itself, the same shape `run.sequence` already has.
 """
 
 from __future__ import annotations
@@ -39,6 +43,10 @@ COMPLETION_COLUMNS: tuple[str, ...] = (
     "recommended_action", "validation_summary", "policy_json", "last_checked_at",
     "next_retry_at", "retry_count", "recovery_count", "version", "created_at",
     "updated_at", "review_verdict", "review_run_id", "review_summary",
+    # Added by `0010_run_completion_insert_seq` (VOYN-W0-AICC-INSERT-SEQ),
+    # appended at the end of the ordinal order like every later `ALTER TABLE
+    # ... ADD COLUMN` in this schema.
+    "insert_seq",
 )
 
 COMPLETION_EVENT_COLUMNS: tuple[str, ...] = (
