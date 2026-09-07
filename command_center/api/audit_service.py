@@ -31,6 +31,7 @@ from pathlib import Path
 from command_center.api import audit_schemas as a
 from command_center.api import models
 from command_center.audit import AuditRunner, default_registry
+from command_center.audit.silent import SilentAuditResult, run_silent_audit
 from command_center.audit.types import CheckContext
 from command_center.events import (
     AuditFindingCreated,
@@ -228,6 +229,53 @@ def run_audit(payload: a.AuditRunRequest) -> a.AuditRunResult:
         findings=finding_models,
         deduped=result.deduped,
     )
+
+
+# --------------------------------------------------------------------------
+# Silent Audit Simulator — an unobtrusive, sandboxed trial pass per change
+# --------------------------------------------------------------------------
+
+
+def record_silent_audit(
+    *,
+    candidate_sha: str,
+    project: str,
+    target: Path,
+    db_path: Path | None = None,
+) -> SilentAuditResult:
+    """Run one silent, sandboxed audit pass for ``candidate_sha`` and persist
+    that it happened. This is the only place :func:`command_center.audit.silent.run_silent_audit`
+    is combined with storage, matching the split every other entry point in
+    this module keeps: the domain function stays storage-free, this service
+    layer owns persistence.
+
+    Never raises: ``run_silent_audit`` already can't, and the persistence
+    write below is itself best-effort so a completion path can call this
+    fire-and-forget, exactly as the domain module's docstring describes,
+    without wrapping it in a try/except of its own."""
+    path = db_path or _db_path()
+    result = run_silent_audit(
+        candidate_sha=candidate_sha,
+        project=project,
+        target=target,
+        db_path=path,
+    )
+    try:
+        db.record_silent_audit_result(
+            path,
+            candidate_sha=result.candidate_sha,
+            project=result.project,
+            ok=result.ok,
+            checks=result.checks,
+            finding_count=result.finding_count,
+            deduped=result.deduped,
+            error=result.error,
+            started_at=result.started_at,
+            completed_at=result.completed_at,
+        )
+    except Exception:  # noqa: BLE001 — a silent pass must never raise or block
+        pass
+    return result
 
 
 # --------------------------------------------------------------------------
