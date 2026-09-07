@@ -389,8 +389,8 @@ def _rows(factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
 # CLI -- readable in journald, invisible to anything but a human tailing it.
 # `next_tick_seq`/`record_tick_skips` are the write side of `tick_skip_event`
 # (migration 0018): one shared ordinal per CLI invocation ("one tick"),
-# stamped onto every skip that invocation records, so `command_center.ops.
-# tick_stall_watchdog` can read a table instead of parsing logs.
+# stamped onto every skip that invocation records, so `command_center.
+# orchestrator.tick_stall_watchdog` can read a table instead of parsing logs.
 
 
 def next_tick_seq(factory: Any) -> int:
