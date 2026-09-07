@@ -119,6 +119,7 @@ ALL_TABLES: tuple[str, ...] = (
     "audit_finding",
     "audit_run",
     "backlog_dependency",
+    "backlog_duplicate",
     "backlog_event",
     "backlog_evidence",
     "backlog_task",
@@ -267,6 +268,7 @@ _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
 _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _READ,
     "backlog_dependency": _READ,
+    "backlog_duplicate": _READ,
     "backlog_evidence": _READ,
     "backlog_event": _READ,
     "backlog_writer_lease": _READ,
@@ -277,6 +279,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _NONE,
     "backlog_dependency": _NONE,
+    "backlog_duplicate": _NONE,
     "backlog_evidence": _NONE,
     "backlog_event": _NONE,
     "backlog_writer_lease": _NONE,
@@ -503,6 +506,10 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # The OPEN -> DECIDED counterpart (0018, VOYN-W0-AICC-BGE-M3-DEDUP-SCAN):
+    # collapses a task already OPEN that turns out to duplicate another one,
+    # with a required, FK-checked canonical reference.
+    "backlog_mark_duplicate(text, text, text)",
 )
 
 # The enrolment surface (0003), split by who may do what.

@@ -236,6 +236,9 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # VOYN-W0-AICC-BGE-M3-DEDUP-SCAN (0018): OPEN -> DECIDED for a task
+        # found to duplicate another already-live one.
+        "backlog_mark_duplicate",
     }
 
 
