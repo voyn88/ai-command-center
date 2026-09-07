@@ -5585,7 +5585,6 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         "prepare",
         "apply",
         "commit",
-        "install",
         "quiesce-worker-only",
         "validate-control-authority",
         "revoke-worker-authority",
