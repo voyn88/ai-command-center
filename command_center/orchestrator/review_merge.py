@@ -1458,16 +1458,25 @@ def _chunk_review_rows(
     first_valid: dict[str, tuple[int, tuple[Any, ...]]] = {}
     for row in rows:
         base_key, attempt = _retry_attempt(row[0])
-        current = newest.get(base_key)
-        if current is None or attempt > current[0]:
-            newest[base_key] = (attempt, (base_key, *row[1:]))
+        # The attempt number rides along as a trailing element so callers
+        # (namely `_aggregate_chunk_verdict`) can tell "still in flight" and
+        # "malformed but retries remain" apart from "malformed AND
+        # `_next_retry_key`'s bounded ceiling was already reached" -- the
+        # latter is permanently stuck and must surface as its own named
+        # terminal reason rather than repeating the same generic WAIT skip
+        # forever (VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS).
+        if current := newest.get(base_key):
+            if attempt > current[0]:
+                newest[base_key] = (attempt, (base_key, *row[1:], attempt))
+        else:
+            newest[base_key] = (attempt, (base_key, *row[1:], attempt))
         result = _json_object(row[3])
         parsed = _parse_verdict((result or {}).get("result_text") or "")
         valid = first_valid.get(base_key)
         if parsed is not None and parsed[1] == snapshot.head and (
             valid is None or attempt < valid[0]
         ):
-            first_valid[base_key] = (attempt, (base_key, *row[1:]))
+            first_valid[base_key] = (attempt, (base_key, *row[1:], attempt))
     selected = {
         base_key: first_valid.get(base_key, newest[base_key])
         for base_key in newest
@@ -1478,10 +1487,10 @@ def _chunk_review_rows(
 def _aggregate_chunk_verdict(
     rows: list[tuple[Any, ...]], snapshot: _PRSnapshot, prefix: str
 ) -> tuple[str, str]:
-    indexed: dict[int, tuple[str, str, dict[str, Any] | None, str]] = {}
+    indexed: dict[int, tuple[str, str, dict[str, Any] | None, str, int]] = {}
     expected_count: int | None = None
     expected_manifest: str | None = None
-    for key, state, payload_value, result_value in rows:
+    for key, state, payload_value, result_value, attempt in rows:
         payload = _json_object(payload_value)
         metadata = payload.get("review_chunk") if payload else None
         if not isinstance(metadata, dict) or metadata.get("version") != 3:
@@ -1521,7 +1530,9 @@ def _aggregate_chunk_verdict(
         content = envelope.get("content") if envelope else None
         if not isinstance(content, dict) or not isinstance(content.get("text"), str):
             return "WAIT", "review_chunk_manifest_invalid"
-        indexed[index] = (str(state), content_hash, _json_object(result_value), content["text"])
+        indexed[index] = (
+            str(state), content_hash, _json_object(result_value), content["text"], attempt,
+        )
 
     if expected_count is None:
         return "WAIT", "review_chunks_missing"
@@ -1536,22 +1547,43 @@ def _aggregate_chunk_verdict(
 
     rejections: list[str] = []
     waiting_reason = ""
+    exhausted_reason = ""
     for index in sorted(indexed):
-        state, _content_hash, result, _text = indexed[index]
+        state, _content_hash, result, _text, attempt = indexed[index]
         if state != "succeeded" or result is None:
             waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
             continue
         text = result.get("result_text") or ""
         parsed = _parse_verdict(text)
+        # A succeeded chunk run that never produced a valid verdict/head-sha
+        # pair, at `_next_retry_key`'s bounded retry ceiling, will never be
+        # retried again -- reconcile_review_once has permanently given up on
+        # it. Distinguishing that from ordinary "still waiting" (which DOES
+        # resolve on a later tick once the retry lands) is exactly the
+        # single-chunk `review_result_retries_exhausted` treatment, applied
+        # per-chunk here: a stuck chunk must surface as its own named,
+        # terminal reason instead of repeating the same generic WAIT skip
+        # forever (VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS, live on PR 649
+        # where every chunk had succeeded yet aggregation never advanced).
         if parsed is None:
+            if attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+                exhausted_reason = exhausted_reason or (
+                    f"review_chunk_retries_exhausted:{index}:verdict_missing"
+                )
             waiting_reason = waiting_reason or f"review_chunk_verdict_missing:{index}"
             continue
         verdict, sha = parsed
         if sha != snapshot.head:
+            if attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+                exhausted_reason = exhausted_reason or (
+                    f"review_chunk_retries_exhausted:{index}:head_sha_mismatch"
+                )
             waiting_reason = waiting_reason or f"review_chunk_head_sha_mismatch:{index}"
             continue
         if verdict == "REJECT":
             rejections.append(f"Chunk {index + 1}/{expected_count}:\n{text}")
+    if exhausted_reason:
+        return "WAIT", exhausted_reason
     if rejections:
         return "REJECT", "\n\n".join(rejections)
     if not complete:

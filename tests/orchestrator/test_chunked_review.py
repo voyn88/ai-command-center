@@ -86,6 +86,32 @@ def test_chunk_completeness_failure_and_reject_are_fail_closed(monkeypatch):
     assert not posted and remediated and report.remediated
 
 
+def test_chunk_stuck_at_retry_ceiling_reports_named_exhaustion_not_generic_wait(monkeypatch):  # noqa: E501
+    """VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS (live 2026-09-06/07 on PR
+    649): every chunk review run had SUCCEEDED, yet `publish_review_verdicts`
+    kept reporting the exact same skip forever with nothing to distinguish
+    a permanently-stuck chunk from an ordinary in-flight one. A chunk whose
+    latest attempt succeeded but never produced a valid verdict/head-sha
+    pair, and which has already reached `_next_retry_key`'s bounded retry
+    ceiling (so reconcile_review_once will never enqueue another attempt for
+    it), must surface as its own named terminal reason -- not the same
+    generic `review_chunk_verdict_missing`/`review_chunk_head_sha_mismatch`
+    skip repeated tick after tick."""
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    stuck = rows(snapshot)
+    key, state, payload, _output = stuck[0]
+    retry_key = f"{key}:retry:{review_merge._MAX_RESULT_RETRY_ATTEMPTS}"
+    stuck[0] = (retry_key, state, payload, {"result_text": "tool transcript only, no verdict"})
+
+    report, posted, remediated = publish(monkeypatch, snapshot, stuck)
+
+    assert not posted and not remediated
+    assert len(report.skipped) == 1
+    reason = report.skipped[0][1]
+    assert reason.startswith("review_chunk_retries_exhausted:")
+    assert "verdict_missing" in reason
+
+
 def test_malformed_result_gets_fresh_bounded_retry_key(monkeypatch):
     key = "review:identity:chunk:0001:abc"
     monkeypatch.setattr(
