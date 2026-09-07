@@ -8,4 +8,9 @@ body {
      see components/BackgroundLayer.tsx. Keep body transparent so it shows
      through undistorted. */
   min-height: 100vh;
+  /* viewport-fit=cover (index.html, VOYN-W0-APP-CONTROL-S3) lets content
+     draw under the iPhone notch/home-indicator; pull it back in so the
+     header and footer stay clear of both. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
 }

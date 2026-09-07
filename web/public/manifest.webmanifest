@@ -1,0 +1,15 @@
+{
+  "name": "AI Command Center",
+  "short_name": "AICC",
+  "description": "Queues, runs and statuses of the autonomous server — one-button audit, from any device on the tailnet.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0c1024",
+  "theme_color": "#121732",
+  "lang": "ru",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}
