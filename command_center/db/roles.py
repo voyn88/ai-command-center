@@ -161,6 +161,11 @@ ALL_TABLES: tuple[str, ...] = (
     "schema_migration",
     "session",
     "task",
+    # The tick-stall watchdog's observability ledgers (0018): plain
+    # append-only data with no state machine to defend, so they take the
+    # blanket app-role default below rather than the function-only idiom.
+    "tick_skip_event",
+    "tick_stall_escalation",
     "work_attempt",
     "work_event",
     "work_item",
@@ -195,6 +200,8 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "proposal_event": "proposal_event_id_seq",
         "proposal_evidence": "proposal_evidence_id_seq",
         "run_event": "run_event_id_seq",
+        "tick_skip_event": "tick_skip_event_id_seq",
+        "tick_stall_escalation": "tick_stall_escalation_id_seq",
         "work_event": "work_event_id_seq",
         "worker_host_fingerprint": "worker_host_fingerprint_id_seq",
     }

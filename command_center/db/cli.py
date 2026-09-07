@@ -163,6 +163,27 @@ def build_parser() -> argparse.ArgumentParser:
         "Needs --repo-path.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
 
+    watchdog = sub.add_parser(
+        "backlog-watchdog",
+        help="One watchdog tick (VOYN-W0-AICC-TICK-STALL-WATCHDOG): read the "
+        "persisted tick_skip_event history, detect any (task, reason) pair "
+        "skipped in N consecutive ticks of one kind, and escalate each stall "
+        "episode exactly once as a new OPEN backlog task "
+        "(aicc-backlog-watchdog.timer). Never mutates the stalled items.",
+    )
+    watchdog.add_argument(
+        "--threshold",
+        type=int,
+        default=5,
+        help="Consecutive same-reason ticks before a stall escalates (default 5).",
+    )
+    watchdog.add_argument(
+        "--window",
+        type=int,
+        default=50,
+        help="Recent ticks per kind the detector reads (default 50).",
+    )
+
     self_deploy = sub.add_parser(
         "self-deploy",
         help="One self-deploy tick (VOYN-W0-AICC-DEPLOY-AUTOMATION): fast-"
@@ -497,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator import watchdog as _watchdog
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
@@ -506,6 +528,10 @@ def main(argv: list[str] | None = None) -> int:
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
+                # One identity per invocation: the watchdog's "consecutive
+                # ticks" is a property of these persisted rows, not of
+                # journald (VOYN-W0-AICC-TICK-STALL-WATCHDOG).
+                tick_id = _watchdog.new_tick_id()
                 # Before selecting anything: a task whose PR exists but was
                 # never recorded is invisible to every gate downstream. This
                 # derives that evidence from the task's own branch, so a pull
@@ -517,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"PR-FOUND  {evidence_task_id} -> {pr}")
                 for evidence_task_id, reason in evidence.skipped:
                     print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                _watchdog.record_skips(conn, "pr_evidence", tick_id, evidence.skipped)
                 report = review_once(
                     lambda: _nc(conn),
                     enqueue,
@@ -527,6 +554,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REVIEW    {task_id} -> {pr}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                _watchdog.record_skips(conn, "review", tick_id, report.skipped)
                 retry_report = reconcile_review_once(
                     lambda: _nc(conn),
                     enqueue,
@@ -537,6 +565,9 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"RETRY     {task_id} -> {retry_key}")
                 for task_id, reason in retry_report.skipped:
                     print(f"RETRY-SKIP {task_id}: {reason}")
+                _watchdog.record_skips(
+                    conn, "review_retry", tick_id, retry_report.skipped
+                )
                 marker_report = publish_review_verdicts(
                     lambda: _nc(conn), args.repo_path, task_id=args.task_id,
                     # The same queue writer review_once uses: a REJECT
@@ -550,11 +581,15 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REMEDIATE {task_id} -> {new_task_id}")
                 for task_id, reason in marker_report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                _watchdog.record_skips(
+                    conn, "review_marker", tick_id, marker_report.skipped
+                )
                 return 0
 
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
 
+                from command_center.orchestrator import watchdog as _watchdog
                 from command_center.orchestrator.review_merge import merge_once
 
                 report = merge_once(lambda: _nc(conn), args.repo_path)
@@ -562,7 +597,40 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                _watchdog.record_skips(
+                    conn, "merge", _watchdog.new_tick_id(), report.skipped
+                )
                 return 0
+
+            if args.command == "backlog-watchdog":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.watchdog import (
+                    WatchdogConfig,
+                    watchdog_once,
+                )
+
+                report = watchdog_once(
+                    lambda: _nc(conn),
+                    WatchdogConfig(threshold=args.threshold, window=args.window),
+                )
+                for episode, new_task_id in report.escalated:
+                    print(
+                        f"ESCALATE  {episode.task_id} -> {new_task_id}: "
+                        f"{episode.tick_kind} repeated {episode.reason!r} "
+                        f"x{episode.consecutive}"
+                    )
+                for episode in report.already_escalated:
+                    print(
+                        f"ALREADY   {episode.task_id}: {episode.tick_kind} "
+                        f"{episode.reason!r} x{episode.consecutive}"
+                    )
+                for task_id, reason in report.refused:
+                    print(f"REFUSED   {task_id}: {reason}")
+                # A refused escalation is a real finding: the stall is
+                # detected but could not reach the inbox. Non-zero so the
+                # timer run goes red for the operator.
+                return 1 if report.refused else 0
 
             if args.command == "backlog-merge-reconcile":
                 from contextlib import nullcontext as _nc

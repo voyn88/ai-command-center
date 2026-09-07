@@ -33,7 +33,6 @@ from pathlib import Path
 import pytest
 
 from command_center.db import roles
-
 from tests.db.mirror_discovery import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -94,6 +93,23 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
             "SQLite incumbent and nothing to dual-write."
         ),
         task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
+    ),
+    "tick_skip_event": Exclusion(
+        reason=(
+            "PostgreSQL-native observability ledger from birth (0018): the "
+            "per-tick skip reasons the watchdog reads were previously only "
+            "journal lines; no SQLite authority ever held them, so there is "
+            "nothing for a mirror to copy from."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
+    "tick_stall_escalation": Exclusion(
+        reason=(
+            "PostgreSQL-native (0018): the watchdog's episode ledger exists "
+            "only to make 'exactly one escalation per stall episode' a "
+            "schema property; born in PostgreSQL with no SQLite counterpart."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
     ),
     "backlog_task": Exclusion(
         reason=(
