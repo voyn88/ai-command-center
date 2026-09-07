@@ -455,3 +455,51 @@ class Invitation(BaseModel):
     project_ref: str | None = None
     invited_at: str | None = None
     responded_at: str | None = None
+
+
+# --------------------------------------------------------------------------
+# Counterfactual Ledger — Decision / Alternative
+# --------------------------------------------------------------------------
+
+#: Whether a decision is subject to the acceptance rule: a ``critical``
+#: decision needs at least ``MIN_ALTERNATIVES_FOR_CRITICAL`` (see
+#: ``command_center.runtime.db.counterfactual_ledger``) recorded alternatives
+#: before it may finalize.
+DecisionCriticality = Literal["normal", "critical"]
+
+DecisionStatus = Literal["draft", "finalized"]
+
+
+class Decision(BaseModel):
+    """A decision moving through ``draft`` → ``finalized``, with the
+    alternatives considered and rejected recorded alongside it — the
+    counterfactual ledger. ``chosen_option``/``rationale`` are filled when the
+    decision finalizes; a ``critical`` decision may only finalize once it
+    carries at least 3 alternatives (the invariant is enforced in the service,
+    not the DB). ``project_ref`` is the redaction key — a decision whose
+    ``project_ref`` is sensitive is dropped from every read."""
+
+    id: str = ""
+    title: str = ""
+    description: str = ""
+    criticality: DecisionCriticality = "normal"
+    status: DecisionStatus = "draft"
+    chosen_option: str = ""
+    rationale: str = ""
+    owner: str | None = None
+    project_ref: str | None = None
+    decided_at: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class Alternative(BaseModel):
+    """One alternative considered for a decision and not taken, with the
+    reason it was rejected. Append-only — the ledger records what was weighed,
+    not a mutable scratchpad."""
+
+    id: str = ""
+    decision_id: str = ""
+    option: str = ""
+    rejection_reason: str = ""
+    created_at: str | None = None

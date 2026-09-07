@@ -133,6 +133,8 @@ ALL_TABLES: tuple[str, ...] = (
     "council_decision",
     "council_event",
     "council_vote",
+    "counterfactual_alternative",
+    "counterfactual_decision",
     "digest_item",
     "enrollment_ticket",
     "market_install_log",
