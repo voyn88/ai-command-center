@@ -161,6 +161,8 @@ ALL_TABLES: tuple[str, ...] = (
     "schema_migration",
     "session",
     "task",
+    "tick_skip_event",
+    "tick_stall_escalation",
     "work_attempt",
     "work_event",
     "work_item",
