@@ -118,6 +118,14 @@ class ReviewConfig:
     #: in the tick functions (review of ce948c0: an unbounded scan meant
     #: unbounded API traffic and runtime regardless of the action cap).
     scan_cap: int = 40
+    #: Per-tick cap on how many `backlog_review_priority` markers `review_once`
+    #: drains before it ever touches the rotating scan window (VOYN-W0-AICC-
+    #: INVALIDATED-VERDICT-PRIORITY-REREVIEW). Deliberately independent of,
+    #: and smaller than, `max_per_tick`/`max_active_reviews`: a burst of
+    #: priority markers can shrink the rotation's share of one tick's action
+    #: budget but never reduce it to zero, so the rotating scan is bounded,
+    #: never starved.
+    max_priority_per_tick: int = 3
 
 
 @dataclass
@@ -1156,37 +1164,43 @@ def review_once(
     last_processed = None
     cascade = _model_only_review_cascade()
     actions = 0
-    for task_id, pr_url in tasks:  # noqa: PLR1704
-        if actions >= action_limit:
-            break
-        last_processed = (task_id, pr_url)
+
+    def _enqueue_review(current_task_id: str, pr_url: str) -> bool:
+        """One task's worth of the loop body above, factored out so the
+        priority drain below and the rotating scan can share it without
+        either touching the other's bookkeeping (the scan's `last_processed`
+        is set by the caller, never here). Returns whether an action was
+        actually spent (a review was enqueued) -- the caller, not this
+        function, decides how that counts against its own budget."""
         if not cascade:
-            report.skipped.append((task_id, "no_review_executor_route"))
-            continue
+            report.skipped.append((current_task_id, "no_review_executor_route"))
+            return False
         repo = _repo_from_pr_url(pr_url)
         route = repo_route(repo) if repo else None
         if route is None:
-            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
-            continue
+            report.skipped.append((current_task_id, f"no_repo_route: {pr_url!r}"))
+            return False
         fetched = _pr_diff_and_head(repo_path, pr_url)
         if fetched is None:
-            report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
-            continue
+            report.skipped.append((current_task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
+            return False
         snapshot = fetched
-        key = _review_key(task_id, pr_url, snapshot)
+        key = _review_key(current_task_id, pr_url, snapshot)
         if key is None:
-            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
-            continue
+            report.skipped.append((current_task_id, f"no_repo_route: {pr_url!r}"))
+            return False
         project_id, repository_path = route
         try:
-            chunks = _review_chunks(snapshot, task_id, pr_url)
+            chunks = _review_chunks(snapshot, current_task_id, pr_url)
         except (RuntimeError, ValueError) as exc:
-            report.skipped.append((task_id, f"review_prompt_budget_invalid: {exc}"))
-            continue
+            report.skipped.append(
+                (current_task_id, f"review_prompt_budget_invalid: {exc}")
+            )
+            return False
 
         prepared: list[tuple[str, dict[str, Any]]] = []
         for chunk in chunks:
-            prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
+            prompt = _render_review_prompt(current_task_id, pr_url, snapshot, chunk)
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
                 prepared = []
                 break
@@ -1202,7 +1216,7 @@ def review_once(
             if chunk.count == 1:
                 prepared.append((key, payload))
             else:
-                chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
+                chunk_key = _chunk_review_key(current_task_id, pr_url, snapshot, chunk)
                 if chunk_key is None:
                     raise RuntimeError("validated PR URL produced no chunk key")
                 payload["review_chunk"] = {
@@ -1218,8 +1232,10 @@ def review_once(
                 }
                 prepared.append((chunk_key, payload))
         if not prepared:
-            report.skipped.append((task_id, "review_prompt_budget_invariant_failed"))
-            continue
+            report.skipped.append(
+                (current_task_id, "review_prompt_budget_invariant_failed")
+            )
+            return False
         # No eager adjudication is enqueued here any more: a REJECT (single-
         # or multi-chunk) is adjudicated lazily by publish_review_verdicts,
         # which enqueues one finding-verification run against the rejecting
@@ -1227,9 +1243,40 @@ def review_once(
         # verification section comment above for why the eager full-context
         # pass of VOYN-W0-AICC-REVIEW-ADJUDICATE was retired).
         for review_key, payload in prepared:
-            enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
-        report.reviewed.append((task_id, pr_url))
-        actions += 1
+            enqueue(cfg.queue, review_key, payload, current_task_id, len(cascade))
+        report.reviewed.append((current_task_id, pr_url))
+        return True
+
+    # The invalidated-verdict priority queue (VOYN-W0-AICC-INVALIDATED-
+    # VERDICT-PRIORITY-REREVIEW): merge_once marks a task here the instant it
+    # moves a PR's head off an ACCEPT-marked head with a real diff-digest
+    # change (see `_mark_review_priority_on_branch_update`). Drained BEFORE
+    # the rotating scan window below touches its own cursor or budget, and
+    # capped at `max_priority_per_tick` (independent of, and smaller than,
+    # `action_limit`) so a burst of priority markers can shrink but never
+    # zero out the rotation's share of this tick's `max_per_tick` budget --
+    # the bound the acceptance test calls "cannot starve the rotation". A
+    # targeted single-task invocation (`task_id is not None`) never touches
+    # this shared queue, the same rule `_scan_tasks` follows for the cursor.
+    if task_id is None and actions < action_limit:
+        priority_limit = min(cfg.max_priority_per_tick, action_limit - actions)
+        if priority_limit > 0:
+            for p_task_id, p_pr_url in _rows(
+                factory,
+                "SELECT * FROM backlog_review_priority_pop(%s)",
+                (priority_limit,),
+            ):
+                if actions >= action_limit:
+                    break
+                if _enqueue_review(p_task_id, p_pr_url):
+                    actions += 1
+
+    for task_id, pr_url in tasks:  # noqa: PLR1704
+        if actions >= action_limit:
+            break
+        last_processed = (task_id, pr_url)
+        if _enqueue_review(task_id, pr_url):
+            actions += 1
     if scan_token is not None:
         _scan_commit(factory, "scan:review_once", scan_token, last_processed)
     return report
@@ -2549,6 +2596,43 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     return f"flaky_rerun_dispatched:{dispatched}" if dispatched else ""
 
 
+def _mark_review_priority_on_branch_update(
+    factory: Any,
+    repo_path: str,
+    task_id: str,
+    pr_url: str,
+    pre_update: "_PRSnapshot | None",
+) -> None:
+    """Called only from `merge_once`'s BEHIND branch, immediately after a
+    successful ``gh pr update-branch`` -- which is only ever reached with an
+    ACCEPT marker standing on the PRE-update head (`_pr_is_mergeable` is the
+    readiness gate one step above every call site). Moving the head off that
+    marker is the merge tick invalidating its own accepted verdict.
+
+    When the diff digest is unchanged, VOYN-W0-AICC-MARKER-CARRYOVER-ON-
+    BRANCH-UPDATE-REM carries the marker itself forward onto the new head, so
+    no re-review is owed. Only a REAL digest change leaves a genuine gap: the
+    task must be re-reviewed, and until now it waited for `review_once`'s
+    rotating scan to reach it again -- up to a full lap of the keyset behind
+    whatever `max_per_tick` lets through per tick (observed live 2026-09-07,
+    PR #766: 20+ minutes with ~10 other PRs still ahead of it in scan order).
+
+    This marks the task in `backlog_review_priority`, which `review_once`
+    drains before it ever touches the rotating scan window -- so the very
+    next review tick enqueues the new-head review first. A failed post-
+    update fetch (`pre_update is None`, or the post-update fetch itself
+    fails) skips the mark rather than guessing: the branch update already
+    succeeded and is not undone by this, and the task still reaches the
+    rotating scan on its own schedule regardless -- this priority marker
+    only supplements that path, it never replaces it."""
+    if pre_update is None:
+        return
+    post_update = _pr_diff_and_head(repo_path, pr_url)
+    if post_update is None or post_update.digest == pre_update.digest:
+        return
+    _rows(factory, "SELECT backlog_review_priority_mark(%s, %s)", (task_id, pr_url))
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
@@ -2636,9 +2720,13 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                     continue
                 branch_updates += 1
                 actions += 1
+                pre_update_snapshot = _pr_diff_and_head(repo_path, pr_url)
                 updated = _gh(["pr", "update-branch", pr_url], repo_path)
                 if updated.returncode == 0:
                     report.skipped.append((task_id, "branch_updated_behind_main"))
+                    _mark_review_priority_on_branch_update(
+                        factory, repo_path, task_id, pr_url, pre_update_snapshot
+                    )
                 else:
                     report.skipped.append(
                         (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")

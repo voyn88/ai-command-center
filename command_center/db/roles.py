@@ -124,6 +124,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_task",
     "backlog_task_remediation",
     "backlog_scan_cursor",
+    "backlog_review_priority",
     "backlog_writer_lease",
     "completion",
     "completion_event",
@@ -272,6 +273,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
     "backlog_scan_cursor": _READ,
+    "backlog_review_priority": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -282,6 +284,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
     "backlog_scan_cursor": _NONE,
+    "backlog_review_priority": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -501,6 +504,13 @@ _APP_BACKLOG_FUNCTIONS = (
     # The persisted scan cursor for the tick windows (0015): returns this
     # tick's offset and advances atomically per invocation.
     "backlog_scan_claim(text, text, text)",
+    # The invalidated-verdict priority queue (0018): merge_once marks a task
+    # whose ACCEPT marker it just invalidated with a real diff-digest
+    # change, review_once pops the bounded head of the queue before the
+    # rotating scan window (VOYN-W0-AICC-INVALIDATED-VERDICT-PRIORITY-
+    # REREVIEW).
+    "backlog_review_priority_mark(text, text)",
+    "backlog_review_priority_pop(integer)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
 )

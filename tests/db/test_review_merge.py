@@ -1861,6 +1861,179 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
     assert sum(1 for _, r in report.skipped if r == "branch_behind_update_capped") == 2
 
 
+# -- VOYN-W0-AICC-INVALIDATED-VERDICT-PRIORITY-REREVIEW ----------------------
+
+
+def _fake_gh_accepted_behind(head):
+    """A BEHIND PR whose head carries an ACCEPT marker and green checks --
+    the exact shape merge_once's readiness gate requires before it will ever
+    reach the branch-update path."""
+    import subprocess
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        if argv[:2] == ["pr", "update-branch"]:
+            return subprocess.CompletedProcess(argv, 0, "updated", "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    return fake_gh
+
+
+def _priority_rows(app_factory):
+    return review_merge._rows(
+        app_factory, "SELECT task_id, pr_url FROM backlog_review_priority ORDER BY queued_at"
+    )
+
+
+def test_branch_update_with_a_changed_digest_marks_review_priority(rig, monkeypatch):  # noqa: F811, E501
+    """merge_once's BEHIND branch just invalidated an ACCEPT marker (moved the
+    head it was keyed to) AND the diff genuinely changed -- the digest-changed
+    path this task is the safety net for, since VOYN-W0-AICC-MARKER-CARRYOVER-
+    ON-BRANCH-UPDATE-REM only carries the marker forward when the digest is
+    unchanged. That must record a `backlog_review_priority` marker so the next
+    review tick jumps the rotating scan."""
+    app_factory, store, _ = rig
+    task_id, pr_url = "VOYN-W0-IVR1", "https://github.com/x/y/pull/91"
+    _ready(store, app_factory, task_id, pr_url)
+    head = "e" * 40
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_accepted_behind(head))
+
+    snapshots = iter([
+        review_merge._PRSnapshot.create("diff --git a/x b/x\n+old\n", BASE, head),
+        review_merge._PRSnapshot.create("diff --git a/x b/x\n+new\n", BASE, "f" * 40),
+    ])
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda repo, pr: next(snapshots))
+
+    report = merge_once(app_factory, "/tmp")
+    assert (task_id, "branch_updated_behind_main") in report.skipped
+    assert _priority_rows(app_factory) == [(task_id, pr_url)]
+
+
+def test_branch_update_with_an_unchanged_digest_does_not_mark_review_priority(  # noqa: E501
+    rig, monkeypatch  # noqa: F811
+):
+    """The companion negative case: VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-
+    UPDATE-REM's own case (digest unchanged) needs no priority re-review, so
+    this task must not mark one -- the two remediations must not double up."""
+    app_factory, store, _ = rig
+    task_id, pr_url = "VOYN-W0-IVR2", "https://github.com/x/y/pull/92"
+    _ready(store, app_factory, task_id, pr_url)
+    head = "1" * 40
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_accepted_behind(head))
+
+    same_snapshot = review_merge._PRSnapshot.create("diff --git a/x b/x\n+same\n", BASE, head)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda repo, pr: same_snapshot)
+
+    report = merge_once(app_factory, "/tmp")
+    assert (task_id, "branch_updated_behind_main") in report.skipped
+    assert _priority_rows(app_factory) == []
+
+
+def test_branch_update_with_no_fetchable_snapshot_does_not_mark_review_priority(  # noqa: E501
+    rig, monkeypatch  # noqa: F811
+):
+    """A pre-update diff fetch failure (`_pr_diff_and_head` returns None) must
+    skip the mark instead of guessing -- the branch update already succeeded
+    either way, and the task still reaches the rotating scan on its own."""
+    app_factory, store, _ = rig
+    task_id, pr_url = "VOYN-W0-IVR3", "https://github.com/x/y/pull/93"
+    _ready(store, app_factory, task_id, pr_url)
+    head = "2" * 40
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_accepted_behind(head))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda repo, pr: None)
+
+    report = merge_once(app_factory, "/tmp")
+    assert (task_id, "branch_updated_behind_main") in report.skipped
+    assert _priority_rows(app_factory) == []
+
+
+def test_review_once_enqueues_a_priority_marked_task_before_rotation(  # noqa: E501
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """The acceptance test: a task marked in `backlog_review_priority` (as
+    `merge_once` would after invalidating its verdict with a real digest
+    change) is enqueued by the very next `review_once` tick BEFORE the
+    rotating scan window gets to spend any of the same tick's action budget
+    on anything else -- even when several other READY_TO_REVIEW tasks sort
+    ahead of it in the scan's deterministic (task_id, pr) order."""
+    app_factory, store, _ = rig
+    # These sort before the priority task in (task_id, pr) scan order, so an
+    # un-prioritized scan would reach them first.
+    for i in range(3):
+        _ready(
+            store, app_factory, f"VOYN-W0-AAA-ROT{i}",
+            f"https://github.com/x/y/pull/{500 + i}",
+        )
+    priority_task, priority_pr = "VOYN-W0-ZZZ-PRIO", "https://github.com/x/y/pull/599"
+    _ready(store, app_factory, priority_task, priority_pr)
+    review_merge._rows(
+        app_factory,
+        "SELECT backlog_review_priority_mark(%s, %s)",
+        (priority_task, priority_pr),
+    )
+
+    head = "3" * 40
+    for i in range(3):
+        SNAPSHOTS[f"https://github.com/x/y/pull/{500 + i}"] = _snapshot(head)
+    SNAPSHOTS[priority_pr] = _snapshot(head)
+
+    recorded = []
+
+    def enqueue(queue, key, payload, task_id, max_attempts):
+        recorded.append(task_id)
+
+    cfg = ReviewConfig(max_per_tick=1, max_active_reviews=100)
+    review_once(app_factory, enqueue, "/tmp", cfg)
+    assert recorded == [priority_task]
+    # The marker is drained (consumed), not left to be picked up again.
+    assert _priority_rows(app_factory) == []
+
+
+def test_review_once_priority_drain_is_bounded_and_leaves_rotation_a_share(  # noqa: E501
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """Rotation fairness is preserved: a burst of priority markers larger than
+    `max_priority_per_tick` can shrink the rotating scan's share of one tick's
+    action budget, but never to zero -- bounded, no starvation."""
+    app_factory, store, _ = rig
+    rotation_task, rotation_pr = "VOYN-W0-KEEP-ROT", "https://github.com/x/y/pull/700"
+    _ready(store, app_factory, rotation_task, rotation_pr)
+    priority_tasks = []
+    for i in range(5):
+        t, pr = f"VOYN-W0-BURST{i}", f"https://github.com/x/y/pull/{800 + i}"
+        _ready(store, app_factory, t, pr)
+        review_merge._rows(
+            app_factory, "SELECT backlog_review_priority_mark(%s, %s)", (t, pr)
+        )
+        priority_tasks.append(t)
+
+    head = "4" * 40
+    SNAPSHOTS[rotation_pr] = _snapshot(head)
+    for i in range(5):
+        SNAPSHOTS[f"https://github.com/x/y/pull/{800 + i}"] = _snapshot(head)
+
+    recorded = []
+
+    def enqueue(queue, key, payload, task_id, max_attempts):
+        recorded.append(task_id)
+
+    cfg = ReviewConfig(max_per_tick=4, max_priority_per_tick=3, max_active_reviews=100)
+    review_once(app_factory, enqueue, "/tmp", cfg)
+    assert len(recorded) == 4
+    assert rotation_task in recorded  # rotation was not starved outright
+    assert sum(1 for t in recorded if t in priority_tasks) == 3  # bounded drain
+    # The two oldest, un-drained priority markers remain queued for next tick.
+    assert len(_priority_rows(app_factory)) == 2
+
+
 def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch):
     """After the marker is posted, the failing pull_request-triggered
     Acceptance-gate run for the exact head AND this PR's own number is

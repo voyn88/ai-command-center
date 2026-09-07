@@ -95,6 +95,16 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
     ),
+    "backlog_review_priority": Exclusion(
+        reason=(
+            "PostgreSQL-native tick-scheduler state from birth (0018), the "
+            "same idiom as backlog_scan_cursor above: a one-shot priority "
+            "marker merge_once sets and review_once drains within the same "
+            "tick cadence, with no SQLite incumbent and nothing to "
+            "dual-write."
+        ),
+        task="VOYN-W0-AICC-INVALIDATED-VERDICT-PRIORITY-REREVIEW",
+    ),
     "backlog_task": Exclusion(
         reason=(
             "PostgreSQL-native authority from birth (BO-S1): the incumbent it "
