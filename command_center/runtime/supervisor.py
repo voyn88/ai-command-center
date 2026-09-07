@@ -391,6 +391,24 @@ _TERMINAL_CAS_MAX_ATTEMPTS = run_finalizer.TERMINAL_CAS_MAX_ATTEMPTS
 # succeeding run out from under its owner and frees its workspace lock.
 _RECONCILE_ABSENCE_GRACE_SECONDS = 5.0
 
+# `start_raw`'s self-heal retry (see the loop in `start_raw` around
+# `db.WorkspaceLockedError`/`db.TaskAlreadyActiveError`) only ever waits out
+# a conflicting run this instance's own `reconcile()` has *already* flagged
+# `_suspected_gone` — never a conflict that still looks alive, which fails
+# immediately as before. Because `reconcile()`'s debounce
+# (`_RECONCILE_ABSENCE_GRACE_SECONDS` above) requires the absence to persist
+# across two separate calls spaced that far apart in wall-clock time, one
+# reconcile-and-retry is not enough in production: the first call only seeds
+# `_suspected_gone`'s `first_seen`, and an immediate retry lands on the exact
+# same still-active row. The retry loop therefore bounds its total wait to
+# the debounce window plus this margin (covering scheduling/polling jitter,
+# not a second full debounce), sleeping `_SELF_HEAL_POLL_INTERVAL_SECONDS` at
+# a time and calling `reconcile()` again before each retry so a later
+# reconcile pass — once the debounce window has actually elapsed — gets the
+# chance to terminalize the stale row and free the lock.
+_SELF_HEAL_GRACE_MARGIN_SECONDS = 1.0
+_SELF_HEAL_POLL_INTERVAL_SECONDS = 0.25
+
 # Bounds on the diagnostic output a provider may attach to a run, so a
 # misbehaving CLI cannot flood the event log.
 MAX_PROVIDER_DIAGNOSTIC_EVENTS = 64
@@ -931,6 +949,16 @@ class Supervisor:
         raise before any subprocess is spawned for: missing confirmation,
         an unconfigured/mismatched repository path, or an invalid resume
         request (no such session).
+
+        A `WorkspaceLockedError`/`TaskAlreadyActiveError` conflict is not
+        always immediately fatal: if `reconcile()` finds the conflicting run
+        merely *suspected* gone (a crashed peer's stale row, not a live
+        process), this method blocks synchronously and retries, bounded by
+        `_RECONCILE_ABSENCE_GRACE_SECONDS + _SELF_HEAL_GRACE_MARGIN_SECONDS`
+        (~6s with the current constants) — so a caller that expected a fast
+        failure on a locked workspace can now wait that long before either
+        succeeding or raising. A conflict against a genuinely live run still
+        raises immediately, exactly as before self-healing existed.
         """
         self._assert_current_process()
         # Pre-launch gates, in the only order that is safe. Provider resolution
@@ -1099,7 +1127,7 @@ class Supervisor:
         if executor_id == providers.CLAUDE_ID:
             _assert_no_forbidden_flags(command)
 
-        try:
+        def _attempt_create_run() -> dict:
             # Keep creation and in-memory ownership registration atomic with
             # `reconcile()`'s active-id snapshot plus active-row query. Without
             # this shared lock, a dashboard refresh can observe the committed
@@ -1108,7 +1136,7 @@ class Supervisor:
             # The lock covers one short SQLite transaction only; it is released
             # before git inspection or subprocess creation.
             with self._active_lock:
-                run = db.create_run(
+                created = db.create_run(
                     self.db_path,
                     session_id=session_id,
                     task_id=task_id,
@@ -1154,13 +1182,62 @@ class Supervisor:
                     enforce_workspace_lock=True,
                     max_global_concurrency=max_global_concurrency,
                 )
-                self._launching.add(run["id"])
+                self._launching.add(created["id"])
                 with _PROCESS_OWNED_RUNS_GUARD:
-                    _PROCESS_OWNED_RUNS.add(run["id"])
-        except db.WorkspaceLockedError as exc:
-            raise WorkspaceLockedError(exc.conflicting_run) from exc
-        except db.TaskAlreadyActiveError as exc:
-            raise TaskAlreadyActiveError(exc.conflicting_run) from exc
+                    _PROCESS_OWNED_RUNS.add(created["id"])
+            return created
+
+        # Self-heal: a lock conflict may be a stale row left behind by a
+        # crashed peer rather than a genuinely live run. `reconcile()` is this
+        # instance's only way to tell the two apart, and — if the conflict
+        # was in fact stale and reconcile() just cleared it — the very next
+        # `_attempt_create_run()` above succeeds without ever raising to the
+        # caller. `self_heal_deadline` bounds the *total* time this loop may
+        # spend retrying (see `_SELF_HEAL_GRACE_MARGIN_SECONDS`'s docstring
+        # for why one reconcile-and-retry is not enough in production).
+        self_heal_deadline: float | None = None
+        while True:
+            try:
+                run = _attempt_create_run()
+                break
+            except db.WorkspaceLockedError as exc:
+                wrapped_error, conflict_exc = WorkspaceLockedError, exc
+            except db.TaskAlreadyActiveError as exc:
+                wrapped_error, conflict_exc = TaskAlreadyActiveError, exc
+
+            self.reconcile()
+            conflicting_run = conflict_exc.conflicting_run
+            conflicting_id = conflicting_run.get("id") if conflicting_run else None
+            # Recomputed from *this* iteration's conflict, never cached from an
+            # earlier one: a retry can legitimately name a different run than
+            # the one that first conflicted (the stale row clears mid-poll and
+            # a second, genuinely live process wins the same slot before our
+            # next attempt), and treating that new conflict as still
+            # self-healable would block on a live peer this loop must instead
+            # fail on immediately — exactly as it did before self-healing
+            # existed.
+            current_conflicting = db.get_run(self.db_path, conflicting_id) if conflicting_id else None
+            if current_conflicting is None or current_conflicting["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
+                # The `reconcile()` call just above (or an earlier one, for a
+                # conflict already seen this loop) already resolved this exact
+                # row — terminalized it and freed the slot. Retry right away
+                # without touching the deadline/sleep machinery below, which
+                # exists only for a conflict that is still active and merely
+                # *suspected* gone.
+                continue
+            with self._suspected_gone_lock:
+                is_self_heal_candidate = conflicting_id in self._suspected_gone
+            if not is_self_heal_candidate:
+                raise wrapped_error(conflicting_run) from conflict_exc
+
+            now = time.monotonic()
+            if self_heal_deadline is None:
+                self_heal_deadline = (
+                    now + self._reconcile_absence_grace + _SELF_HEAL_GRACE_MARGIN_SECONDS
+                )
+            if now >= self_heal_deadline:
+                raise wrapped_error(conflicting_run) from conflict_exc
+            time.sleep(min(_SELF_HEAL_POLL_INTERVAL_SECONDS, self_heal_deadline - now))
 
         # Executor capability preflight (Required fix 5). The decision itself is
         # already persisted on the run row's `capability_*`/`command_policy`
