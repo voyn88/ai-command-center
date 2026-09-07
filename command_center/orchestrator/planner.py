@@ -37,6 +37,7 @@ from command_center.orchestrator.routing import (
     BILLING_MODE_UNKNOWN,
     billing_mode_for_executor,
     cascade_for,
+    classify_task_class,
     metered_executors,
 )
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
@@ -231,7 +232,7 @@ def _payload_for(
     ``untrusted=False`` is on the authority of the planner being the control
     plane acting on the canonical store.
     """
-    cascade = cascade_for("implementation")
+    cascade = cascade_for(classify_task_class(task["title"], task["body"]))
     project_id, repository_path = route
     if mode == "split":
         prompt = (

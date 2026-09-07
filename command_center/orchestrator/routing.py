@@ -27,6 +27,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from command_center.orchestrator import local_model_gates
+
 __all__ = [
     "BILLING_MODE_API_METERED",
     "BILLING_MODE_SUBSCRIPTION",
@@ -35,6 +37,8 @@ __all__ = [
     "billing_mode_for_executor",
     "metered_executors",
     "cascade_for",
+    "BOUNDED_IMPLEMENTATION_TASK_CLASS",
+    "classify_task_class",
 ]
 
 BILLING_MODE_SUBSCRIPTION = "subscription/quota"
@@ -52,6 +56,10 @@ _EXECUTOR_BILLING_MODES: dict[str, str] = {
     "codex": BILLING_MODE_SUBSCRIPTION,
     "claude": BILLING_MODE_SUBSCRIPTION,
 }
+
+#: Opt-in class for benchmark-gated, low-risk local-model patches.
+BOUNDED_IMPLEMENTATION_TASK_CLASS = "bounded_implementation"
+_BOUNDED_TASK_CLASS_TITLE_PREFIXES = ("[docs]", "[fixture]", "[mechanical]")
 
 
 def billing_mode_for_executor(executor: str) -> str:
@@ -120,12 +128,30 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         # isolation, so it would only burn a review attempt.
         {"executor": "claude", "task_type": "review"},
     ],
+    # AICC Fleet decision 2026-09-03: aider + local Ollama as a free,
+    # bounded-implementation executor for low-risk task classes (docs,
+    # fixtures, small mechanical patches). It LEADS the cascade -- free
+    # capacity should be tried before any metered/quota'd account -- but
+    # only once its measured quality has cleared the benchmark bar
+    # (`cascade_for` strips this link out entirely while unpromoted, rather
+    # than leaving a phantom entry that would burn an attempt on a executor
+    # the worker refuses). The remaining links are the same escalation chain
+    # `implementation` uses, so an unpromoted (or a failed-aider) dispatch
+    # degrades to exactly the existing behaviour.
+    BOUNDED_IMPLEMENTATION_TASK_CLASS: [
+        {"executor": "aider", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+        {"executor": "codex", "task_type": "implementation"},
+    ],
 }
 
 
 def cascade_for(task_class: str) -> list[dict[str, Any]]:
     """The cascade for a task class; unknown classes get the implementation
-    route rather than a refusal — routing chooses HOW, never WHETHER."""
+    route rather than a refusal — routing chooses HOW, never WHETHER.
+
+    The local aider link is omitted until its task class is promoted.
+    """
     profile = os.environ.get("AICC_EXECUTOR_PROFILE")
     if profile == "owner-cascade":
         task_type = "review" if task_class == "review" else "implementation"
@@ -143,7 +169,33 @@ def cascade_for(task_class: str) -> list[dict[str, Any]]:
         task_type = "review" if task_class == "review" else "implementation"
         return [{"executor": "cursor", "task_type": task_type, "model": "auto"},
                 {"executor": "grok", "task_type": task_type, "model": "grok-4.6"}]
-    return [
+    cascade = [
         dict(link)
         for link in ROUTING_MATRIX.get(task_class, ROUTING_MATRIX["implementation"])
     ]
+    if task_class == BOUNDED_IMPLEMENTATION_TASK_CLASS and not local_model_gates.is_promoted(
+        task_class
+    ):
+        cascade = [link for link in cascade if link["executor"] != "aider"]
+    return cascade
+
+
+def classify_task_class(title: str, body: str) -> str:
+    """The dispatch task class for a backlog task, from its TITLE alone.
+
+    Opting into `BOUNDED_IMPLEMENTATION_TASK_CLASS` is a task AUTHOR
+    decision, not an inference: only an exact bracketed title prefix
+    (`_BOUNDED_TASK_CLASS_TITLE_PREFIXES`) routes a task into the
+    benchmark-gated local-model lane. `body` is accepted for a stable,
+    forward-compatible signature but deliberately never scanned -- matching
+    against free-form body text would let incidental body wording downgrade
+    a mutating task into the weaker executor lane without its author ever
+    having asked for that. Every other title, including one that merely
+    mentions "docs" or "mechanical" without the exact bracketed prefix,
+    classifies as plain `"implementation"`.
+    """
+    del body  # never scanned, by design — see the docstring above
+    normalized = title.strip().lower()
+    if normalized.startswith(_BOUNDED_TASK_CLASS_TITLE_PREFIXES):
+        return BOUNDED_IMPLEMENTATION_TASK_CLASS
+    return "implementation"
