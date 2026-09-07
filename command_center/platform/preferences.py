@@ -15,6 +15,7 @@ _KEY_THEME = "appearance/theme"
 _KEY_DENSITY = "appearance/density"
 _KEY_SELECTED_PROJECT = "workspace/selected_project"
 _KEY_WORKSPACE_ROOT = "workspace/root"
+_KEY_DATA_SOURCE_MODE = "workspace/data_source_mode"
 
 
 class ThemeMode(str, Enum):
@@ -36,6 +37,26 @@ class DensityMode(str, Enum):
 
     @classmethod
     def from_value(cls, value: object, default: "DensityMode") -> "DensityMode":
+        try:
+            return cls(str(value))
+        except ValueError:
+            return default
+
+
+class DataSourceMode(str, Enum):
+    """The "server" toggle (VOYN-W0-APP-CONTROL-S2): where the Workspace
+    operational read model reads status from — the local runtime (default,
+    unchanged behaviour) or the preprod server's work queue over HTTP
+    (:mod:`command_center.application.server_queue`). Persisted like any
+    other appearance preference; carries no credential of its own — the
+    server client's own configuration (``AICC_SERVER_QUEUE_*``) still gates
+    whether a request can actually be made."""
+
+    LOCAL = "local"
+    SERVER = "server"
+
+    @classmethod
+    def from_value(cls, value: object, default: "DataSourceMode") -> "DataSourceMode":
         try:
             return cls(str(value))
         except ValueError:
@@ -94,6 +115,12 @@ class SettingsStore:
             self._settings.setValue(_KEY_SELECTED_PROJECT, normalized)
         else:
             self._settings.remove(_KEY_SELECTED_PROJECT)
+
+    def data_source_mode(self, default: DataSourceMode = DataSourceMode.LOCAL) -> DataSourceMode:
+        return DataSourceMode.from_value(self._settings.value(_KEY_DATA_SOURCE_MODE), default)
+
+    def set_data_source_mode(self, mode: DataSourceMode) -> None:
+        self._settings.setValue(_KEY_DATA_SOURCE_MODE, mode.value)
 
     def workspace_root(self) -> str | None:
         """Workspace root chosen in the first-run wizard (D-1), if any."""

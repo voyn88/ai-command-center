@@ -124,7 +124,10 @@ def run(argv: list[str] | None = None) -> int:
         home_adapter = WorkspaceHomeAdapter()
         shell.load_workspace_home(
             home_adapter,
-            OperationsAdapter(workspace_home_adapter=home_adapter),
+            OperationsAdapter(
+                workspace_home_adapter=home_adapter,
+                data_source_mode=store.data_source_mode,
+            ),
         )
         shell.show()
     except Exception as error:  # top-level render boundary (D-1 AC 3)

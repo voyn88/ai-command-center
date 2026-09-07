@@ -3,6 +3,7 @@
 from command_center.platform.preferences import (  # noqa: F401
     APPLICATION,
     ORGANIZATION,
+    DataSourceMode,
     DensityMode,
     SettingsStore,
     ThemeMode,
@@ -11,6 +12,7 @@ from command_center.platform.preferences import (  # noqa: F401
 __all__ = [
     "APPLICATION",
     "ORGANIZATION",
+    "DataSourceMode",
     "DensityMode",
     "SettingsStore",
     "ThemeMode",

@@ -8,6 +8,35 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — desktop points at the server (`VOYN-W0-APP-CONTROL-S2`)
+
+- `command_center/application/server_queue.py`: a read-only HTTP port over the
+  preprod server's work queue (`GET /api/v1/queue/items`,
+  `webapi/queue_routes.py`), built the same way
+  `command_center/application/aios_status.py` builds the AIOS SDK adapter —
+  a factory that only constructs the real client from a complete, HTTPS,
+  allowlisted-host configuration (`AICC_SERVER_QUEUE_URL`,
+  `AICC_SERVER_QUEUE_TOKEN`, `AICC_SERVER_QUEUE_ALLOWED_HOSTS`) and otherwise
+  returns an honest `DisabledServerQueueClient`. Transport is the same
+  authenticated `urllib` GET `http_auth.identity` already uses for `whoami` —
+  no new production dependency.
+- `command_center/platform/preferences.py`: `DataSourceMode` (`LOCAL` /
+  `SERVER`), the persisted "server" toggle, alongside the existing theme and
+  density preferences.
+- Settings screen: a new "Источник данных раздела «Выполнение»" group with
+  the Local/Server radio toggle (`command_center/desktop/pages/settings_page.py`).
+- `command_center/application/operations_adapter.py`: `OperationsAdapter.execution()`
+  now reads the mode via an injected callable (so a toggle flipped mid-session
+  takes effect on the very next read, no adapter reconstruction) and switches
+  from the local runtime snapshot to `server_queue`'s port, mapped into the
+  same five-column shape the "Выполнение" table already renders (queue name
+  stands in for `task_type`, repository id — falling back to task id — stands
+  in for `project`, since a queue-list row carries neither field directly).
+  Desktop still never imports `command_center.runtime`/`webapi` directly
+  (`tests/architecture/test_desktop_engine_fitness.py` continues to pass
+  unchanged) — only through this application-layer port, exactly like AIOS
+  status.
+
 ### Added — chat-text backlog intake (`VOYN-W0-APP-CONTROL-S6a`)
 
 - `command_center/db/backlog_intake.py`: turns a free-text owner request into

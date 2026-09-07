@@ -73,6 +73,13 @@ _OPERATION_STATE_LABELS = {
     "status_unavailable": "Статус недоступен",
     "auth_unknown": "Авторизация не подтверждена",
     "contract_pending": "Контракт ожидается",
+    # work_item_public states (VOYN-W0-APP-CONTROL-S1/S2) — shown when the
+    # "Выполнение" section reads the preprod server queue instead of the
+    # local runtime.
+    "ready": "В очереди",
+    "claimed": "Взят в работу",
+    "succeeded": "Успешно завершён",
+    "dead": "Отклонён (DLQ)",
 }
 
 
@@ -260,6 +267,14 @@ SETTINGS_SELECTED_PROJECT_DESCRIPTION = (
 SETTINGS_SELECTED_PROJECT_PLACEHOLDER = "Например, проект-1"
 SETTINGS_SAVE_WORKSPACE = "Сохранить параметры рабочего пространства"
 SETTINGS_SAVED = "Параметры сохранены"
+SETTINGS_DATA_SOURCE_GROUP = "Источник данных раздела «Выполнение»"
+SETTINGS_DATA_SOURCE_ACCESSIBLE = "Выбор источника данных раздела «Выполнение»"
+DATA_SOURCE_LOCAL = "Локальный рантайм"
+DATA_SOURCE_SERVER = "Препрод-сервер"
+SETTINGS_DATA_SOURCE_DESCRIPTION = (
+    "«Локальный рантайм» — статусы запусков на этом компьютере; "
+    "«Препрод-сервер» — очередь и статусы препрод-сервера в закрытой сети."
+)
 
 # --- First-run wizard (D-1) -----------------------------------------------
 FIRST_RUN_TITLE = "Первый запуск"
