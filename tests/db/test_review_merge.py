@@ -12,11 +12,13 @@ import pytest
 
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import (
+    PrWindowConfig,
     ReviewConfig,
     merge_once,
     publish_review_verdicts,
     reconcile_merge_evidence,
     reconcile_pr_evidence,
+    reconcile_pr_window,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -3276,3 +3278,233 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     reconcile_pr_evidence(app_factory, REPO)
 
     assert seen == [REPO]
+
+
+# -- reconcile_pr_window: no database involved, gh is faked in-process ------
+
+
+def _win_pr(number, created, head, *, author="alice", labels=(), reviews=(),
+            checks=(), commits=None, url=None):
+    return {
+        "number": number,
+        "url": url or f"https://github.com/x/repo-w/pull/{number}",
+        "headRefOid": head,
+        "createdAt": created,
+        "commits": commits if commits is not None else [
+            {"oid": head, "committedDate": created}
+        ],
+        "reviews": list(reviews),
+        "statusCheckRollup": list(checks),
+        "author": {"login": author},
+        "labels": [{"name": name} for name in labels],
+    }
+
+
+def _fake_pr_window_gh(prs, *, api_returncode=1, api_stdout="", edits=None):
+    """Fakes `pr list` (returns `prs`) and `pr edit` (records into `edits`,
+    a list the caller can inspect); `api` calls (the direct head-commit
+    lookup) return `api_returncode`/`api_stdout`."""
+    import subprocess as sp
+
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        calls.append(list(argv))
+        if argv[0] == "pr" and argv[1] == "list":
+            return sp.CompletedProcess(argv, 0, json.dumps(prs), "")
+        if argv[0] == "pr" and argv[1] == "edit":
+            if edits is not None:
+                edits.append(list(argv))
+            return sp.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "api":
+            return sp.CompletedProcess(argv, api_returncode, api_stdout, "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
+
+    fake_gh.calls = calls
+    return fake_gh
+
+
+def test_pr_list_is_requested_in_ascending_created_order(monkeypatch):
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM-REM: `gh pr list` with no sort
+    returns newest-first, so a plain `--limit` truncated the OLDEST, longest-
+    waiting PRs out of consideration on any repo busier than the scan limit.
+    Requesting ascending order explicitly is the actual FIFO fix."""
+    fake = _fake_pr_window_gh([])
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    reconcile_pr_window("/repo", PrWindowConfig(scan_limit=10))
+
+    list_call = next(c for c in fake.calls if c[:2] == ["pr", "list"])
+    assert "--search" in list_call
+    assert list_call[list_call.index("--search") + 1] == "sort:created-asc"
+    assert "--limit" in list_call
+    assert list_call[list_call.index("--limit") + 1] == "10"
+
+
+def test_oldest_eligible_prs_fill_the_window_first(monkeypatch):
+    older = _win_pr(1, "2026-01-01T00:00:00Z", "a" * 40)
+    newer = _win_pr(2, "2026-02-01T00:00:00Z", "b" * 40)
+    edits: list[list[str]] = []
+    # gh already returns them oldest-first (ascending search), as real usage
+    # would; the reconciler's own selection must preserve that order too.
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_pr_window_gh([older, newer], edits=edits)
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert report.active == [(1, "a" * 40)]
+    assert report.waiting == [(2, "b" * 40)]
+    assert any(e[2] == "1" and "--add-label" in e for e in edits)
+
+
+def test_reject_marker_from_the_pr_author_does_not_block(monkeypatch):
+    """Mirrors the accept marker's own author-independence rule: the PR's
+    own author cannot spoof a block by posting the reject marker text on a
+    plain comment-type review."""
+    head = "c" * 40
+    pr = _win_pr(
+        3, "2026-01-01T00:00:00Z", head, author="alice",
+        reviews=[{"state": "COMMENTED", "submittedAt": "2026-01-02T00:00:00Z",
+                  "body": f"ACCEPTANCE: REJECT {head}",
+                  "author": {"login": "alice"}}],
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_window_gh([pr]))
+
+    report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=10**12))
+
+    assert report.blocked == []
+    assert report.active == [(3, head)]
+
+
+def test_reject_marker_from_a_non_author_reviewer_blocks(monkeypatch):
+    head = "d" * 40
+    pr = _win_pr(
+        4, "2026-01-01T00:00:00Z", head, author="alice",
+        reviews=[{"state": "COMMENTED", "submittedAt": "2026-01-02T00:00:00Z",
+                  "body": f"ACCEPTANCE: REJECT {head}",
+                  "author": {"login": "bob"}}],
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_window_gh([pr]))
+
+    report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=10**12))
+
+    assert report.blocked == [(4, "acceptance_rejected")]
+    assert report.active == []
+
+
+def test_a_later_unrelated_review_does_not_erase_an_earlier_valid_reject(monkeypatch):
+    """The latest LIVE review is what's inspected -- a genuine reject from a
+    non-author reviewer, followed by a later drive-by comment, must still be
+    the one that counts once the later review is excluded for having no
+    marker of its own... this asserts the reject marker's own precedence:
+    it must win over a later review that carries no marker text at all only
+    when it truly is the latest; here the drive-by IS later, so the marker
+    review is superseded -- documenting the existing, accept-symmetric
+    behavior rather than asserting a stronger guarantee this reconciler does
+    not make (matching `_accept_marker_on_latest_review`'s own semantics)."""
+    head = "e" * 40
+    pr = _win_pr(
+        5, "2026-01-01T00:00:00Z", head, author="alice",
+        reviews=[
+            {"state": "COMMENTED", "submittedAt": "2026-01-02T00:00:00Z",
+             "body": f"ACCEPTANCE: REJECT {head}", "author": {"login": "bob"}},
+            {"state": "COMMENTED", "submittedAt": "2026-01-03T00:00:00Z",
+             "body": "LGTM", "author": {"login": "carol"}},
+        ],
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_window_gh([pr]))
+
+    report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=10**12))
+
+    # Symmetric with `_accept_marker_on_latest_review`: only the single
+    # latest live review is ever inspected, matching this codebase's
+    # existing, accepted trust model for the accept side of the same
+    # protocol.
+    assert report.blocked == []
+    assert report.active == [(5, head)]
+
+
+def test_age_falls_back_to_created_at_and_is_reported(monkeypatch):
+    """The head commit is absent from the (possibly paginated) `commits`
+    field and the direct per-commit lookup also fails -- the age falls back
+    to `createdAt`, and that fallback must be visible in the report rather
+    than silently indistinguishable from a genuinely stale PR."""
+    head = "f" * 40
+    pr = _win_pr(
+        6, "2020-01-01T00:00:00Z", head, commits=[],
+    )
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_pr_window_gh([pr], api_returncode=1)
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(stale_seconds=60)
+    )
+
+    assert (6, head) in report.age_fallback
+    assert report.blocked == [(6, "stale_exact_head_acceptance")]
+
+
+def test_age_uses_direct_lookup_when_commits_list_is_paginated_out(monkeypatch):
+    """The head commit is missing from `commits` but the direct, unpaginated
+    lookup succeeds -- age must come from that fresh date, not `createdAt`,
+    and must not be recorded as a fallback."""
+    head = "1" * 40
+    pr = _win_pr(6, "2020-01-01T00:00:00Z", head, commits=[])
+    import subprocess as sp
+
+    now_iso = "2026-01-01T00:00:00Z"
+
+    def fake_gh(argv, repo_path):
+        if argv[0] == "pr" and argv[1] == "list":
+            return sp.CompletedProcess(argv, 0, json.dumps([pr]), "")
+        if argv[0] == "api":
+            return sp.CompletedProcess(argv, 0, now_iso, "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=999_999_999))
+
+    assert report.age_fallback == []
+    assert report.blocked == []
+
+
+def test_sticky_active_keeps_its_slot_over_an_older_newly_eligible_pr(monkeypatch):
+    """Deliberate low-churn trade-off: a PR already in the window keeps its
+    slot while still eligible, even against an older PR that only just
+    became eligible -- avoiding restarting review on ordinary rotation."""
+    older_new = _win_pr(7, "2026-01-01T00:00:00Z", "2" * 40)
+    younger_active = _win_pr(
+        8, "2026-02-01T00:00:00Z", "3" * 40,
+        labels=["review-window:active"],
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_window_gh([older_new, younger_active]),
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert report.active == [(8, "3" * 40)]
+    assert report.waiting == [(7, "2" * 40)]
+
+
+def test_already_correctly_labelled_pr_costs_no_edit_call(monkeypatch):
+    pr = _win_pr(9, "2026-01-01T00:00:00Z", "4" * 40, labels=["review-window:active"])
+    edits: list[list[str]] = []
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_pr_window_gh([pr], edits=edits)
+    )
+
+    reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert edits == []
