@@ -1380,7 +1380,15 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
         try:
             os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
-            return  # already gone
+            # No process at all still carries this pgid — not merely "the
+            # leader is gone" but "the whole original group is extinct",
+            # which is exactly the state an escaped, setsid()'d descendant
+            # (now on its own, different pgid) leaves behind. Do NOT return
+            # here: that would discard the `descendants` snapshot and skip
+            # the one signal this function has left to deliver. `proc.wait()`
+            # below still returns immediately (the leader — proc.pid itself —
+            # is confirmed gone), so falling through costs nothing.
+            pass
         except OSError:
             pass
         _signal_descendants_outside_group(descendants, proc.pid, signal.SIGTERM)
@@ -1400,7 +1408,10 @@ def _terminate_process_group(proc: subprocess.Popen, *, grace_seconds: float) ->
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
-            return  # already gone
+            # Same reasoning as the SIGTERM branch above: an extinct group is
+            # precisely when an escaped descendant is the only thing left to
+            # signal, so fall through to the sweep instead of returning.
+            pass
         except OSError:
             pass
         _signal_descendants_outside_group(descendants, proc.pid, signal.SIGKILL)
