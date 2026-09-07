@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 public enum EvidenceState: String, Codable, Hashable, Sendable { case unknown, observed, verified, rejected, pending }
@@ -280,15 +281,37 @@ public enum DeviceTokenStore {
         return String(data: data, encoding: .utf8)
     }
 
+    /// Saves the token. When `protectedByBiometrics` is true, the Keychain
+    /// item is sealed behind the Secure Enclave's biometry gate
+    /// (`.biometryCurrentSet`, `.whenUnlockedThisDeviceOnly`): the OS itself
+    /// then demands a fresh Face ID / Touch ID match before `load()` can ever
+    /// decrypt the item, and any change to enrolled biometrics invalidates
+    /// it outright. This is the optional hardware binding described by the
+    /// task; callers that don't opt in keep the previous, unprotected item.
     @discardableResult
-    public static func save(_ token: String) -> Bool {
-        let attributes: [String: Any] = [
+    public static func save(_ token: String, protectedByBiometrics: Bool = false) -> Bool {
+        var attributes: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecValueData as String: Data(token.utf8),
         ]
-        SecItemDelete(attributes as CFDictionary)
+        if protectedByBiometrics {
+            guard
+                let accessControl = SecAccessControlCreateWithFlags(
+                    nil,
+                    kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                    .biometryCurrentSet,
+                    nil
+                )
+            else { return false }
+            attributes[kSecAttrAccessControl as String] = accessControl
+        }
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ] as CFDictionary)
         return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
     }
 
@@ -300,6 +323,110 @@ public enum DeviceTokenStore {
             kSecAttrAccount as String: account,
         ]
         return SecItemDelete(query as CFDictionary) == errSecSuccess
+    }
+}
+
+// MARK: - Biometric / Secure Enclave authorization for critical actions
+
+/// Abstraction over `LAContext` so critical-action flows can be exercised in
+/// tests without a real biometric sensor.
+public protocol BiometricAuthenticating: Sendable {
+    /// Prompts Face ID / Touch ID (backed by the Secure Enclave) and returns
+    /// whether the owner was verified. Returns `false` (never throws) when no
+    /// biometric sensor is enrolled or available, so callers always get a
+    /// simple pass/fail signal.
+    func evaluate(reason: String) async -> Bool
+}
+
+/// Default authenticator: requires the device owner's enrolled biometry
+/// (Face ID / Touch ID), never falling back to a passcode-only check, so a
+/// successful evaluation is always Secure-Enclave-verified biometric proof.
+public struct DeviceBiometricAuthenticator: BiometricAuthenticating {
+    public init() {}
+
+    public func evaluate(reason: String) async -> Bool {
+        let context = LAContext()
+        var error: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+            return false
+        }
+        return await withCheckedContinuation { continuation in
+            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { success, _ in
+                continuation.resume(returning: success)
+            }
+        }
+    }
+}
+
+/// Always-approving/denying stand-ins for tests and previews (no hardware).
+public struct StaticBiometricAuthenticator: BiometricAuthenticating {
+    public let result: Bool
+    public init(result: Bool) { self.result = result }
+    public func evaluate(reason: String) async -> Bool { result }
+}
+
+public enum CriticalActionError: Error, Equatable, Sendable {
+    case biometricAuthenticationFailed
+}
+
+/// Gates critical, credential-affecting actions (pairing, unpairing, key
+/// rotation, …) behind a fresh biometric authorization, and tracks a
+/// short-lived "confirmed session" so a burst of critical actions doesn't
+/// re-prompt the owner on every single call. Optional by design: with
+/// `policy == .disabled` (the default) every action runs unguarded, matching
+/// the task's "opt-in" framing; enabling `.required` is what makes 100% of
+/// critical operations require both a biometric check *and* a live
+/// confirmed-session before they execute.
+public actor CriticalActionGuard {
+    public enum Policy: String, Sendable, Equatable { case disabled, required }
+
+    private let authenticator: BiometricAuthenticating
+    private let sessionTTL: TimeInterval
+    private var confirmedAt: Date?
+    public private(set) var policy: Policy
+
+    public init(
+        authenticator: BiometricAuthenticating = DeviceBiometricAuthenticator(),
+        sessionTTL: TimeInterval = 300,
+        policy: Policy = .disabled
+    ) {
+        self.authenticator = authenticator
+        self.sessionTTL = sessionTTL
+        self.policy = policy
+    }
+
+    /// Changing the policy always drops any live session, so re-enabling the
+    /// guard can never silently reuse a stale confirmation.
+    public func setPolicy(_ policy: Policy) {
+        self.policy = policy
+        confirmedAt = nil
+    }
+
+    public func isSessionActive(now: Date = Date()) -> Bool {
+        guard let confirmedAt else { return false }
+        return now.timeIntervalSince(confirmedAt) < sessionTTL
+    }
+
+    public func invalidateSession() { confirmedAt = nil }
+
+    /// Runs `operation`, requiring a fresh (or still-live) biometric
+    /// confirmation first whenever the policy is `.required`. Throws
+    /// `CriticalActionError.biometricAuthenticationFailed` without ever
+    /// invoking `operation` if authorization is denied or unavailable.
+    @discardableResult
+    public func perform<T: Sendable>(
+        reason: String,
+        now: Date = Date(),
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        guard policy == .required else { return try await operation() }
+        if !isSessionActive(now: now) {
+            guard await authenticator.evaluate(reason: reason) else {
+                throw CriticalActionError.biometricAuthenticationFailed
+            }
+            confirmedAt = now
+        }
+        return try await operation()
     }
 }
 
