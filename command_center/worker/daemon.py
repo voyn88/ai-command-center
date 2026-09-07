@@ -11,7 +11,10 @@ Design decisions, each traceable to the shipped substrate:
 * **The heartbeat runs beside the handler, not inside it.** A handler that
   blocks must not silence the heartbeat, and a lapsed lease must stop the
   work: the beat thread renews at a third of the visibility window and raises
-  a stop flag the moment the database says ``attempt_superseded``.
+  a stop flag the moment the database says ``attempt_superseded``. It keeps
+  renewing through the report call too — ``complete``/``fail`` is its own
+  network round trip, and stopping the beat before it lands would spend the
+  window's last slice on an unrenewed lease.
 * **Shutdown finishes the item in hand.** SIGTERM stops *claiming*; the
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
@@ -166,38 +169,47 @@ class WorkerDaemon:
         beat.start()
         try:
             outcome = self._dispatch(work, lease_lost)
+            if lease_lost.is_set():
+                # The database already gave this attempt to someone else (or
+                # will, at reap). Reporting anything would be refused as a
+                # stale owner — and must be: writing a result after losing
+                # the lease is exactly the lost-update this protocol exists
+                # to prevent.
+                logger.warning(
+                    "attempt %s: lease lost mid-execution; outcome discarded",
+                    work.attempt_id,
+                )
+                return
+            if outcome.ok:
+                accepted = self._store.complete(work, outcome.result)
+            else:
+                accepted = self._store.fail(
+                    work, reason=outcome.reason, retryable=outcome.retryable
+                )
+            if not accepted:
+                # The database refused the report: the lease lapsed between
+                # our last successful beat and this write, and the attempt
+                # belongs to someone else now. The refusal is the protocol
+                # working — but a daemon that does not KNOW it happened
+                # re-runs the handler's side effects on retry with no
+                # operator-visible trace of why. Review found exactly this
+                # interleaving via the heartbeat-error path.
+                logger.warning(
+                    "attempt %s: report refused as stale owner; outcome lost "
+                    "to a lapsed lease (handler effects may re-run on the "
+                    "next attempt)",
+                    work.attempt_id,
+                )
         finally:
+            # The beat must outlive the report call, not just the handler:
+            # complete()/fail() is itself a network round trip, and silencing
+            # the beat before it lands spends the last slice of the window on
+            # an unrenewed lease — the exact race that turns a fully finished
+            # attempt into a stale-owner refusal (VOYN-W0-AICC-VISIBILITY-
+            # WINDOW-COST). The beat thread keeps renewing until the report
+            # itself is done, success or not.
             beat_stop.set()
             beat.join(timeout=5)
-
-        if lease_lost.is_set():
-            # The database already gave this attempt to someone else (or will,
-            # at reap). Reporting anything would be refused as a stale owner —
-            # and must be: writing a result after losing the lease is exactly
-            # the lost-update this protocol exists to prevent.
-            logger.warning(
-                "attempt %s: lease lost mid-execution; outcome discarded",
-                work.attempt_id,
-            )
-            return
-        if outcome.ok:
-            accepted = self._store.complete(work, outcome.result)
-        else:
-            accepted = self._store.fail(
-                work, reason=outcome.reason, retryable=outcome.retryable
-            )
-        if not accepted:
-            # The database refused the report: the lease lapsed between our
-            # last successful beat and this write, and the attempt belongs to
-            # someone else now. The refusal is the protocol working — but a
-            # daemon that does not KNOW it happened re-runs the handler's side
-            # effects on retry with no operator-visible trace of why. Review
-            # found exactly this interleaving via the heartbeat-error path.
-            logger.warning(
-                "attempt %s: report refused as stale owner; outcome lost to a "
-                "lapsed lease (handler effects may re-run on the next attempt)",
-                work.attempt_id,
-            )
 
     def _dispatch(
         self, work: ClaimedWork, lease_lost: threading.Event

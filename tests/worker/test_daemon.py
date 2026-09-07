@@ -216,6 +216,50 @@ def test_a_refused_report_is_logged_not_swallowed(caplog) -> None:
     assert any("report refused as stale owner" in r.message for r in caplog.records)
 
 
+def test_the_heartbeat_keeps_renewing_through_the_report_call() -> None:
+    """VOYN-W0-AICC-VISIBILITY-WINDOW-COST: the beat must not go quiet the
+    moment the handler returns — complete()/fail() is its own network round
+    trip, and a beat silenced before it lands spends the window's last slice
+    on an unrenewed lease, so a slow report races a lapsing lease it need not
+    race at all."""
+    import threading
+    import time
+
+    store = ScriptedStore([_work({"kind": "echo"})])
+    report_started = threading.Event()
+    heartbeat_during_report = threading.Event()
+
+    original_heartbeat = store.heartbeat
+
+    def observed_heartbeat(work):
+        if report_started.is_set():
+            heartbeat_during_report.set()
+        return original_heartbeat(work)
+
+    store.heartbeat = observed_heartbeat  # type: ignore[method-assign]
+
+    def slow_complete(work, result):
+        report_started.set()
+        time.sleep(1.5)  # longer than the 1s beat interval below
+        store.calls.append(("complete", work.attempt_id, result))
+        return True
+
+    store.complete = slow_complete  # type: ignore[method-assign]
+
+    daemon = WorkerDaemon(
+        store,
+        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
+        WorkerConfig(visibility_seconds=3),  # beat interval: 1s
+    )
+    _run_until_idle(daemon, store)
+
+    assert heartbeat_during_report.is_set(), (
+        "the beat thread must still be renewing the lease while the report "
+        "call is in flight"
+    )
+    assert ("complete", "wat-1", {}) in store.calls
+
+
 def test_a_non_object_payload_dead_letters_instead_of_killing_the_daemon() -> None:
     """queue_enqueue accepts any jsonb; a list payload used to raise
     AttributeError out of run_forever and kill the process over one item."""
