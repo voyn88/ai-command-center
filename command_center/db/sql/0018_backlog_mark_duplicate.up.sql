@@ -100,7 +100,7 @@ BEGIN
 
     PERFORM _backlog_audit(p_task_id, 'mark_duplicate', 'granted', 'duplicate',
                            jsonb_build_object('canonical', p_canonical_task_id, 'detail', p_detail));
-    v.ok := true;
+    v.ok := true; v.reason := 'DECIDED';
     RETURN v;
 END
 $$;
