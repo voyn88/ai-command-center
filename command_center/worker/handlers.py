@@ -260,8 +260,17 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
     if agent_runner.principal_isolation_required():
+        # `aider` falls through to here like any other executor: it is
+        # deliberately absent from `agent_runner.PRINCIPAL_EXECUTOR_BINARIES`
+        # (a free, benchmark-gated local-model executor has no business
+        # behind the privileged principal-isolation broker), so this refuses
+        # it generically -- the isolated cascade never reaches the unguarded
+        # `aider_preflight` check below at all.
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
+    if executor == "aider":
+        available, detail = agent_runner.aider_preflight()
+        return available, detail, "aider cli or ollama daemon unavailable"
     if executor == "codex":
         available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
         return available, detail, "codex cli unavailable"

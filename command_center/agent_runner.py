@@ -121,6 +121,15 @@ CLAUDE_BINARY = "claude"
 # the service already runs as that user), which systemd does not add for it.
 CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
 COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
+AIDER_BINARY = os.environ.get("AICC_AIDER_BINARY") or "aider"
+OLLAMA_BINARY = os.environ.get("AICC_OLLAMA_BINARY") or "ollama"
+#: The exact Ollama tag the AICC Fleet benchmark (`scripts/aicc_aider_benchmark.py`)
+#: measures and `orchestrator.local_model_gates` gates promotion on (AICC Fleet
+#: decision 2026-09-03, voyn-worker-01). `aider_preflight` checks for this EXACT
+#: tag, not a prefix match: a different tag pulled under the same daemon (e.g.
+#: an `-instruct` variant) was never benchmarked and must not be dispatched to
+#: silently under this name.
+DEFAULT_AIDER_MODEL = "qwen2.5-coder:14b"
 
 # The worker never elevates and keeps NoNewPrivileges=yes.  A root-owned,
 # socket-activated launcher is the sole bridge to the separate aicc-agent UID.
@@ -140,6 +149,15 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # b311666). The retry-loop hazard that once motivated listing it is
     # closed in handlers instead: an unavailable executor falls through the
     # cascade to the next link rather than respinning forever.
+    #
+    # Aider is DELIBERATELY absent too, for an unrelated reason: it is a
+    # free, benchmark-gated LOCAL-MODEL executor (orchestrator.routing's
+    # BOUNDED_IMPLEMENTATION_TASK_CLASS / orchestrator.local_model_gates),
+    # not something the privileged principal-isolation broker has any
+    # business staging behind its boundary. Its absence here is what makes
+    # `principal_executor_preflight("aider")` refuse it generically, so a
+    # bounded_implementation task dispatched under principal isolation falls
+    # through the cascade to the next (isolated) link instead.
 }
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 
@@ -980,6 +998,100 @@ def build_copilot_command(
     return command
 
 
+def build_aider_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """The `aider` argv for the free, benchmark-gated local-model executor
+    (AICC Fleet decision 2026-09-03: aider + local Ollama `DEFAULT_AIDER_MODEL`
+    on voyn-worker-01, for low-risk bounded-implementation task classes only —
+    see `orchestrator.routing.BOUNDED_IMPLEMENTATION_TASK_CLASS` and
+    `orchestrator.local_model_gates`).
+
+    Fail-closed on `task_type`, unlike every other builder here: aider has no
+    read-only sandbox mode at all -- every invocation of it can write the
+    tree it is pointed at -- so there is no profile mapping to make for
+    `PROFILE_READ_ONLY`/model-only task types, only a refusal. The routing
+    cascade only ever offers this executor `task_type="implementation"`, but
+    this builder re-validates independently rather than trusting that,
+    exactly as `build_openai_http_command` re-validates MODEL_ONLY: an argv
+    builder is reachable from more than one caller, and a hand-built cascade
+    link or a future routing bug must not be able to hand a mutating tool a
+    reviewer/model-only task silently.
+
+    `--message` (not the interactive REPL) makes this a single non-interactive
+    turn, matching every other executor's one-shot dispatch. `--yes-always`
+    auto-confirms aider's own edit/commit prompts, since nothing here is
+    present to answer them. The prompt is passed as ONE argv element (never
+    interpolated into a shell string), so it is inert against shell
+    metacharacters regardless of content -- the same property every other
+    `build_*_command` in this module already has from using `subprocess.Popen`
+    with an argv list, never `shell=True`.
+
+    `model`, when given, is used verbatim if it already names a LiteLLM
+    provider (contains `/`) — a caller that already resolved the full spec
+    should not have it silently mangled. Otherwise it (or the default) is
+    prefixed with `ollama_chat/`, aider's LiteLLM routing prefix for a local
+    Ollama-served model.
+    """
+    if task_type not in MUTATING_TASK_TYPES:
+        raise ValueError(
+            f"aider has no read-only mode and refuses task_type {task_type!r}; "
+            f"only {sorted(MUTATING_TASK_TYPES)} may dispatch to it"
+        )
+    resolved_model = model or DEFAULT_AIDER_MODEL
+    if "/" not in resolved_model:
+        resolved_model = f"ollama_chat/{resolved_model}"
+    return [
+        AIDER_BINARY,
+        "--model",
+        resolved_model,
+        "--yes-always",
+        "--no-check-update",
+        "--no-analytics",
+        "--message",
+        prompt,
+    ]
+
+
+def aider_preflight(
+    binary: str | None = None, *, model: str | None = None
+) -> tuple[bool, str]:
+    """`(available, message)` for the aider CLI AND its local Ollama backend.
+
+    Three things must hold, checked in order so the message names the actual
+    gap: the `aider` binary is on PATH, the `ollama` binary is on PATH, and
+    `ollama list`'s stdout names the EXACT `model` (default
+    `DEFAULT_AIDER_MODEL`) as a pulled tag -- deliberately an exact match on
+    each line's first (name) column, never a substring test. A substring test
+    would let an unrelated, never-benchmarked tag that merely shares the
+    benchmarked tag as a prefix (e.g. `qwen2.5-coder:14b-instruct` containing
+    `qwen2.5-coder:14b`) read as "the benchmarked model is available", which
+    is exactly the "reachable but serving a different model" hazard this
+    preflight exists to catch before a dispatch reaches `build_aider_command`.
+    """
+    resolved_binary = binary or AIDER_BINARY
+    if shutil.which(resolved_binary) is None:
+        return False, f"aider CLI {resolved_binary!r} is not available on PATH"
+    if shutil.which(OLLAMA_BINARY) is None:
+        return False, f"ollama CLI {OLLAMA_BINARY!r} is not available on PATH"
+    listed = subprocess.run(
+        [OLLAMA_BINARY, "list"], capture_output=True, text=True, check=False
+    )
+    if listed.returncode != 0:
+        detail = listed.stderr.strip() or "ollama daemon is not reachable"
+        return False, f"ollama list failed: {detail}"
+    target = model or DEFAULT_AIDER_MODEL
+    pulled_names = {
+        parts[0] for line in listed.stdout.splitlines() if (parts := line.split())
+    }
+    if target not in pulled_names:
+        return False, f"ollama model {target!r} is not pulled"
+    return True, ""
+
+
 #: executor id -> the NAME of its argv builder in this module. The worker
 #: refuses any executor absent from this table (`handlers._run_agent`), so an
 #: unknown/unproven name can never silently burn a cascade attempt on a
@@ -997,6 +1109,7 @@ COMMAND_BUILDERS: dict[str, str] = {
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
     "openai_http": "build_openai_http_command",
+    "aider": "build_aider_command",
 }
 
 
