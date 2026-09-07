@@ -8,6 +8,19 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Decision P&L (`VOYN-MIN-COMPANY-MODEL`)
+- `command_center/decision_pnl.py`: prices every non-sensitive Board decision
+  (`command_center.council`) closed in a week against a declared, per-solution
+  cost/value assumption (`data/solution_valuation.json`, tracked example at
+  `data/solution_valuation.example.json`) — never a measured spend, since no
+  per-decision spend exists yet — and rolls the result into a comparative
+  report ranking solutions by net P&L for BizDev/Sales. A solution missing
+  from the valuation file reports as unpriced rather than a fabricated `$0`;
+  value is credited only on an `approved` outcome, so a rejected/deferred
+  decision still costs but never earns.
+- `scripts/generate_decision_pnl_report.py`: CLI that writes the weekly
+  Markdown report to `reports/decision_pnl_<week-start>_to_<week-end>.md`.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,

@@ -9,6 +9,7 @@ data/portfolio_config.json
 data/portfolio_launches.json
 data/portfolio_locks/
 data/pipeline_settings.json
+data/solution_valuation.json
 # Glob, not a by-name list: every lock added with a new feature was otherwise
 # missed, leaving AICC's own tree dirty and tripping its UNCOMMITTED_CHANGES gate.
 data/*.lock
