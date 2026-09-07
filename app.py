@@ -4,7 +4,7 @@ import html
 import os
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -381,12 +381,29 @@ get_git_worktrees = git_readers.get_git_worktrees
 
 
 def _parse_iso_ts(value: str | None) -> float | None:
+    """Epoch seconds for an `iso_now()`-style timestamp, mixed into the
+    Timeline's `events.sort(key=...)` alongside real file `mtime` epochs and
+    into the Runs tab's calendar-day filter (both via `datetime.fromtimestamp`,
+    which converts an epoch to local wall clock for display/bucketing — the
+    correct direction, unlike parsing).
+
+    `models.iso_now()` writes naive UTC (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`),
+    but a bare `.timestamp()` on a naive `datetime` assumes *local* time. Left
+    as-is, every task/run/activity `ts` here would be shifted by the process's
+    UTC offset relative to the true `mtime` epochs it sorts against, and — the
+    same defect this fix closes elsewhere — non-monotonic across a local DST
+    fall-back. Attaching UTC before calling `.timestamp()` makes this an actual
+    epoch instead of a locally-misread one.
+    """
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value).timestamp()
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def build_timeline_events(
@@ -778,17 +795,20 @@ def _home_greeting() -> str:
 
 def _runs_per_day(runs: list[dict], days: int = 7) -> tuple[int, ...]:
     """A real short series: runs started per day over the last `days` — the
-    honest trend for a KPI sparkline (never random)."""
+    honest trend for a KPI sparkline (never random).
+
+    Buckets by the operator's *local* calendar day, so `started_at` — naive
+    UTC (`models.iso_now()`) — goes through `_parse_iso_ts`/`fromtimestamp`
+    rather than a bare `.date()` on the naive string: the latter reads the
+    UTC calendar date directly, which drifts a run into the wrong day's
+    bucket by the local UTC offset (VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL)."""
     today = datetime.now().date()
     buckets = [0] * days
     for r in runs:
-        started = r.get("started_at")
-        if not started:
+        ts = _parse_iso_ts(r.get("started_at"))
+        if ts is None:
             continue
-        try:
-            d = datetime.fromisoformat(started).date()
-        except (ValueError, TypeError):
-            continue
+        d = datetime.fromtimestamp(ts).date()
         delta = (today - d).days
         if 0 <= delta < days:
             buckets[days - 1 - delta] += 1
@@ -796,14 +816,11 @@ def _runs_per_day(runs: list[dict], days: int = 7) -> tuple[int, ...]:
 
 
 def _run_started_date(run: dict) -> datetime | None:
-    """Parse a run's ``started_at`` ISO timestamp to a date, or ``None``."""
-    started = run.get("started_at")
-    if not started:
-        return None
-    try:
-        return datetime.fromisoformat(started)
-    except (ValueError, TypeError):
-        return None
+    """A run's ``started_at`` as a local datetime, or ``None``. See
+    `_runs_per_day` for why this goes through `_parse_iso_ts` rather than a
+    bare `fromisoformat` on the naive-UTC string."""
+    ts = _parse_iso_ts(run.get("started_at"))
+    return datetime.fromtimestamp(ts) if ts is not None else None
 
 
 # Windowed (sprint) run health — the honest denominator for the dashboard's
@@ -820,13 +837,10 @@ def _window_terminal_runs(runs: list[dict], *, days: int = HEALTH_WINDOW_DAYS) -
     for r in runs:
         if r.get("state") not in runtime_db.TERMINAL_STATES:
             continue
-        started = r.get("started_at")
-        if not started:
+        ts = _parse_iso_ts(r.get("started_at"))
+        if ts is None:
             continue
-        try:
-            d = datetime.fromisoformat(started).date()
-        except (ValueError, TypeError):
-            continue
+        d = datetime.fromtimestamp(ts).date()
         if 0 <= (today - d).days < days:
             out.append(r)
     return out

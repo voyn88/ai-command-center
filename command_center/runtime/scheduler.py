@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Mapping
 
 from command_center import agent_runner, executors, models
@@ -420,12 +420,28 @@ def _normalize_workspace(path: str) -> str:
 
 
 def _to_epoch(iso: str | None) -> float | None:
+    """Epoch seconds for an `enqueued_at`/`last_completed_at`/`now` string —
+    all `models.iso_now()`-sourced naive UTC (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`).
+
+    A bare `.timestamp()` on a naive `datetime` assumes *local* time. `now`
+    and every `enqueued_at`/`last_completed_at` this feeds are naive UTC on
+    the same clock, so a fixed local misreading would cancel out of every
+    subtraction (`_queued_seconds`, backoff) — except across this process's
+    own DST fall-back, where the local offset used to interpret one naive
+    value can differ from the offset used moments earlier for another,
+    reintroducing the exact non-monotonic comparison this fix closes
+    elsewhere: `_order_key`'s FIFO tiebreak and the SLA/backoff deadlines
+    would again pick the wrong item for the span of the repeated hour.
+    Attaching UTC before calling `.timestamp()` makes this an actual epoch."""
     if not iso:
         return None
     try:
-        return datetime.fromisoformat(iso).timestamp()
+        parsed = datetime.fromisoformat(iso)
     except (ValueError, TypeError):
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 @dataclass(frozen=True)
@@ -553,10 +569,18 @@ def _sla_remaining(item: WorkItem, now_epoch: float | None) -> float | None:
 
 
 def _iso_add(iso: str | None, seconds: float) -> str | None:
+    """`iso` plus `seconds`, rendered the way `models.iso_now()` renders:
+    naive UTC. `datetime.fromtimestamp` without a zone renders local wall
+    clock, which would hand `next_eligible_at` back in a different
+    convention than every other timestamp this plan reports."""
     epoch = _to_epoch(iso)
     if epoch is None:
         return None
-    return datetime.fromtimestamp(epoch + seconds).isoformat(timespec="seconds")
+    return (
+        datetime.fromtimestamp(epoch + seconds, tz=timezone.utc)
+        .replace(tzinfo=None)
+        .isoformat(timespec="seconds")
+    )
 
 
 def plan(
