@@ -77,11 +77,13 @@ import json
 import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -90,11 +92,14 @@ from command_center.orchestrator.routing import cascade_for
 
 __all__ = [
     "LoopReport",
+    "PrWindowConfig",
+    "PrWindowReport",
     "ReconcileReport",
     "ReviewConfig",
     "merge_once",
     "publish_review_verdicts",
     "reconcile_merge_evidence",
+    "reconcile_pr_window",
     "reconcile_review_once",
     "review_once",
 ]
@@ -3047,4 +3052,328 @@ def reconcile_merge_evidence(factory: Any, repo_path: str) -> ReconcileReport:
             report.verified.append((task_id, sha))
         else:
             report.suspect.append((task_id, sha, f"sha_not_on_{branch}"))
+    return report
+
+
+# -- Part 4: the PR window (bounded autonomous review rotation) --------------
+#
+# `review_once`/`merge_once` above bound how much work ONE tick will do; they
+# say nothing about how many PRs sit open and reviewable AT ONCE. Left alone
+# that number is unbounded, and this reconciler exists only to put a GitHub-
+# visible label on each open PR -- "active" (in the bounded review/merge
+# rotation), "waiting" (eligible, just not in the window right now), or
+# "blocked" (excluded until the reason clears) -- so an operator can see the
+# window from the PR list without a database query. It never merges,
+# approves, or removes a gate; it only ever relabels.
+
+
+@dataclass(frozen=True, slots=True)
+class PrWindowConfig:
+    label_active: str = "review-window:active"
+    label_waiting: str = "review-window:waiting"
+    label_blocked: str = "review-window:blocked"
+    #: Bounded active window: how many open PRs may carry `label_active` at
+    #: once, so the review/merge tick's own per-tick caps (`ReviewConfig.
+    #: scan_cap`/`max_active_reviews`) are never handed a larger live set
+    #: than they can examine.
+    max_active: int = 5
+    #: How many open PRs `gh pr list` is asked for. Requested in ascending-
+    #: created order (see `reconcile_pr_window`), so a repo with more open
+    #: PRs than this limit still keeps the OLDEST ones in view -- the ones
+    #: FIFO fairness cares about -- instead of truncating them out before
+    #: they are ever sorted. (VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM-REM:
+    #: `gh pr list` with no explicit sort returns newest-created-first, so a
+    #: plain `--limit` truncated the oldest, un-reviewed backlog out of
+    #: consideration entirely on any repo busier than this number.)
+    scan_limit: int = 50
+    #: A PR whose head commit is older than this (seconds) with no green
+    #: acceptance path yet is blocked from the window rather than occupying
+    #: a slot indefinitely. Default 48h.
+    stale_seconds: int = 172_800
+    #: Check names that must be present on the rollup for a PR to be
+    #: eligible at all. Empty means "whatever is present must be green",
+    #: matching `_pr_is_mergeable`'s own all-present-checks-green rule.
+    required_checks: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class PrWindowReport:
+    #: (number, headRefOid) given the active label this tick.
+    active: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, headRefOid) eligible but not selected into the window.
+    waiting: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, reason) excluded from the window entirely.
+    blocked: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, headRefOid) whose age had to fall back to the PR's
+    #: `createdAt` because the head commit's own `committedDate` could not
+    #: be resolved -- neither present on the (possibly paginated) `commits`
+    #: field nor recoverable via the direct per-commit lookup. Surfaced so
+    #: a `blocked`/`stale_exact_head_acceptance` verdict for one of these
+    #: PRs can be told apart from a genuine stale push rather than a lookup
+    #: failure silently inflating its apparent age.
+    age_fallback: list[tuple[int, str]] = field(default_factory=list)
+
+
+def _independent_latest_reject_marker(
+    reviews: list[dict[str, Any]], head: str, pr_author_login: str | None
+) -> bool:
+    """Whether an `ACCEPTANCE: REJECT <head>` marker stands on the MOST
+    RECENT *live* review, from a reviewer login that is NOT the PR's own
+    author -- the exact mirror of `_accept_marker_on_latest_review` above,
+    for the reject side of the same protocol.
+
+    Before this (VOYN-W0-AICC-PR-WINDOW-RECONCILER: adversarial review of
+    16557c86): the reject path took the single chronologically-latest
+    review across ALL reviewers, including plain COMMENT-type reviews any
+    GitHub user with read access can post, and trusted a literal substring
+    match with no author check at all. `headRefOid` is public, so any
+    outside actor could post `ACCEPTANCE: REJECT <headRefOid>` and force
+    this reconciler to demote/block a PR it has no authority over. The
+    accept path was never vulnerable to that because it already scoped
+    itself to a non-author reviewer; the reject path gets the identical
+    scoping here rather than a bespoke, weaker check -- the same DISMISSED-
+    exclusion, same latest-live-review selection, same casefolded login
+    comparison, same `None` (author unknown) skips-the-check behavior."""
+    live = [review for review in reviews if review.get("state") != "DISMISSED"]
+    if not live:
+        return False
+    latest = max(live, key=lambda r: r.get("submittedAt") or "")
+    if f"ACCEPTANCE: REJECT {head}" not in (latest.get("body") or ""):
+        return False
+    if pr_author_login is None:
+        return True
+    reviewer_login = (latest.get("author") or {}).get("login")
+    return (
+        reviewer_login is not None
+        and reviewer_login.casefold() != pr_author_login.casefold()
+    )
+
+
+def _parse_iso8601_seconds(value: str) -> float | None:
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def _head_commit_committed_date(repo_path: str, pr: dict[str, Any]) -> str | None:
+    """Direct, single-commit lookup of the head's own `committedDate` --
+    never paginated, unlike `gh pr list`'s `commits` field (see
+    `_pr_age_seconds`). Best-effort: any failure (network blip, rate limit,
+    an unparseable PR url) returns None and the caller falls back, exactly
+    as it would have without this helper at all; the point is only to make
+    that fallback rarer, not to add a new way to fail the tick."""
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    head = str(pr.get("headRefOid") or "")
+    if parsed is None or not head:
+        return None
+    owner, repo, _number = parsed
+    result = _gh(
+        [
+            "api",
+            f"repos/{owner}/{repo}/commits/{head}",
+            "--jq",
+            ".commit.committer.date",
+        ],
+        repo_path,
+    )
+    if result.returncode != 0:
+        return None
+    date = (result.stdout or "").strip()
+    return date or None
+
+
+def _pr_age_seconds(
+    repo_path: str, pr: dict[str, Any], *, now: float
+) -> tuple[float, bool]:
+    """Age of the PR's HEAD commit, in seconds, plus whether the answer had
+    to fall back to the PR's `createdAt`.
+
+    Deliberately the head commit's `committedDate`, not `PR.updatedAt`:
+    `updatedAt` resets on every write to the PR -- including this very
+    reconciler's own label writes -- so using it would make an actively-
+    relabeled PR look perpetually fresh regardless of when it was last
+    actually pushed.
+
+    The head commit is looked for first in `pr["commits"]` (from the same
+    `gh pr list` call as everything else, zero extra cost), but that field
+    can be paginated/truncated on a PR with many commits (this system's own
+    workers push many small fixup commits per task across retries). Rather
+    than silently trusting an absence there, a missing head commit triggers
+    one direct, unpaginated lookup (`_head_commit_committed_date`) before
+    ever falling back to `createdAt` -- `createdAt` is measured from PR
+    OPEN, not from the last real push, so falling back to it understates
+    freshness (and overstates staleness) for exactly the long-lived,
+    actively-updated PRs this age check exists to treat fairly."""
+    head = str(pr.get("headRefOid") or "")
+    commits = pr.get("commits") or []
+    match = next(
+        (item for item in commits if str(item.get("oid") or "") == head), None
+    )
+    date = match.get("committedDate") if isinstance(match, dict) else None
+    fell_back = False
+    if not date and head:
+        date = _head_commit_committed_date(repo_path, pr)
+    if not date:
+        date = pr.get("createdAt")
+        fell_back = True
+    if not date:
+        return 0.0, fell_back
+    parsed = _parse_iso8601_seconds(str(date))
+    if parsed is None:
+        return 0.0, fell_back
+    return max(now - parsed, 0.0), fell_back
+
+
+def _window_block_reason(
+    pr: dict[str, Any], cfg: PrWindowConfig, *, age_seconds: float
+) -> str | None:
+    """Why a PR is excluded from the window entirely, or None if eligible.
+
+    Checked in order: an independent reject marker is dispositive regardless
+    of check state or age (a human/reviewer said no); missing required
+    checks and non-green present checks are the ordinary CI gate; only once
+    both of those are clear does staleness (age past `stale_seconds` with no
+    accept marker yet standing on the exact current head) apply -- a PR that
+    already carries a fresh accept marker at its current head is never
+    blocked for age alone, since `merge_once`'s own gate is what decides its
+    fate from there."""
+    head = str(pr.get("headRefOid") or "")
+    author_login = (pr.get("author") or {}).get("login")
+    reviews = pr.get("reviews") or []
+    if _independent_latest_reject_marker(reviews, head, author_login):
+        return "acceptance_rejected"
+    rollup = _latest_checks_by_name(pr.get("statusCheckRollup") or [])
+    present = {str(check.get("name") or "") for check in rollup}
+    if any(name not in present for name in cfg.required_checks):
+        return "checks_missing"
+    if rollup and any(not _check_is_green(check) for check in rollup):
+        return "checks_stale"
+    if age_seconds > cfg.stale_seconds and not _accept_marker_on_latest_review(
+        reviews, head, author_login
+    ):
+        return "stale_exact_head_acceptance"
+    return None
+
+
+def _pr_window_labels(pr: dict[str, Any]) -> set[str]:
+    return {
+        str(label.get("name") or "")
+        for label in (pr.get("labels") or [])
+        if isinstance(label, dict)
+    }
+
+
+def _set_pr_window_labels(
+    repo_path: str, pr: dict[str, Any], cfg: PrWindowConfig, desired: str
+) -> bool:
+    """Delta-only label write: only the window labels this reconciler owns
+    are ever touched, and only when the current set differs from the single
+    desired one -- a PR already correctly labelled costs zero `gh` calls."""
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    if parsed is None:
+        return False
+    _owner, _repo, number = parsed
+    window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked}
+    current = _pr_window_labels(pr) & window_labels
+    if current == {desired}:
+        return True
+    argv = ["pr", "edit", number]
+    for name in current - {desired}:
+        argv += ["--remove-label", name]
+    if desired not in current:
+        argv += ["--add-label", desired]
+    result = _gh(argv, repo_path)
+    return result.returncode == 0
+
+
+def reconcile_pr_window(
+    repo_path: str, cfg: PrWindowConfig = PrWindowConfig()
+) -> PrWindowReport:
+    """One tick of the bounded PR review window: label every open PR
+    active/waiting/blocked and nothing else -- no merge, no approval, no
+    weakening of any gate `merge_once`/`_pr_is_mergeable` enforce.
+
+    Listed in ascending-created order (`--search sort:created-asc`) rather
+    than `gh pr list`'s unsorted default (newest-created-first): combined
+    with `--limit`, the unsorted default meant a repo with more open PRs
+    than `scan_limit` never even fetched its oldest, longest-waiting PRs --
+    they could not be selected no matter how the in-memory sort below
+    ranked them. Requesting ascending order up front keeps the oldest PRs
+    the ones in view when the repo is busier than the scan limit, which is
+    what the FIFO tie-break here is actually for.
+
+    Selection is sticky for the *currently* active set: a PR already
+    labelled active keeps its slot while still eligible, ahead of a
+    strictly age-sorted fill. This is a deliberate low-churn trade-off (it
+    only ever affects who KEEPS an existing slot, never who is passed over
+    for a first one -- that fairness question is the scan-order fix above),
+    not a fairness bug: without it, an ordinary rotation tick could bump an
+    active PR out and back in on no real change, restarting its review
+    cycle for nothing."""
+    report = PrWindowReport()
+    listed = _gh(
+        [
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--search",
+            "sort:created-asc",
+            "--limit",
+            str(max(cfg.scan_limit, 1)),
+            "--json",
+            "number,url,headRefOid,createdAt,commits,reviews,"
+            "statusCheckRollup,author,labels",
+        ],
+        repo_path,
+    )
+    if listed.returncode != 0:
+        return report
+    try:
+        prs = json.loads(listed.stdout or "[]")
+    except ValueError:
+        return report
+    if not isinstance(prs, list):
+        return report
+
+    now = time.time()
+    eligible: list[dict[str, Any]] = []
+    for pr in prs:
+        if not isinstance(pr, dict):
+            continue
+        number = int(pr.get("number") or 0)
+        head = str(pr.get("headRefOid") or "")
+        age_seconds, fell_back = _pr_age_seconds(repo_path, pr, now=now)
+        if fell_back:
+            report.age_fallback.append((number, head))
+        reason = _window_block_reason(pr, cfg, age_seconds=age_seconds)
+        if reason is not None:
+            report.blocked.append((number, reason))
+            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_blocked)
+            continue
+        eligible.append(pr)
+
+    eligible.sort(
+        key=lambda pr: (str(pr.get("createdAt") or ""), int(pr.get("number") or 0))
+    )
+    current_active = [pr for pr in eligible if cfg.label_active in _pr_window_labels(pr)]
+    rest = [pr for pr in eligible if cfg.label_active not in _pr_window_labels(pr)]
+    selected = current_active[: cfg.max_active]
+    selected += rest[: max(cfg.max_active - len(selected), 0)]
+    selected_numbers = {int(pr.get("number") or 0) for pr in selected}
+
+    for pr in eligible:
+        number = int(pr.get("number") or 0)
+        head = str(pr.get("headRefOid") or "")
+        if number in selected_numbers:
+            report.active.append((number, head))
+            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_active)
+        else:
+            report.waiting.append((number, head))
+            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
+
     return report
