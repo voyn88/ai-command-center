@@ -86,6 +86,76 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+// MARK: - VOYN-IOS-CONTEXT-APP: situational notification gate
+
+@Test func criticalAndImportantAlwaysBypassSituationalFiltering() {
+    let calendar = Calendar(identifier: .gregorian)
+    let noon = calendar.date(bySettingHour: 12, minute: 0, second: 0, of: Date())!
+    // Worst-case context: asleep, driving-equivalent, away, quiet hours all set to cover noon.
+    let hostileContext = SituationalContext(timestamp: noon, activity: .sleeping, location: .awayFromRelevantPlace, quietHoursStart: 0, quietHoursEnd: 24, calendar: calendar)
+
+    let critical = NotificationCandidate(id: "security-alert", importance: .critical)
+    let important = NotificationCandidate(id: "approval-needed", importance: .important)
+    #expect(SituationalNotificationGate.decide(critical, context: hostileContext) == .deliver)
+    #expect(SituationalNotificationGate.decide(important, context: hostileContext) == .deliver)
+}
+
+@Test func routineNotificationsAreSuppressedWhileAsleepDrivingOrAwayOrQuiet() {
+    let calendar = Calendar(identifier: .gregorian)
+    let midnight = calendar.date(bySettingHour: 23, minute: 0, second: 0, of: Date())!
+    let routine = NotificationCandidate(id: "daily-nudge", importance: .routine)
+
+    let asleep = SituationalContext(timestamp: midnight, activity: .sleeping, location: .atRelevantPlace, quietHoursStart: 0, quietHoursEnd: 0)
+    #expect(SituationalNotificationGate.decide(routine, context: asleep) == .suppress(reason: "user asleep"))
+
+    let driving = SituationalContext(timestamp: midnight, activity: .driving, location: .atRelevantPlace, quietHoursStart: 0, quietHoursEnd: 0)
+    #expect(SituationalNotificationGate.decide(routine, context: driving) == .suppress(reason: "user driving"))
+
+    let quiet = SituationalContext(timestamp: midnight, activity: .stationary, location: .atRelevantPlace, quietHoursStart: 22, quietHoursEnd: 8)
+    #expect(SituationalNotificationGate.decide(routine, context: quiet) == .suppress(reason: "quiet hours"))
+
+    let noon = calendar.date(bySettingHour: 12, minute: 0, second: 0, of: Date())!
+    let away = SituationalContext(timestamp: noon, activity: .stationary, location: .awayFromRelevantPlace, quietHoursStart: 22, quietHoursEnd: 8)
+    #expect(SituationalNotificationGate.decide(routine, context: away) == .suppress(reason: "away from relevant place"))
+}
+
+@Test func favorableContextDeliversRoutineNotifications() {
+    let calendar = Calendar(identifier: .gregorian)
+    let noon = calendar.date(bySettingHour: 12, minute: 0, second: 0, of: Date())!
+    let favorable = SituationalContext(timestamp: noon, activity: .stationary, location: .atRelevantPlace, quietHoursStart: 22, quietHoursEnd: 8, calendar: calendar)
+    let routine = NotificationCandidate(id: "daily-nudge", importance: .routine)
+    #expect(SituationalNotificationGate.decide(routine, context: favorable) == .deliver)
+}
+
+@Test func nonContextAwareRoutineNotificationsBypassTheGate() {
+    let calendar = Calendar(identifier: .gregorian)
+    let midnight = calendar.date(bySettingHour: 3, minute: 0, second: 0, of: Date())!
+    let hostileContext = SituationalContext(timestamp: midnight, activity: .sleeping, location: .awayFromRelevantPlace, quietHoursStart: 22, quietHoursEnd: 8, calendar: calendar)
+    // "не на всех этапах": a specific routine kind can opt out of filtering.
+    let alwaysFire = NotificationCandidate(id: "one-time-digest", importance: .routine, contextAware: false)
+    #expect(SituationalNotificationGate.decide(alwaysFire, context: hostileContext) == .deliver)
+}
+
+@Test func batchEvaluationCutsRoutinePushBy30PercentWithFullImportantConversion() {
+    let calendar = Calendar(identifier: .gregorian)
+    // A context where routine pushes are suppressed (away from the relevant place).
+    let awayAtNoon = calendar.date(bySettingHour: 12, minute: 0, second: 0, of: Date())!
+    let context = SituationalContext(timestamp: awayAtNoon, activity: .stationary, location: .awayFromRelevantPlace, quietHoursStart: 22, quietHoursEnd: 8, calendar: calendar)
+
+    // 10 routine nudges (all suppressed away from the relevant place) plus
+    // important/critical actions that must always still land.
+    let routines = (0..<10).map { NotificationCandidate(id: "routine-\($0)", importance: .routine) }
+    let important = (0..<5).map { NotificationCandidate(id: "important-\($0)", importance: .important) }
+    let critical = [NotificationCandidate(id: "critical-0", importance: .critical)]
+
+    let (_, stats) = SituationalNotificationGate.evaluate(routines + important + critical, context: context)
+
+    #expect(stats.suppressionRate >= 0.3)
+    #expect(stats.importantConversionRate == 1.0)
+    #expect(stats.deliveredImportantOrAbove == 6)
+    #expect(stats.suppressed == 10)
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
