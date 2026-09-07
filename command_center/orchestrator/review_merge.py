@@ -2636,6 +2636,10 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                 # endpoint underneath it (PUT .../pulls/{n}/update-branch) has
                 # been stable since GitHub shipped the feature, so calling it
                 # through `gh api` is version-independent -- no host pin needed.
+                # `_owner_repo_number_from_pr_url` is not new here: it is the
+                # same helper `_rerun_failing_acceptance_gate` (above) already
+                # uses to build REST paths from a PR url, defined once near
+                # the top of this module and imported by nothing else.
                 parsed = _owner_repo_number_from_pr_url(pr_url)
                 if parsed is None:
                     report.skipped.append(
