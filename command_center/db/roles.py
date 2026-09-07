@@ -503,6 +503,10 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # OPEN -> DECIDED for findings confirmed duplicate after the fact (0018);
+    # backlog_triage only reaches DECIDED from UNTRIAGED, so a real duplicate
+    # discovered once a finding is already OPEN had no legal path there.
+    "backlog_mark_duplicate(text, text, text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
