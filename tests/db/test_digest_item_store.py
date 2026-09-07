@@ -379,8 +379,6 @@ def test_list_digest_items_stored_streams_rather_than_materialises(tmp_path) -> 
     `list`-returning implementation would put the whole table in one
     process's memory to feed a check written specifically to avoid that.
     """
-    import types
-
     db_path = tmp_path / "runtime.db"
     wave1.db.migrate(db_path)
     wave1.create_digest_item(db_path, title="only", day="2026-08-14", position=1)
