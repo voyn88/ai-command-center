@@ -22,7 +22,7 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
@@ -677,7 +677,7 @@ def list_digest_items(
         return [_decode_digest_row(dict(row)) for row in rows]
 
 
-def list_digest_items_stored(db_path: Path) -> list[dict]:
+def list_digest_items_stored(db_path: Path) -> Iterator[dict]:
     """Every digest row in the shape SQLite **stores**, for reconciliation.
 
     Every other reader here returns :func:`_decode_digest_row` output, which
@@ -697,10 +697,30 @@ def list_digest_items_stored(db_path: Path) -> list[dict]:
     Deliberately without ``exclude_projects``: redaction is a read-surface
     policy, and a reconciliation that skipped redacted rows would certify a
     cutover over a subset of the table while reporting it as the whole.
+
+    **Streams rather than materialises.** `mirror_support.divergence` was
+    written to accept an iterator specifically so this reader would not have
+    to hold the whole table in memory to feed it — a table already declared
+    too large for a single process's memory to hold twice (once here, once in
+    the mirror) is exactly the table this migration exists to move. This
+    function is a generator: ``db.connect`` is entered and the cursor is
+    walked row-by-row inside the same ``with`` block, so a caller that only
+    partially consumes the iterator — or never starts — still gets the
+    connection closed by that ``with`` (on `GeneratorExit` from an abandoned
+    iterator, same as any other exception), and a failure from `execute()`
+    itself is closed by the same ``with`` rather than leaking a connection
+    that was never handed to a generator body — no `try`/`finally` bolted on
+    to reproduce what `with` already guarantees.
+
+    The connection stays open for as long as the caller keeps pulling rows,
+    trading the old code's short-lived read (closed the instant `fetchall()`
+    returned) for one held across the whole reconciliation pass — the correct
+    trade for a table `fetchall()` cannot afford to make in the first place.
     """
     with db.connect(db_path) as conn:
-        rows = conn.execute("SELECT * FROM digest_item ORDER BY id").fetchall()
-        return [dict(row) for row in rows]
+        cursor = conn.execute("SELECT * FROM digest_item ORDER BY id")
+        for row in cursor:
+            yield dict(row)
 
 
 def _decode_digest_row(row: dict) -> dict:
