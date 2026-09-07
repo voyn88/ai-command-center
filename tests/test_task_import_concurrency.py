@@ -196,8 +196,21 @@ def test_registry_stays_valid_json_after_many_concurrent_imports(tmp_path):
     threads = [threading.Thread(target=run, args=(batch,)) for batch in task_id_batches]
     for t in threads:
         t.start()
+    # `join(timeout=...)` here is a *test* deadline, not a product one — it
+    # must comfortably exceed the worst-case time `apply_task_package` itself
+    # is allowed to take, or a slow-but-correct run reads as a false failure.
+    # 8 batches x 2 items = 16 sequential lock cycles funnelled through one
+    # file lock, close to 3x the 6 lock cycles in
+    # `test_two_different_packages_imported_concurrently_both_survive_threaded`
+    # (which budgets 15s for that smaller workload). Sizing this one at 15s
+    # too left it with far less headroom per lock cycle than its sibling, so
+    # it was the one that flaked under ordinary CI scheduling jitter even
+    # though the underlying lock (proved correct by the other tests in this
+    # module) was never at fault. 45s keeps a bounded, deterministic deadline
+    # — no unbounded wait, no retry loop — while giving each of the 16 cycles
+    # the same per-cycle margin as the smaller sibling test.
     for t in threads:
-        t.join(timeout=15)
+        t.join(timeout=45)
 
     assert not any(t.is_alive() for t in threads), "a batch import did not finish within the join deadline"
     assert not errors, errors
