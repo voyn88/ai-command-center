@@ -19,6 +19,7 @@ from __future__ import annotations
 from command_center.digest.owner_autofill import OwnerAutofill, complete_owner_item
 from command_center.digest.owner_gates import DEFAULT_OWNER_GATES, OwnerGateConfig
 from command_center.digest.service import DigestService, today_str
+from command_center.digest.start_of_day import build_start_of_day_snapshot
 from command_center.events import default_bus
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "OwnerGateConfig",
     "DEFAULT_OWNER_GATES",
     "install_default_autofill",
+    "build_start_of_day_snapshot",
 ]
 
 #: Guards against double-registration on the default bus (import is once per

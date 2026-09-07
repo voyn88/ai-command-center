@@ -406,6 +406,36 @@ class DigestItem(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# «Умный старт дня» — start-of-day priority list (VOYN-IOS-AUTO-HOME)
+# --------------------------------------------------------------------------
+
+
+class StartOfDayCritical(BaseModel):
+    """One entry on the owner's start-of-day priority list — either a
+    «Мой день» owner item or a digest entry needing a decision now."""
+
+    kind: Literal["owner_item", "digest_item"]
+    id: str
+    title: str = ""
+    body: str = ""
+    due: str | None = None
+    refs: list[str] = Field(default_factory=list)
+    created_at: str | None = None
+
+
+class StartOfDaySnapshot(BaseModel):
+    """The owner's «умный старт дня» read contract: a bounded, priority-ordered
+    critical list (due items first, then newest-first) plus the rest of
+    today's digest for context. Backs the iOS start-of-day screen — this is the
+    server-side snapshot its offline-local cache syncs against."""
+
+    day: str
+    critical: list[StartOfDayCritical] = Field(default_factory=list)
+    digest: list[DigestItem] = Field(default_factory=list)
+    critical_truncated: bool = False
+
+
+# --------------------------------------------------------------------------
 # Networking — Contact / Message / Invitation (VOYN-W3-NET)
 # --------------------------------------------------------------------------
 
