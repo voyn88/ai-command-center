@@ -16,9 +16,11 @@
 -- reads a table instead of parsing journald. Every CLI invocation ("one
 -- tick") allocates a single shared ordinal via one `nextval()` on the
 -- table's own identity sequence (`tick_skip_event_id_seq`, resolved through
--- `pg_get_serial_sequence` rather than a second sequence object, so no
--- second entry in `roles.IDENTITY_SEQUENCES` is needed to grant it) and
--- stamps it onto every skip that invocation records -- `review_once`,
+-- `pg_get_serial_sequence` rather than a second, purpose-built sequence
+-- object just for `tick_seq` -- so `roles.IDENTITY_SEQUENCES` needs exactly
+-- ONE entry for this table, the same one a plain `INSERT` into it would
+-- have needed anyway, not a second one for a second sequence) and stamps it
+-- onto every skip that invocation records -- `review_once`,
 -- `reconcile_review_once` and `publish_review_verdicts` all run inside one
 -- `backlog-review` tick and must collapse into ONE tick for "N consecutive
 -- ticks", not into up to three.

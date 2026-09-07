@@ -199,6 +199,16 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "run_event": "run_event_id_seq",
         "work_event": "work_event_id_seq",
         "worker_host_fingerprint": "worker_host_fingerprint_id_seq",
+        # `tick_skip_event`'s own identity sequence, reused (via
+        # `pg_get_serial_sequence`) to allocate the one shared `tick_seq`
+        # ordinal each `backlog-review`/`backlog-merge` tick stamps onto
+        # every skip it records -- see 0018_tick_stall_watchdog's header for
+        # why this is the ONE entry that needs, rather than a second
+        # sequence object for `tick_seq` alone.
+        "tick_skip_event": "tick_skip_event_id_seq",
+        # Plain `INSERT ... DEFAULT` from the watchdog (`aicc_app`) still
+        # draws from this table's own identity sequence like any other.
+        "tick_stall_escalation": "tick_stall_escalation_id_seq",
     }
 )
 

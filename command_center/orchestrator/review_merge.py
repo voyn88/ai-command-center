@@ -383,6 +383,59 @@ def _rows(factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
         return cur.fetchall() if cur.description else []
 
 
+# -- Tick-skip ledger (VOYN-W0-AICC-TICK-STALL-WATCHDOG) ----------------------
+#
+# Every skip reason this module produces used to end at a `print()` in the
+# CLI -- readable in journald, invisible to anything but a human tailing it.
+# `next_tick_seq`/`record_tick_skips` are the write side of `tick_skip_event`
+# (migration 0018): one shared ordinal per CLI invocation ("one tick"),
+# stamped onto every skip that invocation records, so `command_center.ops.
+# tick_stall_watchdog` can read a table instead of parsing logs.
+
+
+def next_tick_seq(factory: Any) -> int:
+    """Allocate the one ordinal this whole CLI invocation's skips share.
+
+    Drawn from `tick_skip_event`'s own identity sequence via
+    `pg_get_serial_sequence` rather than a second, purpose-built sequence
+    object -- see 0018's header. A plain `nextval()` call (not an insert)
+    needs `USAGE` on that sequence, which is why it is listed in
+    `roles.IDENTITY_SEQUENCES` even though `tick_skip_event`'s own `id`
+    column already draws from it automatically on every insert.
+    """
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT nextval(pg_get_serial_sequence('tick_skip_event', 'id'))")
+        (seq,) = cur.fetchone()
+        conn.commit()
+        return int(seq)
+
+
+def record_tick_skips(
+    factory: Any,
+    tick_seq: int,
+    tick_name: str,
+    skipped: list[tuple[str, str]],
+) -> None:
+    """Persist one tick's skip reasons to `tick_skip_event`.
+
+    ``skipped`` may be the concatenation of every skip-producing call inside
+    one CLI invocation (`review_once`, `reconcile_review_once`,
+    `publish_review_verdicts` all run inside one `backlog-review` tick) --
+    they all share the single ``tick_seq`` the caller allocated via
+    `next_tick_seq`, so the watchdog counts consecutive TICKS, not
+    individual calls within one tick.
+    """
+    if not skipped:
+        return
+    with factory() as conn, conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO tick_skip_event (tick_seq, tick_name, task_id, reason) "
+            "VALUES (%s, %s, %s, %s)",
+            [(tick_seq, tick_name, task_id, reason) for task_id, reason in skipped],
+        )
+        conn.commit()
+
+
 # -- Part 2: review -----------------------------------------------------------
 
 _REVIEW_PROMPT = (
