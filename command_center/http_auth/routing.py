@@ -54,8 +54,9 @@ __all__ = [
 MUTATING_VERBS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 #: ``(method, path template) -> operation``. Exhaustive over both HTTP
-#: surfaces: ``command_center/api/app.py`` (29: the original 27 plus the
-#: chat-text backlog intake draft/confirm, VOYN-W0-APP-CONTROL-S6a) and
+#: surfaces: ``command_center/api/app.py`` (30: the original 27 plus the
+#: chat-text backlog intake draft/confirm, VOYN-W0-APP-CONTROL-S6a, plus the
+#: backlog reassign, VOYN-W0-APP-CONTROL-S6d) and
 #: ``command_center/webapi/app.py`` (3: two dispatch writes and the queue
 #: audit enqueue, VOYN-W0-APP-CONTROL-S1/S4).
 ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
@@ -101,6 +102,8 @@ ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     # -- command_center/api/backlog_intake_routes.py (VOYN-W0-APP-CONTROL-S6a)
     ("POST", "/api/v1/backlog/intake/draft"): "backlog:intake:draft",
     ("POST", "/api/v1/backlog/intake/confirm"): "backlog:intake:confirm",
+    # -- command_center/api/backlog_reassign_routes.py (VOYN-W0-APP-CONTROL-S6d)
+    ("POST", "/api/v1/backlog/tasks/{task_id}/reassign"): "backlog:reassign",
 }
 
 

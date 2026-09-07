@@ -87,6 +87,19 @@ class BacklogStore:
         )
         return bool(ok), str(reason or ""), revision
 
+    def reassign(
+        self,
+        task_id: str,
+        wave: str,
+        priority: str | None,
+        expected_revision: int,
+    ) -> tuple[bool, str, int | None]:
+        ok, reason, revision = self._row(
+            "SELECT * FROM backlog_reassign(%s, %s, %s, %s)",
+            (task_id, wave, priority, expected_revision),
+        )
+        return bool(ok), str(reason or ""), revision
+
     def record_evidence(self, task_id: str, kind: str, value: str) -> tuple[bool, str]:
         ok, reason, _revision = self._row(
             "SELECT * FROM backlog_record_evidence(%s, %s, %s)",

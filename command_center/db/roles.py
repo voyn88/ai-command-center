@@ -481,6 +481,8 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_return_to_pool(text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Priority/wave reassignment (0010, VOYN-W0-APP-CONTROL-S6d).
+    "backlog_reassign(text, text, text, bigint)",
 )
 
 # The enrolment surface (0003), split by who may do what.
