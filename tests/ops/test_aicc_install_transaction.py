@@ -2289,6 +2289,64 @@ def test_a_command_property_still_ignores_only_its_invocation_fields():
     assert not module._properties_match("ExecStart", replaced, snapshot)
 
 
+def test_post_restart_assertion_also_tolerates_a_regenerated_dropin(tmp_path):
+    """`_properties_match` was added so a boot-generated drop-in wouldn't be
+    demanded verbatim, but only the pre-start refusal was routed through it
+    (#533) -- `assert_restored`'s post-start check kept comparing raw
+    `_normalise_property`, which does nothing for `DropInPaths`. A unit
+    restored correctly, whose generator wrote a differently-named tmpfs
+    drop-in on restart, still failed with `service snapshot property did not
+    restore: ... DropInPaths`: the same false negative the ExecStart fix
+    (#520) addressed at the other call site, reappearing at this one.
+    """
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    properties = dict.fromkeys(module.SNAPSHOT_PROPERTIES, "")
+    properties["DropInPaths"] = (
+        "/run/systemd/generator.early/aicc-agent-launcher.socket.d/20-before.conf"
+    )
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "units": {
+                    "aicc-agent-launcher.socket": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                        "properties": properties,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(command, **kwargs):
+        action = command[1]
+        joined = " ".join(command)
+        if action == "show" and "LoadState" in joined:
+            return SimpleNamespace(returncode=0, stderr="", stdout="loaded\n")
+        if action == "show" and "DropInPaths" in joined:
+            return SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout=(
+                    "/run/systemd/generator.early/"
+                    "aicc-agent-launcher.socket.d/10-after.conf\n"
+                ),
+            )
+        if action == "show":
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if action == "is-active":
+            return SimpleNamespace(returncode=0, stderr="", stdout="active\n")
+        if action == "is-enabled":
+            return SimpleNamespace(returncode=0, stderr="", stdout="enabled\n")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    module.restore_service_snapshot(snapshot, run=run)
+
+
 def test_restore_does_not_revive_a_legacy_unit_the_rollout_retired(tmp_path):
     """Retiring the pre-template workers is what installing *does*, and
     `disable` removes the symlink that was their fragment. The snapshot still
