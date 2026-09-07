@@ -46,7 +46,12 @@ Current position:
   quartet but do not gate the merge.
 - Runtime history retention is **off by default**: `AICC_RUNTIME_RETENTION_DAYS=<N>` prunes
   `run_event` rows for terminal runs older than `N` days on startup, and
-  `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
+  `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward. The rollback-safe
+  backup/archive/prune/VACUUM pipeline (`command_center.runtime.maintenance.archive_and_prune`) now
+  has a production call site — `python -m command_center.runtime.maintenance`, installed as
+  `deploy/systemd/aicc-runtime-maintenance.timer` to run daily — where previously it ran only in
+  tests and `data/runtime.db` grew unbounded on any install that never set the two flags above
+  (VOYN-W0-AICC-RUNTIME-DB-BLOAT).
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
 - Founder Functional Audit `9761459` is **closed** (2026-08-07), merge-verified against

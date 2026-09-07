@@ -1,0 +1,41 @@
+# The runtime.db retention + VACUUM tick (VOYN-W0-AICC-RUNTIME-DB-BLOAT): the
+# production caller of `command_center.runtime.maintenance.archive_and_prune`,
+# which until this unit existed ran only under
+# `tests/test_runtime_maintenance.py`. Without it, `data/runtime.db` grows
+# unbounded — `run_event` history is never pruned, and even a host that opted
+# into the lighter startup-time `AICC_RUNTIME_RETENTION_DAYS` path leaves
+# freed pages unreclaimed unless `AICC_RUNTIME_VACUUM_ON_START=1` is also set
+# (VACUUM is opt-in there for the same exclusive-lock reason it is a separate
+# flag here).
+#
+# Install (the same host that runs the Streamlit app / worker against this
+# `data/runtime.db`):
+#   cp deploy/systemd/aicc-runtime-maintenance.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-runtime-maintenance.timer
+#
+# `/etc/aicc/runtime-maintenance.env` is optional and may set
+# AICC_DATA_DIR (if not the default /opt/aicc/data) and
+# AICC_RUNTIME_RETENTION_DAYS (default 30 if unset). Every run backs up the
+# database, archives every row it is about to delete to a compressed JSONL
+# file alongside it, and verifies `PRAGMA integrity_check` before and after —
+# a failed tick leaves the database untouched and exits non-zero.
+
+[Unit]
+Description=AI Command Center runtime.db retention + VACUUM
+After=network.target
+
+[Service]
+Type=oneshot
+User=aicc-app
+Group=aicc-app
+EnvironmentFile=-/etc/aicc/runtime-maintenance.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.runtime.maintenance --vacuum
+TimeoutStartSec=300s
+
+# Containment: this process only ever touches its own data directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/aicc/data

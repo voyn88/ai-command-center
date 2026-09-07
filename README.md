@@ -294,6 +294,16 @@ environment variables, so existing installs and the test suite are unaffected:
   database under an exclusive lock, so enable it only on a single-host install that can briefly pause
   other writers.
 
+For a production single-host install, prefer the scheduled path over the two flags above:
+`command_center.runtime.maintenance.archive_and_prune` backs up the database, archives every row it
+is about to delete to a compressed, checksummed JSONL file, prunes, and verifies
+`PRAGMA integrity_check` before touching anything permanently — a failed step leaves the database
+untouched. `python -m command_center.runtime.maintenance --vacuum` is its CLI, installed as
+`deploy/systemd/aicc-runtime-maintenance.{service,timer}` to run once a day (see that file for
+install steps). This is what actually reclaims disk in practice: the startup flags above are a
+no-op until an operator sets them, so a default install's `data/runtime.db` grows unbounded without
+the timer (VOYN-W0-AICC-RUNTIME-DB-BLOAT).
+
 ## Execution lifecycle
 
 The primary launch path is asynchronous and, in Increment 1, reachable only from Streamlit:

@@ -134,3 +134,80 @@ def test_restore_refuses_missing_or_corrupt_backup(tmp_path):
     corrupt.write_bytes(b"not a database")
     with pytest.raises((maintenance.MaintenanceError, sqlite3.DatabaseError)):
         maintenance.restore_backup(corrupt, db_path)
+
+
+# `main()` is the previously-missing production call site (VOYN-W0-AICC-RUNTIME-DB-BLOAT):
+# `deploy/systemd/aicc-runtime-maintenance.timer` runs it on a schedule.
+
+
+def test_main_prunes_and_vacuums_via_explicit_flags(tmp_path, capsys):
+    db_path = tmp_path / "runtime.db"
+    old_run, fresh_run = _seed(db_path, old_events=6, fresh_events=2)
+    archive_dir = tmp_path / "cold"
+
+    exit_code = maintenance.main(
+        [
+            "--db-path",
+            str(db_path),
+            "--archive-dir",
+            str(archive_dir),
+            "--retention-days",
+            "30",
+            "--vacuum",
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["archived_events"] == report["pruned_events"] == 6
+    assert report["vacuum"] is True
+    assert _event_count(db_path, old_run) == 0
+    assert _event_count(db_path, fresh_run) == 2
+
+
+def test_main_missing_database_is_a_clean_no_op(tmp_path, capsys):
+    exit_code = maintenance.main(["--db-path", str(tmp_path / "nope.db")])
+    assert exit_code == 0
+    assert "nothing to do" in capsys.readouterr().out
+
+
+def test_main_reads_retention_and_vacuum_defaults_from_env(tmp_path, capsys, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    old_run, _fresh_run = _seed(db_path, old_events=3, fresh_events=1)
+    monkeypatch.setenv("AICC_RUNTIME_RETENTION_DAYS", "30")
+    monkeypatch.setenv("AICC_RUNTIME_VACUUM_ON_START", "1")
+
+    exit_code = maintenance.main(
+        ["--db-path", str(db_path), "--archive-dir", str(tmp_path / "cold")]
+    )
+
+    assert exit_code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["retention_days"] == 30
+    assert report["vacuum"] is True
+    assert _event_count(db_path, old_run) == 0
+
+
+def test_main_dry_run_leaves_the_original_untouched(tmp_path, capsys):
+    db_path = tmp_path / "runtime.db"
+    old_run, _fresh_run = _seed(db_path, old_events=4, fresh_events=1)
+    before = db_path.read_bytes()
+
+    exit_code = maintenance.main(
+        [
+            "--db-path",
+            str(db_path),
+            "--archive-dir",
+            str(tmp_path / "cold"),
+            "--retention-days",
+            "30",
+            "--dry-run",
+        ]
+    )
+
+    assert exit_code == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "rehearsal"
+    assert report["original_untouched"] is True
+    assert db_path.read_bytes() == before
+    assert _event_count(db_path, old_run) == 4

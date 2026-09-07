@@ -1,0 +1,18 @@
+# Schedule for aicc-runtime-maintenance.service (VOYN-W0-AICC-RUNTIME-DB-BLOAT).
+#
+# Daily, not per-minute like the reaper/planner ticks: VACUUM rewrites the
+# whole `runtime.db` file under an exclusive lock, so this trades latency
+# (disk is reclaimed once a day, not continuously) for keeping that lock rare.
+# 03:14 is an arbitrary low-traffic hour with a few minutes of jitter so a
+# fleet of hosts doesn't all VACUUM at the same instant.
+
+[Unit]
+Description=Run AICC runtime.db retention + VACUUM daily
+
+[Timer]
+OnCalendar=*-*-* 03:14:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

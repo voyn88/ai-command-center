@@ -26,13 +26,16 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from command_center.runtime.db import (
     TERMINAL_STATES,
     connect,
+    resolve_db_path,
     retention_cutoff,
     transaction,
 )
@@ -203,3 +206,77 @@ def restore_backup(backup_path: Path, db_path: Path) -> None:
     # the database content atomically and correctly supersedes any WAL/SHM
     # sidecars a naive copyfile would leave pointing at the pruned state.
     _backup_database(backup_path, db_path)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m command_center.runtime.maintenance` — the production caller
+    of `archive_and_prune`, meant to run on a schedule (see
+    `deploy/systemd/aicc-runtime-maintenance.timer`).
+
+    Before this existed, the rollback-safe pipeline above (backup, archive,
+    prune, integrity, optional VACUUM) had no production call site — it ran
+    only under `tests/test_runtime_maintenance.py`, so `data/runtime.db` grew
+    unbounded on any install that never opted into the lighter
+    `AICC_RUNTIME_RETENTION_DAYS`/`AICC_RUNTIME_VACUUM_ON_START` startup path
+    (VOYN-W0-AICC-RUNTIME-DB-BLOAT).
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m command_center.runtime.maintenance")
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=None,
+        help="Defaults to the resolved runtime.db (AICC_DATA_DIR-aware).",
+    )
+    parser.add_argument(
+        "--archive-dir",
+        type=Path,
+        default=None,
+        help="Defaults to <data dir>/runtime-archive.",
+    )
+    parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=int(os.environ.get("AICC_RUNTIME_RETENTION_DAYS") or 30),
+        help="Prune run_event rows for runs terminal longer than this many days "
+        "(default: $AICC_RUNTIME_RETENTION_DAYS or 30).",
+    )
+    parser.add_argument(
+        "--vacuum",
+        action="store_true",
+        default=os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1",
+        help="Reclaim disk with VACUUM after a clean prune "
+        "(default: on iff $AICC_RUNTIME_VACUUM_ON_START=1).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Rehearse against a copy of the database; report what would "
+        "happen without touching the original.",
+    )
+    args = parser.parse_args(argv)
+
+    db_path = args.db_path or resolve_db_path()
+    if not db_path.exists():
+        print(f"no database at {db_path}; nothing to do")
+        return 0
+    archive_dir = args.archive_dir or (db_path.parent / "runtime-archive")
+
+    runner = rehearse if args.dry_run else archive_and_prune
+    try:
+        report = runner(
+            db_path,
+            retention_days=args.retention_days,
+            archive_dir=archive_dir,
+            vacuum=args.vacuum,
+        )
+    except MaintenanceError as exc:
+        print(f"maintenance refused: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
