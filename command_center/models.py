@@ -9,7 +9,7 @@ not dataclasses/ORM models. This keeps every record trivially compatible with
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 # --------------------------------------------------------------------------
 # Projects
@@ -137,16 +137,48 @@ def is_passing_verdict(verdict: str | None) -> bool:
 SEVERITIES: list[str] = ["Blocker", "High", "Medium", "Low"]
 
 
+def utc_now() -> datetime:
+    """The naive `datetime` `iso_now()` renders — UTC, with `tzinfo` stripped.
+
+    Shared so every caller that needs a fresh reference point for age/staleness
+    math or a cutoff comparable against `iso_now()` output (retention cutoffs,
+    orphan-timeout checks, digest windows, completion backoff) reads the same
+    clock `iso_now()` writes, rather than a second, independently-drifting copy
+    of "what does UTC-naive-now mean here" (see `iso_now`)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def iso_now() -> str:
-    """Naive local time, second precision, no timezone offset — deliberately matches
-    `app.py`'s pre-existing v1.1 `new_task_record` convention (`datetime.now().isoformat
-    (timespec="seconds")`), so every timestamp in this app (`created_at`/`updated_at`
-    on tasks, and every v1.2 run/chat/activity timestamp) is directly comparable
-    without conversion. Not migrated to a timezone-aware format for v1.2, to avoid a
-    mixed-format backward-compatibility hazard against existing `data/tasks.json`
-    records — all timestamps in this app should be read as "local time on the machine
-    that wrote them," never assumed to be UTC."""
-    return datetime.now().isoformat(timespec="seconds")
+    """Naive UTC time, second precision, no timezone offset.
+
+    Was naive *local* time through v1.2 (`datetime.now().isoformat(...)`,
+    matching `app.py`'s pre-existing v1.1 `new_task_record` convention) — kept
+    naive rather than migrated to an aware/offset format, to avoid a
+    mixed-format backward-compatibility hazard against existing
+    `data/tasks.json` records and every naive-string DB column this convention
+    already reaches.
+
+    That local-time choice was itself the defect this now fixes
+    (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`): local wall-clock time is not
+    monotonic. On a DST fall-back transition the clock repeats an hour, so a
+    call made strictly *later* in real time can render a strictly *smaller*
+    string than an earlier call in the same process — and every `ORDER BY
+    created_at DESC` (or bare string comparison) in this app silently returns
+    the wrong row for the span of the repeated hour. Higher precision does not
+    help: the values genuinely repeat, they are not merely tied. UTC has no
+    daylight-saving transitions, so sourcing from it removes the non-monotonic
+    span entirely while leaving the string's shape — naive, second precision,
+    no offset — exactly as every existing parser, comparison and on-disk
+    record already expects.
+
+    A database (or process) that predates this fix mixes local-time rows
+    written before the upgrade with UTC rows written after: the two epochs are
+    indistinguishable by format, and that boundary is the naive convention's
+    own residual limit, not something a comparison at read time can recover —
+    tracked, together with the fully timezone-aware format that would close it
+    for good, as `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`.
+    """
+    return utc_now().isoformat(timespec="seconds")
 
 
 def new_id() -> str:
@@ -281,8 +313,8 @@ def format_duration(seconds: int | float | None) -> str:
 
 def format_age(iso_str: str | None, *, now: datetime | None = None) -> str:
     """Age of an `iso_now()`-style timestamp as a compact duration. Timestamps
-    in this app are naive local time (see `iso_now`), so an aware input is
-    demoted to naive rather than converted. Missing/unparseable → ``"—"``."""
+    in this app are naive UTC (see `iso_now`), so an aware input is demoted to
+    naive rather than converted. Missing/unparseable → ``"—"``."""
     if not iso_str:
         return "—"
     try:
@@ -291,7 +323,7 @@ def format_age(iso_str: str | None, *, now: datetime | None = None) -> str:
         return "—"
     if then.tzinfo is not None:
         then = then.replace(tzinfo=None)
-    reference = now if now is not None else datetime.now()
+    reference = now if now is not None else utc_now()
     return format_duration((reference - then).total_seconds())
 
 

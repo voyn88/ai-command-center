@@ -270,15 +270,16 @@ def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
 ) -> None:
     """Naive text handed to `timestamptz` is stamped with the *session* zone.
 
-    That is silent: no error, every row shifted by the gap between the writing
-    machine and the server. The zone is attached on the way in instead, so the
-    stored instant is the one the writer meant regardless of the server's
-    `TimeZone`.
+    That is silent: no error, every row shifted by the gap between the
+    session's zone and UTC. The zone is attached on the way in instead — UTC,
+    since `models.iso_now()` sources it unconditionally
+    (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`) — so the stored instant is the one
+    the writer meant regardless of the server's `TimeZone`.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     written = "2026-08-13T12:00:00"
-    expected = datetime.fromisoformat(written).astimezone()
+    expected = datetime.fromisoformat(written).replace(tzinfo=timezone.utc)
 
     mirror.upsert(_row("tz", created_at=written, updated_at=written))
 

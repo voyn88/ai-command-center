@@ -40,8 +40,15 @@ CATEGORY_STATUS = "status"
 
 
 def today_str(*, now: datetime | None = None) -> str:
-    """The ``YYYY-MM-DD`` a digest built now belongs to (naive-local, matching
-    the app's timestamp convention)."""
+    """The ``YYYY-MM-DD`` a digest built now belongs to.
+
+    Deliberately the *operator's own local calendar day*, not the naive-UTC
+    convention `models.iso_now()` writes (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`):
+    a morning digest is a human-facing "today", and bucketing it by UTC would
+    put an early-morning run in a positive-offset zone under yesterday's date
+    on screen. Unrelated to the ordering defect that convention exists to fix
+    — this value is never compared against `created_at`-style strings, only
+    used as an opaque day key."""
     return (now or datetime.now()).date().isoformat()
 
 

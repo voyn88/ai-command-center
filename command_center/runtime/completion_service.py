@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from command_center import storage
+from command_center import models, storage
 from command_center.runtime import db as runtime_db
 from command_center import run_lineage as provenance
 from command_center.runtime import git_ops, repo_state, validation
@@ -91,7 +91,12 @@ MERGE_LOCK_TIMEOUT_SECONDS = 0.0
 
 
 def _now() -> datetime:
-    return datetime.now()
+    # Naive UTC, matching `models.iso_now()` — `last_checked_at`/`next_retry_at`
+    # share a `ColumnCodec` with `created_at`/`updated_at` (the latter written
+    # via `db.iso_now()`) in `command_center/db/completion_store.py`, so a
+    # convention mismatch here would silently mistag this table's mirrored
+    # instants by the local UTC offset (VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL).
+    return models.utc_now()
 
 
 def _iso(dt: datetime) -> str:

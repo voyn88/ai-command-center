@@ -1647,7 +1647,9 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     actually changed (`persist_if`), so an idle poll tick costs a lock
     acquisition (cheap, uncontended) but not a disk write. `tasks` is then
     rebound to that fresh, reconciled list for the rest of this render."""
-    now = datetime.now()
+    # UTC, not local: `session_view.elapsed_seconds` treats a naive `now` as
+    # UTC to match naive `started_at`/`completed_at` (VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL).
+    now = models.utc_now()
 
     # Desktop autopilot (AICC-DESKTOP-016). The bounded pipeline tick runs from
     # *this* existing refresh checkpoint — the same one that already owns

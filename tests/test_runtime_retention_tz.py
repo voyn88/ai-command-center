@@ -1,15 +1,22 @@
 """VOYN-W0-AICC-RETENTION-TZ: retention must delete the same *rows*, by id,
 regardless of the timezone of the process that happens to run the prune.
 
-`run.completed_at` is a naive local ISO string (`models.iso_now`, deliberately
-"local time on the machine that wrote them"). Both retention paths built their
-cutoff from a bare `datetime.now()`, i.e. the local zone of *the pruning
-process* — a cron job, a container or a service unit started with a different
-`TZ` than the app that wrote the rows. The comparison `completed_at < cutoff`
-is then shifted by the offset between the two zones, so the same database and
-the same wall-clock instant delete a *different set of run_event rows*
-depending only on who asked. Deletion is irreversible; this is a data-loss
-defect, not a reporting one.
+`run.completed_at` was a naive *local* ISO string (`models.iso_now`,
+"local time on the machine that wrote them") when this test was written. Both
+retention paths built their cutoff from a bare `datetime.now()`, i.e. the
+local zone of *the pruning process* — a cron job, a container or a service
+unit started with a different `TZ` than the app that wrote the rows. The
+comparison `completed_at < cutoff` is then shifted by the offset between the
+two zones, so the same database and the same wall-clock instant delete a
+*different set of run_event rows* depending only on who asked. Deletion is
+irreversible; this is a data-loss defect, not a reporting one.
+
+`models.iso_now()` now sources UTC unconditionally
+(`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`), which closes the defect at its root —
+every writer shares one clock, so a cutoff rendered by the pruning process's
+own zone is no longer possible. These tests still seed rows as the writer
+would have written them and prune from several process zones, guarding
+against a regression of either fix.
 
 These tests assert on identifiers, never on counts: "the same number of rows
 went away" is not evidence that the same rows went away.
@@ -168,7 +175,12 @@ def test_apply_runtime_retention_deletes_the_same_rows_in_every_process_tz(
 
 def test_report_records_the_zone_the_cutoff_was_rendered_in(tmp_path, _restore_tz):
     """An irreversible delete must say, in its own report, which clock it
-    judged the rows against — otherwise the operator cannot audit the set."""
+    judged the rows against — otherwise the operator cannot audit the set.
+
+    Source is `"utc"`, not `"database"`: `retention_cutoff` no longer
+    consults the database's recorded `timestamp_tz` at all (except through an
+    explicit `AICC_RUNTIME_TZ` override) now that every writer shares one
+    UTC clock — see `runtime.db.core.retention_cutoff`."""
     seed_db = tmp_path / "seed.db"
     _seed(seed_db)
     _set_process_tz("America/New_York")
@@ -178,4 +190,4 @@ def test_report_records_the_zone_the_cutoff_was_rendered_in(tmp_path, _restore_t
     )
 
     assert report["cutoff_timezone"] == WRITER_TZ
-    assert report["cutoff_timezone_source"] == "database"
+    assert report["cutoff_timezone_source"] == "utc"

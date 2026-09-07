@@ -58,7 +58,7 @@ from command_center import (
     provider_route,
     workspace_provisioning,
 )
-from command_center.models import iso_now
+from command_center.models import iso_now, utc_now
 from command_center import run_lineage as provenance
 from command_center.runtime import (
     context_service,
@@ -2189,7 +2189,9 @@ class Supervisor:
             started = datetime.fromisoformat(started_at)
         except (TypeError, ValueError):
             return False
-        return datetime.now() >= started + timedelta(seconds=float(timeout_seconds))
+        # `started` is naive UTC (`iso_now()`) — compare against the same clock,
+        # not local wall time (VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL).
+        return utc_now() >= started + timedelta(seconds=float(timeout_seconds))
 
     def _sigkill_orphan_group(self, run_id: str, pid: int | None, recorded_identity: str | None) -> bool:
         """SIGKILL the process group of a past-deadline adopted orphan. Re-verifies

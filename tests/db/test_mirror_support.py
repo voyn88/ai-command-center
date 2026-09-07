@@ -24,11 +24,13 @@ from command_center.db.mirror_support import (
 # --- the conversion that was wrong once -------------------------------------
 
 
-def test_a_naive_timestamp_is_read_in_the_writers_zone() -> None:
+def test_a_naive_timestamp_is_read_as_utc() -> None:
     """Naive text handed to `timestamptz` is stamped with the *session* zone.
 
-    That is silent: no error, every row shifted by the gap between the writing
-    machine and the server. The zone is attached here instead, so the instant
+    That is silent: no error, every row shifted by the gap between the
+    session's zone and UTC. The zone is attached here instead — UTC,
+    unconditionally, since `models.iso_now()` sources UTC regardless of the
+    writer's own host (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`) — so the instant
     stored is the one the writer meant.
     """
     written = "2026-08-13T12:00:00"
@@ -36,7 +38,7 @@ def test_a_naive_timestamp_is_read_in_the_writers_zone() -> None:
     attached = to_instant(written)
 
     assert attached.tzinfo is not None
-    assert attached == datetime.fromisoformat(written).astimezone()
+    assert attached == datetime.fromisoformat(written).replace(tzinfo=timezone.utc)
 
 
 def test_an_already_aware_timestamp_keeps_its_own_offset() -> None:
@@ -51,9 +53,10 @@ def test_the_render_reproduces_exactly_what_the_application_writes() -> None:
     """The regression test for the defect that reached `main`.
 
     An earlier render emitted UTC with a `Z` suffix "matching what the
-    application writes". It does not — `models.iso_now()` writes naive local
-    time at second precision — so `divergence` called every row different: a
-    cutover gate permanently red, which invites loosening the comparison.
+    application writes". It does not — `models.iso_now()` writes naive UTC at
+    second precision, with no `Z` suffix — so `divergence` called every row
+    different: a cutover gate permanently red, which invites loosening the
+    comparison.
     """
     from command_center import models
 
@@ -65,7 +68,7 @@ def test_the_render_reproduces_exactly_what_the_application_writes() -> None:
 
 def test_the_render_survives_a_mirror_read_in_another_zone() -> None:
     """`timestamptz` comes back in the session's zone, not the writer's. The
-    render converts to local first, so the same instant renders identically
+    render converts to UTC first, so the same instant renders identically
     however the server chose to present it."""
     written = "2026-08-13T12:00:00"
     instant = to_instant(written)

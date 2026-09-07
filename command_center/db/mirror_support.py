@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
 __all__ = [
@@ -39,36 +39,30 @@ MIRROR_UNAVAILABLE = "__mirror_unavailable__"
 
 
 def to_instant(value: str) -> datetime:
-    """Attach the writer's zone to a naive timestamp bound for `timestamptz`.
+    """Attach UTC to a naive timestamp bound for `timestamptz`.
 
-    `models.iso_now()` returns *naive local time* — its docstring says every
-    timestamp in this application is "local time on the machine that wrote
-    them, never assumed to be UTC". Handing that to `timestamptz` does not
-    error: PostgreSQL stamps it with the *session* time zone, so every mirrored
-    row is silently offset by the gap between the writing machine and the
-    server. Interpreting it in the local zone is the only reading consistent
-    with what the authority means by it, and the mirror runs in the writer's
-    own process, so "local" is the zone that produced the string.
+    `models.iso_now()` returns naive UTC (naive *local* time through v1.2,
+    fixed by `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL` — local wall clock is not
+    monotonic across a DST fall-back, which broke `ORDER BY created_at DESC`
+    everywhere). Handing a naive string to `timestamptz` does not error:
+    PostgreSQL stamps it with the *session* time zone, so every mirrored row
+    would be silently offset by the session's zone unless the instant is
+    attached explicitly here — and since every writer now shares one clock,
+    there is no "writer's own process" zone to look up: it is always UTC.
 
-    The limit is inherent to the naive format rather than to this code, and
-    reconciliation is **blind** to a violation of it: the render below converts
-    back through the same zone, so a mirror running in the wrong one reproduces
-    the original wall clock and `divergence` reports agreement it never
-    verified. Independent review demonstrated this — the same row mirrored from
-    an MSK and a UTC process stored instants three hours apart and both
-    reconciled clean. Until `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS` closes — by
-    making the authority timezone-aware *or* by giving reconciliation its own
-    zone check — the mirror must run in the writer's process, and that is an
-    operational constraint rather than something any gate enforces.
+    A naive string produced *before* that fix shipped is still local time, and
+    this function cannot tell the two epochs apart by format — the residual
+    limit `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS` (a fully timezone-aware format)
+    would close for good.
     """
     parsed = datetime.fromisoformat(value)
-    return parsed if parsed.tzinfo is not None else parsed.astimezone()
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def render_authority_timestamp(value: datetime) -> str:
     """Render `timestamptz` back into exactly what `models.iso_now()` emits.
 
-    Naive local, second precision, no offset. An earlier version rendered UTC
+    Naive UTC, second precision, no offset. An earlier version rendered UTC
     with a `Z` suffix "matching what the application writes" — it does not, and
     the result was a divergence check that called every row different, which is
     a cutover gate permanently red. A red gate nobody can satisfy is one
@@ -81,7 +75,7 @@ def render_authority_timestamp(value: datetime) -> str:
     in reverse. Tracked as `VOYN-W0-AICC-MIRROR-RENDER-SHARED`, a declared
     blocker on the first such table.
     """
-    return value.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+    return value.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 @dataclass(frozen=True)

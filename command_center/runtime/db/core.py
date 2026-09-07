@@ -442,37 +442,21 @@ RETENTION_TZ_ENV = "AICC_RUNTIME_TZ"
 
 
 def _machine_timestamp_zone() -> str | None:
-    """The IANA zone name this machine writes `models.iso_now` timestamps in,
-    or `None` when it cannot be identified as an IANA key.
+    """The zone this machine writes `models.iso_now` timestamps in: always
+    `"UTC"`.
 
-    Two sources, in order: an explicit `TZ` (what a container, a service unit
-    or a cron entry sets), then the `/etc/localtime` symlink (macOS and Linux
-    both point it into the zoneinfo tree). A `TZ` in POSIX rule form
-    (`EST5EDT`), or a Windows host with no symlink, yields `None` — a name we
-    cannot resolve is worse than no name, because it would be recorded as
-    authoritative and then silently mis-resolve later.
+    Used to answer this by reading `TZ`/`/etc/localtime`, because `iso_now()`
+    wrote naive *local* time and the answer genuinely varied host to host.
+    Fixed by `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`: `iso_now()` now sources UTC
+    unconditionally, so every process writes the same clock regardless of
+    host — there is no per-machine answer left to detect, and reading the
+    host's zone here would just record something `iso_now()` no longer uses.
+    A row written before that fix is still naive local time on whatever zone
+    this function used to report; this stays `"UTC"` because that already-
+    recorded zone (if any) is what `resolve_timestamp_zone` returns for it —
+    this function only ever describes what *new* writes are on.
     """
-    declared = os.environ.get("TZ")
-    if declared:
-        try:
-            ZoneInfo(declared)
-        except (ZoneInfoNotFoundError, ValueError):
-            pass
-        else:
-            return declared
-    try:
-        link = os.readlink("/etc/localtime")
-    except OSError:
-        return None
-    marker = "zoneinfo/"
-    if marker not in link:
-        return None
-    name = link.split(marker, 1)[1]
-    try:
-        ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
-        return None
-    return name
+    return "UTC"
 
 
 def _read_timestamp_zone(conn: sqlite3.Connection) -> str | None:
@@ -494,11 +478,15 @@ def _stamp_timestamp_zone(conn: sqlite3.Connection) -> None:
 
     Written by `migrate()`, i.e. by an application process that also writes
     those timestamps, and never overwritten: the recorded zone describes the
-    history already in the file. Moving a database to a machine in another zone
-    therefore keeps the old (correct) reading of the old rows; new rows written
-    there are on a different clock, which no retention cutoff can reconcile —
-    that is the `iso_now` convention's own limit, not this function's (see
-    `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`).
+    history already in the file. A brand-new database is stamped `"UTC"` —
+    `_machine_timestamp_zone()`'s only possible answer now that `iso_now()`
+    itself is UTC-sourced. A database migrated before `iso_now()` changed
+    (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`) keeps whatever local zone it was
+    already stamped with, describing its pre-fix history correctly — but
+    `retention_cutoff` no longer consults this column except through an
+    explicit `AICC_RUNTIME_TZ` override, so that stale stamp can no longer
+    misdirect a deletion the way it could before this function stopped
+    reading the host's own zone.
 
     Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape the run-table
     migrations use, under the same `BEGIN IMMEDIATE`, so two processes racing
@@ -569,30 +557,30 @@ def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, s
     """The `completed_at < ?` bound for `retention_days`, as
     `(cutoff, zone_name, zone_source)`.
 
-    The single reason this exists: `completed_at` is a naive local string, so
-    the bound has to be rendered on the *same* clock the rows were written on
-    — not on whatever clock the pruning process happens to be started with.
-    Anchoring to `datetime.now(timezone.utc)` and converting into the
-    database's declared zone makes the returned string identical in every
-    process timezone, which is what makes the deleted row *set* deterministic
-    (`VOYN-W0-AICC-RETENTION-TZ`).
-
-    With no declared zone (a database that predates migration 24 and has not
-    been migrated since) the process clock is all there is; the third element
-    says so, so a caller can record that the answer was not pinned.
+    `completed_at` is naive UTC (`models.iso_now`, fixed by
+    `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL` to source UTC unconditionally instead of
+    the pruning process's own local zone — the original defect this function
+    was written to work around, `VOYN-W0-AICC-RETENTION-TZ`). Every process
+    now renders the same cutoff regardless of its own zone by construction, so
+    the database's recorded `timestamp_tz` — a pre-fix machine's *local* zone,
+    on any database migrated before this change shipped — is deliberately not
+    consulted here: trusting it would misdirect deletion by that zone's offset
+    for every row written after the upgrade, the same class of irreversible
+    wrong-row-deletion `VOYN-W0-AICC-RETENTION-TZ` fixed in the other
+    direction. `AICC_RUNTIME_TZ` is the one exception: an operator who set it
+    explicitly to read a database's pre-fix local-time history is honoured
+    exactly as before.
     """
     zone_name, source = db.resolve_timestamp_zone(db_path)
-    if zone_name is None:
-        now_local = datetime.now()
-        zone_name = datetime.now().astimezone().tzname() or ""
-    else:
+    if source == "env":
         now_local = (
-            datetime.now(timezone.utc)
-            .astimezone(ZoneInfo(zone_name))
-            .replace(tzinfo=None)
+            datetime.now(timezone.utc).astimezone(ZoneInfo(zone_name)).replace(tzinfo=None)
         )
-    cutoff = (now_local - timedelta(days=retention_days)).isoformat(timespec="seconds")
-    return cutoff, zone_name, source
+        cutoff = (now_local - timedelta(days=retention_days)).isoformat(timespec="seconds")
+        return cutoff, zone_name, source
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    cutoff = (now_utc - timedelta(days=retention_days)).isoformat(timespec="seconds")
+    return cutoff, "UTC", "utc"
 
 
 def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
@@ -603,8 +591,8 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     Bounded and conservative:
       * only *terminal* runs are eligible (their events are historical audit
         trail, not live state);
-      * the cutoff comes from `retention_cutoff`, which renders it in the zone
-        the database declares its naive timestamps are on — so the deleted row
+      * the cutoff comes from `retention_cutoff`, which renders it in UTC — the
+        clock every `completed_at` is now written on — so the deleted row
         *set* is the same whichever timezone the pruning process runs in. It
         used to be a bare `datetime.now()`, i.e. the pruning process's own
         zone, which deleted a different set of rows from the same database at

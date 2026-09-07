@@ -1219,7 +1219,10 @@ Do not approve unless all three supplied SHA256 values are copied exactly.
             due = datetime.fromisoformat(raw)
         except (TypeError, ValueError):
             return True
-        now = datetime.now(tz=due.tzinfo) if due.tzinfo else datetime.now()
+        # `next_retry_at` is naive UTC when unset by the caller (`completion_service._now()`,
+        # itself `models.utc_now()`) — `datetime.now()` would compare it against local
+        # wall clock (VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL).
+        now = datetime.now(tz=due.tzinfo) if due.tzinfo else models.utc_now()
         return due <= now
 
     def run(self, request: CampaignRequest) -> CampaignResult:
