@@ -8,6 +8,7 @@ import subprocess
 
 import pytest
 
+from command_center import agent_runner
 from command_center.orchestrator.publish import PublishConfig, publish_run
 
 
@@ -615,6 +616,107 @@ def test_static_gate_env_off_is_an_operator_bypass(repo, monkeypatch):
     r = publish_run(work, _cfg(bin_))
 
     assert r.ok, r.reason
+
+
+def _fake_quality_band_run(**kwargs):
+    return agent_runner.RunResult(
+        started_at="2026-09-07T00:00:00+00:00",
+        completed_at="2026-09-07T00:00:01+00:00",
+        duration_seconds=0.1,
+        **kwargs,
+    )
+
+
+def test_sandbox_gate_refuses_a_red_run_before_lease(repo, monkeypatch):
+    """_quality_band_sandbox_gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS):
+    a genuinely failing impacted-test run under the isolated principal
+    refuses the publish before the lease, same contract as the static
+    ruff gate above."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean statics, red sandbox run")
+    monkeypatch.setattr(agent_runner, "quality_band_gate_available", lambda: (True, ""))
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda **kwargs: _fake_quality_band_run(
+            status="failed", exit_code=1, stdout="1 failed, 3 passed", stderr=""
+        ),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_sandbox_failed:")
+    assert not calls.exists()
+
+
+def test_sandbox_gate_defers_and_publishes_on_broker_infrastructure_failure(
+    repo, monkeypatch
+):
+    """A genuine broker transport-envelope failure (exit 125, empty stdout,
+    marker-prefixed stderr) defers to CI rather than blocking the
+    publish -- the same "absent tooling" contract as the static gate's
+    missing-ruff case, never the candidate's fault."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+    monkeypatch.setattr(agent_runner, "quality_band_gate_available", lambda: (True, ""))
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda **kwargs: _fake_quality_band_run(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr=f"{agent_runner._PRINCIPAL_ISOLATION_FAILURE}: quarantined",
+        ),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_sandbox_gate_refuses_when_the_marker_is_only_in_untrusted_stdout(
+    repo, monkeypatch
+):
+    """Regression for the chunk-4 REJECT on 8e667b0b, exercised at the
+    actual publish_run decision point: a red sandbox run whose own
+    (untrusted) stdout happens to contain the transport-envelope marker
+    text must still refuse the publish -- never defer to CI as if the
+    broker itself had failed. `is_principal_isolation_error` only trusts
+    the marker on stderr, paired with exit 125 and empty stdout; a naive
+    substring search over combined output would misread this exact case."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _opt_in(work)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean statics, adversarial sandbox stdout")
+    monkeypatch.setattr(agent_runner, "quality_band_gate_available", lambda: (True, ""))
+    monkeypatch.setattr(
+        agent_runner,
+        "run_quality_band_gate",
+        lambda **kwargs: _fake_quality_band_run(
+            status="failed",
+            exit_code=1,
+            stdout=f"{agent_runner._PRINCIPAL_ISOLATION_FAILURE}: quarantined\n2 failed",
+            stderr="",
+        ),
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("quality_band_sandbox_failed:")
+    assert not calls.exists()
 
 
 def test_real_band_script_defers_without_venv_and_honours_bypass(tmp_path):

@@ -76,7 +76,26 @@ TOOLCHAIN_BIN = "/opt/aicc/toolchains/current/bin"
 EXECUTOR_BINARIES = {
     "claude": f"{TOOLCHAIN_BIN}/claude",
     "codex": f"{TOOLCHAIN_BIN}/codex",
+    # quality_band (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) has no model
+    # executor at all: `_provider_command` runs a FIXED argv -- the
+    # untrusted candidate's own scripts/ci/prepush/quality_band.sh -- through
+    # the immutable, root-owned system shell every other profile's
+    # executable is validated through (`_validate_binary`), never a path
+    # taken from the manifest.
+    "quality_band": "/bin/bash",
 }
+# Executing candidate code is exactly the trust boundary this broker exists
+# to enforce, so the impacted-test phase of the pre-push quality band can
+# only ever run here, under the isolated principal -- never in the
+# credentialed publish worker (see command_center.orchestrator.publish's
+# `_static_quality_gate` docstring for that side of the split).
+QUALITY_BAND_SCRIPT = "scripts/ci/prepush/quality_band.sh"
+# quality_band needs no provider credential, so it is the one executor
+# `_prepare_agent_home` hands a bare, non-tmpfs-auth home instead of a
+# per-run credential copy (see `_prepare_agent_home` and the matching
+# `SupplementaryGroups` branch in `_systemd_command`, which omits
+# aicc-agent-auth for exactly this executor).
+NO_MODEL_AUTH_EXECUTORS = frozenset({"quality_band"})
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
 MOUNT = "/usr/bin/mount"
@@ -97,7 +116,7 @@ MAX_OUTPUT_BYTES = 512 * 1024
 MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
-PROFILES = frozenset({"read_only", "trusted_development"})
+PROFILES = frozenset({"read_only", "trusted_development", "quality_band"})
 MODEL_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 RUN_ID_RE = re.compile(r"[a-f0-9]{32}")
 BROKER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/]{1,200}\.service")
@@ -224,6 +243,15 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
         raise LaunchRefused("executor is not allowlisted")
     if value["profile"] not in PROFILES:
         raise LaunchRefused("profile is not allowlisted")
+    # quality_band is the one profile that runs no model at all -- it must
+    # never be reachable through a claude/codex executor (which would grant
+    # it that executor's provider credential via SupplementaryGroups), and
+    # the quality_band executor must never be dispatched under a profile
+    # that expects a model argv (`_provider_command` ignores prompt/model
+    # for it entirely, so pairing it with read_only/trusted_development
+    # would silently run the fixed script under a mislabeled profile).
+    if (value["profile"] == "quality_band") != (value["executor"] == "quality_band"):
+        raise LaunchRefused("quality_band profile and executor must be paired")
     prompt = value["prompt"]
     if not isinstance(prompt, str) or not prompt or "\x00" in prompt:
         raise LaunchRefused("prompt must be a non-empty NUL-free string")
@@ -429,7 +457,32 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
     not be able to persist plugins, instructions, config or a modified token
     into a later task. The root broker copies only the one allowlisted auth
     file into a per-run tmpfs-backed path and removes it after cgroup exit.
+
+    `NO_MODEL_AUTH_EXECUTORS` (quality_band) skips all of that: there is no
+    credential to stage, and `_systemd_command` deliberately drops
+    aicc-agent-auth from the unit's SupplementaryGroups for these executors
+    (that group has no human or publisher members -- granting it here would
+    be dead weight). The home this function hands back must therefore be
+    owned by a group the unit actually holds -- aicc-workspace -- or the
+    unprivileged, non-root process inside the sandbox has no path to even
+    traverse into its own home (review REJECT on 8e667b0b: the original
+    version of this branch reused `auth_gid` unconditionally, which the
+    quality_band unit is no longer a member of).
     """
+    if executor in NO_MODEL_AUTH_EXECUTORS:
+        try:
+            workspace_gid = grp.getgrnam("aicc-workspace").gr_gid
+        except KeyError as exc:
+            raise LaunchRefused("aicc-workspace group does not exist") from exc
+        home = EPHEMERAL_HOME_ROOT / run_id
+        try:
+            home.mkdir(mode=0o770)
+            os.chown(home, 0, workspace_gid)
+            os.chmod(home, 0o770)
+        except OSError as exc:
+            shutil.rmtree(home, ignore_errors=True)
+            raise LaunchRefused("cannot prepare ephemeral home") from exc
+        return home
     try:
         # A DEDICATED group for ephemeral model-credential homes. The shared
         # aicc-workspace output group also contains the guarded publisher and
@@ -823,6 +876,13 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
     prompt = manifest["prompt"]
     model = manifest["model"]
     binary = EXECUTOR_BINARIES[executor]
+    if executor == "quality_band":
+        # Fixed argv, full stop. `prompt` and `model` are validated manifest
+        # fields but carry no meaning for this profile and are never read
+        # here -- there is no way for a crafted manifest to inject an
+        # argument into this command line the way it can for the model
+        # executors below.
+        return [binary, QUALITY_BAND_SCRIPT]
     if executor == "claude":
         command = [
             binary,
@@ -911,6 +971,7 @@ def _systemd_command(
 ) -> list[str]:
     executor = manifest["executor"]
     timeout = int(manifest["timeout_seconds"])
+    is_quality_band = executor == "quality_band"
     # No nesting hazard in this list: EPHEMERAL_HOME_ROOT is
     # /run/aicc-agent-homes -- a SIBLING of /run/aicc-agent-launcher, not a
     # child, so systemd never overmounts a parent before lstat'ing a nested
@@ -949,7 +1010,15 @@ def _systemd_command(
         "--setenv=GIT_CONFIG_GLOBAL=/dev/null",
         "--setenv=GIT_TERMINAL_PROMPT=0",
         "--setenv=GCM_INTERACTIVE=never",
-        "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
+        # quality_band needs no provider credential at all, so
+        # aicc-agent-auth -- a group with no human or publisher members,
+        # existing solely to key the live model token -- would be dead
+        # weight, granted and unused. `_prepare_agent_home` mirrors this
+        # exactly: the home it hands this unit is owned by whichever group
+        # is actually listed here, never aicc-agent-auth for this executor.
+        "--property=SupplementaryGroups=aicc-workspace"
+        if is_quality_band
+        else "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
         "--property=UMask=0007",
         "--property=NoNewPrivileges=yes",
         "--property=CapabilityBoundingSet=",
@@ -971,7 +1040,9 @@ def _systemd_command(
         "--property=LockPersonality=yes",
         "--property=KeyringMode=private",
         "--property=RemoveIPC=yes",
-        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        "--property=RestrictAddressFamilies=AF_UNIX"
+        if is_quality_band
+        else "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "--property=KillMode=control-group",
         "--property=Delegate=no",
         "--property=MemoryMax=6G",
@@ -988,9 +1059,29 @@ def _systemd_command(
         f"--property=BindPaths={agent_home}:/agent-home",
         "--property=ReadWritePaths=/workspace /agent-home",
     ]
-    for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor]):
-        if _validate_environment_file(env_file, executor):
-            command.append(f"--property=EnvironmentFile={env_file}")
+    if is_quality_band:
+        # No network family is granted above, but keep this as defense in
+        # depth against a future change to the family list this executor
+        # would otherwise inherit -- quality_band never needs outbound
+        # network under any circumstance.
+        command.append("--property=IPAddressDeny=any")
+        # No EnvironmentFile at all: quality_band needs no provider
+        # credential and no operator-set common variable either. LANG/LC_ALL
+        # are fixed constants here rather than read from COMMON_ENV_FILE,
+        # since that file is a channel for values this executor must not
+        # receive.
+        command += ["--setenv=LANG=C.UTF-8", "--setenv=LC_ALL=C.UTF-8"]
+    else:
+        # `.get()`, not `[executor]`: quality_band has no entry in
+        # PROVIDER_ENV_FILES, and a future executor added to
+        # EXECUTOR_BINARIES without one must fail closed here rather than
+        # crash the broker (same defensive shape as MODEL_AUTH_SOURCES.get
+        # above).
+        provider_env_file = PROVIDER_ENV_FILES.get(executor)
+        env_files = (COMMON_ENV_FILE, *((provider_env_file,) if provider_env_file else ()))
+        for env_file in env_files:
+            if _validate_environment_file(env_file, executor):
+                command.append(f"--property=EnvironmentFile={env_file}")
     command += ["--", *_provider_command(manifest)]
     return command
 

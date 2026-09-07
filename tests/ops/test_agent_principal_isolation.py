@@ -167,6 +167,115 @@ def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
             launcher._load_manifest((json.dumps(poisoned) + "\n").encode())
 
 
+def _quality_band_manifest(tmp_path: Path, **updates):
+    base = {
+        "executor": "quality_band",
+        "profile": "quality_band",
+        "prompt": "quality-band-gate",
+        "model": None,
+    }
+    base.update(updates)
+    return _manifest(tmp_path, **base)
+
+
+def test_quality_band_executor_and_profile_must_be_paired(launcher, tmp_path):
+    mismatched_profile = _manifest(
+        tmp_path, executor="quality_band", profile="trusted_development"
+    )
+    with pytest.raises(launcher.LaunchRefused, match="must be paired"):
+        launcher._load_manifest((json.dumps(mismatched_profile) + "\n").encode())
+
+    mismatched_executor = {**_quality_band_manifest(tmp_path), "executor": "codex"}
+    with pytest.raises(launcher.LaunchRefused, match="must be paired"):
+        launcher._load_manifest((json.dumps(mismatched_executor) + "\n").encode())
+
+    valid = _quality_band_manifest(tmp_path)
+    assert launcher._load_manifest((json.dumps(valid) + "\n").encode()) == valid
+
+
+def test_quality_band_provider_command_is_fixed_and_ignores_manifest_fields(
+    launcher, tmp_path
+):
+    """The gate's whole safety story depends on this argv being fixed: a
+    crafted manifest must not be able to inject an argument into the
+    untrusted candidate's own quality_band.sh the way it could if prompt or
+    model were read here."""
+    plain = launcher._provider_command(_quality_band_manifest(tmp_path))
+    poisoned = launcher._provider_command(
+        _quality_band_manifest(
+            tmp_path,
+            prompt="; rm -rf / #",
+            model="attacker-supplied-model",
+        )
+    )
+    assert plain == poisoned == ["/bin/bash", launcher.QUALITY_BAND_SCRIPT]
+
+
+def test_quality_band_home_ownership_matches_granted_supplementary_group(
+    launcher, monkeypatch, tmp_path
+):
+    """Regression for the PR #677 chunk-1 REJECT: quality_band drops
+    aicc-agent-auth from SupplementaryGroups (no model credential is ever
+    needed), so the ephemeral home handed to that unit must be owned by the
+    group actually granted -- aicc-workspace -- not the auth-only group. The
+    original version of this branch reused `auth_gid` unconditionally: owner
+    root, group aicc-agent-auth, mode 0770, and a unit that is no longer a
+    member of that group has no path to even traverse into its own home."""
+    monkeypatch.setattr(launcher, "EPHEMERAL_HOME_ROOT", tmp_path)
+    gids = {"aicc-workspace": 4242, "aicc-agent-auth": 9999}
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=gids[name])
+    )
+    chown_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        launcher.os,
+        "chown",
+        lambda path, uid, gid: chown_calls.append((uid, gid)),
+    )
+
+    home = launcher._prepare_agent_home("quality_band", "b" * 32)
+
+    assert chown_calls, "quality_band home was never chowned"
+    assert all((uid, gid) == (0, 4242) for uid, gid in chown_calls)
+
+    command = launcher._systemd_command(
+        _quality_band_manifest(tmp_path),
+        home,
+        "aicc-agent-test.service",
+        "aicc-agent-launcher@test.service",
+        tmp_path.parent,
+        tmp_path,
+    )
+    groups_property = next(
+        value
+        for value in command
+        if value.startswith("--property=SupplementaryGroups=")
+    )
+    assert groups_property == "--property=SupplementaryGroups=aicc-workspace"
+
+
+def test_quality_band_systemd_command_denies_network_and_provider_env(
+    launcher, tmp_path
+):
+    command = launcher._systemd_command(
+        _quality_band_manifest(tmp_path),
+        Path("/run/aicc-agent-homes/quality-band"),
+        "aicc-agent-test.service",
+        "aicc-agent-launcher@test.service",
+        tmp_path.parent,
+        tmp_path,
+    )
+    assert "--property=RestrictAddressFamilies=AF_UNIX" in command
+    assert "--property=IPAddressDeny=any" in command
+    assert not any(
+        value.startswith("--property=EnvironmentFile=") for value in command
+    ), "quality_band must receive no credential or operator-set env file"
+    joined = "\n".join(command)
+    assert "OPENAI_API_KEY" not in joined
+    assert "ANTHROPIC_API_KEY" not in joined
+    assert command[-2:] == ["/bin/bash", launcher.QUALITY_BAND_SCRIPT]
+
+
 @pytest.mark.parametrize(
     ("executor", "task_type"),
     [
