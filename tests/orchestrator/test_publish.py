@@ -8,7 +8,15 @@ import subprocess
 
 import pytest
 
-from command_center.orchestrator.publish import PublishConfig, publish_run
+from command_center.orchestrator.publish import (
+    PublishConfig,
+    _classify_push_failure,
+    _diff_touches_github_workflows,
+    _gh_oauth_workflow_scope_missing,
+    _target_host,
+    _workflow_scope_gate,
+    publish_run,
+)
 
 
 def _git(cwd, *args):
@@ -743,3 +751,350 @@ def test_candidate_leak_guard_copy_is_never_executed(repo, monkeypatch):
 
     assert r.ok, r.reason
     assert not marker.exists(), "candidate leak_guard executed in publisher"
+
+
+# --- workflow-scope preflight (VOYN-W0-AICC-PUBLISH-WORKFLOW-SCOPE-REM) -----
+# `_gh_oauth_workflow_scope_missing` must correlate its verdict to the exact
+# account `gh auth status` marks active within the *matching host's* own
+# block, not the first "Token scopes:" line found anywhere in the output --
+# independent review caught the earlier cut reading whichever account came
+# first (HEAD_SHA d670c34e4d754d009db6ddcf5a383be7dec85fe1). The multi-
+# account tests below are the regression coverage for exactly that finding:
+# an inactive account's scopes must never decide the verdict, in either
+# direction.
+
+_GH_AUTH_SINGLE_ACCOUNT_MISSING_WORKFLOW = """github.com
+  Logged in to github.com account server-worker (keyring)
+  - Active account: true
+  - Git operations protocol: https
+  - Token scopes: 'gist', 'read:org', 'repo'
+"""
+
+_GH_AUTH_SINGLE_ACCOUNT_WITH_WORKFLOW = """github.com
+  Logged in to github.com account server-worker (keyring)
+  - Active account: true
+  - Git operations protocol: https
+  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'
+"""
+
+# The active account (second block) lacks `workflow`; a *different*,
+# inactive account (first block) happens to carry it. The verdict must
+# follow the active account -- True -- not the first scopes line found.
+_GH_AUTH_MULTI_ACCOUNT_ACTIVE_MISSING_WORKFLOW = """github.com
+  Logged in to github.com account other-account (keyring)
+  - Active account: false
+  - Git operations protocol: https
+  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'
+
+  Logged in to github.com account server-worker (keyring)
+  - Active account: true
+  - Git operations protocol: https
+  - Token scopes: 'gist', 'read:org', 'repo'
+"""
+
+# The mirror image: the active account (second block) already has
+# `workflow`; a different, inactive account (first block) does not. This is
+# the exact false-positive direction the review flagged -- a naive "first
+# scopes line anywhere" read would report `True` here and wrongly block a
+# push that would have succeeded.
+_GH_AUTH_MULTI_ACCOUNT_ACTIVE_HAS_WORKFLOW = """github.com
+  Logged in to github.com account other-account (keyring)
+  - Active account: false
+  - Git operations protocol: https
+  - Token scopes: 'gist', 'read:org', 'repo'
+
+  Logged in to github.com account server-worker (keyring)
+  - Active account: true
+  - Git operations protocol: https
+  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'
+"""
+
+_GH_AUTH_DUPLICATE_HOST_BLOCK = """github.com
+  Logged in to github.com account server-worker (keyring)
+  - Active account: true
+  - Token scopes: 'gist', 'read:org', 'repo'
+
+github.com
+  Logged in to github.com account server-worker (keyring)
+  - Active account: true
+  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'
+"""
+
+_GH_AUTH_NO_ACTIVE_ACCOUNT = """github.com
+  Logged in to github.com account server-worker (keyring)
+  - Active account: false
+  - Token scopes: 'gist', 'read:org', 'repo'
+"""
+
+_GH_AUTH_ACTIVE_ACCOUNT_NO_SCOPES_LINE = """github.com
+  Logged in to github.com account server-worker (keyring)
+  - Active account: true
+  - Git operations protocol: https
+"""
+
+_GH_AUTH_DIFFERENT_HOST_ONLY = """example.ghe.internal
+  Logged in to example.ghe.internal account server-worker (keyring)
+  - Active account: true
+  - Token scopes: 'gist', 'read:org', 'repo'
+"""
+
+
+def _gh_auth_status_script(bin_, output):
+    """A `gh` fake that only answers `gh auth status`; any other invocation
+    fails loudly instead of silently returning nothing, so a test using this
+    helper is deliberately isolated to the preflight and would notice if it
+    accidentally exercised a later `gh pr` call."""
+    gh = bin_ / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "auth" ] && [ "$2" = "status" ]; then\n'
+        "cat <<'EOF'\n"
+        f"{output}"
+        "EOF\n"
+        "exit 0\n"
+        "fi\n"
+        'echo "unexpected gh invocation: $*" >&2\n'
+        "exit 1\n"
+    )
+    gh.chmod(0o755)
+
+
+def test_target_host_extracts_hostname_from_rewritten_https_target():
+    assert _target_host("https://github.com/voyn88/ai-command-center.git") == (
+        "github.com"
+    )
+
+
+def test_target_host_none_for_a_non_https_target():
+    assert _target_host("git@github.com:voyn88/ai-command-center.git") is None
+
+
+def test_diff_touches_github_workflows_true_when_a_workflow_file_changed(repo):
+    work, _bin, _calls = repo
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / ".github" / "workflows").mkdir(parents=True)
+    (work / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    assert _diff_touches_github_workflows(work, base, head) is True
+
+
+def test_diff_touches_github_workflows_false_for_an_unrelated_change(repo):
+    work, _bin, _calls = repo
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "change")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    assert _diff_touches_github_workflows(work, base, head) is False
+
+
+def test_diff_touches_github_workflows_none_when_the_diff_is_unreadable(repo):
+    work, _bin, _calls = repo
+
+    assert (
+        _diff_touches_github_workflows(work, "not-a-sha", "also-not-a-sha") is None
+    )
+
+
+@pytest.mark.parametrize(
+    "output, expected",
+    [
+        (_GH_AUTH_SINGLE_ACCOUNT_MISSING_WORKFLOW, True),
+        (_GH_AUTH_SINGLE_ACCOUNT_WITH_WORKFLOW, False),
+    ],
+)
+def test_gh_oauth_workflow_scope_missing_single_account(
+    repo, monkeypatch, output, expected
+):
+    work, bin_, _calls = repo
+    _with_path(bin_, monkeypatch)
+    _gh_auth_status_script(bin_, output)
+
+    assert _gh_oauth_workflow_scope_missing(work, "github.com") is expected
+
+
+def test_gh_oauth_workflow_scope_missing_follows_the_active_account_not_the_first(
+    repo, monkeypatch
+):
+    """Regression for independent-review finding on HEAD_SHA
+    d670c34e4d754d009db6ddcf5a383be7dec85fe1: an inactive account listed
+    first must never decide the verdict. Here the first-listed account has
+    `workflow` and is inactive; the active, second-listed account lacks it.
+    The old "first Token scopes: line anywhere" read would have returned
+    False (scope present) and let a doomed push through; the correlated read
+    must return True."""
+    work, bin_, _calls = repo
+    _with_path(bin_, monkeypatch)
+    _gh_auth_status_script(bin_, _GH_AUTH_MULTI_ACCOUNT_ACTIVE_MISSING_WORKFLOW)
+
+    assert _gh_oauth_workflow_scope_missing(work, "github.com") is True
+
+
+def test_gh_oauth_workflow_scope_missing_does_not_false_positive_on_other_accounts(
+    repo, monkeypatch
+):
+    """Mirror of the case above and the direction the review called out as
+    the real regression risk: an inactive account lacking `workflow` must
+    never cause a push to be wrongly refused when the active account
+    actually has the scope."""
+    work, bin_, _calls = repo
+    _with_path(bin_, monkeypatch)
+    _gh_auth_status_script(bin_, _GH_AUTH_MULTI_ACCOUNT_ACTIVE_HAS_WORKFLOW)
+
+    assert _gh_oauth_workflow_scope_missing(work, "github.com") is False
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        _GH_AUTH_DUPLICATE_HOST_BLOCK,
+        _GH_AUTH_NO_ACTIVE_ACCOUNT,
+        _GH_AUTH_ACTIVE_ACCOUNT_NO_SCOPES_LINE,
+        _GH_AUTH_DIFFERENT_HOST_ONLY,
+        "",
+    ],
+)
+def test_gh_oauth_workflow_scope_missing_fails_open_when_ambiguous(
+    repo, monkeypatch, output
+):
+    """Every case where the active credential for `host` cannot be pinned
+    down unambiguously must defer to the real push (`None`) rather than
+    guess in either direction."""
+    work, bin_, _calls = repo
+    _with_path(bin_, monkeypatch)
+    _gh_auth_status_script(bin_, output)
+
+    assert _gh_oauth_workflow_scope_missing(work, "github.com") is None
+
+
+def test_workflow_scope_gate_none_when_there_is_no_https_target(repo):
+    work, _bin, _calls = repo
+    assert _workflow_scope_gate(work, None, "base", "head") is None
+
+
+def test_workflow_scope_gate_none_when_the_diff_does_not_touch_workflows(
+    repo, monkeypatch
+):
+    work, bin_, _calls = repo
+    _with_path(bin_, monkeypatch)
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "change")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+    # No `gh` fake at all: reaching `gh auth status` here would be a bug --
+    # the diff-touch check must short-circuit before it.
+
+    result = _workflow_scope_gate(
+        work, "https://github.com/voyn88/ai-command-center.git", base, head
+    )
+
+    assert result is None
+
+
+def test_workflow_scope_gate_blocks_a_workflow_touching_push_missing_scope(
+    repo, monkeypatch
+):
+    work, bin_, _calls = repo
+    _with_path(bin_, monkeypatch)
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / ".github" / "workflows").mkdir(parents=True)
+    (work / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+    _gh_auth_status_script(bin_, _GH_AUTH_SINGLE_ACCOUNT_MISSING_WORKFLOW)
+
+    result = _workflow_scope_gate(
+        work, "https://github.com/voyn88/ai-command-center.git", base, head
+    )
+
+    assert result is not None
+    assert not result.ok
+    assert result.reason.startswith("workflow_scope_missing")
+    assert "github.com" in result.reason
+    assert "workflow" in result.reason
+
+
+def test_workflow_scope_gate_allows_a_workflow_touching_push_with_scope(
+    repo, monkeypatch
+):
+    work, bin_, _calls = repo
+    _with_path(bin_, monkeypatch)
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / ".github" / "workflows").mkdir(parents=True)
+    (work / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+    _gh_auth_status_script(bin_, _GH_AUTH_SINGLE_ACCOUNT_WITH_WORKFLOW)
+
+    result = _workflow_scope_gate(
+        work, "https://github.com/voyn88/ai-command-center.git", base, head
+    )
+
+    assert result is None
+
+
+def test_publish_run_refuses_a_workflow_touching_push_before_the_lease(
+    repo, monkeypatch
+):
+    """End-to-end: a candidate that touches `.github/workflows/**` over a
+    `gh`-OAuth HTTPS origin whose active account lacks `workflow` must be
+    refused before a lease is ever acquired -- not burn a lease + push
+    attempt against a token already known to fail it."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _git(
+        work,
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/voyn88/ai-command-center.git",
+    )
+    (work / ".github" / "workflows").mkdir(parents=True)
+    (work / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    _gh_auth_status_script(bin_, _GH_AUTH_SINGLE_ACCOUNT_MISSING_WORKFLOW)
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("workflow_scope_missing")
+    assert not calls.exists(), "must refuse before acquiring a lease"
+
+
+def test_classify_push_failure_names_a_live_workflow_scope_denial():
+    stderr = (
+        "! [remote rejected] backlog/x -> backlog/x (refusing to allow an "
+        "OAuth App to create or update workflow `.github/workflows/ci.yml` "
+        "without `workflow` scope)"
+    )
+    assert _classify_push_failure(stderr) == "workflow_scope_denied"
+
+
+def test_classify_push_failure_names_a_lease_race():
+    stderr = "! [rejected] backlog/x -> backlog/x (stale info)"
+    assert _classify_push_failure(stderr) == "push_rejected_stale_info"
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "ssh: Could not resolve hostname github.com: Name or service not known",
+        "ssh: connect to host github.com port 22: Connection timed out",
+        "ssh: connect to host github.com port 22: Connection refused",
+        "fatal: unable to access '...': Could not read from remote repository.",
+    ],
+)
+def test_classify_push_failure_names_a_network_failure(stderr):
+    assert _classify_push_failure(stderr) == "push_network_failure"
+
+
+def test_classify_push_failure_falls_back_to_the_generic_bucket_when_unrecognized():
+    assert _classify_push_failure("! [rejected] some other reason") == "push_failed"
