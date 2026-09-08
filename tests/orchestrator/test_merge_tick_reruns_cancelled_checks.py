@@ -93,9 +93,29 @@ def test_a_newer_success_after_a_cancelled_run_needs_no_rerun(monkeypatch):
          "detailsUrl": URL.format(run=11, job=1)},
         {"name": "CI", "conclusion": "SUCCESS", "startedAt": "2026-09-08T01:10:00Z",
          "detailsUrl": URL.format(run=13, job=1)},
+        {"name": "Final merge gate", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-08T01:10:00Z", "detailsUrl": URL.format(run=13, job=2)},
+        {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-08T01:12:00Z", "detailsUrl": URL.format(run=14, job=1)},
     ]
     fake, calls = _fake_gh(rollup, {})
     monkeypatch.setattr(review_merge, "_gh", fake)
     ok, reason = review_merge._pr_is_mergeable("/repo", PR)
     assert ok is True and reason == HEAD
+    assert not [c for c in calls if c[:2] == ["run", "rerun"]]
+
+
+def test_a_head_whose_required_gates_never_ran_is_not_mergeable(monkeypatch):
+    """Absence of information is not a verdict: an all-green rollup that lacks
+    the required contexts (gates skipped or never triggered) must not merge."""
+    rollup = [{"name": "Secret scan", "conclusion": "SUCCESS",
+               "startedAt": "2026-09-08T01:00:00Z", "detailsUrl": URL.format(run=11, job=1)}]
+    fake, calls = _fake_gh(rollup, {})
+    monkeypatch.setattr(review_merge, "_gh", fake)
+    ok, reason = review_merge._pr_is_mergeable("/repo", PR)
+    assert ok is False
+    assert reason == (
+        "checks_missing: ['Final merge gate', "
+        "'Acceptance gate (independent verdict on exact SHA)']"
+    )
     assert not [c for c in calls if c[:2] == ["run", "rerun"]]
