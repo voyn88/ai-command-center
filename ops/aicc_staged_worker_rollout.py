@@ -741,10 +741,17 @@ def _process_gid(pid: int) -> int:
     raise RolloutError(f"MainPID {pid} has no Gid field")
 
 
-def _lane_inputs_visible(pid: int, uid: int, data_dir: str) -> str | None:
-    """Prove, from INSIDE the lane's mount namespace and as its principal,
-    that the inputs every task needs are readable: the project config under
-    the lane's data dir and each repository_path it configures.
+def _lane_inputs_visible(
+    pid: int, uid: int, data_dir: str, environment: tuple[str, ...] = ()
+) -> str | None:
+    """Prove, from INSIDE the lane's mount namespace, as its principal and
+    with its own environment, that the inputs every task needs are usable:
+    the project config under the lane's data dir is readable and each
+    repository_path it configures answers `git rev-parse --show-toplevel`.
+    `test -d` alone is not enough: a visible clone that git refuses as
+    "dubious ownership" (owned by voynadmin, read by aicc-worker) killed every
+    writer-lease acquire on worker-01 (2026-09-08); the lane's environment
+    carries the safe.directory trust for exactly the bound paths.
 
     Returns the failure, or None when everything is visible. This is the
     check whose absence let the 2026-09-08 outage ship: the unit was
@@ -765,19 +772,27 @@ def _lane_inputs_visible(pid: int, uid: int, data_dir: str) -> str | None:
     if not repositories:
         return f"{config} configures no repository_path: every task would fail"
     gid = _process_gid(pid)
-    probes = ((str(config), "-r"), *((path, "-d") for path in repositories))
-    for path, flag in probes:
+    enter = ["nsenter", "-t", str(pid), "-m", "-S", str(uid), "-G", str(gid), "--"]
+    # `env -i` + the lane's own variables: the probe must see the clone the
+    # way the worker does, not the way root's shell does.
+    lane_env = ["env", "-i", *environment]
+    probes = (
+        (str(config), ["test", "-r", str(config)]),
+        *(
+            (path, [*lane_env, "git", "-C", path, "rev-parse", "--show-toplevel"])
+            for path in repositories
+        ),
+    )
+    for path, argv in probes:
         result = subprocess.run(
-            [
-                "nsenter", "-t", str(pid), "-m", "-S", str(uid), "-G", str(gid),
-                "--", "test", flag, path,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+            [*enter, *argv], capture_output=True, text=True, check=False
         )
         if result.returncode != 0:
-            return f"{path} is not visible inside the lane namespace as uid {uid}"
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            return (
+                f"{path} is not usable inside the lane namespace as uid {uid}"
+                + (f": {detail[0][:160]}" if detail else "")
+            )
     return None
 
 
@@ -938,7 +953,7 @@ def verify_unit(
     )
     if len(data_dirs) != 1 or not data_dirs[0].startswith("/"):
         raise RolloutError(f"{unit} MainPID has no single absolute {DATA_DIR_ENVIRONMENT_KEY}")
-    failure = lane_inputs_visible(int(raw_pid), unit_uid, data_dirs[0])
+    failure = lane_inputs_visible(int(raw_pid), unit_uid, data_dirs[0], environment)
     if failure is not None:
         raise RolloutError(f"{unit} cannot read its task inputs: {failure}")
 

@@ -31,7 +31,7 @@ def _module():
     # The lane-input probe nsenters a live PID; ordinary tests take the
     # visible answer, dedicated tests below override this seam.
     module._real_lane_inputs_visible = module._lane_inputs_visible
-    module._lane_inputs_visible = lambda pid, uid, data_dir: None
+    module._lane_inputs_visible = lambda pid, uid, data_dir, environment=(): None
 
     class RootRegistryStat:
         def __init__(self, value):
@@ -1334,7 +1334,7 @@ def test_a_lane_that_cannot_read_its_inputs_is_refused_with_the_path():
     systemd = FakeSystemd((unit,))
     seen = []
 
-    def blind(pid, uid, data_dir):
+    def blind(pid, uid, data_dir, environment=()):
         seen.append((pid, uid, data_dir))
         return "/home/voynadmin/Projects/ai-command-center is not visible inside the lane namespace as uid 1002"
 
@@ -1356,7 +1356,7 @@ def test_rollout_refuses_to_advance_past_a_blind_lane():
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: _ENV_OK,
-            lane_inputs_visible=lambda pid, uid, data_dir: (
+            lane_inputs_visible=lambda pid, uid, data_dir, environment=(): (
                 "project_config.json is not visible inside the lane namespace as uid 1002"
             ),
         )
@@ -1383,17 +1383,21 @@ def test_lane_inputs_probe_reads_the_config_on_the_host_and_tests_each_path_in_t
 
     def fake_run(argv, **kwargs):
         ran.append(argv)
-        return subprocess.CompletedProcess(argv, 1 if argv[-1].endswith("/aios") else 0, "", "")
+        failing = "/aios" in " ".join(argv)
+        return subprocess.CompletedProcess(argv, 1 if failing else 0, "", "fatal: detected dubious ownership" if failing else "")
 
     monkeypatch.setattr(real.subprocess, "run", fake_run)
-    failure = real._lane_inputs_visible(4242, 1002, str(data_dir))
-    assert failure == "/home/voynadmin/Projects/aios is not visible inside the lane namespace as uid 1002"
-    assert ran[0][:8] == ["nsenter", "-t", "4242", "-m", "-S", "1002", "-G", "2002"]
-    assert [a[-2:] for a in ran] == [
-        ["-r", str(data_dir / "project_config.json")],
-        ["-d", "/home/voynadmin/Projects/ai-command-center"],
-        ["-d", "/home/voynadmin/Projects/aios"],
-    ]
+    env = ("GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=/x")
+    failure = real._lane_inputs_visible(4242, 1002, str(data_dir), env)
+    assert failure == (
+        "/home/voynadmin/Projects/aios is not usable inside the lane namespace as uid 1002"
+        ": fatal: detected dubious ownership"
+    )
+    assert all(a[:9] == ["nsenter", "-t", "4242", "-m", "-S", "1002", "-G", "2002", "--"] for a in ran)
+    assert ran[0][9:] == ["test", "-r", str(data_dir / "project_config.json")]
+    # git runs with the LANE's environment, not root's: env -i + its variables.
+    assert ran[1][9:] == ["env", "-i", *env, "git", "-C", "/home/voynadmin/Projects/ai-command-center", "rev-parse", "--show-toplevel"]
+    assert ran[2][-3:] == ["/home/voynadmin/Projects/aios", "rev-parse", "--show-toplevel"]
 
 
 def test_lane_inputs_probe_refuses_a_config_without_any_repository_path(tmp_path):
