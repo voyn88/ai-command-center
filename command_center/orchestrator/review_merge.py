@@ -3210,7 +3210,25 @@ class PrWindowConfig:
     #: `gh pr list` with no explicit sort returns newest-created-first, so a
     #: plain `--limit` truncated the oldest, un-reviewed backlog out of
     #: consideration entirely on any repo busier than this number.)
-    scan_limit: int = 50
+    #: Every open PR must be seen, or the ones beyond the scan never get a
+    #: label at all (67 unlabelled PRs on 2026-09-07 at 180+ open). The
+    #: listing is light (no reviews/checks/commits per PR), so a large limit
+    #: is cheap; details are fetched lazily for candidates only.
+    scan_limit: int = 300
+    #: The listing is exhaustive, not bounded: `scan_limit` is the first page
+    #: size, and a page that comes back full is retried at twice the size
+    #: until a page comes back short (review of d16dc0e4: a fixed 300 still
+    #: silently omitted PR 301+). This is the ceiling past which the tick
+    #: refuses to pretend it saw everything and reports `pr_list_truncated`.
+    scan_hard_cap: int = 5000
+    #: How many per-PR detail lookups (`gh pr view` with reviews, checks,
+    #: commits) one tick may spend, candidates included. The block reasons
+    #: (`_window_block_reason`: reject marker, missing/red checks, stale
+    #: head) need those details, so PRs beyond the window are still
+    #: examined while budget remains -- oldest first -- and a PR the budget
+    #: did not reach keeps the label it has: `blocked` is never downgraded
+    #: to `waiting` on no evidence (adversarial review of 53183850).
+    detail_budget: int = 80
     #: A PR whose head commit is older than this (seconds) with no green
     #: acceptance path yet is blocked from the window rather than occupying
     #: a slot indefinitely. Default 48h.
@@ -3237,6 +3255,19 @@ class PrWindowReport:
     #: PRs can be told apart from a genuine stale push rather than a lookup
     #: failure silently inflating its apparent age.
     age_fallback: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, headRefOid) beyond the window that the detail budget did not
+    #: reach this tick; their existing window label was left untouched.
+    unchecked: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, headRefOid) whose detail lookup (`gh pr view`) failed this
+    #: tick; their existing window label was left untouched -- a transient
+    #: GitHub error is no evidence about eligibility (review of d16dc0e4).
+    unreadable: list[tuple[int, str]] = field(default_factory=list)
+    #: Set when the listing itself failed: nothing was labelled this tick,
+    #: and the caller must say so loudly rather than print an empty report
+    #: (live 2026-09-08: the old all-fields listing exceeded GitHub's
+    #: 500,000 GraphQL node limit at 50 PRs and the tick silently did nothing
+    #: for days -- VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE).
+    error: str | None = None
 
 
 def _independent_latest_reject_marker(
@@ -3440,65 +3471,126 @@ def reconcile_pr_window(
     active PR out and back in on no real change, restarting its review
     cycle for nothing."""
     report = PrWindowReport()
-    listed = _gh(
-        [
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--search",
-            "sort:created-asc",
-            "--limit",
-            str(max(cfg.scan_limit, 1)),
-            "--json",
-            "number,url,headRefOid,createdAt,commits,reviews,"
-            "statusCheckRollup,author,labels",
-        ],
-        repo_path,
-    )
-    if listed.returncode != 0:
-        return report
-    try:
-        prs = json.loads(listed.stdout or "[]")
-    except ValueError:
-        return report
-    if not isinstance(prs, list):
-        return report
-
+    # Light listing only: reviews, checks and commits multiply the GraphQL
+    # node budget per PR and the full-field request died at 50 PRs
+    # ("requests up to 520,100 possible nodes which exceeds the maximum
+    # limit of 500,000"). Details are fetched per candidate below, and only
+    # until the window is full: a PR far down the queue cannot be selected
+    # this tick, so evaluating it would be wasted API budget.
+    # Exhaustive: page size doubles while a page comes back full, so every
+    # open PR is seen or the tick says loudly that it was not (`pr_list_
+    # truncated`); a bounded `--limit` silently dropped PR N+1 onward
+    # (review of d16dc0e4). `gh pr list` pages the GraphQL cursor itself.
+    limit = max(cfg.scan_limit, 1)
+    while True:
+        listed = _gh(
+            [
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--search",
+                "sort:created-asc",
+                "--limit",
+                str(limit),
+                "--json",
+                "number,url,headRefOid,createdAt,author,labels",
+            ],
+            repo_path,
+        )
+        if listed.returncode != 0:
+            report.error = f"pr_list_failed: {(listed.stderr or '').strip()[:200]}"
+            return report
+        try:
+            prs = json.loads(listed.stdout or "[]")
+        except ValueError:
+            report.error = "pr_list_unparseable"
+            return report
+        if not isinstance(prs, list):
+            report.error = "pr_list_unparseable"
+            return report
+        if len(prs) < limit:
+            break
+        if limit >= max(cfg.scan_hard_cap, 1):
+            report.error = f"pr_list_truncated: {limit} open PRs listed and the page was full"
+            return report
+        limit = min(limit * 2, max(cfg.scan_hard_cap, 1))
     now = time.time()
-    eligible: list[dict[str, Any]] = []
-    for pr in prs:
-        if not isinstance(pr, dict):
-            continue
-        number = int(pr.get("number") or 0)
-        head = str(pr.get("headRefOid") or "")
-        age_seconds, fell_back = _pr_age_seconds(repo_path, pr, now=now)
-        if fell_back:
-            report.age_fallback.append((number, head))
-        reason = _window_block_reason(pr, cfg, age_seconds=age_seconds)
-        if reason is not None:
-            report.blocked.append((number, reason))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_blocked)
-            continue
-        eligible.append(pr)
-
-    eligible.sort(
+    listed_prs = [pr for pr in prs if isinstance(pr, dict)]
+    listed_prs.sort(
         key=lambda pr: (str(pr.get("createdAt") or ""), int(pr.get("number") or 0))
     )
-    current_active = [pr for pr in eligible if cfg.label_active in _pr_window_labels(pr)]
-    rest = [pr for pr in eligible if cfg.label_active not in _pr_window_labels(pr)]
-    selected = current_active[: cfg.max_active]
-    selected += rest[: max(cfg.max_active - len(selected), 0)]
-    selected_numbers = {int(pr.get("number") or 0) for pr in selected}
+    # Sticky for the currently active set: they are examined first and keep
+    # their slot while still eligible; the age-sorted rest fills what is left.
+    ordered = [pr for pr in listed_prs if cfg.label_active in _pr_window_labels(pr)]
+    ordered += [pr for pr in listed_prs if cfg.label_active not in _pr_window_labels(pr)]
 
-    for pr in eligible:
+    selected = 0
+    details_used = 0
+    for pr in ordered:
         number = int(pr.get("number") or 0)
         head = str(pr.get("headRefOid") or "")
-        if number in selected_numbers:
-            report.active.append((number, head))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_active)
-        else:
+        window_full = selected >= cfg.max_active
+        if details_used >= max(cfg.detail_budget, 0):
+            # Out of detail budget: no evidence either way this tick, so no
+            # label write at all -- whatever the PR carried (active, waiting,
+            # blocked, nothing) stays. Writing `waiting` here demoted an
+            # active PR on no real change whenever the active set outgrew
+            # the budget (review of 5dec6322). Re-examined on a later tick.
+            report.unchecked.append((number, head))
+            continue
+        details_used += 1
+        detailed = _pr_window_details(repo_path, pr)
+        if detailed is None:
+            # Unknown is not evidence: a failed `gh pr view` says nothing
+            # about eligibility, so the PR's existing label (active,
+            # blocked, waiting or none) stays exactly as it was and the PR is
+            # reported unreadable for this tick (review of d16dc0e4: stamping
+            # `waiting` here could demote an active or blocked PR on a
+            # transient GitHub error). Re-examined next tick.
+            report.unreadable.append((number, head))
+            continue
+        age_seconds, fell_back = _pr_age_seconds(repo_path, detailed, now=now)
+        if fell_back:
+            report.age_fallback.append((number, head))
+        reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+        if reason is not None:
+            report.blocked.append((number, reason))
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
+            continue
+        if window_full:
             report.waiting.append((number, head))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
+            continue
+        selected += 1
+        report.active.append((number, head))
+        _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
 
     return report
+
+
+_PR_WINDOW_DETAIL_FIELDS = "reviews,statusCheckRollup,commits"
+
+
+def _pr_window_details(repo_path: str, pr: dict[str, Any]) -> dict[str, Any] | None:
+    """The per-PR fields the eligibility rules need (reviews, check rollup,
+    commits), fetched with one `gh pr view` -- unless the listing already
+    carried them (tests and any future richer listing). None when the
+    lookup fails, which the caller treats as not-eligible-this-tick."""
+    if all(key in pr for key in ("reviews", "statusCheckRollup", "commits")):
+        return pr
+    number = int(pr.get("number") or 0)
+    view = _gh(
+        ["pr", "view", str(number), "--json", _PR_WINDOW_DETAIL_FIELDS], repo_path
+    )
+    if view.returncode != 0:
+        return None
+    try:
+        details = json.loads(view.stdout or "{}")
+    except ValueError:
+        return None
+    if not isinstance(details, dict):
+        return None
+    merged = dict(pr)
+    merged.update(details)
+    return merged

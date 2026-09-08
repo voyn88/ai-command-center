@@ -3583,3 +3583,262 @@ def test_already_correctly_labelled_pr_costs_no_edit_call(monkeypatch):
     )
 
     assert edits == []
+
+
+def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE: live 2026-09-08 the listing
+    exceeded GitHub's GraphQL node limit, `gh pr list` returned rc=1 and the
+    tick printed an empty report for days. A failed listing is an error,
+    and nothing is relabelled on the strength of it."""
+    import subprocess as sp
+
+    edits: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        if argv[:2] == ["pr", "list"]:
+            return sp.CompletedProcess(argv, 1, "", "GraphQL: exceeds the maximum limit")
+        edits.append(list(argv))
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window("/repo", PrWindowConfig())
+    assert report.error is not None and "pr_list_failed" in report.error
+    assert report.active == [] and report.waiting == [] and report.blocked == []
+    assert edits == []
+
+
+def test_window_listing_is_light_and_details_come_from_one_view_per_pr_within_the_budget(monkeypatch):
+    """The listing asks for no reviews/checks/commits (that is what blew the
+    node budget); a PR's details come from exactly one `pr view`, for every
+    PR the detail budget reaches -- beyond the window too, because the block
+    check needs them (review of 53183850). Bounding is the budget's job
+    (`test_out_of_budget_prs_...`), not this test's claim (review of
+    d16dc0e4: the old name promised laziness the assertions contradicted)."""
+    import subprocess as sp
+
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 5)}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": []}
+        for n in range(1, 5)
+    ]
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        calls.append(list(argv))
+        if argv[:2] == ["pr", "list"]:
+            fields = argv[argv.index("--json") + 1]
+            assert "reviews" not in fields and "statusCheckRollup" not in fields
+            assert "commits" not in fields
+            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
+        if argv[:2] == ["pr", "view"]:
+            n = int(argv[2])
+            return sp.CompletedProcess(argv, 0, json.dumps({
+                "reviews": [], "statusCheckRollup": [],
+                "commits": [{"oid": heads[n], "committedDate": f"2026-01-0{n}T00:00:00Z"}],
+            }), "")
+        if argv[:2] == ["pr", "edit"]:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=2, stale_seconds=10**12)
+    )
+    assert report.error is None
+    assert [n for n, _ in report.active] == [1, 2]
+    assert [n for n, _ in report.waiting] == [3, 4]
+    viewed = [int(c[2]) for c in calls if c[:2] == ["pr", "view"]]
+    assert sorted(viewed) == [1, 2, 3, 4], (
+        "beyond-window PRs are still examined for block reasons while budget remains"
+    )
+    assert len(viewed) == len(set(viewed)), "exactly one detail lookup per PR"
+    assert any(c[:2] == ["pr", "edit"] and c[2] == "4" for c in calls), (
+        "the tail is still labelled waiting"
+    )
+
+
+def _window_fake(monkeypatch, light, views):
+    import subprocess as sp
+
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        calls.append(list(argv))
+        if argv[:2] == ["pr", "list"]:
+            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps(views[int(argv[2])]), "")
+        if argv[:2] == ["pr", "edit"]:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    return calls
+
+
+def test_a_genuinely_blocked_pr_beyond_the_window_is_labelled_blocked(monkeypatch):
+    """Adversarial review of 53183850: stamping everything past the window
+    `waiting` without a detail lookup lost the blocked signal for the whole
+    backlog. A stale PR far down the queue must still come out blocked."""
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 4)}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": []}
+        for n in range(1, 4)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {
+        1: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[1], "committedDate": fresh}]},
+        2: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[2], "committedDate": fresh}]},
+        # Beyond the window AND stale: an old head with no accept marker.
+        3: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[3], "committedDate": "2020-01-01T00:00:00Z"}]},
+    }
+    calls = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=3600))
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.waiting] == [2]
+    assert report.blocked == [(3, "stale_exact_head_acceptance")]
+    assert ["pr", "edit", "3", "--add-label", "review-window:blocked"] in calls
+
+
+def test_out_of_budget_prs_keep_their_blocked_label_and_are_reported(monkeypatch):
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 5)}
+    labels = {3: [{"name": "review-window:blocked"}], 4: []}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": labels.get(n, [])}
+        for n in range(1, 5)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {n: {"reviews": [], "statusCheckRollup": [],
+                 "commits": [{"oid": heads[n], "committedDate": fresh}]} for n in range(1, 5)}
+    calls = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=3600, detail_budget=2)
+    )
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.waiting] == [2]
+    assert [n for n, _ in report.unchecked] == [3, 4]
+    viewed = sorted(int(c[2]) for c in calls if c[:2] == ["pr", "view"])
+    assert viewed == [1, 2], "the budget bounds the detail lookups"
+    # Neither 3 (blocked) nor 4 (unlabelled) was examined: no label is
+    # written on no evidence.
+    assert not any(c[:2] == ["pr", "edit"] and c[2] in ("3", "4") for c in calls)
+
+
+def test_an_active_pr_beyond_the_detail_budget_is_not_demoted(monkeypatch):
+    """Two sticky-active PRs, budget for one detail lookup: the second stays
+    `active` untouched. The budget-exhausted path used to stamp `waiting`,
+    knocking an active PR out and back in on no real change."""
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 4)}
+    labels = {1: [{"name": "review-window:active"}], 2: [{"name": "review-window:active"}]}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": labels.get(n, [])}
+        for n in range(1, 4)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {n: {"reviews": [], "statusCheckRollup": [],
+                 "commits": [{"oid": heads[n], "committedDate": fresh}]} for n in range(1, 4)}
+    calls = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=2, stale_seconds=3600, detail_budget=1)
+    )
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.unchecked] == [2, 3]
+    assert not any(c[:2] == ["pr", "edit"] and c[2] in ("2", "3") for c in calls), (
+        "no evidence, no label change: 2 keeps active, 3 keeps nothing"
+    )
+
+
+def _light_pr(n: int) -> dict:
+    return {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+            "headRefOid": format(n, "040x"), "createdAt": f"2026-01-01T00:{n % 60:02d}:{n // 60:02d}Z",
+            "author": {"login": "alice"}, "labels": []}
+
+
+def test_window_lists_every_open_pr_by_growing_the_page_until_it_comes_back_short(monkeypatch):
+    """Review of d16dc0e4: a fixed --limit 300 still silently omitted PR 301+.
+    The listing is exhaustive: a full page is retried at twice the size
+    until a page is short, and every PR seen gets a label."""
+    import subprocess as sp
+
+    total = 7
+    limits: list[int] = []
+    edited: set[str] = set()
+
+    def fake_gh(argv, repo_path):
+        if argv[:2] == ["pr", "list"]:
+            limit = int(argv[argv.index("--limit") + 1])
+            limits.append(limit)
+            page = [_light_pr(n) for n in range(1, min(total, limit) + 1)]
+            return sp.CompletedProcess(argv, 0, json.dumps(page), "")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"reviews": [], "statusCheckRollup": [], "commits": []}), "")
+        if argv[:2] == ["pr", "edit"]:
+            edited.add(argv[2])
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, scan_limit=2, detail_budget=100, stale_seconds=10**12)
+    )
+    assert report.error is None
+    assert limits == [2, 4, 8], "page size doubles until a page comes back short"
+    assert edited == {str(n) for n in range(1, total + 1)}, "every open PR was seen and labelled"
+
+
+def test_window_refuses_to_pretend_it_saw_everything_past_the_hard_cap(monkeypatch):
+    import subprocess as sp
+
+    edits: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        if argv[:2] == ["pr", "list"]:
+            limit = int(argv[argv.index("--limit") + 1])
+            return sp.CompletedProcess(argv, 0, json.dumps([_light_pr(n) for n in range(1, limit + 1)]), "")
+        if argv[:2] == ["pr", "edit"]:
+            edits.append(argv)
+        return sp.CompletedProcess(argv, 0, "{}", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window("/repo", PrWindowConfig(scan_limit=2, scan_hard_cap=8))
+    assert report.error and report.error.startswith("pr_list_truncated")
+    assert edits == [], "a tick that did not see every PR labels nothing"
+
+
+def test_a_failed_detail_lookup_leaves_the_existing_label_untouched(monkeypatch):
+    """Review of d16dc0e4: a transient `gh pr view` failure stamped `waiting`,
+    demoting an active or blocked PR on no evidence. Now the label stays and
+    the PR is reported unreadable."""
+    import subprocess as sp
+
+    labels = {1: [{"name": "review-window:active"}], 2: [{"name": "review-window:blocked"}], 3: []}
+    light = [dict(_light_pr(n), labels=labels[n]) for n in (1, 2, 3)]
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        calls.append(list(argv))
+        if argv[:2] == ["pr", "list"]:
+            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 1, "", "HTTP 502")
+        if argv[:2] == ["pr", "edit"]:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=2, stale_seconds=3600))
+    assert report.error is None
+    assert [n for n, _ in report.unreadable] == [1, 2, 3]
+    assert report.active == [] and report.waiting == [] and report.blocked == []
+    assert not any(c[:2] == ["pr", "edit"] for c in calls), "no evidence, no label change"

@@ -598,6 +598,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
                 report = reconcile_pr_window(args.repo_path)
+                if report.error is not None:
+                    print(f"pr-window tick failed: {report.error}", file=sys.stderr)
+                    return 1
                 for number, head in report.active:
                     print(f"ACTIVE    #{number} -> {head}")
                 for number, head in report.waiting:
@@ -606,6 +609,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"BLOCKED   #{number}: {reason}")
                 for number, head in report.age_fallback:
                     print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+                for number, head in report.unreadable:
+                    print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
                 return 0
 
             if args.command == "downgrade":
