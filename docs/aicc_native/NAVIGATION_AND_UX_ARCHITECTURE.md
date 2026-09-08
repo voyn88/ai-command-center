@@ -45,6 +45,7 @@ screen, state and governance design lives in `WATCH_ESCALATION_UX.md`
 ## Shared interaction model
 
 - A global **Ask AICC** entry point is present everywhere. It accepts text or voice and offers three explicit intentions: ask a question, create a proposed task, or prepare a decision. Nothing is launched or changed without a visible confirmation.
+- Before that text or voice reaches the entry point, `VOYN-IOS-SPEECH-COACH` (`SpeechCoach` in `AICCNativeCore`) rewrites a dictated, hedge-heavy phrasing — "не мог бы ты, пожалуйста, показать что горит по проекту" — into one clean instruction — "Покажи что горит по проекту." — in a single on-device pass. This is text tidying only: it never calls the gateway, never launches or changes anything, and stays outside the deferred voice-processing/command-gateway boundary below. See `clients/aicc-native/apple/Sources/AICCNativeCore/SpeechCoach.swift` and its `SpeechCoachTests` for the 50+ typical-request acceptance coverage.
 - A dialogue is object-linked. The header shows the related project/task/decision, an AI-generated summary, sources and current state; the thread remains readable without opening technical logs.
 - Every decision uses one card: situation, why now, options, recommendation, risk, owner, deadline and later measured outcome. “More detail” reveals evidence progressively.
 - Every operational object has the same path: overview → object detail → related dialogue/decision → activity and proof. This prevents parallel screens with duplicate status.
