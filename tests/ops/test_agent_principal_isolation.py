@@ -415,10 +415,33 @@ def test_workspace_with_renamable_parent_is_refused(launcher, tmp_path):
         launcher._open_pinned_workspace(workspace)
 
 
+def test_workspace_parent_owned_by_the_client_is_rename_proof_unless_group_writable(
+    launcher, tmp_path
+):
+    """VOYN-W0-AICC-LAUNCHER-PARENT-RULE-REJECTS-WORKER-OWNED-WORKSPACES: the
+    worker lane provisions workspaces under directories it owns; those are
+    rename-proof against the agent when no group/other write bit is set.
+    A group-writable parent (the old 2770 root, agents in that group) is
+    still refused, and so is a parent owned by a third uid."""
+    parent = tmp_path / "ai-command-center-worktrees"
+    parent.mkdir(mode=0o700)
+    workspace = parent / "workspace"
+    workspace.mkdir()
+    me = os.getuid()
+    assert launcher._parent_is_rename_proof(workspace, me) is True
+    assert launcher._parent_is_rename_proof(workspace, me + 1) is False
+    descriptor = launcher._open_pinned_workspace(workspace, me)
+    os.close(descriptor)
+    parent.chmod(0o2770)
+    assert launcher._parent_is_rename_proof(workspace, me) is False
+    with pytest.raises(launcher.LaunchRefused, match="renamable"):
+        launcher._open_pinned_workspace(workspace, me)
+
+
 def test_workspace_bind_source_stays_on_pinned_inode_after_path_replacement(
     launcher, monkeypatch, tmp_path
 ):
-    monkeypatch.setattr(launcher, "_parent_is_rename_proof", lambda workspace: True)
+    monkeypatch.setattr(launcher, "_parent_is_rename_proof", lambda workspace, client_uid=0: True)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "identity").write_text("original", encoding="utf-8")

@@ -1386,7 +1386,7 @@ def _cleanup_workspace_bind(binding: WorkspaceBind) -> None:
     binding.path.rmdir()
 
 
-def _open_pinned_workspace(workspace: Path) -> int:
+def _open_pinned_workspace(workspace: Path, client_uid: int = 0) -> int:
     """Pin the validated directory inode until PID 1 consumes the bind source."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
@@ -1406,15 +1406,27 @@ def _open_pinned_workspace(workspace: Path) -> int:
     # 52ced1f). A rename can only happen if the PARENT directory is writable
     # by a non-root principal; require it rename-proof so the untrusted agent
     # cannot swap the workspace entry between here and PID 1's resolution.
-    if not _parent_is_rename_proof(workspace):
+    if not _parent_is_rename_proof(workspace, client_uid):
         os.close(descriptor)
         raise LaunchRefused("task workspace parent is renamable by non-root")
     return descriptor
 
 
-def _parent_is_rename_proof(workspace: Path) -> bool:
-    """True iff the workspace's parent is root-owned and not group/other-
-    writable -- i.e. no non-root principal can rename the workspace entry."""
+def _parent_is_rename_proof(workspace: Path, client_uid: int = 0) -> bool:
+    """True iff no principal other than root or the connecting client can
+    rename the workspace entry: the parent is owned by root or by the client
+    and carries no group/other write bit.
+
+    The client is the worker lane that provisioned the workspace -- the
+    trusted side of this socket (``_authorised_peer``); the threat is the
+    untrusted agent (DynamicUser, SupplementaryGroups=aicc-workspace)
+    swapping the entry between the pin and PID 1's path resolution. The old
+    rule demanded a ROOT-owned parent, which no directory a non-root worker
+    can create inside ever satisfies -- every isolated launch on worker-01
+    was refused with "task workspace parent is renamable by non-root"
+    (2026-09-08); and the workspace root itself was 2770 with the agents'
+    group, so the threat was real there. The root is 2750 now (tmpfiles):
+    agents reach only their bound /workspace, never the root."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1426,7 +1438,7 @@ def _parent_is_rename_proof(workspace: Path) -> bool:
         parent = os.fstat(parent_fd)
     finally:
         os.close(parent_fd)
-    return parent.st_uid == 0 and not (parent.st_mode & 0o022)
+    return parent.st_uid in (0, client_uid) and not (parent.st_mode & 0o022)
 
 
 def _workspace_is_quarantined(workspace: Path) -> bool:
@@ -1646,7 +1658,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         workspace_lock = _open_workspace_lock(workspace)
-        workspace_fd = _open_pinned_workspace(workspace)
+        workspace_fd = _open_pinned_workspace(workspace, peer)
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         _prepare_reusable_workspace(workspace, workspace_fd)
