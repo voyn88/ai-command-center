@@ -294,7 +294,9 @@ public struct SnapshotRemoteStore: Sendable {
 
 /// Keychain-backed storage for the device token: the token is provisioned
 /// once by the operator and lives only in the device Keychain (never in
-/// Info.plist, UserDefaults or source control).
+/// Info.plist, UserDefaults or source control). Every access is appended to
+/// `DeviceCredentialAuditLog` — the action and outcome are recorded, never
+/// the token value itself.
 public enum DeviceTokenStore {
     static let service = "aicc.native.gateway"
     static let account = "device-token"
@@ -308,10 +310,13 @@ public enum DeviceTokenStore {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data
-        else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data, let token = String(data: data, encoding: .utf8) else {
+            DeviceCredentialAuditLog.record(action: .load, outcome: status == errSecItemNotFound ? .absent : .failure)
+            return nil
+        }
+        DeviceCredentialAuditLog.record(action: .load, outcome: .success)
+        return token
     }
 
     @discardableResult
@@ -323,7 +328,9 @@ public enum DeviceTokenStore {
             kSecValueData as String: Data(token.utf8),
         ]
         SecItemDelete(attributes as CFDictionary)
-        return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
+        let ok = SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
+        DeviceCredentialAuditLog.record(action: .save, outcome: ok ? .success : .failure)
+        return ok
     }
 
     @discardableResult
@@ -333,7 +340,79 @@ public enum DeviceTokenStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        return SecItemDelete(query as CFDictionary) == errSecSuccess
+        let ok = SecItemDelete(query as CFDictionary) == errSecSuccess
+        DeviceCredentialAuditLog.record(action: .delete, outcome: ok ? .success : .failure)
+        return ok
+    }
+}
+
+// MARK: - Device credential audit trail
+
+/// An append-only, on-device record of every access to the device token in
+/// the Keychain. The log itself never stores the secret: only the action
+/// (load/save/delete), its outcome and a timestamp — enough to answer "who
+/// touched the credential and when" without adding a second copy of the
+/// secret to device storage.
+public enum DeviceCredentialAuditLog {
+    public enum Action: String, Codable, Sendable { case load, save, delete }
+    public enum Outcome: String, Codable, Sendable { case success, failure, absent }
+
+    public struct Entry: Codable, Equatable, Sendable {
+        public let action: Action
+        public let outcome: Outcome
+        public let occurredAt: Date
+
+        public init(action: Action, outcome: Outcome, occurredAt: Date) {
+            self.action = action; self.outcome = outcome; self.occurredAt = occurredAt
+        }
+    }
+
+    static func defaultURL() -> URL? {
+        guard
+            let base = FileManager.default.urls(
+                for: .applicationSupportDirectory, in: .userDomainMask
+            ).first
+        else { return nil }
+        return base.appending(path: "AICC/device-credential-audit.jsonl")
+    }
+
+    /// Appends one audit entry as a JSON line. Best-effort: a failure to
+    /// write the audit trail must never block the credential operation it
+    /// is recording, so errors are swallowed here.
+    static func record(action: Action, outcome: Outcome, at date: Date = Date(), to url: URL? = nil) {
+        guard let target = url ?? defaultURL() else { return }
+        let entry = Entry(action: action, outcome: outcome, occurredAt: date)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard var line = try? encoder.encode(entry) else { return }
+        line.append(0x0A) // newline
+        do {
+            try FileManager.default.createDirectory(
+                at: target.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            if let handle = FileHandle(forWritingAtPath: target.path) {
+                defer { try? handle.close() }
+                handle.seekToEndOfFile()
+                handle.write(line)
+            } else {
+                try line.write(to: target, options: .atomic)
+            }
+        } catch { /* audit trail must not break credential access */ }
+    }
+
+    /// Reads every recorded access, oldest first. Malformed lines are
+    /// skipped rather than failing the whole read.
+    public static func readAll(from url: URL? = nil) -> [Entry] {
+        guard let target = url ?? defaultURL(), let data = try? Data(contentsOf: target) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return data.split(separator: 0x0A).compactMap { try? decoder.decode(Entry.self, from: Data($0)) }
+    }
+
+    @discardableResult
+    public static func clear(at url: URL? = nil) -> Bool {
+        guard let target = url ?? defaultURL() else { return false }
+        return (try? FileManager.default.removeItem(at: target)) != nil
     }
 }
 

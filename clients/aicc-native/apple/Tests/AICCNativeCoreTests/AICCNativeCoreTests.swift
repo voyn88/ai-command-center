@@ -51,6 +51,28 @@ import Testing
     #expect(DeviceTokenStore.load() == nil)
 }
 
+@Test func deviceCredentialAuditLogRecordsEveryAccessWithoutTheSecret() throws {
+    let url = FileManager.default.temporaryDirectory
+        .appending(path: "aicc-test-\(UUID().uuidString)/device-credential-audit.jsonl")
+    defer { DeviceCredentialAuditLog.clear(at: url) }
+
+    DeviceCredentialAuditLog.record(action: .save, outcome: .success, to: url)
+    DeviceCredentialAuditLog.record(action: .load, outcome: .success, to: url)
+    DeviceCredentialAuditLog.record(action: .delete, outcome: .success, to: url)
+    DeviceCredentialAuditLog.record(action: .load, outcome: .absent, to: url)
+
+    let entries = DeviceCredentialAuditLog.readAll(from: url)
+    #expect(entries.map(\.action) == [.save, .load, .delete, .load])
+    #expect(entries.map(\.outcome) == [.success, .success, .success, .absent])
+
+    // The audit trail must never contain the credential value itself.
+    let raw = try String(contentsOf: url, encoding: .utf8)
+    #expect(!raw.contains("round-trip-token"))
+
+    #expect(DeviceCredentialAuditLog.clear(at: url))
+    #expect(DeviceCredentialAuditLog.readAll(from: url).isEmpty)
+}
+
 /// Live end-to-end proof against a running Gateway v1 (opt-in via environment):
 /// AICC_ITEST_URL, AICC_ITEST_TOKEN, AICC_ITEST_PIN (path to the DER pin).
 @Test func liveGatewayConnectsOverHTTPSWithTokenAndPin() async throws {
