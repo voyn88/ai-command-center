@@ -2420,8 +2420,60 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
+        rerun = _rerun_cancelled_latest_runs(repo_path, rollup)
+        if rerun:
+            return False, f"checks_cancelled_rerun_requested: {rerun[:3]}"
         return False, f"checks_not_green: {bad[:3]}"
     return True, head
+
+
+#: A cancelled latest check is not a verdict on the code: it is what a
+#: superseded, pruned or label-noise run leaves behind (all three observed
+#: live 2026-09-07/08, when 87 accepted PRs sat outside the review window
+#: with red-but-never-failed checks and an operator timer had to rerun them).
+#: The merge tick reruns such a run itself -- once per tick per run, and
+#: never past three attempts, so a run that keeps getting cancelled becomes a
+#: `checks_not_green` finding instead of an infinite retry
+#: (VOYN-W0-AICC-MERGE-TICK-RERUNS-CANCELLED-CHECKS).
+_MAX_RERUNS_PER_PR_PER_TICK = 2
+_MAX_RUN_ATTEMPTS_FOR_RERUN = 3
+_RUN_ID_IN_DETAILS_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
+
+
+def _rerun_cancelled_latest_runs(
+    repo_path: str, latest_checks: list[dict[str, Any]]
+) -> list[str]:
+    """Ask GitHub to rerun every workflow run whose LATEST check on the head
+    ended `CANCELLED`, at most `_MAX_RERUNS_PER_PR_PER_TICK` runs and only
+    while the run has fewer than `_MAX_RUN_ATTEMPTS_FOR_RERUN` attempts.
+    Returns the run ids a rerun was requested for. Idempotent by
+    construction: after the request the latest check is queued, not
+    cancelled, so the next tick does not ask again."""
+    run_ids: list[str] = []
+    for check in latest_checks:
+        if str(check.get("conclusion") or "").upper() != "CANCELLED":
+            continue
+        match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
+        if match is None or match.group(1) in run_ids:
+            continue
+        run_ids.append(match.group(1))
+    requested: list[str] = []
+    for run_id in run_ids:
+        if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
+            break
+        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
+        if view.returncode != 0:
+            continue
+        try:
+            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
+            continue
+        rerun = _gh(["run", "rerun", run_id], repo_path)
+        if rerun.returncode == 0:
+            requested.append(run_id)
+    return requested
 
 
 def _merge_state(repo_path: str, pr_url: str) -> str:
