@@ -112,6 +112,21 @@ class BacklogStore:
         )
         return bool(ok), str(reason or ""), revision
 
+    def close_superseded(
+        self, task_id: str, source_task_id: str, evidence_sha: str, detail: str | None = None
+    ) -> tuple[bool, str, int | None]:
+        """OPEN -> DONE through the 0019 reuse gate: granted only when
+        `source_task_id`'s commit (`evidence_sha`) already satisfies this
+        task's acceptance criteria on the target branch -- the planner's exit
+        for a REM/retry task that would otherwise re-implement merged work
+        (VOYN-W0-AICC-DISPATCH-REUSE-GATE). Records `sha` and `acceptance`
+        evidence naming the source before closing DONE."""
+        ok, reason, revision = self._row(
+            "SELECT * FROM backlog_close_superseded(%s, %s, %s, %s)",
+            (task_id, source_task_id, evidence_sha, detail),
+        )
+        return bool(ok), str(reason or ""), revision
+
     def record_evidence(self, task_id: str, kind: str, value: str) -> tuple[bool, str]:
         ok, reason, _revision = self._row(
             "SELECT * FROM backlog_record_evidence(%s, %s, %s)",
