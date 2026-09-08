@@ -1737,3 +1737,104 @@ def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
 
     missing, failure = _review_head_checkout(clone, "7", "f" * 40)
     assert missing is None and "unreachable" in failure
+
+
+def test_read_only_run_under_isolation_uses_a_detached_clone_in_the_principal_root(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-WORKSPACE: under principal
+    isolation the launcher admits only workspaces inside the principal root
+    and cannot see /home, so a review handed the shared clone died with
+    "[Errno 2] No such file or directory: '/home/voynadmin'" (worker-01,
+    2026-09-08). The run executes in the throwaway clone and the ExitStack
+    removes it on every exit path."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(agent_runner, "principal_executor_preflight", lambda executor: (True, "ok"))
+    clone = tmp_path / "root" / "ro-repo-abc"
+    removed: list[Path] = []
+    asked: list[Path] = []
+
+    def fake_checkout(repository):
+        asked.append(repository)
+        return clone, None
+
+    monkeypatch.setattr(handlers_module, "_read_only_isolated_checkout", fake_checkout)
+    monkeypatch.setattr(
+        handlers_module, "_remove_read_only_isolated_checkout", lambda target: removed.append(target)
+    )
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+    assert outcome.ok, outcome.reason
+    assert asked == [tmp_path]
+    assert runs[0]["repository_path"] == clone
+    assert removed == [clone]
+
+
+def test_read_only_run_outside_isolation_keeps_the_shared_clone(handler, monkeypatch, tmp_path) -> None:
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: False)
+    monkeypatch.setattr(
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda repository: (_ for _ in ()).throw(AssertionError("must not clone outside isolation")),
+    )
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+    assert outcome.ok, outcome.reason
+    assert runs[0]["repository_path"] == tmp_path
+
+
+def test_read_only_isolated_checkout_failure_is_retryable(handler, monkeypatch) -> None:
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(agent_runner, "principal_executor_preflight", lambda executor: (True, "ok"))
+    monkeypatch.setattr(
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda repository: (None, "read-only isolated checkout clone failed: boom"),
+    )
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+    assert not outcome.ok and outcome.retryable
+    assert "read-only isolated checkout clone failed" in outcome.reason
+    assert runs == []
+
+
+def test_read_only_isolated_checkout_clones_detached_at_the_source_head_and_verifies(
+    tmp_path, monkeypatch
+) -> None:
+    """Real git: the clone lands under the principal root, HEAD equals the
+    source HEAD, and the source is untouched (no worktree registered)."""
+    import subprocess
+
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "--allow-empty", "-q", "-m", "one"], check=True)
+    head = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure = handlers_module._read_only_isolated_checkout(source)
+    assert failure is None and target is not None
+    assert target.parent == root and target.name.startswith("ro-source-")
+    at = subprocess.run(["git", "-C", str(target), "rev-parse", "HEAD"],
+                        capture_output=True, text=True, check=True).stdout.strip()
+    assert at == head
+    worktrees = subprocess.run(["git", "-C", str(source), "worktree", "list", "--porcelain"],
+                               capture_output=True, text=True, check=True).stdout
+    assert str(target) not in worktrees, "the source must not be touched"
+    handlers_module._remove_read_only_isolated_checkout(target)
+    assert not target.exists()

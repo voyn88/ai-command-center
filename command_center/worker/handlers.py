@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import threading
+import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -150,6 +152,58 @@ def _review_head_checkout(
             f"expected {head_sha}"
         )
     return target, None
+
+
+def _read_only_isolated_checkout(repository: Path) -> tuple[Path | None, str | None]:
+    """A throwaway detached clone of ``repository`` under the principal
+    workspace root, for a read-only run under principal isolation.
+
+    The launcher admits a workspace only inside that root
+    (``aicc_agent_launcher._validated_workspace``) and its own unit hides
+    /home, so handing a read-only run the shared clone -- which lives under
+    /home/voynadmin and is bound read-only into the WORKER's namespace only --
+    failed every review with ``[Errno 2] No such file or directory:
+    '/home/voynadmin'`` (worker-01, 2026-09-08), and nothing merged. A
+    ``git worktree add`` is not an option either: it writes into the bound
+    clone's .git, which is read-only here. ``--no-local`` copies the objects
+    through upload-pack, so the source is never touched; the lane's system
+    gitconfig (``/etc/aicc/gitconfig``) carries the safe.directory trust the
+    source's ownership needs. Returns ``(path, None)`` or
+    ``(None, retryable_reason)``."""
+    try:
+        root = agent_runner.principal_workspace_root()
+    except (OSError, agent_runner.RunnerError) as exc:
+        return None, f"isolated workspace root is unavailable: {exc}"
+    target = root / f"ro-{repository.name}-{uuid.uuid4().hex[:12]}"
+    cloned = agent_runner._run_git(
+        ["clone", "--no-local", "--quiet", str(repository), str(target)],
+        root,
+        timeout=600,
+    )
+    if cloned is None or cloned.returncode != 0:
+        detail = cloned.stderr.strip() if cloned is not None else "git unavailable"
+        _remove_read_only_isolated_checkout(target)
+        return None, f"read-only isolated checkout clone failed: {detail[-300:]}"
+    source_head = agent_runner._run_git(["rev-parse", "HEAD"], repository)
+    at = agent_runner._run_git(["rev-parse", "HEAD"], target)
+    if (
+        source_head is None
+        or at is None
+        or not at.stdout.strip()
+        or at.stdout.strip() != source_head.stdout.strip()
+    ):
+        _remove_read_only_isolated_checkout(target)
+        observed = at.stdout.strip() if at is not None else "unknown"
+        expected = source_head.stdout.strip() if source_head is not None else "unknown"
+        return None, (
+            f"read-only isolated checkout verification failed: HEAD is {observed}, "
+            f"expected {expected}"
+        )
+    return target, None
+
+
+def _remove_read_only_isolated_checkout(target: Path) -> None:
+    shutil.rmtree(target, ignore_errors=True)
 
 
 def _remove_review_head_checkout(repository: Path, target: Path) -> None:
@@ -439,6 +493,20 @@ def _run_agent(
                 # later delivery (or another host) can genuinely cure.
                 return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
             stack.callback(_remove_review_head_checkout, repository, checkout)
+            run_repository = checkout
+        if (
+            task_type not in agent_runner.MUTATING_TASK_TYPES
+            and request.review_head_sha is None
+            and agent_runner.principal_isolation_required()
+        ):
+            # VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-WORKSPACE: a
+            # read-only run under isolation gets its own detached clone
+            # inside the principal root -- see the helper for why the
+            # shared clone cannot be handed to the launcher.
+            checkout, failure = _read_only_isolated_checkout(repository)
+            if checkout is None:
+                return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
+            stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
             expected_branch = f"backlog/{backlog_task}"
