@@ -658,6 +658,52 @@ def test_concurrent_upgrades_are_serialized(
         assert cur.fetchone()[0] == len(ALL_VERSIONS)
 
 
+def test_concurrent_role_creation_is_serialized(admin_conn, admin_dsn, psycopg):
+    """`render_role_creation()`'s advisory lock, exercised concurrently.
+
+    VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE: roles are cluster objects, so N
+    xdist workers bootstrapping their own throwaway database race the same
+    "IF NOT EXISTS THEN CREATE ROLE" check-then-act — without a lock spanning
+    both statements, more than one connection can see "does not exist" and
+    run CREATE ROLE, and the loser fails with a duplicate-object error. The
+    fix was verified manually against a live cluster (see `roles.py`'s
+    module docstring and PR #340) but never landed as a permanent regression
+    test. A throwaway role name is used, rather than one of `roles.ALL_ROLES`,
+    so this does not touch the shared cluster-level roles other concurrently
+    running xdist workers are simultaneously authenticating as.
+    """
+    import threading
+
+    role = f"aicc_test_race_{uuid.uuid4().hex[:16]}"
+    statement = roles.render_role_creation(role)
+    errors: list[Exception] = []
+    barrier = threading.Barrier(8)
+
+    def run() -> None:
+        try:
+            with psycopg.connect(admin_dsn, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    barrier.wait(timeout=30)
+                    cur.execute(statement)
+        except Exception as exc:  # noqa: BLE001 — recorded, asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    try:
+        assert errors == [], errors
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+            assert cur.fetchone() is not None
+    finally:
+        with admin_conn.cursor() as cur:
+            cur.execute(f"DROP ROLE IF EXISTS {role}")
+
+
 def test_new_tables_are_unreachable_until_granted(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
