@@ -1781,3 +1781,25 @@ def test_release_venv_installs_the_accepted_aios_wheels_from_the_root_store():
     preflight = staging.index("import aios_db")
     record = staging.index("run_release release-record")
     assert lock_install < aios_install < preflight < record
+
+
+def test_boundary_script_masks_the_launcher_trees_and_tolerates_absent_ones():
+    """The boundary canary masks exactly the launcher's sensitive trees, each
+    with the '-' prefix: a tree that does not exist yet (the workspace-bind
+    root before the first launch, the lane runtime root before a lane runs,
+    the quarantine root before the first quarantine) must not make systemd
+    refuse the canary namespace -- that refusal rolled back the whole install
+    as a boundary failure that measured nothing (worker-01, 2026-09-08)."""
+    import re
+
+    script = (Path(__file__).parents[2] / "ops" / "verify-agent-principal-boundary.sh").read_text()
+    match = re.search(r'^principal_inaccessible_paths="([^"]+)"', script, re.MULTILINE)
+    assert match, "inaccessible path list not found"
+    entries = match.group(1).split()
+    assert all(entry.startswith("-/") for entry in entries), entries
+    spec = importlib.util.spec_from_file_location(
+        "aicc_agent_launcher", Path(__file__).parents[2] / "ops" / "aicc_agent_launcher.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert {entry[1:] for entry in entries} == set(module.SENSITIVE_AUTHORITY_TREES)
