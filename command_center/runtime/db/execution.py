@@ -1079,3 +1079,49 @@ def list_queue_entries(db_path: Path) -> list[dict]:
             f"SELECT {', '.join(db._QUEUE_ENTRY_COLUMNS)} FROM queue_entry ORDER BY position ASC"
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def record_queue_divergence_check(
+    db_path: Path, *, checked_at: str, divergence: list[dict]
+) -> None:
+    """Append one row to the windowed queue-divergence memory (see the
+    `queue_divergence_check` table's DDL, migration 25, for why this exists).
+    Called once per pipeline tick with that tick's `queue_divergence()`
+    result, so a divergence that clears before the next tick is still visible
+    to `list_queue_divergence_checks`'s window."""
+    entry_ids = ",".join(str(d.get("entry_id")) for d in divergence)
+    with db.connect(db_path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO queue_divergence_check (checked_at, divergence_count, entry_ids) "
+                "VALUES (?, ?, ?)",
+                (checked_at, len(divergence), entry_ids),
+            )
+
+
+def list_queue_divergence_checks(db_path: Path, *, since: str | None = None) -> list[dict]:
+    """Every recorded check, oldest first, optionally limited to
+    `checked_at >= since` — the query the window summary is built from."""
+    query = "SELECT id, checked_at, divergence_count, entry_ids FROM queue_divergence_check"
+    params: tuple = ()
+    if since is not None:
+        query += " WHERE checked_at >= ?"
+        params = (since,)
+    query += " ORDER BY checked_at ASC, id ASC"
+    with db.connect(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+
+def prune_queue_divergence_checks(db_path: Path, *, before: str) -> int:
+    """Delete checks with `checked_at < before`, returning the number removed.
+    Keeps the table windowed rather than growing forever — the same shape as
+    `apply_runtime_retention`, just for this one small table, and run inline
+    by `queue_divergence_memory.record_and_summarize` rather than on a
+    separate retention schedule."""
+    with db.connect(db_path) as conn:
+        with db.transaction(conn):
+            cur = conn.execute(
+                "DELETE FROM queue_divergence_check WHERE checked_at < ?", (before,)
+            )
+            return cur.rowcount

@@ -21,7 +21,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1126,6 +1126,30 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_council_ref ON networking_i
 CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invitation(project_ref);
 """
 
+_SCHEMA_V25 = """
+-- VOYN-W0-AICC-SRV-07c: windowed memory of ADR 0007 queue-divergence checks.
+--
+-- `execution_queue.queue_divergence` recomputes fresh on every pipeline tick
+-- and is never itself persisted: a divergence that appears on tick N and is
+-- gone by tick N+1 (the mirror catches up, or the offending write was a
+-- one-off) left no trace, even though ADR 0007 step 4 ("stop writing JSON")
+-- is gated on "a session with no divergence logged" — a claim about a
+-- *period* of time, not a single instant. This table is that period's
+-- memory: one row per tick's check, pruned by
+-- `queue_divergence_memory.record_and_summarize` to a rolling window so it
+-- never grows unbounded.
+CREATE TABLE IF NOT EXISTS queue_divergence_check (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    checked_at        TEXT NOT NULL,
+    divergence_count  INTEGER NOT NULL,
+    -- Comma-joined `entry_id`s from that check's `queue_divergence()` result,
+    -- empty when the check was clean — detail for the panel, never queried on.
+    entry_ids         TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_queue_divergence_check_checked_at ON queue_divergence_check(checked_at);
+"""
+
 
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
@@ -1160,4 +1184,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (22, _SCHEMA_V22),
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
+    (25, _SCHEMA_V25),
 ]

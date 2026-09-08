@@ -156,3 +156,10 @@ def test_divergence_reaches_the_tick_result(root, tmp_path):
     assert result.ran is True
     assert [d["entry_id"] for d in result.queue_divergence] == ["q1"]
     assert "queue_divergence" in result.as_dict()
+
+    # VOYN-W0-AICC-SRV-07c: the same tick's check is also remembered, so a
+    # later clean tick does not make this one invisible.
+    assert result.queue_divergence_window is not None
+    assert result.queue_divergence_window.clean is False
+    assert result.queue_divergence_window.divergent_checks == 1
+    assert result.as_dict()["queue_divergence_window"]["clean"] is False

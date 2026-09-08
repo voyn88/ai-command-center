@@ -15,7 +15,7 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
-from command_center import pipeline_settings, task_pipeline
+from command_center import pipeline_settings, queue_divergence_memory, task_pipeline
 from command_center.pipeline_settings import PipelineSettings
 from command_center.runtime import scheduler
 from command_center.ui import autopilot_panel
@@ -243,6 +243,44 @@ def test_tick_errors_are_surfaced(isolated_data_dir):
 def test_failed_tick_is_surfaced_as_an_error(isolated_data_dir):
     at = _at(**{autopilot_panel.TICK_ERROR_KEY: "boom"})
     assert any("boom" in error.value for error in at.error)
+
+
+# --------------------------------------------------------------------------
+# VOYN-W0-AICC-SRV-07c — windowed queue-divergence memory (ADR 0007)
+# --------------------------------------------------------------------------
+
+
+def test_this_ticks_own_divergence_is_a_warning(isolated_data_dir):
+    result = _tick_result(queue_divergence=({"entry_id": "q1", "fields": ["state"]},))
+    at = _at(**{autopilot_panel.TICK_RESULT_KEY: result})
+    assert any("расхождений с зеркалом БД — 1" in warning.value for warning in at.warning)
+
+
+def test_a_clean_tick_still_warns_about_a_divergence_earlier_in_the_window(isolated_data_dir):
+    """The point of the window: this tick alone is clean, but an earlier tick in
+    the same session was not, and that must still be visible — otherwise a
+    divergence that cleared between ticks would be as if it never happened."""
+    window = queue_divergence_memory.DivergenceWindowSummary(
+        window_hours=24,
+        checks=3,
+        divergent_checks=1,
+        total_divergences=2,
+        last_divergence_at="2026-07-24T09:00:00",
+    )
+    result = _tick_result(queue_divergence=(), queue_divergence_window=window)
+    at = _at(**{autopilot_panel.TICK_RESULT_KEY: result})
+    body = "\n".join(w.value for w in at.warning)
+    assert "24 ч." in body
+    assert "2026-07-24T09:00:00" in body
+
+
+def test_a_clean_window_shows_no_divergence_warning(isolated_data_dir):
+    window = queue_divergence_memory.DivergenceWindowSummary(
+        window_hours=24, checks=3, divergent_checks=0, total_divergences=0, last_divergence_at=None
+    )
+    result = _tick_result(queue_divergence=(), queue_divergence_window=window)
+    at = _at(**{autopilot_panel.TICK_RESULT_KEY: result})
+    assert not any("расхожд" in warning.value for warning in at.warning)
 
 
 # --------------------------------------------------------------------------

@@ -76,6 +76,7 @@ from command_center import (
     git_info,
     launch_service,
     models,
+    queue_divergence_memory,
     report_parser,
     pipeline_settings,
     project_config,
@@ -516,6 +517,7 @@ class PipelineTickResult:
     reworks: tuple[dict, ...] = ()
     reviews: tuple[dict, ...] = ()
     queue_divergence: tuple[dict, ...] = ()
+    queue_divergence_window: queue_divergence_memory.DivergenceWindowSummary | None = None
     remediations: tuple[dict, ...] = ()
     stuck: tuple[StuckTask, ...] = ()
     completed_task_ids: tuple[str, ...] = ()
@@ -547,6 +549,11 @@ class PipelineTickResult:
             "reworks": [dict(r) for r in self.reworks],
             "reviews": [dict(r) for r in self.reviews],
             "queue_divergence": [dict(d) for d in self.queue_divergence],
+            "queue_divergence_window": (
+                self.queue_divergence_window.as_dict()
+                if self.queue_divergence_window is not None
+                else None
+            ),
             "remediations": [dict(r) for r in self.remediations],
             "stuck": [s.as_dict() for s in self.stuck],
             "completed_task_ids": list(self.completed_task_ids),
@@ -2214,6 +2221,10 @@ def _locked_tick(
         divergence = tuple(execution_queue.queue_divergence(root))
     except Exception as exc:  # noqa: BLE001
         _record(exc, "queue_divergence")
+    # Remembers this check in the windowed history (VOYN-W0-AICC-SRV-07c) so a
+    # divergence that clears before the next tick is not lost; never raises,
+    # see `record_and_summarize`'s docstring.
+    divergence_window = queue_divergence_memory.record_and_summarize(root, list(divergence))
 
     # 8. Plan the wave.
     decisions, _wave, tasks_by_id = _plan_wave(
@@ -2275,6 +2286,7 @@ def _locked_tick(
         reworks=tuple(reworks),
         reviews=tuple(reviews),
         queue_divergence=divergence,
+        queue_divergence_window=divergence_window,
         remediations=tuple(remediations),
         stuck=stuck,
         completed_task_ids=tuple(completed_task_ids),

@@ -394,6 +394,19 @@ def render_autopilot_wave(result=None, *, live_running: int | None = None) -> No
             "Данные верны (источник истины — JSON), но переход на БД откладывается.",
             icon=":material/sync_problem:",
         )
+    elif result.queue_divergence_window and not result.queue_divergence_window.clean:
+        # This tick alone is clean, but the windowed memory (VOYN-W0-AICC-SRV-07c)
+        # remembers an earlier one — without it a divergence that cleared before
+        # the next tick would be invisible, and step 4's "a session with no
+        # divergence" is a claim about the whole session, not this instant.
+        window = result.queue_divergence_window
+        st.warning(
+            f"Очередь: за последние {window.window_hours} ч. было расхождений — "
+            f"{window.divergent_checks} проверок ({window.total_divergences} записей), "
+            f"последнее в {window.last_divergence_at}. Сейчас расхождений нет, но переход "
+            "на БД откладывается до чистой сессии.",
+            icon=":material/sync_problem:",
+        )
 
     requested = [r for r in result.reviews if r["outcome"] == task_pipeline.REVIEW_REQUESTED]
     recorded = [r for r in result.reviews if r["outcome"] == task_pipeline.REVIEW_RECORDED]
