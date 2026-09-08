@@ -123,6 +123,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_event",
     "backlog_evidence",
     "backlog_task",
+    "monitor_finding",
     "backlog_task_remediation",
     "backlog_scan_cursor",
     "backlog_writer_lease",
@@ -272,6 +273,16 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
 # PostgreSQL authority must expose a dedicated CAS function, never blanket DML.
 _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
     "run_finalization_claim": _NONE,
+}
+
+# Fail-closed monitor findings (0021): every write travels through a SECURITY
+# DEFINER function -- record/clear (control plane and worker hosts, so the
+# worker-host probe can record) and monitor_link_task (control plane only,
+# the one field it sets). The control plane READS the table and nothing more;
+# a blanket UPDATE here would have let the web layer's role rewrite what a
+# monitor measured (adversarial review of fb837255).
+_MONITOR_FINDING_TABLES: dict[str, frozenset[str]] = {
+    "monitor_finding": _READ,
 }
 
 # The structured backlog store (0005, BO-S1), the queue-claim idiom again:
@@ -523,6 +534,9 @@ _WORKER_FUNCTIONS = (
     "queue_heartbeat(text, text)",
     "queue_complete(text, text, jsonb)",
     "queue_fail(text, text, text, boolean)",
+    # 0021: the worker-host fail-closed probe records what it measured.
+    "monitor_record_finding(text, text, jsonb)",
+    "monitor_clear_finding(text)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a
@@ -561,6 +575,15 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # 0021: read-only deploy preflight with dispatch's privileges; the task
+    # class setter the planner uses for split children and monitor tasks; the
+    # monitor-finding record/clear pair (shared with worker hosts, see
+    # _WORKER_FUNCTIONS) and the control-plane-only task link.
+    "backlog_dispatch_smoke()",
+    "backlog_set_task_class(text, text)",
+    "monitor_record_finding(text, text, jsonb)",
+    "monitor_clear_finding(text)",
+    "monitor_link_task(bigint, text)",
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
@@ -646,6 +669,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                         and table not in _APP_ENROLMENT_TABLES
                         and table not in _APP_BACKLOG_TABLES
                         and table not in _FINALIZATION_CLAIM_TABLES
+                        and table not in _MONITOR_FINDING_TABLES
                     },
                     # Declared policies. A second task adding rows here for a
                     # table this one already names must union with it, not
@@ -654,6 +678,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _APP_ENROLMENT_TABLES,
                     _APP_BACKLOG_TABLES,
                     _FINALIZATION_CLAIM_TABLES,
+                    _MONITOR_FINDING_TABLES,
                 )
             ),
             WORKER_ROLE: MappingProxyType(
@@ -939,11 +964,21 @@ def render_worker_host_role(role: str) -> list[str]:
     No new identity machinery is needed for this — role membership already
     carries the grants, and revoking a host is `ALTER ROLE ... NOLOGIN`. No
     password is rendered here, for the reason `render_role_creation()` gives.
+
+    `role` is unique per call site (a fresh per-host or per-test name), so two
+    callers never race the SAME `CREATE ROLE` — but `IN ROLE {WORKER_ROLE}`
+    still writes a `pg_auth_members` membership row that references the
+    shared `aicc_worker` role, the same class of cluster-level catalog write
+    `render_role_creation()`'s docstring guards with `pg_advisory_xact_lock`.
+    Taking that same lock here keeps every writer of `aicc_worker`-referencing
+    catalog state serialized through one gate rather than depending on each
+    new call site independently rediscovering the need for it.
     """
     _require_identifier(role)
     return [
         "DO $$\n"
         "BEGIN\n"
+        "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
         "    END IF;\n"

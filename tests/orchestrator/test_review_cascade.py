@@ -36,11 +36,7 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     assert task_id == "VOYN-W0-X"
     assert f":{review_merge._REVIEW_POLICY_VERSION}:base:" in key
     assert ":diff:" in key
-    assert [link["executor"] for link in payload["cascade"]] == [
-        "codex",
-        "copilot",
-        "claude",
-    ]
+    assert [link["executor"] for link in payload["cascade"]] == ["codex", "claude"]
     assert payload["untrusted"] is True
     assert payload["task_type"] == "independent_review"
     assert all(
@@ -60,7 +56,7 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
             assert argv[argv.index("--sandbox") + 1] == "read-only"
         else:
             assert argv[argv.index("--tools") + 1] == ""
-    assert max_attempts == len(payload["cascade"]) == 3
+    assert max_attempts == len(payload["cascade"]) == 2
 
 
 def test_exact_task_target_is_parameterized_for_enqueue_and_marker(monkeypatch):

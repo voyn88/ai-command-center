@@ -28,6 +28,7 @@ from command_center import (
     task_import,
     task_pipeline,
     task_view,
+    tournament_store,
 )
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
@@ -36,6 +37,7 @@ from command_center.ui import (
     agent_launcher,
     alert_panel,
     aml_panel,
+    board_view,
     case_panel,
     compliance_dashboard,
     customer_panel,
@@ -65,6 +67,7 @@ from command_center.ui import (
     task_cards,
     task_dependencies,
     tokens,
+    tournament_panel,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -191,6 +194,7 @@ NAV: dict[str, tuple[str, str]] = {
     "command": ("Командный центр", ":material/space_dashboard:"),
     "workspace_home": ("Workspace Home", ":material/home_work:"),
     "executive": ("Исполнительная панель", ":material/insights:"),
+    "board_view": ("Сводка для руководства", ":material/summarize:"),
     "compliance": ("Compliance Dashboard", ":material/security:"),
     "alerts": ("Алерты", ":material/notifications_active:"),
     "customers": ("Клиенты", ":material/people:"),
@@ -1153,6 +1157,8 @@ def render_home_dashboard(
             st.caption(truth.run_window_label)
         home_dashboard.card_close()
 
+        tournament_panel.render(tournament_store.ensure_current_month_published(root=ROOT))
+
     with side:
         settings = task_pipeline.pipeline_settings.load_settings(ROOT)
         # Supervisor status reflects real run state, not a hardcoded 94%/"Active".
@@ -1657,6 +1663,19 @@ elif page_key == "sar":
 
 elif page_key == "aml":
     aml_panel.render()
+
+
+# --------------------------------------------------------------------------
+# Board/Investor view — weekly one-page summary and risks for a non-technical
+# board member or investor (VOYN-MIN-BOARD-LAUNCH). Deliberately reads the
+# same `tasks` list as every operator screen instead of a separate "board
+# truth", so it can never disagree with Kanban about what is actually true.
+# --------------------------------------------------------------------------
+
+elif page_key == "board_view":
+    board_view.render_board_view(
+        board_view.build_weekly_summary(tasks, parse_project_statuses(), now=datetime.now())
+    )
 
 
 # --------------------------------------------------------------------------
