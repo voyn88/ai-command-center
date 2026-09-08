@@ -144,7 +144,17 @@ log "install the isolated template + drop-in over the legacy template (lane 2 ke
 install -m 0644 "$REPO/deploy/systemd/voyn-aicc-worker@.service" /etc/systemd/system/voyn-aicc-worker@.service
 install -d -m 0755 /etc/systemd/system/voyn-aicc-worker@.service.d
 install -m 0644 "$REPO/deploy/systemd/voyn-aicc-worker-principal-isolation.conf" /etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
-# The drop-in Requires= the recovery barrier; provide an inert one here.
+# The template Requires= the PostgreSQL tunnel and the drop-in Requires= the
+# recovery barrier; provide inert stand-ins (there is no database here).
+cat > /etc/systemd/system/voyn-aicc-pgtunnel.service <<'TUN'
+[Unit]
+Description=inert PostgreSQL tunnel stand-in (integration harness)
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+TUN
+systemctl start voyn-aicc-pgtunnel.service
 cat > /etc/systemd/system/aicc-principal-recovery.service <<'REC'
 [Unit]
 Description=inert recovery barrier (integration harness)
