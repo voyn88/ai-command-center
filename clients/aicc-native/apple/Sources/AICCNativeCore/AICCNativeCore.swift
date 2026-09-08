@@ -360,6 +360,122 @@ extension SnapshotRemoteStore {
     }
 }
 
+// MARK: - «Умный старт дня» (VOYN-IOS-AUTO-HOME)
+
+/// One entry on the owner's start-of-day priority list — either a «Мой день»
+/// owner item or a digest entry needing a decision now. Mirrors
+/// ``command_center.api.models.StartOfDayCritical``.
+public struct StartOfDayCritical: Codable, Identifiable, Equatable, Sendable {
+    public let kind: String
+    public let id: String
+    public let title: String
+    public let body: String
+    public let due: String?
+    public let refs: [String]
+    public let createdAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind, id, title, body, due, refs
+        case createdAt = "created_at"
+    }
+}
+
+/// One entry in the periodic digest, returned as non-critical context on the
+/// start-of-day snapshot. Mirrors ``command_center.api.models.DigestItem``.
+public struct DigestItem: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let title: String
+    public let body: String
+    public let category: String?
+    public let refs: [String]
+    public let createdAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, body, category, refs
+        case createdAt = "created_at"
+    }
+}
+
+/// The owner's read contract for the "smart start of day" screen: a bounded,
+/// priority-ordered critical list (due items first, then newest-first) plus
+/// the rest of today's digest for context. Mirrors
+/// ``command_center.api.models.StartOfDaySnapshot`` (``GET /v1/home/start-of-day``).
+public struct StartOfDaySnapshot: Codable, Equatable, Sendable {
+    public let day: String
+    public let critical: [StartOfDayCritical]
+    public let digest: [DigestItem]
+    public let criticalTruncated: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case day, critical, digest
+        case criticalTruncated = "critical_truncated"
+    }
+
+    public init(day: String, critical: [StartOfDayCritical] = [], digest: [DigestItem] = [], criticalTruncated: Bool = false) {
+        self.day = day; self.critical = critical; self.digest = digest; self.criticalTruncated = criticalTruncated
+    }
+}
+
+extension SnapshotRemoteStore {
+    /// Fetch the owner's start-of-day priority list (`GET /v1/home/start-of-day`).
+    /// Read-only and cheap on the server (see the Python docstring for the
+    /// <2s rationale); the client persists the result via ``StartOfDayCache``
+    /// so a restart without network still shows the owner's last real list.
+    public func fetchStartOfDay() async throws -> StartOfDaySnapshot {
+        var request = Self.request(configuration: configuration)
+        request.url = configuration.baseURL.appending(path: "v1/home/start-of-day")
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw GatewayError.invalidResponse }
+        if http.statusCode == 401 { throw GatewayError.unauthorized }
+        guard (200...299).contains(http.statusCode) else { throw GatewayError.unexpectedStatus(http.statusCode) }
+        let decoder = JSONDecoder()
+        return try decoder.decode(StartOfDaySnapshot.self, from: data)
+    }
+}
+
+/// Persists the last successfully fetched start-of-day snapshot so a cold
+/// start without network can still render the owner's priority list from
+/// disk within the <2s first-open budget, instead of showing an empty state.
+/// The DTO is already redacted by the gateway (BANK/LEGAL rows dropped
+/// server-side), so nothing sensitive is written; the file lives in
+/// Application Support, private to the app.
+public enum StartOfDayCache {
+    static func defaultURL() -> URL? {
+        guard
+            let base = FileManager.default.urls(
+                for: .applicationSupportDirectory, in: .userDomainMask
+            ).first
+        else { return nil }
+        return base.appending(path: "AICC/last-start-of-day.json")
+    }
+
+    @discardableResult
+    public static func save(_ snapshot: StartOfDaySnapshot, to url: URL? = nil) -> Bool {
+        guard let target = url ?? defaultURL() else { return false }
+        guard let data = try? JSONEncoder().encode(snapshot) else { return false }
+        do {
+            try FileManager.default.createDirectory(
+                at: target.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            try data.write(to: target, options: .atomic)
+            return true
+        } catch { return false }
+    }
+
+    public static func load(from url: URL? = nil) -> StartOfDaySnapshot? {
+        guard let target = url ?? defaultURL(),
+              let data = try? Data(contentsOf: target)
+        else { return nil }
+        return try? JSONDecoder().decode(StartOfDaySnapshot.self, from: data)
+    }
+
+    @discardableResult
+    public static func clear(at url: URL? = nil) -> Bool {
+        guard let target = url ?? defaultURL() else { return false }
+        return (try? FileManager.default.removeItem(at: target)) != nil
+    }
+}
+
 // MARK: - Last-snapshot persistence (offline start)
 
 /// Persists the last successfully fetched snapshot so a restart without
