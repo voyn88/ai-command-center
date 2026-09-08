@@ -243,9 +243,27 @@ def _render_state_actions(sar_db: Path, sar: dict) -> None:
         col_a, col_b = st.columns(2)
         with col_a:
             sub_ref = st.text_input("Ref подачи в Росфинмониторинг *", key=f"sr_{sar['id']}")
+            submit_key_prefix = f"submit_{sar['id']}"
             if st.button("📤 Подать в регулятор", key=f"sub_{sar['id']}"):
-                _safe(lambda: sar_store.submit_to_regulator(
-                    sar_db, sar["id"], actor=actor, submission_ref=sub_ref))
+                confirm_dialog.open_confirmation(submit_key_prefix)
+            confirm_dialog.render_destructive_confirmation(
+                key_prefix=submit_key_prefix,
+                dialog_title="Подтверждение подачи в регулятор",
+                warning=(
+                    f"SAR {sar['sar_number']} будет подан в Росфинмониторинг "
+                    f"(ref: {sub_ref or '—'}). Это действие юридически значимо "
+                    "и не может быть отменено."
+                ),
+                checkbox_label="Я подтверждаю подачу этого SAR в регулятор.",
+                confirm_label="Подтвердить подачу",
+                confirm_icon=":material/send:",
+                # Plain call, not `_safe` (which reruns internally): the
+                # dialog itself resets `open_key` and reruns after
+                # `on_confirm` returns, so a second rerun here would raise
+                # before that reset runs and leave the dialog stuck open.
+                on_confirm=lambda: _guarded_submit(
+                    sar_db, sar["id"], actor=actor, submission_ref=sub_ref),
+            )
         with col_b:
             if st.button("↩ Вернуть в драфт", key=f"rdraft2_{sar['id']}"):
                 _safe(lambda: sar_store.reopen_to_draft(sar_db, sar["id"], actor=actor))
@@ -387,6 +405,23 @@ def _safe(fn) -> None:
     try:
         fn()
         st.rerun()
+    except (PermissionDenied, InvalidTransition, MissingRequiredField,
+            NarrativeLocked, SarStoreError) as e:
+        st.error(str(e))
+
+
+def _guarded_submit(sar_db: Path, sar_id: str, *, actor: str, submission_ref: str) -> None:
+    """`on_confirm` callback for the regulator-submission dialog.
+
+    Unlike `_safe`, this must not call `st.rerun()` itself: it runs inside
+    `confirm_dialog.render_destructive_confirmation`, which resets the
+    dialog's open flag and reruns *after* `on_confirm` returns. Rerunning
+    here would raise before that reset executes, leaving the dialog stuck
+    open on the next render.
+    """
+    try:
+        sar_store.submit_to_regulator(
+            sar_db, sar_id, actor=actor, submission_ref=submission_ref)
     except (PermissionDenied, InvalidTransition, MissingRequiredField,
             NarrativeLocked, SarStoreError) as e:
         st.error(str(e))
