@@ -51,7 +51,7 @@ struct AICCNativeShell: View {
 
     private var content: some View {
         TabView(selection: $tab) {
-            OverviewView(snapshot: model.snapshot, connection: model.connection)
+            OverviewView(snapshot: model.snapshot, connection: model.connection, startOfDay: model.startOfDay)
                 .tabItem { Label(AppTab.overview.title, systemImage: AppTab.overview.icon) }.tag(AppTab.overview)
             WorkView(tasks: model.snapshot.tasks)
                 .tabItem { Label(AppTab.work.title, systemImage: AppTab.work.icon) }.tag(AppTab.work)
@@ -105,6 +105,7 @@ private struct PairingView: View {
 private struct OverviewView: View {
     let snapshot: Snapshot
     let connection: AICCAppModel.ConnectionState
+    let startOfDay: StartOfDaySnapshot?
 
     // Attention first, then the busiest — a calm reader sees what matters.
     private var topProjects: [Project] {
@@ -134,6 +135,7 @@ private struct OverviewView: View {
                     Text("Я собрала главное и оставила вам только то, что действительно заслуживает внимания.")
                         .font(.title3).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     CalmStatus(freshness: snapshot.freshness, needsAttention: snapshot.overview.needsAttention, connection: connection)
+                    PriorityListCard(startOfDay: startOfDay)
                     ProgressCard(goal: snapshot.goal)
                     Text("Ваши проекты").font(.title2.weight(.semibold))
                     if snapshot.projects.isEmpty {
@@ -169,6 +171,48 @@ private struct CalmStatus: View {
         }
         .padding().frame(maxWidth: .infinity, alignment: .leading)
         .background(needsAttention == 0 ? AICCTheme.mint : AICCTheme.peach, in: RoundedRectangle(cornerRadius: 20))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// The «умный старт дня» priority list (VOYN-IOS-AUTO-HOME): the owner's
+/// bounded, critical-first list, rendered as soon as the app has *any* copy
+/// on disk — this is what satisfies "priority list on first open <2s" even
+/// before the network refresh in `.task` completes.
+private struct PriorityListCard: View {
+    let startOfDay: StartOfDaySnapshot?
+
+    private func detail(_ item: StartOfDayCritical) -> String {
+        if let due = item.due, !due.isEmpty { return "Срок: \(due)" }
+        return item.body.isEmpty ? "Требует решения сегодня." : item.body
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            Text("СЕЙЧАС ВАЖНЕЕ ВСЕГО").font(.caption2.weight(.bold)).tracking(1.1).foregroundStyle(.secondary)
+            if let startOfDay, !startOfDay.critical.isEmpty {
+                ForEach(startOfDay.critical.prefix(5)) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: item.due != nil ? "clock.fill" : "exclamationmark.circle.fill")
+                            .foregroundStyle(AICCTheme.plum)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.title).font(.headline)
+                            Text(detail(item)).font(.subheadline).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if startOfDay.criticalTruncated {
+                    Text("И ещё несколько пунктов — откройте «Работу», чтобы увидеть все.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            } else if startOfDay != nil {
+                Text("Ничего критичного — можно спокойно начинать день.").foregroundStyle(.secondary)
+            } else {
+                Text("Список появится после первого подключения к серверу.").foregroundStyle(.secondary)
+            }
+        }
+        .padding(22).frame(maxWidth: .infinity, alignment: .leading)
+        .background(AICCTheme.mint, in: RoundedRectangle(cornerRadius: 24))
         .accessibilityElement(children: .combine)
     }
 }

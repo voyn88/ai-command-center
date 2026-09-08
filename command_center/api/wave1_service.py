@@ -29,6 +29,7 @@ from pathlib import Path
 from command_center.api import models, schemas
 from command_center.api import wave1_schemas as w
 from command_center.digest import DigestService
+from command_center.digest import build_start_of_day_snapshot as _build_start_of_day_snapshot
 from command_center.digest import complete_owner_item as _complete_owner_item
 from command_center.events import (
     DigestReady,
@@ -398,6 +399,21 @@ def list_digest_today() -> w.DigestItemList:
     rows = DigestService(root=ROOT).today()
     return w.DigestItemList(
         items=[_digest_from_row(r) for r in rows], limit=len(rows), offset=0
+    )
+
+
+def start_of_day() -> models.StartOfDaySnapshot:
+    """The owner's «умный старт дня» priority list. Backs
+    ``GET /home/start-of-day`` (VOYN-IOS-AUTO-HOME) — read-only, offline-
+    computable from already-persisted rows (see
+    :mod:`command_center.digest.start_of_day` for why that keeps this under the
+    <2s first-open budget)."""
+    snapshot = _build_start_of_day_snapshot(root=ROOT)
+    return models.StartOfDaySnapshot(
+        day=snapshot["day"],
+        critical=[models.StartOfDayCritical(**entry) for entry in snapshot["critical"]],
+        digest=[_digest_from_row(r) for r in snapshot["digest"]],
+        critical_truncated=snapshot["critical_truncated"],
     )
 
 

@@ -24,6 +24,11 @@ final class AICCAppModel: ObservableObject {
 
     @Published private(set) var snapshot: Snapshot
     @Published private(set) var dialogs: [DialogSummary] = []
+    /// The owner's "smart start of day" priority list (VOYN-IOS-AUTO-HOME).
+    /// Seeded from ``StartOfDayCache`` in `init`, so a cold, offline first
+    /// open still renders the last real priority list within budget instead
+    /// of an empty screen.
+    @Published private(set) var startOfDay: StartOfDaySnapshot?
     @Published private(set) var connection: ConnectionState = .fixture
 
     init() {
@@ -35,6 +40,10 @@ final class AICCAppModel: ObservableObject {
         } else {
             snapshot = (try? Fixture.healthySnapshot()) ?? .preview
         }
+        // Offline-local cache read: synchronous, on-device, no network — this
+        // is what keeps the priority list on-screen within the <2s first-open
+        // budget even before `refresh()` completes.
+        startOfDay = StartOfDayCache.load()
     }
 
     /// Whether any device credential is available (env override or Keychain).
@@ -98,6 +107,13 @@ final class AICCAppModel: ObservableObject {
         // degrade the primary snapshot state.
         if connection == .live {
             dialogs = (try? await store.fetchDialogs()) ?? dialogs
+            // Best-effort refresh of the start-of-day priority list: a fetch
+            // failure keeps whatever was already loaded from the offline
+            // cache in `init`, so the owner's list never regresses to empty.
+            if let fresh = try? await store.fetchStartOfDay() {
+                startOfDay = fresh
+                StartOfDayCache.save(fresh)
+            }
         }
     }
 }

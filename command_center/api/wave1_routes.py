@@ -163,6 +163,20 @@ def complete_owner_item(item_id: str) -> models.OwnerItem:
 
 
 # --------------------------------------------------------------------------
+# «Умный старт дня» — start-of-day priority list (VOYN-IOS-AUTO-HOME)
+# --------------------------------------------------------------------------
+
+
+@router.get("/home/start-of-day", response_model=models.StartOfDaySnapshot)
+def start_of_day() -> models.StartOfDaySnapshot:
+    """The owner's priority list for the iOS "smart start of day" screen: due
+    owner items first, then everything else newest first, bounded and
+    read-only — see ``command_center.digest.start_of_day`` for the ordering
+    and latency rationale."""
+    return service.start_of_day()
+
+
+# --------------------------------------------------------------------------
 # Дайджест — digest items
 # --------------------------------------------------------------------------
 

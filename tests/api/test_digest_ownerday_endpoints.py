@@ -99,3 +99,27 @@ def test_owner_item_complete_flow(client) -> None:
 
 def test_complete_missing_owner_item_is_404(client) -> None:
     assert client.post("/api/v1/owner-items/nope/complete").status_code == 404
+
+
+def test_start_of_day_ranks_due_owner_item_first(client, stub_sources) -> None:
+    client.post("/api/v1/digest/build")
+    client.post("/api/v1/owner-items", json={"title": "No deadline"})
+    due = client.post(
+        "/api/v1/owner-items", json={"title": "Ship it", "due": "2026-08-12T09:00:00"}
+    ).json()
+
+    snapshot = client.get("/api/v1/home/start-of-day")
+    assert snapshot.status_code == 200, snapshot.text
+    body = snapshot.json()
+    assert body["critical"][0]["id"] == due["id"]
+    assert body["critical"][0]["kind"] == "owner_item"
+    assert body["critical_truncated"] is False
+
+
+def test_start_of_day_with_nothing_pending_is_empty_and_fast(client, stub_sources) -> None:
+    # No digest built and no owner items: the snapshot degrades to empty
+    # rather than erroring, and never triggers a digest build itself.
+    snapshot = client.get("/api/v1/home/start-of-day")
+    assert snapshot.status_code == 200
+    assert snapshot.json()["critical"] == []
+    assert snapshot.json()["digest"] == []

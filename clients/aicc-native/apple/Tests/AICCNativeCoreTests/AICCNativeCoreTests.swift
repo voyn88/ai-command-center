@@ -108,6 +108,41 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+@Test func startOfDaySnapshotDecodesFromGatewayContract() throws {
+    let data = Data("""
+    {"day":"2026-08-12","critical":[{"kind":"owner_item","id":"o1","title":"Ship it","body":"","due":"2026-08-12T09:00:00","refs":["owner-item:o1"],"created_at":"2026-08-11T10:00:00"}],"digest":[{"id":"d1","title":"Overnight run","body":"","category":"overnight","refs":["run:r1"],"created_at":"2026-08-12T02:00:00"}],"critical_truncated":false}
+    """.utf8)
+    let snapshot = try JSONDecoder().decode(StartOfDaySnapshot.self, from: data)
+    #expect(snapshot.day == "2026-08-12")
+    #expect(snapshot.critical.first?.id == "o1")
+    #expect(snapshot.critical.first?.due == "2026-08-12T09:00:00")
+    #expect(snapshot.digest.first?.category == "overnight")
+    #expect(snapshot.criticalTruncated == false)
+}
+
+@Test func startOfDayCacheRoundTrips() throws {
+    let snapshot = StartOfDaySnapshot(
+        day: "2026-08-12",
+        critical: [StartOfDayCritical(kind: "owner_item", id: "o1", title: "Ship it", body: "", due: nil, refs: [], createdAt: nil)],
+        digest: [], criticalTruncated: false
+    )
+    let url = FileManager.default.temporaryDirectory
+        .appending(path: "aicc-test-\(UUID().uuidString)/start-of-day.json")
+    #expect(StartOfDayCache.save(snapshot, to: url))
+    let loaded = StartOfDayCache.load(from: url)
+    #expect(loaded == snapshot)
+    #expect(StartOfDayCache.clear(at: url))
+    #expect(StartOfDayCache.load(from: url) == nil)
+}
+
+@Test func fetchStartOfDayRequestsTheOwnerHomeRoute() throws {
+    let configuration = try GatewayConfiguration(baseURL: URL(string: "https://control.example")!, deviceToken: "tok-123")
+    var request = SnapshotRemoteStore.request(configuration: configuration)
+    request.url = configuration.baseURL.appending(path: "v1/home/start-of-day")
+    #expect(request.url?.absoluteString == "https://control.example/v1/home/start-of-day")
+    #expect(request.value(forHTTPHeaderField: "Authorization") == "******")
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
