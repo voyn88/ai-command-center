@@ -1882,3 +1882,14 @@ def test_validate_binary_refuses_a_target_that_is_group_writable(launcher, tmp_p
         launcher._validate_binary(str(link))
     binary.chmod(0o755)
     launcher._validate_binary(str(link))
+
+
+def test_the_worker_preflight_names_the_same_executors_the_broker_launches(launcher):
+    """Two authorities for "where is the executor" drift: the worker's
+    preflight pointed at /usr/local/bin (where codex never was) while the
+    broker launches from the toolchain, so codex read as unavailable and
+    every review fell through to the next link (worker-01 2026-09-08)."""
+    from command_center import agent_runner
+
+    for name, path in agent_runner.PRINCIPAL_EXECUTOR_BINARIES.items():
+        assert path == launcher.EXECUTOR_BINARIES[name], name
