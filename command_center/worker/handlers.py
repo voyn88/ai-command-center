@@ -35,6 +35,7 @@ stays on the worker host's journal.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -50,6 +51,8 @@ from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
+
+log = logging.getLogger(__name__)
 
 __all__ = ["build_handlers"]
 
@@ -154,56 +157,117 @@ def _review_head_checkout(
     return target, None
 
 
-def _read_only_isolated_checkout(repository: Path) -> tuple[Path | None, str | None]:
-    """A throwaway detached clone of ``repository`` under the principal
+# Seam for tests; the real removal is shutil's.
+_rmtree = shutil.rmtree
+
+_PERMANENT_CLONE_FAILURES = (
+    "dubious ownership",
+    "not a git repository",
+    "does not exist",
+    "No such file or directory",
+)
+
+
+def _read_only_isolated_checkout(
+    repository: Path,
+) -> tuple[Path | None, str | None, bool]:
+    """A throwaway DETACHED clone of ``repository`` under the principal
     workspace root, for a read-only run under principal isolation.
 
-    The launcher admits a workspace only inside that root
-    (``aicc_agent_launcher._validated_workspace``) and its own unit hides
-    /home, so handing a read-only run the shared clone -- which lives under
-    /home/voynadmin and is bound read-only into the WORKER's namespace only --
-    failed every review with ``[Errno 2] No such file or directory:
-    '/home/voynadmin'`` (worker-01, 2026-09-08), and nothing merged. A
-    ``git worktree add`` is not an option either: it writes into the bound
-    clone's .git, which is read-only here. ``--no-local`` copies the objects
-    through upload-pack, so the source is never touched; the lane's system
-    gitconfig (``/etc/aicc/gitconfig``) carries the safe.directory trust the
-    source's ownership needs. Returns ``(path, None)`` or
-    ``(None, retryable_reason)``."""
+    Why not the shared clone: the launcher admits a workspace only inside the
+    principal root (``aicc_agent_launcher._validated_workspace``) and its own
+    unit hides /home, while the shared clone lives under /home/voynadmin and
+    is bound read-only into the WORKER's namespace only -- every review died
+    with ``[Errno 2] No such file or directory: '/home/voynadmin'``
+    (worker-01, 2026-09-08). Why not ``git worktree add``: it writes into the
+    bound clone's .git, which is read-only here.
+
+    Ownership and mode are NOT this helper's job: the broker normalises the
+    whole workspace tree to the agent's dynamic uid and the aicc-workspace
+    group (2770 directories, 660/770 files) before it binds it as
+    ``/workspace`` (``aicc_agent_launcher``, the ``os.fchown``/``os.fchmod``
+    walk), exactly as it does for a provisioned mutating workspace; the lane
+    reads the result through that group.
+
+    Order: rev-parse the source HEAD first, clone ``--no-checkout`` (the
+    upload-pack child needs the lane's system gitconfig for the source's
+    safe.directory trust), ``checkout --detach <sha>`` -- so a source that
+    moves mid-clone or sits on a detached HEAD cannot produce a spurious
+    mismatch -- then drop ``origin``: it named the hidden /home path, and a
+    ``git fetch`` the agent attempted would have resurrected the very ENOENT
+    this exists to remove; a missing remote is a legible refusal instead.
+
+    Returns ``(path, None, False)`` on success, or ``(None, reason,
+    retryable)``: a missing root, a source git refuses (ownership, not a
+    repository, absent) are permanent -- another delivery cannot cure them
+    -- everything else is retryable.
+    """
     try:
         root = agent_runner.principal_workspace_root()
     except (OSError, agent_runner.RunnerError) as exc:
-        return None, f"isolated workspace root is unavailable: {exc}"
-    target = root / f"ro-{repository.name}-{uuid.uuid4().hex[:12]}"
-    cloned = agent_runner._run_git(
-        ["clone", "--no-local", "--quiet", str(repository), str(target)],
-        root,
-        timeout=600,
-    )
-    if cloned is None or cloned.returncode != 0:
-        detail = cloned.stderr.strip() if cloned is not None else "git unavailable"
-        _remove_read_only_isolated_checkout(target)
-        return None, f"read-only isolated checkout clone failed: {detail[-300:]}"
+        return None, f"isolated workspace root is unavailable: {exc}", False
+    if not repository.is_dir():
+        return None, f"read-only isolated checkout source is absent: {repository}", False
     source_head = agent_runner._run_git(["rev-parse", "HEAD"], repository)
+    if source_head is None or source_head.returncode != 0 or not source_head.stdout.strip():
+        detail = source_head.stderr.strip() if source_head is not None else "git unavailable"
+        permanent = any(marker in detail for marker in _PERMANENT_CLONE_FAILURES)
+        return None, f"read-only isolated checkout source is unreadable: {detail[-300:]}", not permanent
+    sha = source_head.stdout.strip()
+    target = root / f"ro-{repository.name}-{uuid.uuid4().hex[:12]}"
+    steps = (
+        (["clone", "--no-local", "--no-checkout", "--quiet", str(repository), str(target)], root),
+        (["checkout", "--quiet", "--detach", sha], target),
+        (["remote", "remove", "origin"], target),
+    )
+    for argv, cwd in steps:
+        result = agent_runner._run_git(argv, cwd, timeout=600)
+        if result is None or result.returncode != 0:
+            detail = result.stderr.strip() if result is not None else "git unavailable"
+            _remove_read_only_isolated_checkout(target)
+            permanent = any(marker in detail for marker in _PERMANENT_CLONE_FAILURES)
+            return (
+                None,
+                f"read-only isolated checkout {argv[0]} failed: {detail[-300:]}",
+                not permanent,
+            )
     at = agent_runner._run_git(["rev-parse", "HEAD"], target)
+    attached = agent_runner._run_git(["symbolic-ref", "--quiet", "HEAD"], target)
     if (
-        source_head is None
-        or at is None
-        or not at.stdout.strip()
-        or at.stdout.strip() != source_head.stdout.strip()
+        at is None
+        or at.stdout.strip() != sha
+        or attached is None
+        or attached.returncode == 0
     ):
         _remove_read_only_isolated_checkout(target)
         observed = at.stdout.strip() if at is not None else "unknown"
-        expected = source_head.stdout.strip() if source_head is not None else "unknown"
-        return None, (
-            f"read-only isolated checkout verification failed: HEAD is {observed}, "
-            f"expected {expected}"
+        return (
+            None,
+            f"read-only isolated checkout verification failed: HEAD is {observed}"
+            f" (expected detached {sha})",
+            True,
         )
-    return target, None
+    return target, None, False
 
 
 def _remove_read_only_isolated_checkout(target: Path) -> None:
-    shutil.rmtree(target, ignore_errors=True)
+    """Remove the throwaway clone and say so when that fails: a silent leak
+    of a full repository copy per review would fill the principal root
+    (review of 3d22e50d). Not `force_remove_worktree`: this is a standalone
+    clone, not a worktree of any repository, so there is nothing to
+    `git worktree remove` or `prune`."""
+    failures: list[str] = []
+
+    def _record(function, path, exc_info):
+        failures.append(f"{path}: {exc_info[1]}")
+
+    _rmtree(target, onerror=_record)
+    if failures or target.exists():
+        log.error(
+            "read-only isolated checkout %s was not fully removed: %s",
+            target,
+            "; ".join(failures[:3]) or "still present",
+        )
 
 
 def _remove_review_head_checkout(repository: Path, target: Path) -> None:
@@ -483,6 +547,21 @@ def _run_agent(
                     ),
                     retryable=False,
                 )
+            if agent_runner.principal_isolation_required():
+                # A pinned checkout is a `git worktree add` inside the bound
+                # clone (read-only under isolation) after a fetch the lane
+                # has no credential for; both fail forever, so say so once
+                # instead of consuming the cascade on retries
+                # (VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-WORKSPACE-REM).
+                return HandlerOutcome(
+                    ok=False,
+                    reason=(
+                        "review_head pin is not supported under principal isolation "
+                        "yet: the pinned worktree would be created inside the "
+                        "read-only bound clone"
+                    ),
+                    retryable=False,
+                )
             checkout, failure = _review_head_checkout(
                 repository,
                 request.review_head_pr_number or "",
@@ -503,9 +582,9 @@ def _run_agent(
             # read-only run under isolation gets its own detached clone
             # inside the principal root -- see the helper for why the
             # shared clone cannot be handed to the launcher.
-            checkout, failure = _read_only_isolated_checkout(repository)
+            checkout, failure, retryable = _read_only_isolated_checkout(repository)
             if checkout is None:
-                return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
+                return HandlerOutcome(ok=False, reason=failure or "?", retryable=retryable)
             stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
