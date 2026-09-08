@@ -502,6 +502,10 @@ _APP_BACKLOG_FUNCTIONS = (
     # DEFER_TO_USER -> OPEN for technical parks only (0014); the function is
     # the classification gate, so granting it does not grant a generic unpark.
     "backlog_resume_deferred(text)",
+    # READY_TO_REVIEW -> OPEN recovery for a task stuck with no `pr`
+    # evidence (0018); the pr-evidence check is the gate, so granting it
+    # does not grant a generic READY_TO_REVIEW unstick.
+    "backlog_recover_stuck_ready_to_review(text)",
     # The persisted scan cursor for the tick windows (0015): returns this
     # tick's offset and advances atomically per invocation.
     "backlog_scan_claim(text, text, text)",
