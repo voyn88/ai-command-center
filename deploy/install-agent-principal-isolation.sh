@@ -143,6 +143,9 @@ assert worker is not None
 PY
     chown -R root:root "$release_staging"
     chmod -R a-w "$release_staging"
+    # mktemp -d created the staging root 0700; the lane runs as aicc-worker
+    # and must traverse it (WorkingDirectory=/opt/aicc/current).
+    chmod 0555 "$release_staging"
     # Record the root-owned content manifest from the staging tree BEFORE the
     # rename, so a release directory can never exist without the manifest that
     # authorises its later reuse. A crash between the two leaves only staging,
