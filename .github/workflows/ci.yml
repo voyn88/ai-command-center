@@ -40,8 +40,13 @@ on:
 
 # Cancel superseded runs for the same ref (e.g. a new push to an open PR) so only
 # the latest commit's gates keep running.
+# A `labeled`/`unlabeled` event for anything but a `release-gate-canary-*`
+# label (the queue reconciler and operators move `queue-*` labels constantly)
+# is label noise: it must neither cancel the head's real run nor run the
+# gates again on the same SHA. Noise runs get a group of their own and every
+# job below skips on them (VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) && github.run_id || 'head' }}
   cancel-in-progress: true
 
 # Least privilege: the gates only read the checked-out code.
@@ -58,6 +63,7 @@ permissions:
 jobs:
   prepare:
     name: Prepare CI shared inputs
+    if: ${{ !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -122,6 +128,7 @@ jobs:
 
   quality-gates:
     name: Linux quality shard ${{ matrix.shard }} of 4
+    if: ${{ !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -345,7 +352,7 @@ jobs:
 
   manifest-gate:
     name: Linux manifest gate (exactly once)
-    if: always()
+    if: ${{ always() && !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     needs: [prepare, quality-gates]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -379,7 +386,7 @@ jobs:
 
   coverage-gate:
     name: Main coverage aggregation
-    if: always()
+    if: ${{ always() && !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     needs: [quality-gates]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -439,6 +446,7 @@ jobs:
   # its stable job name without relying on an agent report.
   windows-quality-gates:
     name: Windows quality gates (Ruff · compile · pytest)
+    if: ${{ !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     runs-on: windows-latest
     timeout-minutes: 30
     env:
@@ -556,6 +564,7 @@ jobs:
   # product's fail-closed provenance and report-path containment boundaries.
   security-gates:
     name: Security gates (workflow policy · provenance · supply chain)
+    if: ${{ !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -661,6 +670,7 @@ jobs:
   # command includes the TypeScript project build before emitting web/dist/.
   build-gates:
     name: Build gates (web production)
+    if: ${{ !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -695,7 +705,7 @@ jobs:
   # "ALL" and this job simply defers to the full gate instead of re-running it.
   impact-fast-check:
     name: Impact fast pre-check (advisory)
-    if: github.event_name == 'pull_request'
+    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -812,8 +822,11 @@ jobs:
   # even when an upstream job fails, is cancelled, or is skipped; only every
   # explicit success results can pass it.
   final-gate:
-    name: Final merge gate
-    if: always()
+    # On a noise run the required context keeps its real (previous) result:
+    # a skipped job under the real name would read as green (skipped counts as
+    # success for required checks) and could mask a failed head.
+    name: ${{ (github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) && 'Label event (no gate ran)' || 'Final merge gate' }}
+    if: ${{ always() && !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
