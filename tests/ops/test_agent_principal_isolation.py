@@ -1818,3 +1818,29 @@ def test_boundary_flag_check_skips_a_retired_legacy_family_unit_but_not_a_lane()
     assert 'fail "registered worker lane is not loaded: $family_unit"' in block
     # The flag itself is still required exactly for every loaded unit.
     assert "isolation flag did not reach $family_unit exactly" in block
+
+
+def test_every_launcher_read_write_path_is_created_by_tmpfiles_before_the_first_connection():
+    """systemd builds the per-connection namespace BEFORE the launcher runs, so
+    a ReadWritePaths= entry only the launcher creates refuses every first
+    connection with 226/NAMESPACE (worker-01 2026-09-08: ten launches, all
+    "Connection reset by peer" on the worker side). Each entry must be a
+    tmpfiles.d directory and tolerate absence with '-'."""
+    root = Path(__file__).parents[2]
+    unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text(encoding="utf-8")
+    tmpfiles = (root / "deploy/tmpfiles.d/aicc-agent.conf").read_text(encoding="utf-8")
+    declared = {
+        line.split()[1]
+        for line in tmpfiles.splitlines()
+        if line.strip() and not line.startswith("#") and line.split()[0] in {"d", "D", "z", "Z"}
+    }
+    entries = [
+        line.partition("=")[2].split()
+        for line in unit.splitlines()
+        if line.startswith("ReadWritePaths=")
+    ]
+    assert entries, "launcher unit has no ReadWritePaths="
+    for path in (p for entry in entries for p in entry):
+        assert path.startswith("-"), f"{path} does not tolerate an absent path"
+        assert path[1:] in declared, f"{path[1:]} is not created by tmpfiles.d/aicc-agent.conf"
+    assert "/run/aicc-agent-workspace-binds" in declared

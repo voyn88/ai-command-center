@@ -27,7 +27,11 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 KeyringMode=private
 RestrictAddressFamilies=AF_UNIX
-ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine
+# Every entry is declared in deploy/tmpfiles.d/aicc-agent.conf (a test pins
+# that): the namespace is built before ExecStart, so a path only the launcher
+# creates would refuse the connection with 226/NAMESPACE (worker-01,
+# 2026-09-08). The '-' tolerates a boot where tmpfiles has not run yet.
+ReadWritePaths=-/run/aicc-agent-launcher -/run/aicc-agent-homes -/run/aicc-agent-workspace-binds -/srv/aicc-workspaces -/srv/aicc-quarantine
 UMask=0077
 MemoryMax=256M
 TasksMax=64
