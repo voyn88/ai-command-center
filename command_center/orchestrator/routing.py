@@ -10,11 +10,16 @@ COMMENT, not an entry, until its CLI is proven on worker-01.
 
 Cascade mechanics live where the state already is: the planner writes the
 cascade into the payload, ``max_attempts`` = its length (the attempt budget
-IS the cascade budget), and the worker selects ``cascade[attempt_no - 1]``
-(clamped) — so executor failover rides the queue's existing retry/reap
-machinery (SRV-06) with no new tables and no new loop, and the audit trail
-is the existing ``work_event`` attempt history (attempt_no <-> cascade step
-is a bijection until the clamp).
+IS the cascade budget), and the worker selects the cascade link by
+``attempt_no`` wrapped modulo the cascade length (see
+``worker.handlers._cascade_step``) — so executor failover rides the queue's
+existing retry/reap machinery (SRV-06) with no new tables and no new loop,
+and the audit trail is the existing ``work_event`` attempt history. A
+redrive (``queue_redrive``) widens ``max_attempts`` without resetting
+``attempt_count``, so attempt_no <-> cascade step stays a bijection only
+within one pass through the cascade; the wrap is what makes a redrive's
+fresh attempts walk the cascade again instead of dead-ending on the last
+link every time (VOYN-W0-AICC-REDRIVE-CLAMP-RESETS-TO-LAST-LINK).
 """
 
 from __future__ import annotations

@@ -966,13 +966,45 @@ def test_cascade_second_attempt_takes_the_second_link(handler) -> None:
     assert outcome.result["cascade_step"] == 2
 
 
-def test_cascade_clamps_at_the_tail(handler) -> None:
-    """Past the last link the tail keeps serving until the attempt budget
-    (the cascade's own length, set by the planner) dead-letters the item."""
+def test_cascade_wraps_past_the_tail_instead_of_clamping(handler) -> None:
+    """VOYN-W0-AICC-REDRIVE-CLAMP-RESETS-TO-LAST-LINK: `queue_redrive` widens
+    `max_attempts` without resetting `attempt_count`, so `attempt_no` keeps
+    climbing past the cascade's own length across redrives. Clamping to the
+    last index (the old behaviour) meant every redriven attempt ran the same
+    final link regardless of the cascade's design. Wrapping modulo the
+    cascade length instead means attempt 7 on a 2-link cascade lands back on
+    step 1, not stuck on step 2 forever."""
     run_agent, runs = handler
     outcome = run_agent(_cascade_payload(), _event(), 7)
     assert outcome.ok
-    assert runs[-1]["model"] == "stronger-model"
+    assert runs[-1]["model"] is None
+    assert outcome.result["cascade_step"] == 1
+
+
+def test_redriven_item_with_fresh_attempts_restarts_the_cascade(handler) -> None:
+    """The acceptance case: a 3-link cascade fully exhausted (dead-lettered
+    at attempt_count == max_attempts == 3) and then redriven starts its
+    first fresh attempt (attempt_no 4) back at cascade step 1 -- and its
+    second fresh attempt (attempt_no 5) at step 2 -- rather than clamping
+    every redriven attempt onto the last link."""
+    run_agent, runs = handler
+    payload = _cascade_payload(
+        cascade=[
+            {"executor": "claude", "task_type": "review"},
+            {"executor": "claude", "task_type": "review", "model": "step-2"},
+            {"executor": "claude", "task_type": "review", "model": "step-3"},
+        ]
+    )
+
+    outcome = run_agent(payload, _event(), 4)
+    assert outcome.ok
+    assert runs[-1]["model"] is None
+    assert outcome.result["cascade_step"] == 1
+
+    outcome = run_agent(payload, _event(), 5)
+    assert outcome.ok
+    assert runs[-1]["model"] == "step-2"
+    assert outcome.result["cascade_step"] == 2
 
 
 def test_unavailable_executor_is_a_routing_signal_not_a_task_error(handler) -> None:

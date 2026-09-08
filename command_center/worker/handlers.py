@@ -366,14 +366,28 @@ def _tail(text: str) -> str:
     return text[-_TAIL_CHARS:] if len(text) > _TAIL_CHARS else text
 
 
+def _cascade_step(attempt_no: int, cascade_len: int) -> int:
+    """The 1-indexed cascade step for this delivery's attempt number.
+
+    ``queue_redrive`` (0002_queue_claim.up.sql) widens ``max_attempts``
+    without resetting ``attempt_count`` — deliberately, so the attempt
+    history stays an honest audit trail across redrives
+    (VOYN-W0-AICC-REDRIVE-CLAMP-RESETS-TO-LAST-LINK). That means
+    ``attempt_no`` keeps climbing past the cascade's own length on every
+    redrive. Wrapping modulo the cascade length, instead of clamping to the
+    last index, is what makes a redrive's fresh attempts walk the cascade
+    again — a redriven item with 3 extra attempts on a 3-link cascade tries
+    all three executors, not just whichever one happened to be last."""
+    return ((attempt_no - 1) % cascade_len) + 1
+
+
 def _cascade_link(request, attempt_no: int) -> dict[str, Any] | None:
     """BO-S2a: the cascade link for this delivery, selected by the queue's own
     attempt number — no new state, so failover rides the existing retry/reap
-    machinery. Clamped at the tail: once the cascade is exhausted the last
-    link keeps serving until the attempt budget (its length) dead-letters."""
+    machinery. See `_cascade_step` for why this wraps rather than clamps."""
     if not request.cascade:
         return None
-    return request.cascade[min(attempt_no, len(request.cascade)) - 1]
+    return request.cascade[_cascade_step(attempt_no, len(request.cascade)) - 1]
 
 
 def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> bool:
@@ -419,7 +433,9 @@ def _run_agent(
         )
 
     link = _cascade_link(request, attempt_no)
-    cascade_step = attempt_no if link is not None else None
+    cascade_step = (
+        _cascade_step(attempt_no, len(request.cascade)) if link is not None else None
+    )
     task_type = request.task_type
     model = request.model
     # A payload with no cascade at all (pre-BO-S2a shape, or a direct
@@ -435,7 +451,7 @@ def _run_agent(
             # into the dead letter, where the reason names the route.
             return HandlerOutcome(
                 ok=False,
-                reason=f"executor_unavailable: {executor!r} (cascade step {attempt_no})",
+                reason=f"executor_unavailable: {executor!r} (cascade step {cascade_step})",
                 retryable=True,
             )
         task_type = str(link.get("task_type", task_type))
@@ -459,7 +475,7 @@ def _run_agent(
         # attempt. Select the next healthy cascade link inside this already
         # claimed delivery instead of returning it just to increment the
         # queue attempt counter.
-        for candidate_step in range(attempt_no + 1, len(request.cascade) + 1):
+        for candidate_step in range(cascade_step + 1, len(request.cascade) + 1):
             candidate = request.cascade[candidate_step - 1]
             candidate_executor = str(candidate.get("executor"))
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
