@@ -414,8 +414,25 @@ def _validate_binary(path: str) -> None:
                     f"executor path component is not immutable root-owned: {parent}"
                 )
     link_info = candidate.lstat()
-    if link_info.st_uid != 0 or link_info.st_mode & 0o022:
+    if not _node_is_immutable_root_owned(link_info):
         raise LaunchRefused(f"executor link is not immutable root-owned: {path}")
+    if not _node_is_immutable_root_owned(resolved.stat()):
+        raise LaunchRefused(f"executor binary is not immutable root-owned: {resolved}")
+
+
+def _node_is_immutable_root_owned(info: os.stat_result) -> bool:
+    """Root-owned and not group/other-writable. A symlink's mode bits are
+    always 0777 on Linux and carry no permission meaning, so only its owner
+    is judged -- the old check applied `& 0o022` to the link itself and
+    refused EVERY executor (the toolchain exposes them as root-owned
+    symlinks), so no isolated agent ever launched (worker-01 2026-09-08:
+    "executor link is not immutable root-owned: .../bin/claude"). The
+    resolved target is judged with its real mode bits."""
+    if info.st_uid != 0:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return not (info.st_mode & 0o022)
     info = resolved.stat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
         raise LaunchRefused(f"executor is not an immutable root-owned file: {path}")

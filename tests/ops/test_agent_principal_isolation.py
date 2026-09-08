@@ -1841,3 +1841,44 @@ def test_boundary_flag_check_skips_a_retired_legacy_family_unit_but_not_a_lane()
     assert 'fail "registered worker lane is not loaded: $family_unit"' in block
     # The flag itself is still required exactly for every loaded unit.
     assert "isolation flag did not reach $family_unit exactly" in block
+
+
+def test_executor_symlink_is_judged_by_owner_only_and_its_target_by_mode(launcher):
+    """VOYN-W0-AICC-LAUNCHER-PARENT-RULE-REJECTS-WORKER-OWNED-WORKSPACES: a
+    symlink's mode is always 0777 and means nothing; refusing it on `& 0o022`
+    refused every toolchain executor. The target keeps the strict rule."""
+    def info(mode, uid):
+        return os.stat_result((mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+
+    link = 0o120777
+    assert launcher._node_is_immutable_root_owned(info(link, 0)) is True
+    assert launcher._node_is_immutable_root_owned(info(link, 1000)) is False
+    assert launcher._node_is_immutable_root_owned(info(0o100755, 0)) is True
+    assert launcher._node_is_immutable_root_owned(info(0o100775, 0)) is False
+    assert launcher._node_is_immutable_root_owned(info(0o100755, 1000)) is False
+
+
+def test_validate_binary_refuses_a_target_that_is_group_writable(launcher, tmp_path, monkeypatch):
+    binary = tmp_path / "bin" / "claude"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o775)
+    link = tmp_path / "claude-link"
+    link.symlink_to(binary)
+    real_stat = os.stat_result
+
+    class RootStat:
+        """Every node reads as root-owned; modes stay real."""
+
+    def fake_stat(self, *, follow_symlinks=True):
+        result = os.stat(self, follow_symlinks=follow_symlinks)
+        values = list(result)
+        values[4] = 0
+        return real_stat(values)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(Path, "lstat", lambda self: fake_stat(self, follow_symlinks=False))
+    with pytest.raises(launcher.LaunchRefused, match="executor binary is not immutable root-owned"):
+        launcher._validate_binary(str(link))
+    binary.chmod(0o755)
+    launcher._validate_binary(str(link))
