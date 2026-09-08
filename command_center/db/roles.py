@@ -507,6 +507,9 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Audit trail for where a record came from (0020); the importer's stamp
+    # that a row was migrated rather than authored directly in the store.
+    "backlog_record_provenance(text, text, jsonb)",
 )
 
 # The enrolment surface (0003), split by who may do what.
