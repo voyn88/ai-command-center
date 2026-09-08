@@ -47,25 +47,35 @@ def pair(tmp_path):
 @pytest.fixture
 def calls(monkeypatch, tmp_path):
     """Fake the two privileged seams; git stays real."""
-    recorded = {"systemctl": [], "migrate": 0, "smoke_rc": 0, "systemctl_rc": {}}
+    recorded = {"systemctl": [], "migrate": 0, "smoke_rc": 0, "systemctl_rc": {}, "order": []}
 
     def fake_systemctl(args, timeout):
         recorded["systemctl"].append(args)
+        recorded["order"].append(f"systemctl:{args[0]}")
         rc = recorded["systemctl_rc"].get(tuple(args[:1]), 0)
         out = "active" if args[0] == "is-active" and rc == 0 else ""
         return subprocess.CompletedProcess(args, rc, out, "" if rc == 0 else "boom")
 
     def fake_migrations(repo_path, timeout):
         recorded["migrate"] += 1
+        recorded["order"].append("migrate")
         recorded["migrate_cwd"] = repo_path
         return subprocess.CompletedProcess([], 0, "", "")
 
     def fake_smoke(repo_path, timeout):
         return subprocess.CompletedProcess([], recorded["smoke_rc"], "", "import boom")
 
+    def fake_dispatch_smoke(repo_path, timeout):
+        recorded["dispatch_smoke"] = recorded.get("dispatch_smoke", 0) + 1
+        recorded["order"].append("dispatch_smoke")
+        return subprocess.CompletedProcess(
+            [], recorded.get("dispatch_smoke_rc", 0), "", "permission denied for view"
+        )
+
     monkeypatch.setattr(self_deploy, "_systemctl", fake_systemctl)
     monkeypatch.setattr(self_deploy, "_run_migrations", fake_migrations)
     monkeypatch.setattr(self_deploy, "_import_smoke", fake_smoke)
+    monkeypatch.setattr(self_deploy, "_dispatch_smoke", fake_dispatch_smoke)
     return recorded
 
 
@@ -94,13 +104,56 @@ def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_pat
     assert _git(clone, "rev-parse", "HEAD") == new
     assert calls["migrate"] == 1
     assert calls["migrate_cwd"] == str(clone)  # the NEW tree, review of f794b3e
-    assert report.steps.index("import_smoke_passed") < report.steps.index("migrations_applied")
+    assert (
+        report.steps.index("import_smoke_passed")
+        < report.steps.index("database_upgrade_ran_not_rolled_back")
+    )
     assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
     rows = [
         json.loads(line)
         for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
     ]
     assert rows[-1]["outcome"] == "deployed" and rows[-1]["target_sha"] == new
+
+
+def test_noop_looking_migration_still_records_unrolled_back_write(
+    pair, calls, tmp_path, monkeypatch
+):
+    """Review of 5eb6f62 (`migrations_applied` on any zero exit, even a
+    no-op) and review of 15774a77 (a stdout-parsed `schema_mutated` flag
+    that missed `db upgrade` unconditionally re-asserting table grants):
+    the step recorded for a successful `db upgrade` must neither claim a
+    confirmed mutation nor claim a confirmed no-op -- it must say a database
+    write happened that will not be undone, regardless of what the command's
+    stdout says and regardless of whether a later restart fails."""
+    origin, clone, first = pair
+    _commit(origin, "advance, no pending schema change")
+    monkeypatch.setattr(
+        self_deploy, "_run_migrations",
+        lambda repo_path, timeout: subprocess.CompletedProcess(
+            [], 0, "already up to date\nre-asserted 0 table grants\n", ""
+        ),
+    )
+    fails = {"left": 1}
+
+    def one_shot_systemctl(args, timeout):
+        calls["systemctl"].append(args)
+        if args[0] == "restart" and fails["left"] > 0:
+            fails["left"] -= 1
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        out = "active" if args[0] == "is-active" else ""
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+    monkeypatch.setattr(self_deploy, "_systemctl", one_shot_systemctl)
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "rolled_back"
+    assert "restart_failed" in report.detail
+    # The checkout and services were restored, but the database write from
+    # `db upgrade` is not -- and the report must still say so, not omit it
+    # just because the command's own output looked like a no-op.
+    assert "database_upgrade_ran_not_rolled_back" in report.steps
+    assert _git(clone, "rev-parse", "HEAD") == first
 
 
 def test_diverged_and_dirty_checkouts_refuse(pair, calls, tmp_path):
@@ -288,3 +341,32 @@ def test_migration_failure_provenance_names_the_partial_database(
     assert report.outcome == "rolled_back"
     assert "database_may_hold_partial_migrations" in report.detail
     assert _git(clone, "rev-parse", "HEAD") == first
+
+
+def test_failed_dispatch_smoke_after_migration_rolls_back_before_restart(pair, calls, tmp_path):
+    """0019 on control-01 (2026-09-08): the migration applied, import-smoke was
+    green, services restarted, and every planner tick died on a view whose
+    owner the migration had changed. The dispatch smoke runs with exactly
+    dispatch's privileges AFTER the migration and BEFORE any restart; a
+    refusal rolls the checkout back with no service touched."""
+    origin, clone, first = pair
+    _commit(origin, "advance with a migration that breaks dispatch")
+    calls["dispatch_smoke_rc"] = 1
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "rolled_back"
+    assert "dispatch_smoke_failed_after_migration" in report.detail
+    assert calls["migrate"] == 1
+    assert calls["dispatch_smoke"] == 1
+    # The safety guarantee is an ORDER: migration, then the dispatch smoke,
+    # then rollback -- and no service start/restart at all (review of
+    # fc167cf7: counts alone passed with the smoke before the migration or
+    # after a restart).
+    assert calls["order"].index("migrate") < calls["order"].index("dispatch_smoke")
+    assert not any(
+        event.startswith("systemctl:") and event.split(":", 1)[1] in {"restart", "start", "reload"}
+        for event in calls["order"]
+    ), calls["order"]
+    assert _git(clone, "rev-parse", "HEAD") == first
+    assert "database_upgrade_ran_not_rolled_back" in report.steps
+    assert "dispatch_smoke_passed" not in report.steps

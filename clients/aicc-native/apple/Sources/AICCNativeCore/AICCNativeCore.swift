@@ -34,6 +34,73 @@ public enum TaskState: String, Codable, Hashable, Sendable {
     case backlog, next, inProgress = "in_progress", review, done, deferred
 }
 
+/// A plain-language risk band for the "what and why happened" microvisual,
+/// ordered so a UI can compare severity without re-encoding the ranking.
+public enum ImpactRiskLevel: String, Codable, Hashable, Sendable, Comparable, CaseIterable {
+    case low, medium, high, critical
+
+    private var rank: Int {
+        switch self {
+        case .low: 0
+        case .medium: 1
+        case .high: 2
+        case .critical: 3
+        }
+    }
+
+    public static func < (lhs: ImpactRiskLevel, rhs: ImpactRiskLevel) -> Bool { lhs.rank < rhs.rank }
+}
+
+/// One plain-language step on the "what happened" timeline strand of the
+/// microvisual. Deliberately narrower than `TimelineEvent`: it carries a
+/// human sentence instead of a technical correlation id, so it can be shown
+/// directly to a non-technical owner without translation.
+public struct ImpactTimelineStep: Codable, Identifiable, Hashable, Sendable {
+    public let id: String
+    public let occurredAt: Date
+    public let headline: String
+
+    public init(id: String, occurredAt: Date, headline: String) {
+        self.id = id; self.occurredAt = occurredAt; self.headline = headline
+    }
+}
+
+/// One link in the "why it happened" cause -> effect chain, read in order as
+/// "because <cause>, <effect>".
+public struct ImpactCauseLink: Codable, Hashable, Sendable {
+    public let cause: String
+    public let effect: String
+
+    public init(cause: String, effect: String) {
+        self.cause = cause; self.effect = effect
+    }
+}
+
+/// A microvisual-ready "what and why happened" story for a non-technical
+/// owner: a timeline strand, a cause -> effect chain and a plain-language
+/// risk read. Additive on `Task`: absent in older fixtures/snapshots, so it
+/// decodes to `nil` rather than failing the whole snapshot.
+public struct ImpactStory: Codable, Hashable, Sendable {
+    public let timeline: [ImpactTimelineStep]
+    public let causeChain: [ImpactCauseLink]
+    public let risk: ImpactRiskLevel
+    public let riskExplanation: String
+
+    public init(timeline: [ImpactTimelineStep], causeChain: [ImpactCauseLink], risk: ImpactRiskLevel, riskExplanation: String) {
+        self.timeline = timeline; self.causeChain = causeChain; self.risk = risk; self.riskExplanation = riskExplanation
+    }
+
+    /// One ordered, human-readable sentence stack combining the timeline and
+    /// cause chain (e.g. "CI failed." then "Because CI failed, acceptance is
+    /// blocked."), so a screen can render a single clear narrative without
+    /// re-deriving ordering or wording per surface.
+    public var narrative: [String] {
+        var lines = timeline.sorted(by: { $0.occurredAt < $1.occurredAt }).map(\.headline)
+        lines += causeChain.map { "Because \($0.cause), \($0.effect)." }
+        return lines
+    }
+}
+
 public struct Task: Codable, Identifiable, Hashable, Sendable {
     public let id: String
     public let title: String
@@ -41,9 +108,12 @@ public struct Task: Codable, Identifiable, Hashable, Sendable {
     /// Additive in DTO 1.0: the backlog's execution state, when known.
     public let state: TaskState?
     public let evidence: DeliveryEvidence
+    /// Additive in DTO 1.0: the non-technical "what and why happened"
+    /// microvisual story, when the server has one to tell.
+    public let story: ImpactStory?
 
-    public init(id: String, title: String, blocker: String?, state: TaskState? = nil, evidence: DeliveryEvidence) {
-        self.id = id; self.title = title; self.blocker = blocker; self.state = state; self.evidence = evidence
+    public init(id: String, title: String, blocker: String?, state: TaskState? = nil, evidence: DeliveryEvidence, story: ImpactStory? = nil) {
+        self.id = id; self.title = title; self.blocker = blocker; self.state = state; self.evidence = evidence; self.story = story
     }
 
     public init(from decoder: Decoder) throws {
@@ -54,6 +124,60 @@ public struct Task: Codable, Identifiable, Hashable, Sendable {
         // Unknown future states decode as nil rather than failing the snapshot.
         state = try? container.decodeIfPresent(TaskState.self, forKey: .state)
         evidence = try container.decode(DeliveryEvidence.self, forKey: .evidence)
+        // Same tolerance: a malformed or absent story never fails the task.
+        story = try? container.decodeIfPresent(ImpactStory.self, forKey: .story)
+    }
+
+    /// A blocker is a decision the owner must make now — the closest thing
+    /// this snapshot has to a critical alert. Absent that, evidence that
+    /// cannot be classified is next most urgent; routine in-flight work is
+    /// least urgent and gets the gentlest (or no) haptic.
+    public var criticality: Criticality {
+        if blocker != nil { return .critical }
+        switch evidence.derivedStatus {
+        case .unknown: return .high
+        case .awaitingAcceptance: return .medium
+        case .awaitingCI, .inProgress, .completed: return .low
+        }
+    }
+}
+
+/// Local, purely-derived urgency ordering — never sent by the server. It is
+/// how the client picks a haptic signal that stays legible level-to-level,
+/// not a value anyone stores.
+public enum Criticality: Int, Equatable, Comparable, CaseIterable, Sendable {
+    case low, medium, high, critical
+    public static func < (lhs: Criticality, rhs: Criticality) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+/// A single haptic "tap" of a given intensity; `HapticSignal` composes these
+/// into a pattern per `Criticality`.
+public enum HapticPulse: Equatable, Sendable { case light, medium, heavy, error }
+
+/// A short burst of pulses with the pause between them. Two patterns for
+/// different criticality levels always differ in pulse count and/or style,
+/// so the signal survives even if only one of those dimensions is felt.
+public struct HapticPattern: Equatable, Sendable {
+    public let pulses: [HapticPulse]
+    public let gapSeconds: Double
+
+    public init(pulses: [HapticPulse], gapSeconds: Double = 0.12) {
+        self.pulses = pulses
+        self.gapSeconds = gapSeconds
+    }
+}
+
+public enum HapticSignal {
+    /// Escalating by both length and weight: a critical item pulses longest
+    /// and heaviest, a low one barely taps — distinguishable even in a
+    /// pocket, where subtle single-pulse intensity differences get lost.
+    public static func pattern(for criticality: Criticality) -> HapticPattern {
+        switch criticality {
+        case .critical: HapticPattern(pulses: [.error, .heavy, .heavy], gapSeconds: 0.14)
+        case .high: HapticPattern(pulses: [.heavy, .medium], gapSeconds: 0.12)
+        case .medium: HapticPattern(pulses: [.medium], gapSeconds: 0)
+        case .low: HapticPattern(pulses: [.light], gapSeconds: 0)
+        }
     }
 }
 
@@ -260,7 +384,9 @@ public struct SnapshotRemoteStore: Sendable {
 
 /// Keychain-backed storage for the device token: the token is provisioned
 /// once by the operator and lives only in the device Keychain (never in
-/// Info.plist, UserDefaults or source control).
+/// Info.plist, UserDefaults or source control). Every access is appended to
+/// `DeviceCredentialAuditLog` — the action and outcome are recorded, never
+/// the token value itself.
 public enum DeviceTokenStore {
     static let service = "aicc.native.gateway"
     static let account = "device-token"
@@ -274,10 +400,13 @@ public enum DeviceTokenStore {
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data
-        else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let data = item as? Data, let token = String(data: data, encoding: .utf8) else {
+            DeviceCredentialAuditLog.record(action: .load, outcome: status == errSecItemNotFound ? .absent : .failure)
+            return nil
+        }
+        DeviceCredentialAuditLog.record(action: .load, outcome: .success)
+        return token
     }
 
     @discardableResult
@@ -289,7 +418,9 @@ public enum DeviceTokenStore {
             kSecValueData as String: Data(token.utf8),
         ]
         SecItemDelete(attributes as CFDictionary)
-        return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
+        let ok = SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
+        DeviceCredentialAuditLog.record(action: .save, outcome: ok ? .success : .failure)
+        return ok
     }
 
     @discardableResult
@@ -299,7 +430,79 @@ public enum DeviceTokenStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        return SecItemDelete(query as CFDictionary) == errSecSuccess
+        let ok = SecItemDelete(query as CFDictionary) == errSecSuccess
+        DeviceCredentialAuditLog.record(action: .delete, outcome: ok ? .success : .failure)
+        return ok
+    }
+}
+
+// MARK: - Device credential audit trail
+
+/// An append-only, on-device record of every access to the device token in
+/// the Keychain. The log itself never stores the secret: only the action
+/// (load/save/delete), its outcome and a timestamp — enough to answer "who
+/// touched the credential and when" without adding a second copy of the
+/// secret to device storage.
+public enum DeviceCredentialAuditLog {
+    public enum Action: String, Codable, Sendable { case load, save, delete }
+    public enum Outcome: String, Codable, Sendable { case success, failure, absent }
+
+    public struct Entry: Codable, Equatable, Sendable {
+        public let action: Action
+        public let outcome: Outcome
+        public let occurredAt: Date
+
+        public init(action: Action, outcome: Outcome, occurredAt: Date) {
+            self.action = action; self.outcome = outcome; self.occurredAt = occurredAt
+        }
+    }
+
+    static func defaultURL() -> URL? {
+        guard
+            let base = FileManager.default.urls(
+                for: .applicationSupportDirectory, in: .userDomainMask
+            ).first
+        else { return nil }
+        return base.appending(path: "AICC/device-credential-audit.jsonl")
+    }
+
+    /// Appends one audit entry as a JSON line. Best-effort: a failure to
+    /// write the audit trail must never block the credential operation it
+    /// is recording, so errors are swallowed here.
+    static func record(action: Action, outcome: Outcome, at date: Date = Date(), to url: URL? = nil) {
+        guard let target = url ?? defaultURL() else { return }
+        let entry = Entry(action: action, outcome: outcome, occurredAt: date)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard var line = try? encoder.encode(entry) else { return }
+        line.append(0x0A) // newline
+        do {
+            try FileManager.default.createDirectory(
+                at: target.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            if let handle = FileHandle(forWritingAtPath: target.path) {
+                defer { try? handle.close() }
+                handle.seekToEndOfFile()
+                handle.write(line)
+            } else {
+                try line.write(to: target, options: .atomic)
+            }
+        } catch { /* audit trail must not break credential access */ }
+    }
+
+    /// Reads every recorded access, oldest first. Malformed lines are
+    /// skipped rather than failing the whole read.
+    public static func readAll(from url: URL? = nil) -> [Entry] {
+        guard let target = url ?? defaultURL(), let data = try? Data(contentsOf: target) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return data.split(separator: 0x0A).compactMap { try? decoder.decode(Entry.self, from: Data($0)) }
+    }
+
+    @discardableResult
+    public static func clear(at url: URL? = nil) -> Bool {
+        guard let target = url ?? defaultURL() else { return false }
+        return (try? FileManager.default.removeItem(at: target)) != nil
     }
 }
 

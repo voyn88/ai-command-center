@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+# The rollout reads root-owned registries and release trees, so its fixtures
+# are built host-shaped and the suite runs under the permissive 0o002 umask.
+# See tests/ops/conftest.py.
+pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
 
 
 def _module():
@@ -21,6 +28,10 @@ def _module():
     # owner so ordinary parser tests exercise content handling; dedicated
     # tests below override this seam to prove ownership rejection.
     real_fstat = module._registry_fstat
+    # The lane-input probe nsenters a live PID; ordinary tests take the
+    # visible answer, dedicated tests below override this seam.
+    module._real_lane_inputs_visible = module._lane_inputs_visible
+    module._lane_inputs_visible = lambda pid, uid, data_dir, environment=(): None
 
     class RootRegistryStat:
         def __init__(self, value):
@@ -63,7 +74,8 @@ class FakeSystemd:
                 "SubState": "running",
                 "NoNewPrivileges": "yes",
                 "ProtectSystem": "strict",
-                "ProtectHome": "yes",
+                "ProtectHome": "tmpfs",
+                "StateDirectory": "aicc/data",
                 "ProtectControlGroups": "yes",
                 "PrivateTmp": "yes",
                 "PrivateDevices": "yes",
@@ -171,6 +183,9 @@ class FakeSystemd:
             state["SubState"] = "running"
             state["MainPID"] = "3000"
         return ""
+
+    def probe(self, *args: str) -> tuple[int, str, str]:
+        return 0, self.run(*args, check=False), ""
 
     def property(self, unit: str, name: str) -> str:
         return str(self.states[unit][name])
@@ -356,7 +371,12 @@ def test_snapshot_and_restore_tolerate_unit_absent_on_clean_host():
     unit = "aicc-principal-recovery.service"
     systemd = FakeSystemd((unit,))
     systemd.states[unit].update(
-        {"LoadState": "not-found", "enabled": False, "ActiveState": "inactive"}
+        {
+            "LoadState": "not-found",
+            "enabled": False,
+            "ActiveState": "inactive",
+            "MainPID": "0",
+        }
     )
 
     state = module.snapshot(systemd, (unit,))
@@ -368,8 +388,8 @@ def test_snapshot_and_restore_tolerate_unit_absent_on_clean_host():
         "properties": {},
     }
     module.restore(systemd, state)
-    assert ("stop", unit) in systemd.calls
-    assert ("disable", unit) in systemd.calls
+    assert ("stop", unit) not in systemd.calls
+    assert ("disable", unit) not in systemd.calls
 
 
 def test_absent_baseline_unit_restore_fails_if_unit_remains_active():
@@ -392,6 +412,30 @@ def test_absent_baseline_unit_restore_fails_if_unit_remains_active():
         module.restore(systemd, state)
 
 
+def test_self_recovery_exception_never_allows_enabled_absent_baseline_unit():
+    module = _module()
+    unit = "aicc-principal-recovery.service"
+
+    class EnabledSelfRecovery(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args[0] in {"stop", "disable"} and args[-1] == unit:
+                self.calls.append(args)
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = EnabledSelfRecovery((unit,))
+    systemd.states[unit]["MainPID"] = str(os.getpid())
+    state = {
+        "version": 2,
+        "units": {unit: {"exists": False, "enabled": False, "active": False}},
+    }
+
+    with pytest.raises(module.RolloutError, match="did not restore exactly"):
+        module.restore(systemd, state)
+
+    assert systemd.states[unit]["enabled"] is True
+
+
 def test_versioned_restore_refuses_property_drift_before_restart():
     module = _module()
     unit = "voyn-aicc-worker@1.service"
@@ -408,6 +452,67 @@ def test_versioned_restore_refuses_property_drift_before_restart():
     assert ("start", unit) not in systemd.calls
 
 
+def test_restore_accepts_activating_notify_worker_with_live_main_pid():
+    """A Type=notify unit forks its MainPID before sending READY=1.
+
+    `restore` reading `is-active` as "activating" with a nonzero MainPID
+    right after `start` is the service coming up normally, not one that
+    failed to go inactive (same shape as the live worker-01 install-recovery
+    wedge, 2026-09-07/08).
+    """
+    module = _module()
+    unit = "voyn-aicc-worker@blue.service"
+
+    class NotifyStartingSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args == ("start", unit):
+                self.calls.append(args)
+                state = self.states[unit]
+                state["ActiveState"] = "activating"
+                state["SubState"] = "start"
+                state["MainPID"] = "4242"
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = NotifyStartingSystemd((unit,))
+    state = module.snapshot(systemd, (unit,))
+    state["units"][unit]["active"] = True
+
+    module.restore(systemd, state)
+
+    assert systemd.states[unit]["ActiveState"] == "activating"
+    assert systemd.states[unit]["MainPID"] == "4242"
+
+
+def test_restore_still_refuses_deactivating_expected_inactive_main_pid():
+    """The activating exemption must not paper over a real stuck unit.
+
+    An expected-inactive unit still "deactivating" with a live MainPID after
+    `stop` is exactly the leftover-process case the assertion exists to
+    catch.
+    """
+    module = _module()
+    unit = "voyn-aicc-worker@blue.service"
+
+    class StuckStoppingSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args == ("stop", unit):
+                self.calls.append(args)
+                state = self.states[unit]
+                state["ActiveState"] = "deactivating"
+                state["SubState"] = "stop"
+                state["MainPID"] = "4242"
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = StuckStoppingSystemd((unit,))
+    state = module.snapshot(systemd, (unit,))
+    state["units"][unit]["active"] = False
+
+    with pytest.raises(module.RolloutError, match="did not restore exactly"):
+        module.restore(systemd, state)
+
+
 def test_staged_rollout_drains_and_proves_each_lane_before_next():
     module = _module()
     units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
@@ -420,7 +525,7 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
         privileged_users=("root", "voynadmin"),
         uid_for_user=_uid,
         process_uid=lambda pid: 1002,
-        process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+        process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data"),
     )
 
     mutations = [
@@ -510,6 +615,7 @@ def test_rollout_refuses_fail_open_lane_before_first_mutation(change, message):
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
 
@@ -540,6 +646,7 @@ def test_rollout_revalidates_configuration_after_drain_before_start():
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
 
@@ -576,6 +683,7 @@ def test_rollout_refuses_to_start_template_lane_while_legacy_pid_survives():
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
     # Legacy drain precedes the canary start; the surviving legacy PID must
@@ -607,6 +715,7 @@ def test_verifier_rejects_stopped_stale_or_uid_aliased_unit(change, message):
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
 
@@ -629,6 +738,7 @@ def test_verifier_rejects_named_privileged_alias_of_agent_uid():
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
 
@@ -673,6 +783,7 @@ def test_rollout_failure_restores_all_lane_states():
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
     # Failed generation remains fail-closed. The outer file transaction
@@ -922,8 +1033,451 @@ def test_rollout_checks_required_files_before_retiring_anything():
             privileged_users=("root", "voynadmin"),
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
-            process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+            process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data"),
         )
 
     # Nothing was retired, enabled, started or stopped: the refusal came first.
     assert systemd.states == before
+
+
+def _launcher_state(unit: str, *, active: bool = True) -> dict[str, str]:
+    return {
+        "enabled": False,
+        "LoadState": "loaded",
+        "FragmentPath": "/etc/systemd/system/aicc-agent-launcher@.service",
+        "DropInPaths": "",
+        "ActiveState": "active" if active else "inactive",
+        "SubState": "running" if active else "dead",
+        "NoNewPrivileges": "yes",
+        "ProtectSystem": "strict",
+        "ProtectHome": "yes",
+        "ProtectControlGroups": "yes",
+        "SupplementaryGroups": "aicc-publisher",
+        "User": "aicc-agent",
+        "Group": "aicc-agent",
+        "ExecStart": "/usr/libexec/aicc-agent-launcher",
+        "WorkingDirectory": "/var/lib/aicc-agent",
+        "EnvironmentFiles": "",
+        "MainPID": "4100" if active else "0",
+    }
+
+
+def test_broker_instances_are_discovered_for_the_snapshot_not_for_the_rollout(
+    tmp_path,
+):
+    """A `aicc-agent-launcher@<connection>.service` runs off a template the
+    control generation deletes, so it belongs in the snapshot a rollback
+    restores. It is not a worker lane, so it must not reach the rollout that
+    drains, starts and verifies lanes."""
+    module = _module()
+    lanes = tmp_path / "lanes"
+    lanes.write_text("1\n", encoding="utf-8")
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["aicc-agent-launcher@7.service"] = _launcher_state(
+        "aicc-agent-launcher@7.service"
+    )
+
+    assert module.discover_launcher_units(systemd) == (
+        "aicc-agent-launcher@7.service",
+    )
+    assert module.discover_units(systemd, lanes) == ("voyn-aicc-worker@1.service",)
+
+
+def test_snapshot_closure_refuses_a_broker_instance_outside_the_snapshot():
+    """The snapshot is what a rollback restores; a live unit absent from it is
+    a unit no rollback can put back."""
+    module = _module()
+    systemd = FakeSystemd(("voyn-aicc-worker@blue.service",))
+    systemd.states["aicc-agent-launcher@7.service"] = _launcher_state(
+        "aicc-agent-launcher@7.service"
+    )
+    state = {
+        "version": 3,
+        "units": {
+            "voyn-aicc-worker@blue.service": {
+                "exists": True,
+                "enabled": True,
+                "active": True,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="outside service snapshot"):
+        module.verify_snapshot_closure(systemd, state)
+
+
+def test_a_snapshot_covering_the_broker_instances_passes_closure():
+    module = _module()
+    systemd = FakeSystemd(("voyn-aicc-worker@blue.service",))
+    systemd.states["aicc-agent-launcher@7.service"] = _launcher_state(
+        "aicc-agent-launcher@7.service"
+    )
+    state = {
+        "version": 3,
+        "units": {
+            unit: {"exists": True, "enabled": True, "active": True, "properties": {}}
+            for unit in (
+                "voyn-aicc-worker@blue.service",
+                "aicc-agent-launcher@7.service",
+            )
+        },
+    }
+
+    module.verify_snapshot_closure(systemd, state)
+
+
+def test_a_broker_instance_already_gone_is_verified_without_mutating_it():
+    """Rollback of a control transition: the snapshot says the instance did
+    not exist, so restoring it means proving it is stopped, disabled and
+    unloaded without issuing operations that fail for a vanished transient
+    instance."""
+    module = _module()
+
+    # The strict fake models real non-zero stop/disable for a vanished unit by
+    # raising on mutation.  Production must first prove LoadState=not-found
+    # and avoid those operations, not teach the fake an impossible success.
+    systemd = FakeSystemd(())
+    state = {
+        "version": 3,
+        "units": {
+            "aicc-agent-launcher@7.service": {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    module.restore(systemd, state)
+
+    assert ("stop", "aicc-agent-launcher@7.service") not in systemd.calls
+    assert ("disable", "aicc-agent-launcher@7.service") not in systemd.calls
+    assert (
+        "show",
+        "aicc-agent-launcher@7.service",
+        "--property=LoadState",
+        "--value",
+    ) in systemd.calls
+
+
+def test_absent_broker_with_empty_load_state_is_not_treated_as_verified_gone():
+    module = _module()
+
+    class SilentLoadState(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            self.calls.append(args)
+            return 1, "", ""
+
+    systemd = SilentLoadState(())
+    state = {
+        "version": 3,
+        "units": {
+            "aicc-agent-launcher@7.service": {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="cannot prove absent service"):
+        module.restore(systemd, state)
+
+    assert not any(call[0] in {"stop", "disable"} for call in systemd.calls)
+
+
+def test_nonzero_load_probe_cannot_forge_a_verified_not_found_result():
+    module = _module()
+
+    class FailedButPrintedNotFound(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            self.calls.append(args)
+            return 1, "not-found", "transport failed"
+
+    systemd = FailedButPrintedNotFound(())
+    state = {
+        "version": 3,
+        "units": {
+            "aicc-agent-launcher@7.service": {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="cannot prove absent service"):
+        module.restore(systemd, state)
+
+    assert not any(call[0] in {"stop", "disable"} for call in systemd.calls)
+
+
+def test_not_found_fragment_with_stale_enablement_is_not_exact_absence():
+    module = _module()
+
+    class DanglingEnablement(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            if args[0] == "is-enabled":
+                self.calls.append(args)
+                return 0, "enabled", ""
+            return super().probe(*args)
+
+    systemd = DanglingEnablement(())
+    unit = "aicc-agent-launcher@7.service"
+    state = {
+        "version": 3,
+        "units": {
+            unit: {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="did not restore exactly"):
+        module.restore(systemd, state)
+
+    assert ("stop", unit) not in systemd.calls
+    assert ("disable", unit) not in systemd.calls
+
+
+def test_silent_post_stop_probe_cannot_confirm_an_absent_service():
+    module = _module()
+    unit = "aicc-principal-recovery.service"
+
+    class PostStopTransportFailure(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            if args[0] == "show" and "--property=LoadState" in args:
+                # The first probe sees a loaded unit.  After stop, the
+                # transport dies silently instead of proving not-found.
+                if any(call[0] == "stop" for call in self.calls):
+                    self.calls.append(args)
+                    return 1, "", ""
+            return super().probe(*args)
+
+    systemd = PostStopTransportFailure((unit,))
+    state = {
+        "version": 3,
+        "units": {
+            unit: {
+                "exists": False,
+                "enabled": False,
+                "active": False,
+                "properties": {},
+            }
+        },
+    }
+
+    with pytest.raises(module.RolloutError, match="cannot prove absent service"):
+        module.restore(systemd, state)
+
+
+class _ZeroMatchSystemd(FakeSystemd):
+    """Real systemd (255, live-verified on a pre-launcher worker):
+    `list-unit-files <pattern>` exits 1 with no stdout and no stderr when
+    the pattern matches no unit file at all."""
+
+    def probe(self, *args: str) -> tuple[int, str, str]:
+        if args[0] == "list-unit-files":
+            import fnmatch
+
+            pattern = args[1]
+            matches = [
+                f"{unit} enabled"
+                for unit in self.states
+                if fnmatch.fnmatch(unit, pattern)
+            ]
+            if not matches:
+                return 1, "", ""
+            return 0, "\n".join(matches), ""
+        return super().probe(*args)
+
+
+def test_snapshot_closure_tolerates_a_host_with_no_matching_templates():
+    """A pre-launcher worker, a control host (whose generation removes the
+    launcher template by design), and the post-uninstall closure check all
+    legitimately own zero matching unit files. `list-unit-files` reports
+    that answer as rc=1 with no output, and the closure check must read it
+    as "none" -- the same contract the install transaction's lane enumerator
+    already honours -- not abort the uninstall after mutation (acceptance
+    finding on 0e856b9a)."""
+    module = _module()
+
+    module.verify_snapshot_closure(
+        _ZeroMatchSystemd(()), {"version": 3, "units": {}}
+    )
+
+
+def test_snapshot_closure_still_fails_closed_on_a_real_enumeration_failure():
+    """Only the exact rc=1/no-output shape is the documented empty answer.
+    A diagnosed failure -- or silent breakage under any other status -- must
+    still refuse rather than report a closure it never proved."""
+    module = _module()
+
+    class BrokenSystemd(FakeSystemd):
+        def probe(self, *args: str) -> tuple[int, str, str]:
+            if args[0] == "list-unit-files":
+                return 1, "", "Failed to connect to bus"
+            return super().probe(*args)
+
+    with pytest.raises(module.RolloutError, match="Failed to connect"):
+        module.verify_snapshot_closure(
+            BrokenSystemd(()), {"version": 3, "units": {}}
+        )
+
+
+_ENV_OK = ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data")
+
+
+def _verify_one(module, systemd, unit, **overrides):
+    kwargs = dict(
+        agent_uid=1001,
+        privileged_uids=frozenset({0, 1000}),
+        uid_for_user=_uid,
+        process_uid=lambda pid: 1002,
+        process_environment=lambda pid: _ENV_OK,
+    )
+    kwargs.update(overrides)
+    module.verify_unit(systemd, unit, **kwargs)
+
+
+def _real_probe(module):
+    """_module() stubs the probe seam and keeps the real one beside it."""
+    module._lane_inputs_visible = module._real_lane_inputs_visible
+    return module
+
+
+def test_protect_home_true_is_refused_because_it_hides_the_clone_binds():
+    """`true` mounts an inaccessible empty /home: the BindReadOnlyPaths below
+    it never appear and every task fails with "repository path not
+    configured" (worker-01, 2026-09-08). Only tmpfs is the isolated shape."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    for value in ("yes", "read-only"):
+        systemd.states[unit]["ProtectHome"] = value
+        with pytest.raises(module.RolloutError, match="ProtectHome is not isolated"):
+            _verify_one(module, systemd, unit)
+
+
+def test_a_lane_without_the_state_directory_is_refused():
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    systemd.states[unit]["StateDirectory"] = ""
+    with pytest.raises(module.RolloutError, match="StateDirectory is not aicc/data"):
+        _verify_one(module, systemd, unit)
+
+
+def test_a_lane_whose_process_has_no_data_dir_is_refused():
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    for env in (
+        ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+        (*_ENV_OK, "AICC_DATA_DIR=relative"),
+    ):
+        with pytest.raises(module.RolloutError, match="no single absolute AICC_DATA_DIR"):
+            _verify_one(module, systemd, unit, process_environment=lambda pid, env=env: env)
+
+
+def test_a_lane_that_cannot_read_its_inputs_is_refused_with_the_path():
+    """Active, UID-isolated, flagged -- and blind: the exact state that
+    shipped. The probe answer names the invisible path."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    seen = []
+
+    def blind(pid, uid, data_dir, environment=()):
+        seen.append((pid, uid, data_dir))
+        return "/home/voynadmin/Projects/ai-command-center is not visible inside the lane namespace as uid 1002"
+
+    with pytest.raises(module.RolloutError, match="cannot read its task inputs: /home/voynadmin"):
+        _verify_one(module, systemd, unit, lane_inputs_visible=blind)
+    assert seen == [(int(systemd.states[unit]["MainPID"]), 1002, "/var/lib/aicc/data")]
+
+
+def test_rollout_refuses_to_advance_past_a_blind_lane():
+    module = _module()
+    units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
+    systemd = FakeSystemd(units)
+    with pytest.raises(module.RolloutError, match="voyn-aicc-worker@1.service cannot read its task inputs"):
+        module.rollout(
+            systemd,
+            units,
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: _ENV_OK,
+            lane_inputs_visible=lambda pid, uid, data_dir, environment=(): (
+                "project_config.json is not visible inside the lane namespace as uid 1002"
+            ),
+        )
+    started = [call[1] for call in systemd.calls if call[0] == "start"]
+    assert started == ["voyn-aicc-worker@1.service"], "lane 2 never started"
+
+
+def test_lane_inputs_probe_reads_the_config_on_the_host_and_tests_each_path_in_the_namespace(
+    tmp_path, monkeypatch
+):
+    real = _real_probe(_module())
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "project_config.json").write_text(
+        json.dumps({
+            "AICC": {"repository_path": "/home/voynadmin/Projects/ai-command-center"},
+            "AIOS": {"repository_path": "/home/voynadmin/Projects/aios"},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(real, "_process_gid", lambda pid: 2002)
+    ran = []
+
+    def fake_run(argv, **kwargs):
+        ran.append(argv)
+        failing = "/aios" in " ".join(argv)
+        return subprocess.CompletedProcess(argv, 1 if failing else 0, "", "fatal: detected dubious ownership" if failing else "")
+
+    monkeypatch.setattr(real.subprocess, "run", fake_run)
+    env = ("GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=/x")
+    failure = real._lane_inputs_visible(4242, 1002, str(data_dir), env)
+    assert failure == (
+        "/home/voynadmin/Projects/aios is not usable inside the lane namespace as uid 1002"
+        ": fatal: detected dubious ownership"
+    )
+    assert all(a[:9] == ["nsenter", "-t", "4242", "-m", "-S", "1002", "-G", "2002", "--"] for a in ran)
+    assert ran[0][9:] == ["test", "-r", str(data_dir / "project_config.json")]
+    # git runs with the LANE's environment, not root's: env -i + its variables.
+    assert ran[1][9:] == ["env", "-i", *env, "git", "-C", "/home/voynadmin/Projects/ai-command-center", "rev-parse", "--show-toplevel"]
+    assert ran[2][-3:] == ["/home/voynadmin/Projects/aios", "rev-parse", "--show-toplevel"]
+
+
+def test_lane_inputs_probe_refuses_a_config_without_any_repository_path(tmp_path):
+    real = _real_probe(_module())
+    assert "is not readable on the host" in real._lane_inputs_visible(1, 1002, str(tmp_path / "missing"))
+    (tmp_path / "project_config.json").write_text("{}", encoding="utf-8")
+    assert real._lane_inputs_visible(1, 1002, str(tmp_path)) == (
+        f"{tmp_path / 'project_config.json'} configures no project: every task would fail"
+    )
+    # A mixed configuration is refused too: one valid project does not excuse
+    # another whose tasks would fail (review of 39981fc9).
+    (tmp_path / "project_config.json").write_text(
+        json.dumps({"AICC": {"repository_path": "/srv/x"}, "AIOS": {"allowed_agents": ["claude_code"]}}),
+        encoding="utf-8",
+    )
+    failure = real._lane_inputs_visible(1, 1002, str(tmp_path))
+    assert "project 'AIOS' has no absolute repository_path" in failure
+    (tmp_path / "project_config.json").write_text(
+        json.dumps({"AICC": {"repository_path": "relative/path"}}), encoding="utf-8"
+    )
+    assert "project 'AICC' has no absolute repository_path" in real._lane_inputs_visible(1, 1002, str(tmp_path))
+    (tmp_path / "project_config.json").write_text("not json", encoding="utf-8")
+    assert "is not valid JSON" in real._lane_inputs_visible(1, 1002, str(tmp_path))

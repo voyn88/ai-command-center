@@ -13,7 +13,7 @@ from typing import Any, Iterator
 from command_center import storage
 
 ROOT = Path(__file__).resolve().parent.parent
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ROLES = ("Analyst", "MLRO")
 CRITICAL_ACTIONS = frozenset({"escalate", "close", "approve_sar"})
 ACTION_POLICY = {
@@ -27,6 +27,16 @@ ACTION_POLICY = {
     ),
     "close": (frozenset({"MLRO"}), frozenset({"escalated"}), "closed", "Кейс закрыт"),
 }
+
+# The one incident type eligible for the instant-closure playbook: low/medium-risk
+# "Unusual activity" alerts, still untriaged. This scenario has the lowest confirmed
+# true-positive rate of the seeded rules (see aml_panel.RULES), so routing it through a
+# scripted playbook — instead of the full manual assign/escalate/close workflow —
+# still requires MLRO sign-off but replaces four clicks with one auditable decision.
+INSTANT_PLAYBOOK_ID = "unusual_activity_quick_close"
+INSTANT_PLAYBOOK_SCENARIO = "Unusual activity"
+INSTANT_PLAYBOOK_RISKS = frozenset({"low", "medium"})
+INSTANT_PLAYBOOK_OUTCOME = "closed_no_action"
 
 
 class AmlStoreError(Exception):
@@ -214,7 +224,13 @@ def init_db(db_path: Path | None = None) -> Path:
                );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_aml_sar_active_case
                 ON aml_sar(case_id) WHERE status IN ('draft', 'approved');
-            PRAGMA user_version = 1;
+            CREATE TABLE IF NOT EXISTS aml_incident_report (
+                id TEXT PRIMARY KEY, case_id TEXT NOT NULL REFERENCES aml_case(id) ON DELETE CASCADE,
+                playbook TEXT NOT NULL, outcome TEXT NOT NULL, generated_at TEXT NOT NULL,
+                actor TEXT NOT NULL, role TEXT NOT NULL, report_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_aml_incident_report_case ON aml_incident_report(case_id);
+            PRAGMA user_version = 2;
             COMMIT;
             """
         )
@@ -464,3 +480,175 @@ def approve_sar(
                VALUES (?, ?, ?, ?, 'Регуляторное сообщение утверждено', ?)""",
             (sar["case_id"], now, clean_actor, role, reason.strip()),
         )
+
+
+def _money_display(amount: float, currency: str) -> str:
+    return f"{amount:,.0f} {currency}".replace(",", " ")
+
+
+def instant_closure_eligible(case: dict[str, Any]) -> bool:
+    """Whether ``case`` matches the one incident type wired to the instant-closure
+    playbook: an untriaged, low/medium-risk "Unusual activity" alert."""
+    return (
+        case["status"] == "new"
+        and case["scenario"] == INSTANT_PLAYBOOK_SCENARIO
+        and case["risk"] in INSTANT_PLAYBOOK_RISKS
+    )
+
+
+def run_instant_closure(
+    case_id: str,
+    *,
+    actor: str,
+    role: str,
+    reason: str,
+    expected_version: int,
+    confirmed: bool = False,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Run the one-click playbook: take an eligible case straight from ``new`` to
+    ``closed`` in a single transaction, recording each playbook step as its own
+    audit event (the decision trace) and persisting an auto-generated closure
+    report that snapshots the case and the full trace."""
+    if role != "MLRO":
+        raise PermissionDenied("Мгновенное закрытие по playbook доступно только MLRO")
+    clean_actor = _validated_actor(actor)
+    clean_reason = reason.strip()
+    if not confirmed or not clean_reason:
+        raise ConfirmationRequired("Мгновенное закрытие требует подтверждения и причины")
+
+    path = _initialized_path(db_path)
+    with _transaction(path) as connection:
+        row = connection.execute("SELECT * FROM aml_case WHERE id = ?", (case_id,)).fetchone()
+        if row is None:
+            raise AmlStoreError(f"Кейс не найден: {case_id}")
+        if row["version"] != expected_version:
+            raise LostUpdate("Кейс уже изменён другим пользователем; обновите страницу")
+        case = _case_from_row(connection, row)
+        if not instant_closure_eligible(case):
+            raise InvalidTransition(
+                f"Playbook «{INSTANT_PLAYBOOK_ID}» неприменим: кейс не соответствует критериям "
+                f"(сценарий={case['scenario']!r}, риск={case['risk']!r}, статус={case['status']!r})"
+            )
+        if connection.execute(
+            "SELECT 1 FROM aml_sar WHERE case_id = ? LIMIT 1", (case_id,)
+        ).fetchone():
+            raise InvalidTransition(
+                "Кейс с черновиком или утверждённым SAR / STR нельзя закрыть по playbook"
+            )
+
+        now = _now()
+        criteria_note = (
+            f"Сценарий «{case['scenario']}» · риск {case['risk']} · risk score {case['score']} · "
+            f"сумма {_money_display(case['amount'], case['currency'])}"
+        )
+        steps = (
+            ("Playbook запущен", f"«{INSTANT_PLAYBOOK_ID}»: {criteria_note}"),
+            (
+                "Автоматическая проверка пройдена",
+                f"Активных SAR/STR не найдено · транзакций проверено: {len(case['transactions'])} · "
+                "признаков PEP/санкций не выявлено",
+            ),
+            ("Кейс закрыт по playbook", clean_reason),
+        )
+        for event, details in steps:
+            connection.execute(
+                """INSERT INTO aml_audit_event
+                   (case_id, occurred_at, actor, role, event, details) VALUES (?, ?, ?, ?, ?, ?)""",
+                (case_id, now, clean_actor, role, event, details),
+            )
+        owner = clean_actor if case["owner"] == "Не назначен" else case["owner"]
+        cursor = connection.execute(
+            """UPDATE aml_case SET status = 'closed', owner = ?, version = version + 1, updated_at = ?
+               WHERE id = ? AND version = ?""",
+            (owner, now, case_id, expected_version),
+        )
+        if cursor.rowcount != 1:
+            raise LostUpdate("Кейс уже изменён другим пользователем; обновите страницу")
+
+        decision_trace = [
+            dict(event_row)
+            for event_row in connection.execute(
+                "SELECT * FROM aml_audit_event WHERE case_id = ? ORDER BY id", (case_id,)
+            )
+        ]
+        report_id = f"RPT-{uuid.uuid4().hex[:8].upper()}"
+        report = {
+            "id": report_id,
+            "case_id": case_id,
+            "playbook": INSTANT_PLAYBOOK_ID,
+            "outcome": INSTANT_PLAYBOOK_OUTCOME,
+            "generated_at": now,
+            "actor": clean_actor,
+            "role": role,
+            "reason": clean_reason,
+            "case_snapshot": {
+                "customer": case["customer"],
+                "country": case["country"],
+                "scenario": case["scenario"],
+                "risk": case["risk"],
+                "score": case["score"],
+                "amount": case["amount"],
+                "currency": case["currency"],
+            },
+            "decision_trace": decision_trace,
+        }
+        connection.execute(
+            """INSERT INTO aml_incident_report
+               (id, case_id, playbook, outcome, generated_at, actor, role, report_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                report_id, case_id, INSTANT_PLAYBOOK_ID, INSTANT_PLAYBOOK_OUTCOME, now,
+                clean_actor, role, json.dumps(report, ensure_ascii=False),
+            ),
+        )
+    return report
+
+
+def get_incident_report(case_id: str, db_path: Path | None = None) -> dict[str, Any] | None:
+    """The most recently generated instant-closure report for ``case_id``, if any."""
+    path = _initialized_path(db_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """SELECT report_json FROM aml_incident_report WHERE case_id = ?
+               ORDER BY generated_at DESC, id DESC LIMIT 1""",
+            (case_id,),
+        ).fetchone()
+        return json.loads(row["report_json"]) if row else None
+
+
+def list_incident_reports(db_path: Path | None = None) -> list[dict[str, Any]]:
+    path = _initialized_path(db_path)
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT report_json FROM aml_incident_report ORDER BY generated_at DESC, id DESC"
+        ).fetchall()
+        return [json.loads(row["report_json"]) for row in rows]
+
+
+def render_incident_report_markdown(report: dict[str, Any]) -> str:
+    """Render an instant-closure report as the human-readable auto-report."""
+    snapshot = report["case_snapshot"]
+    lines = [
+        f"# Отчёт о закрытии инцидента {report['case_id']}",
+        "",
+        f"- **Playbook:** {report['playbook']}",
+        f"- **Итог:** {report['outcome']}",
+        f"- **Дата:** {report['generated_at']}",
+        f"- **Кто закрыл:** {report['actor']} ({report['role']})",
+        f"- **Клиент:** {snapshot['customer']} · {snapshot['country']}",
+        f"- **Сценарий:** {snapshot['scenario']} · риск {snapshot['risk']} · score {snapshot['score']}",
+        f"- **Сумма:** {_money_display(snapshot['amount'], snapshot['currency'])}",
+        "",
+        f"**Обоснование:** {report['reason']}",
+        "",
+        "## Трасса решений",
+    ]
+    for event in report["decision_trace"]:
+        lines.append(
+            f"- `{event['occurred_at']}` **{event['event']}** "
+            f"({event['actor']}, {event['role']}) — {event['details']}"
+        )
+    return "\n".join(lines)

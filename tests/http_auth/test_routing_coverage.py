@@ -28,6 +28,8 @@ from command_center.webapi.app import create_app as create_webapi_app
 #: rather than a silent drift back towards an uncounted one.
 EXPECTED_MUTATING_ROUTES = 31  # 29 from AUTH-HTTP-01 + queue:audit:enqueue (APP-CONTROL-S1/S4) + arena:duel:run (AGT-SELF-PLAY)
 
+EXPECTED_MUTATING_ROUTES = 31  # 29 from AUTH-HTTP-01 + queue:audit:enqueue (APP-CONTROL-S1/S4) + audit:auto-trigger (VOYN-MIN-RTD)
+
 
 def _apps():
     return [create_api_app(), create_webapi_app()]

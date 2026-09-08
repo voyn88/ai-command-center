@@ -75,6 +75,7 @@ ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/conflicts/{conflict_id}/resolve"): "conflicts:resolve",
     # -- command_center/api/audit_routes.py -------------------------------
     ("POST", "/api/v1/audit/run"): "audit:run",
+    ("POST", "/api/v1/audit/auto-trigger"): "audit:auto-trigger",
     ("POST", "/api/v1/audit/findings/{finding_id}/status"): "audit:finding:status",
     ("POST", "/api/v1/audit/findings/{finding_id}/promote"): "audit:finding:promote",
     # -- command_center/api/council_routes.py -----------------------------

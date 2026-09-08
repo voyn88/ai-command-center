@@ -43,6 +43,9 @@ _SYSTEMCTL_ERRORS = (OSError, subprocess.SubprocessError)
 _PROC_STAT_MISSING_ERRORS = (FileNotFoundError, ProcessLookupError)
 
 FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
+MAX_TASK_TIMEOUT_SECONDS = 3600
+TRANSIENT_RUNTIME_GRACE_SECONDS = 30
+TRANSIENT_STOP_TIMEOUT_SECONDS = 20
 SOCKET_PATH = "/run/aicc-agent-launcher/control.sock"
 ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 COMMON_ENV_FILE = Path("/etc/aicc/agent.env")
@@ -158,6 +161,7 @@ SENSITIVE_AUTHORITY_TREES = (
     "/run/aicc-agent-workspace-binds",
     "/run/credentials",
     "/run/voyn-aicc-worker",
+    "/run/aicc-worker-lanes",
     "/srv/aicc-quarantine",
 )
 SYSTEMD_RUN_ENVIRONMENT = {
@@ -235,7 +239,7 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
     if (
         isinstance(timeout, bool)
         or not isinstance(timeout, int)
-        or not 30 <= timeout <= 3600
+        or not 30 <= timeout <= MAX_TASK_TIMEOUT_SECONDS
     ):
         raise LaunchRefused("timeout_seconds is outside 30..3600")
     if not isinstance(value["workspace"], str):
@@ -410,13 +414,30 @@ def _validate_binary(path: str) -> None:
                     f"executor path component is not immutable root-owned: {parent}"
                 )
     link_info = candidate.lstat()
-    if link_info.st_uid != 0 or link_info.st_mode & 0o022:
+    if not _node_is_immutable_root_owned(link_info):
         raise LaunchRefused(f"executor link is not immutable root-owned: {path}")
-    info = resolved.stat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-        raise LaunchRefused(f"executor is not an immutable root-owned file: {path}")
+    target_info = resolved.stat()
+    if not stat.S_ISREG(target_info.st_mode):
+        raise LaunchRefused(f"executor is not a regular file: {resolved}")
+    if not _node_is_immutable_root_owned(target_info):
+        raise LaunchRefused(f"executor binary is not immutable root-owned: {resolved}")
     if not os.access(resolved, os.X_OK):
         raise LaunchRefused(f"executor is not executable: {path}")
+
+
+def _node_is_immutable_root_owned(info: os.stat_result) -> bool:
+    """Root-owned and not group/other-writable. A symlink's mode bits are
+    always 0777 on Linux and carry no permission meaning, so only its owner
+    is judged -- the old check applied `& 0o022` to the link itself and
+    refused EVERY executor (the toolchain exposes them as root-owned
+    symlinks), so no isolated agent ever launched (worker-01 2026-09-08:
+    "executor link is not immutable root-owned: .../bin/claude"). The
+    resolved target is judged with its real mode bits."""
+    if info.st_uid != 0:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return not (info.st_mode & 0o022)
 
 
 def _prepare_agent_home(executor: str, run_id: str) -> Path:
@@ -975,8 +996,8 @@ def _systemd_command(
         "--property=MemoryHigh=5G",
         "--property=CPUQuota=300%",
         "--property=TasksMax=512",
-        f"--property=RuntimeMaxSec={timeout + 30}",
-        "--property=TimeoutStopSec=20",
+        f"--property=RuntimeMaxSec={timeout + TRANSIENT_RUNTIME_GRACE_SECONDS}",
+        f"--property=TimeoutStopSec={TRANSIENT_STOP_TIMEOUT_SECONDS}",
         f"--property=InaccessiblePaths={inaccessible_paths}",
         # The source is always a broker-created bind mount. There is no
         # pathname fallback: PID 1 must never resolve the mutable workspace
@@ -1382,7 +1403,7 @@ def _cleanup_workspace_bind(binding: WorkspaceBind) -> None:
     binding.path.rmdir()
 
 
-def _open_pinned_workspace(workspace: Path) -> int:
+def _open_pinned_workspace(workspace: Path, client_uid: int = 0) -> int:
     """Pin the validated directory inode until PID 1 consumes the bind source."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
@@ -1402,15 +1423,27 @@ def _open_pinned_workspace(workspace: Path) -> int:
     # 52ced1f). A rename can only happen if the PARENT directory is writable
     # by a non-root principal; require it rename-proof so the untrusted agent
     # cannot swap the workspace entry between here and PID 1's resolution.
-    if not _parent_is_rename_proof(workspace):
+    if not _parent_is_rename_proof(workspace, client_uid):
         os.close(descriptor)
         raise LaunchRefused("task workspace parent is renamable by non-root")
     return descriptor
 
 
-def _parent_is_rename_proof(workspace: Path) -> bool:
-    """True iff the workspace's parent is root-owned and not group/other-
-    writable -- i.e. no non-root principal can rename the workspace entry."""
+def _parent_is_rename_proof(workspace: Path, client_uid: int = 0) -> bool:
+    """True iff no principal other than root or the connecting client can
+    rename the workspace entry: the parent is owned by root or by the client
+    and carries no group/other write bit.
+
+    The client is the worker lane that provisioned the workspace -- the
+    trusted side of this socket (``_authorised_peer``); the threat is the
+    untrusted agent (DynamicUser, SupplementaryGroups=aicc-workspace)
+    swapping the entry between the pin and PID 1's path resolution. The old
+    rule demanded a ROOT-owned parent, which no directory a non-root worker
+    can create inside ever satisfies -- every isolated launch on worker-01
+    was refused with "task workspace parent is renamable by non-root"
+    (2026-09-08); and the workspace root itself was 2770 with the agents'
+    group, so the threat was real there. The root is 2750 now (tmpfiles):
+    agents reach only their bound /workspace, never the root."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1422,7 +1455,7 @@ def _parent_is_rename_proof(workspace: Path) -> bool:
         parent = os.fstat(parent_fd)
     finally:
         os.close(parent_fd)
-    return parent.st_uid == 0 and not (parent.st_mode & 0o022)
+    return parent.st_uid in (0, client_uid) and not (parent.st_mode & 0o022)
 
 
 def _workspace_is_quarantined(workspace: Path) -> bool:
@@ -1642,7 +1675,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         workspace_lock = _open_workspace_lock(workspace)
-        workspace_fd = _open_pinned_workspace(workspace)
+        workspace_fd = _open_pinned_workspace(workspace, peer)
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         _prepare_reusable_workspace(workspace, workspace_fd)
