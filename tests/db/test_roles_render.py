@@ -240,6 +240,9 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
+        # of where a migrated row came from.
+        "backlog_record_provenance",
     }
 
 
