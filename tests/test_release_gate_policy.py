@@ -529,13 +529,35 @@ def test_label_noise_never_cancels_or_reruns_the_head_gates():
         ("arch-fitness.yml", "boundary-fitness"),
     ):
         workflow = _workflow(ROOT / ".github/workflows" / workflow_name)
+        # The group is exactly the pre-existing key plus the noise suffix: a
+        # noise run gets its own run id as group, every other run shares the
+        # head's group as before.
         group = workflow["concurrency"]["group"]
-        assert f"({LABEL_NOISE_GUARD}) && github.run_id" in group, workflow_name
+        assert group.endswith(
+            f"-${{{{ ({LABEL_NOISE_GUARD}) && github.run_id || 'head' }}}}"
+        ), (workflow_name, group)
+        # Every job's condition is one of three exact forms, all of which are
+        # `<prior condition> && !(guard)`: the guard is the outermost
+        # conjunct, so a true guard skips the job whatever the prior term
+        # says. A substring check would also pass `x || !(guard)`, which does
+        # not skip on noise (adversarial review on 47ff7d9c).
+        allowed = {
+            f"${{{{ !({LABEL_NOISE_GUARD}) }}}}",
+            f"${{{{ always() && !({LABEL_NOISE_GUARD}) }}}}",
+            f"${{{{ github.event_name == 'pull_request' && !({LABEL_NOISE_GUARD}) }}}}",
+        }
         for job_id, job in workflow["jobs"].items():
-            condition = str(job.get("if", ""))
-            assert f"!({LABEL_NOISE_GUARD})" in condition, (workflow_name, job_id)
+            assert str(job.get("if", "")) in allowed, (workflow_name, job_id, job.get("if"))
+        # The required context is renamed only on a noise run, and only to the
+        # no-op name; on every other run it is exactly the name branch
+        # protection requires.
         required_name = workflow["jobs"][required_job]["name"]
-        assert f"({LABEL_NOISE_GUARD}) && 'Label event (no gate ran)' ||" in required_name
+        real_name = EXPECTED_CONTEXTS.get(required_job) or {
+            "acceptance-gate": "Acceptance gate (independent verdict on exact SHA)",
+        }[required_job]
+        assert required_name == (
+            f"${{{{ ({LABEL_NOISE_GUARD}) && 'Label event (no gate ran)' || '{real_name}' }}}}"
+        ), (workflow_name, required_name)
     # Never traded for dropping the canary triggers: the release-gate canaries
     # still need a fresh event carrying the label.
     ci = _workflow(CI_WORKFLOW)
