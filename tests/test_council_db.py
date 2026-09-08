@@ -230,3 +230,57 @@ def test_full_journal_orders_by_seq(db_path: Path) -> None:
     assert [e["event_type"] for e in events] == [
         "motion_opened", "vote_cast", "vote_cast", "decision_recorded"
     ]
+
+
+# --- reputation read path (VOYN-MIN-LINK-REPUTE) ---------------------------
+
+
+def test_get_vote_returns_row_or_none(db_path: Path) -> None:
+    m = _open_with_votes(db_path, {"chair": "yes"})
+    [vote] = db.list_votes(db_path, m["id"])
+    assert db.get_vote(db_path, vote["id"])["voter_id"] == "chair"
+    assert db.get_vote(db_path, "nope") is None
+
+
+def test_list_votes_with_outcomes_carries_null_outcome_for_open_motion(db_path: Path) -> None:
+    m = _open_with_votes(db_path, {"chair": "yes"})
+    [row] = db.list_votes_with_outcomes(db_path, voter_id="chair")
+    assert row["motion_id"] == m["id"]
+    assert row["decision_outcome"] is None
+    assert row["decision_tally"] is None
+
+
+def test_list_votes_with_outcomes_decodes_decision_after_close(db_path: Path) -> None:
+    m = _open_with_votes(db_path, {"chair": "yes"})
+    db.record_decision(
+        db_path, motion_id=m["id"], expected_version=0, outcome="approved",
+        tally={"yes": 1, "no": 0, "abstain": 0}, roles=[], rationale="ok", quorum=1,
+    )
+    [row] = db.list_votes_with_outcomes(db_path, voter_id="chair")
+    assert row["decision_outcome"] == "approved"
+    assert row["decision_tally"] == {"yes": 1, "no": 0, "abstain": 0}
+
+
+def test_list_votes_with_outcomes_covers_every_motion_the_voter_voted_on(db_path: Path) -> None:
+    m1 = _open_with_votes(db_path, {"chair": "yes"})
+    m2 = _open_with_votes(db_path, {"chair": "no"})
+    rows = db.list_votes_with_outcomes(db_path, voter_id="chair")
+    assert {r["motion_id"] for r in rows} == {m1["id"], m2["id"]}
+
+
+def test_list_votes_with_outcomes_excludes_sensitive_projects(db_path: Path) -> None:
+    m = db.create_motion(db_path, title="secret", proposed_by="chair", project_ref="BANK")
+    db.cast_vote(db_path, motion_id=m["id"], voter_id="chair", role="chair", choice="yes")
+    assert db.list_votes_with_outcomes(db_path, exclude_projects=["BANK"]) == []
+    assert len(db.list_votes_with_outcomes(db_path)) == 1
+
+
+def test_list_voter_ids_is_distinct_and_alphabetical(db_path: Path) -> None:
+    _open_with_votes(db_path, {"security": "yes", "chair": "no"})
+    assert db.list_voter_ids(db_path) == ["chair", "security"]
+
+
+def test_list_voter_ids_excludes_sensitive_projects(db_path: Path) -> None:
+    m = db.create_motion(db_path, title="secret", proposed_by="chair", project_ref="BANK")
+    db.cast_vote(db_path, motion_id=m["id"], voter_id="ghost", role="chair", choice="yes")
+    assert db.list_voter_ids(db_path, exclude_projects=["BANK"]) == []
