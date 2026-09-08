@@ -94,6 +94,50 @@ def test_noop_when_already_at_origin(pair, calls, tmp_path):
     assert not (tmp_path / "provenance.jsonl").exists()  # noops leave no rows
 
 
+def test_refuses_while_a_staged_rollout_holds_the_lock(pair, calls, tmp_path):
+    """A self-deploy tick that fires while the staged rollout holds its lock
+    must refuse before touching git or systemctl -- a restart issued mid-drain
+    is exactly what raced the rollout's own `stop` of the canary lane on
+    worker-01 (live 2026-09-08). The next tick, five minutes later once the
+    rollout has finished and removed the lock, picks the deploy back up."""
+    origin, clone, first = pair
+    _commit(origin, "advance")  # a real fast-forward is available and skipped
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text("12345\n", encoding="utf-8")
+    cfg = _cfg(
+        tmp_path,
+        services=("voyn-aicc-worker.service",),
+        rollout_lock_path=str(lock),
+    )
+
+    report = self_deploy_once(str(clone), cfg)
+
+    assert (report.outcome, report.detail) == ("refused", "staged_rollout_in_progress")
+    assert calls["systemctl"] == [] and calls["migrate"] == 0
+    assert _git(clone, "rev-parse", "HEAD") == first  # untouched
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
+    ]
+    assert rows[-1]["outcome"] == "refused"
+    assert rows[-1]["detail"] == "staged_rollout_in_progress"
+
+
+def test_deploys_normally_once_the_rollout_lock_is_absent(pair, calls, tmp_path):
+    origin, clone, first = pair
+    new = _commit(origin, "advance")
+    cfg = _cfg(
+        tmp_path,
+        services=("voyn-aicc-worker.service",),
+        rollout_lock_path=str(tmp_path / "no-such-lock"),
+    )
+
+    report = self_deploy_once(str(clone), cfg)
+
+    assert (report.outcome, report.detail) == ("deployed", new)
+    assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
+
+
 def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_path):
     origin, clone, first = pair
     new = _commit(origin, "advance")

@@ -1137,6 +1137,56 @@ def test_publish_falls_back_to_project_id_without_a_backlog_task_id(
     assert captured[0].task == "proj"  # _payload()'s project_id
 
 
+def test_lease_unavailable_publish_failure_is_a_lease_wait_not_a_spent_attempt(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT, live 2026-09-06
+    (wki_55f316db): a guarded publish lost the writer-lease race to a
+    sibling lane -- neighbouring publishes for OTHER tasks succeeded
+    04:57-04:58Z while this one got `lease_unavailable`. That names no fault
+    in this run's own (already-committed) work, so the outcome must set
+    `lease_wait=True` -- routing the daemon to the refund-and-bound path
+    instead of spending this item's `max_attempts` on contention it had no
+    part in causing."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    def fake_publish(repository, cfg):
+        return PublishResult(
+            ok=False,
+            reason="lease_unavailable: held by server-worker-b pid 4242",
+        )
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert outcome.lease_wait is True
+    assert "lease_unavailable" in outcome.reason
+
+
+def test_other_publish_failures_are_not_lease_waits(handler, monkeypatch) -> None:
+    """Only `lease_unavailable` names contention with no fault of its own;
+    every other publish failure (a bad push, a dead `gh`) must keep spending
+    the ordinary attempt budget -- a regression here would let a genuinely
+    broken publish retry forever off a budget nothing spends down."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    def fake_publish(repository, cfg):
+        return PublishResult(ok=False, reason="push_failed: non-fast-forward")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert outcome.lease_wait is False
+
+
 def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:
     """Only the labelled trailer counts: a transcript is full of object ids,
     and guessing which one is the head is the substring-matching the rules
