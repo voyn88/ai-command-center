@@ -537,6 +537,10 @@ _WORKER_FUNCTIONS = (
     # 0021: the worker-host fail-closed probe records what it measured.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    # A second, narrower fail path for a refusal that names no fault in the
+    # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
+    # see 0022_queue_fail_lease_wait.
+    "queue_fail_lease_wait(text, text, text, integer)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a

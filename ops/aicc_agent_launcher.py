@@ -440,6 +440,66 @@ def _node_is_immutable_root_owned(info: os.stat_result) -> bool:
     return not (info.st_mode & 0o022)
 
 
+def _write_back_model_auth(executor: str, home: Path) -> bool:
+    """Persist a provider credential the model process refreshed during the
+    run back into the root-owned store the next run is staged from.
+
+    Claude and Codex rotate their refresh token when they refresh: the new
+    token lands in the per-run ephemeral home and the old one in the store
+    is revoked. Without this, the FIRST isolated run succeeds and every
+    later one fails with "OAuth session expired and could not be refreshed"
+    (worker-01, 2026-09-08: 48 dead attempts in 25 minutes). The broker,
+    still root, copies the file back only when it is a regular file the run
+    left in place, parses as a JSON object whose top-level keys equal the
+    staged copy's (a token refresh changes values, never the shape -- a
+    different shape is not a refresh and is not trusted), and differs from
+    the store; the write is atomic (temp + rename in the store directory,
+    0600 root). Returns True when the store was updated."""
+    source = MODEL_AUTH_SOURCES.get(executor)
+    if source is None:
+        return False
+    target = home / MODEL_AUTH_TARGETS[executor]
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MODEL_AUTH_BYTES:
+        raise LaunchRefused("refreshed model auth is not a plain regular file")
+    refreshed = target.read_bytes()
+    current = _read_exact_protected_file(
+        source, expected_uid=0, expected_gid=0, exact_mode=0o600
+    )
+    if refreshed == current:
+        return False
+    try:
+        refreshed_doc = json.loads(refreshed.decode("utf-8"))
+        current_doc = json.loads(current.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise LaunchRefused("refreshed model auth is not JSON") from exc
+    if (
+        not isinstance(refreshed_doc, dict)
+        or not isinstance(current_doc, dict)
+        or set(refreshed_doc) != set(current_doc)
+    ):
+        raise LaunchRefused("refreshed model auth changed shape; not a token refresh")
+    temporary = source.with_name(f".{source.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        if os.geteuid() == 0:
+            os.fchown(descriptor, 0, 0)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(refreshed)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, source)
+    print(f"model auth write-back: {executor} credential refreshed by the run", file=sys.stderr, flush=True)
+    return True
+
+
 def _prepare_agent_home(executor: str, run_id: str) -> Path:
     """Create one non-persistent provider home with a private auth copy.
 
@@ -1782,6 +1842,10 @@ def _serve_connected_socket(sock: socket.socket) -> int:
                     ).decode("ascii"),
                 }
         if agent_home is not None:
+            try:
+                _write_back_model_auth(manifest["executor"], agent_home)
+            except (LaunchRefused, OSError, ValueError) as exc:
+                print(f"model auth write-back skipped: {exc}", file=sys.stderr, flush=True)
             shutil.rmtree(agent_home, ignore_errors=True)
         if workspace_bind is not None:
             try:

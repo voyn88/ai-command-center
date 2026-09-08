@@ -14,6 +14,8 @@ This document turns the canonical VOYN backlog into a product map for the Apple 
 | Agents and skills | who is working, proven strengths, skills, cost and safe routing | `VOYN-W2-AGENT`, `VOYN-W0-AICC-SKILL-ACQUISITION`, `VOYN-W0-AICC-AGENT-MARKETPLACE`, `VOYN-MIN-TRUST-LATTICE` |
 | Board view | one-page executive/investor narrative and material risks | `VOYN-MIN-BOARD-LAUNCH`, `VOYN-MIN-COMPANY-MODEL` |
 | iPhone companion | offline start-of-day view, useful push, haptics, voice explanations and protected critical confirmations | `VOYN-IOS-LOCK`, `VOYN-IOS-HAPTIC`, `VOYN-IOS-AUTO-HOME`, `VOYN-IOS-SPEECH-COACH`, `VOYN-IOS-CRYPTO-KEY`, `VOYN-IOS-VISUAL-DSL` |
+| Watch / complication crisis surface | a single critical escalation, resolved with one tap, without opening the phone | `VOYN-MIN-WATCH-CRISIS` |
+
 | Watch companion | one-tap escalation from a complication or a single minimal-interface screen, governed the same as a phone-initiated escalation | `VOYN-IOS-WEAR-ESCALATE` |
 
 ## Dialogues are a first-class capability
@@ -32,3 +34,7 @@ Chat is not a bypass around governance. The first fixture UI can show realistic 
 4. **Differentiators:** agent/skill map, board view, decision memory, visual causality, carefully scoped push/haptics/widgets, and the watch companion's one-tap escalation.
 
 Every screen must remain usable for a top manager: explain the situation, why it matters, options and next step first; technical proof can be opened only when wanted.
+
+## Watch / complication crisis surface
+
+`VOYN-MIN-WATCH-CRISIS` asks for a critical escalation to resolve with one tap on the smallest surface available. `AICCNativeCore` now carries the shared, testable piece of that: a `CriticalEscalation` model, a `Snapshot.openCriticalEscalations` query, and an on-device `EscalationAcknowledgementStore` that records the tap. Today it renders as a crisis banner at the top of the iPhone/Mac Overview — the same glanceable, single-action shape a watch complication needs — because no WatchKit/WidgetKit target exists yet in this package. The one-tap action is deliberately local-only: it records that the owner saw and handled the alert, and never calls AIOS or infrastructure, consistent with the Phase 0 non-goal of no mutation commands (`PRODUCT_BLUEPRINT.md`) and the disabled command gateway (`APPLE_RELEASE_READINESS.md`). Adding an actual watchOS app/complication extension is Xcode-project work for a follow-up once this interaction shape is reviewed.

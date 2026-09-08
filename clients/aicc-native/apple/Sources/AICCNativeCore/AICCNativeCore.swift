@@ -220,6 +220,30 @@ public struct WaveGoal: Codable, Equatable, Sendable {
     public var progress: Double { total > 0 ? Double(done) / Double(total) : 0 }
 }
 
+/// How urgently a crisis alert needs the owner's eyes; only `.critical`
+/// qualifies for the one-tap watch/complication surface.
+public enum EscalationSeverity: String, Codable, Sendable { case critical, warning, info }
+
+/// A crisis-level event sized for a glanceable surface with a single safe
+/// action — the shape a watch complication offers today's iPhone/Mac banner
+/// and will offer a WatchKit/WidgetKit target once one exists. `actionLabel`
+/// names that one action; acting on it only records a local acknowledgement
+/// (`EscalationAcknowledgementStore`) and never calls AIOS or infrastructure,
+/// since command-gateway mutations remain disabled (see
+/// docs/aicc_native/APPLE_RELEASE_READINESS.md).
+public struct CriticalEscalation: Codable, Identifiable, Equatable, Sendable {
+    public let id: String
+    public let title: String
+    public let summary: String
+    public let occurredAt: Date
+    public let severity: EscalationSeverity
+    public let actionLabel: String
+
+    public init(id: String, title: String, summary: String, occurredAt: Date, severity: EscalationSeverity, actionLabel: String) {
+        self.id = id; self.title = title; self.summary = summary; self.occurredAt = occurredAt; self.severity = severity; self.actionLabel = actionLabel
+    }
+}
+
 public struct Snapshot: Codable, Equatable, Sendable {
     public let schemaVersion: String
     public let revision: String
@@ -232,8 +256,9 @@ public struct Snapshot: Codable, Equatable, Sendable {
     // defaults instead of failing (the server always sends them).
     public let projects: [Project]
     public let goal: WaveGoal?
+    public let criticalEscalations: [CriticalEscalation]
 
-    public init(schemaVersion: String, revision: String, generatedAt: Date, freshness: Freshness, tasks: [Task], lanes: [AgentLane], events: [TimelineEvent], projects: [Project] = [], goal: WaveGoal? = nil) {
+    public init(schemaVersion: String, revision: String, generatedAt: Date, freshness: Freshness, tasks: [Task], lanes: [AgentLane], events: [TimelineEvent], projects: [Project] = [], goal: WaveGoal? = nil, criticalEscalations: [CriticalEscalation] = []) {
         self.schemaVersion = schemaVersion
         self.revision = revision
         self.generatedAt = generatedAt
@@ -243,6 +268,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
         self.events = events
         self.projects = projects
         self.goal = goal
+        self.criticalEscalations = criticalEscalations
     }
 
     public init(from decoder: Decoder) throws {
@@ -256,10 +282,18 @@ public struct Snapshot: Codable, Equatable, Sendable {
         events = try container.decode([TimelineEvent].self, forKey: .events)
         projects = try container.decodeIfPresent([Project].self, forKey: .projects) ?? []
         goal = try? container.decodeIfPresent(WaveGoal.self, forKey: .goal)
+        criticalEscalations = try container.decodeIfPresent([CriticalEscalation].self, forKey: .criticalEscalations) ?? []
     }
 
     public var overview: OverviewModel {
         OverviewModel(freshness: freshness, activeTasks: tasks.filter { $0.evidence.derivedStatus != .completed }.count, needsAttention: tasks.filter { $0.blocker != nil || $0.evidence.derivedStatus == .unknown }.count)
+    }
+
+    /// Critical escalations not yet handled by the one-tap action, newest first.
+    public func openCriticalEscalations(acknowledged: Set<String> = []) -> [CriticalEscalation] {
+        criticalEscalations
+            .filter { $0.severity == .critical && !acknowledged.contains($0.id) }
+            .sorted { $0.occurredAt > $1.occurredAt }
     }
 }
 
@@ -506,9 +540,38 @@ public enum DeviceCredentialAuditLog {
     }
 }
 
+/// On-device record of critical escalations the owner has handled through
+/// the one-tap action. This is local bookkeeping only, not an AIOS command —
+/// command-gateway mutations remain disabled (see
+/// docs/aicc_native/APPLE_RELEASE_READINESS.md) — so acknowledging never
+/// leaves the device.
+public enum EscalationAcknowledgementStore {
+    static let key = "aicc.native.acknowledgedEscalations"
+
+    public static func acknowledgedIDs(defaults: UserDefaults = .standard) -> Set<String> {
+        Set(defaults.stringArray(forKey: key) ?? [])
+    }
+
+    /// Records the one tap and returns the updated set of acknowledged IDs.
+    @discardableResult
+    public static func acknowledge(_ id: String, defaults: UserDefaults = .standard) -> Set<String> {
+        var ids = acknowledgedIDs(defaults: defaults)
+        ids.insert(id)
+        defaults.set(Array(ids), forKey: key)
+        return ids
+    }
+}
+
 public enum Fixture {
     public static func healthySnapshot() throws -> Snapshot {
         let url = try Bundle.module.url(forResource: "healthy-snapshot", withExtension: "json").unwrap()
+        return try SnapshotDecoder.decode(Data(contentsOf: url))
+    }
+
+    /// A snapshot carrying exactly one open critical escalation, for the
+    /// watch/complication crisis surface and its tests.
+    public static func criticalSnapshot() throws -> Snapshot {
+        let url = try Bundle.module.url(forResource: "critical-snapshot", withExtension: "json").unwrap()
         return try SnapshotDecoder.decode(Data(contentsOf: url))
     }
 }

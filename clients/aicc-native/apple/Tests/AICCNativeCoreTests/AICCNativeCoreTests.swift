@@ -141,6 +141,28 @@ import Testing
     let decisions = empty.widgetSnippets().first { $0.flow == .decisions }
     #expect(decisions?.destination == .flowInbox(.decisions))
 
+@Test func criticalSnapshotExposesExactlyOneOpenEscalation() throws {
+    let snapshot = try Fixture.criticalSnapshot()
+    #expect(snapshot.criticalEscalations.count == 1)
+    #expect(snapshot.criticalEscalations[0].severity == .critical)
+    #expect(snapshot.openCriticalEscalations().count == 1)
+}
+
+@Test func criticalEscalationCompletesWithOneTapAcknowledgement() throws {
+    let suiteName = "aicc-test-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let snapshot = try Fixture.criticalSnapshot()
+    let escalation = try #require(snapshot.criticalEscalations.first)
+
+    #expect(snapshot.openCriticalEscalations(acknowledged: EscalationAcknowledgementStore.acknowledgedIDs(defaults: defaults)).count == 1)
+
+    // The one tap.
+    let acknowledged = EscalationAcknowledgementStore.acknowledge(escalation.id, defaults: defaults)
+
+    #expect(acknowledged.contains(escalation.id))
+    #expect(snapshot.openCriticalEscalations(acknowledged: acknowledged).isEmpty)
+
 @Test func impactStoryDecodesTimelineChainAndRiskFromFixture() throws {
     let snapshot = try Fixture.healthySnapshot()
     let withStory = try #require(snapshot.tasks.first { $0.id == "VOYN-EXAMPLE-002" })

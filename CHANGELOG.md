@@ -18,6 +18,25 @@ functional application milestones of `app.py`.
   mutation — `POST /v1/commands` is still out of the v1 read-only contract.
   See `docs/aicc_native/WIDGET_SNIPPETS.md`.
 
+### Added — Executive Time-Machine (`VOYN-MIN-EXEC`)
+- `command_center/decision_time_machine.py`: for a critical decision or
+  incident, one executable `decision package` — hypothesis, alternatives
+  considered (with why each was passed over), the decision and its
+  rationale — created with a pending effect checkpoint already scheduled at
+  each of 1/7/30/90 days out. `record_effect` fills in the actual outcome at
+  a horizon (in any order); `due_checkpoints` surfaces whichever check-ins
+  have passed their due date without being asked; `build_post_mortem`
+  assembles the package into a post-mortem view with a verdict
+  (`validated`/`invalidated`/`mixed`/`pending_data`) computed from the
+  checkpoints recorded so far; `find_similar_packages` matches a new
+  critical event's framing against past packages' actual outcomes (the
+  "application in similar scenarios" acceptance), and
+  `missing_decision_packages` flags any critical event with no package on
+  file yet.
+- `tests/test_decision_time_machine.py`: coverage for checkpoint scheduling,
+  out-of-order effect recording, post-mortem verdict derivation, similar-
+  scenario matching and the critical-event coverage gap check.
+
 ### Added — SRV-04b two-host acceptance record (`VOYN-W0-AICC-CLAIM-TWO-HOST-ACCEPTED`)
 - `docs/srv04b-two-host-acceptance.md`: records a separate, two-physical-host
   acceptance pass of the `0002_queue_claim` protocol against
