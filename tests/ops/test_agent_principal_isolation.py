@@ -1871,9 +1871,14 @@ def test_validate_binary_refuses_a_target_that_is_group_writable(launcher, tmp_p
         """Every node reads as root-owned; modes stay real."""
 
     def fake_stat(self, *, follow_symlinks=True):
+        # Every node reads as root-owned; directories (tmp_path lives under a
+        # 1777 /tmp on Linux runners) read as not group/other-writable so the
+        # path-component rule passes and the TARGET's real mode is judged.
         result = os.stat(self, follow_symlinks=follow_symlinks)
         values = list(result)
         values[4] = 0
+        if stat.S_ISDIR(values[0]):
+            values[0] &= ~0o022
         return real_stat(values)
 
     monkeypatch.setattr(Path, "stat", fake_stat)
@@ -1906,6 +1911,8 @@ def test_validate_binary_refuses_a_target_that_is_not_a_regular_file(launcher, t
     def fake_stat(self, *, follow_symlinks=True):
         values = list(os.stat(self, follow_symlinks=follow_symlinks))
         values[4] = 0
+        if stat.S_ISDIR(values[0]):
+            values[0] &= ~0o022
         return real_stat(values)
 
     monkeypatch.setattr(Path, "stat", fake_stat)
