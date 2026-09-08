@@ -22,7 +22,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1360,6 +1360,126 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invit
 """
 
 
+# Skill acquisition (VOYN-W0-AICC-SKILL-ACQUISITION-REM): the registry behind the
+# command center's ability to acquire a missing skill (an MCP server, an Agent
+# Skill, a CLI tool, an internal doc reference) for a task rather than only
+# reasoning from a bare prompt. Four additive tables, wholly separate from every
+# family above.
+#
+#   skill_source          -- one mutable current-state row per allowlisted
+#                             *source* an agent may pull skills from (a registry
+#                             URL, a catalogue). Guarded by a `lock_version`
+#                             compare-and-set column and an explicit status
+#                             allowlist (`skills.SKILL_SOURCE_TRANSITIONS`,
+#                             proposed -> approved -> revoked). A source starts
+#                             `proposed` and stays inert until a human approves
+#                             it — the acquisition pipeline may never itself
+#                             flip this status — which is the human gate on the
+#                             first connection to a new source.
+#   skill_item            -- one mutable current-state row per candidate/
+#                             acquired skill, always attributed to an approved
+#                             `skill_source`. `version`+`content_hash` pin
+#                             exactly what was acquired; `task_class` is the
+#                             class of task the skill targets, the axis the
+#                             effect measurement below groups by. Status moves
+#                             candidate -> acquiring -> acquired (or back to
+#                             candidate on a failed acquisition attempt),
+#                             candidate -> rejected, acquired -> revoked
+#                             (`skills.SKILL_ITEM_TRANSITIONS`). The `acquiring`
+#                             state exists so a compare-and-set claim happens
+#                             *before* the (possibly side-effecting) executor
+#                             ever runs — see the service module — so two
+#                             concurrent callers can never both materialise the
+#                             same skill.
+#   skill_acquisition_log -- append-only audit trail: one immutable row per
+#                             lifecycle action taken on a `skill_item`, ordered
+#                             by a per-skill monotonic `seq`. `ON DELETE
+#                             RESTRICT` (not CASCADE) on purpose: this is the
+#                             acquisition/provenance evidence a revoked skill
+#                             must still be answerable for, so it must outlive
+#                             any future deletion path for its parent rather
+#                             than silently vanish with it.
+#   skill_outcome         -- append-only per-task evidence: one row per task a
+#                             skill was (or, for the `used=0` baseline, was not)
+#                             applied to, recording cost and first-pass
+#                             acceptance. This is what the effect measurement
+#                             (cost per accepted change, first-pass acceptance
+#                             rate, with vs. without the skill) is computed
+#                             from, so it is `ON DELETE RESTRICT` for the same
+#                             reason as the acquisition log: the evidence must
+#                             outlive the row it evaluates.
+#
+# Kinds/statuses/actions are stored as their stable string *values* (never a
+# Python enum's member name), so a column round-trips to exactly the Literal the
+# API contract (`api/models.py`) declares — the enum-name lesson carried forward
+# from the earlier migration renumbering.
+_SCHEMA_V26 = """
+CREATE TABLE IF NOT EXISTS skill_source (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    origin TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'proposed',
+    proposed_by TEXT NOT NULL DEFAULT '',
+    lock_version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_source_kind ON skill_source(kind);
+CREATE INDEX IF NOT EXISTS idx_skill_source_status ON skill_source(status);
+
+CREATE TABLE IF NOT EXISTS skill_item (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES skill_source(id) ON DELETE RESTRICT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL,
+    task_class TEXT NOT NULL DEFAULT '',
+    provenance TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'candidate',
+    lock_version INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_item_source_id ON skill_item(source_id);
+CREATE INDEX IF NOT EXISTS idx_skill_item_kind ON skill_item(kind);
+CREATE INDEX IF NOT EXISTS idx_skill_item_status ON skill_item(status);
+CREATE INDEX IF NOT EXISTS idx_skill_item_task_class ON skill_item(task_class);
+
+CREATE TABLE IF NOT EXISTS skill_acquisition_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id TEXT NOT NULL REFERENCES skill_item(id) ON DELETE RESTRICT,
+    seq INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(skill_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_acquisition_log_skill_id ON skill_acquisition_log(skill_id);
+
+CREATE TABLE IF NOT EXISTS skill_outcome (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id TEXT NOT NULL REFERENCES skill_item(id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL,
+    used INTEGER NOT NULL,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    accepted INTEGER NOT NULL,
+    latency_seconds REAL NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_outcome_skill_id_used ON skill_outcome(skill_id, used);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -1394,4 +1514,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
     (25, _migration_25_add_finalization_claim),
+    (26, _SCHEMA_V26),
 ]

@@ -54,9 +54,10 @@ __all__ = [
 MUTATING_VERBS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 #: ``(method, path template) -> operation``. Exhaustive over both HTTP
-#: surfaces: ``command_center/api/app.py`` (27) and
-#: ``command_center/webapi/app.py`` (3: two dispatch writes and the queue
-#: audit enqueue, VOYN-W0-APP-CONTROL-S1/S4).
+#: surfaces: ``command_center/api/app.py`` (35, 27 from AUTH-HTTP-01 + 8
+#: skills:* from SKILL-ACQUISITION-REM) and ``command_center/webapi/app.py``
+#: (3: two dispatch writes and the queue audit enqueue,
+#: VOYN-W0-APP-CONTROL-S1/S4).
 ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     # -- command_center/api/wave1_routes.py -------------------------------
     ("POST", "/api/v1/proposals"): "proposals:create",
@@ -92,6 +93,15 @@ ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/networking/messages"): "networking:message:send",
     ("POST", "/api/v1/networking/feedback"): "networking:feedback:submit",
     ("POST", "/api/v1/networking/invite"): "networking:invite",
+    # -- command_center/api/skills_routes.py ------------------------------
+    ("POST", "/api/v1/skills/sources"): "skills:source:propose",
+    ("POST", "/api/v1/skills/sources/{source_id}/approve"): "skills:source:approve",
+    ("POST", "/api/v1/skills/sources/{source_id}/revoke"): "skills:source:revoke",
+    ("POST", "/api/v1/skills/items"): "skills:item:register",
+    ("POST", "/api/v1/skills/items/{item_id}/acquire"): "skills:item:acquire",
+    ("POST", "/api/v1/skills/items/{item_id}/reject"): "skills:item:reject",
+    ("POST", "/api/v1/skills/items/{item_id}/revoke"): "skills:item:revoke",
+    ("POST", "/api/v1/skills/items/{item_id}/outcomes"): "skills:item:outcome:record",
     # -- command_center/dispatch/api.py -----------------------------------
     ("POST", "/api/v1/dispatch/assign"): "dispatch:assign",
     ("PUT", "/api/v1/dispatch/policy"): "dispatch:policy:update",
@@ -182,6 +192,36 @@ CLIENT_IDENTITY_CARVE_OUTS: dict[tuple[str, str], CarveOut] = {
     ("POST", "/api/v1/models/{model_id}/assign"): CarveOut(
         fields=("actor",),
         reason="Governance-log attribution; should become the principal. See 01b.",
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/sources"): CarveOut(
+        fields=("actor",),
+        reason="Acquisition-log attribution (proposed_by); should become the principal. See 01b.",
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/sources/{source_id}/approve"): CarveOut(
+        fields=("actor",),
+        reason="Acquisition-log attribution; should become the principal. See 01b.",
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/sources/{source_id}/revoke"): CarveOut(
+        fields=("actor",),
+        reason="Acquisition-log attribution; should become the principal. See 01b.",
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/items/{item_id}/acquire"): CarveOut(
+        fields=("actor",),
+        reason="Acquisition-log attribution; should become the principal. See 01b.",
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/items/{item_id}/reject"): CarveOut(
+        fields=("actor",),
+        reason="Acquisition-log attribution; should become the principal. See 01b.",
+        task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/skills/items/{item_id}/revoke"): CarveOut(
+        fields=("actor",),
+        reason="Acquisition-log attribution; should become the principal. See 01b.",
         task="VOYN-W0-AICC-AUTH-HTTP-01b",
     ),
 }

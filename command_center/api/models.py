@@ -455,3 +455,138 @@ class Invitation(BaseModel):
     project_ref: str | None = None
     invited_at: str | None = None
     responded_at: str | None = None
+
+
+# --------------------------------------------------------------------------
+# Skill acquisition — SkillSource / SkillItem / SkillAcquisitionLogEntry /
+# SkillOutcome / SkillEffect (VOYN-W0-AICC-SKILL-ACQUISITION-REM)
+# --------------------------------------------------------------------------
+
+#: What a source *is*: the reuse-before-creation set named by the owner idea —
+#: an MCP registry, an Agent Skills catalogue, a CLI-tool index, or an internal
+#: repo doc/ADR/runbook — before any bespoke format is considered. Mirrors
+#: ``command_center.runtime.db.skills.SKILL_SOURCE_KINDS``.
+SkillSourceKind = Literal["mcp_registry", "agent_skill_catalog", "cli_tool_index", "repo_doc"]
+
+#: A source's lifecycle. ``proposed -> approved -> revoked``; ``revoked`` is
+#: terminal. Nothing but a human calling the ``approve`` endpoint may drive the
+#: first edge — the human gate on the first connection to a new source.
+SkillSourceStatus = Literal["proposed", "approved", "revoked"]
+
+#: What a skill *is*. Mirrors ``command_center.runtime.db.skills.SKILL_ITEM_KINDS``.
+SkillItemKind = Literal["mcp_server", "agent_skill", "cli_tool", "doc_reference"]
+
+#: A skill's lifecycle: ``candidate -> acquiring -> acquired``, with
+#: ``acquiring -> candidate`` on a failed acquisition (retryable), ``candidate
+#: -> rejected`` and ``acquired -> revoked`` as the terminal edges.
+SkillItemStatus = Literal["candidate", "acquiring", "acquired", "rejected", "revoked"]
+
+#: The acquisition-log action vocabulary. Mirrors
+#: ``command_center.runtime.db.skills.SKILL_LOG_ACTIONS``.
+SkillLogAction = Literal[
+    "registered", "acquiring", "acquired", "acquire_failed", "rejected", "revoked"
+]
+
+
+class SkillSource(BaseModel):
+    """One allowlisted source an agent may pull skills from.
+
+    Starts ``proposed`` and stays inert — no :class:`SkillItem` may reference it
+    (enforced structurally, not by caller discipline) — until a human approves
+    it. This is the required human gate on the first connection to a new
+    source; nothing in the acquisition pipeline may drive that edge itself.
+    """
+
+    id: str = ""
+    kind: SkillSourceKind = "repo_doc"
+    origin: str = ""
+    status: SkillSourceStatus = "proposed"
+    proposed_by: str = ""
+    lock_version: int = 0
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class SkillItem(BaseModel):
+    """One candidate/acquired skill, always attributed to an approved
+    :class:`SkillSource`.
+
+    ``version`` + ``content_hash`` pin exactly what was (or would be) acquired —
+    the registry never resolves "latest" implicitly. ``task_class`` is the class
+    of task the skill targets, the axis :class:`SkillEffect` groups by.
+    """
+
+    id: str = ""
+    source_id: str = ""
+    name: str = ""
+    kind: SkillItemKind = "mcp_server"
+    version: str = ""
+    content_hash: str = ""
+    task_class: str = ""
+    provenance: str = ""
+    status: SkillItemStatus = "candidate"
+    lock_version: int = 0
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class SkillAcquisitionLogEntry(BaseModel):
+    """One append-only lifecycle-transition line for a :class:`SkillItem`,
+    ordered by a per-skill monotonic ``seq`` — the traceable provenance record
+    every transition appends to and none may edit or delete."""
+
+    id: int = 0
+    skill_id: str = ""
+    seq: int = 0
+    action: SkillLogAction = "registered"
+    actor: str | None = None
+    from_status: str = ""
+    to_status: str = ""
+    detail: str = ""
+    metadata: dict = Field(default_factory=dict)
+    created_at: str | None = None
+
+
+class SkillOutcome(BaseModel):
+    """One append-only per-task evidence row: a task a skill was (``used=True``)
+    or was not (the ``used=False`` baseline) applied to, with its cost and
+    whether it was accepted first-pass. This is the raw evidence
+    :class:`SkillEffect` aggregates."""
+
+    id: int = 0
+    skill_id: str = ""
+    task_id: str = ""
+    used: bool = False
+    cost_usd: float = 0.0
+    accepted: bool = False
+    latency_seconds: float = 0.0
+    detail: str = ""
+    created_at: str | None = None
+
+
+class SkillEffectStats(BaseModel):
+    """Aggregate stats over one side (baseline or with-skill) of a
+    :class:`SkillEffect` comparison. ``None`` fields mean no outcomes were
+    recorded for that side yet — never fabricated as zero."""
+
+    count: int = 0
+    avg_cost_usd: float | None = None
+    first_pass_rate: float | None = None
+
+
+class SkillEffect(BaseModel):
+    """The measured effect of one skill: baseline (``used=False``) vs.
+    with-skill (``used=True``) cost-per-task and first-pass acceptance rate.
+
+    ``improved`` is ``True`` only when the with-skill side is measurably
+    better on *both* metrics (strictly lower cost **and** strictly higher
+    first-pass rate) than the baseline — never worse on either. It is ``None``
+    when either side has no recorded outcomes yet, so "no evidence" is never
+    conflated with "measured, and not an improvement". A skill without a
+    proven ``True`` here is a candidate for retirement from the registry.
+    """
+
+    skill_id: str = ""
+    baseline: SkillEffectStats = Field(default_factory=SkillEffectStats)
+    with_skill: SkillEffectStats = Field(default_factory=SkillEffectStats)
+    improved: bool | None = None
