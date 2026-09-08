@@ -264,6 +264,9 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_transition",
         "backlog_record_evidence",
         "backlog_record_remediation",
+        # VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE (0017): the minor-findings
+        # follow-up lineage, alongside the remediation lineage above.
+        "backlog_record_followup",
         "backlog_add_dependency",
         "backlog_lease_acquire",
         "backlog_lease_heartbeat",

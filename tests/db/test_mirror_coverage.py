@@ -144,6 +144,16 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
     ),
+    "backlog_task_followup": Exclusion(
+        reason=(
+            "PostgreSQL-native (migration 0017), same shape as "
+            "backlog_task_remediation: follow-up lineage rows exist only "
+            "through backlog_record_followup, written the same transaction as "
+            "the new OPEN task they point at; no SQLite authority ever held "
+            "them, so there is nothing to mirror."
+        ),
+        task="VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE",
+    ),
     "queue_entry": Exclusion(
         reason=(
             "Mirrored under a contract of its own rather than the shared one: the "

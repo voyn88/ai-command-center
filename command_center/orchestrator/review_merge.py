@@ -700,6 +700,21 @@ _VERIFICATION_SECURITY_ATTESTATION = re.compile(
     r"(?m)^\s*SECURITY_CLAIMS\s*:\s*(NONE|DISPROVEN)\b"
 )
 
+#: Full disposition lines the verifier classified real but non-blocking
+#: (VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE): these survive an auto-accept
+#: override untouched -- they are exactly what `_verification_accept_is_
+#: well_formed` allows through -- but until this change they lived nowhere
+#: but the PR audit comment once posted. `_minor_findings_text` pulls the
+#: whole line (not just the class) so `_record_minor_followup` can carry the
+#: verifier's own cited evidence into the follow-up task body.
+_MINOR_FINDING_LINE = re.compile(r"(?m)^\s*FINDING\s+\d+\s*:\s*CONFIRMED_MINOR\b.*$")
+
+
+def _minor_findings_text(verification_text: str) -> str:
+    return "\n".join(
+        match.group(0).strip() for match in _MINOR_FINDING_LINE.finditer(verification_text)
+    )
+
 #: `_aggregate_chunk_verdict` builds the multi-chunk findings text as one
 #: `Chunk i/N:` header line per REJECTing chunk, joined by blank lines --
 #: this is orchestrator-known structure, not the verifier's self-report, so
@@ -2185,6 +2200,89 @@ def _post_auto_accept_audit(
     return posted.returncode == 0, True
 
 
+def _record_minor_followup(
+    factory: Any, task_id: str, pr_url: str, head_sha: str, minor_text: str
+) -> str | None:
+    """Turn CONFIRMED_MINOR findings the auto-accept verifier confirmed real
+    (VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE) into an ordinary, dispatchable
+    backlog task instead of leaving them to live only in the PR audit
+    comment `_post_auto_accept_audit` posts. A no-op when `minor_text` is
+    empty -- most overrides carry only ARTIFACT/UNVERIFIABLE findings, which
+    were never real, so there is nothing to track.
+
+    Deliberately best-effort and never a precondition of the marker (unlike
+    the audit comment): the caller is expected to call this only after the
+    audit has already succeeded, and its own failure is a missed tracking
+    opportunity, not a review-correctness problem -- the same findings stay
+    durable in the audit comment and the verification work_result row
+    regardless. Idempotent per parent task
+    (`backlog_task_followup(parent_task_id, kind)` is unique): a task can
+    only be auto-accepted once (the marker check at the top of `publish_
+    review_verdicts`' loop short-circuits every later tick for that PR), so
+    in practice this ever gets one live attempt -- the idempotency guard
+    exists for the same reason `_remediate_rejection`'s does, a retried
+    call after a same-tick failure elsewhere must not double-create."""
+    if not minor_text:
+        return None
+    from command_center.db.backlog_parser import ParsedTask
+    from command_center.db.backlog_store import BacklogStore
+
+    with factory() as conn:
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM backlog_task_followup "
+                    "WHERE parent_task_id = %s AND kind = 'minor_findings'",
+                    (task_id,),
+                )
+                if cur.fetchone() is not None:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    "SELECT wave, priority, title, repo FROM backlog_task WHERE task_id = %s",
+                    (task_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None
+                wave, priority, title, repo = row
+            new_task_id = f"{task_id}-MINOR"
+            new_title = f"Minor findings follow-up: {title}"
+            new_body = (
+                f"Non-blocking findings the auto-accept verifier confirmed real "
+                f"(not artifacts) while overriding a review REJECT on {pr_url} "
+                f"at {head_sha}, but which did not block merge:\n\n{minor_text}\n\n"
+                "Optional cleanup -- pick up if worthwhile, close otherwise; "
+                "nothing else depends on this task."
+            )
+            store = BacklogStore(lambda: nullcontext(conn))
+            ok, _reason, _changed = store.upsert_task(
+                ParsedTask(
+                    task_id=new_task_id, wave=wave, priority=priority,
+                    status="OPEN", kind="task", title=new_title, body=new_body,
+                    repo=repo, line_no=0,
+                )
+            )
+            if not ok:
+                conn.rollback()
+                return None
+            ok, _reason = store.record_followup(
+                new_task_id, task_id, pr_url, head_sha, "minor_findings"
+            )
+            if not ok:
+                conn.rollback()
+                return None
+            conn.commit()
+            return new_task_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.autocommit = True
+
+
 def publish_review_verdicts(
     factory: Any,
     repo_path: str,
@@ -2366,6 +2464,15 @@ def publish_review_verdicts(
                 # verification verdict is durable, so a later tick retries.
                 report.skipped.append((task_id, "auto_accept_audit_post_failed"))
                 continue
+            # Real, non-blocking findings the verifier confirmed become an
+            # ordinary tracked follow-up task instead of living only in the
+            # audit comment just posted (VOYN-W0-AICC-REVIEW-FULLCONTEXT-
+            # TRIAGE). Best-effort and never a precondition of the marker --
+            # see `_record_minor_followup`'s docstring for why.
+            if _record_minor_followup(
+                factory, task_id, pr_url, sha, _minor_findings_text(override_audit[1])
+            ):
+                actions += 1
             if actions >= cfg.max_per_tick:
                 # Leave the cursor BEFORE this task (verification of
                 # c4426a4, CONFIRMED: advancing past a deferred marker made
