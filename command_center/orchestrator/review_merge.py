@@ -105,6 +105,14 @@ __all__ = [
 ]
 
 
+#: See `ReviewConfig.required_checks`. A module constant (not a dataclass
+#: attribute read at call time) because `ReviewConfig` uses slots.
+_DEFAULT_REQUIRED_MERGE_CHECKS: tuple[str, ...] = (
+    "Final merge gate",
+    "Acceptance gate (independent verdict on exact SHA)",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewConfig:
     reviewer: str = "server-reviewer"
@@ -127,6 +135,14 @@ class ReviewConfig:
     #: in the tick functions (review of ce948c0: an unbounded scan meant
     #: unbounded API traffic and runtime regardless of the action cap).
     scan_cap: int = 40
+    #: Check contexts that must be PRESENT and green on the head before the
+    #: merge tick may merge. Branch protection names the same two. Without
+    #: this, a head whose gates never ran (a run skipped by a workflow
+    #: condition, a PR outside a CI window, a workflow renamed away) has an
+    #: empty or partial rollup and `_pr_is_mergeable` saw "nothing red" as
+    #: green -- absence of information is not a verdict
+    #: (VOYN-W0-AICC-MERGE-TICK-REQUIRED-CHECKS-PRESENT).
+    required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS
 
 
 @dataclass
@@ -2434,7 +2450,11 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
     return list(latest.values())
 
 
-def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
+def _pr_is_mergeable(
+    repo_path: str,
+    pr_url: str,
+    required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS,
+) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
     marker -- from a reviewer login that is NOT the PR's own author -- stands
     on the head. `gh pr view` gives all of it in one call.
@@ -2473,6 +2493,10 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
         if rerun:
             return False, f"checks_cancelled_rerun_requested: {rerun[:3]}"
         return False, f"checks_not_green: {bad[:3]}"
+    present = {str(c.get("name") or "") for c in rollup}
+    missing = [name for name in required_checks if name not in present]
+    if missing:
+        return False, f"checks_missing: {missing[:3]}"
     return True, head
 
 
@@ -2951,7 +2975,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             report.skipped.append((task_id, merge_reason))
             continue
         if merge_sha is None:
-            ready, detail = _pr_is_mergeable(repo_path, pr_url)
+            ready, detail = _pr_is_mergeable(repo_path, pr_url, cfg.required_checks)
             if not ready:
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake

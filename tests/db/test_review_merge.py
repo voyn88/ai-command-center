@@ -259,13 +259,13 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
@@ -300,7 +300,7 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch): 
             "state": "OPEN", "headRefOid": head,
             "author": {"login": "dimastov-lab"},
             "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": "dimastov-lab"}}],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -329,7 +329,7 @@ def test_merge_skips_a_self_issued_marker_that_only_differs_by_login_case(rig, m
             "state": "OPEN", "headRefOid": head,
             "author": {"login": "Dimastov-Lab"},
             "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": "dimastov-lab"}}],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -364,7 +364,7 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                         "body": f"ACCEPTANCE: ACCEPT {head}",
                         "author": {"login": "voyn88-acceptance-gate[bot]"},
                     }],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
@@ -374,7 +374,7 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                         "body": f"ACCEPTANCE: ACCEPT {head}",
                         "author": {"login": "voyn88-acceptance-gate[bot]"},
                     }],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
@@ -406,7 +406,7 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
                 "author": {"login": "voyn88-acceptance-gate[bot]"},
             }],
             "statusCheckRollup": [
-                {"name": "CI", "conclusion": "SUCCESS"},
+                {"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"},
                 {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "FAILURE"},
             ],
         })
@@ -429,7 +429,7 @@ def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": "b" * 40, "reviews": [],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -509,7 +509,7 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
                 {"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"},
                 {"body": "Actually, hold on -- this needs another look.", "submittedAt": "2026-01-02T00:00:00Z"},
             ],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -542,7 +542,7 @@ def test_merge_skips_a_dismissed_review_even_when_it_is_the_only_one(rig, monkey
                     "author": {"login": "voyn88-acceptance-gate[bot]"},
                 },
             ],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -587,14 +587,14 @@ def test_merge_falls_back_to_an_earlier_live_review_past_a_dismissed_one(rig, mo
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head, "author": {"login": "dimastov-lab"},
                     "reviews": reviews,
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
                     "author": {"login": "dimastov-lab"},
                     "reviews": reviews,
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
@@ -1112,7 +1112,11 @@ def test_mergeability_uses_latest_check_rerun(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    assert review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10") == (True, head)
+    # Rerun/timestamp semantics of the rollup alone; the required-context
+    # presence gate is covered separately.
+    assert review_merge._pr_is_mergeable(
+        "/tmp", "https://github.com/x/y/pull/10", required_checks=()
+    ) == (True, head)
 
 
 def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
@@ -1173,7 +1177,7 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     ready, _ = review_merge._pr_is_mergeable(
-        "/tmp", "https://github.com/x/y/pull/10"
+        "/tmp", "https://github.com/x/y/pull/10", required_checks=()
     )
     assert ready is expected_ready
 
@@ -1745,7 +1749,7 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
                 "author": {"login": "writer-bot"},
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
                              "author": {"login": "voyn88-acceptance-gate[bot]"}}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "update-branch"]:
@@ -1818,7 +1822,7 @@ def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F8
                 "author": {"login": "writer-bot"},
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
                              "author": {"login": "voyn88-acceptance-gate[bot]"}}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
@@ -1846,7 +1850,7 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
                 "author": {"login": "writer-bot"},
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
                              "author": {"login": "voyn88-acceptance-gate[bot]"}}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "update-branch"]:
@@ -2059,13 +2063,13 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             return sp.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
@@ -2288,7 +2292,7 @@ def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeyp
             body = json.dumps({
                 "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                 "headRefOid": head, "reviews": [],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return sp.CompletedProcess(argv, 0, body, "")
         return sp.CompletedProcess(argv, 1, "", "?")
@@ -2599,14 +2603,14 @@ def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch)
                     "state": "MERGED", "mergeCommit": {"oid": "ef" * 20},
                     "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 }), "")
             return sp.CompletedProcess(argv, 0, json.dumps({"state": "OPEN"}), "")
         if argv[:2] == ["pr", "view"]:
             return sp.CompletedProcess(argv, 0, json.dumps({
                 "state": "OPEN", "headRefOid": head,
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 "mergeStateStatus": "CLEAN",
             }), "")
         if argv[:2] == ["pr", "merge"]:
