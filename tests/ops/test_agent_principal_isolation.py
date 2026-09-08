@@ -1929,6 +1929,24 @@ def test_validate_binary_refuses_a_target_that_is_not_a_regular_file(launcher, t
         launcher._validate_binary(str(fifo))
 
 
+def test_the_worker_data_dir_parent_stays_root_owned():
+    """Review of f4ef507c: `install -d -o aicc-worker /var/lib/aicc /var/lib/aicc/data`
+    handed the PARENT to the worker too. Only the leaf is the worker's."""
+    text = (Path(__file__).parents[2] / "deploy/install-agent-principal-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "install -d -m 0755 -o root -g root /var/lib/aicc\n" in text
+    assert "install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc/data\n" in text
+    # No worker-owned install may name the parent as a target, in any
+    # position or order (review of 39981fc9: the first version only rejected
+    # one ordering).
+    for line in text.splitlines():
+        if "install" in line and "-o aicc-worker" in line:
+            targets = [word for word in line.split() if word.startswith("/")]
+            assert "/var/lib/aicc" not in targets, line
+            assert targets == ["/var/lib/aicc/data"] or "/var/lib/aicc" not in " ".join(targets), line
+
+
 def test_every_launcher_read_write_path_is_created_by_tmpfiles_before_the_first_connection():
     """VOYN-W0-AICC-LAUNCHER-BIND-ROOT-MUST-EXIST-BEFORE-FIRST-CONNECTION:
     a ReadWritePaths= entry only the launcher creates refuses every first

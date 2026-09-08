@@ -5149,6 +5149,7 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/aicc-agent-launcher@.service",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
+        "/etc/aicc/gitconfig",
         "/etc/aicc/agent.env",
         "/etc/systemd/system/voyn-aicc-worker@.service",
         "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf",
@@ -5373,6 +5374,13 @@ def default_specs(
         FileSpec(
             repo_root / "deploy/aicc/worker-lanes",
             "/etc/aicc/worker-lanes",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/aicc/gitconfig",
+            "/etc/aicc/gitconfig",
             0o644,
             root_uid,
             root_gid,
