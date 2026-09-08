@@ -39,8 +39,10 @@ class PlanLimits:
     #: Repo leases must outlive the dispatched RUN (hours).
     lease_ttl_seconds: int = 7200
     #: The planner:global lease covers one TICK (seconds) — its own parameter
-    #: (PLANNER-LEASE-TTL follow-up): a tick that dies before releasing must
-    #: not lock every control host out for the repo-lease horizon.
+    #: (VOYN-W0-AICC-PLANNER-LEASE-TTL, resolved and pinned by
+    #: test_the_tick_lease_uses_its_own_ttl_not_the_repo_horizon): a tick
+    #: that dies before releasing must not lock every control host out for
+    #: the repo-lease horizon.
     planner_lease_ttl_seconds: int = 300
     #: Per-tick dispatch cap, distinct from WIP: one tick must stay short.
     max_dispatches_per_tick: int = 4
