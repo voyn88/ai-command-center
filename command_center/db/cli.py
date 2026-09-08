@@ -155,6 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
         "ancestor of the default branch (pre-fix rows recorded the PR head, "
         "not the merge commit). Never changes a task's status.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    sub.add_parser(
+        "backlog-pr-window",
+        help="One PR-window tick: label every open PR active/waiting/"
+        "blocked in a bounded rotation (aicc-backlog-pr-window.timer). "
+        "Only ever relabels -- never merges, approves, or weakens a gate. "
+        "Needs --repo-path.",
+    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -466,6 +473,12 @@ def main(argv: list[str] | None = None) -> int:
                 if report.planner_busy:
                     print("planner lease held elsewhere; nothing done")
                     return 0
+                if report.review_window_full is not None:
+                    print(
+                        "implementation dispatch paused: review backlog at "
+                        f"{report.review_window_full} "
+                        "(PlanLimits.review_backlog_limit)"
+                    )
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
@@ -571,6 +584,22 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "backlog-pr-window":
+                from command_center.orchestrator.review_merge import (
+                    reconcile_pr_window,
+                )
+
+                report = reconcile_pr_window(args.repo_path)
+                for number, head in report.active:
+                    print(f"ACTIVE    #{number} -> {head}")
+                for number, head in report.waiting:
+                    print(f"WAITING   #{number} -> {head}")
+                for number, reason in report.blocked:
+                    print(f"BLOCKED   #{number}: {reason}")
+                for number, head in report.age_fallback:
+                    print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+                return 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
