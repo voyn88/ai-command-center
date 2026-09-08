@@ -1759,3 +1759,25 @@ def test_control_authority_is_proven_before_prepare():
     validation = installer.index("run_transaction validate-control-authority")
     prepare = installer.index("run_transaction prepare")
     assert sysusers < validation < prepare
+
+
+def test_release_venv_installs_the_accepted_aios_wheels_from_the_root_store():
+    """The worker imports `aios_db`; the CI lock does not carry it (CI fetches
+    the private aios release with a token a root installer must not hold). The
+    first canary start after #823/#858 died with "No module named 'aios_db'"
+    (worker-01, 2026-09-08). The release venv installs both accepted wheels
+    from the root-owned digest store, verified against the release's own lock
+    files, and the import preflight proves them before the release is recorded."""
+    installer = (
+        Path(__file__).parents[2] / "deploy" / "install-agent-principal-isolation.sh"
+    ).read_text()
+    assert "aios_artifact_store=/var/lib/aicc-artifacts" in installer
+    assert 'for lock in aios-sdk.lock.json aios-db.lock.json; do' in installer
+    assert "sha256sum -c --quiet" in installer
+    assert "--no-deps --require-hashes" in installer
+    staging = installer.split("stage_immutable_release() {", 1)[1]
+    lock_install = staging.index('-r "$release_staging/requirements-ci-linux.lock"')
+    aios_install = staging.index('install_aios_wheels "$release_staging"')
+    preflight = staging.index("import aios_db")
+    record = staging.index("run_release release-record")
+    assert lock_install < aios_install < preflight < record

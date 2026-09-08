@@ -22,6 +22,13 @@ This is a fail-closed deployment gate. Do not set
    release. To change a CLI version, edit the lock, run the
    `build-agent-toolchain` workflow, and record the digest it reports -- a
    reviewed change, never an ambient `latest`.
+   The release venv also needs the accepted AIOS wheels (`aios-sdk.lock.json`,
+   `aios-db.lock.json`), which CI fetches with a read-only token a root
+   installer must not hold. Stage them once per digest, root-owned and
+   immutable, at `/var/lib/aicc-artifacts/<wheel_sha256>/<wheel_filename>`
+   (`install -D -m 0644 -o root -g root`); the installer verifies each wheel
+   against the release's lock file and refuses a missing, writable or
+   mismatched artifact.
 3. Put only model credentials in `/etc/aicc/agent-claude.env` and
    `/etc/aicc/agent-codex.env` (root:`aicc-agent`, `0640`), or provider config
    below `/var/lib/aicc-agent` (`root:root`, `0600`). The broker uses only an
