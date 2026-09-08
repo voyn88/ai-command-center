@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +28,10 @@ def _module():
     # owner so ordinary parser tests exercise content handling; dedicated
     # tests below override this seam to prove ownership rejection.
     real_fstat = module._registry_fstat
+    # The lane-input probe nsenters a live PID; ordinary tests take the
+    # visible answer, dedicated tests below override this seam.
+    module._real_lane_inputs_visible = module._lane_inputs_visible
+    module._lane_inputs_visible = lambda pid, uid, data_dir, environment=(): None
 
     class RootRegistryStat:
         def __init__(self, value):
@@ -68,7 +74,8 @@ class FakeSystemd:
                 "SubState": "running",
                 "NoNewPrivileges": "yes",
                 "ProtectSystem": "strict",
-                "ProtectHome": "yes",
+                "ProtectHome": "tmpfs",
+                "StateDirectory": "aicc/data",
                 "ProtectControlGroups": "yes",
                 "PrivateTmp": "yes",
                 "PrivateDevices": "yes",
@@ -445,6 +452,67 @@ def test_versioned_restore_refuses_property_drift_before_restart():
     assert ("start", unit) not in systemd.calls
 
 
+def test_restore_accepts_activating_notify_worker_with_live_main_pid():
+    """A Type=notify unit forks its MainPID before sending READY=1.
+
+    `restore` reading `is-active` as "activating" with a nonzero MainPID
+    right after `start` is the service coming up normally, not one that
+    failed to go inactive (same shape as the live worker-01 install-recovery
+    wedge, 2026-09-07/08).
+    """
+    module = _module()
+    unit = "voyn-aicc-worker@blue.service"
+
+    class NotifyStartingSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args == ("start", unit):
+                self.calls.append(args)
+                state = self.states[unit]
+                state["ActiveState"] = "activating"
+                state["SubState"] = "start"
+                state["MainPID"] = "4242"
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = NotifyStartingSystemd((unit,))
+    state = module.snapshot(systemd, (unit,))
+    state["units"][unit]["active"] = True
+
+    module.restore(systemd, state)
+
+    assert systemd.states[unit]["ActiveState"] == "activating"
+    assert systemd.states[unit]["MainPID"] == "4242"
+
+
+def test_restore_still_refuses_deactivating_expected_inactive_main_pid():
+    """The activating exemption must not paper over a real stuck unit.
+
+    An expected-inactive unit still "deactivating" with a live MainPID after
+    `stop` is exactly the leftover-process case the assertion exists to
+    catch.
+    """
+    module = _module()
+    unit = "voyn-aicc-worker@blue.service"
+
+    class StuckStoppingSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args == ("stop", unit):
+                self.calls.append(args)
+                state = self.states[unit]
+                state["ActiveState"] = "deactivating"
+                state["SubState"] = "stop"
+                state["MainPID"] = "4242"
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = StuckStoppingSystemd((unit,))
+    state = module.snapshot(systemd, (unit,))
+    state["units"][unit]["active"] = False
+
+    with pytest.raises(module.RolloutError, match="did not restore exactly"):
+        module.restore(systemd, state)
+
+
 def test_staged_rollout_drains_and_proves_each_lane_before_next():
     module = _module()
     units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
@@ -457,7 +525,7 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
         privileged_users=("root", "voynadmin"),
         uid_for_user=_uid,
         process_uid=lambda pid: 1002,
-        process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+        process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data"),
     )
 
     mutations = [
@@ -547,6 +615,7 @@ def test_rollout_refuses_fail_open_lane_before_first_mutation(change, message):
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
 
@@ -577,6 +646,7 @@ def test_rollout_revalidates_configuration_after_drain_before_start():
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
 
@@ -613,6 +683,7 @@ def test_rollout_refuses_to_start_template_lane_while_legacy_pid_survives():
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
     # Legacy drain precedes the canary start; the surviving legacy PID must
@@ -644,6 +715,7 @@ def test_verifier_rejects_stopped_stale_or_uid_aliased_unit(change, message):
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
 
@@ -666,6 +738,7 @@ def test_verifier_rejects_named_privileged_alias_of_agent_uid():
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
 
@@ -710,6 +783,7 @@ def test_rollout_failure_restores_all_lane_states():
             process_uid=lambda pid: 1002,
             process_environment=lambda pid: (
                 "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
             ),
         )
     # Failed generation remains fail-closed. The outer file transaction
@@ -959,7 +1033,7 @@ def test_rollout_checks_required_files_before_retiring_anything():
             privileged_users=("root", "voynadmin"),
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
-            process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+            process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data"),
         )
 
     # Nothing was retired, enabled, started or stopped: the refusal came first.
@@ -1256,3 +1330,154 @@ def test_snapshot_closure_still_fails_closed_on_a_real_enumeration_failure():
         module.verify_snapshot_closure(
             BrokenSystemd(()), {"version": 3, "units": {}}
         )
+
+
+_ENV_OK = ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data")
+
+
+def _verify_one(module, systemd, unit, **overrides):
+    kwargs = dict(
+        agent_uid=1001,
+        privileged_uids=frozenset({0, 1000}),
+        uid_for_user=_uid,
+        process_uid=lambda pid: 1002,
+        process_environment=lambda pid: _ENV_OK,
+    )
+    kwargs.update(overrides)
+    module.verify_unit(systemd, unit, **kwargs)
+
+
+def _real_probe(module):
+    """_module() stubs the probe seam and keeps the real one beside it."""
+    module._lane_inputs_visible = module._real_lane_inputs_visible
+    return module
+
+
+def test_protect_home_true_is_refused_because_it_hides_the_clone_binds():
+    """`true` mounts an inaccessible empty /home: the BindReadOnlyPaths below
+    it never appear and every task fails with "repository path not
+    configured" (worker-01, 2026-09-08). Only tmpfs is the isolated shape."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    for value in ("yes", "read-only"):
+        systemd.states[unit]["ProtectHome"] = value
+        with pytest.raises(module.RolloutError, match="ProtectHome is not isolated"):
+            _verify_one(module, systemd, unit)
+
+
+def test_a_lane_without_the_state_directory_is_refused():
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    systemd.states[unit]["StateDirectory"] = ""
+    with pytest.raises(module.RolloutError, match="StateDirectory is not aicc/data"):
+        _verify_one(module, systemd, unit)
+
+
+def test_a_lane_whose_process_has_no_data_dir_is_refused():
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    for env in (
+        ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+        (*_ENV_OK, "AICC_DATA_DIR=relative"),
+    ):
+        with pytest.raises(module.RolloutError, match="no single absolute AICC_DATA_DIR"):
+            _verify_one(module, systemd, unit, process_environment=lambda pid, env=env: env)
+
+
+def test_a_lane_that_cannot_read_its_inputs_is_refused_with_the_path():
+    """Active, UID-isolated, flagged -- and blind: the exact state that
+    shipped. The probe answer names the invisible path."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    systemd = FakeSystemd((unit,))
+    seen = []
+
+    def blind(pid, uid, data_dir, environment=()):
+        seen.append((pid, uid, data_dir))
+        return "/home/voynadmin/Projects/ai-command-center is not visible inside the lane namespace as uid 1002"
+
+    with pytest.raises(module.RolloutError, match="cannot read its task inputs: /home/voynadmin"):
+        _verify_one(module, systemd, unit, lane_inputs_visible=blind)
+    assert seen == [(int(systemd.states[unit]["MainPID"]), 1002, "/var/lib/aicc/data")]
+
+
+def test_rollout_refuses_to_advance_past_a_blind_lane():
+    module = _module()
+    units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
+    systemd = FakeSystemd(units)
+    with pytest.raises(module.RolloutError, match="voyn-aicc-worker@1.service cannot read its task inputs"):
+        module.rollout(
+            systemd,
+            units,
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: _ENV_OK,
+            lane_inputs_visible=lambda pid, uid, data_dir, environment=(): (
+                "project_config.json is not visible inside the lane namespace as uid 1002"
+            ),
+        )
+    started = [call[1] for call in systemd.calls if call[0] == "start"]
+    assert started == ["voyn-aicc-worker@1.service"], "lane 2 never started"
+
+
+def test_lane_inputs_probe_reads_the_config_on_the_host_and_tests_each_path_in_the_namespace(
+    tmp_path, monkeypatch
+):
+    real = _real_probe(_module())
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "project_config.json").write_text(
+        json.dumps({
+            "AICC": {"repository_path": "/home/voynadmin/Projects/ai-command-center"},
+            "AIOS": {"repository_path": "/home/voynadmin/Projects/aios"},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(real, "_process_gid", lambda pid: 2002)
+    ran = []
+
+    def fake_run(argv, **kwargs):
+        ran.append(argv)
+        failing = "/aios" in " ".join(argv)
+        return subprocess.CompletedProcess(argv, 1 if failing else 0, "", "fatal: detected dubious ownership" if failing else "")
+
+    monkeypatch.setattr(real.subprocess, "run", fake_run)
+    env = ("GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=/x")
+    failure = real._lane_inputs_visible(4242, 1002, str(data_dir), env)
+    assert failure == (
+        "/home/voynadmin/Projects/aios is not usable inside the lane namespace as uid 1002"
+        ": fatal: detected dubious ownership"
+    )
+    assert all(a[:9] == ["nsenter", "-t", "4242", "-m", "-S", "1002", "-G", "2002", "--"] for a in ran)
+    assert ran[0][9:] == ["test", "-r", str(data_dir / "project_config.json")]
+    # git runs with the LANE's environment, not root's: env -i + its variables.
+    assert ran[1][9:] == ["env", "-i", *env, "git", "-C", "/home/voynadmin/Projects/ai-command-center", "rev-parse", "--show-toplevel"]
+    assert ran[2][-3:] == ["/home/voynadmin/Projects/aios", "rev-parse", "--show-toplevel"]
+
+
+def test_lane_inputs_probe_refuses_a_config_without_any_repository_path(tmp_path):
+    real = _real_probe(_module())
+    assert "is not readable on the host" in real._lane_inputs_visible(1, 1002, str(tmp_path / "missing"))
+    (tmp_path / "project_config.json").write_text("{}", encoding="utf-8")
+    assert real._lane_inputs_visible(1, 1002, str(tmp_path)) == (
+        f"{tmp_path / 'project_config.json'} configures no project: every task would fail"
+    )
+    # A mixed configuration is refused too: one valid project does not excuse
+    # another whose tasks would fail (review of 39981fc9).
+    (tmp_path / "project_config.json").write_text(
+        json.dumps({"AICC": {"repository_path": "/srv/x"}, "AIOS": {"allowed_agents": ["claude_code"]}}),
+        encoding="utf-8",
+    )
+    failure = real._lane_inputs_visible(1, 1002, str(tmp_path))
+    assert "project 'AIOS' has no absolute repository_path" in failure
+    (tmp_path / "project_config.json").write_text(
+        json.dumps({"AICC": {"repository_path": "relative/path"}}), encoding="utf-8"
+    )
+    assert "project 'AICC' has no absolute repository_path" in real._lane_inputs_visible(1, 1002, str(tmp_path))
+    (tmp_path / "project_config.json").write_text("not json", encoding="utf-8")
+    assert "is not valid JSON" in real._lane_inputs_visible(1, 1002, str(tmp_path))

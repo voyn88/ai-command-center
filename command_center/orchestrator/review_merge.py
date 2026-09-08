@@ -51,6 +51,15 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
 - ``merge_once``: for each PR that carries an ACCEPT marker AND whose required
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
+  A PR that is only BEHIND main gets `gh pr update-branch`, which mints a
+  fresh head with no marker on it -- ``_carry_over_marker_if_patch_id_stable``
+  then reposts the ACCEPT marker on that new head, with its own audited
+  comment, iff `git patch-id --stable` proves the PR's own diff is
+  byte-identical to what a prior standing marker already accepted; a diff
+  that actually changed, or a base moving faster than carry-over can keep up
+  with (the churn-breaker), instead falls through to a genuine re-review.
+  See that function's section comment for the live incident that motivated
+  it (VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE-REM).
 - ``reconcile_merge_evidence``: report-only audit of existing DONE tasks'
   'sha' evidence against the default branch, for rows written before
   VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY (when that evidence was the
@@ -96,6 +105,14 @@ __all__ = [
 ]
 
 
+#: See `ReviewConfig.required_checks`. A module constant (not a dataclass
+#: attribute read at call time) because `ReviewConfig` uses slots.
+_DEFAULT_REQUIRED_MERGE_CHECKS: tuple[str, ...] = (
+    "Final merge gate",
+    "Acceptance gate (independent verdict on exact SHA)",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class ReviewConfig:
     reviewer: str = "server-reviewer"
@@ -118,6 +135,14 @@ class ReviewConfig:
     #: in the tick functions (review of ce948c0: an unbounded scan meant
     #: unbounded API traffic and runtime regardless of the action cap).
     scan_cap: int = 40
+    #: Check contexts that must be PRESENT and green on the head before the
+    #: merge tick may merge. Branch protection names the same two. Without
+    #: this, a head whose gates never ran (a run skipped by a workflow
+    #: condition, a PR outside a CI window, a workflow renamed away) has an
+    #: empty or partial rollup and `_pr_is_mergeable` saw "nothing red" as
+    #: green -- absence of information is not a verdict
+    #: (VOYN-W0-AICC-MERGE-TICK-REQUIRED-CHECKS-PRESENT).
+    required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS
 
 
 @dataclass
@@ -952,6 +977,51 @@ def _next_retry_key(
     return f"{base_key}:retry:{attempt + 1}"
 
 
+def _latest_attempt_executor(factory: Any, task_id: str, base_key: str) -> str | None:
+    """The executor whose run produced the latest terminal (``succeeded``)
+    result for ``base_key`` -- read from `work_result.payload["executor"]`,
+    the same field `command_center/worker/handlers.py` records on every
+    completed run. Used only to bias a *retry's* cascade away from the
+    executor that just produced a malformed/verdict-less result; returns
+    None (no bias) if the field is absent or the row itself is missing,
+    which simply leaves `_failover_cascade` a no-op."""
+    latest = _latest_attempt(factory, task_id, base_key)
+    if latest is None:
+        return None
+    _attempt, _state, payload_value = latest
+    result = _json_object(payload_value)
+    executor = (result or {}).get("executor")
+    return executor if isinstance(executor, str) and executor else None
+
+
+def _failover_cascade(
+    cascade: list[dict[str, Any]], avoid_executor: str | None
+) -> list[dict[str, Any]]:
+    """Reorder ``cascade`` so its first link is not ``avoid_executor`` when
+    another executor is available.
+
+    A review chunk whose executor refused the reviewer role (completed
+    successfully, exit 0, but wrote no parseable VERDICT line for the
+    expected head sha -- see `_next_retry_key`) gets a bounded fresh retry
+    identity. Without this reorder that retry's attempt 1 lands on
+    `cascade[0]`, which -- for the common single-repo-route cascade -- is
+    the SAME executor that just refused, so a persistent single-executor
+    refusal (a systemic policy/prompt reaction, not a transient fluke)
+    silently exhausts every bounded retry attempt on that one executor and
+    still never produces a verdict, the exact failure mode
+    VOYN-W0-AICC-REVIEW-REFUSAL-RETRYABLE was filed over. This never DROPS
+    the refusing executor's link -- only deprioritizes it -- so it still
+    serves as this retry's own last-resort fallback if every preferred
+    alternative is unavailable at dispatch time."""
+    if not avoid_executor or len(cascade) < 2:
+        return cascade
+    preferred = [link for link in cascade if link.get("executor") != avoid_executor]
+    if not preferred:
+        return cascade
+    deprioritized = [link for link in cascade if link.get("executor") == avoid_executor]
+    return preferred + deprioritized
+
+
 def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
@@ -1320,12 +1390,16 @@ def reconcile_review_once(
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
                 report.skipped.append((current_task_id, "review_prompt_budget_invalid"))
                 continue
+            refusing_executor = _latest_attempt_executor(
+                factory, current_task_id, base_key
+            )
+            retry_cascade = _failover_cascade(cascade, refusing_executor)
             payload: dict[str, Any] = {
                 "kind": "agent_run", "v": 1, "project_id": project_id,
                 "repository_path": repository_path,
                 "task_type": "independent_review", "prompt": prompt,
                 "timeout_seconds": cfg.review_timeout, "untrusted": True,
-                "cascade": cascade,
+                "cascade": retry_cascade,
             }
             if chunk.count > 1:
                 payload["review_chunk"] = {
@@ -1336,7 +1410,7 @@ def reconcile_review_once(
                     "base_sha": snapshot.base, "head_sha": snapshot.head,
                     "diff_hash": snapshot.digest,
                 }
-            enqueue(cfg.queue, retry_key, payload, current_task_id, len(cascade))
+            enqueue(cfg.queue, retry_key, payload, current_task_id, len(retry_cascade))
             report.retried.append((current_task_id, retry_key))
             actions += 1
         if actions == retries_before:
@@ -2376,7 +2450,11 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
     return list(latest.values())
 
 
-def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
+def _pr_is_mergeable(
+    repo_path: str,
+    pr_url: str,
+    required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS,
+) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
     marker -- from a reviewer login that is NOT the PR's own author -- stands
     on the head. `gh pr view` gives all of it in one call.
@@ -2411,8 +2489,64 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
+        rerun = _rerun_cancelled_latest_runs(repo_path, rollup)
+        if rerun:
+            return False, f"checks_cancelled_rerun_requested: {rerun[:3]}"
         return False, f"checks_not_green: {bad[:3]}"
+    present = {str(c.get("name") or "") for c in rollup}
+    missing = [name for name in required_checks if name not in present]
+    if missing:
+        return False, f"checks_missing: {missing[:3]}"
     return True, head
+
+
+#: A cancelled latest check is not a verdict on the code: it is what a
+#: superseded, pruned or label-noise run leaves behind (all three observed
+#: live 2026-09-07/08, when 87 accepted PRs sat outside the review window
+#: with red-but-never-failed checks and an operator timer had to rerun them).
+#: The merge tick reruns such a run itself -- once per tick per run, and
+#: never past three attempts, so a run that keeps getting cancelled becomes a
+#: `checks_not_green` finding instead of an infinite retry
+#: (VOYN-W0-AICC-MERGE-TICK-RERUNS-CANCELLED-CHECKS).
+_MAX_RERUNS_PER_PR_PER_TICK = 2
+_MAX_RUN_ATTEMPTS_FOR_RERUN = 3
+_RUN_ID_IN_DETAILS_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
+
+
+def _rerun_cancelled_latest_runs(
+    repo_path: str, latest_checks: list[dict[str, Any]]
+) -> list[str]:
+    """Ask GitHub to rerun every workflow run whose LATEST check on the head
+    ended `CANCELLED`, at most `_MAX_RERUNS_PER_PR_PER_TICK` runs and only
+    while the run has fewer than `_MAX_RUN_ATTEMPTS_FOR_RERUN` attempts.
+    Returns the run ids a rerun was requested for. Idempotent by
+    construction: after the request the latest check is queued, not
+    cancelled, so the next tick does not ask again."""
+    run_ids: list[str] = []
+    for check in latest_checks:
+        if str(check.get("conclusion") or "").upper() != "CANCELLED":
+            continue
+        match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
+        if match is None or match.group(1) in run_ids:
+            continue
+        run_ids.append(match.group(1))
+    requested: list[str] = []
+    for run_id in run_ids:
+        if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
+            break
+        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
+        if view.returncode != 0:
+            continue
+        try:
+            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
+            continue
+        rerun = _gh(["run", "rerun", run_id], repo_path)
+        if rerun.returncode == 0:
+            requested.append(run_id)
+    return requested
 
 
 def _merge_state(repo_path: str, pr_url: str) -> str:
@@ -2549,6 +2683,241 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     return f"flaky_rerun_dispatched:{dispatched}" if dispatched else ""
 
 
+# -- Marker carry-over on branch update (VOYN-W0-AICC-MARKER-CARRYOVER-ON-
+# BRANCH-UPDATE-REM) -----------------------------------------------------
+#
+# Live incident, 2026-08-27 05:06Z: a merge tick brought three BEHIND PRs
+# current with a `gh pr update-branch` GitHub-side merge of the base into
+# the branch. That produces a brand-new head commit -- a real, different
+# sha -- even though the PR's own diff against the (also advanced) base is
+# byte-identical to what was already reviewed and ACCEPTed. The marker
+# check in `_accept_marker_on_latest_review` is exact-sha (deliberately: an
+# ACCEPT must name the commit that will actually merge), so the new head
+# carries no marker and `_pr_is_mergeable` reports `no_accept_marker_on_
+# head` -- indistinguishable from an unreviewed PR. That forces a full
+# independent re-review of a diff nobody changed (~15-30 minutes of model
+# time per PR), and if main advances faster than review can complete, the
+# PR never stops cycling BEHIND -> update -> re-review -> BEHIND again.
+#
+# The fix is not to weaken the exact-sha check -- that is the whole point
+# of `_pr_is_mergeable` -- but to recognize, mechanically, when a new head
+# carries the SAME diff as a prior ACCEPTed head and carry that verdict
+# forward with its own audited paper trail, exactly the way finding
+# verification (`_post_auto_accept_audit`, above) posts an audit comment
+# before ever posting an overriding marker. `git patch-id --stable` is the
+# right invariant: it fingerprints a diff's actual content, ignoring the
+# base commit, parent shas, and hunk-header line numbers that
+# `update-branch` changes but a same-content merge does not.
+_MARKER_CARRYOVER_TAG = re.compile(
+    r"MARKER-CARRYOVER ([0-9a-f]{40})->([0-9a-f]{40})"
+)
+
+#: How many un-merged carry-over cycles may fire on one PR before carry-
+#: over stops being attempted. Without this, a base that never stops
+#: moving turns "carry the verdict forward" into the exact same infinite
+#: churn this feature exists to close, just one layer removed (BEHIND ->
+#: update -> carry-over -> BEHIND again, forever, without ever spending
+#: the wall-clock a full re-review would). Past this many, carry-over
+#: declines outright: the PR keeps its (still un-marked) new head and
+#: falls through to a genuine re-review on the next tick -- the same
+#: fail-closed path a diff that actually changed already takes, so a
+#: runaway base escalates into "get a real verdict," not a silent spin.
+_MAX_MARKER_CARRYOVER_CHURN = 3
+
+
+def _run_git_patch_id(repo_path: str, diff_text: str) -> str | None:
+    """The diff's content fingerprint via `git patch-id --stable`, run
+    with `cwd=repo_path` like every other subprocess call in this module
+    (`_gh`) -- an ambient cwd that is not a checkout at all would make
+    this needlessly fail on hosts where it happens to work by accident.
+    `--stable` rather than the default algorithm so the id does not shift
+    across git versions on different hosts. Byte-capped the same as the
+    review diff fetch. None on any failure -- carry-over fails closed to
+    a full re-review rather than trust a corrupt or empty id."""
+    if len(diff_text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            cwd=repo_path, input=diff_text, capture_output=True, text=True,
+            check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    first_line = (proc.stdout or "").splitlines()[0] if proc.stdout else ""
+    match = re.fullmatch(r"([0-9a-f]{40}) [0-9a-f]{40}", first_line.strip())
+    return match.group(1) if match else None
+
+
+def _compare_diff_text(
+    repo_path: str, owner: str, repo: str, base: str, sha: str
+) -> str | None:
+    """The unified diff text for `base...sha` via the same GitHub compare
+    API call `_pr_diff_and_head` makes for the PR's own base/head -- same
+    byte-size guard applies here too. `sha` reaches this function from
+    text parsed out of a PR review body (`_latest_marker_sha`), not from
+    a field GitHub itself typed as a commit oid the way `base` does, so it
+    gets the identical 40-hex validation `base` gets before either is
+    interpolated into the API path -- both are untrusted the same way, and
+    both are checked the same way, rather than the sha that is actually
+    free-form text being the one left unchecked."""
+    if not re.fullmatch(r"[0-9a-f]{40}", base) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return None
+    diff = _gh(
+        ["api", f"repos/{owner}/{repo}/compare/{base}...{sha}",
+         "-H", "Accept: application/vnd.github.v3.diff"],
+        repo_path,
+    )
+    if diff.returncode != 0:
+        return None
+    text = diff.stdout
+    if len(text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
+        return None
+    return text
+
+
+def _latest_marker_sha(
+    reviews: list[dict[str, Any]], pr_author_login: str | None
+) -> str | None:
+    """The sha of the most recent standing ACCEPT marker, under exactly
+    the same trust rule `_accept_marker_on_latest_review` already
+    enforces for merge itself: the most recent *live* (non-DISMISSED)
+    review, whose author's login is NOT the PR's own author's login
+    (casefolded) -- generalized to report WHICH sha it accepted rather
+    than only whether it matches one caller-supplied head, since carry-
+    over does not yet know the prior head to check.
+
+    This is deliberately the same author-independence comparison
+    `evaluate()` in `scripts/assert_independent_acceptance.py` makes and
+    not a hardcoded acceptance-bot login: comparing against a literal
+    login would (a) not match if the App were ever reinstalled under a
+    different slug, and (b) if instead compared the WRONG way -- against
+    the PR's own author's login as something a marker's review author
+    should equal, rather than must differ from -- would either never
+    match a genuine bot-authored marker at all (making carry-over a
+    silent no-op) or accept a self-issued marker whenever a marker-shaped
+    body happened to be posted by the PR's own author. Reusing the
+    proven-live independence check, generalized only to extract the sha,
+    is the same trust decision the rest of this module already makes for
+    an actual merge -- not a new one invented for this feature."""
+    live = [review for review in reviews if review.get("state") != "DISMISSED"]
+    if not live:
+        return None
+    latest = max(live, key=lambda r: r.get("submittedAt") or "")
+    match = re.search(r"ACCEPTANCE: ACCEPT ([0-9a-f]{40})", latest.get("body") or "")
+    if match is None:
+        return None
+    if pr_author_login is not None:
+        reviewer_login = (latest.get("author") or {}).get("login")
+        if reviewer_login is None or reviewer_login.casefold() == pr_author_login.casefold():
+            return None
+    return match.group(1)
+
+
+def _accept_marker_churn_count(comments: list[dict[str, Any]]) -> int:
+    """How many marker carry-overs already fired on this PR without a
+    merge landing in between -- the churn-breaker's counter. Counted from
+    the PR's own audit-comment trail (durable GitHub state, survives
+    process/host restarts, and needs no new storage) rather than a local
+    counter: every successful carry-over posts one `MARKER-CARRYOVER`
+    audit comment (see `_carry_over_marker_if_patch_id_stable`) before its
+    marker, so the comment count IS the cycle count."""
+    return sum(
+        1 for comment in comments
+        if _MARKER_CARRYOVER_TAG.search((comment or {}).get("body") or "")
+    )
+
+
+def _carry_over_marker_if_patch_id_stable(
+    repo_path: str, pr_url: str, task_id: str
+) -> bool:
+    """After a `gh pr update-branch` call has already succeeded (the
+    caller's job, not this function's), post a fresh ACCEPT marker on the
+    new head WITHOUT a full re-review, iff the PR's own diff is
+    byte-identical in content to the diff a prior standing ACCEPT marker
+    already covered -- proven via `git patch-id --stable`, invariant
+    across the base-merge commit `update-branch` creates. Returns whether
+    a marker was posted this call; any False is a decline, never an
+    error, and the caller's existing `no_accept_marker_on_head` handling
+    on the next tick is exactly the correct fallback (a full re-review).
+
+    Sequencing mirrors `_post_auto_accept_audit`: the audit comment
+    recording the carry-over is posted BEFORE the marker and gates it --
+    if the audit comment cannot be posted, no marker is posted this call
+    either, so a marker never stands without its own paper trail. The
+    audit tag is checked against existing comments first, so a call that
+    already posted the audit (but was interrupted before the marker) does
+    not repost it -- it still goes on to post the marker."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    if view.returncode != 0:
+        return False
+    try:
+        pr_data = json.loads(view.stdout or "{}")
+        base, head = pr_data["base"]["sha"], pr_data["head"]["sha"]
+        author_login = (pr_data.get("user") or {}).get("login")
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return False
+    if not re.fullmatch(r"[0-9a-f]{40}", head) or not re.fullmatch(r"[0-9a-f]{40}", base):
+        return False
+
+    meta = _gh(["pr", "view", pr_url, "--json", "reviews,comments"], repo_path)
+    if meta.returncode != 0:
+        return False
+    try:
+        meta_data = json.loads(meta.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    reviews = meta_data.get("reviews")
+    comments = meta_data.get("comments")
+    if not isinstance(reviews, list) or not isinstance(comments, list):
+        return False
+
+    if _accept_marker_churn_count(comments) >= _MAX_MARKER_CARRYOVER_CHURN:
+        return False
+
+    prior_sha = _latest_marker_sha(reviews, author_login)
+    if prior_sha is None or prior_sha == head:
+        return False
+
+    old_diff = _compare_diff_text(repo_path, owner, repo, base, prior_sha)
+    new_diff = _compare_diff_text(repo_path, owner, repo, base, head)
+    if old_diff is None or new_diff is None:
+        return False
+
+    old_id = _run_git_patch_id(repo_path, old_diff)
+    new_id = _run_git_patch_id(repo_path, new_diff)
+    if old_id is None or new_id is None or old_id != new_id:
+        return False
+
+    creds = _acceptance_app_credentials()
+    if creds is None:
+        return False
+
+    tag = f"MARKER-CARRYOVER {prior_sha}->{head}"
+    if not any(tag in ((comment or {}).get("body") or "") for comment in comments):
+        body = (
+            f"{tag}\n\n"
+            f"Task: {task_id}\n"
+            f"The ACCEPT marker for {prior_sha} carried over to {head} without "
+            "a new review: `git patch-id --stable` is identical before and "
+            "after `gh pr update-branch` brought this branch current with its "
+            "base, so the reviewed diff itself did not change. CI and the "
+            "acceptance gate remain required for merge.\n"
+        )
+        posted = _gh(["pr", "comment", pr_url, "--body", body], repo_path)
+        if posted.returncode != 0:
+            return False
+
+    ok, _err = _post_marker_as_bot(creds, pr_url, "ACCEPT", head)
+    return ok
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
@@ -2606,7 +2975,7 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
             report.skipped.append((task_id, merge_reason))
             continue
         if merge_sha is None:
-            ready, detail = _pr_is_mergeable(repo_path, pr_url)
+            ready, detail = _pr_is_mergeable(repo_path, pr_url, cfg.required_checks)
             if not ready:
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake
@@ -2638,7 +3007,23 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                 actions += 1
                 updated = _gh(["pr", "update-branch", pr_url], repo_path)
                 if updated.returncode == 0:
-                    report.skipped.append((task_id, "branch_updated_behind_main"))
+                    # The new head is a fresh, unmarked commit even though
+                    # the PR's own diff may not have changed at all -- see
+                    # the section comment above `_carry_over_marker_if_
+                    # patch_id_stable` for the live churn this closes.
+                    # Best-effort and never a reason to fail this branch
+                    # update: a decline here just leaves the ordinary
+                    # `no_accept_marker_on_head` path to pick it up with a
+                    # real re-review on a later tick, exactly as before
+                    # this existed.
+                    carried = _carry_over_marker_if_patch_id_stable(
+                        repo_path, pr_url, task_id
+                    )
+                    report.skipped.append((
+                        task_id,
+                        "branch_updated_marker_carried_over" if carried
+                        else "branch_updated_behind_main",
+                    ))
                 else:
                     report.skipped.append(
                         (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
@@ -2825,7 +3210,25 @@ class PrWindowConfig:
     #: `gh pr list` with no explicit sort returns newest-created-first, so a
     #: plain `--limit` truncated the oldest, un-reviewed backlog out of
     #: consideration entirely on any repo busier than this number.)
-    scan_limit: int = 50
+    #: Every open PR must be seen, or the ones beyond the scan never get a
+    #: label at all (67 unlabelled PRs on 2026-09-07 at 180+ open). The
+    #: listing is light (no reviews/checks/commits per PR), so a large limit
+    #: is cheap; details are fetched lazily for candidates only.
+    scan_limit: int = 300
+    #: The listing is exhaustive, not bounded: `scan_limit` is the first page
+    #: size, and a page that comes back full is retried at twice the size
+    #: until a page comes back short (review of d16dc0e4: a fixed 300 still
+    #: silently omitted PR 301+). This is the ceiling past which the tick
+    #: refuses to pretend it saw everything and reports `pr_list_truncated`.
+    scan_hard_cap: int = 5000
+    #: How many per-PR detail lookups (`gh pr view` with reviews, checks,
+    #: commits) one tick may spend, candidates included. The block reasons
+    #: (`_window_block_reason`: reject marker, missing/red checks, stale
+    #: head) need those details, so PRs beyond the window are still
+    #: examined while budget remains -- oldest first -- and a PR the budget
+    #: did not reach keeps the label it has: `blocked` is never downgraded
+    #: to `waiting` on no evidence (adversarial review of 53183850).
+    detail_budget: int = 80
     #: A PR whose head commit is older than this (seconds) with no green
     #: acceptance path yet is blocked from the window rather than occupying
     #: a slot indefinitely. Default 48h.
@@ -2852,6 +3255,19 @@ class PrWindowReport:
     #: PRs can be told apart from a genuine stale push rather than a lookup
     #: failure silently inflating its apparent age.
     age_fallback: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, headRefOid) beyond the window that the detail budget did not
+    #: reach this tick; their existing window label was left untouched.
+    unchecked: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, headRefOid) whose detail lookup (`gh pr view`) failed this
+    #: tick; their existing window label was left untouched -- a transient
+    #: GitHub error is no evidence about eligibility (review of d16dc0e4).
+    unreadable: list[tuple[int, str]] = field(default_factory=list)
+    #: Set when the listing itself failed: nothing was labelled this tick,
+    #: and the caller must say so loudly rather than print an empty report
+    #: (live 2026-09-08: the old all-fields listing exceeded GitHub's
+    #: 500,000 GraphQL node limit at 50 PRs and the tick silently did nothing
+    #: for days -- VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE).
+    error: str | None = None
 
 
 def _independent_latest_reject_marker(
@@ -3055,65 +3471,126 @@ def reconcile_pr_window(
     active PR out and back in on no real change, restarting its review
     cycle for nothing."""
     report = PrWindowReport()
-    listed = _gh(
-        [
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--search",
-            "sort:created-asc",
-            "--limit",
-            str(max(cfg.scan_limit, 1)),
-            "--json",
-            "number,url,headRefOid,createdAt,commits,reviews,"
-            "statusCheckRollup,author,labels",
-        ],
-        repo_path,
-    )
-    if listed.returncode != 0:
-        return report
-    try:
-        prs = json.loads(listed.stdout or "[]")
-    except ValueError:
-        return report
-    if not isinstance(prs, list):
-        return report
-
+    # Light listing only: reviews, checks and commits multiply the GraphQL
+    # node budget per PR and the full-field request died at 50 PRs
+    # ("requests up to 520,100 possible nodes which exceeds the maximum
+    # limit of 500,000"). Details are fetched per candidate below, and only
+    # until the window is full: a PR far down the queue cannot be selected
+    # this tick, so evaluating it would be wasted API budget.
+    # Exhaustive: page size doubles while a page comes back full, so every
+    # open PR is seen or the tick says loudly that it was not (`pr_list_
+    # truncated`); a bounded `--limit` silently dropped PR N+1 onward
+    # (review of d16dc0e4). `gh pr list` pages the GraphQL cursor itself.
+    limit = max(cfg.scan_limit, 1)
+    while True:
+        listed = _gh(
+            [
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--search",
+                "sort:created-asc",
+                "--limit",
+                str(limit),
+                "--json",
+                "number,url,headRefOid,createdAt,author,labels",
+            ],
+            repo_path,
+        )
+        if listed.returncode != 0:
+            report.error = f"pr_list_failed: {(listed.stderr or '').strip()[:200]}"
+            return report
+        try:
+            prs = json.loads(listed.stdout or "[]")
+        except ValueError:
+            report.error = "pr_list_unparseable"
+            return report
+        if not isinstance(prs, list):
+            report.error = "pr_list_unparseable"
+            return report
+        if len(prs) < limit:
+            break
+        if limit >= max(cfg.scan_hard_cap, 1):
+            report.error = f"pr_list_truncated: {limit} open PRs listed and the page was full"
+            return report
+        limit = min(limit * 2, max(cfg.scan_hard_cap, 1))
     now = time.time()
-    eligible: list[dict[str, Any]] = []
-    for pr in prs:
-        if not isinstance(pr, dict):
-            continue
-        number = int(pr.get("number") or 0)
-        head = str(pr.get("headRefOid") or "")
-        age_seconds, fell_back = _pr_age_seconds(repo_path, pr, now=now)
-        if fell_back:
-            report.age_fallback.append((number, head))
-        reason = _window_block_reason(pr, cfg, age_seconds=age_seconds)
-        if reason is not None:
-            report.blocked.append((number, reason))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_blocked)
-            continue
-        eligible.append(pr)
-
-    eligible.sort(
+    listed_prs = [pr for pr in prs if isinstance(pr, dict)]
+    listed_prs.sort(
         key=lambda pr: (str(pr.get("createdAt") or ""), int(pr.get("number") or 0))
     )
-    current_active = [pr for pr in eligible if cfg.label_active in _pr_window_labels(pr)]
-    rest = [pr for pr in eligible if cfg.label_active not in _pr_window_labels(pr)]
-    selected = current_active[: cfg.max_active]
-    selected += rest[: max(cfg.max_active - len(selected), 0)]
-    selected_numbers = {int(pr.get("number") or 0) for pr in selected}
+    # Sticky for the currently active set: they are examined first and keep
+    # their slot while still eligible; the age-sorted rest fills what is left.
+    ordered = [pr for pr in listed_prs if cfg.label_active in _pr_window_labels(pr)]
+    ordered += [pr for pr in listed_prs if cfg.label_active not in _pr_window_labels(pr)]
 
-    for pr in eligible:
+    selected = 0
+    details_used = 0
+    for pr in ordered:
         number = int(pr.get("number") or 0)
         head = str(pr.get("headRefOid") or "")
-        if number in selected_numbers:
-            report.active.append((number, head))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_active)
-        else:
+        window_full = selected >= cfg.max_active
+        if details_used >= max(cfg.detail_budget, 0):
+            # Out of detail budget: no evidence either way this tick, so no
+            # label write at all -- whatever the PR carried (active, waiting,
+            # blocked, nothing) stays. Writing `waiting` here demoted an
+            # active PR on no real change whenever the active set outgrew
+            # the budget (review of 5dec6322). Re-examined on a later tick.
+            report.unchecked.append((number, head))
+            continue
+        details_used += 1
+        detailed = _pr_window_details(repo_path, pr)
+        if detailed is None:
+            # Unknown is not evidence: a failed `gh pr view` says nothing
+            # about eligibility, so the PR's existing label (active,
+            # blocked, waiting or none) stays exactly as it was and the PR is
+            # reported unreadable for this tick (review of d16dc0e4: stamping
+            # `waiting` here could demote an active or blocked PR on a
+            # transient GitHub error). Re-examined next tick.
+            report.unreadable.append((number, head))
+            continue
+        age_seconds, fell_back = _pr_age_seconds(repo_path, detailed, now=now)
+        if fell_back:
+            report.age_fallback.append((number, head))
+        reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+        if reason is not None:
+            report.blocked.append((number, reason))
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
+            continue
+        if window_full:
             report.waiting.append((number, head))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
+            continue
+        selected += 1
+        report.active.append((number, head))
+        _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
 
     return report
+
+
+_PR_WINDOW_DETAIL_FIELDS = "reviews,statusCheckRollup,commits"
+
+
+def _pr_window_details(repo_path: str, pr: dict[str, Any]) -> dict[str, Any] | None:
+    """The per-PR fields the eligibility rules need (reviews, check rollup,
+    commits), fetched with one `gh pr view` -- unless the listing already
+    carried them (tests and any future richer listing). None when the
+    lookup fails, which the caller treats as not-eligible-this-tick."""
+    if all(key in pr for key in ("reviews", "statusCheckRollup", "commits")):
+        return pr
+    number = int(pr.get("number") or 0)
+    view = _gh(
+        ["pr", "view", str(number), "--json", _PR_WINDOW_DETAIL_FIELDS], repo_path
+    )
+    if view.returncode != 0:
+        return None
+    try:
+        details = json.loads(view.stdout or "{}")
+    except ValueError:
+        return None
+    if not isinstance(details, dict):
+        return None
+    merged = dict(pr)
+    merged.update(details)
+    return merged

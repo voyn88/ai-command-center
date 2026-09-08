@@ -19,9 +19,30 @@ LoadCredential=voyn_lease_pgpass:/etc/voyn/secrets/voyn_lease_pgpass
 # All lane credentials live below one stable tree.  This is both scalable for
 # arbitrary lane counts and lets transient agents mask the authority root once
 # instead of maintaining an unsafe per-lane path list.
-RuntimeDirectory=voyn-aicc-worker/%i
+# `aicc-worker-lanes`, not the legacy `voyn-aicc-worker`: the staged rollout
+# keeps legacy lanes (User=voynadmin, legacy runtime root voyn-aicc-worker)
+# running while the first isolated lane starts, and the legacy unit owns
+# that root 0750 voynadmin, so an aicc-worker lane nested under it
+# died at ExecStartPre with "cannot stat ... Permission denied" (worker-01,
+# 2026-09-08). A distinct runtime root is created by systemd for this unit's
+# own principal and never collides with a lane of the other generation.
+RuntimeDirectory=aicc-worker-lanes/%i
 RuntimeDirectoryMode=0750
-Environment=PGPASSFILE=/run/voyn-aicc-worker/%i/pgpass
+Environment=PGPASSFILE=/run/aicc-worker-lanes/%i/pgpass
+# Mutable runtime data (project_config.json and the other data/*.json the
+# control plane's modules resolve through storage.resolve_data_dir) lives
+# OUTSIDE the immutable release: /opt/aicc/current is a read-only 0555 tree
+# with no data/, so without this every lane read an empty config and every
+# task failed with "repository path not configured" (worker-01, 2026-09-08,
+# six hours after the first isolated rollout). All lanes share one state
+# directory, as they shared one clone's data/ before.
+StateDirectory=aicc/data
+StateDirectoryMode=0750
+Environment=AICC_DATA_DIR=/var/lib/aicc/data
+# Root-owned system git config (safe.directory for the bound clone sources):
+# a file, not GIT_CONFIG_COUNT/KEY/VALUE, because git's upload-pack child of
+# a local clone does not inherit the environment form (worker-01 2026-09-08).
+Environment=GIT_CONFIG_SYSTEM=/etc/aicc/gitconfig
 Environment=AICC_WORKER_ENV_FILE=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=/etc/aicc/lease.env
 EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env
@@ -31,7 +52,7 @@ UnsetEnvironment=ANTHROPIC_API_KEY
 # ADR-0010 invariant: the worker neither receives sudo nor selects a
 # privileged command (review finding on 6218a21).
 NoNewPrivileges=yes
-ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker/%i/pgpass
+ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/aicc-worker-lanes/%i/pgpass
 # This final argv assignment cannot be overridden by EnvironmentFile values.
 ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.worker
 ExecReload=/bin/kill -HUP $MAINPID

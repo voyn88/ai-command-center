@@ -1487,6 +1487,91 @@ def test_boot_restore_queues_active_worker_without_dependency_deadlock(tmp_path)
     ] not in calls
 
 
+def test_boot_restore_accepts_activating_notify_worker_with_live_main_pid(
+    tmp_path,
+):
+    """A Type=notify unit forks its MainPID before sending READY=1.
+
+    A queued (`--no-block`) start of an expected-active unit can therefore
+    still read `is-active` as "activating" with a nonzero MainPID moments
+    later -- that is the service coming up normally, not one that failed to
+    go inactive. Refusing it wedged every install behind recovery (worker-01,
+    2026-09-07/08, bootstrap attempts at 22:40/23:00/23:05 UTC).
+    """
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(argv, **kwargs):
+        if "--property=LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if "--property=MainPID" in argv:
+            return SimpleNamespace(returncode=0, stdout="4242\n", stderr="")
+        if argv[1] == "is-active":
+            return SimpleNamespace(returncode=3, stdout="activating\n", stderr="")
+        if argv[1] == "is-enabled":
+            return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+
+
+def test_boot_restore_still_refuses_deactivating_expected_inactive_main_pid(
+    tmp_path,
+):
+    """The activating exemption must not paper over a real stuck unit.
+
+    An expected-inactive unit that is still "deactivating" with a live
+    MainPID after `stop` is exactly the leftover-process case the assertion
+    exists to catch, queued start or not.
+    """
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run(argv, **kwargs):
+        if "--property=LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if "--property=MainPID" in argv:
+            return SimpleNamespace(returncode=0, stdout="4242\n", stderr="")
+        if argv[1] == "is-active":
+            return SimpleNamespace(returncode=3, stdout="deactivating\n", stderr="")
+        if argv[1] == "is-enabled":
+            return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="retains MainPID"):
+        module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+
+
 def test_boot_restore_never_synchronously_stops_its_own_recovery_service(
     tmp_path,
 ):
