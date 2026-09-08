@@ -232,6 +232,10 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-DEFER-AUTO-RESUME (0014): the machine exit from
         # DEFER_TO_USER for technical parks.
         "backlog_resume_deferred",
+        # VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW (0018): the
+        # machine exit from READY_TO_REVIEW for a task stuck there with no
+        # `pr` evidence.
+        "backlog_recover_stuck_ready_to_review",
         # VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (0015): the persisted
         # scan cursor for the tick windows.
         "backlog_scan_claim",
