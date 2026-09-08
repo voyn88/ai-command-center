@@ -8,6 +8,16 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
+- `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`
+  (`clients/aicc-native/apple/Sources/AICCNativeCore/AICCNativeCore.swift`):
+  a one-status, one-action snapshot for each of the three flows with a single
+  next action on iPhone — Work, Dialogues, Decisions. `Snapshot.
+  widgetSnippets(dialogs:)` always returns exactly three, one per flow, and
+  a widget's one action is always a deep link into the exact item, never a
+  mutation — `POST /v1/commands` is still out of the v1 read-only contract.
+  See `docs/aicc_native/WIDGET_SNIPPETS.md`.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,

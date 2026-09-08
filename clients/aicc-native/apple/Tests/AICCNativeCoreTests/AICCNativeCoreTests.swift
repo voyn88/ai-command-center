@@ -86,6 +86,40 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+@Test func widgetSnippetsCoverAllThreeFlowsInOrderEveryTime() throws {
+    let snapshot = try Fixture.healthySnapshot()
+    let snippets = snapshot.widgetSnippets()
+    #expect(snippets.map(\.flow) == [.work, .dialogues, .decisions])
+}
+
+@Test func workSnippetSurfacesTheBlockedTaskBeforeAnyActiveTask() throws {
+    let snapshot = try Fixture.healthySnapshot()
+    let work = snapshot.widgetSnippets().first { $0.flow == .work }
+    #expect(work?.destination == .task(id: "VOYN-EXAMPLE-002"))
+    #expect(work?.statusLine == "Canary has not been verified")
+}
+
+@Test func workSnippetFallsBackToACalmInboxWhenNothingNeedsTheOwner() {
+    let empty = Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: [], lanes: [], events: [])
+    let work = empty.widgetSnippets().first { $0.flow == .work }
+    #expect(work?.destination == .flowInbox(.work))
+}
+
+@Test func dialoguesSnippetPicksTheMostRecentlyActiveDialogue() {
+    let older = DialogSummary(id: "d1", title: "Older", state: "open", lastActivityAt: Date(timeIntervalSince1970: 0), messageCount: 2, lastSummary: nil)
+    let newer = DialogSummary(id: "d2", title: "Newer", state: "open", lastActivityAt: Date(timeIntervalSince1970: 1000), messageCount: 5, lastSummary: nil)
+    let empty = Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: [], lanes: [], events: [])
+    let dialogues = empty.widgetSnippets(dialogs: [older, newer]).first { $0.flow == .dialogues }
+    #expect(dialogues?.destination == .dialogue(id: "d2"))
+    #expect(dialogues?.statusLine == "Newer · сообщений: 5")
+}
+
+@Test func decisionsSnippetStaysHonestAboutMissingBackingData() {
+    let empty = Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: [], lanes: [], events: [])
+    let decisions = empty.widgetSnippets().first { $0.flow == .decisions }
+    #expect(decisions?.destination == .flowInbox(.decisions))
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}

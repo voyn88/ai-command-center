@@ -26,6 +26,6 @@ Chat is not a bypass around governance. The first fixture UI can show realistic 
 1. **Foundation:** Mac and iPhone navigation, accessible design system, offline validated snapshot and Overview/Attention/Projects/Tasks/Activity fixtures.
 2. **Owner communication:** Dialogues and decision-request fixtures, then the read-only conversation feed once the gateway contract is accepted.
 3. **Governed response:** replies, approvals and voice-assisted requests only through a separately accepted command gateway; high-risk actions require biometric confirmation on iPhone.
-4. **Differentiators:** agent/skill map, board view, decision memory, visual causality and carefully scoped push/haptics/widgets.
+4. **Differentiators:** agent/skill map, board view, decision memory, visual causality and carefully scoped push/haptics/widgets (`VOYN-MIN-WIDGET-SNIP`: one-status, one-action snippets for Work, Dialogues and Decisions — see `docs/aicc_native/WIDGET_SNIPPETS.md`).
 
 Every screen must remain usable for a top manager: explain the situation, why it matters, options and next step first; technical proof can be opened only when wanted.
