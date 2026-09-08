@@ -305,6 +305,9 @@ def test_the_control_plane_cannot_claim() -> None:
         "monitor_record_finding",
         "monitor_clear_finding",
         "monitor_link_task",
+        # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
+        # of where a migrated row came from.
+        "backlog_record_provenance",
     }
 
 

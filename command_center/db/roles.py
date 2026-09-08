@@ -588,6 +588,9 @@ _APP_BACKLOG_FUNCTIONS = (
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
     "monitor_link_task(bigint, text)",
+    # Audit trail for where a record came from (0020); the importer's stamp
+    # that a row was migrated rather than authored directly in the store.
+    "backlog_record_provenance(text, text, jsonb)",
 )
 
 # The enrolment surface (0003), split by who may do what.
