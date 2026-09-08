@@ -21,7 +21,13 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["ROUTING_MATRIX", "cascade_for"]
+__all__ = [
+    "ROUTING_MATRIX",
+    "MODEL_ONLY_REVIEW_EXECUTORS",
+    "cascade_for",
+    "model_only_review_cascade",
+    "verification_review_cascade",
+]
 
 #: task class -> ordered cascade. Each link: executor + the agent_run fields
 #: it pins. 'claude' is the headless CLI the worker's agent_runner already
@@ -74,4 +80,43 @@ def cascade_for(task_class: str) -> list[dict[str, Any]]:
     return [
         dict(link)
         for link in ROUTING_MATRIX.get(task_class, ROUTING_MATRIX["implementation"])
+    ]
+
+
+#: The review route's executors that also serve the two read/model-only
+#: verdict roles below. Restated here (not just "review") because
+#: `ROUTING_MATRIX["review"]` is the escalation cascade's vocabulary
+#: (executor + generic "review" task_type); a verdict role additionally pins
+#: a specific `task_type` (`independent_review` / `verification_review`),
+#: which the worker maps to a strictly different tool profile (see
+#: `agent_runner.MODEL_ONLY_TASK_TYPES` / `READ_ONLY_TASK_TYPES`). Filtering to
+#: this set (rather than every review executor) is itself part of the
+#: contract: an executor absent here has no argv builder for the model-only /
+#: read-only profile and must not silently enter a verdict role.
+MODEL_ONLY_REVIEW_EXECUTORS = frozenset({"copilot", "claude", "codex", "openai_http"})
+
+
+def model_only_review_cascade() -> list[dict[str, Any]]:
+    """The **reviewer** role: the review route, retyped `independent_review`
+    (MODEL_ONLY — the worker strips every tool). Renders a verdict from the
+    diff/prompt alone, never the tree."""
+    route = cascade_for("review")
+    return [
+        {**link, "task_type": "independent_review", "capability": "model_only"}
+        for link in route
+        if isinstance(link, dict) and link.get("executor") in MODEL_ONLY_REVIEW_EXECUTORS
+    ]
+
+
+def verification_review_cascade() -> list[dict[str, Any]]:
+    """The **verifier** role: same executor route as the reviewer, retyped
+    `verification_review` (read-only — Claude: Read/Grep/Glob; Codex:
+    `--sandbox read-only`) instead of MODEL_ONLY's zero tools, since
+    verification is exactly the task that must read the tree to confirm or
+    refute a finding."""
+    route = cascade_for("review")
+    return [
+        {**link, "task_type": "verification_review", "capability": "read_only"}
+        for link in route
+        if isinstance(link, dict) and link.get("executor") in MODEL_ONLY_REVIEW_EXECUTORS
     ]

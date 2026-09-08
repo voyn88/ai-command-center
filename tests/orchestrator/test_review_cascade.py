@@ -94,7 +94,7 @@ def test_empty_review_route_fails_closed_without_enqueuing(monkeypatch):
             ("VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7")
         ],
     )
-    monkeypatch.setattr(review_merge, "cascade_for", lambda _task_class: [])
+    monkeypatch.setattr(review_merge, "_model_only_review_cascade", lambda: [])
     calls = []
     report = review_merge.review_once(
         object(), lambda *args: calls.append(args), "/tmp"
