@@ -961,6 +961,51 @@ def _next_retry_key(
     return f"{base_key}:retry:{attempt + 1}"
 
 
+def _latest_attempt_executor(factory: Any, task_id: str, base_key: str) -> str | None:
+    """The executor whose run produced the latest terminal (``succeeded``)
+    result for ``base_key`` -- read from `work_result.payload["executor"]`,
+    the same field `command_center/worker/handlers.py` records on every
+    completed run. Used only to bias a *retry's* cascade away from the
+    executor that just produced a malformed/verdict-less result; returns
+    None (no bias) if the field is absent or the row itself is missing,
+    which simply leaves `_failover_cascade` a no-op."""
+    latest = _latest_attempt(factory, task_id, base_key)
+    if latest is None:
+        return None
+    _attempt, _state, payload_value = latest
+    result = _json_object(payload_value)
+    executor = (result or {}).get("executor")
+    return executor if isinstance(executor, str) and executor else None
+
+
+def _failover_cascade(
+    cascade: list[dict[str, Any]], avoid_executor: str | None
+) -> list[dict[str, Any]]:
+    """Reorder ``cascade`` so its first link is not ``avoid_executor`` when
+    another executor is available.
+
+    A review chunk whose executor refused the reviewer role (completed
+    successfully, exit 0, but wrote no parseable VERDICT line for the
+    expected head sha -- see `_next_retry_key`) gets a bounded fresh retry
+    identity. Without this reorder that retry's attempt 1 lands on
+    `cascade[0]`, which -- for the common single-repo-route cascade -- is
+    the SAME executor that just refused, so a persistent single-executor
+    refusal (a systemic policy/prompt reaction, not a transient fluke)
+    silently exhausts every bounded retry attempt on that one executor and
+    still never produces a verdict, the exact failure mode
+    VOYN-W0-AICC-REVIEW-REFUSAL-RETRYABLE was filed over. This never DROPS
+    the refusing executor's link -- only deprioritizes it -- so it still
+    serves as this retry's own last-resort fallback if every preferred
+    alternative is unavailable at dispatch time."""
+    if not avoid_executor or len(cascade) < 2:
+        return cascade
+    preferred = [link for link in cascade if link.get("executor") != avoid_executor]
+    if not preferred:
+        return cascade
+    deprioritized = [link for link in cascade if link.get("executor") == avoid_executor]
+    return preferred + deprioritized
+
+
 def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
@@ -1329,12 +1374,16 @@ def reconcile_review_once(
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
                 report.skipped.append((current_task_id, "review_prompt_budget_invalid"))
                 continue
+            refusing_executor = _latest_attempt_executor(
+                factory, current_task_id, base_key
+            )
+            retry_cascade = _failover_cascade(cascade, refusing_executor)
             payload: dict[str, Any] = {
                 "kind": "agent_run", "v": 1, "project_id": project_id,
                 "repository_path": repository_path,
                 "task_type": "independent_review", "prompt": prompt,
                 "timeout_seconds": cfg.review_timeout, "untrusted": True,
-                "cascade": cascade,
+                "cascade": retry_cascade,
             }
             if chunk.count > 1:
                 payload["review_chunk"] = {
@@ -1345,7 +1394,7 @@ def reconcile_review_once(
                     "base_sha": snapshot.base, "head_sha": snapshot.head,
                     "diff_hash": snapshot.digest,
                 }
-            enqueue(cfg.queue, retry_key, payload, current_task_id, len(cascade))
+            enqueue(cfg.queue, retry_key, payload, current_task_id, len(retry_cascade))
             report.retried.append((current_task_id, retry_key))
             actions += 1
         if actions == retries_before:
