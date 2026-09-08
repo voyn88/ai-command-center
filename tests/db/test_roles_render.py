@@ -296,6 +296,7 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_set_task_class",
         "monitor_record_finding",
         "monitor_clear_finding",
+        "monitor_link_task",
     }
 
 

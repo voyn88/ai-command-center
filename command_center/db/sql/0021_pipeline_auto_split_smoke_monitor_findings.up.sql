@@ -77,7 +77,7 @@ $$;
 -- {"suffix","title","body"[,"priority"]}. Children inherit wave, repo and
 -- (by default) priority; the parent depends on every child and closes as
 -- SPLIT. Fail-closed on any malformed entry: nothing is created.
-CREATE FUNCTION backlog_split_task(p_parent text, p_children jsonb)
+CREATE OR REPLACE FUNCTION backlog_split_task(p_parent text, p_children jsonb)
     RETURNS backlog_verdict
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE t backlog_task%ROWTYPE; v backlog_verdict; c jsonb; v_suffix text; v_id text;
@@ -156,7 +156,7 @@ BEGIN
         SELECT * INTO t FROM backlog_task b WHERE b.task_id = r.t_id FOR UPDATE;
         task_id := r.t_id; queue_state := r.q_state; detail := NULL;
 
-        v_task_status := NULL; v_pr := NULL; v_sha := NULL;
+        v_task_status := NULL; v_pr := NULL; v_sha := NULL; v_result := NULL;
         IF r.q_state = 'succeeded' AND r.result_id IS NOT NULL THEN
             SELECT wr.payload INTO v_result FROM work_result wr
              WHERE wr.result_id = r.result_id;
@@ -172,15 +172,21 @@ BEGIN
         -- for the owner (VOYN-W0-AICC-PLANNER-AUTO-SPLIT-PIPELINE-TASKS).
         v_split := NULL;
         IF r.q_state = 'succeeded' AND v_result ? 'result_text' THEN
+            -- One line, bounded at end-of-line: prose after the array on a
+            -- later line cannot widen the capture.
             v_split := substring(v_result ->> 'result_text'
-                                 from 'SPLIT_TASKS_JSON:[[:space:]]*(\[.*\])');
+                                 from 'SPLIT_TASKS_JSON:[[:space:]]*(\[[^\n]*\])');
         END IF;
         IF v_split IS NOT NULL THEN
             BEGIN
                 sv := backlog_split_task(r.t_id, v_split::jsonb);
             EXCEPTION
-                WHEN invalid_text_representation OR check_violation THEN
-                    sv.ok := false; sv.reason := 'trailer_not_json: ' || left(SQLERRM, 120);
+                -- Any refusal of one task's split -- bad JSON, a child the
+                -- upsert refused, a constraint -- is that task's finding, never
+                -- the batch's: the loop continues and the task falls through
+                -- to the ordinary return-to-pool path below.
+                WHEN OTHERS THEN
+                    sv.ok := false; sv.reason := 'split_refused: ' || left(SQLERRM, 160);
             END;
             IF sv.ok THEN
                 action := 'split';
@@ -242,7 +248,7 @@ $$;
 -- Read-only preflight with exactly backlog_dispatch's privileges (definer
 -- aicc_migrator reading backlog_eligible and the wave candidate). Run by
 -- self-deploy after every migration; a refusal here rolls the deploy back.
-CREATE FUNCTION backlog_dispatch_smoke()
+CREATE OR REPLACE FUNCTION backlog_dispatch_smoke()
     RETURNS boolean
     LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE v_n bigint;
@@ -257,7 +263,7 @@ GRANT EXECUTE ON FUNCTION backlog_dispatch_smoke() TO aicc_app;
 -- The control plane never updates backlog_task directly; the class is the
 -- one machine field the planner sets itself (split children inherit the
 -- parent's class inside backlog_split_task; monitor tasks are pipeline).
-CREATE FUNCTION backlog_set_task_class(p_task_id text, p_class text)
+CREATE OR REPLACE FUNCTION backlog_set_task_class(p_task_id text, p_class text)
     RETURNS boolean
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE v_n integer;
@@ -294,7 +300,7 @@ CREATE TABLE monitor_finding (
 CREATE UNIQUE INDEX monitor_finding_open_unique
     ON monitor_finding (source, failure) WHERE state = 'open';
 
-CREATE FUNCTION monitor_record_finding(p_source text, p_failure text, p_detail jsonb DEFAULT NULL)
+CREATE OR REPLACE FUNCTION monitor_record_finding(p_source text, p_failure text, p_detail jsonb DEFAULT NULL)
     RETURNS bigint
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE v_id bigint;
@@ -311,7 +317,7 @@ BEGIN
 END
 $$;
 
-CREATE FUNCTION monitor_clear_finding(p_source text)
+CREATE OR REPLACE FUNCTION monitor_clear_finding(p_source text)
     RETURNS integer
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE v_n integer;
@@ -324,4 +330,21 @@ END
 $$;
 GRANT EXECUTE ON FUNCTION monitor_record_finding(text, text, jsonb) TO aicc_app, aicc_worker;
 GRANT EXECUTE ON FUNCTION monitor_clear_finding(text) TO aicc_app, aicc_worker;
-GRANT SELECT, UPDATE ON monitor_finding TO aicc_app;
+GRANT SELECT ON monitor_finding TO aicc_app;
+
+-- The one write the control plane makes to a finding: link the task it filed.
+CREATE OR REPLACE FUNCTION monitor_link_task(p_finding_id bigint, p_task_id text)
+    RETURNS boolean
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE v_n integer;
+BEGIN
+    IF p_task_id !~ '^[A-Z0-9][A-Z0-9-]{2,120}$' THEN
+        RAISE EXCEPTION 'invalid task id for finding link';
+    END IF;
+    UPDATE monitor_finding SET task_id = p_task_id
+     WHERE finding_id = p_finding_id AND state = 'open' AND task_id IS NULL;
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    RETURN v_n > 0;
+END
+$$;
+GRANT EXECUTE ON FUNCTION monitor_link_task(bigint, text) TO aicc_app;

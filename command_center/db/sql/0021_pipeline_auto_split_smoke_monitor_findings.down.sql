@@ -1,4 +1,5 @@
 -- Reverse of 0021: previous return/ingest bodies, drop split/smoke/findings.
+DROP FUNCTION IF EXISTS monitor_link_task(bigint, text);
 DROP FUNCTION IF EXISTS monitor_clear_finding(text);
 DROP FUNCTION IF EXISTS monitor_record_finding(text, text, jsonb);
 DROP TABLE IF EXISTS monitor_finding;

@@ -371,8 +371,7 @@ class Planner:
                         (task_id_for_finding,),
                     )
                     self._exec(
-                        "UPDATE monitor_finding SET task_id = %s WHERE finding_id = %s",
-                        (task_id_for_finding, finding_id),
+                        "SELECT monitor_link_task(%s, %s)", (finding_id, task_id_for_finding)
                     )
                     report.monitor_tasks.append((task_id_for_finding, failure))
 

@@ -275,12 +275,14 @@ _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
     "run_finalization_claim": _NONE,
 }
 
-# Fail-closed monitor findings (0021): written only through the SECURITY
-# DEFINER pair (monitor_record_finding / monitor_clear_finding, granted to the
-# control plane AND worker hosts so the worker-host probe can record); the
-# control plane reads them and links the task it created (UPDATE task_id).
+# Fail-closed monitor findings (0021): every write travels through a SECURITY
+# DEFINER function -- record/clear (control plane and worker hosts, so the
+# worker-host probe can record) and monitor_link_task (control plane only,
+# the one field it sets). The control plane READS the table and nothing more;
+# a blanket UPDATE here would have let the web layer's role rewrite what a
+# monitor measured (adversarial review of fb837255).
 _MONITOR_FINDING_TABLES: dict[str, frozenset[str]] = {
-    "monitor_finding": frozenset({"SELECT", "UPDATE"}),
+    "monitor_finding": _READ,
 }
 
 # The structured backlog store (0005, BO-S1), the queue-claim idiom again:
@@ -573,13 +575,15 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
-    # 0021: read-only deploy preflight with dispatch's privileges, the task
-    # class setter the planner uses for split children and monitor tasks,
-    # and the monitor-finding pair (also granted to worker hosts below).
+    # 0021: read-only deploy preflight with dispatch's privileges; the task
+    # class setter the planner uses for split children and monitor tasks; the
+    # monitor-finding record/clear pair (shared with worker hosts, see
+    # _WORKER_FUNCTIONS) and the control-plane-only task link.
     "backlog_dispatch_smoke()",
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_link_task(bigint, text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
