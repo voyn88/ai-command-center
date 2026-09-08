@@ -16,6 +16,10 @@ import pytest
 from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
 from command_center.dispatch import models, policy_config, service
+from command_center.dispatch.degradation import (
+    QualityWindow,
+    evaluate_degradation,
+)
 from command_center.dispatch.models import DispatchPolicy, ExecutorProfile
 from command_center.http_auth.identity import Principal
 

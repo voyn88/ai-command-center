@@ -15,6 +15,7 @@ from command_center.dispatch.models import (
     DEFAULT_TAIL_RISK_SCENARIOS,
     AgentLimit,
     DispatchPolicy,
+    QuarantineRecord,
     TailRiskScenario,
 )
 
@@ -138,6 +139,81 @@ def test_load_returns_defaults_when_nothing_saved():
     loaded = policy_config.load_policy(ROOT)
     assert loaded.prefer_local is True
     assert loaded.cost_matrix == {}
+
+
+def test_quarantined_agents_default_to_empty_unlike_tail_risk_scenarios():
+    # No agent starts quarantined — unlike the tail-risk registry, garbage
+    # input must not fall back to some non-empty "protective" default here.
+    for garbage in (None, [], "nope", 42, {"quarantined_agents": "not-a-dict"}):
+        assert DispatchPolicy.from_dict(garbage).quarantined_agents == {}
+
+
+def test_quarantined_agents_roundtrip_through_dict():
+    record = QuarantineRecord(
+        executor_id="codex",
+        reason="degradation_confirmed",
+        quarantined_at="2026-09-08T00:00:00Z",
+        breaching_window_ids=("w2", "w3"),
+        baseline_failure_rate=0.1,
+    )
+    policy = DispatchPolicy(quarantined_agents={"codex": record})
+    restored = DispatchPolicy.from_dict(policy.as_dict())
+
+    assert restored.quarantined_agents == {"codex": record}
+    assert restored.is_quarantined("codex")
+    assert not restored.is_quarantined("claude_code")
+
+
+def test_quarantined_agents_drops_unparseable_entries():
+    policy = DispatchPolicy.from_dict(
+        {"quarantined_agents": {"good": {"reason": "x"}, "bad": "not-a-dict"}}
+    )
+    assert set(policy.quarantined_agents) == {"good"}
+
+
+def test_record_quarantine_persists_and_is_read_back():
+    record = QuarantineRecord(
+        executor_id="codex", reason="degradation_confirmed", quarantined_at="now"
+    )
+
+    updated = policy_config.record_quarantine(ROOT, record, actor="monitor")
+
+    assert updated.is_quarantined("codex")
+    assert policy_config.load_policy(ROOT).is_quarantined("codex")
+    assert updated.updated_by == "monitor"
+
+
+def test_record_quarantine_does_not_clobber_other_policy_fields():
+    policy_config.save_policy(
+        ROOT, DispatchPolicy(prefer_local=False, cost_matrix={"ollama": 0.0})
+    )
+
+    policy_config.record_quarantine(
+        ROOT,
+        QuarantineRecord(executor_id="codex", reason="x", quarantined_at="now"),
+    )
+
+    reloaded = policy_config.load_policy(ROOT)
+    assert reloaded.prefer_local is False
+    assert reloaded.cost_matrix == {"ollama": 0.0}
+    assert reloaded.is_quarantined("codex")
+
+
+def test_clear_quarantine_removes_the_record():
+    policy_config.record_quarantine(
+        ROOT,
+        QuarantineRecord(executor_id="codex", reason="x", quarantined_at="now"),
+    )
+
+    cleared = policy_config.clear_quarantine(ROOT, "codex", actor="operator")
+
+    assert not cleared.is_quarantined("codex")
+    assert not policy_config.load_policy(ROOT).is_quarantined("codex")
+
+
+def test_clear_quarantine_of_an_unquarantined_agent_is_a_noop():
+    cleared = policy_config.clear_quarantine(ROOT, "never-quarantined")
+    assert cleared.quarantined_agents == {}
 
 
 def test_update_policy_overlays_only_named_fields():

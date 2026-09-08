@@ -31,6 +31,11 @@ DEFER_NO_AVAILABLE_EXECUTOR = "no_available_executor"
 # expected cost of error (probability x impact) currently exceeds the
 # scenario's configured limit. Checked per task, before eligibility/budget.
 DEFER_TAIL_RISK = "tail_risk_limit_exceeded"
+# Every executor permitted for this task is quarantined (`quality.QuarantineRecord`
+# in `DispatchPolicy.quarantined_agents`) — a confirmed quality-degradation
+# verdict, not a capacity/availability gap, so it gets its own typed reason
+# rather than collapsing into `DEFER_NO_ELIGIBLE_EXECUTOR`.
+DEFER_AGENT_QUARANTINED = "agent_quarantined"
 
 DEFER_REASONS = frozenset(
     {
@@ -43,6 +48,7 @@ DEFER_REASONS = frozenset(
         DEFER_NO_ELIGIBLE_EXECUTOR,
         DEFER_NO_AVAILABLE_EXECUTOR,
         DEFER_TAIL_RISK,
+        DEFER_AGENT_QUARANTINED,
     }
 )
 
@@ -79,6 +85,11 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "cost of error (probability x impact) exceeds its configured limit: "
         "dispatch is refused until the scenario is revised or the limit is "
         "raised, never assigned anyway."
+    ),
+    DEFER_AGENT_QUARANTINED: (
+        "Every eligible executor is quarantined after confirmed quality "
+        "degradation across two consecutive windows: dispatch is refused "
+        "until the quarantine is cleared, never assigned anyway."
     ),
 }
 
@@ -314,6 +325,59 @@ def _default_tail_risk_registry() -> dict[str, TailRiskScenario]:
 
 
 @dataclass(frozen=True)
+class QuarantineRecord:
+    """One executor's confirmed quality-degradation quarantine.
+
+    Produced by `command_center.dispatch.degradation.evaluate_degradation`
+    from windowed run-outcome stats and persisted here so the pure dispatch
+    engine (`policy.plan_dispatch`) can refuse to assign this executor any
+    further work with no code path that assigns anyway — the same structural
+    guarantee the kill switch and tail-risk gate already get. `retrain_required`
+    is a flag for the (separate, out-of-band) retraining workflow to consume;
+    this module never triggers retraining itself, it only records that the
+    threshold-degradation acceptance requires it.
+    """
+
+    executor_id: str
+    reason: str
+    quarantined_at: str | None
+    retrain_required: bool = True
+    breaching_window_ids: tuple[str, ...] = ()
+    baseline_failure_rate: float = 0.0
+
+    def as_dict(self) -> dict:
+        return {
+            "executor_id": self.executor_id,
+            "reason": self.reason,
+            "quarantined_at": self.quarantined_at,
+            "retrain_required": self.retrain_required,
+            "breaching_window_ids": list(self.breaching_window_ids),
+            "baseline_failure_rate": self.baseline_failure_rate,
+        }
+
+    @classmethod
+    def from_dict(cls, executor_id: str, data: object) -> "QuarantineRecord | None":
+        """Fail closed at the entry level, like `TailRiskScenario.from_dict`:
+        an unparseable record is dropped rather than coerced into one that
+        quarantines (or clears) an executor nobody actually flagged."""
+        if not isinstance(data, dict):
+            return None
+        windows = data.get("breaching_window_ids")
+        return cls(
+            executor_id=executor_id,
+            reason=str(data.get("reason") or "degradation_confirmed"),
+            quarantined_at=data.get("quarantined_at"),
+            retrain_required=data.get("retrain_required", True) is not False,
+            breaching_window_ids=(
+                tuple(str(w) for w in windows)
+                if isinstance(windows, (list, tuple))
+                else ()
+            ),
+            baseline_failure_rate=_clamp01(data.get("baseline_failure_rate")),
+        )
+
+
+@dataclass(frozen=True)
 class DispatchPolicy:
     """The config-driven dispatch policy (like the advisor's AutoRule).
 
@@ -338,6 +402,11 @@ class DispatchPolicy:
     tail_risk_scenarios: dict[str, TailRiskScenario] = field(
         default_factory=_default_tail_risk_registry
     )
+    # executor id -> QuarantineRecord. Empty by default (unlike
+    # `tail_risk_scenarios`, no executor starts quarantined) — an entry only
+    # exists once `degradation.evaluate_degradation` confirms two consecutive
+    # breaching windows for that executor.
+    quarantined_agents: dict[str, QuarantineRecord] = field(default_factory=dict)
     updated_at: str | None = None
     updated_by: str | None = None
 
@@ -365,6 +434,9 @@ class DispatchPolicy:
                 return scenario
         return None
 
+    def is_quarantined(self, executor_id: str) -> bool:
+        return executor_id in self.quarantined_agents
+
     def as_dict(self) -> dict:
         return {
             "prefer_local": self.prefer_local,
@@ -378,6 +450,9 @@ class DispatchPolicy:
             "local_executor_ids": sorted(self.local_executor_ids),
             "tail_risk_scenarios": {
                 k: v.as_dict() for k, v in self.tail_risk_scenarios.items()
+            },
+            "quarantined_agents": {
+                k: v.as_dict() for k, v in self.quarantined_agents.items()
             },
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
@@ -420,6 +495,12 @@ class DispatchPolicy:
             if (scenario := TailRiskScenario.from_dict(str(scenario_id), raw))
             is not None
         } or _default_tail_risk_registry()
+        quarantined = {
+            record.executor_id: record
+            for executor_id, raw in _as_dict(data.get("quarantined_agents")).items()
+            if (record := QuarantineRecord.from_dict(str(executor_id), raw))
+            is not None
+        }
         return cls(
             prefer_local=data.get("prefer_local", True) is not False,
             cost_matrix=cost_matrix,
@@ -431,6 +512,7 @@ class DispatchPolicy:
             priority_weights=weights,
             local_executor_ids=local_set,
             tail_risk_scenarios=scenarios,
+            quarantined_agents=quarantined,
             updated_at=data.get("updated_at"),
             updated_by=data.get("updated_by"),
         )
