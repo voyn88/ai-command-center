@@ -46,6 +46,8 @@ def test_worker_cannot_reach_governance_tables() -> None:
         "council_vote",
         "council_decision",
         "council_event",
+        "counterfactual_decision",
+        "counterfactual_alternative",
         "audit_run",
         "audit_finding",
         "market_item",

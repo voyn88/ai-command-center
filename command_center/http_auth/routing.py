@@ -92,6 +92,10 @@ ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/networking/messages"): "networking:message:send",
     ("POST", "/api/v1/networking/feedback"): "networking:feedback:submit",
     ("POST", "/api/v1/networking/invite"): "networking:invite",
+    # -- command_center/api/counterfactual_ledger_routes.py ---------------
+    ("POST", "/api/v1/decisions"): "decisions:create",
+    ("POST", "/api/v1/decisions/{decision_id}/alternatives"): "decisions:alternative:add",
+    ("POST", "/api/v1/decisions/{decision_id}/finalize"): "decisions:finalize",
     # -- command_center/dispatch/api.py -----------------------------------
     ("POST", "/api/v1/dispatch/assign"): "dispatch:assign",
     ("PUT", "/api/v1/dispatch/policy"): "dispatch:policy:update",
@@ -158,6 +162,17 @@ CLIENT_IDENTITY_CARVE_OUTS: dict[tuple[str, str], CarveOut] = {
             "assignment; that needs a schema field before the caller can fill it."
         ),
         task="VOYN-W0-AICC-AUTH-HTTP-01b",
+    ),
+    ("POST", "/api/v1/decisions"): CarveOut(
+        fields=("owner",),
+        reason=(
+            "`owner` names who is accountable for the decision, not a claim about "
+            "the caller recording it — the person opening the ledger entry is "
+            "routinely not the decision's owner. Deriving it from the principal "
+            "would be wrong, so it stays until this surface grows a separate "
+            "`recorded_by` field taken from the caller."
+        ),
+        task="VOYN-MIN-COMP",
     ),
     ("POST", "/api/v1/marketplace/items/{item_id}/install"): CarveOut(
         fields=("actor",),

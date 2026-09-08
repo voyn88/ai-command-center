@@ -240,6 +240,27 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-SRV-03",
     ),
+    "counterfactual_decision": Exclusion(
+        reason=(
+            "Born in VOYN-MIN-COMP with a PostgreSQL target declared for schema "
+            "correspondence, but no dual-write store yet: the ledger has a single "
+            "reader/writer (the AICC API) and no reconciliation story has been "
+            "built for it. A follow-up task should add a PostgresTableMirror "
+            "before this table carries production data that needs cross-engine "
+            "parity, the same deferral run_finalization_claim already recorded."
+        ),
+        task="VOYN-MIN-COMP",
+    ),
+    "counterfactual_alternative": Exclusion(
+        reason=(
+            "As counterfactual_decision: born in VOYN-MIN-COMP, has a PostgreSQL "
+            "target for schema correspondence, but no PostgresTableMirror yet. "
+            "It is a child row keyed off its decision's foreign key, so its "
+            "mirror would need to land after the parent's the same way "
+            "message follows contact, and that ordering is deferred with it."
+        ),
+        task="VOYN-MIN-COMP",
+    ),
     "worker_host_fingerprint": Exclusion(
         reason=(
             "PostgreSQL-native, and deliberately unreachable from the component "
