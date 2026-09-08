@@ -103,6 +103,50 @@ run_release() {
     --lock-fd "$AICC_INSTALL_LOCK_FD"
 }
 
+aios_artifact_store=/var/lib/aicc-artifacts
+
+install_aios_wheels() {
+  staging=$1
+  for lock in aios-sdk.lock.json aios-db.lock.json; do
+    spec=$(/usr/bin/python3 - "$staging/$lock" <<'PY'
+import json
+import re
+import sys
+
+lock = json.load(open(sys.argv[1], encoding="utf-8"))
+name = lock["wheel_filename"]
+digest = lock["wheel_sha256"]
+if not re.fullmatch(r"[A-Za-z0-9_.-]+\.whl", name) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+    raise SystemExit("invalid AIOS artifact lock")
+print(name, digest)
+PY
+)
+    name=${spec% *}
+    digest=${spec#* }
+    wheel="$aios_artifact_store/$digest/$name"
+    if [ -L "$wheel" ] || [ ! -f "$wheel" ]; then
+      echo "AIOS artifact missing from the root store: $wheel (stage the accepted wheel, sha256 $digest)" >&2
+      exit 1
+    fi
+    if [ "$(stat -c %u:%g -- "$wheel")" != 0:0 ] || \
+       find "$wheel" -maxdepth 0 -perm /022 -print -quit | grep -q . || \
+       [ "$(stat -c %u:%g -- "$aios_artifact_store")" != 0:0 ] || \
+       find "$aios_artifact_store" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
+      echo "AIOS artifact store is not root-owned and immutable: $wheel" >&2
+      exit 1
+    fi
+    if ! printf '%s  %s\n' "$digest" "$wheel" | sha256sum -c --quiet -; then
+      echo "AIOS artifact digest mismatch: $wheel" >&2
+      exit 1
+    fi
+    printf '%s --hash=sha256:%s\n' "$wheel" "$digest" > "$staging/.aios-requirements.txt"
+    "$staging/.venv/bin/python" -m pip install \
+      --disable-pip-version-check --no-deps --require-hashes \
+      -r "$staging/.aios-requirements.txt"
+    rm -f "$staging/.aios-requirements.txt"
+  done
+}
+
 stage_immutable_release() {
   release_id=$(git_trusted -C "$repo_root" rev-parse --verify HEAD)
   case "$release_id" in
@@ -137,12 +181,25 @@ stage_immutable_release() {
     "$release_staging/.venv/bin/python" -m pip install \
       --disable-pip-version-check --require-hashes \
       -r "$release_staging/requirements-ci-linux.lock"
+    # The worker imports `aios_db` (and the SDK) which the lock does not carry:
+    # CI fetches them from the private aios release with a read-only token.
+    # A root installer holds no such token, so it installs the exact accepted
+    # wheels from the root-owned digest-addressed store, verified against the
+    # release's own lock files -- and refuses otherwise. Without this the lane
+    # started and died at once with "No module named 'aios_db'" (worker-01,
+    # 2026-09-08, first canary start after #823/#858).
+    install_aios_wheels "$release_staging"
     PYTHONPATH="$release_staging" "$release_staging/.venv/bin/python" - <<'PY'
+import aios_db
+import aios_sdk
 from command_center import worker
-assert worker is not None
+assert worker is not None and aios_db is not None and aios_sdk is not None
 PY
     chown -R root:root "$release_staging"
     chmod -R a-w "$release_staging"
+    # mktemp -d created the staging root 0700; the lane runs as aicc-worker
+    # and must traverse it (WorkingDirectory=/opt/aicc/current).
+    chmod 0555 "$release_staging"
     # Record the root-owned content manifest from the staging tree BEFORE the
     # rename, so a release directory can never exist without the manifest that
     # authorises its later reuse. A crash between the two leaves only staging,
@@ -364,6 +421,32 @@ if [ ! -f "$baseline_release" ]; then
   sync -f "$state_dir"
 fi
 
+# The lanes' mutable data dir (template: StateDirectory=aicc/data,
+# AICC_DATA_DIR=/var/lib/aicc/data). The immutable release has no data/, so
+# project_config.json -- the file that names every project's
+# repository_path -- is carried over from the clone the legacy lanes ran
+# from, once; afterwards the state directory is the authority and this never
+# overwrites it. Without the file every task fails with "repository path not
+# configured" (worker-01, 2026-09-08), and the rollout's lane-input probe
+# refuses to advance past such a lane.
+stage_worker_data_dir() {
+  local legacy_data_dir=${AICC_LEGACY_DATA_DIR:-/home/voynadmin/aicc-preprod/repo/data}
+  # The parent stays root-owned, as systemd keeps it for a nested
+  # StateDirectory=: a worker-owned /var/lib/aicc would let that principal
+  # rename or replace entries under the shared state hierarchy (review of
+  # f4ef507c). Only the leaf belongs to the worker.
+  install -d -m 0755 -o root -g root /var/lib/aicc
+  install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc/data
+  [ -e /var/lib/aicc/data/project_config.json ] && return 0
+  if [ -f "$legacy_data_dir/project_config.json" ]; then
+    install -m 0640 -o aicc-worker -g aicc-worker \
+      "$legacy_data_dir/project_config.json" /var/lib/aicc/data/project_config.json
+    return 0
+  fi
+  echo "AICC_AGENT_PRINCIPAL_ISOLATION_FAIL: no project_config.json in /var/lib/aicc/data and none to migrate from $legacy_data_dir" >&2
+  return 1
+}
+
 rollback() {
   result=$?
   trap - EXIT HUP INT TERM
@@ -473,6 +556,7 @@ fi
 # maps deploy/aicc/worker-lanes onto it) before this rollout runs on
 # a fresh host and matches the snapshot origin (reviewed on 8a881d3).
 if [ "$install_profile" = "worker" ]; then
+  stage_worker_data_dir
   run_rollout rollout --lanes /etc/aicc/worker-lanes
   "$repo_root/ops/verify-agent-principal-boundary.sh"
 fi

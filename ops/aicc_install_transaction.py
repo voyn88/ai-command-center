@@ -1870,7 +1870,19 @@ def restore_service_snapshot(
             enabled_matches = enabled != "enabled"
         if not (exists_matches and active_matches and enabled_matches):
             raise RuntimeError(f"service snapshot did not restore exactly: {unit}")
-        if active != "active" and main_pid not in {"", "0"}:
+        # A queued Type=notify start forks its MainPID before it sends
+        # READY=1, so systemd reports it "activating" with a live MainPID for
+        # a window that is entirely normal -- not a leftover from a service
+        # that failed to go inactive. `active_matches` already accepts that
+        # transitional state for a queued start of an expected-active unit;
+        # this must not re-refuse the exact same state (observed live on
+        # worker-01, 2026-09-07/08).
+        activating_start = queued_start and expected_active and active == "activating"
+        if (
+            active != "active"
+            and not activating_start
+            and main_pid not in {"", "0"}
+        ):
             raise RuntimeError(f"inactive restored service retains MainPID: {unit}")
         if version == 3 and state["exists"] and not self_recovery:
             properties = state["properties"]
@@ -4664,6 +4676,16 @@ def _release_entry(
         raise ReleaseRefused(f"release path is not trusted-owned: {relative}")
     if mode & 0o022 and not stat.S_ISLNK(info.st_mode):
         raise ReleaseRefused(f"release path is group/world writable: {relative}")
+    if stat.S_ISDIR(info.st_mode) and mode & 0o055 != 0o055:
+        # The worker lane runs as the unprivileged `aicc-worker` principal with
+        # `WorkingDirectory=/opt/aicc/current`; a directory it cannot traverse
+        # makes the release unstartable (200/CHDIR at ExecStartPre, observed
+        # live on worker-01 2026-09-02 and 2026-09-07: `mktemp -d` staged the
+        # release root as 0700 and `chmod -R a-w` left it 0500). Refuse to
+        # record or accept such a tree rather than publish a dead release.
+        raise ReleaseRefused(
+            f"release directory is not traversable by the worker principal: {relative}"
+        )
     if stat.S_ISLNK(info.st_mode):
         # A symlink is legitimate inside the interpreter venv, but only as the
         # exact link recorded when root built the release. The target is data,
@@ -5139,6 +5161,7 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/aicc-agent-launcher@.service",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
+        "/etc/aicc/gitconfig",
         "/etc/aicc/agent.env",
         "/etc/systemd/system/voyn-aicc-worker@.service",
         "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf",
@@ -5363,6 +5386,13 @@ def default_specs(
         FileSpec(
             repo_root / "deploy/aicc/worker-lanes",
             "/etc/aicc/worker-lanes",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/aicc/gitconfig",
+            "/etc/aicc/gitconfig",
             0o644,
             root_uid,
             root_gid,

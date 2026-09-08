@@ -130,9 +130,17 @@ COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
 PRINCIPAL_ISOLATION_LAUNCHER = "/usr/libexec/aicc-agent-launcher"
 PRINCIPAL_ISOLATION_REQUIRED_ENV = "AICC_AGENT_PRINCIPAL_ISOLATION"
 PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
+# The ONE place the isolated executors live: the root-owned toolchain the
+# broker validates and launches (`ops/aicc_agent_launcher.py`,
+# `EXECUTOR_BINARIES`). This map used to name /usr/local/bin, a path the
+# toolchain does not populate: on worker-01 codex was absent there, the
+# worker's preflight declared it unavailable, and every review fell through
+# the cascade to claude (2026-09-08). Two authorities for "where is the
+# executor" is exactly the drift that hid it; keep this in step with the
+# launcher's TOOLCHAIN_BIN.
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
-    "claude": "/usr/local/bin/claude",
-    "codex": "/usr/local/bin/codex",
+    "claude": "/opt/aicc/toolchains/current/bin/claude",
+    "codex": "/opt/aicc/toolchains/current/bin/codex",
     # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
     # principal isolation because its login credential carries GitHub /
     # repository authority -- staging it would hand untrusted model code the
