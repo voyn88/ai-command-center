@@ -18,13 +18,19 @@ Layering, mirroring `docs/mobile/API_REQUIREMENTS.md` §1:
     api.py       — the HTTP boundary (M1D).
     notify.py    — notification detection, a durable per-device offline queue,
                    and bidirectional sync (Phase C; VOYN-W0-F5).
+    summary_cache.py — a signed, secure per-device summary cache for offline
+                   mode: the owner's priority task views plus this device's
+                   own pending notification backlog, persisted as a signed
+                   envelope so a device that loses network can still render
+                   its last known-good priority view instead of a blank
+                   screen (VOYN-MIN-OFFLINE-SUMMARY).
 
-`adapters.py` and `notify.py` exist today; `auth.py`/`api.py` remain
-deliberate stubs so the package shape matches the specification before the
-HTTP boundary they front (which needs the device identity `auth.py` will own)
-is written.
+`adapters.py`, `notify.py`, and `summary_cache.py` exist today; `auth.py`/
+`api.py` remain deliberate stubs so the package shape matches the
+specification before the HTTP boundary they front (which needs the device
+identity `auth.py` will own) is written.
 """
 
 from __future__ import annotations
 
-__all__ = ["adapters", "notify"]
+__all__ = ["adapters", "notify", "summary_cache"]
