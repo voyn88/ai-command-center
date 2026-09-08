@@ -865,11 +865,20 @@ def test_review_backlog_fence_pauses_dispatch_but_not_resume_reconcile(rig) -> N
     )
     _park_technically(app_factory, store, worker, "VOYN-W0-BL3")
     assert store.upsert_task(_task("VOYN-W0-BL4", repo="repo-d2"))[0]  # OPEN
+    # A lane is busy, so the fence is real backpressure here (with every lane
+    # idle the tick would dispatch anyway -- see
+    # test_idle_lanes_dispatch_through_the_review_backlog_fence).
+    assert store.upsert_task(_task("VOYN-W0-TT", repo="repo-tt"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-TT")[0]
 
     report = plan_once(app_factory, PlanLimits(wip_limit=4, review_backlog_limit=2))
 
     assert report.review_window_full == 2
+    assert report.idle_trickle is False
     assert report.dispatched == []
+    # BL4, plus BL3 once the resume reconcile above returned it to OPEN in
+    # this same tick: both are functional candidates the fence held.
+    assert report.fenced >= 1
     assert "VOYN-W0-BL3" in [task_id for task_id, _reason in report.resumed]
     assert store.get_task("VOYN-W0-BL3")["status"] in ("OPEN", "IN_PROGRESS")
     # The candidate loop never ran at all -- the OPEN task the fence was
@@ -1076,3 +1085,61 @@ def test_recover_stuck_ready_to_review_refuses_everything_else(rig) -> None:
     assert store.recover_stuck_ready_to_review("VOYN-W0-NOPE")[:2] == (
         False, "unknown_task",
     )
+
+
+def _mark_ready_to_review_with_pr(app_factory, task_id: str) -> None:
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM backlog_record_evidence(%s, 'pr', %s)",
+            (task_id, f"https://github.com/voyn88/x/pull/{secrets.randbelow(10**6)}"),
+        )
+
+
+def test_pipeline_class_tasks_pass_the_review_backlog_fence(rig, admin_conn) -> None:
+    """VOYN-W0-AICC-PLANNER-PIPELINE-CLASS-PRIORITY-AND-WINDOW-PAUSE: with the
+    review backlog at the limit and a lane busy, a functional candidate is
+    held (backpressure) while a pipeline-class candidate is dispatched --
+    the fix for the backlog must never wait behind the backlog."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RV", status="READY_TO_REVIEW", repo="repo-rv"))[0]
+    _mark_ready_to_review_with_pr(app_factory, "VOYN-W0-RV")
+    assert store.upsert_task(_task("VOYN-W0-TT", repo="repo-tt"))[0]  # keeps a lane busy
+    assert _dispatch(app_factory, "VOYN-W0-TT")[0]
+    assert store.upsert_task(_task("VOYN-W0-P1", repo="repo-p1"))[0]  # functional
+    assert store.upsert_task(_task("VOYN-W0-P3", repo="repo-p3"))[0]  # pipeline
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_task SET task_class = 'pipeline' WHERE task_id = %s",
+            ("VOYN-W0-P3",),
+        )
+        admin_conn.commit()
+        cur.execute("SELECT task_id FROM backlog_eligible")
+        order = [row[0] for row in cur.fetchall()]
+    assert order.index("VOYN-W0-P3") < order.index("VOYN-W0-P1"), (
+        "same wave and priority: the pipeline task is offered first"
+    )
+
+    limits = PlanLimits(planner="planner-fence", review_backlog_limit=1)
+    report = plan_once(app_factory, limits)
+    assert report.review_window_full == 1
+    assert report.idle_trickle is False
+    assert [t for t, _ in report.dispatched] == ["VOYN-W0-P3"]
+    assert report.pipeline_bypass == ["VOYN-W0-P3"]
+    assert report.fenced == 1
+
+
+def test_idle_lanes_dispatch_through_the_review_backlog_fence(rig) -> None:
+    """The fence is backpressure for busy lanes, not a reason to idle the
+    fleet: with no execution work item ready or claimed, the tick dispatches
+    its ordinary bounded batch even though the backlog is at the limit."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RV", status="READY_TO_REVIEW", repo="repo-rv"))[0]
+    _mark_ready_to_review_with_pr(app_factory, "VOYN-W0-RV")
+    assert store.upsert_task(_task("VOYN-W0-P1", repo="repo-p1"))[0]
+
+    limits = PlanLimits(planner="planner-idle", review_backlog_limit=1)
+    report = plan_once(app_factory, limits)
+    assert report.review_window_full == 1
+    assert report.idle_trickle is True
+    assert [t for t, _ in report.dispatched] == ["VOYN-W0-P1"]
+    assert report.fenced == 0
