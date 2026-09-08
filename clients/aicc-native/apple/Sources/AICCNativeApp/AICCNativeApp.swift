@@ -215,6 +215,7 @@ private struct ProjectRow: View {
 
 private struct WorkView: View {
     let tasks: [AICCNativeCore.Task]
+    @State private var announcedAttentionIDs: Set<String> = []
 
     private var attention: [AICCNativeCore.Task] { tasks.filter { $0.blocker != nil } }
     private var active: [AICCNativeCore.Task] {
@@ -254,6 +255,18 @@ private struct WorkView: View {
                     CompanionCard(title: task.title, detail: statusLine(for: task), tint: AICCTheme.plum)
                 }.buttonStyle(.plain)
             }
+        }
+        .task { announceNewAttention() }
+        .onChange(of: tasks) { _, _ in announceNewAttention() }
+    }
+
+    // A distinguishable haptic per criticality level fires once per task, the
+    // first time it becomes attention-worthy — not on every snapshot refresh,
+    // so a still-open item does not buzz again each time it reappears.
+    private func announceNewAttention() {
+        for task in tasks where !announcedAttentionIDs.contains(task.id) && task.criticality >= .high {
+            announcedAttentionIDs.insert(task.id)
+            HapticFeedbackPlayer.shared.play(HapticSignal.pattern(for: task.criticality))
         }
     }
 
@@ -297,6 +310,9 @@ struct TaskDetailView: View {
                 if let blocker = task.blocker {
                     CompanionCard(title: "Что требуется", detail: blocker, tint: .orange, badge: "Внимание")
                 }
+                if let story = task.story {
+                    ImpactStoryView(story: story)
+                }
                 VStack(alignment: .leading, spacing: 9) {
                     Text("ХОД ДОСТАВКИ").font(.caption2.weight(.bold)).tracking(1).foregroundStyle(.secondary)
                     detailRow("Идентификатор", task.id)
@@ -333,6 +349,76 @@ struct TaskDetailView: View {
         case .verified: "пройдены"
         case .rejected: "отклонены"
         case .pending: "идут"
+        }
+    }
+}
+
+/// The "что и почему произошло" microvisual for a non-technical owner: a
+/// plain-language timeline, a cause -> effect chain and a risk badge, ahead
+/// of any technical proof (which stays in the card below this one).
+struct ImpactStoryView: View {
+    let story: ImpactStory
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("ЧТО И ПОЧЕМУ ПРОИЗОШЛО").font(.caption2.weight(.bold)).tracking(1).foregroundStyle(.secondary)
+                Spacer()
+                RiskBadge(risk: story.risk)
+            }
+            if !story.timeline.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(story.timeline.sorted(by: { $0.occurredAt < $1.occurredAt })) { step in
+                        HStack(alignment: .top, spacing: 10) {
+                            Circle().frame(width: 8, height: 8).padding(.top, 5).foregroundStyle(.tint)
+                            Text(step.headline)
+                        }
+                    }
+                }
+            }
+            if !story.causeChain.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(story.causeChain.enumerated()), id: \.offset) { _, link in
+                        Text("Потому что \(link.cause), \(link.effect).")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Text(story.riskExplanation)
+                .font(.footnote)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AICCTheme.lilac, in: RoundedRectangle(cornerRadius: 20))
+    }
+}
+
+private struct RiskBadge: View {
+    let risk: ImpactRiskLevel
+
+    var body: some View {
+        Text(label)
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(tint.opacity(0.18), in: Capsule())
+            .foregroundStyle(tint)
+    }
+
+    private var label: String {
+        switch risk {
+        case .low: "Низкий риск"
+        case .medium: "Средний риск"
+        case .high: "Высокий риск"
+        case .critical: "Критический риск"
+        }
+    }
+
+    private var tint: Color {
+        switch risk {
+        case .low: .green
+        case .medium: .orange
+        case .high: .red
+        case .critical: .red
         }
     }
 }

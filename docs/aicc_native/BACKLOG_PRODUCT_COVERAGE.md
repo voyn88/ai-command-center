@@ -16,6 +16,8 @@ This document turns the canonical VOYN backlog into a product map for the Apple 
 | iPhone companion | offline start-of-day view, useful push, haptics, voice explanations and protected critical confirmations | `VOYN-IOS-LOCK`, `VOYN-IOS-HAPTIC`, `VOYN-IOS-AUTO-HOME`, `VOYN-IOS-SPEECH-COACH`, `VOYN-IOS-CRYPTO-KEY`, `VOYN-IOS-VISUAL-DSL` |
 | Watch / complication crisis surface | a single critical escalation, resolved with one tap, without opening the phone | `VOYN-MIN-WATCH-CRISIS` |
 
+| Watch companion | one-tap escalation from a complication or a single minimal-interface screen, governed the same as a phone-initiated escalation | `VOYN-IOS-WEAR-ESCALATE` |
+
 ## Dialogues are a first-class capability
 
 The app will contain a **Dialogues** section, not merely a notification list. Its eventual live model needs: a conversation, participants, linked project/task/decision, readable summary, attachments represented by safe references, message delivery state, and an audit-linked reply or approval.
@@ -27,7 +29,7 @@ Chat is not a bypass around governance. The first fixture UI can show realistic 
 1. **Foundation:** Mac and iPhone navigation, accessible design system, offline validated snapshot and Overview/Attention/Projects/Tasks/Activity fixtures.
 2. **Owner communication:** Dialogues and decision-request fixtures, then the read-only conversation feed once the gateway contract is accepted.
 3. **Governed response:** replies, approvals and voice-assisted requests only through a separately accepted command gateway; high-risk actions require biometric confirmation on iPhone.
-4. **Differentiators:** agent/skill map, board view, decision memory, visual causality and carefully scoped push/haptics/widgets.
+4. **Differentiators:** agent/skill map, board view, decision memory, visual causality, carefully scoped push/haptics/widgets, and the watch companion's one-tap escalation.
 
 Every screen must remain usable for a top manager: explain the situation, why it matters, options and next step first; technical proof can be opened only when wanted.
 

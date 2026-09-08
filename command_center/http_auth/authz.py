@@ -90,6 +90,7 @@ OPERATIONS: frozenset[str] = frozenset(
         "conflicts:resolve",
         # command_center/api/audit_routes.py
         "audit:run",
+        "audit:auto-trigger",
         "audit:finding:status",
         "audit:finding:promote",
         # command_center/api/council_routes.py

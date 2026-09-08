@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Installed by scripts/install-git-hooks.sh. Blocks a commit when the Wave-2
+# Audit engine (command_center/audit) finds a high/critical anti-pattern —
+# security, lint, or code-quality — in the working tree. See
+# scripts/precommit_findings_gate.py for the check set and severities, and
+# `git commit --no-verify` for a deliberate, logged bypass.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+PY=".venv/bin/python"
+if [ ! -x "$PY" ]; then
+    PY="python3"
+fi
+
+exec "$PY" scripts/precommit_findings_gate.py "$@"
