@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,15 @@ def _module():
     # the machine running them; the property under test is ordering, not this
     # host's /etc. Dedicated tests below set the seam back to the real check.
     module._environment_file_exists = lambda _path: True
+    # ROLLOUT_LOCK_PATH defaults to a root-owned /run path that ordinary
+    # test users cannot write. Every module load gets its own throwaway
+    # directory so tests exercise the real write-then-rename code path
+    # instead of a fake; dedicated tests below override this seam again to
+    # assert on the lock file's exact location and lifecycle.
+    module.ROLLOUT_LOCK_PATH = (
+        Path(tempfile.mkdtemp(prefix="aicc-rollout-lock-"))
+        / "aicc-staged-rollout.lock"
+    )
     return module
 
 
@@ -116,6 +126,25 @@ class FakeSystemd:
                     "ProtectControlGroups": "yes",
                     "SupplementaryGroups": "aicc-workspace aicc-publisher",
                     "User": "aicc-worker",
+                    "MainPID": "0",
+                },
+            )
+        # The lane-mutating timers (rotate, self-deploy) are held/released
+        # around every rollout, live and disabled outside it -- a strict
+        # fake must declare them like any other real rollout-visible unit
+        # rather than silently no-opping their stop/start (review on
+        # fd5de6b, same rationale as the legacy units above).
+        for timer in (
+            "voyn-aicc-credential-rotation.timer",
+            "voyn-aicc-self-deploy.timer",
+        ):
+            self.states.setdefault(
+                timer,
+                {
+                    "enabled": True,
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "waiting",
                     "MainPID": "0",
                 },
             )
@@ -445,8 +474,10 @@ def test_versioned_restore_refuses_property_drift_before_restart():
     assert ("start", unit) not in systemd.calls
 
 
-def test_staged_rollout_drains_and_proves_each_lane_before_next():
+def test_staged_rollout_drains_and_proves_each_lane_before_next(tmp_path, monkeypatch):
     module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
     units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
     systemd = FakeSystemd(units)
 
@@ -461,7 +492,10 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
     )
 
     mutations = [
-        call for call in systemd.calls if call[0] in {"enable", "stop", "start"}
+        call
+        for call in systemd.calls
+        if call[0] in {"enable", "stop", "start"}
+        and call[-1] not in module.LANE_MUTATING_TIMERS
     ]
     # Legacy claimers retire BEFORE the canary lane starts claiming -- no
     # coexistence window (review on 0f4d77e; runbook step 5 ordering).
@@ -476,6 +510,16 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next():
         ("stop", units[1]),
         ("start", units[1]),
     ]
+    # Both lane-mutating timers are held before the FIRST lane mutation (the
+    # legacy retirement) and released only after the LAST -- staged rollout
+    # vs. rotate/self-deploy timers, live worker-01 (2026-09-08).
+    assert systemd.calls[0] == ("stop", "voyn-aicc-credential-rotation.timer")
+    assert systemd.calls[1] == ("stop", "voyn-aicc-self-deploy.timer")
+    assert systemd.calls[-2] == ("start", "voyn-aicc-credential-rotation.timer")
+    assert systemd.calls[-1] == ("start", "voyn-aicc-self-deploy.timer")
+    # The shared lock a tick honours even if it fires anyway is gone once the
+    # rollout finishes -- a rollout must never exit leaving it in place.
+    assert not lock_path.exists()
 
 
 def test_verifier_accepts_real_systemctl_execstart_serialization():
@@ -717,6 +761,94 @@ def test_rollout_failure_restores_all_lane_states():
     lanes = {name: state for name, state in systemd.states.items() if "@" in name}
     assert all(not state["enabled"] for state in lanes.values())
     assert all(state["ActiveState"] == "inactive" for state in lanes.values())
+
+
+def test_rollout_restores_timers_and_lock_on_failure(tmp_path, monkeypatch):
+    """A rollout that fails mid-mutation must still hand rotate and
+    self-deploy their timers back and remove the shared lock -- a rollout
+    must never exit leaving either permanently paused (staged rollout vs.
+    rotate/self-deploy timers, live worker-01 2026-09-08)."""
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
+
+    class FailingSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            value = super().run(*args, check=check)
+            if args == ("start", units[1]):
+                self.states[units[1]]["SubState"] = "failed"
+            return value
+
+    systemd = FailingSystemd(units)
+    with pytest.raises(module.RolloutError, match="SubState"):
+        module.rollout(
+            systemd,
+            units,
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
+        )
+
+    assert not lock_path.exists()
+    assert systemd.states["voyn-aicc-credential-rotation.timer"]["ActiveState"] == (
+        "active"
+    )
+    assert systemd.states["voyn-aicc-self-deploy.timer"]["ActiveState"] == "active"
+    timer_calls = [
+        call for call in systemd.calls if call[-1] in module.LANE_MUTATING_TIMERS
+    ]
+    assert timer_calls == [
+        ("stop", "voyn-aicc-credential-rotation.timer"),
+        ("stop", "voyn-aicc-self-deploy.timer"),
+        ("start", "voyn-aicc-credential-rotation.timer"),
+        ("start", "voyn-aicc-self-deploy.timer"),
+    ]
+
+
+def test_hold_lane_mutating_timers_restarts_already_stopped_on_partial_failure():
+    """Fail-closed on a partial hold: if the second timer refuses to stop,
+    the first (already stopped) is restarted before the error propagates,
+    so a failed hold never leaves the fleet with only some of its
+    guardrails disabled."""
+    module = _module()
+    failing_timer = module.LANE_MUTATING_TIMERS[1]
+
+    class FailOnSecondTimerSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args == ("stop", failing_timer):
+                self.calls.append(args)
+                raise RuntimeError("simulated stop failure")
+            return super().run(*args, check=check)
+
+    systemd = FailOnSecondTimerSystemd(())
+    with pytest.raises(RuntimeError, match="simulated stop failure"):
+        module.hold_lane_mutating_timers(systemd)
+
+    assert systemd.states[module.LANE_MUTATING_TIMERS[0]]["ActiveState"] == "active"
+    start_calls = [call for call in systemd.calls if call[0] == "start"]
+    assert start_calls == [("start", module.LANE_MUTATING_TIMERS[0])]
+
+
+def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
+    module = _module()
+    lock_path = tmp_path / "run" / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+
+    module.write_rollout_lock()
+
+    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+    # Written via temp-then-rename: no leftover temp file beside it.
+    assert list(lock_path.parent.iterdir()) == [lock_path]
+
+    module.remove_rollout_lock()
+    assert not lock_path.exists()
+    # Idempotent: removing an already-absent lock is not an error.
+    module.remove_rollout_lock()
 
 
 def test_verifier_rejects_execstart_path_decoupled_from_argv():

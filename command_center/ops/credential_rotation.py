@@ -905,12 +905,12 @@ class RotationController:
         )
 
     def _refresh_rotatable_units(self) -> tuple[str, ...]:
-        """Snapshot which configured lanes are actually running right now.
+        """Snapshot which configured lanes are not held down right now.
 
         Queried once per rotation attempt (right after tunnel readiness is
         proved) and reused for every wave/budget calculation and fleet
         activation in that attempt, so a lane cannot flip categories
-        mid-run. A lane that is not currently active is presumed
+        mid-run. A lane that is currently inactive is presumed
         intentionally held down -- by a staged rollout that has not enabled
         it yet, or by an operator -- and must never be reloaded or, worse,
         restarted into existence: `_activate_lane`'s reload-then-restart
@@ -920,11 +920,19 @@ class RotationController:
         worker-01 mid-rollout (live 2026-09-08). Excluding them here, before
         any reload/restart is attempted, is what makes that impossible
         instead of merely unlikely.
+
+        "inactive" -- the exact state the rollout's own drain leaves a
+        staged-off lane in -- is the only state that means "held down".
+        Every other transient state (activating, reloading, deactivating,
+        even failed) is still a rotation candidate: `_wait_workers_healthy`
+        polls it toward `active`/`running` right after this snapshot, and a
+        lane that is merely mid-startup must stay eligible for that wait
+        rather than being excluded before it ever gets the chance.
         """
         active: list[str] = []
         for unit in self.config.worker_units:
             state = self.systemd.state(unit)
-            if state.active == "active":
+            if state.active != "inactive":
                 active.append(unit)
             else:
                 self.audit.emit(
