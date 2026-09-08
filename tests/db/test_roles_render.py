@@ -228,6 +228,12 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "identity_assert",
         "identity_current_credential",
         "enroll_rotate_self",
+        # 0021: the worker-host fail-closed probe records what it measured
+        # (a finding row keyed by source+failure, and its clearing); neither
+        # reads the backlog nor the queue, and the planner -- not the worker
+        # -- turns a finding into a task.
+        "monitor_record_finding",
+        "monitor_clear_finding",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
@@ -283,6 +289,13 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # 0021: read-only deploy preflight with dispatch's privileges; the
+        # task-class setter (split children, monitor tasks); and the
+        # monitor-finding pair the control-host probe uses.
+        "backlog_dispatch_smoke",
+        "backlog_set_task_class",
+        "monitor_record_finding",
+        "monitor_clear_finding",
     }
 
 

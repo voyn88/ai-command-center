@@ -25,6 +25,10 @@ class QueueSnapshot:
     success_age_seconds: float | None
     pending_age_seconds: float | None
     recent_dead: int = 0
+    #: dead-lettered in the trailing hour by an executor quota/spend/rate refusal
+    recent_quota_dead: int = 0
+    #: succeeded in the trailing hour (throughput); None when not measured
+    recent_succeeded: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +97,15 @@ def read_queue_snapshot() -> QueueSnapshot:
                     count(*) FILTER (
                         WHERE state = 'dead'
                           AND updated_at > now() - interval '1 hour'
+                    ),
+                    count(*) FILTER (
+                        WHERE state = 'dead'
+                          AND updated_at > now() - interval '1 hour'
+                          AND dead_reason ~* '(quota|spend limit|weekly limit|session limit|credit balance|rate limit)'
+                    ),
+                    count(*) FILTER (
+                        WHERE state = 'succeeded'
+                          AND updated_at > now() - interval '1 hour'
                     )
                 FROM work_item
                 """
@@ -105,6 +118,8 @@ def read_queue_snapshot() -> QueueSnapshot:
                 success_age,
                 pending_age,
                 recent_dead,
+                recent_quota_dead,
+                recent_succeeded,
             ) = cur.fetchone()
     finally:
         pool.close_pool()
@@ -116,6 +131,8 @@ def read_queue_snapshot() -> QueueSnapshot:
         success_age_seconds=(float(success_age) if success_age is not None else None),
         pending_age_seconds=(float(pending_age) if pending_age is not None else None),
         recent_dead=int(recent_dead),
+        recent_quota_dead=int(recent_quota_dead),
+        recent_succeeded=int(recent_succeeded),
     )
 
 
@@ -180,6 +197,21 @@ def evaluate(
             failures.append(
                 f"dead_letter_growth:{queue.recent_dead}>{max_recent_dead}"
             )
+        # Executor quota/spend/rate refusals are a capacity fact the fleet
+        # cannot retry through; surface them as their own class so routing
+        # (quota-aware cascade) and budgets get a task, not a guess.
+        if queue.recent_quota_dead > 0:
+            failures.append(f"executor_quota_exhausted:{queue.recent_quota_dead}")
+        # Throughput: work waiting (past the stall clock) with nothing having
+        # succeeded in the trailing hour is a stalled pipeline even when every
+        # lane shows active -- the lanes may be spinning on refusals.
+        if (
+            queue.recent_succeeded is not None
+            and queue.recent_succeeded == 0
+            and queue.ready + queue.claimed > 0
+            and not pending_is_stale
+        ):
+            failures.append("throughput_stalled:0_succeeded_in_1h")
 
     return MonitorReport(
         ok=not failures,
@@ -212,7 +244,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not read queue tables (for the least-privileged worker-host probe).",
     )
+    parser.add_argument(
+        "--record-findings",
+        metavar="SOURCE",
+        default="",
+        help=(
+            "Record every failure as an open monitor_finding under this source "
+            "(and clear the source's findings when healthy), so the planner turns "
+            "a red monitor into a pipeline task instead of a failed unit."
+        ),
+    )
     return parser
+
+
+def record_findings(source: str, failures: tuple[str, ...], detail: dict[str, Any]) -> None:
+    """Write the measurement to the database through the SECURITY DEFINER
+    functions of migration 0021 (granted to aicc_app and aicc_worker). A red
+    monitor becomes a task the fleet fixes; a healthy one clears its rows.
+    Never lets a recording problem mask the measurement: raises, and main()
+    reports monitor_error while still exiting non-zero."""
+    from command_center.db import pool
+    from command_center.db.config import load_config
+
+    pool.open_pool(load_config())
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            if failures:
+                for failure in failures:
+                    cur.execute(
+                        "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                        (source, failure[:200], json.dumps(detail, sort_keys=True)),
+                    )
+            else:
+                cur.execute("SELECT monitor_clear_finding(%s)", (source,))
+            conn.commit()
+    finally:
+        pool.close_pool()
 
 
 def _json_report(report: MonitorReport) -> dict[str, Any]:
@@ -238,7 +305,15 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
         return 1
-    print(json.dumps(_json_report(report), sort_keys=True))
+    payload = _json_report(report)
+    if args.record_findings:
+        try:
+            record_findings(args.record_findings, report.failures, payload)
+            payload["findings_recorded"] = True
+        except Exception as exc:  # noqa: BLE001 - recording must not hide the measurement
+            payload["findings_recorded"] = False
+            payload["findings_error"] = str(exc)[:200]
+    print(json.dumps(payload, sort_keys=True))
     return 0 if report.ok else 1
 
 

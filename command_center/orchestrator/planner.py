@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -75,6 +76,12 @@ class PlanReport:
     #: limit` this tick (None when the fence never fired). Ingest and the
     #: DEFER_TO_USER resume reconcile still ran -- only dispatch paused.
     review_window_full: int | None = None
+    #: Pipeline tasks dispatched in decomposition mode this tick (the second
+    #: non-technical return asked for a split; 0021).
+    split_dispatched: list[str] = field(default_factory=list)
+    #: (task, failure) pipeline tasks created this tick from open monitor
+    #: findings (0021 monitor_finding).
+    monitor_tasks: list[tuple[str, str]] = field(default_factory=list)
     #: Pipeline-class tasks dispatched THROUGH the review-backlog fence this
     #: tick: work that repairs CI, review, merge train, planner or queue must
     #: never wait behind the backlog it exists to drain
@@ -129,10 +136,51 @@ def repo_route(repo: str) -> tuple[str, str] | None:
     return _DEFAULT_REPO_ROUTES.get(repo)
 
 
+#: The decomposition assignment for a pipeline task the fleet returned twice
+#: without a technical cause (VOYN-W0-AICC-PLANNER-AUTO-SPLIT-PIPELINE-TASKS).
+#: The run makes NO code change: its whole result is the trailer that
+#: `backlog_ingest_results` turns into subtasks via `backlog_split_task`.
+_SPLIT_INSTRUCTIONS = (
+    "This task was returned twice by executors without a technical cause: it is "
+    "too large for one run. Do NOT implement it and do NOT commit anything. "
+    "Decompose it into 2 to 8 bounded subtasks, each closable by one run with one "
+    "pull request and its own acceptance criteria and tests, ordered so that "
+    "producers come before consumers. End your final message with a single line of "
+    "exactly this form (one line, valid JSON, no code fences):\n"
+    'SPLIT_TASKS_JSON: [{"suffix": "S1-<SHORT-NAME>", "title": "<imperative title>", '
+    '"body": "<scope, acceptance, tests, files>", "priority": "P1"}, ...]\n'
+    "Suffixes are uppercase [A-Z0-9-], unique, 2-40 chars; the orchestrator creates "
+    "<this task id>-<suffix> for each entry and closes this task as SPLIT."
+)
+
+
+def _monitor_task_id(source: str, failure: str) -> str:
+    """Deterministic, exact task id for a monitor finding: the same
+    (source, failure) always maps to the same id, so re-opening a finding
+    re-uses the task instead of creating a twin."""
+    slug = re.sub(r"[^A-Z0-9]+", "-", f"{source}-{failure}".upper()).strip("-")[:90]
+    return f"VOYN-MON-{slug}"
+
+
+def _split_requested(rows: Any, task_id: str) -> bool:
+    """True when the task's latest granted return_to_pool asked for a split."""
+    row = rows(
+        "SELECT (e.detail ->> 'split_requested')::boolean "
+        "FROM backlog_event e WHERE e.task_id = %s AND e.event = 'return_to_pool' "
+        "AND e.outcome = 'granted' ORDER BY e.event_id DESC LIMIT 1",
+        (task_id,),
+    )
+    return bool(row and row[0] and row[0][0])
+
+
 def _payload_for(
-    task: dict[str, Any], limits: PlanLimits, route: tuple[str, str]
+    task: dict[str, Any], limits: PlanLimits, route: tuple[str, str], *, mode: str = "implement"
 ) -> tuple[dict[str, Any], int]:
     """The agent_run payload plus the attempt budget (= cascade length).
+
+    ``mode="split"`` sends the decomposition assignment instead of the
+    implementation contract; everything else (route, cascade, provenance) is
+    identical, so a split run passes the same gates as any run.
 
     Prompt discipline: the task record IS the assignment — id, title, body
     travel verbatim; the worker's provenance gate still applies, and
@@ -141,6 +189,27 @@ def _payload_for(
     """
     cascade = cascade_for("implementation")
     project_id, repository_path = route
+    if mode == "split":
+        prompt = (
+            f"Central task: {task['task_id']} ({task['title']}).\n"
+            f"Wave {task['wave']}, priority {task['priority'] or 'unset'}.\n\n"
+            f"{task['body']}\n\n"
+            f"{_SPLIT_INSTRUCTIONS}"
+        ).strip()
+        payload = {
+            "kind": "agent_run",
+            "v": AGENT_RUN_SCHEMA_VERSION,
+            "project_id": project_id,
+            "repository_path": repository_path,
+            "prompt": prompt,
+            "task_type": cascade[0]["task_type"],
+            "timeout_seconds": limits.timeout_seconds,
+            "untrusted": False,
+            "cascade": cascade,
+            "backlog_task_id": task["task_id"],
+            "mode": "split",
+        }
+        return payload, len(cascade)
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"
         f"Wave {task['wave']}, priority {task['priority'] or 'unset'}.\n\n"
@@ -192,6 +261,11 @@ class Planner:
 
     def _row(self, sql: str, params: tuple[Any, ...]) -> tuple:
         return self._rows(sql, params)[0]
+
+    def _exec(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        with self._factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
 
     def plan_once(self, limits: PlanLimits = PlanLimits()) -> PlanReport:
         report = PlanReport()
@@ -268,6 +342,40 @@ class Planner:
                     if ok:
                         report.resumed.append((task_id, park_reason))
 
+            # Fail-closed monitors record what they measured (0021
+            # monitor_finding); every open finding becomes a pipeline task
+            # once, so a red monitor is a task the fleet fixes rather than a
+            # permanently failed unit (owner instruction 2026-09-08).
+            for finding_id, source, failure in self._rows(
+                "SELECT finding_id, source, failure FROM monitor_finding "
+                "WHERE state = 'open' AND task_id IS NULL ORDER BY finding_id LIMIT 20",
+                (),
+            ):
+                task_id_for_finding = _monitor_task_id(source, failure)
+                ok, reason, _changed, _rev = self._row(
+                    "SELECT * FROM backlog_upsert_task(%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        task_id_for_finding, "0", "P1", "OPEN", "task",
+                        f"monitor finding: {failure} on {source}",
+                        f"Recorded by the fail-closed monitor '{source}' (monitor_finding "
+                        f"#{finding_id}): failure '{failure}'. Find the root cause and fix "
+                        "it so the measurement is healthy again; the monitor clears the "
+                        "finding when it measures healthy. Acceptance: the monitor reports "
+                        "ok for 24h and the root-cause fix is merged with a regression test.",
+                        "ai-command-center",
+                    ),
+                )
+                if ok or reason == "unchanged":
+                    self._exec(
+                        "SELECT backlog_set_task_class(%s, 'pipeline')",
+                        (task_id_for_finding,),
+                    )
+                    self._exec(
+                        "UPDATE monitor_finding SET task_id = %s WHERE finding_id = %s",
+                        (task_id_for_finding, finding_id),
+                    )
+                    report.monitor_tasks.append((task_id_for_finding, failure))
+
             # The review-backlog fence is DISPATCH-only backpressure: it
             # must never short-circuit anything above it in the tick. An
             # earlier version of this fence was a blanket `return report`
@@ -339,7 +447,10 @@ class Planner:
                     # worker refuses unknown projects three times, honestly).
                     report.undispatchable.append((task_id, "unknown_repo_route"))
                     continue
-                payload, budget = _payload_for(task, limits, route)
+                mode = "split" if _split_requested(self._rows, task_id) else "implement"
+                payload, budget = _payload_for(task, limits, route, mode=mode)
+                if mode == "split":
+                    report.split_dispatched.append(task_id)
                 ok, reason, work_item_id, _revision = self._row(
                     "SELECT * FROM backlog_dispatch(%s, %s, %s, %s, %s::jsonb, %s)",
                     (

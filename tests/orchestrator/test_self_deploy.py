@@ -63,9 +63,16 @@ def calls(monkeypatch, tmp_path):
     def fake_smoke(repo_path, timeout):
         return subprocess.CompletedProcess([], recorded["smoke_rc"], "", "import boom")
 
+    def fake_dispatch_smoke(repo_path, timeout):
+        recorded["dispatch_smoke"] = recorded.get("dispatch_smoke", 0) + 1
+        return subprocess.CompletedProcess(
+            [], recorded.get("dispatch_smoke_rc", 0), "", "permission denied for view"
+        )
+
     monkeypatch.setattr(self_deploy, "_systemctl", fake_systemctl)
     monkeypatch.setattr(self_deploy, "_run_migrations", fake_migrations)
     monkeypatch.setattr(self_deploy, "_import_smoke", fake_smoke)
+    monkeypatch.setattr(self_deploy, "_dispatch_smoke", fake_dispatch_smoke)
     return recorded
 
 
@@ -331,3 +338,23 @@ def test_migration_failure_provenance_names_the_partial_database(
     assert report.outcome == "rolled_back"
     assert "database_may_hold_partial_migrations" in report.detail
     assert _git(clone, "rev-parse", "HEAD") == first
+
+
+def test_failed_dispatch_smoke_after_migration_rolls_back_before_restart(pair, calls, tmp_path):
+    """0019 on control-01 (2026-09-08): the migration applied, import-smoke was
+    green, services restarted, and every planner tick died on a view whose
+    owner the migration had changed. The dispatch smoke runs with exactly
+    dispatch's privileges AFTER the migration and BEFORE any restart; a
+    refusal rolls the checkout back with no service touched."""
+    origin, clone, first = pair
+    _commit(origin, "advance with a migration that breaks dispatch")
+    calls["dispatch_smoke_rc"] = 1
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "rolled_back"
+    assert "dispatch_smoke_failed_after_migration" in report.detail
+    assert calls["migrate"] == 1
+    assert calls["dispatch_smoke"] == 1
+    assert _git(clone, "rev-parse", "HEAD") == first
+    assert "database_upgrade_ran_not_rolled_back" in report.steps
+    assert "dispatch_smoke_passed" not in report.steps
