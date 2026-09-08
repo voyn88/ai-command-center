@@ -717,9 +717,91 @@ def _optional_environment_files(unit: str) -> frozenset[str]:
 
 
 def _protect_home_is_safe(value: str) -> bool:
-    # `ProtectHome=true` is serialized as `yes`; older versions may report
-    # the equivalent read-only mount using the explicit enum spelling.
-    return value in {"yes", "read-only"}
+    # Only `tmpfs`: it hides every home AND lets the BindReadOnlyPaths=
+    # below /home (the clone sources) become visible. `yes` (=true) mounts
+    # an inaccessible empty /home, so those binds silently never appear and
+    # every task fails with "repository path not configured" (worker-01,
+    # 2026-09-08); `read-only` exposes every home the DAC bits allow.
+    return value == "tmpfs"
+
+
+DATA_DIR_ENVIRONMENT_KEY = "AICC_DATA_DIR"
+PROJECT_CONFIG_NAME = "project_config.json"
+
+
+def _process_gid(pid: int) -> int:
+    try:
+        for line in (
+            Path(f"/proc/{pid}/status").read_text(encoding="ascii").splitlines()
+        ):
+            if line.startswith("Gid:"):
+                return int(line.split()[1])
+    except (FileNotFoundError, ValueError) as exc:
+        raise RolloutError(f"cannot prove MainPID GID for {pid}") from exc
+    raise RolloutError(f"MainPID {pid} has no Gid field")
+
+
+def _lane_inputs_visible(
+    pid: int, uid: int, data_dir: str, environment: tuple[str, ...] = ()
+) -> str | None:
+    """Prove, from INSIDE the lane's mount namespace, as its principal and
+    with its own environment, that the inputs every task needs are usable:
+    the project config under the lane's data dir is readable and each
+    repository_path it configures answers `git rev-parse --show-toplevel`.
+    `test -d` alone is not enough: a visible clone that git refuses as
+    "dubious ownership" (owned by voynadmin, read by aicc-worker) killed every
+    writer-lease acquire on worker-01 (2026-09-08); the lane's environment
+    carries the safe.directory trust for exactly the bound paths.
+
+    Returns the failure, or None when everything is visible. This is the
+    check whose absence let the 2026-09-08 outage ship: the unit was
+    'active', UID-isolated and flagged, and could not read a single input.
+    """
+    config = Path(data_dir) / PROJECT_CONFIG_NAME
+    try:
+        overrides = json.loads(config.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return f"{config} is not readable on the host: {exc}"
+    except ValueError as exc:
+        return f"{config} is not valid JSON: {exc}"
+    if not isinstance(overrides, dict) or not overrides:
+        return f"{config} configures no project: every task would fail"
+    # EVERY project entry must name an absolute repository_path -- a task for
+    # a project without one fails with "repository path not configured", so
+    # skipping such an entry would let exactly that configuration pass
+    # (review of 39981fc9).
+    repositories: list[str] = []
+    for project_id, entry in overrides.items():
+        path = entry.get("repository_path") if isinstance(entry, dict) else None
+        if not isinstance(path, str) or not path.startswith("/"):
+            return (
+                f"{config}: project {project_id!r} has no absolute repository_path: "
+                "its tasks would fail with 'repository path not configured'"
+            )
+        repositories.append(path)
+    gid = _process_gid(pid)
+    enter = ["nsenter", "-t", str(pid), "-m", "-S", str(uid), "-G", str(gid), "--"]
+    # `env -i` + the lane's own variables: the probe must see the clone the
+    # way the worker does, not the way root's shell does.
+    lane_env = ["env", "-i", *environment]
+    probes = (
+        (str(config), ["test", "-r", str(config)]),
+        *(
+            (path, [*lane_env, "git", "-C", path, "rev-parse", "--show-toplevel"])
+            for path in repositories
+        ),
+    )
+    for path, argv in probes:
+        result = subprocess.run(
+            [*enter, *argv], capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            return (
+                f"{path} is not usable inside the lane namespace as uid {uid}"
+                + (f": {detail[0][:160]}" if detail else "")
+            )
+    return None
 
 
 def _expected_environment_files(unit: str) -> tuple[str, ...]:
@@ -749,6 +831,9 @@ def verify_unit_configuration(systemd: Systemd, unit: str) -> None:
         "User": "aicc-worker",
         "Group": "aicc-worker",
         "WorkingDirectory": "/opt/aicc/current",
+        # The immutable release has no data/: the lane's mutable data dir
+        # is a systemd state directory shared by all lanes.
+        "StateDirectory": "aicc/data",
         "NoNewPrivileges": "yes",
         "ProtectSystem": "strict",
         "ProtectControlGroups": "yes",
@@ -834,10 +919,12 @@ def verify_unit(
     uid_for_user=None,
     process_uid=None,
     process_environment=None,
+    lane_inputs_visible=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
     process_environment = process_environment or _process_environment
+    lane_inputs_visible = lane_inputs_visible or _lane_inputs_visible
     verify_unit_configuration(systemd, unit)
     expected = {
         "ActiveState": "active",
@@ -859,13 +946,24 @@ def verify_unit(
         raise RolloutError(f"{unit} has no live MainPID")
     if process_uid(int(raw_pid)) != unit_uid:
         raise RolloutError(f"{unit} MainPID UID does not match systemd User")
+    environment = process_environment(int(raw_pid))
     isolation = tuple(
         value
-        for value in process_environment(int(raw_pid))
+        for value in environment
         if value.startswith("AICC_AGENT_PRINCIPAL_ISOLATION=")
     )
     if isolation != (REQUIRED_ISOLATION_ENVIRONMENT,):
         raise RolloutError(f"{unit} MainPID principal-isolation flag is not required")
+    data_dirs = tuple(
+        value.partition("=")[2]
+        for value in environment
+        if value.startswith(DATA_DIR_ENVIRONMENT_KEY + "=")
+    )
+    if len(data_dirs) != 1 or not data_dirs[0].startswith("/"):
+        raise RolloutError(f"{unit} MainPID has no single absolute {DATA_DIR_ENVIRONMENT_KEY}")
+    failure = lane_inputs_visible(int(raw_pid), unit_uid, data_dirs[0], environment)
+    if failure is not None:
+        raise RolloutError(f"{unit} cannot read its task inputs: {failure}")
 
 
 def verify_all(
@@ -877,10 +975,12 @@ def verify_all(
     uid_for_user=None,
     process_uid=None,
     process_environment=None,
+    lane_inputs_visible=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
     process_environment = process_environment or _process_environment
+    lane_inputs_visible = lane_inputs_visible or _lane_inputs_visible
     verify_legacy_units_retired(systemd)
     agent_uid = uid_for_user(agent_user)
     privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
@@ -895,6 +995,7 @@ def verify_all(
             uid_for_user=uid_for_user,
             process_uid=process_uid,
             process_environment=process_environment,
+            lane_inputs_visible=lane_inputs_visible,
         )
 
 
@@ -952,10 +1053,12 @@ def rollout(
     uid_for_user=None,
     process_uid=None,
     process_environment=None,
+    lane_inputs_visible=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
     process_environment = process_environment or _process_environment
+    lane_inputs_visible = lane_inputs_visible or _lane_inputs_visible
     # Validate the complete discovered fleet before the first mutation.
     # In particular, do not retire a healthy legacy fleet and then learn that
     # a configured/live template lane is masked or fail-open.
@@ -1001,6 +1104,7 @@ def rollout(
                 uid_for_user=uid_for_user,
                 process_uid=process_uid,
                 process_environment=process_environment,
+                lane_inputs_visible=lane_inputs_visible,
             )
     except BaseException:
         # Never restart from a service snapshot while the failed file
