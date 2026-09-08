@@ -3508,3 +3508,84 @@ def test_already_correctly_labelled_pr_costs_no_edit_call(monkeypatch):
     )
 
     assert edits == []
+
+
+def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE: live 2026-09-08 the listing
+    exceeded GitHub's GraphQL node limit, `gh pr list` returned rc=1 and the
+    tick printed an empty report for days. A failed listing is an error,
+    and nothing is relabelled on the strength of it."""
+    import subprocess as sp
+
+    edits: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        if argv[:2] == ["pr", "list"]:
+            return sp.CompletedProcess(argv, 1, "", "GraphQL: exceeds the maximum limit")
+        edits.append(list(argv))
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window("/repo", PrWindowConfig())
+    assert report.error is not None and "pr_list_failed" in report.error
+    assert report.active == [] and report.waiting == [] and report.blocked == []
+    assert edits == []
+
+
+def test_window_listing_is_light_and_details_are_fetched_lazily(monkeypatch):
+    """The listing asks for no reviews/checks/commits (that is what blew the
+    node budget); a candidate's details come from one `pr view`, and a PR
+    beyond the window is labelled waiting without any detail lookup."""
+    import subprocess as sp
+
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 5)}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": []}
+        for n in range(1, 5)
+    ]
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        calls.append(list(argv))
+        if argv[:2] == ["pr", "list"]:
+            fields = argv[argv.index("--json") + 1]
+            assert "reviews" not in fields and "statusCheckRollup" not in fields
+            assert "commits" not in fields
+            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
+        if argv[:2] == ["pr", "view"]:
+            n = int(argv[2])
+            return sp.CompletedProcess(argv, 0, json.dumps({
+                "reviews": [], "statusCheckRollup": [],
+                "commits": [{"oid": heads[n], "committedDate": f"2026-01-0{n}T00:00:00Z"}],
+            }), "")
+        if argv[:2] == ["pr", "edit"]:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=2, stale_seconds=10**12)
+    )
+    assert report.error is None
+    assert [n for n, _ in report.active] == [1, 2]
+    assert [n for n, _ in report.waiting] == [3, 4]
+    viewed = sorted(int(c[2]) for c in calls if c[:2] == ["pr", "view"])
+    assert viewed == [1, 2], "only the candidates that could fill the window are examined"
+    assert any(c[:2] == ["pr", "edit"] and c[2] == "4" for c in calls), (
+        "the tail is still labelled waiting"
+    )
+
+
+def test_window_scans_every_open_pr_not_just_fifty(monkeypatch):
+    import subprocess as sp
+
+    def fake_gh(argv, repo_path):
+        if argv[:2] == ["pr", "list"]:
+            assert int(argv[argv.index("--limit") + 1]) >= 300
+            return sp.CompletedProcess(argv, 0, "[]", "")
+        return sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert reconcile_pr_window("/repo").error is None
