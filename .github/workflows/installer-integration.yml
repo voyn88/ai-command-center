@@ -1,0 +1,66 @@
+name: Installer integration
+
+# The principal-isolation installer, rolled out next to a live legacy lane in
+# a privileged systemd container -- the host shape that produced five
+# live-only installer defects on 2026-09-08
+# (VOYN-W0-AICC-INSTALLER-INTEGRATION-TEST-NEXT-TO-LEGACY). Nightly, and on
+# every change to the installer, the rollout, the boundary script, the unit
+# files or this harness.
+on:
+  schedule:
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - deploy/**
+      - ops/aicc_install_transaction.py
+      - ops/aicc_staged_worker_rollout.py
+      - ops/aicc_agent_launcher.py
+      - ops/verify-agent-principal-boundary.sh
+      - ops/ci/installer-integration/**
+      - .github/workflows/installer-integration.yml
+  push:
+    branches: [main]
+    paths:
+      - deploy/**
+      - ops/aicc_install_transaction.py
+      - ops/aicc_staged_worker_rollout.py
+      - ops/aicc_agent_launcher.py
+      - ops/verify-agent-principal-boundary.sh
+      - ops/ci/installer-integration/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rollout-next-to-legacy:
+    name: Installer integration (systemd container, legacy lane beside)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Start a privileged systemd container
+        run: |
+          docker run -d --name sysd --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            jrei/systemd-ubuntu:24.04
+          for _ in $(seq 1 30); do
+            docker exec sysd systemctl is-system-running --wait >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker exec sysd systemctl is-system-running || true
+
+      - name: Roll lane 1 out next to the legacy lane and assert the boundary
+        run: docker exec sysd bash /repo/ops/ci/installer-integration/run.sh
+
+      - name: Collect journal on failure
+        if: failure()
+        run: docker exec sysd journalctl --no-pager -b -u 'voyn-aicc-worker@*' -u 'run-*' | tail -120 || true

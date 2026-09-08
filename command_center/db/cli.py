@@ -129,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Report the eligible set without dispatching.",
     )
+    plan.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Deploy preflight: run backlog_dispatch_smoke() (0021) -- the read-only "
+        "probe with exactly dispatch's privileges -- and exit non-zero on refusal.",
+    )
     review = sub.add_parser(
         "backlog-review",
         help="One review tick (BO-S3b): enqueue an adversarial review run for "
@@ -455,6 +461,12 @@ def main(argv: list[str] | None = None) -> int:
 
                 from command_center.orchestrator.planner import PlanLimits, plan_once
 
+                if args.smoke:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT backlog_dispatch_smoke()")
+                        (ok,) = cur.fetchone()
+                    print(f"SMOKE     backlog_dispatch_smoke={'ok' if ok else 'refused'}")
+                    return 0 if ok else 1
                 if args.dry_run:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -486,6 +498,10 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 for task_id in report.pipeline_bypass:
                     print(f"PIPELINE  {task_id}: dispatched past the review fence")
+                for task_id in report.split_dispatched:
+                    print(f"SPLIT     {task_id}: dispatched in decomposition mode")
+                for task_id, failure in report.monitor_tasks:
+                    print(f"MONITOR   {task_id}: task for finding {failure}")
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
@@ -598,6 +614,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
                 report = reconcile_pr_window(args.repo_path)
+                if report.error is not None:
+                    print(f"pr-window tick failed: {report.error}", file=sys.stderr)
+                    return 1
                 for number, head in report.active:
                     print(f"ACTIVE    #{number} -> {head}")
                 for number, head in report.waiting:
@@ -606,6 +625,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"BLOCKED   #{number}: {reason}")
                 for number, head in report.age_fallback:
                     print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+                for number, head in report.unreadable:
+                    print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
                 return 0
 
             if args.command == "downgrade":

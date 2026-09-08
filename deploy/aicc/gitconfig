@@ -1,0 +1,18 @@
+# Git configuration the isolated worker lanes read as their SYSTEM config
+# (template: Environment=GIT_CONFIG_SYSTEM=/etc/aicc/gitconfig), installed
+# root-owned by the principal-isolation transaction.
+#
+# safe.directory: the clone sources bound read-only into the lane
+# (voyn-aicc-worker-principal-isolation.conf, BindReadOnlyPaths=) are owned by
+# voynadmin and read by aicc-worker, which git refuses as "dubious ownership".
+# Both the work tree and its .git are listed: a local `git clone` of a bound
+# clone -- the read-only workspace a review runs in -- checks the source's
+# .git ownership in the upload-pack child, which does not inherit
+# GIT_CONFIG_COUNT/KEY/VALUE (worker-01 2026-09-08: rev-parse passed with the
+# environment form, the clone still failed). A system-level file reaches
+# every child. Exactly the bound paths, never `*`.
+[safe]
+	directory = /home/voynadmin/Projects/ai-command-center
+	directory = /home/voynadmin/Projects/ai-command-center/.git
+	directory = /home/voynadmin/Projects/aios
+	directory = /home/voynadmin/Projects/aios/.git
