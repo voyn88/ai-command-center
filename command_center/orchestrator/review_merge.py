@@ -3511,12 +3511,12 @@ def reconcile_pr_window(
         head = str(pr.get("headRefOid") or "")
         window_full = selected >= cfg.max_active
         if details_used >= max(cfg.detail_budget, 0):
-            # Out of detail budget: no evidence either way this tick. A PR
-            # already labelled blocked keeps that signal; anything else is
-            # (still) waiting. Re-examined on a later tick.
+            # Out of detail budget: no evidence either way this tick, so no
+            # label write at all -- whatever the PR carried (active, waiting,
+            # blocked, nothing) stays. Writing `waiting` here demoted an
+            # active PR on no real change whenever the active set outgrew
+            # the budget (review of 5dec6322). Re-examined on a later tick.
             report.unchecked.append((number, head))
-            if cfg.label_blocked not in _pr_window_labels(pr):
-                _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
             continue
         details_used += 1
         detailed = _pr_window_details(repo_path, pr)

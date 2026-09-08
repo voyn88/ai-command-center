@@ -3724,10 +3724,35 @@ def test_out_of_budget_prs_keep_their_blocked_label_and_are_reported(monkeypatch
     assert [n for n, _ in report.unchecked] == [3, 4]
     viewed = sorted(int(c[2]) for c in calls if c[:2] == ["pr", "view"])
     assert viewed == [1, 2], "the budget bounds the detail lookups"
-    # 3 was blocked and was not examined: its label is untouched.
-    assert not any(c[:2] == ["pr", "edit"] and c[2] == "3" for c in calls)
-    # 4 had no window label and becomes waiting without a lookup.
-    assert ["pr", "edit", "4", "--add-label", "review-window:waiting"] in calls
+    # Neither 3 (blocked) nor 4 (unlabelled) was examined: no label is
+    # written on no evidence.
+    assert not any(c[:2] == ["pr", "edit"] and c[2] in ("3", "4") for c in calls)
+
+
+def test_an_active_pr_beyond_the_detail_budget_is_not_demoted(monkeypatch):
+    """Two sticky-active PRs, budget for one detail lookup: the second stays
+    `active` untouched. The budget-exhausted path used to stamp `waiting`,
+    knocking an active PR out and back in on no real change."""
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 4)}
+    labels = {1: [{"name": "review-window:active"}], 2: [{"name": "review-window:active"}]}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": labels.get(n, [])}
+        for n in range(1, 4)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {n: {"reviews": [], "statusCheckRollup": [],
+                 "commits": [{"oid": heads[n], "committedDate": fresh}]} for n in range(1, 4)}
+    calls = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=2, stale_seconds=3600, detail_budget=1)
+    )
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.unchecked] == [2, 3]
+    assert not any(c[:2] == ["pr", "edit"] and c[2] in ("2", "3") for c in calls), (
+        "no evidence, no label change: 2 keeps active, 3 keeps nothing"
+    )
 
 
 def test_window_scans_every_open_pr_not_just_fifty(monkeypatch):
