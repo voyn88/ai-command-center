@@ -210,6 +210,7 @@ private struct ProjectRow: View {
 
 private struct WorkView: View {
     let tasks: [AICCNativeCore.Task]
+    @State private var announcedAttentionIDs: Set<String> = []
 
     private var attention: [AICCNativeCore.Task] { tasks.filter { $0.blocker != nil } }
     private var active: [AICCNativeCore.Task] {
@@ -249,6 +250,18 @@ private struct WorkView: View {
                     CompanionCard(title: task.title, detail: statusLine(for: task), tint: AICCTheme.plum)
                 }.buttonStyle(.plain)
             }
+        }
+        .task { announceNewAttention() }
+        .onChange(of: tasks) { _, _ in announceNewAttention() }
+    }
+
+    // A distinguishable haptic per criticality level fires once per task, the
+    // first time it becomes attention-worthy — not on every snapshot refresh,
+    // so a still-open item does not buzz again each time it reappears.
+    private func announceNewAttention() {
+        for task in tasks where !announcedAttentionIDs.contains(task.id) && task.criticality >= .high {
+            announcedAttentionIDs.insert(task.id)
+            HapticFeedbackPlayer.shared.play(HapticSignal.pattern(for: task.criticality))
         }
     }
 

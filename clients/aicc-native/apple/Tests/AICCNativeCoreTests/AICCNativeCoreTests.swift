@@ -121,3 +121,45 @@ import Testing
     let tolerant = try JSONDecoder().decode(AICCNativeCore.Task.self, from: future)
     #expect(tolerant.state == nil)
 }
+
+@Test func taskCriticalityRanksBlockerAboveAmbiguousAboveRoutine() {
+    let evidence = DeliveryEvidence(headSHA: nil, pullRequest: nil, ci: .unknown, acceptance: .unknown, mergedSHA: nil, deployedSHA: nil)
+    let blocked = AICCNativeCore.Task(id: "1", title: "T", blocker: "Waiting on owner", evidence: evidence)
+    #expect(blocked.criticality == .critical)
+
+    let ambiguous = AICCNativeCore.Task(id: "2", title: "T", blocker: nil, evidence: evidence)
+    #expect(ambiguous.evidence.derivedStatus == .unknown)
+    #expect(ambiguous.criticality == .high)
+
+    let awaitingAcceptance = DeliveryEvidence(headSHA: "abc", pullRequest: "#1", ci: .verified, acceptance: .pending, mergedSHA: nil, deployedSHA: nil)
+    #expect(awaitingAcceptance.derivedStatus == .awaitingAcceptance)
+    let pendingReview = AICCNativeCore.Task(id: "3", title: "T", blocker: nil, evidence: awaitingAcceptance)
+    #expect(pendingReview.criticality == .medium)
+
+    let routine = DeliveryEvidence(headSHA: "abc", pullRequest: "#1", ci: .verified, acceptance: .verified, mergedSHA: "def", deployedSHA: "fed")
+    #expect(routine.derivedStatus == .completed)
+    let done = AICCNativeCore.Task(id: "4", title: "T", blocker: nil, evidence: routine)
+    #expect(done.criticality == .low)
+}
+
+@Test func hapticPatternsAreDistinctAndEscalateWithCriticality() {
+    let patterns = Criticality.allCases.map(HapticSignal.pattern(for:))
+    // Every level maps to a pattern nobody else shares — pulse count and/or
+    // style differ, so the signal survives even if one dimension is missed.
+    for i in patterns.indices {
+        for j in patterns.indices where i != j {
+            #expect(patterns[i] != patterns[j])
+        }
+    }
+    // Longer or heavier as criticality rises: critical is never shorter than
+    // low, and it is the only level that carries the sharp `.error` pulse.
+    #expect(HapticSignal.pattern(for: .critical).pulses.count >= HapticSignal.pattern(for: .low).pulses.count)
+    #expect(HapticSignal.pattern(for: .critical).pulses.contains(.error))
+    #expect(!HapticSignal.pattern(for: .low).pulses.contains(.error))
+}
+
+@Test func criticalityOrdersLowToCritical() {
+    #expect(Criticality.low < .medium)
+    #expect(Criticality.medium < .high)
+    #expect(Criticality.high < .critical)
+}

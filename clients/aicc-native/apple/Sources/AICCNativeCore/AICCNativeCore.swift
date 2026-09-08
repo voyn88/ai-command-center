@@ -55,6 +55,58 @@ public struct Task: Codable, Identifiable, Hashable, Sendable {
         state = try? container.decodeIfPresent(TaskState.self, forKey: .state)
         evidence = try container.decode(DeliveryEvidence.self, forKey: .evidence)
     }
+
+    /// A blocker is a decision the owner must make now — the closest thing
+    /// this snapshot has to a critical alert. Absent that, evidence that
+    /// cannot be classified is next most urgent; routine in-flight work is
+    /// least urgent and gets the gentlest (or no) haptic.
+    public var criticality: Criticality {
+        if blocker != nil { return .critical }
+        switch evidence.derivedStatus {
+        case .unknown: return .high
+        case .awaitingAcceptance: return .medium
+        case .awaitingCI, .inProgress, .completed: return .low
+        }
+    }
+}
+
+/// Local, purely-derived urgency ordering — never sent by the server. It is
+/// how the client picks a haptic signal that stays legible level-to-level,
+/// not a value anyone stores.
+public enum Criticality: Int, Equatable, Comparable, CaseIterable, Sendable {
+    case low, medium, high, critical
+    public static func < (lhs: Criticality, rhs: Criticality) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+/// A single haptic "tap" of a given intensity; `HapticSignal` composes these
+/// into a pattern per `Criticality`.
+public enum HapticPulse: Equatable, Sendable { case light, medium, heavy, error }
+
+/// A short burst of pulses with the pause between them. Two patterns for
+/// different criticality levels always differ in pulse count and/or style,
+/// so the signal survives even if only one of those dimensions is felt.
+public struct HapticPattern: Equatable, Sendable {
+    public let pulses: [HapticPulse]
+    public let gapSeconds: Double
+
+    public init(pulses: [HapticPulse], gapSeconds: Double = 0.12) {
+        self.pulses = pulses
+        self.gapSeconds = gapSeconds
+    }
+}
+
+public enum HapticSignal {
+    /// Escalating by both length and weight: a critical item pulses longest
+    /// and heaviest, a low one barely taps — distinguishable even in a
+    /// pocket, where subtle single-pulse intensity differences get lost.
+    public static func pattern(for criticality: Criticality) -> HapticPattern {
+        switch criticality {
+        case .critical: HapticPattern(pulses: [.error, .heavy, .heavy], gapSeconds: 0.14)
+        case .high: HapticPattern(pulses: [.heavy, .medium], gapSeconds: 0.12)
+        case .medium: HapticPattern(pulses: [.medium], gapSeconds: 0)
+        case .low: HapticPattern(pulses: [.light], gapSeconds: 0)
+        }
+    }
 }
 
 public struct AgentLane: Codable, Identifiable, Equatable, Sendable {
