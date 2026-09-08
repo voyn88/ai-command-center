@@ -169,7 +169,7 @@ _PERMANENT_CLONE_FAILURES = (
 
 
 def _read_only_isolated_checkout(
-    repository: Path,
+    repository: Path, pin_sha: str | None = None
 ) -> tuple[Path | None, str | None, bool]:
     """A throwaway DETACHED clone of ``repository`` under the principal
     workspace root, for a read-only run under principal isolation.
@@ -197,6 +197,13 @@ def _read_only_isolated_checkout(
     ``git fetch`` the agent attempted would have resurrected the very ENOENT
     this exists to remove; a missing remote is a legible refusal instead.
 
+    ``pin_sha`` (a verification review's exact PR head) is honoured the same
+    way: the clone is detached at that sha instead of the source HEAD, so
+    isolation isolates the pinned review rather than disabling it (review
+    of 5361b78a). The object must already be in the bound clone -- the lane
+    has no credential to fetch ``refs/pull/<n>/head`` -- and its absence is a
+    retryable condition: the source mirror catches up between deliveries.
+
     Returns ``(path, None, False)`` on success, or ``(None, reason,
     retryable)``: a missing root, a source git refuses (ownership, not a
     repository, absent) are permanent -- another delivery cannot cure them
@@ -214,6 +221,16 @@ def _read_only_isolated_checkout(
         permanent = any(marker in detail for marker in _PERMANENT_CLONE_FAILURES)
         return None, f"read-only isolated checkout source is unreadable: {detail[-300:]}", not permanent
     sha = source_head.stdout.strip()
+    if pin_sha is not None:
+        present = agent_runner._run_git(["cat-file", "-e", f"{pin_sha}^{{commit}}"], repository)
+        if present is None or present.returncode != 0:
+            return (
+                None,
+                f"review_head {pin_sha} is not in the bound clone yet "
+                "(the lane cannot fetch; the source mirror catches up)",
+                True,
+            )
+        sha = pin_sha
     target = root / f"ro-{repository.name}-{uuid.uuid4().hex[:12]}"
     steps = (
         (["clone", "--no-local", "--no-checkout", "--quiet", str(repository), str(target)], root),
@@ -548,25 +565,25 @@ def _run_agent(
                     retryable=False,
                 )
             if agent_runner.principal_isolation_required():
-                # A pinned checkout is a `git worktree add` inside the bound
-                # clone (read-only under isolation) after a fetch the lane
-                # has no credential for; both fail forever, so say so once
-                # instead of consuming the cascade on retries
-                # (VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-WORKSPACE-REM).
-                return HandlerOutcome(
-                    ok=False,
-                    reason=(
-                        "review_head pin is not supported under principal isolation "
-                        "yet: the pinned worktree would be created inside the "
-                        "read-only bound clone"
-                    ),
-                    retryable=False,
+                # Under isolation the pinned checkout is the same detached
+                # clone a plain read-only run gets, detached at the exact PR
+                # head instead of the source HEAD: a `git worktree add` would
+                # write into the read-only bound clone and a fetch has no
+                # credential (VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-
+                # WORKSPACE-REM-REM).
+                checkout, failure, retryable = _read_only_isolated_checkout(
+                    repository, pin_sha=request.review_head_sha
                 )
-            checkout, failure = _review_head_checkout(
-                repository,
-                request.review_head_pr_number or "",
-                request.review_head_sha,
-            )
+                if checkout is None:
+                    return HandlerOutcome(ok=False, reason=failure or "?", retryable=retryable)
+                stack.callback(_remove_read_only_isolated_checkout, checkout)
+                run_repository = checkout
+            else:
+                checkout, failure = _review_head_checkout(
+                    repository,
+                    request.review_head_pr_number or "",
+                    request.review_head_sha,
+                )
             if checkout is None:
                 # Fetch/worktree trouble is repository or network state a
                 # later delivery (or another host) can genuinely cure.

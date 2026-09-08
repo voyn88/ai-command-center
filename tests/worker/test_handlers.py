@@ -1913,7 +1913,12 @@ def test_remove_read_only_isolated_checkout_reports_a_leak_instead_of_hiding_it(
                for record in caplog.records)
 
 
-def test_review_head_pin_under_isolation_is_refused_permanently(handler, monkeypatch) -> None:
+def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Isolation isolates the pinned verification review instead of disabling
+    it (review of 5361b78a): the detached clone is pinned to the requested
+    sha, the bound clone is never touched."""
     from command_center import agent_runner
     from command_center.worker import handlers as handlers_module
 
@@ -1924,11 +1929,48 @@ def test_review_head_pin_under_isolation_is_refused_permanently(handler, monkeyp
         handlers_module, "_review_head_checkout",
         lambda *a: (_ for _ in ()).throw(AssertionError("must not touch the bound clone")),
     )
+    clone = tmp_path / "root" / "ro-pinned"
+    asked: list[tuple] = []
+    removed: list[Path] = []
+    monkeypatch.setattr(
+        handlers_module, "_read_only_isolated_checkout",
+        lambda repository, pin_sha=None: (asked.append((repository, pin_sha)), (clone, None, False))[1],
+    )
+    monkeypatch.setattr(
+        handlers_module, "_remove_read_only_isolated_checkout", lambda target: removed.append(target)
+    )
     outcome = run_agent(
         _payload(task_type="verification_review", untrusted=True,
                  review_head={"pr_number": "42", "head_sha": "b" * 40}),
         _event(),
     )
-    assert not outcome.ok and not outcome.retryable
-    assert "not supported under principal isolation" in outcome.reason
-    assert runs == []
+    assert outcome.ok, outcome.reason
+    assert asked == [(tmp_path, "b" * 40)]
+    assert runs[0]["repository_path"] == clone
+    assert removed == [clone]
+
+
+def test_read_only_isolated_checkout_pins_to_the_requested_sha_or_waits_for_it(tmp_path, monkeypatch):
+    """Real git: a pin to an older commit detaches there; a pin the bound
+    clone does not hold yet is a retryable wait, never a permanent refusal."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    first = _git_repo_with_one_commit(source)
+    assert _git("-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
+                "commit", "--allow-empty", "-q", "-m", "two").returncode == 0
+    head = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert head != first
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(source, pin_sha=first)
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == first
+    assert _git("-C", str(target), "symbolic-ref", "-q", "HEAD").returncode != 0
+    handlers_module._remove_read_only_isolated_checkout(target)
+    missing = "c" * 40
+    target, failure, retryable = handlers_module._read_only_isolated_checkout(source, pin_sha=missing)
+    assert target is None and retryable is True and "not in the bound clone yet" in failure
+    assert list(root.iterdir()) == []
