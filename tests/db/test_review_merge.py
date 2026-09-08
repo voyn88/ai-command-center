@@ -26,6 +26,15 @@ from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
     rig,
 )
 
+# `rig` provisions cluster-level roles (aicc_migrator, aicc_worker, ...) that
+# every xdist worker's database shares; running these tests under xdist
+# parallelism races that provisioning against every other module that also
+# pulls in `rig`, surfacing PostgreSQL's `tuple concurrently updated` on the
+# shared catalog rows (VOYN-W0-AICC-FLAKE-RIG-ROLE-SETUP-CONCURRENT-UPDATE).
+# `tests/db/test_backlog_planner.py`, `rig`'s home module, already opts out of
+# xdist this way; every other module that borrows `rig` must do the same.
+pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
+
 BASE = "c" * 40
 DIFF = "diff --git a/x b/x\n+hi\n"
 SNAPSHOTS = {}
