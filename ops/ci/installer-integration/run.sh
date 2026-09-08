@@ -121,7 +121,7 @@ cat > "$release/.venv/bin/python" <<'SHIM'
 exec /usr/local/bin/aicc-stub-worker "$@"
 SHIM
 chown -R root:root "$release"; chmod -R a-w "$release"; chmod 0555 "$release"; chmod 0555 "$release/.venv/bin/python"
-ln -sfn "$release" /opt/aicc/current
+ln -sfn "releases/$sha" /opt/aicc/current
 runuser -u aicc-worker -- test -x /opt/aicc/current || fail "aicc-worker cannot traverse the release root (#823 shape)"
 runuser -u aicc-worker -- test -x /opt/aicc/current/.venv/bin/python || fail "aicc-worker cannot execute the release interpreter"
 
