@@ -62,6 +62,18 @@ def test_unknown_task_class_falls_back_to_implementation():
     assert cascade_for("martian") == cascade_for("implementation")
 
 
+def test_review_prescreen_is_ollama_only_and_separate_from_review():
+    """VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR: the PRESCREEN tier is its OWN
+    cascade, never a link on "review" -- a link on "review" would put an
+    Ollama result inside `review_merge._model_only_review_cascade()` and
+    therefore reachable from `_parse_verdict`/the ACCEPT marker, which the
+    2026-09-03 benchmark (0% recall, twice) means it must never be."""
+    cascade = cascade_for("review_prescreen")
+    assert [link["executor"] for link in cascade] == ["ollama"]
+    assert all(link["task_type"] == "review_prescreen" for link in cascade)
+    assert "ollama" not in [link["executor"] for link in cascade_for("review")]
+
+
 def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> None:
     """VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP (found live 2026-08-30).
 

@@ -498,6 +498,8 @@ def main(argv: list[str] | None = None) -> int:
 
                 from command_center.db.work_queue_store import WorkQueueStore
                 from command_center.orchestrator.review_merge import (
+                    prescreen_once,
+                    publish_prescreen_findings,
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
@@ -550,6 +552,25 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REMEDIATE {task_id} -> {new_task_id}")
                 for task_id, reason in marker_report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                # PRESCREEN tier (VOYN-W0-AICC-OLLAMA-REVIEW-EXECUTOR): an
+                # advisory-only Ollama pass alongside the real review above.
+                # A fleet with no ollama link routed for "review_prescreen"
+                # makes both calls silent no-ops (empty reports), so this is
+                # safe to run unconditionally on every host.
+                prescreen_report = prescreen_once(
+                    lambda: _nc(conn), enqueue, args.repo_path, task_id=args.task_id,
+                )
+                for task_id, pr in prescreen_report.reviewed:
+                    print(f"PRESCREEN {task_id} -> {pr}")
+                for task_id, reason in prescreen_report.skipped:
+                    print(f"PRESCREEN-SKIP {task_id}: {reason}")
+                prescreen_publish_report = publish_prescreen_findings(
+                    lambda: _nc(conn), args.repo_path, task_id=args.task_id,
+                )
+                for task_id, pr in prescreen_publish_report.reviewed:
+                    print(f"PRESCREEN-POST {task_id} -> {pr}")
+                for task_id, reason in prescreen_publish_report.skipped:
+                    print(f"PRESCREEN-POST-SKIP {task_id}: {reason}")
                 return 0
 
             if args.command == "backlog-merge":
