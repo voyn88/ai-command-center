@@ -306,15 +306,22 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
         return 1
     payload = _json_report(report)
+    recorded = True
     if args.record_findings:
         try:
             record_findings(args.record_findings, report.failures, payload)
             payload["findings_recorded"] = True
         except Exception as exc:  # noqa: BLE001 - recording must not hide the measurement
+            # The measurement is still printed in full; the exit code says
+            # the monitor did NOT do its whole job. A healthy measurement
+            # whose persistence failed exited 0 before (review of fc167cf7),
+            # so a broken finding store went unnoticed exactly when the
+            # monitor is trusted to turn red into a task.
+            recorded = False
             payload["findings_recorded"] = False
             payload["findings_error"] = str(exc)[:200]
     print(json.dumps(payload, sort_keys=True))
-    return 0 if report.ok else 1
+    return 0 if report.ok and recorded else 1
 
 
 if __name__ == "__main__":

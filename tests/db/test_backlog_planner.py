@@ -99,7 +99,7 @@ def _test_repo_routes(monkeypatch, request):
     out by overriding the variable themselves."""
     import json
 
-    repos = ["repo-d2","repo-ga","repo-gb","repo-gc","repo-in","repo-nm",
+    repos = ["repo-d2","repo-pipe","repo-ga","repo-gb","repo-gc","repo-in","repo-nm",
              "repo-one","repo-p1","repo-p3","repo-pk","repo-shared","repo-tt"]
     monkeypatch.setenv(
         "AICC_PLANNER_REPO_ROUTES",
@@ -1185,8 +1185,24 @@ def test_pipeline_task_returned_twice_is_split_not_parked(rig) -> None:
     from command_center.orchestrator.planner import Planner, _split_requested
 
     assert _split_requested(Planner(app_factory)._rows, "VOYN-W0-PIPE") is True
+    # The PLANNER's next dispatch of this task is a decomposition run: the
+    # payload carries the split instructions and the SPLIT_TASKS_JSON
+    # trailer contract, not an ordinary implementation prompt (review of
+    # fc167cf7: the earlier assertion only checked the flag, so a planner
+    # that ignored it during planning still passed).
+    from command_center.orchestrator.planner import _SPLIT_INSTRUCTIONS, PlanLimits
+
+    plan = Planner(app_factory).plan_once(PlanLimits(planner="planner-t"))
+    assert "VOYN-W0-PIPE" in plan.split_dispatched, plan
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT payload FROM work_item WHERE task_id = %s ORDER BY created_at DESC LIMIT 1",
+            ("VOYN-W0-PIPE",),
+        )
+        payload = cur.fetchone()[0]
+    assert "SPLIT_TASKS_JSON" in payload["prompt"]
+    assert _SPLIT_INSTRUCTIONS.strip()[:40] in payload["prompt"]
     # Third and fourth returns: still open once more, then parked.
-    assert _dispatch(app_factory, "VOYN-W0-PIPE")[0]
     assert _return_non_technical(app_factory, "VOYN-W0-PIPE") == "OPEN"
     assert _dispatch(app_factory, "VOYN-W0-PIPE")[0]
     assert _return_non_technical(app_factory, "VOYN-W0-PIPE") == "DEFER_TO_USER"
@@ -1290,8 +1306,12 @@ def test_open_monitor_findings_become_pipeline_tasks_once(rig) -> None:
             cur.execute("SELECT count(*) FROM monitor_finding WHERE state = 'open'")
             assert cur.fetchone()[0] == 1
     report = Planner(app_factory).plan_once(PlanLimits(planner="planner-t"))
-    assert report.monitor_tasks == [("VOYN-MON-WORKER-01-INFRA-ACTIVE-WORKERS-2-4", "active_workers:2<4")]
-    task = store.get_task("VOYN-MON-WORKER-01-INFRA-ACTIVE-WORKERS-2-4")
+    from command_center.orchestrator.planner import _monitor_task_id
+
+    monitor_id = _monitor_task_id("worker-01:infra", "active_workers:2<4")
+    assert monitor_id.startswith("VOYN-MON-WORKER-01-INFRA-ACTIVE-WORKERS-2-4-")
+    assert report.monitor_tasks == [(monitor_id, "active_workers:2<4")]
+    task = store.get_task(monitor_id)
     assert task["status"] == "OPEN" and task["priority"] == "P1"
     with app_factory() as conn:
         with conn.cursor() as cur:

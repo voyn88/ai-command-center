@@ -379,3 +379,25 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(monkeyp
     calls.clear()
     infra_monitor.record_findings("worker-01:infra", (), {})
     assert any("monitor_clear_finding" in c[0] for c in calls)
+
+
+def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(monkeypatch, capsys) -> None:
+    """Review of fc167cf7: a healthy measurement whose persistence failed
+    exited 0, so a broken finding store passed unnoticed. Fail closed."""
+    monkeypatch.setattr(
+        infra_monitor, "discover_worker_units", lambda: {"voyn-aicc-worker@1.service": "active"}
+    )
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor,
+        "record_findings",
+        lambda source, failures, detail: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+    result = infra_monitor.main(
+        ["--minimum-active-workers", "1", "--skip-queue", "--prometheus-url", "http://m/ready",
+         "--record-findings", "worker-01:infra"]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True and out["findings_recorded"] is False
+    assert "db down" in out["findings_error"]
+    assert result == 1

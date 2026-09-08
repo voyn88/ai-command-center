@@ -17,6 +17,7 @@ function's own refusal reason, including ``skipped_by_wave_gate``
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -157,9 +158,14 @@ _SPLIT_INSTRUCTIONS = (
 def _monitor_task_id(source: str, failure: str) -> str:
     """Deterministic, exact task id for a monitor finding: the same
     (source, failure) always maps to the same id, so re-opening a finding
-    re-uses the task instead of creating a twin."""
-    slug = re.sub(r"[^A-Z0-9]+", "-", f"{source}-{failure}".upper()).strip("-")[:90]
-    return f"VOYN-MON-{slug}"
+    re-uses the task instead of creating a twin. The readable slug is
+    followed by a digest of the UNMODIFIED pair: two findings that differ
+    only in punctuation, case, or past the slug's length must not share an
+    id (review of fc167cf7) -- the second upsert would have collided and
+    that finding would have stayed unlinked forever."""
+    slug = re.sub(r"[^A-Z0-9]+", "-", f"{source}-{failure}".upper()).strip("-")[:70]
+    digest = hashlib.sha256(f"{source}\x00{failure}".encode("utf-8")).hexdigest()[:10].upper()
+    return f"VOYN-MON-{slug}-{digest}"
 
 
 def _split_requested(rows: Any, task_id: str) -> bool:
