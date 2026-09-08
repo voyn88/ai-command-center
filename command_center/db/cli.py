@@ -609,6 +609,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"BLOCKED   #{number}: {reason}")
                 for number, head in report.age_fallback:
                     print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+                for number, head in report.unreadable:
+                    print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
                 return 0
 
             if args.command == "downgrade":

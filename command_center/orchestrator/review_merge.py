@@ -3215,6 +3215,12 @@ class PrWindowConfig:
     #: listing is light (no reviews/checks/commits per PR), so a large limit
     #: is cheap; details are fetched lazily for candidates only.
     scan_limit: int = 300
+    #: The listing is exhaustive, not bounded: `scan_limit` is the first page
+    #: size, and a page that comes back full is retried at twice the size
+    #: until a page comes back short (review of d16dc0e4: a fixed 300 still
+    #: silently omitted PR 301+). This is the ceiling past which the tick
+    #: refuses to pretend it saw everything and reports `pr_list_truncated`.
+    scan_hard_cap: int = 5000
     #: How many per-PR detail lookups (`gh pr view` with reviews, checks,
     #: commits) one tick may spend, candidates included. The block reasons
     #: (`_window_block_reason`: reject marker, missing/red checks, stale
@@ -3252,6 +3258,10 @@ class PrWindowReport:
     #: (number, headRefOid) beyond the window that the detail budget did not
     #: reach this tick; their existing window label was left untouched.
     unchecked: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, headRefOid) whose detail lookup (`gh pr view`) failed this
+    #: tick; their existing window label was left untouched -- a transient
+    #: GitHub error is no evidence about eligibility (review of d16dc0e4).
+    unreadable: list[tuple[int, str]] = field(default_factory=list)
     #: Set when the listing itself failed: nothing was labelled this tick,
     #: and the caller must say so loudly rather than print an empty report
     #: (live 2026-09-08: the old all-fields listing exceeded GitHub's
@@ -3467,33 +3477,44 @@ def reconcile_pr_window(
     # limit of 500,000"). Details are fetched per candidate below, and only
     # until the window is full: a PR far down the queue cannot be selected
     # this tick, so evaluating it would be wasted API budget.
-    listed = _gh(
-        [
-            "pr",
-            "list",
-            "--state",
-            "open",
-            "--search",
-            "sort:created-asc",
-            "--limit",
-            str(max(cfg.scan_limit, 1)),
-            "--json",
-            "number,url,headRefOid,createdAt,author,labels",
-        ],
-        repo_path,
-    )
-    if listed.returncode != 0:
-        report.error = f"pr_list_failed: {(listed.stderr or '').strip()[:200]}"
-        return report
-    try:
-        prs = json.loads(listed.stdout or "[]")
-    except ValueError:
-        report.error = "pr_list_unparseable"
-        return report
-    if not isinstance(prs, list):
-        report.error = "pr_list_unparseable"
-        return report
-
+    # Exhaustive: page size doubles while a page comes back full, so every
+    # open PR is seen or the tick says loudly that it was not (`pr_list_
+    # truncated`); a bounded `--limit` silently dropped PR N+1 onward
+    # (review of d16dc0e4). `gh pr list` pages the GraphQL cursor itself.
+    limit = max(cfg.scan_limit, 1)
+    while True:
+        listed = _gh(
+            [
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--search",
+                "sort:created-asc",
+                "--limit",
+                str(limit),
+                "--json",
+                "number,url,headRefOid,createdAt,author,labels",
+            ],
+            repo_path,
+        )
+        if listed.returncode != 0:
+            report.error = f"pr_list_failed: {(listed.stderr or '').strip()[:200]}"
+            return report
+        try:
+            prs = json.loads(listed.stdout or "[]")
+        except ValueError:
+            report.error = "pr_list_unparseable"
+            return report
+        if not isinstance(prs, list):
+            report.error = "pr_list_unparseable"
+            return report
+        if len(prs) < limit:
+            break
+        if limit >= max(cfg.scan_hard_cap, 1):
+            report.error = f"pr_list_truncated: {limit} open PRs listed and the page was full"
+            return report
+        limit = min(limit * 2, max(cfg.scan_hard_cap, 1))
     now = time.time()
     listed_prs = [pr for pr in prs if isinstance(pr, dict)]
     listed_prs.sort(
@@ -3521,10 +3542,13 @@ def reconcile_pr_window(
         details_used += 1
         detailed = _pr_window_details(repo_path, pr)
         if detailed is None:
-            # Unknown is not eligible: an unreadable PR keeps (or gets) the
-            # waiting label and is re-examined next tick.
-            report.waiting.append((number, head))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
+            # Unknown is not evidence: a failed `gh pr view` says nothing
+            # about eligibility, so the PR's existing label (active,
+            # blocked, waiting or none) stays exactly as it was and the PR is
+            # reported unreadable for this tick (review of d16dc0e4: stamping
+            # `waiting` here could demote an active or blocked PR on a
+            # transient GitHub error). Re-examined next tick.
+            report.unreadable.append((number, head))
             continue
         age_seconds, fell_back = _pr_age_seconds(repo_path, detailed, now=now)
         if fell_back:

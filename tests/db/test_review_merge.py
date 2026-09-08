@@ -3607,10 +3607,13 @@ def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
     assert edits == []
 
 
-def test_window_listing_is_light_and_details_are_fetched_lazily(monkeypatch):
+def test_window_listing_is_light_and_details_come_from_one_view_per_pr_within_the_budget(monkeypatch):
     """The listing asks for no reviews/checks/commits (that is what blew the
-    node budget); a candidate's details come from one `pr view`, and a PR
-    beyond the window is labelled waiting without any detail lookup."""
+    node budget); a PR's details come from exactly one `pr view`, for every
+    PR the detail budget reaches -- beyond the window too, because the block
+    check needs them (review of 53183850). Bounding is the budget's job
+    (`test_out_of_budget_prs_...`), not this test's claim (review of
+    d16dc0e4: the old name promised laziness the assertions contradicted)."""
     import subprocess as sp
 
     heads = {n: chr(ord("a") + n) * 40 for n in range(1, 5)}
@@ -3646,10 +3649,11 @@ def test_window_listing_is_light_and_details_are_fetched_lazily(monkeypatch):
     assert report.error is None
     assert [n for n, _ in report.active] == [1, 2]
     assert [n for n, _ in report.waiting] == [3, 4]
-    viewed = sorted(int(c[2]) for c in calls if c[:2] == ["pr", "view"])
-    assert viewed == [1, 2, 3, 4], (
+    viewed = [int(c[2]) for c in calls if c[:2] == ["pr", "view"]]
+    assert sorted(viewed) == [1, 2, 3, 4], (
         "beyond-window PRs are still examined for block reasons while budget remains"
     )
+    assert len(viewed) == len(set(viewed)), "exactly one detail lookup per PR"
     assert any(c[:2] == ["pr", "edit"] and c[2] == "4" for c in calls), (
         "the tail is still labelled waiting"
     )
@@ -3755,14 +3759,86 @@ def test_an_active_pr_beyond_the_detail_budget_is_not_demoted(monkeypatch):
     )
 
 
-def test_window_scans_every_open_pr_not_just_fifty(monkeypatch):
+def _light_pr(n: int) -> dict:
+    return {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+            "headRefOid": format(n, "040x"), "createdAt": f"2026-01-01T00:{n % 60:02d}:{n // 60:02d}Z",
+            "author": {"login": "alice"}, "labels": []}
+
+
+def test_window_lists_every_open_pr_by_growing_the_page_until_it_comes_back_short(monkeypatch):
+    """Review of d16dc0e4: a fixed --limit 300 still silently omitted PR 301+.
+    The listing is exhaustive: a full page is retried at twice the size
+    until a page is short, and every PR seen gets a label."""
     import subprocess as sp
+
+    total = 7
+    limits: list[int] = []
+    edited: set[str] = set()
 
     def fake_gh(argv, repo_path):
         if argv[:2] == ["pr", "list"]:
-            assert int(argv[argv.index("--limit") + 1]) >= 300
-            return sp.CompletedProcess(argv, 0, "[]", "")
-        return sp.CompletedProcess(argv, 0, "", "")
+            limit = int(argv[argv.index("--limit") + 1])
+            limits.append(limit)
+            page = [_light_pr(n) for n in range(1, min(total, limit) + 1)]
+            return sp.CompletedProcess(argv, 0, json.dumps(page), "")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"reviews": [], "statusCheckRollup": [], "commits": []}), "")
+        if argv[:2] == ["pr", "edit"]:
+            edited.add(argv[2])
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    assert reconcile_pr_window("/repo").error is None
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, scan_limit=2, detail_budget=100, stale_seconds=10**12)
+    )
+    assert report.error is None
+    assert limits == [2, 4, 8], "page size doubles until a page comes back short"
+    assert edited == {str(n) for n in range(1, total + 1)}, "every open PR was seen and labelled"
+
+
+def test_window_refuses_to_pretend_it_saw_everything_past_the_hard_cap(monkeypatch):
+    import subprocess as sp
+
+    edits: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        if argv[:2] == ["pr", "list"]:
+            limit = int(argv[argv.index("--limit") + 1])
+            return sp.CompletedProcess(argv, 0, json.dumps([_light_pr(n) for n in range(1, limit + 1)]), "")
+        if argv[:2] == ["pr", "edit"]:
+            edits.append(argv)
+        return sp.CompletedProcess(argv, 0, "{}", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window("/repo", PrWindowConfig(scan_limit=2, scan_hard_cap=8))
+    assert report.error and report.error.startswith("pr_list_truncated")
+    assert edits == [], "a tick that did not see every PR labels nothing"
+
+
+def test_a_failed_detail_lookup_leaves_the_existing_label_untouched(monkeypatch):
+    """Review of d16dc0e4: a transient `gh pr view` failure stamped `waiting`,
+    demoting an active or blocked PR on no evidence. Now the label stays and
+    the PR is reported unreadable."""
+    import subprocess as sp
+
+    labels = {1: [{"name": "review-window:active"}], 2: [{"name": "review-window:blocked"}], 3: []}
+    light = [dict(_light_pr(n), labels=labels[n]) for n in (1, 2, 3)]
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        calls.append(list(argv))
+        if argv[:2] == ["pr", "list"]:
+            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 1, "", "HTTP 502")
+        if argv[:2] == ["pr", "edit"]:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=2, stale_seconds=3600))
+    assert report.error is None
+    assert [n for n, _ in report.unreadable] == [1, 2, 3]
+    assert report.active == [] and report.waiting == [] and report.blocked == []
+    assert not any(c[:2] == ["pr", "edit"] for c in calls), "no evidence, no label change"
