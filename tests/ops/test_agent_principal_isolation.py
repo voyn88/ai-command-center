@@ -1982,3 +1982,59 @@ def test_every_launcher_read_write_path_is_created_by_tmpfiles_before_the_first_
         in socket_unit
     ), "the socket must re-create the runtime paths before the first connection"
     assert "/run/aicc-agent-workspace-binds" in created
+
+
+def _auth_store(tmp_path, monkeypatch, launcher, payload: bytes):
+    store = tmp_path / "store" / ".claude" / ".credentials.json"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(payload)
+    store.chmod(0o600)
+    monkeypatch.setitem(launcher.MODEL_AUTH_SOURCES, "claude", store)
+    monkeypatch.setattr(
+        launcher, "_read_exact_protected_file", lambda path, **kwargs: Path(path).read_bytes()
+    )
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    return store, home
+
+
+def test_refreshed_model_auth_is_written_back_to_the_store(tmp_path, monkeypatch, launcher):
+    """VOYN-W0-AICC-AGENT-MODEL-AUTH-REFRESH-IS-LOST-WITH-THE-EPHEMERAL-HOME:
+    a token refresh (same keys, new values) in the ephemeral home reaches
+    the root store atomically; the next run is staged from the new token."""
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1", "expiresAt": 1}}).encode()
+    new = json.dumps({"claudeAiOauth": {"accessToken": "b", "refreshToken": "r2", "expiresAt": 2}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    (home / ".claude" / ".credentials.json").write_bytes(new)
+    assert launcher._write_back_model_auth("claude", home) is True
+    assert store.read_bytes() == new
+    assert stat.S_IMODE(store.stat().st_mode) == 0o600
+    assert not list(store.parent.glob(".*.tmp"))
+
+
+def test_unchanged_or_missing_model_auth_is_not_written_back(tmp_path, monkeypatch, launcher):
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1"}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    assert launcher._write_back_model_auth("claude", home) is False
+    (home / ".claude" / ".credentials.json").write_bytes(old)
+    assert launcher._write_back_model_auth("claude", home) is False
+    assert store.read_bytes() == old
+
+
+def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monkeypatch, launcher):
+    """A refresh changes values, never the key set; anything else the agent
+    left behind is not trusted into the store."""
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1"}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    target = home / ".claude" / ".credentials.json"
+    target.write_bytes(b"not json")
+    with pytest.raises(launcher.LaunchRefused, match="not JSON"):
+        launcher._write_back_model_auth("claude", home)
+    target.write_bytes(json.dumps({"claudeAiOauth": {"accessToken": "a"}, "extra": 1}).encode())
+    with pytest.raises(launcher.LaunchRefused, match="changed shape"):
+        launcher._write_back_model_auth("claude", home)
+    target.unlink()
+    target.symlink_to(store)
+    with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
+        launcher._write_back_model_auth("claude", home)
+    assert store.read_bytes() == old
