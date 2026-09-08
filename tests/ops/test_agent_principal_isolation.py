@@ -1833,22 +1833,25 @@ def test_every_launcher_read_write_path_is_created_by_tmpfiles_before_the_first_
     unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text(encoding="utf-8")
     socket_unit = (root / "deploy/systemd/aicc-agent-launcher.socket").read_text(encoding="utf-8")
     tmpfiles = (root / "deploy/tmpfiles.d/aicc-agent.conf").read_text(encoding="utf-8")
-    declared = {
+    # Only d/D CREATE a directory; z/Z merely adjust one that exists (review
+    # of 446856da: counting them let a `d` demoted to `z` pass).
+    created = {
         line.split()[1]
         for line in tmpfiles.splitlines()
-        if line and not line.startswith("#") and line.split()[0] in {"d", "D", "z", "Z"}
+        if line and not line.startswith("#") and line.split()[0] in {"d", "D"}
     }
-    entries = [
-        line.split("=", 1)[1].split()
+    paths = [
+        path
         for line in unit.splitlines()
         if line.startswith("ReadWritePaths=")
+        for path in line.split("=", 1)[1].split()
     ]
-    assert entries, "launcher unit has no ReadWritePaths="
-    for path in entries[0]:
+    assert paths, "launcher unit has no ReadWritePaths="
+    for path in paths:
         assert not path.startswith("-"), f"{path}: '-' hides the absence instead of curing it"
-        assert path in declared, f"{path} is not created by tmpfiles.d/aicc-agent.conf"
+        assert path in created, f"{path} is not CREATED (d/D) by tmpfiles.d/aicc-agent.conf"
     assert (
         "ExecStartPre=/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/aicc-agent.conf"
         in socket_unit
     ), "the socket must re-create the runtime paths before the first connection"
-    assert "/run/aicc-agent-workspace-binds" in declared
+    assert "/run/aicc-agent-workspace-binds" in created
