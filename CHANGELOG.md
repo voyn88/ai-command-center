@@ -8,6 +8,25 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Decision-memory graph (`VOYN-MIN-GRAPH-SQL`)
+- `command_center/decision_graph_store.py`: a standalone SQLite store for a
+  semantic graph of decisions, errors, dependencies and effects — nodes typed
+  by kind, directed/typed edges, and `path_to_failure()`, one `WITH RECURSIVE`
+  query finding the shortest cycle-safe chain from any node to the nearest
+  reachable failure.
+- `command_center/decision_graph_render.py`: a hand-rolled layered-DAG-to-SVG
+  renderer (no `graphviz`/`pydot`/`networkx` dependency exists in this repo)
+  that highlights the path-to-failure edges in red and draws each incident's
+  corrective decision as a dashed `mitigates` arrow rather than a step on the
+  road to its own fix.
+- `scripts/seed_decision_graph_incidents.py` /
+  `scripts/render_decision_graph.py`: seed the graph from six real incidents
+  mined from this repository's own migration comments, docstrings and commit
+  messages, and render it. The rendered artifact —
+  [`docs/operations/decision_memory_graph.svg`](docs/operations/decision_memory_graph.svg)
+  — is the acceptance criterion: one visual graph with a path-to-failure for
+  past incidents. See `docs/operations/DECISION_MEMORY_GRAPH.md`.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,
