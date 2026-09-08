@@ -93,6 +93,22 @@ export async function fetchHome(): Promise<HomeDTO> {
   return r.json()
 }
 
+// The canonical provenance read model (`run_lineage.build_view`, mirrored
+// verbatim by `serialize_execution`): who initiated the run, the exact
+// prompt/model/actions that produced it, and a reproducibility hash over
+// the inputs a reproduction attempt must match. Any field can be `null` —
+// evidence that hasn't been observed yet is never guessed, and its name
+// shows up in `unknown_fields` instead.
+export type RunProvenance = {
+  initiated_by: string | null
+  prompt: string | null
+  prompt_version: number | null
+  model: string | null
+  actions: string[] | null
+  reproducibility_hash: string | null
+  unknown_fields: string[]
+}
+
 export type ExecutionRun = {
   id: string
   source: string
@@ -108,6 +124,7 @@ export type ExecutionRun = {
   exit_code: number | null
   failure_reason: string | null
   verdict: string | null
+  provenance: RunProvenance | null
 }
 
 export type ExecutionDTO = {

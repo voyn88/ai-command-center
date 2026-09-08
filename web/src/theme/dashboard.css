@@ -101,6 +101,11 @@
 .execution-primary strong { color: var(--tx); font-size: .84rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .execution-primary > span:last-child, .execution-meta span { color: var(--tx3); font-size: .7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .execution-state { font-size: .64rem; font-weight: 700; letter-spacing: .08em; }
+/* Provenance strip: who initiated the run, which model executed it, and the
+   reproducibility hash — spans the full row so it never crowds out the
+   primary/meta columns on narrow layouts. */
+.execution-provenance { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: .6rem 1rem; border-top: 1px solid var(--gline); padding-top: .5rem; margin-top: .1rem; }
+.execution-provenance span { color: var(--tx3); font-size: .66rem; font-family: var(--mono, monospace); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 @media (max-width: 760px) { .execution-layout { grid-template-columns: 1fr; } .execution-nav { position: static; grid-template-columns: 1fr 1fr; } .execution-row { grid-template-columns: 1fr; } }
 
 .split-grid {

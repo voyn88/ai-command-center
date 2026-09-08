@@ -30,8 +30,36 @@ function stateTone(state: string) {
   return 'var(--tx3)'
 }
 
-function RunRow({ run, fallback, language, resultLabel, exitLabel }: { run: ExecutionRun; fallback: string; language: string; resultLabel: string; exitLabel: string }) {
+// A short, human-checkable prefix of the full sha256 reproducibility hash —
+// the full value stays available in the title tooltip for anyone who needs
+// to compare it byte-for-byte.
+function shortHash(value: string | null) {
+  if (!value) return null
+  return value.slice(0, 12)
+}
+
+function RunRow({
+  run,
+  fallback,
+  language,
+  resultLabel,
+  exitLabel,
+  initiatedByLabel,
+  modelLabel,
+  reproHashLabel,
+}: {
+  run: ExecutionRun
+  fallback: string
+  language: string
+  resultLabel: string
+  exitLabel: string
+  initiatedByLabel: string
+  modelLabel: string
+  reproHashLabel: string
+}) {
   const result = run.verdict || run.failure_reason || (run.exit_code !== null ? `${exitLabel}: ${run.exit_code}` : fallback)
+  const provenance = run.provenance
+  const reproHash = shortHash(provenance?.reproducibility_hash ?? null)
   return (
     <article className="execution-row">
       <div className="execution-primary">
@@ -43,6 +71,11 @@ function RunRow({ run, fallback, language, resultLabel, exitLabel }: { run: Exec
         <span>{formatDate(run.started_at || run.created_at, language, fallback)}</span>
         <span>{formatDuration(run.duration_seconds, fallback)}</span>
         <span title={resultLabel}>{result}</span>
+      </div>
+      <div className="execution-provenance" title={provenance?.reproducibility_hash ?? undefined}>
+        <span>{initiatedByLabel}: {provenance?.initiated_by ?? fallback}</span>
+        <span>{modelLabel}: {provenance?.model ?? fallback}</span>
+        <span>{reproHashLabel}: {reproHash ?? fallback}</span>
       </div>
     </article>
   )
@@ -95,7 +128,19 @@ export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' 
                 {states.map(([name, count]) => <button key={name} className={state === name ? 'active' : ''} onClick={() => setState(name)}>{name} · {count}</button>)}
               </div>
               <div className="execution-list">
-                {runs.length === 0 ? <p style={{ color: 'var(--tx3)' }}>{t('noRuns')}</p> : runs.map((run) => <RunRow key={`${run.source}-${run.id}`} run={run} fallback={t('notAvailable')} language={i18n.language} resultLabel={t('result')} exitLabel={t('exitCode')} />)}
+                {runs.length === 0 ? <p style={{ color: 'var(--tx3)' }}>{t('noRuns')}</p> : runs.map((run) => (
+                  <RunRow
+                    key={`${run.source}-${run.id}`}
+                    run={run}
+                    fallback={t('notAvailable')}
+                    language={i18n.language}
+                    resultLabel={t('result')}
+                    exitLabel={t('exitCode')}
+                    initiatedByLabel={t('initiatedBy')}
+                    modelLabel={t('model')}
+                    reproHashLabel={t('reproHash')}
+                  />
+                ))}
               </div>
             </GlassPanel>
           </>}
