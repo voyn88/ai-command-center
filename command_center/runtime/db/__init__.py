@@ -68,9 +68,12 @@ from command_center.runtime.db.core import (  # noqa: F401
     _retry_on_busy,
     _row_to_dict,
     _stamp_timestamp_zone,
+    _table_exists,
     _validate_updatable_fields,
     LEDGER_TIMESTAMP_TZ_COLUMN,
     RETENTION_TZ_ENV,
+    RUNTIME_RETENTION_ARCHIVE_DIR_ENV,
+    RUNTIME_RETENTION_DRY_RUN_ENV,
     apply_runtime_retention,
     connect,
     current_schema_version,
@@ -134,6 +137,7 @@ from command_center.runtime.db.execution import (  # noqa: F401
     tail_run_events,
     update_run_fields,
     update_run_state,
+    wait_for_run_finalized,
 )
 from command_center.runtime.db.provenance import (  # noqa: F401
     backfill_run_provenance,

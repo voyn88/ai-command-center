@@ -77,6 +77,33 @@ def test_build_projection_maps_tasks_and_projects(tmp_path, monkeypatch):
     assert projects["beta"]["state"] == "idle"
 
 
+def test_degraded_run_journal_failure_is_logged(tmp_path, monkeypatch, caplog):
+    """A `runtime.db` that exists but errors on read must degrade the same
+    way a missing journal does (never break the artifact) — but unlike a
+    missing journal, the failure is a real bug and must leave a trace, or a
+    broken read and a genuinely empty journal are indistinguishable from the
+    written artifact alone."""
+    import logging
+
+    from native_gateway import projection_producer
+
+    root = _seed_root(tmp_path, monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("schema mismatch: no such column: state")
+
+    monkeypatch.setattr(projection_producer.runs_read, "list_unified_runs", _boom)
+
+    with caplog.at_level(logging.WARNING, logger=projection_producer.__name__):
+        projection = build_projection(root)
+
+    assert projection["degraded"] is True
+    assert projection["lanes"] == []
+    assert projection["events"] == []
+    assert any("Run journal unavailable" in r.message for r in caplog.records)
+    assert any(r.exc_info for r in caplog.records)
+
+
 def test_revision_is_stable_for_identical_state(tmp_path, monkeypatch):
     root = _seed_root(tmp_path, monkeypatch)
     first = build_projection(root)

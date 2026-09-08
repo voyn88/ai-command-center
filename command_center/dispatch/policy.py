@@ -31,6 +31,13 @@ The hard guarantees, enforced structurally here:
    same plan could have used.
 4. **No force-run.** A task that finds nothing eligible within budget stays
    queued with a typed reason. The engine never "assigns anyway".
+5. **Tail risk is priced per business path, and blocks before eligibility.**
+   Each task's project is checked against `policy.tail_risk_scenarios`
+   (`DispatchPolicy.tail_risk_block`); a business path whose scenario has a
+   priced expected cost of error (probability x impact) over its configured
+   limit defers with `DEFER_TAIL_RISK` before executors or budget are even
+   considered — the top-5 scenarios this ships with are the acceptance this
+   guarantee exists to satisfy (`models.DEFAULT_TAIL_RISK_SCENARIOS`).
 """
 
 from __future__ import annotations
@@ -45,6 +52,9 @@ from command_center.dispatch.models import (
     DEFER_NO_AVAILABLE_EXECUTOR,
     DEFER_NO_ELIGIBLE_EXECUTOR,
     DEFER_PROJECT_BUDGET,
+    DEFER_TAIL_RISK,
+    SPEND_MEASUREMENT_ACTUAL,
+    SPEND_MEASUREMENT_UNAVAILABLE,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
@@ -108,7 +118,7 @@ def plan_dispatch(
     executors: list[ExecutorProfile],
     policy: DispatchPolicy,
     *,
-    daily_spend_usd: float,
+    daily_spend_usd: float | None,
     max_daily_spend_usd: float,
     kill_switch_engaged: bool,
     budget_unknown: bool = False,
@@ -142,8 +152,22 @@ def plan_dispatch(
             budget_unknown=budget_unknown,
             daily_spend_usd=daily_spend_usd,
             max_daily_spend_usd=max_daily_spend_usd,
+            # `daily_spend_usd` here is a real reading unless the trailing-24h
+            # spend itself couldn't be read (`budget_unknown`), in which case
+            # the caller already passed `None` — never a fabricated ceiling.
+            # `projected_spend_usd` mirrors it exactly, so an unmeasured spend
+            # never sprouts a concrete number one field over.
             projected_spend_usd=daily_spend_usd,
+            spend_measurement=(
+                SPEND_MEASUREMENT_UNAVAILABLE
+                if budget_unknown
+                else SPEND_MEASUREMENT_ACTUAL
+            ),
         )
+
+    # `budget_unknown` was False to reach here, so the caller supplied a real
+    # trailing-24h figure rather than the `None` it sends when the read fails.
+    assert daily_spend_usd is not None
 
     # (3) SLA/priority order.
     ordered = sorted(tasks, key=lambda t: _task_sort_key(t, policy))
@@ -155,6 +179,24 @@ def plan_dispatch(
     decisions: list[DispatchDecision] = []
 
     for task in ordered:
+        # Tail-risk gate: a business path (project) whose priced expected
+        # cost of error currently breaches its scenario limit is refused
+        # before eligibility/budget is even considered — the same "no code
+        # path assigns anyway" structure as the kill switch, just scoped to
+        # this one task's business path instead of the whole plan.
+        blocking_scenario = policy.tail_risk_block(task.project)
+        if blocking_scenario is not None:
+            decisions.append(
+                DispatchDecision(
+                    task_id=task.id,
+                    project=task.project,
+                    priority=task.priority,
+                    reason=DEFER_TAIL_RISK,
+                    blocked_scenario_id=blocking_scenario.id,
+                )
+            )
+            continue
+
         candidates, empty_reason = _eligible_executors(task, executor_by_id)
         if empty_reason is not None:
             decisions.append(
@@ -229,6 +271,7 @@ def plan_dispatch(
         daily_spend_usd=daily_spend_usd,
         max_daily_spend_usd=max_daily_spend_usd,
         projected_spend_usd=projected,
+        spend_measurement=SPEND_MEASUREMENT_ACTUAL,
     )
 
 

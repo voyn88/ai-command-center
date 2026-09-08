@@ -47,6 +47,17 @@ class PlanLimits:
     #: RESUME). Bounded so a large parked backlog drains gradually across
     #: ticks instead of flooding OPEN in one; 0 disables the reconcile.
     max_resumes_per_tick: int = 10
+    #: The planner's dispatch-only backpressure fence: once this many
+    #: READY_TO_REVIEW tasks are carrying `pr` evidence, this tick dispatches
+    #: nothing new, so implementation supply stops outrunning review/merge
+    #: capacity. Scoped to dispatch alone -- see `Planner.plan_once`'s
+    #: comment at the fence check for why ingest and the DEFER_TO_USER
+    #: resume reconcile above run unconditionally regardless of this fence.
+    #: 0 disables the fence, matching `max_resumes_per_tick`'s convention
+    #: in this same class (not a threshold of 1: an operator following that
+    #: sibling field's convention would otherwise get a silently different
+    #: meaning for the same sentinel value on this field).
+    review_backlog_limit: int = 20
 
 
 @dataclass(slots=True)
@@ -60,6 +71,10 @@ class PlanReport:
     #: gate returned to OPEN this tick (VOYN-W0-AICC-DEFER-AUTO-RESUME).
     resumed: list[tuple[str, str]] = field(default_factory=list)
     planner_busy: bool = False
+    #: The review backlog count that tripped `PlanLimits.review_backlog_
+    #: limit` this tick (None when the fence never fired). Ingest and the
+    #: DEFER_TO_USER resume reconcile still ran -- only dispatch paused.
+    review_window_full: int | None = None
 
 
 # Repo → (canonical project_id, worker-host repository path). The worker's
@@ -217,10 +232,20 @@ class Planner:
                     "                        'dispatch', 'return_to_pool',"
                     "                        'resume_deferred')"
                     "       AND e2.event_id > park.event_id) "
+                    # The anti-ping-pong bound is a sliding WINDOW, not a
+                    # lifetime score: three granted resumes within the
+                    # trailing 48h say "this park re-arms itself faster than
+                    # automation can help — a human should look". A lifetime
+                    # count buried tasks forever: parks from the dead-codex
+                    # era (2026-09) exhausted their 3 and stayed DEFER even
+                    # after the pipeline that parked them was fixed
+                    # (VOYN-W0-AICC-DEFER-AUTO-RESUME-REM).
                     "  AND (SELECT count(*) FROM backlog_event e"
                     "        WHERE e.task_id = t.task_id"
                     "          AND e.event = 'resume_deferred'"
-                    "          AND e.outcome = 'granted') < 3 "
+                    "          AND e.outcome = 'granted'"
+                    "          AND e.created_at > now() - interval '48 hours'"
+                    "       ) < 3 "
                     "ORDER BY t.priority NULLS LAST, t.wave, t.task_id "
                     "LIMIT %s",
                     (limits.max_resumes_per_tick,),
@@ -231,6 +256,29 @@ class Planner:
                     )
                     if ok:
                         report.resumed.append((task_id, park_reason))
+
+            # The review-backlog fence is DISPATCH-only backpressure: it
+            # must never short-circuit anything above it in the tick. An
+            # earlier version of this fence was a blanket `return report`
+            # placed before the DEFER_TO_USER reconcile above, which meant a
+            # full review backlog also silently froze parked-task recovery
+            # for as long as PRs sat unreviewed -- a control whose blast
+            # radius (the whole rest of the tick) was wider than its stated
+            # purpose (gate new dispatch). Ingest and the resume reconcile
+            # both run unconditionally above; only the candidate/dispatch
+            # loop below is skipped when the fence fires.
+            if limits.review_backlog_limit > 0:
+                (review_backlog,) = self._row(
+                    "SELECT count(DISTINCT t.task_id) FROM backlog_task t "
+                    "JOIN backlog_evidence e "
+                    "  ON e.task_id = t.task_id AND e.kind = 'pr' "
+                    "WHERE t.status = 'READY_TO_REVIEW'",
+                    (),
+                )
+                review_backlog = int(review_backlog)
+                if review_backlog >= limits.review_backlog_limit:
+                    report.review_window_full = review_backlog
+                    return report
 
             candidates = self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable "
