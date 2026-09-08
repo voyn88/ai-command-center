@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import os
 import socket
-import sys
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -18,6 +17,7 @@ import pytest
 
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
+from command_center.worker import worktree_lease
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
 
@@ -1216,25 +1216,31 @@ def test_no_configured_authority_leaves_the_gate_inert(handler, tmp_path) -> Non
     assert outcome.ok and len(runs) == 1
 
 
-def _own_start(pid: int) -> str:
-    """The identity token the lease authority stores for a pid, read the same
-    way the gate reads it -- past the last ``)``, because ``comm`` is
-    parenthesised and may contain spaces."""
-    stat = Path(f"/proc/{pid}/stat").read_text()
-    return stat[stat.rindex(")") + 2 :].split()[19]
+def _stub_stat_reader(chain: dict[int, tuple[int, str]]):
+    """A fake ``worktree_lease._stat_reader`` for a known pid -> (ppid, start)
+    chain.
+
+    ``worktree_lease``'s ancestry walk reads real process identity through
+    that one seam (see its docstring), which lets these tests exercise the
+    ancestor-matching logic on a deterministic, made-up chain instead of
+    depending on a real ``/proc`` filesystem -- something not every platform
+    that runs this suite has.
+    """
+
+    def reader(pid: int) -> list[str] | None:
+        entry = chain.get(pid)
+        if entry is None:
+            return None
+        ppid, start = entry
+        # Field layout only matters at the two indices worktree_lease reads:
+        # ppid at 1, start token at 19. The rest is filler.
+        return ["S", str(ppid)] + ["0"] * 17 + [start]
+
+    return reader
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="reads /proc/<pid>/stat directly, the same seamless-fallback shape "
-    "worktree_lease._process_start itself uses in production (fails soft to "
-    "None off Linux, never crashes there) -- but this test's own fixture "
-    "helper, _own_start, has no such fallback, so it must skip rather than "
-    "fail where /proc does not exist. Linux CI (the real deployment target) "
-    "keeps full coverage; see VOYN-W0-AICC-LEASE-TEST-PROC-MACOS-SKIP.",
-)
 def test_a_lease_held_by_our_own_supervisor_does_not_block(
-    handler, lease_tool, tmp_path
+    handler, lease_tool, monkeypatch, tmp_path
 ) -> None:
     """The process that launched us owning the tree is the normal shape.
 
@@ -1245,9 +1251,16 @@ def test_a_lease_held_by_our_own_supervisor_does_not_block(
     """
     run_agent, runs = handler
     pid = os.getpid()
+    monkeypatch.setattr(
+        worktree_lease,
+        "_stat_reader",
+        _stub_stat_reader({pid: (0, "fake-start-token")}),
+    )
     lease_tool(
         _lease_row(
-            isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)
+            isolated_path(tmp_path),
+            process_pid=pid,
+            process_start="fake-start-token",
         )
     )
     outcome = run_agent(_payload(task_type="implementation"), _event())
