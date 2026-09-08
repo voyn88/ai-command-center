@@ -11,7 +11,7 @@ secret_manifest=/etc/aicc/publisher-secret-paths
 lane_registry=/etc/aicc/worker-lanes
 worker_template=/etc/systemd/system/voyn-aicc-worker@.service
 worker_dropin=/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
-principal_inaccessible_paths="/etc/aicc /etc/voyn /home /root /var/lib/aicc-worker /var/lib/aicc-agent /var/lib/voyn-aicc-credential-rotation /run/aicc-agent-launcher /run/aicc-agent-workspace-binds /run/credentials /run/voyn-aicc-worker /srv/aicc-quarantine"
+principal_inaccessible_paths="/etc/aicc /etc/voyn /home /root /var/lib/aicc-worker /var/lib/aicc-agent /var/lib/voyn-aicc-credential-rotation /run/aicc-agent-launcher /run/aicc-agent-workspace-binds /run/credentials /run/voyn-aicc-worker /run/aicc-worker-lanes /srv/aicc-quarantine"
 
 fail() {
   echo "AICC_AGENT_PRINCIPAL_BOUNDARY_FAIL: $*" >&2

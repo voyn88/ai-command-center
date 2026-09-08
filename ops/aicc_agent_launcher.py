@@ -161,6 +161,7 @@ SENSITIVE_AUTHORITY_TREES = (
     "/run/aicc-agent-workspace-binds",
     "/run/credentials",
     "/run/voyn-aicc-worker",
+    "/run/aicc-worker-lanes",
     "/srv/aicc-quarantine",
 )
 SYSTEMD_RUN_ENVIRONMENT = {
