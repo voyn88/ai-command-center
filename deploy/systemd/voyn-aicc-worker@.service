@@ -19,9 +19,16 @@ LoadCredential=voyn_lease_pgpass:/etc/voyn/secrets/voyn_lease_pgpass
 # All lane credentials live below one stable tree.  This is both scalable for
 # arbitrary lane counts and lets transient agents mask the authority root once
 # instead of maintaining an unsafe per-lane path list.
-RuntimeDirectory=voyn-aicc-worker/%i
+# `aicc-worker-lanes`, not the legacy `voyn-aicc-worker`: the staged rollout
+# keeps legacy lanes (User=voynadmin, legacy runtime root voyn-aicc-worker)
+# running while the first isolated lane starts, and the legacy unit owns
+# that root 0750 voynadmin, so an aicc-worker lane nested under it
+# died at ExecStartPre with "cannot stat ... Permission denied" (worker-01,
+# 2026-09-08). A distinct runtime root is created by systemd for this unit's
+# own principal and never collides with a lane of the other generation.
+RuntimeDirectory=aicc-worker-lanes/%i
 RuntimeDirectoryMode=0750
-Environment=PGPASSFILE=/run/voyn-aicc-worker/%i/pgpass
+Environment=PGPASSFILE=/run/aicc-worker-lanes/%i/pgpass
 Environment=AICC_WORKER_ENV_FILE=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=/etc/aicc/lease.env
 EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env
@@ -31,7 +38,7 @@ UnsetEnvironment=ANTHROPIC_API_KEY
 # ADR-0010 invariant: the worker neither receives sudo nor selects a
 # privileged command (review finding on 6218a21).
 NoNewPrivileges=yes
-ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/voyn-aicc-worker/%i/pgpass
+ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/aicc-worker-lanes/%i/pgpass
 # This final argv assignment cannot be overridden by EnvironmentFile values.
 ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.worker
 ExecReload=/bin/kill -HUP $MAINPID
