@@ -8,6 +8,22 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Documented — Local-model backlog triage calibration (`VOYN-W0-AICC-OLLAMA-TRIAGE-CALIBRATION`)
+- [`docs/operations/OLLAMA_TRIAGE_CALIBRATION.md`](docs/operations/OLLAMA_TRIAGE_CALIBRATION.md) —
+  two calibration attempts of a local Ollama model (`qwen2.5:7b-instruct`,
+  then `qwen2.5-coder:14b`) against the `backlog_triage()` `accept`/`refine`/
+  `done` decision (`command_center/db/sql/0008_backlog_triage.up.sql`), both
+  short of the owner's 90%-holdout promotion bar (64% and 41%). Records why
+  (truncated context on attempt 1; an unstable `accept`/`refine` ground
+  truth on attempt 2), why `done` should stay off the LLM path entirely
+  (already deterministic, and independently gated by the seam's own
+  pr+sha evidence requirement), and the resulting gate: no caller wires a
+  model verdict into `backlog_triage()` until a future attempt clears the
+  bar against an objectively checkable class (recommended: `bge-m3`
+  near-duplicate detection, not the semantically fuzzy accept/refine split).
+  `backlog_triage()` remains uncalled from application code, so nothing live
+  changes — this is a promotion gate for future wiring, not a rollback.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,
