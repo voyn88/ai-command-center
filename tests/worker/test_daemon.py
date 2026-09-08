@@ -60,6 +60,10 @@ class ScriptedStore:
         self.calls.append(("fail", work.attempt_id, reason, retryable))
         return True
 
+    def fail_lease_wait(self, work, *, reason):
+        self.calls.append(("fail_lease_wait", work.attempt_id, reason))
+        return True
+
 
 def _run_until_idle(daemon: WorkerDaemon, store: ScriptedStore) -> None:
     """Run the loop until the script is exhausted, then stop it via the
@@ -96,6 +100,30 @@ def test_a_failing_handler_reports_fail_not_complete() -> None:
 
     assert ("fail", "wat-1", "did not work", True) in store.calls
     assert not any(c[0] == "complete" for c in store.calls)
+
+
+def test_a_lease_wait_failure_routes_to_the_lease_wait_store_method() -> None:
+    """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a publish that
+    lost the writer-lease race to a sibling lane names no fault in this
+    item's own work. Reporting it through the ordinary `fail(retryable=True)`
+    path would still count it against `max_attempts` (the queue already
+    advanced `attempt_count` at claim), which is exactly what dead-lettered
+    finished work live on 2026-09-06. `lease_wait=True` must route to the
+    store's separate refund-and-bound path instead."""
+    store = ScriptedStore([_work({"kind": "publish"})])
+
+    def contended(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="publish failed: lease_unavailable: held by x", lease_wait=True
+        )
+
+    daemon = WorkerDaemon(store, {"publish": contended}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert ("fail_lease_wait", "wat-1", "publish failed: lease_unavailable: held by x") in (
+        store.calls
+    )
+    assert not any(c[0] == "fail" for c in store.calls)
 
 
 def test_a_raising_handler_is_a_retryable_failure() -> None:

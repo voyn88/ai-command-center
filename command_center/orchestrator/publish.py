@@ -564,9 +564,15 @@ def publish_run(
     if lease.returncode != 0:
         # The lease is held by another writer: a data refusal, the attempt
         # returns to the pool and a later tick retries — never a forced push.
-        return PublishResult(
-            ok=False, reason=f"lease_unavailable: {lease.stderr.strip()[:120]}"
-        )
+        #
+        # Live 2026-09-06 (wki_55f316db): the refusal reached the caller with
+        # an EMPTY detail because `voyn-lease acquire` wrote the holder onto
+        # stdout, not stderr, for this refusal shape -- `stderr.strip()` was
+        # silently "". `writer_lease._acquire_and_provision_hooks` already
+        # falls back to stdout for exactly this reason; mirrored here so the
+        # refusal always names the holder when the tool reports one.
+        detail = (lease.stderr or lease.stdout).strip()[:120]
+        return PublishResult(ok=False, reason=f"lease_unavailable: {detail}")
     # Live-reproduced 2026-08-21: `install-hooks` is what writes the
     # pre-push hook's `voyn-lease.env` (repository/owner/session/task/pid/
     # process-start) -- and it had only ever been run once, at whatever

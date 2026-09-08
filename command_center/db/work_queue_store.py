@@ -132,6 +132,22 @@ class WorkQueueStore:
         )
         return bool(row["ok"])
 
+    def fail_lease_wait(
+        self, work: ClaimedWork, *, reason: str, max_lease_waits: int = 20
+    ) -> bool:
+        """Report a failure that names no fault in the work itself -- a
+        writer-lease race lost to a sibling lane
+        (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT). Unlike
+        ``fail``, this refunds the attempt ``queue_claim`` already spent for
+        this delivery and bounds retries against a separate lease-wait
+        budget instead of ``max_attempts``.
+        """
+        row = self._call(
+            "SELECT * FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+            (work.attempt_id, work.claim_token, reason, max_lease_waits),
+        )
+        return bool(row["ok"])
+
     # -- enqueue (control plane, app role) ------------------------------------
 
     def enqueue(
