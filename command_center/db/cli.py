@@ -14,9 +14,16 @@ every deploy as the migrator. The application credential does neither.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
+import os
+import platform
+import secrets
+import socket
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
 
 from command_center.db import migrations, pool, roles
@@ -51,6 +58,14 @@ def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
         )
 
     return _enqueue
+
+
+def _read_machine_id() -> str:
+    """Best-effort local machine identifier for an enrolment descriptor."""
+    try:
+        return Path("/etc/machine-id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return platform.node()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -187,6 +202,58 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="confirmed",
         help="Required acknowledgement that a downgrade is destructive.",
+    )
+
+    # Zero-touch onboarding (VOYN-MIN-UNBOXING): a printed code stands in for
+    # manual per-host configuration. `enroll-mint` is the operator/control-
+    # plane act that prints the code; `enroll-redeem` is the (also operator/
+    # control-plane) act that turns a presented code into the new host's
+    # database credential -- never the enrolling host itself, which by
+    # protocol design (0003_worker_enrollment) has no credential to call with.
+    mint = sub.add_parser(
+        "enroll-mint",
+        help="Mint a one-time enrolment code for a new or re-enrolling host "
+        "and print it exactly once.",
+    )
+    mint.add_argument("principal_id", help="Intended principal id, e.g. worker:srv-a")
+    mint.add_argument("host", help="Intended hostname/address for the principal")
+    mint.add_argument("--cidr", default=None, help="Expected source CIDR, if any")
+    mint.add_argument(
+        "--ttl",
+        default=None,
+        help="Requested ticket lifetime, e.g. '5 minutes' (the server clamps "
+        "to a 10-minute default and a 15-minute ceiling regardless).",
+    )
+    mint.add_argument(
+        "--purpose",
+        default="enroll",
+        choices=("enroll", "re_enroll"),
+        help="'re_enroll' readmits a suspended/retired principal "
+        "(requires the operator role; the control plane cannot).",
+    )
+
+    redeem = sub.add_parser(
+        "enroll-redeem",
+        help="Redeem a printed enrolment code and produce the device's "
+        "PostgreSQL credential. Run this as the operator/control plane, "
+        "never on the enrolling host.",
+    )
+    redeem.add_argument(
+        "ticket",
+        nargs="?",
+        default=None,
+        help="The printed one-time code; omitted means read one line from stdin.",
+    )
+    redeem.add_argument("--machine-id", default=None, help="Defaults to /etc/machine-id")
+    redeem.add_argument("--os", default=None, help="Defaults to the local platform")
+    redeem.add_argument("--arch", default=None, help="Defaults to the local platform")
+    redeem.add_argument("--hostname", default=None, help="Defaults to the local hostname")
+    redeem.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Write the resulting EnvironmentFile here, mode 0600 "
+        "(e.g. /etc/aicc/worker.env); default prints it to stdout.",
     )
     return parser
 
@@ -449,6 +516,87 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "enroll-mint":
+                ticket_secret = secrets.token_hex(32)
+                ticket_hash = hashlib.sha256(
+                    ticket_secret.encode("utf-8")
+                ).hexdigest()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT * FROM enroll_mint_ticket(%s, %s, %s, %s, %s, %s)",
+                        (
+                            args.principal_id,
+                            args.host,
+                            ticket_hash,
+                            args.cidr,
+                            args.ttl,
+                            args.purpose,
+                        ),
+                    )
+                    ticket_id, refused = cur.fetchone()
+                if refused:
+                    print(f"refused: {refused}", file=sys.stderr)
+                    return 1
+                print(f"ticket:  {ticket_id}")
+                print("code (shown once -- hand it to the device, then discard it):")
+                print(ticket_secret)
+                return 0
+
+            if args.command == "enroll-redeem":
+                from command_center.ops.credential_rotation import scram_verifier
+
+                ticket_secret = args.ticket
+                if ticket_secret is None:
+                    ticket_secret = sys.stdin.readline().strip()
+                if not ticket_secret:
+                    print(
+                        "no code given (pass it as an argument or on stdin)",
+                        file=sys.stderr,
+                    )
+                    return 2
+                descriptor = {
+                    "machine_id": args.machine_id or _read_machine_id(),
+                    "os": args.os or platform.system().lower(),
+                    "arch": args.arch or platform.machine(),
+                    "hostname": args.hostname or socket.gethostname(),
+                }
+                host_secret = secrets.token_hex(32)
+                secret_hash = hashlib.sha256(
+                    host_secret.encode("utf-8")
+                ).hexdigest()
+                verifier = scram_verifier(host_secret)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT * FROM enroll_redeem_ticket(%s, %s, %s, %s::jsonb)",
+                        (ticket_secret, secret_hash, verifier, json.dumps(descriptor)),
+                    )
+                    (
+                        principal_id,
+                        db_role,
+                        credential_id,
+                        expires_at,
+                        refused,
+                    ) = cur.fetchone()
+                if refused:
+                    print(f"refused: {refused}", file=sys.stderr)
+                    return 1
+                rendered = (
+                    f"AICC_PG_USER={db_role}\nAICC_PG_PASSWORD={host_secret}\n"
+                )
+                if args.out:
+                    args.out.parent.mkdir(parents=True, exist_ok=True)
+                    args.out.write_text(rendered, encoding="utf-8")
+                    os.chmod(args.out, 0o600)
+                    print(f"credential written: {args.out}", file=sys.stderr)
+                else:
+                    print(rendered, end="")
+                print(
+                    f"principal={principal_id} role={db_role} "
+                    f"credential={credential_id} expires={expires_at.isoformat()}",
+                    file=sys.stderr,
+                )
+                return 0
 
             if args.command == "downgrade":
                 if not args.confirmed:
