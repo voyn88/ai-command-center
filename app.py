@@ -33,6 +33,7 @@ from command_center.runtime import db as runtime_db
 from command_center.runtime import runs_read, scheduler, session_view
 from command_center.ui import (
     agent_launcher,
+    agent_metrics_panel,
     alert_panel,
     aml_panel,
     case_panel,
@@ -218,6 +219,7 @@ NAV: dict[str, tuple[str, str]] = {
     "focus": ("Focus Mode", ":material/center_focus_strong:"),
     "portfolio": ("Портфель", ":material/inventory_2:"),
     "portfolio_overview": ("Portfolio Overview", ":material/hub:"),
+    "agent_metrics": ("Метрики агентов", ":material/monitoring:"),
 }
 
 
@@ -3330,3 +3332,11 @@ elif page_key == "portfolio_overview":
         "Обзор портфеля объединён со страницей «Портфель»; этот адрес сохранён для старых закладок."
     )
     portfolio_overview_panel.render_portfolio_overview_panel(root=ROOT)
+
+
+# --------------------------------------------------------------------------
+# Agent Metrics
+# --------------------------------------------------------------------------
+
+elif page_key == "agent_metrics":
+    agent_metrics_panel.render_agent_metrics_panel(get_execution_center_api(), root=ROOT)

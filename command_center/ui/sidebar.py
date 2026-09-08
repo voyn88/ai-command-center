@@ -31,7 +31,7 @@ NAV_GROUPS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
     # sidebar entries — they live inside the project view (task 02661825).
     ("Основное", ("dashboard", "command", "kanban", "task_deps", "execution_center", "projects", "git_center"), True),
     ("Планирование", ("waves", "create"), False),
-    ("Аналитика", ("runs", "agents", "portfolio"), False),
+    ("Аналитика", ("runs", "agents", "portfolio", "agent_metrics"), False),
 )
 
 # Pages whose handler is kept (for delegation / an existing deep link) but which

@@ -8,6 +8,20 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — unified agent metrics dashboard (`VOYN-AGT-METRICS`)
+
+- `command_center/agent_metrics.py` — a Streamlit-free projection that reduces
+  `runs_read.list_unified_runs` rows plus the `completion` and
+  `provider_attempt` tables into one normalized `[0, 1]` schema per agent:
+  quality, speed, cost (attempts-per-run proxy — no dollar/token cost is
+  tracked anywhere yet), rollback rate (`completion.recovery_count`) and
+  manual rework rate (`completion.requires_human`). A dimension is `None`
+  when its inputs are entirely absent for that agent, never a guessed 0.
+- `command_center/ui/agent_metrics_panel.py` + the new `agent_metrics` nav
+  page (in the "Аналитика" sidebar group) — the single `agent_metrics`
+  dashboard the acceptance criteria calls for, rendering every agent's
+  normalized scores side by side.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
