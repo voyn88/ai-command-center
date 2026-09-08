@@ -108,6 +108,49 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+@Test func impactStoryDecodesTimelineChainAndRiskFromFixture() throws {
+    let snapshot = try Fixture.healthySnapshot()
+    let withStory = try #require(snapshot.tasks.first { $0.id == "VOYN-EXAMPLE-002" })
+    let story = try #require(withStory.story)
+    #expect(story.timeline.count == 3)
+    #expect(story.causeChain.count == 2)
+    #expect(story.risk == .medium)
+    #expect(snapshot.tasks.first { $0.id == "VOYN-EXAMPLE-001" }?.story == nil)
+}
+
+@Test func impactStoryNarrativeOrdersTimelineBeforeCauseChain() {
+    let story = ImpactStory(
+        timeline: [
+            ImpactTimelineStep(id: "b", occurredAt: Date(timeIntervalSince1970: 200), headline: "Second"),
+            ImpactTimelineStep(id: "a", occurredAt: Date(timeIntervalSince1970: 100), headline: "First")
+        ],
+        causeChain: [ImpactCauseLink(cause: "X failed", effect: "Y is blocked")],
+        risk: .high,
+        riskExplanation: "Customers may notice a delay."
+    )
+    #expect(story.narrative == ["First", "Second", "Because X failed, Y is blocked."])
+}
+
+@Test func impactRiskLevelOrdersFromLowToCritical() {
+    #expect(ImpactRiskLevel.low < .medium)
+    #expect(ImpactRiskLevel.medium < .high)
+    #expect(ImpactRiskLevel.high < .critical)
+}
+
+@Test func taskToleratesMissingOrMalformedStoryWithoutFailing() throws {
+    let missing = Data("""
+    {"id":"X","title":"T","blocker":null,"evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
+    """.utf8)
+    let taskWithoutStory = try JSONDecoder().decode(AICCNativeCore.Task.self, from: missing)
+    #expect(taskWithoutStory.story == nil)
+
+    let malformed = Data("""
+    {"id":"X","title":"T","blocker":null,"evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null},"story":{"risk":"unheard-of"}}
+    """.utf8)
+    let taskWithBadStory = try JSONDecoder().decode(AICCNativeCore.Task.self, from: malformed)
+    #expect(taskWithBadStory.story == nil)
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
