@@ -28,6 +28,7 @@ from command_center import (
     task_import,
     task_pipeline,
     task_view,
+    tournament_store,
 )
 from command_center.runtime import api as runtime_api
 from command_center.runtime import db as runtime_db
@@ -66,6 +67,7 @@ from command_center.ui import (
     task_cards,
     task_dependencies,
     tokens,
+    tournament_panel,
 )
 
 ROOT = Path(__file__).resolve().parent
@@ -1154,6 +1156,8 @@ def render_home_dashboard(
             )
             st.caption(truth.run_window_label)
         home_dashboard.card_close()
+
+        tournament_panel.render(tournament_store.ensure_current_month_published(root=ROOT))
 
     with side:
         settings = task_pipeline.pipeline_settings.load_settings(ROOT)
