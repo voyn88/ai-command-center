@@ -276,8 +276,10 @@ _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
 
 # The structured backlog store (0005, BO-S1), the queue-claim idiom again:
 # the control plane READS; every write travels through a SECURITY DEFINER
-# function so that it audits and the status machine cannot be bypassed —
-# there is no SQL path that performs OPEN -> DONE. Workers get nothing: an
+# function so that it audits and the status machine cannot be bypassed — the
+# one narrow OPEN -> DONE door is `backlog_close_superseded` (0019), gated on
+# naming the already-landed commit and source task that satisfy this task's
+# acceptance criteria, not a blanket bypass. Workers get nothing: an
 # execution host has no business reading the programme's plan, and a
 # compromised one must not learn it.
 #
@@ -561,6 +563,11 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # The pre-dispatch reuse gate (0019): OPEN -> DONE for a REM/retry task
+    # whose acceptance criteria are already satisfied by a named source
+    # task's commit already on the target branch, closed instead of
+    # dispatched into a duplicate implementation.
+    "backlog_close_superseded(text, text, text, text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
