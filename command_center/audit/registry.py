@@ -16,6 +16,7 @@ from command_center.audit.checks.base import Check
 from command_center.audit.checks.code_quality import CodeQualityCheck
 from command_center.audit.checks.coverage import CoverageCheck
 from command_center.audit.checks.deps import DepsCheck
+from command_center.audit.checks.gaming import GamingDetectionCheck
 from command_center.audit.checks.lint import LintCheck
 from command_center.audit.checks.security import SecurityCheck
 
@@ -73,4 +74,5 @@ def default_registry() -> CheckRegistry:
     registry.register(CodeQualityCheck.name, CodeQualityCheck)
     registry.register(DepsCheck.name, DepsCheck)
     registry.register(CoverageCheck.name, CoverageCheck)
+    registry.register(GamingDetectionCheck.name, GamingDetectionCheck)
     return registry
