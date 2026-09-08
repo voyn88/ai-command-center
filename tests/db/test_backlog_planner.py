@@ -99,7 +99,7 @@ def _test_repo_routes(monkeypatch, request):
     out by overriding the variable themselves."""
     import json
 
-    repos = ["repo-d2","repo-ga","repo-gb","repo-gc","repo-in","repo-nm",
+    repos = ["repo-d2","repo-pipe","repo-ga","repo-gb","repo-gc","repo-in","repo-nm",
              "repo-one","repo-p1","repo-p3","repo-pk","repo-shared","repo-tt"]
     monkeypatch.setenv(
         "AICC_PLANNER_REPO_ROUTES",
@@ -865,11 +865,20 @@ def test_review_backlog_fence_pauses_dispatch_but_not_resume_reconcile(rig) -> N
     )
     _park_technically(app_factory, store, worker, "VOYN-W0-BL3")
     assert store.upsert_task(_task("VOYN-W0-BL4", repo="repo-d2"))[0]  # OPEN
+    # A lane is busy, so the fence is real backpressure here (with every lane
+    # idle the tick would dispatch anyway -- see
+    # test_idle_lanes_dispatch_through_the_review_backlog_fence).
+    assert store.upsert_task(_task("VOYN-W0-TT", repo="repo-tt"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-TT")[0]
 
     report = plan_once(app_factory, PlanLimits(wip_limit=4, review_backlog_limit=2))
 
     assert report.review_window_full == 2
+    assert report.idle_trickle is False
     assert report.dispatched == []
+    # BL4, plus BL3 once the resume reconcile above returned it to OPEN in
+    # this same tick: both are functional candidates the fence held.
+    assert report.fenced >= 1
     assert "VOYN-W0-BL3" in [task_id for task_id, _reason in report.resumed]
     assert store.get_task("VOYN-W0-BL3")["status"] in ("OPEN", "IN_PROGRESS")
     # The candidate loop never ran at all -- the OPEN task the fence was
@@ -1076,3 +1085,242 @@ def test_recover_stuck_ready_to_review_refuses_everything_else(rig) -> None:
     assert store.recover_stuck_ready_to_review("VOYN-W0-NOPE")[:2] == (
         False, "unknown_task",
     )
+
+
+def _mark_ready_to_review_with_pr(app_factory, task_id: str) -> None:
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM backlog_record_evidence(%s, 'pr', %s)",
+            (task_id, f"https://github.com/voyn88/x/pull/{secrets.randbelow(10**6)}"),
+        )
+
+
+def test_pipeline_class_tasks_pass_the_review_backlog_fence(rig, admin_conn) -> None:
+    """VOYN-W0-AICC-PLANNER-PIPELINE-CLASS-PRIORITY-AND-WINDOW-PAUSE: with the
+    review backlog at the limit and a lane busy, a functional candidate is
+    held (backpressure) while a pipeline-class candidate is dispatched --
+    the fix for the backlog must never wait behind the backlog."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RV", status="READY_TO_REVIEW", repo="repo-rv"))[0]
+    _mark_ready_to_review_with_pr(app_factory, "VOYN-W0-RV")
+    assert store.upsert_task(_task("VOYN-W0-TT", repo="repo-tt"))[0]  # keeps a lane busy
+    assert _dispatch(app_factory, "VOYN-W0-TT")[0]
+    assert store.upsert_task(_task("VOYN-W0-P1", repo="repo-p1"))[0]  # functional
+    assert store.upsert_task(_task("VOYN-W0-P3", repo="repo-p3"))[0]  # pipeline
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_task SET task_class = 'pipeline' WHERE task_id = %s",
+            ("VOYN-W0-P3",),
+        )
+        admin_conn.commit()
+        cur.execute("SELECT task_id FROM backlog_eligible")
+        order = [row[0] for row in cur.fetchall()]
+    assert order.index("VOYN-W0-P3") < order.index("VOYN-W0-P1"), (
+        "same wave and priority: the pipeline task is offered first"
+    )
+
+    limits = PlanLimits(planner="planner-fence", review_backlog_limit=1)
+    report = plan_once(app_factory, limits)
+    assert report.review_window_full == 1
+    assert report.idle_trickle is False
+    assert [t for t, _ in report.dispatched] == ["VOYN-W0-P3"]
+    assert report.pipeline_bypass == ["VOYN-W0-P3"]
+    assert report.fenced == 1
+
+
+def test_idle_lanes_dispatch_through_the_review_backlog_fence(rig) -> None:
+    """The fence is backpressure for busy lanes, not a reason to idle the
+    fleet: with no execution work item ready or claimed, the tick dispatches
+    its ordinary bounded batch even though the backlog is at the limit."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RV", status="READY_TO_REVIEW", repo="repo-rv"))[0]
+    _mark_ready_to_review_with_pr(app_factory, "VOYN-W0-RV")
+    assert store.upsert_task(_task("VOYN-W0-P1", repo="repo-p1"))[0]
+
+    limits = PlanLimits(planner="planner-idle", review_backlog_limit=1)
+    report = plan_once(app_factory, limits)
+    assert report.review_window_full == 1
+    assert report.idle_trickle is True
+    assert [t for t, _ in report.dispatched] == ["VOYN-W0-P1"]
+    assert report.fenced == 0
+
+
+def _set_pipeline(app_factory, task_id: str) -> None:
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT backlog_set_task_class(%s, 'pipeline')", (task_id,))
+
+
+def _return_non_technical(app_factory, task_id: str) -> str:
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason FROM backlog_return_to_pool(%s, %s)",
+                (task_id, "cascade_exhausted: agent gave up (too large)"),
+            )
+            return cur.fetchone()[0]
+
+
+def test_pipeline_task_returned_twice_is_split_not_parked(rig) -> None:
+    """0021: a pipeline-class task returned twice without a technical cause
+    stays OPEN with split_requested (the planner then dispatches a
+    decomposition run); the fourth return still parks. A functional task
+    keeps the original second-return park."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-PIPE", repo="repo-pipe"))[0]
+    _set_pipeline(app_factory, "VOYN-W0-PIPE")
+    assert _dispatch(app_factory, "VOYN-W0-PIPE")[0]
+    assert _return_non_technical(app_factory, "VOYN-W0-PIPE") == "OPEN"
+    assert _dispatch(app_factory, "VOYN-W0-PIPE")[0]
+    assert _return_non_technical(app_factory, "VOYN-W0-PIPE") == "OPEN"
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT (detail->>'split_requested')::boolean FROM backlog_event "
+                "WHERE task_id = %s AND event = 'return_to_pool' AND outcome = 'granted' "
+                "ORDER BY event_id DESC LIMIT 1",
+                ("VOYN-W0-PIPE",),
+            )
+            assert cur.fetchone()[0] is True
+    from command_center.orchestrator.planner import Planner, _split_requested
+
+    assert _split_requested(Planner(app_factory)._rows, "VOYN-W0-PIPE") is True
+    # The PLANNER's next dispatch of this task is a decomposition run: the
+    # payload carries the split instructions and the SPLIT_TASKS_JSON
+    # trailer contract, not an ordinary implementation prompt (review of
+    # fc167cf7: the earlier assertion only checked the flag, so a planner
+    # that ignored it during planning still passed).
+    from command_center.orchestrator.planner import _SPLIT_INSTRUCTIONS, PlanLimits
+
+    plan = Planner(app_factory).plan_once(PlanLimits(planner="planner-t"))
+    assert "VOYN-W0-PIPE" in plan.split_dispatched, plan
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT payload FROM work_item WHERE task_id = %s ORDER BY created_at DESC LIMIT 1",
+            ("VOYN-W0-PIPE",),
+        )
+        payload = cur.fetchone()[0]
+    assert "SPLIT_TASKS_JSON" in payload["prompt"]
+    assert _SPLIT_INSTRUCTIONS.strip()[:40] in payload["prompt"]
+    # Third and fourth returns: still open once more, then parked.
+    assert _return_non_technical(app_factory, "VOYN-W0-PIPE") == "OPEN"
+    assert _dispatch(app_factory, "VOYN-W0-PIPE")[0]
+    assert _return_non_technical(app_factory, "VOYN-W0-PIPE") == "DEFER_TO_USER"
+    # Functional control: second return parks as before.
+    assert store.upsert_task(_task("VOYN-W0-FUNC", repo="repo-func"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-FUNC")[0]
+    assert _return_non_technical(app_factory, "VOYN-W0-FUNC") == "OPEN"
+    assert _dispatch(app_factory, "VOYN-W0-FUNC")[0]
+    assert _return_non_technical(app_factory, "VOYN-W0-FUNC") == "DEFER_TO_USER"
+
+
+def test_split_trailer_creates_bounded_children_and_closes_the_parent(rig) -> None:
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-BIG", repo="repo-big", priority="P1"))[0]
+    _set_pipeline(app_factory, "VOYN-W0-BIG")
+    assert _dispatch(app_factory, "VOYN-W0-BIG")[0]
+    trailer = (
+        "I decomposed the task.\n"
+        'SPLIT_TASKS_JSON: [{"suffix": "s1-gate", "title": "Gate the CI workflows", '
+        '"body": "Add the job-level guard and the concurrency suffix; tests in policy file."}, '
+        '{"suffix": "S2-RECONCILER", "title": "Order accepted PRs first", '
+        '"body": "Accepted-but-unmerged PRs enter the window first; unit tests.", "priority": "P0"}]'
+    )
+    _complete_latest(
+        app_factory, worker, "VOYN-W0-BIG",
+        {"status": "completed", "result_text": trailer},
+    )
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            rows = cur.fetchall()
+    assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-BIG", "split")]
+    assert store.get_task("VOYN-W0-BIG")["status"] == "SPLIT"
+    c1 = store.get_task("VOYN-W0-BIG-S1-GATE")
+    c2 = store.get_task("VOYN-W0-BIG-S2-RECONCILER")
+    assert c1["status"] == "OPEN" and c1["priority"] == "P1" and c1["repo"] == "repo-big"
+    assert c2["priority"] == "P0"
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT depends_on_task_id FROM backlog_dependency WHERE task_id = %s ORDER BY 1",
+                ("VOYN-W0-BIG",),
+            )
+            assert [r[0] for r in cur.fetchall()] == [
+                "VOYN-W0-BIG-S1-GATE", "VOYN-W0-BIG-S2-RECONCILER"
+            ]
+            cur.execute(
+                "SELECT task_class FROM backlog_task WHERE task_id = %s", ("VOYN-W0-BIG-S1-GATE",)
+            )
+            assert cur.fetchone()[0] == "pipeline"
+            # Children are eligible; the parent is not (SPLIT).
+            cur.execute("SELECT task_id FROM backlog_eligible WHERE task_id LIKE 'VOYN-W0-BIG%'")
+            assert sorted(r[0] for r in cur.fetchall()) == [
+                "VOYN-W0-BIG-S1-GATE", "VOYN-W0-BIG-S2-RECONCILER"
+            ]
+
+
+def test_malformed_split_trailer_creates_nothing_and_returns_to_pool(rig) -> None:
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-BAD", repo="repo-bad"))[0]
+    _set_pipeline(app_factory, "VOYN-W0-BAD")
+    assert _dispatch(app_factory, "VOYN-W0-BAD")[0]
+    _complete_latest(
+        app_factory, worker, "VOYN-W0-BAD",
+        {"status": "completed",
+         "result_text": 'SPLIT_TASKS_JSON: [{"suffix": "bad suffix!", "title": "x", "body": "y"}]'},
+    )
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            rows = cur.fetchall()
+            cur.execute("SELECT count(*) FROM backlog_task WHERE task_id LIKE 'VOYN-W0-BAD-%'")
+            assert cur.fetchone()[0] == 0
+    assert rows[0][2] in ("returned_to_pool", "parked_for_owner")
+    assert store.get_task("VOYN-W0-BAD")["status"] in ("OPEN", "DEFER_TO_USER")
+
+
+def test_dispatch_smoke_reads_with_dispatch_privileges(rig) -> None:
+    app_factory, _store, _worker = rig
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT backlog_dispatch_smoke()")
+            assert cur.fetchone()[0] is True
+
+
+def test_open_monitor_findings_become_pipeline_tasks_once(rig) -> None:
+    from command_center.orchestrator.planner import PlanLimits, Planner
+
+    app_factory, store, worker = rig
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                ("worker-01:infra", "active_workers:2<4", '{"active_workers": 2}'),
+            )
+            # Idempotent while open: the same (source, failure) is one row.
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                ("worker-01:infra", "active_workers:2<4", '{"active_workers": 2}'),
+            )
+            cur.execute("SELECT count(*) FROM monitor_finding WHERE state = 'open'")
+            assert cur.fetchone()[0] == 1
+    report = Planner(app_factory).plan_once(PlanLimits(planner="planner-t"))
+    from command_center.orchestrator.planner import _monitor_task_id
+
+    monitor_id = _monitor_task_id("worker-01:infra", "active_workers:2<4")
+    assert monitor_id.startswith("VOYN-MON-WORKER-01-INFRA-ACTIVE-WORKERS-2-4-")
+    assert report.monitor_tasks == [(monitor_id, "active_workers:2<4")]
+    task = store.get_task(monitor_id)
+    assert task["status"] == "OPEN" and task["priority"] == "P1"
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT task_class FROM backlog_task WHERE task_id = %s", (task["task_id"],))
+            assert cur.fetchone()[0] == "pipeline"
+    # A second tick does not create a twin; clearing then re-recording re-uses the id.
+    report2 = Planner(app_factory).plan_once(PlanLimits(planner="planner-t"))
+    assert report2.monitor_tasks == []
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT monitor_clear_finding(%s)", ("worker-01:infra",))
+            assert cur.fetchone()[0] == 1

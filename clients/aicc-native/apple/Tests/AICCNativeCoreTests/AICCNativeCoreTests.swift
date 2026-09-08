@@ -140,6 +140,48 @@ import Testing
     let empty = Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: [], lanes: [], events: [])
     let decisions = empty.widgetSnippets().first { $0.flow == .decisions }
     #expect(decisions?.destination == .flowInbox(.decisions))
+
+@Test func impactStoryDecodesTimelineChainAndRiskFromFixture() throws {
+    let snapshot = try Fixture.healthySnapshot()
+    let withStory = try #require(snapshot.tasks.first { $0.id == "VOYN-EXAMPLE-002" })
+    let story = try #require(withStory.story)
+    #expect(story.timeline.count == 3)
+    #expect(story.causeChain.count == 2)
+    #expect(story.risk == .medium)
+    #expect(snapshot.tasks.first { $0.id == "VOYN-EXAMPLE-001" }?.story == nil)
+}
+
+@Test func impactStoryNarrativeOrdersTimelineBeforeCauseChain() {
+    let story = ImpactStory(
+        timeline: [
+            ImpactTimelineStep(id: "b", occurredAt: Date(timeIntervalSince1970: 200), headline: "Second"),
+            ImpactTimelineStep(id: "a", occurredAt: Date(timeIntervalSince1970: 100), headline: "First")
+        ],
+        causeChain: [ImpactCauseLink(cause: "X failed", effect: "Y is blocked")],
+        risk: .high,
+        riskExplanation: "Customers may notice a delay."
+    )
+    #expect(story.narrative == ["First", "Second", "Because X failed, Y is blocked."])
+}
+
+@Test func impactRiskLevelOrdersFromLowToCritical() {
+    #expect(ImpactRiskLevel.low < .medium)
+    #expect(ImpactRiskLevel.medium < .high)
+    #expect(ImpactRiskLevel.high < .critical)
+}
+
+@Test func taskToleratesMissingOrMalformedStoryWithoutFailing() throws {
+    let missing = Data("""
+    {"id":"X","title":"T","blocker":null,"evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
+    """.utf8)
+    let taskWithoutStory = try JSONDecoder().decode(AICCNativeCore.Task.self, from: missing)
+    #expect(taskWithoutStory.story == nil)
+
+    let malformed = Data("""
+    {"id":"X","title":"T","blocker":null,"evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null},"story":{"risk":"unheard-of"}}
+    """.utf8)
+    let taskWithBadStory = try JSONDecoder().decode(AICCNativeCore.Task.self, from: malformed)
+    #expect(taskWithBadStory.story == nil)
 }
 
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
@@ -154,4 +196,46 @@ import Testing
     """.utf8)
     let tolerant = try JSONDecoder().decode(AICCNativeCore.Task.self, from: future)
     #expect(tolerant.state == nil)
+}
+
+@Test func taskCriticalityRanksBlockerAboveAmbiguousAboveRoutine() {
+    let evidence = DeliveryEvidence(headSHA: nil, pullRequest: nil, ci: .unknown, acceptance: .unknown, mergedSHA: nil, deployedSHA: nil)
+    let blocked = AICCNativeCore.Task(id: "1", title: "T", blocker: "Waiting on owner", evidence: evidence)
+    #expect(blocked.criticality == .critical)
+
+    let ambiguous = AICCNativeCore.Task(id: "2", title: "T", blocker: nil, evidence: evidence)
+    #expect(ambiguous.evidence.derivedStatus == .unknown)
+    #expect(ambiguous.criticality == .high)
+
+    let awaitingAcceptance = DeliveryEvidence(headSHA: "abc", pullRequest: "#1", ci: .verified, acceptance: .pending, mergedSHA: nil, deployedSHA: nil)
+    #expect(awaitingAcceptance.derivedStatus == .awaitingAcceptance)
+    let pendingReview = AICCNativeCore.Task(id: "3", title: "T", blocker: nil, evidence: awaitingAcceptance)
+    #expect(pendingReview.criticality == .medium)
+
+    let routine = DeliveryEvidence(headSHA: "abc", pullRequest: "#1", ci: .verified, acceptance: .verified, mergedSHA: "def", deployedSHA: "fed")
+    #expect(routine.derivedStatus == .completed)
+    let done = AICCNativeCore.Task(id: "4", title: "T", blocker: nil, evidence: routine)
+    #expect(done.criticality == .low)
+}
+
+@Test func hapticPatternsAreDistinctAndEscalateWithCriticality() {
+    let patterns = Criticality.allCases.map(HapticSignal.pattern(for:))
+    // Every level maps to a pattern nobody else shares — pulse count and/or
+    // style differ, so the signal survives even if one dimension is missed.
+    for i in patterns.indices {
+        for j in patterns.indices where i != j {
+            #expect(patterns[i] != patterns[j])
+        }
+    }
+    // Longer or heavier as criticality rises: critical is never shorter than
+    // low, and it is the only level that carries the sharp `.error` pulse.
+    #expect(HapticSignal.pattern(for: .critical).pulses.count >= HapticSignal.pattern(for: .low).pulses.count)
+    #expect(HapticSignal.pattern(for: .critical).pulses.contains(.error))
+    #expect(!HapticSignal.pattern(for: .low).pulses.contains(.error))
+}
+
+@Test func criticalityOrdersLowToCritical() {
+    #expect(Criticality.low < .medium)
+    #expect(Criticality.medium < .high)
+    #expect(Criticality.high < .critical)
 }

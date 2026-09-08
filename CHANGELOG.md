@@ -18,6 +18,21 @@ functional application milestones of `app.py`.
   mutation — `POST /v1/commands` is still out of the v1 read-only contract.
   See `docs/aicc_native/WIDGET_SNIPPETS.md`.
 
+### Added — SRV-04b two-host acceptance record (`VOYN-W0-AICC-CLAIM-TWO-HOST-ACCEPTED`)
+- `docs/srv04b-two-host-acceptance.md`: records a separate, two-physical-host
+  acceptance pass of the `0002_queue_claim` protocol against
+  `origin/main@f9bb889` — exclusivity under real network jitter (192 attempts
+  across 8 runs, exactly 8 winners); a real userspace network blackhole that
+  forces `queue_reap()` to expire and requeue the stale owner's attempt
+  (`attempt_expired` after 27.45s) followed by a genuine second, winning
+  claim, with the old and new owners confirmed never simultaneously valid
+  (the stale owner's post-reap token use was rejected `attempt_expired` only
+  *after* the second claim had already won); cross-host token theft/
+  `SET ROLE` laundering refused by the `session_user` claimant check; and
+  clock independence (0 of 11 protocol functions take a timestamp parameter).
+  Named limit: the database host's OS was not Linux in this pass.
+  `docs/AIOS_BOUNDARY.md` cross-references it from the SRV-04b exception note.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,
@@ -197,6 +212,19 @@ need reconciliation.
 
 Both FastAPI applications served no authentication at all. Every mutating route
 now requires a verified platform principal and an explicit AICC-local grant.
+
+This delivery also fulfils `VOYN-W0-AICC-SRV-02` ("principal-and-permission-model").
+`SRV-02` was filed in the `SRV` sequence between `SRV-01`/`SRV-01a`/`SRV-01b`
+(PostgreSQL foundation) and `SRV-03` (worker host admission), but every
+dispatch of it was refused by the writer-lease bug fixed in
+`VOYN-W0-AICC-LEASE-STUCK-EXPIRED-NO-RECLAIM` (PR #358) — so it never ran, and
+this AUTH-HTTP-01 delivery (filed and completed independently) covers its
+intended scope in full: `command_center/http_auth/` is the HTTP-layer
+principal-and-permission model, and `command_center/db/roles.py` (`SRV-01a`)
+is its database-layer counterpart. `SRV-02` needs no further code and should
+not be re-attempted; this note is the closure record for anyone who finds the
+gap in the `SRV` numbering, the same gap that prompted its retry
+(`VOYN-W0-AICC-SRV-02-RETRY`) on 2026-08-26.
 
 #### Added
 - **`command_center/http_auth/`** — `identity.py` (forwards the caller's platform
