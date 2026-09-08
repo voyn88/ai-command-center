@@ -1430,6 +1430,78 @@ def test_worker_to_control_is_one_generation_with_one_rollback_boundary():
     )
 
 
+def test_lane_timers_are_held_before_apply_and_released_after_commit():
+    """Both lane-mutating timers, and the shared rollout lock, must be held
+    for the transaction's full mutating span -- prepare through commit -- not
+    just the `run_rollout rollout` step. `rollback`'s own `run_transaction
+    recover` (armed the moment `transaction_active` becomes 1) mutates the
+    same worker units from a separate, shell-level snapshot on ANY later
+    failure -- including one in `run_transaction apply`, before the rollout
+    step even starts -- so the hold has to begin there too, live worker-01
+    2026-09-08 (VOYN-W0-AICC-ROLLOUT-VS-ROTATE-SELFDEPLOY-TIMERS)."""
+    text = _installer_text()
+    lines = [line.strip() for line in text.splitlines()]
+    active = lines.index("transaction_active=1")
+    hold = lines.index("hold_lane_timers || {")
+    apply_index = lines.index("run_transaction apply")
+    commit = lines.index("run_transaction commit")
+    release_after_commit = lines.index("release_lane_timers", commit)
+
+    assert active < hold < apply_index < commit < release_after_commit
+    # Immediately after commit -- not buried behind
+    # `verify-agent-principal-boundary.sh` or the rollout step, both of which
+    # run before commit and must stay covered by the hold.
+    assert lines[commit + 1] == "transaction_active=0"
+    assert lines[commit + 2] == "release_lane_timers"
+
+
+def test_rollback_always_releases_lane_timers_after_recover():
+    """`rollback`'s release must be unconditional: it has to run whether or
+    not `recover` was even invoked (the guard above it may be false), and
+    whether or not `recover` succeeded -- a rollback that only released the
+    timers on the happy path would leave rotation/self-deploy paused forever
+    on exactly the failure this ticket is about."""
+    text = _installer_text()
+    body_start = text.index("rollback() {\n") + len("rollback() {\n")
+    body_end = text.index("\n}\n", body_start)
+    lines = [line.strip() for line in text[body_start:body_end].splitlines()]
+
+    recover_guard = lines.index(
+        'if [ "$transaction_active" -eq 1 ] && path_present '
+        '"$state_dir/pending.json"; then'
+    )
+    recover_call = lines.index("if ! run_transaction recover; then")
+    guard_fi = next(
+        index
+        for index, line in enumerate(lines)
+        if line == "fi" and index > recover_call
+    )
+    release_index = lines.index("release_lane_timers")
+    baseline_check = lines.index(
+        'if [ "$rollback_complete" -eq 1 ] && [ "$baseline_created" -eq 1 ]; then'
+    )
+
+    assert recover_guard < recover_call < guard_fi < release_index < baseline_check
+    # `release_lane_timers` sits AFTER the guard's closing `fi`, not inside
+    # it: reached even when transaction_active was never 1 (nothing to
+    # recover) or when recover() itself failed.
+    assert lines.count("release_lane_timers") == 1
+
+
+def test_rollout_step_declares_the_transaction_already_holds_the_timers():
+    """The rollout step must tell `rollout()` not to stop/start the timers or
+    touch the lock itself -- the transaction already holds both for a wider
+    span than this one step, and `rollout()`'s own `finally` releasing them
+    early would reopen the gap between a successful rollout and `commit`."""
+    text = _installer_text()
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+    _assert_command_inside_shell_if(
+        text,
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes --assume-timers-held",
+        guard,
+    )
+
+
 def test_worker_to_control_guard_check_rejects_an_intervening_fi():
     """A nearby guard is not proof if it closes before quiesce."""
     guard = 'if [ "$install_profile" = "control" ]; then'
@@ -1505,7 +1577,7 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
 
     for line in (
         "systemctl enable --now aicc-agent-launcher.socket",
-        "run_rollout rollout --lanes /etc/aicc/worker-lanes",
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes --assume-timers-held",
         '"$repo_root/ops/verify-agent-principal-boundary.sh"',
     ):
         # The boundary verifier is also named earlier as `sh -n "..."`, a

@@ -103,6 +103,45 @@ run_release() {
     --lock-fd "$AICC_INSTALL_LOCK_FD"
 }
 
+# Shared with LANE_MUTATING_TIMERS/ROLLOUT_LOCK_PATH in
+# ops/aicc_staged_worker_rollout.py -- duplicated by hand, same rationale as
+# the other independent copies of this path. Held for the transaction's
+# ENTIRE mutating span (prepare through commit), not just the `run_rollout
+# rollout` step: the `rollback` trap below runs `run_transaction recover` on
+# ANY failure in that span, and `recover` restores the same worker units from
+# its own separate, shell-level snapshot -- outside `rollout()`'s own
+# internal hold and, if `rollout()` itself is what failed, AFTER that
+# function's `finally` has already released its hold. A rotate/self-deploy
+# tick firing during that outer `recover` call races it exactly like it raced
+# the rollout step itself, live on worker-01 2026-09-08.
+timers_held=0
+
+hold_lane_timers() {
+  if [ "$timers_held" -eq 1 ]; then
+    return 0
+  fi
+  systemctl stop voyn-aicc-credential-rotation.timer || return 1
+  if ! systemctl stop voyn-aicc-self-deploy.timer; then
+    systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+    return 1
+  fi
+  lock_tmp="/run/aicc-staged-rollout.lock.$$"
+  printf '%s\n' "$$" >"$lock_tmp"
+  chmod 0644 "$lock_tmp"
+  mv -f -- "$lock_tmp" /run/aicc-staged-rollout.lock
+  timers_held=1
+}
+
+release_lane_timers() {
+  if [ "$timers_held" -ne 1 ]; then
+    return 0
+  fi
+  rm -f -- /run/aicc-staged-rollout.lock
+  systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+  systemctl start voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
+  timers_held=0
+}
+
 aios_artifact_store=/var/lib/aicc-artifacts
 
 install_aios_wheels() {
@@ -439,6 +478,10 @@ rollback() {
       echo "principal-isolation rollback incomplete; durable WAL retained" >&2
     fi
   fi
+  # Best-effort and unconditional: this transaction must never exit leaving
+  # rotation or self-deploy permanently paused, whether or not `recover` ran
+  # or succeeded above.
+  release_lane_timers
   if [ "$rollback_complete" -eq 1 ] && [ "$baseline_created" -eq 1 ]; then
     rm -f -- "$baseline_units" "$baseline_release"
   fi
@@ -487,6 +530,16 @@ else
 fi
 run_transaction prepare
 transaction_active=1
+# Held from here through `commit` below -- the entire span in which a
+# failure makes the `rollback` trap call `run_transaction recover`, which
+# mutates worker units of its own accord (see `hold_lane_timers` above). A
+# failure to hold aborts cleanly: `transaction_active` is already 1 but
+# nothing below has mutated a worker unit yet, so `recover` above has nothing
+# to undo.
+hold_lane_timers || {
+  echo "cannot hold lane-mutating timers for this transaction" >&2
+  exit 1
+}
 # A control host must not run the agent layer at all, and prepare() has just
 # staged its removal as part of this same generation (default_specs pairs
 # every WORKER_ONLY_TARGETS drop with an explicit removal spec). Stop and
@@ -530,12 +583,18 @@ fi
 # maps deploy/aicc/worker-lanes onto it) before this rollout runs on
 # a fresh host and matches the snapshot origin (reviewed on 8a881d3).
 if [ "$install_profile" = "worker" ]; then
-  run_rollout rollout --lanes /etc/aicc/worker-lanes
+  # This transaction already holds both lane-mutating timers and the shared
+  # rollout lock (see `hold_lane_timers` above) for the whole prepare-through-
+  # commit span, not just this step -- so the rollout must not stop/start
+  # them or touch the lock itself, and must not hand them back in its own
+  # `finally` before `commit` below is done needing them held.
+  run_rollout rollout --lanes /etc/aicc/worker-lanes --assume-timers-held
   "$repo_root/ops/verify-agent-principal-boundary.sh"
 fi
 
 run_transaction commit
 transaction_active=0
+release_lane_timers
 rm -f -- "$attempt_units"
 trap - EXIT HUP INT TERM
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"

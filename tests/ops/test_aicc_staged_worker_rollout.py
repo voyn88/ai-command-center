@@ -851,6 +851,90 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     module.remove_rollout_lock()
 
 
+def test_rollout_with_timers_already_held_does_not_touch_timers_or_lock(
+    tmp_path, monkeypatch
+):
+    """deploy/install-agent-principal-isolation.sh holds both lane-mutating
+    timers and the shared lock for its ENTIRE transaction (prepare through
+    commit), not just this rollout step, because its own `recover` on a later
+    failure mutates the same worker units outside of `rollout()`. Passing
+    `timers_already_held=True` must leave that outer hold completely alone --
+    no stop/start of either timer, and no write or removal of the lock file
+    -- while the lane mutations themselves proceed exactly as normal."""
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
+    systemd = FakeSystemd(units)
+
+    module.rollout(
+        systemd,
+        units,
+        agent_user="aicc-agent",
+        privileged_users=("root", "voynadmin"),
+        uid_for_user=_uid,
+        process_uid=lambda pid: 1002,
+        process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
+        timers_already_held=True,
+    )
+
+    timer_calls = [
+        call for call in systemd.calls if call[-1] in module.LANE_MUTATING_TIMERS
+    ]
+    assert timer_calls == []
+    assert not lock_path.exists()
+    mutations = [
+        call for call in systemd.calls if call[0] in {"enable", "stop", "start"}
+    ]
+    assert ("enable", units[0]) in mutations
+    assert ("start", units[1]) in mutations
+
+
+def test_rollout_with_timers_already_held_does_not_release_on_failure(
+    tmp_path, monkeypatch
+):
+    """The nested-hold contract must hold on the failure path too: a rollout
+    failure while `timers_already_held=True` must not start either timer or
+    remove a lock it never wrote -- the caller that holds them decides when
+    they come back, typically after its own later recovery step finishes."""
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("12345\n", encoding="utf-8")
+    units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
+
+    class FailingSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            value = super().run(*args, check=check)
+            if args == ("start", units[1]):
+                self.states[units[1]]["SubState"] = "failed"
+            return value
+
+    systemd = FailingSystemd(units)
+    with pytest.raises(module.RolloutError, match="SubState"):
+        module.rollout(
+            systemd,
+            units,
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
+            timers_already_held=True,
+        )
+
+    timer_calls = [
+        call for call in systemd.calls if call[-1] in module.LANE_MUTATING_TIMERS
+    ]
+    assert timer_calls == []
+    # The lock this test pre-seeded (standing in for the outer caller's own
+    # hold) is untouched -- still present, still the outer caller's content.
+    assert lock_path.read_text(encoding="utf-8") == "12345\n"
+
+
 def test_verifier_rejects_execstart_path_decoupled_from_argv():
     """systemd's @ prefix runs path= while argv[] still matches the expected
     command; the verifier must reject a path= that diverges from argv[0]

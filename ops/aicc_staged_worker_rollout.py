@@ -1026,6 +1026,7 @@ def rollout(
     uid_for_user=None,
     process_uid=None,
     process_environment=None,
+    timers_already_held: bool = False,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
@@ -1044,8 +1045,19 @@ def rollout(
     # rollout vs. rotate/self-deploy timers (2026-09-08 worker-01). Nothing
     # has mutated yet at this point, so a failure to hold aborts cleanly with
     # no rollback needed.
-    hold_lane_mutating_timers(systemd)
-    write_rollout_lock()
+    #
+    # `timers_already_held` is how deploy/install-agent-principal-isolation.sh
+    # opts out of this function's own hold/release: that installer wraps its
+    # ENTIRE transaction (prepare through commit) in the same hold, because a
+    # rollout failure here triggers ITS OWN outer `recover`, which restores
+    # the same worker units from a separate, shell-level snapshot -- outside
+    # this function and after this function's own `finally` would otherwise
+    # have already handed the timers back. Skipping the inner hold/release
+    # when the caller already holds it is what keeps that second, outer
+    # restore covered too, instead of just this function's mutations.
+    if not timers_already_held:
+        hold_lane_mutating_timers(systemd)
+        write_rollout_lock()
     try:
         try:
             agent_uid = uid_for_user(agent_user)
@@ -1103,8 +1115,13 @@ def rollout(
     finally:
         # Restored on both the success and failure path -- a rollout must
         # never exit leaving rotation or self-deploy permanently paused.
-        remove_rollout_lock()
-        release_lane_mutating_timers(systemd)
+        # Skipped when the caller already holds the timers: releasing here
+        # would hand them back before that caller's own later steps (e.g. the
+        # installer's `commit`, or its `recover` on a later failure) are
+        # done needing them held.
+        if not timers_already_held:
+            remove_rollout_lock()
+            release_lane_mutating_timers(systemd)
 
 
 def main() -> int:
@@ -1127,6 +1144,14 @@ def main() -> int:
     parser.add_argument("--agent-user", default="aicc-agent")
     parser.add_argument("--include-unit", action="append", default=[])
     parser.add_argument("--privileged-user", action="append", default=[])
+    parser.add_argument(
+        "--assume-timers-held",
+        action="store_true",
+        help="The caller (deploy/install-agent-principal-isolation.sh) has "
+        "already stopped both lane-mutating timers and written the shared "
+        "rollout lock for a wider transaction than this rollout step alone; "
+        "do not stop/start them or touch the lock here.",
+    )
     args = parser.parse_args()
     systemd = Systemd()
     if args.action == "restore":
@@ -1178,6 +1203,7 @@ def main() -> int:
             units,
             agent_user=args.agent_user,
             privileged_users=privileged_users,
+            timers_already_held=args.assume_timers_held,
         )
     else:
         privileged_users = (
