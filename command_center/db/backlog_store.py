@@ -98,6 +98,20 @@ class BacklogStore:
         )
         return bool(ok), str(reason or ""), revision
 
+    def recover_stuck_ready_to_review(self, task_id: str) -> tuple[bool, str, int | None]:
+        """READY_TO_REVIEW -> OPEN through the 0018 machine gate: granted only
+        for a task that is currently READY_TO_REVIEW with NO `pr` evidence on
+        record -- the stuck state a completed-but-unpublished run (0011) or
+        any future bug in the same corner could leave behind, invisible to
+        both `backlog_transition` (no READY_TO_REVIEW -> OPEN adjacency) and
+        `backlog_return_to_pool` (IN_PROGRESS only). A task with `pr`
+        evidence already recorded is refused (`has_pr_evidence`) and left to
+        the real review/merge path."""
+        ok, reason, revision = self._row(
+            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
+        )
+        return bool(ok), str(reason or ""), revision
+
     def record_evidence(self, task_id: str, kind: str, value: str) -> tuple[bool, str]:
         ok, reason, _revision = self._row(
             "SELECT * FROM backlog_record_evidence(%s, %s, %s)",
