@@ -22,6 +22,15 @@ import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
 import { fetchHome } from '../lib/api'
 import type { Project } from '../lib/api'
 import {
+  confirmBacklogTask,
+  draftBacklogTask,
+  fetchBacklogStatus,
+  fetchBacklogTaskDetail,
+  fetchBacklogTasks,
+  reassignBacklogTask,
+} from '../lib/backlogApi'
+import type { BacklogStatusCounts, BacklogTask, BacklogTaskDetail, DraftResult } from '../lib/backlogApi'
+import {
   enqueueAudit,
   fetchQueueItem,
   fetchQueueItems,
@@ -203,6 +212,329 @@ function AuditLauncher({ projects, onQueued }: { projects: Project[]; onQueued: 
   )
 }
 
+const BACKLOG_STATUSES = [
+  'OPEN',
+  'IN_PROGRESS',
+  'READY_TO_REVIEW',
+  'DONE',
+  'UNTRIAGED',
+  'DEFER_TO_USER',
+  'SPLIT',
+  'NEEDS_REFINEMENT',
+  'DECIDED',
+] as const
+
+function backlogStatusLabel(status: string, t: (key: string) => string): string {
+  const key = `backlogStatus${status}`
+  const label = t(key)
+  return label === key ? status : label
+}
+
+function backlogStatusTone(status: string): string {
+  if (status === 'DONE') return 'var(--ok)'
+  if (status === 'DEFER_TO_USER' || status === 'NEEDS_REFINEMENT') return 'var(--bad)'
+  if (status === 'IN_PROGRESS' || status === 'READY_TO_REVIEW') return 'var(--accent-2)'
+  return 'var(--tx3)'
+}
+
+/** History for one backlog task (S6c drill-down): the transition trail that
+ * makes up its "decomposition" — this record IS one piece of the larger
+ * central task, and its events are the progress record for that piece. */
+function BacklogHistory({ taskId }: { taskId: string }) {
+  const { t } = useTranslation()
+  const [detail, setDetail] = useState<BacklogTaskDetail | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    setDetail(null)
+    setFailed(false)
+    fetchBacklogTaskDetail(taskId).then(setDetail).catch(() => setFailed(true))
+  }, [taskId])
+
+  if (failed) return <p className="task-details" style={{ color: 'var(--bad)' }}>{t('errorLoading')}</p>
+  if (!detail) return <p className="task-details">{t('loading')}</p>
+  return (
+    <div className="task-details">
+      {detail.events.length === 0 ? (
+        <p>{t('backlogHistoryEmpty')}</p>
+      ) : (
+        detail.events.map((event, index) => (
+          <p key={`${event.created_at}-${index}`}>
+            {event.event} — {event.outcome}
+            {event.reason ? ` (${event.reason})` : ''}
+          </p>
+        ))
+      )}
+    </div>
+  )
+}
+
+/** Inline priority/wave reprioritization for one backlog task (S6d): the
+ * optimistic-revision form the same operation the chat/voice parser drives
+ * (S6a/S6b) when it re-issues a task line with a changed token. */
+function BacklogReassignForm({
+  item,
+  onSaved,
+}: {
+  item: BacklogTask
+  onSaved: (next: { wave: string; priority: string | null; revision: number }) => void
+}) {
+  const { t } = useTranslation()
+  const [wave, setWave] = useState(item.wave)
+  const [priority, setPriority] = useState(item.priority ?? '')
+  const [status, setStatus] = useState<'idle' | 'saving' | 'error' | 'conflict'>('idle')
+
+  const dirty = wave.trim() !== item.wave || priority.trim() !== (item.priority ?? '')
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!dirty || !wave.trim() || status === 'saving') return
+    setStatus('saving')
+    try {
+      const result = await reassignBacklogTask(item.task_id, {
+        wave: wave.trim(),
+        priority: priority.trim() || null,
+        expected_revision: item.revision,
+      })
+      setStatus('idle')
+      onSaved({ wave: wave.trim(), priority: priority.trim() || null, revision: result.revision })
+    } catch (error) {
+      // `reassign`'s 409 body is `{reason, revision}` — not a string `detail`,
+      // so `authedPost` falls back to the bare status code as the reason.
+      setStatus(error instanceof Error && error.message.endsWith('-> 409') ? 'conflict' : 'error')
+    }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+      <label style={{ display: 'flex', gap: '.35rem', alignItems: 'center', fontSize: '.72rem', color: 'var(--tx3)' }}>
+        {t('backlogWave')}
+        <input
+          className="task-token-input"
+          style={{ minWidth: '5rem', padding: '.3rem .5rem' }}
+          value={wave}
+          onChange={(event) => setWave(event.target.value)}
+        />
+      </label>
+      <label style={{ display: 'flex', gap: '.35rem', alignItems: 'center', fontSize: '.72rem', color: 'var(--tx3)' }}>
+        {t('backlogPriority')}
+        <input
+          className="task-token-input"
+          style={{ minWidth: '4rem', padding: '.3rem .5rem' }}
+          value={priority}
+          onChange={(event) => setPriority(event.target.value)}
+        />
+      </label>
+      <button type="submit" className="task-toggle" disabled={!dirty || status === 'saving'}>
+        {status === 'saving' ? t('backlogReassignSaving') : t('backlogReassignSave')}
+      </button>
+      {status === 'conflict' && <span style={{ color: 'var(--bad)', fontSize: '.7rem' }}>{t('backlogReassignConflict')}</span>}
+      {status === 'error' && <span style={{ color: 'var(--bad)', fontSize: '.7rem' }}>{t('backlogReassignError')}</span>}
+    </form>
+  )
+}
+
+function BacklogTaskRow({ item, onReassigned }: { item: BacklogTask; onReassigned: (id: string, next: { wave: string; priority: string | null; revision: number }) => void }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+
+  return (
+    <article className="task-row">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '.8rem', flexWrap: 'wrap' }}>
+        <span className="task-status" style={{ color: backlogStatusTone(item.status) }}>
+          {backlogStatusLabel(item.status, t)}
+        </span>
+        <strong style={{ color: 'var(--tx)', fontSize: '.84rem', flex: 1, minWidth: '8rem' }}>{item.title}</strong>
+        <span className="task-date">
+          {t('backlogWave')} {item.wave} · {t('backlogPriority')} {item.priority ?? t('backlogNoPriority')}
+        </span>
+        <button type="button" className="task-toggle" onClick={() => setOpen((v) => !v)}>
+          {open ? t('taskHide') : t('taskDetails')}
+        </button>
+      </div>
+      {open && (
+        <>
+          <BacklogReassignForm item={item} onSaved={(next) => onReassigned(item.task_id, next)} />
+          <div>
+            <p className="task-details-label" style={{ margin: '0 0 .3rem' }}>{t('backlogHistory')}</p>
+            <BacklogHistory taskId={item.task_id} />
+          </div>
+        </>
+      )}
+    </article>
+  )
+}
+
+/** Chat-text intake (S6a): draft a proposed backlog line from free text,
+ * let the owner read (and edit) it, then confirm. Voice (S6b) is a separate
+ * transcription step feeding the same text box. */
+function BacklogIntake({ onCreated }: { onCreated: () => void }) {
+  const { t } = useTranslation()
+  const [text, setText] = useState('')
+  const [line, setLine] = useState<string | null>(null)
+  const [parseFailed, setParseFailed] = useState(false)
+  const [phase, setPhase] = useState<'idle' | 'drafting' | 'previewing' | 'confirming' | 'locked' | 'draftError' | 'confirmError' | 'duplicate' | 'success'>('idle')
+
+  const draft = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!text.trim() || phase === 'drafting') return
+    setPhase('drafting')
+    try {
+      const result: DraftResult = await draftBacklogTask(text.trim())
+      setParseFailed(!result.ok)
+      setLine(result.ok ? result.line : result.raw_output)
+      setPhase('previewing')
+    } catch (error) {
+      setPhase(error instanceof QueueAuthError ? 'locked' : 'draftError')
+    }
+  }
+
+  const confirm = async () => {
+    if (!line || !line.trim() || phase === 'confirming') return
+    setPhase('confirming')
+    try {
+      await confirmBacklogTask(line.trim())
+      setPhase('success')
+      setText('')
+      setLine(null)
+      onCreated()
+    } catch (error) {
+      if (error instanceof QueueAuthError) setPhase('locked')
+      // `confirm`'s 409 body is a string `detail` ("... already exists ..."),
+      // which `authedPost` surfaces verbatim as the reason.
+      else if (error instanceof Error && error.message.includes('already exists')) setPhase('duplicate')
+      else setPhase('confirmError')
+    }
+  }
+
+  const cancel = () => {
+    setLine(null)
+    setPhase('idle')
+  }
+
+  return (
+    <GlassPanel title={t('intakeTitle')}>
+      {line === null ? (
+        <form onSubmit={draft} style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}>
+          <textarea
+            className="task-token-input"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            aria-label={t('intakeTitle')}
+            placeholder={t('intakePlaceholder')}
+            rows={2}
+            style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+          />
+          <button type="submit" className="execution-back" disabled={!text.trim() || phase === 'drafting'}>
+            {phase === 'drafting' ? t('intakeDrafting') : t('intakeDraft')}
+          </button>
+        </form>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '.6rem' }}>
+          <p style={{ margin: 0, color: parseFailed ? 'var(--bad)' : 'var(--tx3)' }}>
+            {parseFailed ? t('intakeParseFailed') : t('intakePreview')}
+          </p>
+          <textarea
+            className="task-token-input"
+            value={line}
+            onChange={(event) => setLine(event.target.value)}
+            aria-label={t('intakePreview')}
+            rows={2}
+            style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--font-mono)' }}
+          />
+          <div style={{ display: 'flex', gap: '.6rem' }}>
+            <button type="button" className="execution-back" onClick={confirm} disabled={!line.trim() || phase === 'confirming'}>
+              {phase === 'confirming' ? t('intakeConfirming') : t('intakeConfirm')}
+            </button>
+            <button type="button" className="task-toggle" onClick={cancel}>{t('intakeCancel')}</button>
+          </div>
+        </div>
+      )}
+      {phase === 'locked' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeLocked')}</p>}
+      {phase === 'draftError' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeDraftError')}</p>}
+      {phase === 'confirmError' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeError')}</p>}
+      {phase === 'duplicate' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeDuplicate')}</p>}
+      {phase === 'success' && <p style={{ color: 'var(--ok)', margin: 0 }}>{t('intakeSuccess')}</p>}
+    </GlassPanel>
+  )
+}
+
+/** The central backlog's status and decomposition (S6c): an overall
+ * done/total progress bar, per-status counts, and the task list itself —
+ * each row IS one piece of the decomposition, with its own history and
+ * reprioritization control. */
+function BacklogSection() {
+  const { t } = useTranslation()
+  const [status, setStatus] = useState<BacklogStatusCounts | null>(null)
+  const [tasks, setTasks] = useState<BacklogTask[] | null>(null)
+  const [error, setError] = useState(false)
+
+  const load = useCallback(() => {
+    setError(false)
+    Promise.all([fetchBacklogStatus(), fetchBacklogTasks()])
+      .then(([statusResult, tasksResult]) => {
+        setStatus(statusResult)
+        setTasks(tasksResult.tasks)
+      })
+      .catch(() => setError(true))
+  }, [])
+  useEffect(load, [load])
+
+  const reassign = (taskId: string, next: { wave: string; priority: string | null; revision: number }) => {
+    setTasks((current) =>
+      current
+        ? current.map((task) => (task.task_id === taskId ? { ...task, ...next } : task))
+        : current,
+    )
+  }
+
+  if (error) {
+    return (
+      <GlassPanel title={t('backlogTitle')}>
+        <p style={{ color: 'var(--bad)' }}>{t('backlogErrorLoading')}</p>
+        <button className="execution-back" onClick={load}>{t('retry')}</button>
+      </GlassPanel>
+    )
+  }
+  if (!status || !tasks) {
+    return <GlassPanel title={t('backlogTitle')}>{t('loading')}</GlassPanel>
+  }
+
+  const done = status.counts['DONE'] ?? 0
+  const percent = status.total === 0 ? 0 : Math.round((done / status.total) * 100)
+
+  return (
+    <>
+      <BacklogIntake onCreated={load} />
+      <GlassPanel title={t('backlogTitle')}>
+        <p style={{ color: 'var(--tx3)', marginTop: 0 }}>{t('backlogSubtitle')}</p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem', marginBottom: '.9rem' }}>
+          <div style={{ flex: 1, height: '.5rem', borderRadius: '999px', background: 'rgba(255,255,255,.08)', overflow: 'hidden' }}>
+            <div style={{ width: `${percent}%`, height: '100%', background: 'var(--ok)' }} />
+          </div>
+          <span style={{ fontSize: '.72rem', color: 'var(--tx3)', whiteSpace: 'nowrap' }}>
+            {percent}% {t('backlogProgress')} ({done}/{status.total})
+          </span>
+        </div>
+        <div className="execution-filters" aria-label={t('allStates')}>
+          {BACKLOG_STATUSES.map((state) => (
+            <span key={state} style={{ color: 'var(--tx3)', fontSize: '.68rem' }}>
+              {backlogStatusLabel(state, t)}: {status.counts[state] ?? 0}
+            </span>
+          ))}
+        </div>
+        <div className="execution-list">
+          {tasks.length === 0 ? (
+            <p style={{ color: 'var(--tx3)' }}>{t('backlogEmpty')}</p>
+          ) : (
+            tasks.map((item) => <BacklogTaskRow key={item.task_id} item={item} onReassigned={reassign} />)
+          )}
+        </div>
+      </GlassPanel>
+    </>
+  )
+}
+
 function TokenGate({ onUnlocked }: { onUnlocked: () => void }) {
   const { t } = useTranslation()
   const [value, setValue] = useState('')
@@ -287,6 +619,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
             </GlassPanel>
           )}
           {!locked && items && <AuditLauncher projects={projects} onQueued={load} />}
+          {!locked && items && <BacklogSection />}
           {!locked && items && (
             <GlassPanel title={t('tasks')}>
               <div className="execution-filters" aria-label={t('allStates')}>

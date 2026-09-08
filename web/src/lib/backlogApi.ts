@@ -45,6 +45,37 @@ export function fetchBacklogTasks(limit = 200): Promise<{ tasks: BacklogTask[]; 
   })
 }
 
+export type BacklogEvent = {
+  event: string
+  outcome: string
+  reason: string | null
+  actor: string
+  detail: Record<string, unknown> | null
+  created_at: string
+}
+
+export type BacklogEvidence = {
+  kind: string
+  value: string
+  recorded_at: string
+}
+
+export type BacklogTaskDetail = {
+  task: BacklogTask
+  events: BacklogEvent[]
+  evidence: BacklogEvidence[]
+}
+
+/** The decomposition/progress trail for one backlog task (S6c drill-down):
+ * every transition it has been through, plus recorded evidence. */
+export function fetchBacklogTaskDetail(taskId: string): Promise<BacklogTaskDetail> {
+  const path = `/api/v1/backlog/tasks/${encodeURIComponent(taskId)}`
+  return fetch(path).then((response) => {
+    if (!response.ok) throw new Error(`GET ${path} -> ${response.status}`)
+    return response.json() as Promise<BacklogTaskDetail>
+  })
+}
+
 export type DraftedTask = {
   task_id: string
   wave: string
