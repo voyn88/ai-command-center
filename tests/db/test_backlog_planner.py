@@ -986,3 +986,93 @@ def test_resume_budget_is_a_window_not_a_lifetime_score(
 
     ok, reason, _ = store.resume_deferred(task)
     assert not ok and reason == "resume_budget_exhausted"
+
+
+# ---------------------------------------------------------------------------
+# VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW (0018): a sanctioned
+# recovery path for a task stuck in READY_TO_REVIEW with no `pr` evidence --
+# invisible to both backlog_transition (no READY_TO_REVIEW -> OPEN move) and
+# backlog_return_to_pool (IN_PROGRESS only).
+# ---------------------------------------------------------------------------
+
+
+def _stick_in_review_without_pr_evidence(app_factory, store, task_id) -> None:
+    """Reproduce the stuck state directly through the machine: dispatch to
+    IN_PROGRESS, then transition straight to READY_TO_REVIEW with no
+    evidence recorded at all -- the exact shape 0011 stopped `backlog_
+    ingest_results` from producing, and the shape any future bug in a
+    different corner of the same pipeline could still produce. `backlog_
+    transition`'s READY_TO_REVIEW move itself carries no evidence
+    requirement (only the DONE move does), so this is a legitimate machine
+    path, not a raw INSERT bypassing it."""
+    assert _dispatch(app_factory, task_id)[0]
+    task = store.get_task(task_id)
+    ok, reason, _rev = store.transition(task_id, "READY_TO_REVIEW", task["revision"])
+    assert ok, reason
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
+def test_recover_stuck_ready_to_review_returns_evidence_free_task_to_open(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SK", repo="repo-sk"))[0]
+    _stick_in_review_without_pr_evidence(app_factory, store, "VOYN-W0-SK")
+
+    ok, reason, revision = store.recover_stuck_ready_to_review("VOYN-W0-SK")
+    assert ok and reason == "OPEN" and revision is not None
+    assert store.get_task("VOYN-W0-SK")["status"] == "OPEN"
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason, detail FROM backlog_event WHERE task_id = %s "
+                "AND event = 'recover_stuck_ready_to_review' AND outcome = 'granted'",
+                ("VOYN-W0-SK",),
+            )
+            rows = cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "no_pr_evidence"
+    assert rows[0][1] == {"from": "READY_TO_REVIEW", "to": "OPEN"}
+
+    # OPEN means a fresh dispatch is possible again.
+    assert _dispatch(app_factory, "VOYN-W0-SK")[0]
+
+
+def test_recover_stuck_ready_to_review_refuses_a_task_with_pr_evidence(rig) -> None:
+    """A READY_TO_REVIEW task that DOES carry `pr` evidence is genuinely
+    reviewable: this recovery path must leave it alone for the real
+    review/merge machinery."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SP", repo="repo-sp"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-SP")[0]
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-SP",
+        {"status": "completed", "pr_url": "https://github.com/o/r/pull/9",
+         "head_sha": "deadbeef"},
+    )
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+    assert store.get_task("VOYN-W0-SP")["status"] == "READY_TO_REVIEW"
+
+    ok, reason, _rev = store.recover_stuck_ready_to_review("VOYN-W0-SP")
+    assert (ok, reason) == (False, "has_pr_evidence")
+    assert store.get_task("VOYN-W0-SP")["status"] == "READY_TO_REVIEW"
+
+
+def test_recover_stuck_ready_to_review_refuses_everything_else(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SX"))[0]  # OPEN
+    assert store.recover_stuck_ready_to_review("VOYN-W0-SX")[:2] == (
+        False, "not_ready_to_review",
+    )
+    assert store.upsert_task(
+        _task("VOYN-W0-SG", kind="gate", status="READY_TO_REVIEW")
+    )[0]
+    assert store.recover_stuck_ready_to_review("VOYN-W0-SG")[:2] == (
+        False, "gate_is_control_record",
+    )
+    assert store.recover_stuck_ready_to_review("VOYN-W0-NOPE")[:2] == (
+        False, "unknown_task",
+    )
