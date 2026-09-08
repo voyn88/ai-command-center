@@ -470,14 +470,21 @@ DecisionCriticality = Literal["normal", "critical"]
 DecisionStatus = Literal["draft", "finalized"]
 
 
-class Decision(BaseModel):
+class CounterfactualDecision(BaseModel):
     """A decision moving through ``draft`` → ``finalized``, with the
     alternatives considered and rejected recorded alongside it — the
     counterfactual ledger. ``chosen_option``/``rationale`` are filled when the
     decision finalizes; a ``critical`` decision may only finalize once it
     carries at least 3 alternatives (the invariant is enforced in the service,
     not the DB). ``project_ref`` is the redaction key — a decision whose
-    ``project_ref`` is sensitive is dropped from every read."""
+    ``project_ref`` is sensitive is dropped from every read.
+
+    Named ``CounterfactualDecision`` (not the bare ``Decision`` the
+    per-surface convention would suggest) because :class:`Decision` above
+    already names the Council engine's ADR-style outcome record on this same
+    module — a second class of that name would silently shadow the first at
+    import time (module-level rebind), and every Council response built via
+    ``models.Decision(...)`` would silently construct the wrong shape."""
 
     id: str = ""
     title: str = ""

@@ -2,7 +2,7 @@
 surface.
 
 The *entities* returned on this surface are the shared contract models
-:class:`command_center.api.models.Decision` and
+:class:`command_center.api.models.CounterfactualDecision` and
 :class:`command_center.api.models.Alternative`; the classes here only describe
 the **inputs** a client POSTs (open a decision, record an alternative, finalize
 a decision) and the small composite responses (list pages) that wrap them.
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from command_center.api.models import Alternative, Decision, DecisionCriticality
+from command_center.api.models import Alternative, CounterfactualDecision, DecisionCriticality
 
 
 class DecisionCreate(BaseModel):
@@ -51,7 +51,7 @@ class DecisionFinalize(BaseModel):
 class DecisionList(BaseModel):
     """A page of decisions plus the paging echo the client sent."""
 
-    decisions: list[Decision]
+    decisions: list[CounterfactualDecision]
     limit: int
     offset: int
 

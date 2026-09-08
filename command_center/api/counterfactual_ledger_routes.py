@@ -40,16 +40,16 @@ def list_decisions(
     )
 
 
-@router.get("/decisions/{decision_id}", response_model=models.Decision)
-def get_decision(decision_id: str) -> models.Decision:
+@router.get("/decisions/{decision_id}", response_model=models.CounterfactualDecision)
+def get_decision(decision_id: str) -> models.CounterfactualDecision:
     found = service.get_decision(decision_id)
     if found is None:
         raise HTTPException(status_code=404, detail="decision not found")
     return found
 
 
-@router.post("/decisions", response_model=models.Decision, status_code=201)
-def create_decision(payload: w.DecisionCreate) -> models.Decision:
+@router.post("/decisions", response_model=models.CounterfactualDecision, status_code=201)
+def create_decision(payload: w.DecisionCreate) -> models.CounterfactualDecision:
     try:
         return service.create_decision(payload)
     except service.SensitiveProjectRefError as exc:
@@ -86,8 +86,8 @@ def add_alternative(
     return created
 
 
-@router.post("/decisions/{decision_id}/finalize", response_model=models.Decision)
-def finalize_decision(decision_id: str, payload: w.DecisionFinalize) -> models.Decision:
+@router.post("/decisions/{decision_id}/finalize", response_model=models.CounterfactualDecision)
+def finalize_decision(decision_id: str, payload: w.DecisionFinalize) -> models.CounterfactualDecision:
     try:
         finalized = service.finalize_decision(decision_id, payload)
     except service.DecisionNotFinalizableError as exc:

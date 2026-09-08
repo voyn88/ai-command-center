@@ -75,8 +75,8 @@ def _db_path() -> Path:
     return path
 
 
-def _decision_from_row(row: dict) -> models.Decision:
-    return models.Decision(
+def _decision_from_row(row: dict) -> models.CounterfactualDecision:
+    return models.CounterfactualDecision(
         id=row["id"],
         title=row["title"],
         description=row.get("description") or "",
@@ -107,7 +107,7 @@ def _alternative_from_row(row: dict) -> models.Alternative:
 # --------------------------------------------------------------------------
 
 
-def create_decision(payload: s.DecisionCreate) -> models.Decision:
+def create_decision(payload: s.DecisionCreate) -> models.CounterfactualDecision:
     if payload.project_ref and is_sensitive(payload.project_ref):
         raise SensitiveProjectRefError(
             f"decision for sensitive project {payload.project_ref!r} is rejected"
@@ -146,7 +146,7 @@ def list_decisions(
     )
 
 
-def get_decision(decision_id: str) -> models.Decision | None:
+def get_decision(decision_id: str) -> models.CounterfactualDecision | None:
     row = db.get_counterfactual_decision(_db_path(), decision_id)
     if row is None or is_sensitive(row.get("project_ref") or ""):
         # A sensitive decision reads as absent — its title/rationale must never leak.
@@ -198,7 +198,7 @@ def list_alternatives(decision_id: str) -> s.AlternativeList | None:
 
 def finalize_decision(
     decision_id: str, payload: s.DecisionFinalize
-) -> models.Decision | None:
+) -> models.CounterfactualDecision | None:
     """Finalize a decision — but only if it is ``normal`` criticality, or is
     ``critical`` and already carries at least
     :data:`MIN_ALTERNATIVES_FOR_CRITICAL` recorded alternatives. This is the
