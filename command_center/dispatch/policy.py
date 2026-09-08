@@ -38,6 +38,15 @@ The hard guarantees, enforced structurally here:
    limit defers with `DEFER_TAIL_RISK` before executors or budget are even
    considered — the top-5 scenarios this ships with are the acceptance this
    guarantee exists to satisfy (`models.DEFAULT_TAIL_RISK_SCENARIOS`).
+6. **A quarantined agent is never dispatched again.** `DispatchPolicy.
+   quarantined_agents` (populated by `dispatch.degradation.evaluate_degradation`
+   once an executor's failure rate breaches the degradation threshold across
+   two consecutive windows) is checked ahead of availability for every task:
+   a quarantined executor is excluded from the eligible pool even if it is
+   the only permitted or pinned one, deferring with `DEFER_AGENT_QUARANTINED`.
+   This is what makes "0 critical errors from a degrading agent" structural
+   rather than a monitoring promise — there is no code path back to that
+   executor once it is quarantined, short of an operator clearing the record.
 """
 
 from __future__ import annotations
@@ -46,6 +55,7 @@ from command_center.dispatch.models import (
     ASSIGNED,
     DEFER_AGENT_BUDGET,
     DEFER_AGENT_CAPACITY,
+    DEFER_AGENT_QUARANTINED,
     DEFER_COST_DATA_UNAVAILABLE,
     DEFER_DAILY_BUDGET,
     DEFER_KILL_SWITCH,
@@ -79,10 +89,10 @@ def _task_sort_key(task: QueuedTask, policy: DispatchPolicy) -> tuple:
 
 
 def _eligible_executors(
-    task: QueuedTask, executors: dict[str, ExecutorProfile]
+    task: QueuedTask, executors: dict[str, ExecutorProfile], policy: DispatchPolicy
 ) -> tuple[list[ExecutorProfile], str | None]:
     """Return the executors permitted for `task`, and a defer reason when the
-    permitted set is empty or none of it is available.
+    permitted set is empty, all quarantined, or none of it is available.
 
     Order of the returned list is not yet cost-ordered — the caller sorts it.
     """
@@ -97,7 +107,17 @@ def _eligible_executors(
     if not permitted:
         return [], DEFER_NO_ELIGIBLE_EXECUTOR
 
-    available = [ex for ex in permitted if ex.available]
+    # Quarantine is checked before availability, same posture as the tail-risk
+    # gate: a confirmed quality-degradation verdict is a structural refusal,
+    # not "temporarily unavailable" — an executor pinned onto a quarantined
+    # agent must be refused even if that agent's live probe reports available,
+    # so a degrading agent can never accumulate another critical error after
+    # quarantine.
+    not_quarantined = [ex for ex in permitted if not policy.is_quarantined(ex.id)]
+    if not not_quarantined:
+        return [], DEFER_AGENT_QUARANTINED
+
+    available = [ex for ex in not_quarantined if ex.available]
     if not available:
         return [], DEFER_NO_AVAILABLE_EXECUTOR
     return available, None
@@ -197,7 +217,7 @@ def plan_dispatch(
             )
             continue
 
-        candidates, empty_reason = _eligible_executors(task, executor_by_id)
+        candidates, empty_reason = _eligible_executors(task, executor_by_id, policy)
         if empty_reason is not None:
             decisions.append(
                 DispatchDecision(
