@@ -11,7 +11,17 @@ secret_manifest=/etc/aicc/publisher-secret-paths
 lane_registry=/etc/aicc/worker-lanes
 worker_template=/etc/systemd/system/voyn-aicc-worker@.service
 worker_dropin=/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
-principal_inaccessible_paths="/etc/aicc /etc/voyn /home /root /var/lib/aicc-worker /var/lib/aicc-agent /var/lib/voyn-aicc-credential-rotation /run/aicc-agent-launcher /run/aicc-agent-workspace-binds /run/credentials /run/voyn-aicc-worker /run/aicc-worker-lanes /srv/aicc-quarantine"
+# The same sensitive trees the launcher masks, with the launcher's rule: the
+# '-' prefix tolerates an ABSENT tree (still masked when present). Several are
+# created lazily -- /run/aicc-agent-workspace-binds by the first agent launch,
+# /run/aicc-worker-lanes by a running isolated lane, /srv/aicc-quarantine on
+# first quarantine -- and this boundary test runs before any of them exist
+# (runbook step 6 precedes step 8). An unprefixed missing entry made systemd
+# refuse the canary namespace ("Failed to set up mount namespacing:
+# /run/aicc-agent-workspace-binds: No such file or directory", 226/NAMESPACE,
+# worker-01 2026-09-08 12:24 UTC) and the whole install rolled back with a
+# boundary "failure" that measured nothing.
+principal_inaccessible_paths="-/etc/aicc -/etc/voyn -/home -/root -/var/lib/aicc-worker -/var/lib/aicc-agent -/var/lib/voyn-aicc-credential-rotation -/run/aicc-agent-launcher -/run/aicc-agent-workspace-binds -/run/credentials -/run/voyn-aicc-worker -/run/aicc-worker-lanes -/srv/aicc-quarantine"
 
 fail() {
   echo "AICC_AGENT_PRINCIPAL_BOUNDARY_FAIL: $*" >&2
