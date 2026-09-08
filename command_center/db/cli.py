@@ -194,6 +194,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="main",
         help="Remote branch to deploy from (the repository's default branch).",
     )
+    self_deploy.add_argument(
+        "--rollout-lock",
+        default="/run/aicc-staged-rollout.lock",
+        help="Marker file the staged worker rollout holds for its duration; "
+        "a tick that finds it present refuses rather than racing the "
+        "rollout's own lane mutations.",
+    )
 
     # The fleet's single-panel view over enrolled worker-host devices
     # (VOYN-MIN-FARM: "10 devices managed by one operational panel"). Reads
@@ -267,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
                 branch=args.branch,
                 services=tuple(args.restart),
                 migrate=args.migrate,
+                rollout_lock_path=args.rollout_lock,
             ),
         )
         print(f"{deploy_report.outcome.upper():10} {deploy_report.detail}")
