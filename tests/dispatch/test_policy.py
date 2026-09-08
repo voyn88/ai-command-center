@@ -361,3 +361,93 @@ def test_plan_is_deterministic_for_identical_input():
     assert [d.as_dict() for d in first.decisions] == [
         d.as_dict() for d in second.decisions
     ]
+
+
+# --------------------------------------------------------------------------
+# Critical zone (VOYN-AGT-ATTEST) — a Critical-priority task may only be
+# assigned to a certified executor, once the caller supplies attestation
+# evidence via `certified_executor_ids`.
+# --------------------------------------------------------------------------
+
+
+def test_certified_executor_ids_none_leaves_the_gate_off():
+    # No attestation evidence supplied at all: back-compat with every other
+    # test in this file that exercises Critical priority without it.
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan([_task("t1", priority="Critical")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_uncertified_executor_is_refused_a_critical_task():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1", priority="Critical")],
+        executors,
+        policy,
+        certified_executor_ids=frozenset(),
+    )
+
+    assert plan.assignments == ()
+    assert plan.deferred[0].reason == models.DEFER_NOT_CERTIFIED
+
+
+def test_certified_executor_is_assigned_a_critical_task():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1", priority="Critical")],
+        executors,
+        policy,
+        certified_executor_ids=frozenset({"claude_code"}),
+    )
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_uncertified_executor_still_takes_non_critical_work():
+    # The gate is scoped to the critical zone: an uncertified executor is not
+    # generally unusable, just not for Critical-priority tasks.
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1", priority="High")],
+        executors,
+        policy,
+        certified_executor_ids=frozenset(),
+    )
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_critical_task_skips_uncertified_executor_in_favor_of_a_certified_one():
+    policy = DispatchPolicy(cost_matrix={"cheap_uncertified": 0.0, "certified": 0.5})
+    executors = [
+        _executor("cheap_uncertified", cost=0.0),
+        _executor("certified", cost=0.5),
+    ]
+    plan = _plan(
+        [_task("t1", priority="Critical")],
+        executors,
+        policy,
+        certified_executor_ids=frozenset({"certified"}),
+    )
+
+    assert plan.assignments[0].assigned_executor == "certified"
+
+
+def test_certification_gate_never_force_runs_even_with_budget_to_spare():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.0)]
+    plan = _plan(
+        [_task("t1", priority="Critical")],
+        executors,
+        policy,
+        max_daily_spend_usd=100.0,
+        certified_executor_ids=frozenset(),
+    )
+
+    assert plan.assignments == ()
+    assert plan.projected_spend_usd == plan.daily_spend_usd

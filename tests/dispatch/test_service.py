@@ -220,6 +220,89 @@ def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
 
 
 # --------------------------------------------------------------------------
+# Critical zone (VOYN-AGT-ATTEST) — real attestation evidence, via
+# `attestation_config`, gates which executor a Critical-priority task reaches.
+# --------------------------------------------------------------------------
+
+
+def test_plan_refuses_a_critical_task_when_no_executor_is_certified(
+    monkeypatch, pool
+):
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1", priority="Critical")
+
+    plan = service.plan(ROOT)
+
+    # Nothing is recorded in `data/agent_attestation.json` yet -> both
+    # executors are uncertified -> the critical zone stays empty.
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_NOT_CERTIFIED
+
+
+def test_plan_assigns_a_critical_task_to_a_certified_executor(monkeypatch, pool):
+    from command_center.dispatch import attestation, attestation_config
+
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    attestation_config.save_record(
+        ROOT,
+        attestation.AttestationRecord(
+            agent_id="ollama",
+            test_results=(
+                attestation.CertificationCase(name="handles_denial", passed=True),
+            ),
+            critical_incidents=0,
+        ),
+    )
+    _queued_task(title="t1", priority="Critical")
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments[0].assigned_executor == "ollama"
+
+
+def test_plan_skips_an_executor_with_a_historical_critical_incident(
+    monkeypatch, pool
+):
+    from command_center.dispatch import attestation, attestation_config
+
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    attestation_config.save_record(
+        ROOT,
+        attestation.AttestationRecord(
+            agent_id="ollama",
+            test_results=(
+                attestation.CertificationCase(name="handles_denial", passed=True),
+            ),
+            critical_incidents=1,
+        ),
+    )
+    _queued_task(title="t1", priority="Critical")
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_NOT_CERTIFIED
+
+
+def test_non_critical_task_ignores_certification(monkeypatch, pool):
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1", priority="High")
+
+    plan = service.plan(ROOT)
+
+    # No attestation recorded, yet a non-critical task is still dispatched.
+    assert plan.assignments[0].assigned_executor == "ollama"
+
+
+# --------------------------------------------------------------------------
 # assign() applies through tasks_repository
 # --------------------------------------------------------------------------
 

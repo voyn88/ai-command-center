@@ -10,6 +10,10 @@ never reimplementing them:
 * spend ceiling      -> `pipeline_settings.max_daily_spend_usd`
 * kill switch        -> `pipeline_settings.enabled` (the master switch the
                         `task_pipeline.kill_switch` sets off)
+* critical-zone gate -> `attestation_config.load_records` + `attestation
+                        .evaluate_attestation` (VOYN-AGT-ATTEST: which
+                        executors are certified via test cases and historical
+                        incident data)
 
 `plan(...)` is a dry run (no writes). `assign(...)` applies the plan by
 recording the chosen executor onto each assigned task **through
@@ -27,7 +31,7 @@ from command_center import executors as executors_module
 from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
 from command_center.project_config import is_sensitive
-from command_center.dispatch import policy_config
+from command_center.dispatch import attestation, attestation_config, policy_config
 from command_center.dispatch.models import (
     DispatchPlan,
     DispatchPolicy,
@@ -147,6 +151,21 @@ def active_by_executor(db_path: Path) -> dict[str, int]:
     return counts
 
 
+def certified_executor_ids(root: Path) -> frozenset[str]:
+    """Executors currently certified for the critical zone (VOYN-AGT-ATTEST):
+    those whose persisted `AttestationRecord` evidence
+    `attestation.evaluate_attestation` certifies. Fail-closed by construction
+    — an executor with no record, an empty/failing test suite, or any
+    historical critical incident is simply absent from the returned set, so
+    `plan_dispatch` can never assign it a `Critical`-priority task."""
+    records = attestation_config.load_records(root)
+    return frozenset(
+        agent_id
+        for agent_id, record in records.items()
+        if attestation.evaluate_attestation(record).certified
+    )
+
+
 # --------------------------------------------------------------------------
 # Plan (dry run) and Assign (apply)
 # --------------------------------------------------------------------------
@@ -190,6 +209,7 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         kill_switch_engaged=kill_switch_engaged,
         budget_unknown=budget_unknown,
         active_by_executor=active_by_executor(resolved_db),
+        certified_executor_ids=certified_executor_ids(root),
     )
 
 

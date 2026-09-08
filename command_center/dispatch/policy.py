@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from command_center.dispatch.models import (
     ASSIGNED,
+    CRITICAL_ZONE_PRIORITY,
     DEFER_AGENT_BUDGET,
     DEFER_AGENT_CAPACITY,
     DEFER_COST_DATA_UNAVAILABLE,
@@ -44,6 +45,7 @@ from command_center.dispatch.models import (
     DEFER_KILL_SWITCH,
     DEFER_NO_AVAILABLE_EXECUTOR,
     DEFER_NO_ELIGIBLE_EXECUTOR,
+    DEFER_NOT_CERTIFIED,
     DEFER_PROJECT_BUDGET,
     DispatchDecision,
     DispatchPlan,
@@ -69,10 +71,13 @@ def _task_sort_key(task: QueuedTask, policy: DispatchPolicy) -> tuple:
 
 
 def _eligible_executors(
-    task: QueuedTask, executors: dict[str, ExecutorProfile]
+    task: QueuedTask,
+    executors: dict[str, ExecutorProfile],
+    certified_executor_ids: frozenset[str] | None,
 ) -> tuple[list[ExecutorProfile], str | None]:
     """Return the executors permitted for `task`, and a defer reason when the
-    permitted set is empty or none of it is available.
+    permitted set is empty, none of it is available, or (for a critical-zone
+    task, once `certified_executor_ids` is supplied) none of it is certified.
 
     Order of the returned list is not yet cost-ordered — the caller sorts it.
     """
@@ -90,6 +95,19 @@ def _eligible_executors(
     available = [ex for ex in permitted if ex.available]
     if not available:
         return [], DEFER_NO_AVAILABLE_EXECUTOR
+
+    # VOYN-AGT-ATTEST: the critical zone. `certified_executor_ids is None`
+    # means the caller did not supply attestation evidence for this call (a
+    # pure-engine test exercising something else) — the gate only engages
+    # once a caller actually passes a set, so `dispatch.service` is where this
+    # is fail-closed for real (an unrecorded/uncertified agent's id is simply
+    # absent from the set it builds).
+    if certified_executor_ids is not None and task.priority == CRITICAL_ZONE_PRIORITY:
+        certified = [ex for ex in available if ex.id in certified_executor_ids]
+        if not certified:
+            return [], DEFER_NOT_CERTIFIED
+        available = certified
+
     return available, None
 
 
@@ -113,9 +131,16 @@ def plan_dispatch(
     kill_switch_engaged: bool,
     budget_unknown: bool = False,
     active_by_executor: dict[str, int] | None = None,
+    certified_executor_ids: frozenset[str] | None = None,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
-    guarantees this function structurally enforces."""
+    guarantees this function structurally enforces.
+
+    `certified_executor_ids`, when supplied, gates the critical zone
+    (VOYN-AGT-ATTEST, `CRITICAL_ZONE_PRIORITY`): a `Critical`-priority task can
+    only be assigned to an executor whose id is in this set. `None` (the
+    default) leaves the gate off, for callers that don't supply attestation
+    evidence; `dispatch.service` always supplies a real, fail-closed set."""
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
 
@@ -155,7 +180,9 @@ def plan_dispatch(
     decisions: list[DispatchDecision] = []
 
     for task in ordered:
-        candidates, empty_reason = _eligible_executors(task, executor_by_id)
+        candidates, empty_reason = _eligible_executors(
+            task, executor_by_id, certified_executor_ids
+        )
         if empty_reason is not None:
             decisions.append(
                 DispatchDecision(

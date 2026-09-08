@@ -8,6 +8,23 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — agent attestation gates the critical zone (`VOYN-AGT-ATTEST`)
+- `command_center/dispatch/attestation.py` — the pure certification decision:
+  an agent is certified only if its recorded evidence carries at least one
+  certification test case, every recorded case passed, and it has zero
+  historical critical incidents. Fail-closed by construction, same shape as
+  `delivery_gate`.
+- `command_center/dispatch/attestation_config.py` — single writer of
+  `data/agent_attestation.json`, mirroring `policy_config`'s atomic-write /
+  advisory-lock primitives.
+- `dispatch.policy.plan_dispatch` takes an optional `certified_executor_ids`
+  set; when supplied, a `Critical`-priority task (`models.CRITICAL_ZONE_PRIORITY`)
+  can only be assigned to a certified executor, deferring with the new
+  `DEFER_NOT_CERTIFIED` reason otherwise. `dispatch.service.plan` always
+  supplies a real set built from persisted attestation evidence, so an
+  agent with no record — or a failing/incomplete one — is simply absent from
+  the critical zone rather than defaulting into it.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,
