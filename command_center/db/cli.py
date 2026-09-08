@@ -478,7 +478,14 @@ def main(argv: list[str] | None = None) -> int:
                         "implementation dispatch paused: review backlog at "
                         f"{report.review_window_full} "
                         "(PlanLimits.review_backlog_limit)"
+                        + (
+                            "; lanes idle, dispatching this tick anyway"
+                            if report.idle_trickle
+                            else f"; {report.fenced} functional candidate(s) held"
+                        )
                     )
+                for task_id in report.pipeline_bypass:
+                    print(f"PIPELINE  {task_id}: dispatched past the review fence")
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
