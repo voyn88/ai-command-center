@@ -14,18 +14,26 @@ ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 
-LABEL_NOISE_GUARD = (
+LABEL_NOISE = (
     "github.event_name == 'pull_request' && (github.event.action == 'labeled' "
     "|| github.event.action == 'unlabeled') && !startsWith(github.event.label.name, "
-    "'release-gate-canary-')"
+    "'release-gate-canary-') && !(github.event.action == 'labeled' && "
+    "(github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))"
 )
+OUTSIDE_WINDOW = (
+    "github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, "
+    "'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') "
+    "&& !startsWith(github.event.label.name, 'release-gate-canary-')"
+)
+#: The guard every gated job negates: label noise OR outside the review window.
+LABEL_NOISE_GUARD = f"({LABEL_NOISE}) || ({OUTSIDE_WINDOW})"
 
 
 def _context_name(job: dict) -> str:
     """The check-run name a non-noise run reports. Required-context jobs carry
     the label-noise rename (see test_label_noise_never_cancels_or_reruns_the_head_gates)."""
     name = job["name"]
-    prefix = "${{ (" + LABEL_NOISE_GUARD + ") && 'Label event (no gate ran)' || '"
+    prefix = "${{ (" + LABEL_NOISE_GUARD + ") && 'Gate not run (label noise or outside review window)' || '"
     if name.startswith(prefix) and name.endswith("' }}"):
         return name[len(prefix):-len("' }}")]
     return name
@@ -556,7 +564,7 @@ def test_label_noise_never_cancels_or_reruns_the_head_gates():
             "acceptance-gate": "Acceptance gate (independent verdict on exact SHA)",
         }[required_job]
         assert required_name == (
-            f"${{{{ ({LABEL_NOISE_GUARD}) && 'Label event (no gate ran)' || '{real_name}' }}}}"
+            f"${{{{ ({LABEL_NOISE_GUARD}) && 'Gate not run (label noise or outside review window)' || '{real_name}' }}}}"
         ), (workflow_name, required_name)
     # Never traded for dropping the canary triggers: the release-gate canaries
     # still need a fresh event carrying the label.

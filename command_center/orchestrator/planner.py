@@ -75,6 +75,17 @@ class PlanReport:
     #: limit` this tick (None when the fence never fired). Ingest and the
     #: DEFER_TO_USER resume reconcile still ran -- only dispatch paused.
     review_window_full: int | None = None
+    #: Pipeline-class tasks dispatched THROUGH the review-backlog fence this
+    #: tick: work that repairs CI, review, merge train, planner or queue must
+    #: never wait behind the backlog it exists to drain
+    #: (VOYN-W0-AICC-PLANNER-PIPELINE-CLASS-PRIORITY-AND-WINDOW-PAUSE).
+    pipeline_bypass: list[str] = field(default_factory=list)
+    #: The fence fired while no execution work item was ready or claimed:
+    #: idle lanes are pure waste, so the tick dispatches its ordinary bounded
+    #: batch anyway (backpressure resumes as soon as a lane has work).
+    idle_trickle: bool = False
+    #: Functional candidates held back by the fence this tick (count only).
+    fenced: int = 0
 
 
 # Repo → (canonical project_id, worker-host repository path). The worker's
@@ -267,6 +278,8 @@ class Planner:
             # purpose (gate new dispatch). Ingest and the resume reconcile
             # both run unconditionally above; only the candidate/dispatch
             # loop below is skipped when the fence fires.
+            fence_active = False
+            lanes_idle = False
             if limits.review_backlog_limit > 0:
                 (review_backlog,) = self._row(
                     "SELECT count(DISTINCT t.task_id) FROM backlog_task t "
@@ -278,15 +291,36 @@ class Planner:
                 review_backlog = int(review_backlog)
                 if review_backlog >= limits.review_backlog_limit:
                     report.review_window_full = review_backlog
-                    return report
+                    fence_active = True
+                    # Backpressure exists to keep review from drowning, not to
+                    # idle the fleet: with nothing ready or claimed on the
+                    # execution queue the fence holds nothing back this tick
+                    # (observed 2026-09-08: four lanes idle for hours at
+                    # review backlog 164 while accepted PRs waited on CI).
+                    (live_items,) = self._row(
+                        "SELECT count(*) FROM work_item_public "
+                        "WHERE queue = 'execution' "
+                        "  AND state IN ('ready', 'claimed')",
+                        (),
+                    )
+                    lanes_idle = int(live_items) == 0
+                    report.idle_trickle = lanes_idle
 
             candidates = self._rows(
-                "SELECT task_id, wave, priority, title, body, repo, dispatchable "
+                "SELECT task_id, wave, priority, title, body, repo, dispatchable, "
+                "       task_class "
                 "FROM backlog_eligible"
             )
-            for task_id, wave, priority, title, body, repo, dispatchable in candidates:
+            for (
+                task_id, wave, priority, title, body, repo, dispatchable, task_class,
+            ) in candidates:
                 if len(report.dispatched) >= limits.max_dispatches_per_tick:
                     break
+                if fence_active and not lanes_idle and task_class != "pipeline":
+                    report.fenced += 1
+                    continue
+                if fence_active and task_class == "pipeline":
+                    report.pipeline_bypass.append(task_id)
                 task = {
                     "task_id": task_id,
                     "wave": wave,
