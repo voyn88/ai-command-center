@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 from contextlib import nullcontext
@@ -1815,8 +1816,6 @@ def test_read_only_isolated_checkout_failure_is_retryable(handler, monkeypatch) 
 
 
 def _git_repo_with_one_commit(path: Path) -> str:
-    import subprocess
-
     path.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
     subprocess.run(["git", "-C", str(path), "-c", "user.email=t@t", "-c", "user.name=t",
@@ -1825,9 +1824,7 @@ def _git_repo_with_one_commit(path: Path) -> str:
                           capture_output=True, text=True, check=True).stdout.strip()
 
 
-def _git(*argv: str) -> "subprocess.CompletedProcess[str]":
-    import subprocess
-
+def _git(*argv: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *argv], capture_output=True, text=True)
 
 
