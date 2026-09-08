@@ -307,3 +307,97 @@ def test_main_skip_workers_reads_queue_without_inspecting_systemd(
 
     assert result == 0
     assert json.loads(capsys.readouterr().out)["queue"]["succeeded"] == 1
+
+
+def _queue(**kw):
+    from command_center.ops.infra_monitor import QueueSnapshot
+
+    base = dict(ready=3, claimed=2, succeeded=100, dead=0, success_age_seconds=200.0,
+                pending_age_seconds=60.0, recent_dead=0)
+    base.update(kw)
+    return QueueSnapshot(**base)
+
+
+def test_executor_quota_refusals_are_their_own_failure_class() -> None:
+    from command_center.ops.infra_monitor import evaluate
+
+    report = evaluate({"voyn-aicc-worker@1.service": "active"}, _queue(recent_dead=2, recent_quota_dead=2),
+                      minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True,
+                      max_recent_dead=5)
+    assert "executor_quota_exhausted:2" in report.failures
+    assert not any(f.startswith("dead_letter_growth") for f in report.failures)
+
+
+def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> None:
+    from command_center.ops.infra_monitor import evaluate
+
+    # Pending age keeps resetting (items re-claimed), so queue_stalled does
+    # not fire -- but nothing succeeded for an hour while work is waiting.
+    report = evaluate({"voyn-aicc-worker@1.service": "active"}, _queue(recent_succeeded=0),
+                      minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True)
+    assert report.failures == ("throughput_stalled:0_succeeded_in_1h",)
+    healthy = evaluate({"voyn-aicc-worker@1.service": "active"}, _queue(recent_succeeded=4),
+                       minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True)
+    assert healthy.ok
+
+
+def test_findings_are_recorded_and_cleared_through_the_definer_functions(monkeypatch) -> None:
+    from command_center.ops import infra_monitor
+
+    calls: list[tuple] = []
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): calls.append((sql.strip(), params))
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _Cur()
+        def commit(self): calls.append(("commit", None))
+
+    class _Pool:
+        @staticmethod
+        def open_pool(cfg): calls.append(("open", None))
+        @staticmethod
+        def connection(): return _Conn()
+        @staticmethod
+        def close_pool(): calls.append(("close", None))
+
+    import sys
+    import types
+    fake_db = types.ModuleType("command_center.db")
+    fake_db.pool = _Pool
+    fake_cfg = types.ModuleType("command_center.db.config")
+    fake_cfg.load_config = lambda: {}
+    monkeypatch.setitem(sys.modules, "command_center.db", fake_db)
+    monkeypatch.setitem(sys.modules, "command_center.db.pool", _Pool)
+    monkeypatch.setitem(sys.modules, "command_center.db.config", fake_cfg)
+    infra_monitor.record_findings("worker-01:infra", ("active_workers:2<4",), {"x": 1})
+    assert any("monitor_record_finding" in c[0] and c[1][:2] == ("worker-01:infra", "active_workers:2<4") for c in calls)
+    calls.clear()
+    infra_monitor.record_findings("worker-01:infra", (), {})
+    assert any("monitor_clear_finding" in c[0] for c in calls)
+
+
+def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(monkeypatch, capsys) -> None:
+    """Review of fc167cf7: a healthy measurement whose persistence failed
+    exited 0, so a broken finding store passed unnoticed. Fail closed."""
+    monkeypatch.setattr(
+        infra_monitor, "discover_worker_units", lambda: {"voyn-aicc-worker@1.service": "active"}
+    )
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor,
+        "record_findings",
+        lambda source, failures, detail: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+    result = infra_monitor.main(
+        ["--minimum-active-workers", "1", "--skip-queue", "--prometheus-url", "http://m/ready",
+         "--record-findings", "worker-01:infra"]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True and out["findings_recorded"] is False
+    assert "db down" in out["findings_error"]
+    assert result == 1

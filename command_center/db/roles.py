@@ -123,6 +123,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_event",
     "backlog_evidence",
     "backlog_task",
+    "monitor_finding",
     "backlog_task_remediation",
     "backlog_scan_cursor",
     "backlog_writer_lease",
@@ -272,6 +273,16 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
 # PostgreSQL authority must expose a dedicated CAS function, never blanket DML.
 _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
     "run_finalization_claim": _NONE,
+}
+
+# Fail-closed monitor findings (0021): every write travels through a SECURITY
+# DEFINER function -- record/clear (control plane and worker hosts, so the
+# worker-host probe can record) and monitor_link_task (control plane only,
+# the one field it sets). The control plane READS the table and nothing more;
+# a blanket UPDATE here would have let the web layer's role rewrite what a
+# monitor measured (adversarial review of fb837255).
+_MONITOR_FINDING_TABLES: dict[str, frozenset[str]] = {
+    "monitor_finding": _READ,
 }
 
 # The structured backlog store (0005, BO-S1), the queue-claim idiom again:
@@ -523,6 +534,9 @@ _WORKER_FUNCTIONS = (
     "queue_heartbeat(text, text)",
     "queue_complete(text, text, jsonb)",
     "queue_fail(text, text, text, boolean)",
+    # 0021: the worker-host fail-closed probe records what it measured.
+    "monitor_record_finding(text, text, jsonb)",
+    "monitor_clear_finding(text)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a
@@ -561,6 +575,15 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # 0021: read-only deploy preflight with dispatch's privileges; the task
+    # class setter the planner uses for split children and monitor tasks; the
+    # monitor-finding record/clear pair (shared with worker hosts, see
+    # _WORKER_FUNCTIONS) and the control-plane-only task link.
+    "backlog_dispatch_smoke()",
+    "backlog_set_task_class(text, text)",
+    "monitor_record_finding(text, text, jsonb)",
+    "monitor_clear_finding(text)",
+    "monitor_link_task(bigint, text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
@@ -643,6 +666,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                         and table not in _APP_ENROLMENT_TABLES
                         and table not in _APP_BACKLOG_TABLES
                         and table not in _FINALIZATION_CLAIM_TABLES
+                        and table not in _MONITOR_FINDING_TABLES
                     },
                     # Declared policies. A second task adding rows here for a
                     # table this one already names must union with it, not
@@ -651,6 +675,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _APP_ENROLMENT_TABLES,
                     _APP_BACKLOG_TABLES,
                     _FINALIZATION_CLAIM_TABLES,
+                    _MONITOR_FINDING_TABLES,
                 )
             ),
             WORKER_ROLE: MappingProxyType(

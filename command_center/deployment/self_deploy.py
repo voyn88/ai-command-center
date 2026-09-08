@@ -131,6 +131,17 @@ def _import_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess[s
     )
 
 
+def _dispatch_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess[str]:
+    """`backlog_dispatch_smoke()` (0021) through the deployed code and the
+    control plane's own role: a read of `backlog_eligible` and the wave
+    candidate under the same SECURITY DEFINER the planner's dispatch uses."""
+    return _run_bounded(
+        [sys.executable, "-m", "command_center.db", "backlog-plan", "--smoke"],
+        timeout,
+        cwd=repo_path,
+    )
+
+
 def _record_provenance(cfg: SelfDeployConfig, report: SelfDeployReport) -> None:
     try:
         path = Path(cfg.provenance_path).expanduser()
@@ -273,6 +284,19 @@ def self_deploy_once(
         # rolled back, which is true whether or not anything actually
         # changed.
         report.steps.append("database_upgrade_ran_not_rolled_back")
+        # A migration can leave the schema importable yet unusable by the
+        # control plane (0019 recreated a view under the wrong owner; every
+        # planner tick died for 18 minutes while import-smoke was green).
+        # Exercise exactly the privileges dispatch needs before any service
+        # restarts; a refusal rolls the checkout and services back.
+        dispatch_smoke = _dispatch_smoke(repo_path, timeout)
+        if dispatch_smoke.returncode != 0:
+            return rollback(
+                "dispatch_smoke_failed_after_migration: "
+                f"{(dispatch_smoke.stderr or dispatch_smoke.stdout).strip()[:150]}",
+                services_touched=False,
+            )
+        report.steps.append("dispatch_smoke_passed")
 
     # A completed `db upgrade` is deliberately NOT rolled back on a later
     # restart failure: this codebase's migration policy is expand-contract
