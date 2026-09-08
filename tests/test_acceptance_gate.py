@@ -287,7 +287,15 @@ def test_the_gate_re_runs_when_the_verdict_arrives_after_ci() -> None:
 
 def test_the_check_name_is_the_one_branch_protection_can_require() -> None:
     (job,) = _workflow()["jobs"].values()
-    assert job["name"] == "Acceptance gate (independent verdict on exact SHA)"
+    # On a real run the context is exactly the required name. On a label-noise
+    # run (a `queue-*` label event, VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA) the
+    # job is skipped under a different name, so a skipped job -- which GitHub
+    # counts as success for required checks -- can never stand in for the
+    # verdict on the head. The guard is asserted in tests/test_release_gate_policy.py.
+    name = job["name"]
+    assert name.endswith("|| 'Acceptance gate (independent verdict on exact SHA)' }}")
+    assert name.startswith("${{ (github.event_name == 'pull_request' && (github.event.action == 'labeled'")
+    assert "'Label event (no gate ran)'" in name
 
 
 def test_the_gate_asks_for_no_more_access_than_it_reads() -> None:
