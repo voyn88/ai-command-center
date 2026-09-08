@@ -626,6 +626,113 @@ extension SnapshotRemoteStore {
     }
 }
 
+// MARK: - Home screen widget snippets (VOYN-MIN-WIDGET-SNIP)
+
+/// The three action-bearing flows a home screen widget can summarize. Fixed
+/// at three by design: Work, Dialogues and Decisions are the surfaces with a
+/// single next action an owner can take without opening the full app (see
+/// `docs/aicc_native/NAVIGATION_AND_UX_ARCHITECTURE.md`: "Widgets and push
+/// open the relevant decision, conversation or incident, never a generic
+/// home screen.").
+public enum WidgetFlow: String, Codable, CaseIterable, Identifiable, Hashable, Sendable {
+    case work, dialogues, decisions
+    public var id: Self { self }
+}
+
+/// Where a widget's one action takes the owner. Always a deep link into the
+/// app, never a silent mutation: `POST /v1/commands` is deliberately out of
+/// v1 read scope (`docs/aicc_native/contracts/v1/README.md`), so a widget
+/// cannot act on the owner's behalf yet — only open the exact place to act.
+public enum WidgetDestination: Equatable, Sendable {
+    case task(id: String)
+    case dialogue(id: String)
+    case flowInbox(WidgetFlow)
+}
+
+/// A one-action, one-status snapshot for a single flow: what a home screen
+/// widget shows, and the one place tapping it opens. WidgetKit's
+/// `TimelineEntry` conformance belongs at the widget-extension layer; this
+/// type stays here so the snapshot logic is unit-testable without one.
+public struct WidgetIntentSnippet: Identifiable, Equatable, Sendable {
+    public let flow: WidgetFlow
+    public let statusLine: String
+    public let actionTitle: String
+    public let destination: WidgetDestination
+    public var id: WidgetFlow { flow }
+
+    public init(flow: WidgetFlow, statusLine: String, actionTitle: String, destination: WidgetDestination) {
+        self.flow = flow; self.statusLine = statusLine; self.actionTitle = actionTitle; self.destination = destination
+    }
+}
+
+extension Snapshot {
+    /// Exactly one snippet per `WidgetFlow`, in `WidgetFlow.allCases` order —
+    /// a widget gallery always offers all three flows, never a subset, even
+    /// when a flow currently has nothing that needs the owner.
+    public func widgetSnippets(dialogs: [DialogSummary] = []) -> [WidgetIntentSnippet] {
+        WidgetFlow.allCases.map { flow in
+            switch flow {
+            case .work: return Self.workSnippet(tasks: tasks)
+            case .dialogues: return Self.dialoguesSnippet(dialogs: dialogs)
+            case .decisions: return Self.decisionsSnippet()
+            }
+        }
+    }
+
+    // The blocked task first — it is the one thing standing still on the
+    // owner; otherwise the highest-priority active task. Mirrors the
+    // attention-before-active ordering the Work tab itself uses.
+    private static func workSnippet(tasks: [Task]) -> WidgetIntentSnippet {
+        if let blocked = tasks.first(where: { $0.blocker != nil }), let reason = blocked.blocker {
+            return WidgetIntentSnippet(flow: .work, statusLine: reason, actionTitle: "Открыть задачу", destination: .task(id: blocked.id))
+        }
+        if let active = tasks.first(where: { $0.state != .done && $0.evidence.derivedStatus != .completed }) {
+            return WidgetIntentSnippet(flow: .work, statusLine: statusLine(for: active), actionTitle: "Открыть задачу", destination: .task(id: active.id))
+        }
+        return WidgetIntentSnippet(flow: .work, statusLine: "Сейчас всё спокойно.", actionTitle: "Открыть работу", destination: .flowInbox(.work))
+    }
+
+    private static func dialoguesSnippet(dialogs: [DialogSummary]) -> WidgetIntentSnippet {
+        guard let latest = dialogs.max(by: { ($0.lastActivityAt ?? .distantPast) < ($1.lastActivityAt ?? .distantPast) }) else {
+            return WidgetIntentSnippet(flow: .dialogues, statusLine: "Пока тихо.", actionTitle: "Открыть диалоги", destination: .flowInbox(.dialogues))
+        }
+        return WidgetIntentSnippet(
+            flow: .dialogues,
+            statusLine: "\(latest.title) · сообщений: \(latest.messageCount)",
+            actionTitle: "Открыть диалог",
+            destination: .dialogue(id: latest.id)
+        )
+    }
+
+    // No decisions DTO exists yet — the tab is still a static fixture card
+    // (see AICCNativeApp's DecisionsView) — so a widget must not fabricate a
+    // pending decision it cannot back with real data. Stays a calm,
+    // deterministic inbox pointer until that contract lands.
+    private static func decisionsSnippet() -> WidgetIntentSnippet {
+        WidgetIntentSnippet(flow: .decisions, statusLine: "Нет решений, ожидающих вас.", actionTitle: "Открыть решения", destination: .flowInbox(.decisions))
+    }
+
+    private static func statusLine(for task: Task) -> String {
+        if let state = task.state {
+            switch state {
+            case .backlog: return "В планах."
+            case .next: return "Следующая в очереди."
+            case .inProgress: return "В работе."
+            case .review: return "На проверке."
+            case .done: return "Завершена."
+            case .deferred: return "Ждёт вашего решения."
+            }
+        }
+        switch task.evidence.derivedStatus {
+        case .inProgress: return "В работе."
+        case .awaitingCI: return "Идут проверки."
+        case .awaitingAcceptance: return "Ждёт приёмки."
+        case .completed: return "Завершена."
+        case .unknown: return "Состояние уточняется."
+        }
+    }
+}
+
 // MARK: - Last-snapshot persistence (offline start)
 
 /// Persists the last successfully fetched snapshot so a restart without
