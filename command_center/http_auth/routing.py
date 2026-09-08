@@ -57,8 +57,13 @@ MUTATING_VERBS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 #: surfaces: ``command_center/api/app.py`` (30: the original 27 plus the
 #: chat-text backlog intake draft/confirm, VOYN-W0-APP-CONTROL-S6a, plus the
 #: backlog reassign, VOYN-W0-APP-CONTROL-S6d) and
-#: ``command_center/webapi/app.py`` (3: two dispatch writes and the queue
-#: audit enqueue, VOYN-W0-APP-CONTROL-S1/S4).
+#: ``command_center/webapi/app.py`` (6: two dispatch writes, the queue audit
+#: enqueue (VOYN-W0-APP-CONTROL-S1/S4), and the same backlog intake
+#: draft/confirm + reassign trio mounted a second time here so the owner's
+#: browser client — which only ever talks to this app — can reach them
+#: (VOYN-W0-APP-CONTROL-S6a/S6c/S6d)). Each (method, path) key is shared by
+#: both mounts, so one entry guards the operation identically wherever it is
+#: included.
 ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     # -- command_center/api/wave1_routes.py -------------------------------
     ("POST", "/api/v1/proposals"): "proposals:create",

@@ -26,8 +26,20 @@ from command_center.webapi.app import create_app as create_webapi_app
 #: The premise this task started from was "two endpoints"; the inventory found
 #: 29. Pinning the number means growing the surface is a deliberate edit here
 #: rather than a silent drift back towards an uncounted one.
-EXPECTED_MUTATING_ROUTES = 33  # 29 from AUTH-HTTP-01 + queue:audit:enqueue (APP-CONTROL-S1/S4)
-# + backlog:intake:draft/confirm (APP-CONTROL-S6a) + backlog:reassign (APP-CONTROL-S6d)
+EXPECTED_MUTATING_ROUTES = 36  # 29 from AUTH-HTTP-01 + queue:audit:enqueue (APP-CONTROL-S1/S4)
+# + backlog:intake:draft/confirm (APP-CONTROL-S6a) + backlog:reassign (APP-CONTROL-S6d),
+# each counted once on command_center/api/app.py (+3) and once again on
+# command_center/webapi/app.py (+3), which now mounts the same three routes
+# so the owner's browser client can reach them (APP-CONTROL-S6a/S6c/S6d).
+
+#: The same surface, but as the number of *distinct* (verb, path) pairs
+#: rather than mount points: three of the 36 mounts above are the backlog
+#: intake/reassign trio deliberately mounted on both apps, so a dict keyed by
+#: (verb, path) collapses them to one entry each. Both apps still enforce
+#: the identical guard on each — that is exactly what the sweeps below
+#: check — so 3 fewer than EXPECTED_MUTATING_ROUTES is the correct count
+#: here, not a discrepancy.
+EXPECTED_DISTINCT_MUTATING_ROUTES = 33
 
 
 def _apps():
@@ -72,7 +84,7 @@ def test_every_mutating_route_refuses_an_unauthenticated_caller(platform, grants
 
     not_401 = {route: status for route, status in refused.items() if status != 401}
     assert not_401 == {}, f"reachable without a credential: {not_401}"
-    assert len(refused) == EXPECTED_MUTATING_ROUTES
+    assert len(refused) == EXPECTED_DISTINCT_MUTATING_ROUTES
     assert platform.calls == [], "an absent credential costs no platform round trip"
 
 

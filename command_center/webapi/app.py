@@ -38,6 +38,7 @@ from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from command_center.api import backlog_intake_routes, backlog_reassign_routes, backlog_routes
 from command_center.dispatch.api import create_dispatch_router
 from command_center.http_auth.routing import enforce, validate_routing
 from command_center.webapi.queue_routes import create_queue_router
@@ -159,6 +160,21 @@ def create_app() -> FastAPI:
     # the router (they expose run transcripts — see queue_routes.py for the
     # recorded read-auth decision under VOYN-W0-AICC-AUTH-HTTP-02).
     app.include_router(create_queue_router(), dependencies=[Depends(enforce)])
+
+    # Postgres-backed autonomous delivery backlog (VOYN-W0-APP-CONTROL-S6a/
+    # S6c/S6d): the owner's Tasks screen shows decomposition/progress from
+    # `GET /api/v1/backlog/*` and can create or reprioritize tasks by chat or
+    # voice (`POST .../intake/draft`, `.../intake/confirm`,
+    # `.../tasks/{id}/reassign`). Mounted here — not only on
+    # `command_center.api.app` (the wave-1 app) — because this process is the
+    # one actually served to the owner's Mac/iPhone at the same origin as the
+    # SPA; `command_center.api.app` has no browser client pointed at it. The
+    # two apps share `ROUTE_OPERATIONS` by (method, path), so the same three
+    # mutating operations are guarded identically wherever they are mounted,
+    # and `validate_routing` below proves it for this app too.
+    app.include_router(backlog_routes.router, dependencies=[Depends(enforce)])
+    app.include_router(backlog_intake_routes.router, dependencies=[Depends(enforce)])
+    app.include_router(backlog_reassign_routes.router, dependencies=[Depends(enforce)])
 
     # Fail closed at boot: an unrouted mutating route stops the process here,
     # in the environment that matters, not only in a CI report.
