@@ -764,13 +764,21 @@ def _lane_inputs_visible(
         return f"{config} is not readable on the host: {exc}"
     except ValueError as exc:
         return f"{config} is not valid JSON: {exc}"
-    repositories = tuple(
-        str(entry["repository_path"])
-        for entry in (overrides.values() if isinstance(overrides, dict) else ())
-        if isinstance(entry, dict) and entry.get("repository_path")
-    )
-    if not repositories:
-        return f"{config} configures no repository_path: every task would fail"
+    if not isinstance(overrides, dict) or not overrides:
+        return f"{config} configures no project: every task would fail"
+    # EVERY project entry must name an absolute repository_path -- a task for
+    # a project without one fails with "repository path not configured", so
+    # skipping such an entry would let exactly that configuration pass
+    # (review of 39981fc9).
+    repositories: list[str] = []
+    for project_id, entry in overrides.items():
+        path = entry.get("repository_path") if isinstance(entry, dict) else None
+        if not isinstance(path, str) or not path.startswith("/"):
+            return (
+                f"{config}: project {project_id!r} has no absolute repository_path: "
+                "its tasks would fail with 'repository path not configured'"
+            )
+        repositories.append(path)
     gid = _process_gid(pid)
     enter = ["nsenter", "-t", str(pid), "-m", "-S", str(uid), "-G", str(gid), "--"]
     # `env -i` + the lane's own variables: the probe must see the clone the

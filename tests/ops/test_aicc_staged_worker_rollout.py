@@ -1374,7 +1374,6 @@ def test_lane_inputs_probe_reads_the_config_on_the_host_and_tests_each_path_in_t
         json.dumps({
             "AICC": {"repository_path": "/home/voynadmin/Projects/ai-command-center"},
             "AIOS": {"repository_path": "/home/voynadmin/Projects/aios"},
-            "X": {"allowed_agents": ["claude_code"]},
         }),
         encoding="utf-8",
     )
@@ -1405,7 +1404,19 @@ def test_lane_inputs_probe_refuses_a_config_without_any_repository_path(tmp_path
     assert "is not readable on the host" in real._lane_inputs_visible(1, 1002, str(tmp_path / "missing"))
     (tmp_path / "project_config.json").write_text("{}", encoding="utf-8")
     assert real._lane_inputs_visible(1, 1002, str(tmp_path)) == (
-        f"{tmp_path / 'project_config.json'} configures no repository_path: every task would fail"
+        f"{tmp_path / 'project_config.json'} configures no project: every task would fail"
     )
+    # A mixed configuration is refused too: one valid project does not excuse
+    # another whose tasks would fail (review of 39981fc9).
+    (tmp_path / "project_config.json").write_text(
+        json.dumps({"AICC": {"repository_path": "/srv/x"}, "AIOS": {"allowed_agents": ["claude_code"]}}),
+        encoding="utf-8",
+    )
+    failure = real._lane_inputs_visible(1, 1002, str(tmp_path))
+    assert "project 'AIOS' has no absolute repository_path" in failure
+    (tmp_path / "project_config.json").write_text(
+        json.dumps({"AICC": {"repository_path": "relative/path"}}), encoding="utf-8"
+    )
+    assert "project 'AICC' has no absolute repository_path" in real._lane_inputs_visible(1, 1002, str(tmp_path))
     (tmp_path / "project_config.json").write_text("not json", encoding="utf-8")
     assert "is not valid JSON" in real._lane_inputs_visible(1, 1002, str(tmp_path))

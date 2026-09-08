@@ -1828,6 +1828,11 @@ def test_the_worker_data_dir_parent_stays_root_owned():
     )
     assert "install -d -m 0755 -o root -g root /var/lib/aicc\n" in text
     assert "install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc/data\n" in text
+    # No worker-owned install may name the parent as a target, in any
+    # position or order (review of 39981fc9: the first version only rejected
+    # one ordering).
     for line in text.splitlines():
-        if "-o aicc-worker" in line and "/var/lib/aicc " in line + " ":
-            assert "/var/lib/aicc/data" in line and "/var/lib/aicc /var/lib/aicc/data" not in line, line
+        if "install" in line and "-o aicc-worker" in line:
+            targets = [word for word in line.split() if word.startswith("/")]
+            assert "/var/lib/aicc" not in targets, line
+            assert targets == ["/var/lib/aicc/data"] or "/var/lib/aicc" not in " ".join(targets), line
