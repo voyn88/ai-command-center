@@ -103,6 +103,50 @@ run_release() {
     --lock-fd "$AICC_INSTALL_LOCK_FD"
 }
 
+aios_artifact_store=/var/lib/aicc-artifacts
+
+install_aios_wheels() {
+  staging=$1
+  for lock in aios-sdk.lock.json aios-db.lock.json; do
+    spec=$(/usr/bin/python3 - "$staging/$lock" <<'PY'
+import json
+import re
+import sys
+
+lock = json.load(open(sys.argv[1], encoding="utf-8"))
+name = lock["wheel_filename"]
+digest = lock["wheel_sha256"]
+if not re.fullmatch(r"[A-Za-z0-9_.-]+\.whl", name) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+    raise SystemExit("invalid AIOS artifact lock")
+print(name, digest)
+PY
+)
+    name=${spec% *}
+    digest=${spec#* }
+    wheel="$aios_artifact_store/$digest/$name"
+    if [ -L "$wheel" ] || [ ! -f "$wheel" ]; then
+      echo "AIOS artifact missing from the root store: $wheel (stage the accepted wheel, sha256 $digest)" >&2
+      exit 1
+    fi
+    if [ "$(stat -c %u:%g -- "$wheel")" != 0:0 ] || \
+       find "$wheel" -maxdepth 0 -perm /022 -print -quit | grep -q . || \
+       [ "$(stat -c %u:%g -- "$aios_artifact_store")" != 0:0 ] || \
+       find "$aios_artifact_store" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
+      echo "AIOS artifact store is not root-owned and immutable: $wheel" >&2
+      exit 1
+    fi
+    if ! printf '%s  %s\n' "$digest" "$wheel" | sha256sum -c --quiet -; then
+      echo "AIOS artifact digest mismatch: $wheel" >&2
+      exit 1
+    fi
+    printf '%s --hash=sha256:%s\n' "$wheel" "$digest" > "$staging/.aios-requirements.txt"
+    "$staging/.venv/bin/python" -m pip install \
+      --disable-pip-version-check --no-deps --require-hashes \
+      -r "$staging/.aios-requirements.txt"
+    rm -f "$staging/.aios-requirements.txt"
+  done
+}
+
 stage_immutable_release() {
   release_id=$(git_trusted -C "$repo_root" rev-parse --verify HEAD)
   case "$release_id" in
@@ -137,9 +181,19 @@ stage_immutable_release() {
     "$release_staging/.venv/bin/python" -m pip install \
       --disable-pip-version-check --require-hashes \
       -r "$release_staging/requirements-ci-linux.lock"
+    # The worker imports `aios_db` (and the SDK) which the lock does not carry:
+    # CI fetches them from the private aios release with a read-only token.
+    # A root installer holds no such token, so it installs the exact accepted
+    # wheels from the root-owned digest-addressed store, verified against the
+    # release's own lock files -- and refuses otherwise. Without this the lane
+    # started and died at once with "No module named 'aios_db'" (worker-01,
+    # 2026-09-08, first canary start after #823/#858).
+    install_aios_wheels "$release_staging"
     PYTHONPATH="$release_staging" "$release_staging/.venv/bin/python" - <<'PY'
+import aios_db
+import aios_sdk
 from command_center import worker
-assert worker is not None
+assert worker is not None and aios_db is not None and aios_sdk is not None
 PY
     chown -R root:root "$release_staging"
     chmod -R a-w "$release_staging"
