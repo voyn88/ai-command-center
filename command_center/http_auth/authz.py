@@ -79,6 +79,7 @@ OPERATIONS: frozenset[str] = frozenset(
         "proposals:promote",
         "tasks:reorder",
         "advisor:run",
+        "arena:duel:run",
         "owner-items:create",
         "owner-items:complete",
         "digest:build",
