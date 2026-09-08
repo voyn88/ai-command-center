@@ -821,6 +821,78 @@ def test_plan_once_reconciles_technical_parks_without_audit_spam(rig) -> None:
     assert store.get_task("VOYN-W0-RZ")["status"] == "DEFER_TO_USER"
 
 
+# --- review_backlog_limit: dispatch-only backpressure, not a whole-tick gate
+
+
+def _ready_to_review_with_pr(app_factory, store, task_id, pr_url) -> None:
+    """A READY_TO_REVIEW task carrying `pr` evidence -- what
+    `review_backlog_limit` counts."""
+    assert store.upsert_task(_task(task_id, repo="repo-d2", status="OPEN"))[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            def _rev():
+                cur.execute(
+                    "SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,)
+                )
+                return cur.fetchone()[0]
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)",
+                (task_id, _rev()),
+            )
+            cur.execute(
+                "SELECT backlog_record_evidence(%s,'pr',%s)", (task_id, pr_url)
+            )
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)",
+                (task_id, _rev()),
+            )
+
+
+def test_review_backlog_fence_pauses_dispatch_but_not_resume_reconcile(rig) -> None:
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM: an earlier version of this
+    fence was a blanket `return report` placed ABOVE the DEFER_TO_USER
+    resume reconcile, so a full review backlog silently froze parked-task
+    recovery too -- a control whose blast radius (the whole rest of the
+    tick) was wider than its stated purpose (gate new dispatch). This pins
+    that ingest and resume both still happen when the fence trips, and only
+    the dispatch loop is skipped."""
+    app_factory, store, worker = rig
+    _ready_to_review_with_pr(
+        app_factory, store, "VOYN-W0-BL1", "https://github.com/x/repo-d2/pull/101"
+    )
+    _ready_to_review_with_pr(
+        app_factory, store, "VOYN-W0-BL2", "https://github.com/x/repo-d2/pull/102"
+    )
+    _park_technically(app_factory, store, worker, "VOYN-W0-BL3")
+    assert store.upsert_task(_task("VOYN-W0-BL4", repo="repo-d2"))[0]  # OPEN
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4, review_backlog_limit=2))
+
+    assert report.review_window_full == 2
+    assert report.dispatched == []
+    assert "VOYN-W0-BL3" in [task_id for task_id, _reason in report.resumed]
+    assert store.get_task("VOYN-W0-BL3")["status"] in ("OPEN", "IN_PROGRESS")
+    # The candidate loop never ran at all -- the OPEN task the fence was
+    # supposed to hold back stays exactly where it was, not merely un-
+    # dispatched-but-examined.
+    assert store.get_task("VOYN-W0-BL4")["status"] == "OPEN"
+
+
+def test_review_backlog_limit_zero_disables_the_fence(rig) -> None:
+    """0 disables, matching `max_resumes_per_tick`'s convention on this same
+    dataclass -- not silently coerced to a threshold of 1."""
+    app_factory, store, _worker = rig
+    _ready_to_review_with_pr(
+        app_factory, store, "VOYN-W0-BL5", "https://github.com/x/repo-d2/pull/103"
+    )
+    assert store.upsert_task(_task("VOYN-W0-BL6", repo="repo-d2"))[0]
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4, review_backlog_limit=0))
+
+    assert report.review_window_full is None
+    assert "VOYN-W0-BL6" in [task_id for task_id, _work_item in report.dispatched]
+
+
 def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
     """Independent review of PR #401 at 2bc73ac: a task technically parked,
     later resumed, and then hand-upserted BACK into DEFER_TO_USER (an owner
@@ -854,3 +926,153 @@ def test_resume_deferred_refuses_stale_park_evidence(rig) -> None:
                 ("VOYN-W0-RSS",),
             )
             assert cur.fetchone()[0] == 1
+
+
+def test_resume_budget_is_a_window_not_a_lifetime_score(
+    rig, admin_conn
+) -> None:
+    """0017 (VOYN-W0-AICC-DEFER-AUTO-RESUME-REM): three granted resumes
+    OLDER than the 48h window must not exhaust the budget — a fixed
+    pipeline reclaims its old parks; three recent ones still refuse.
+
+    Grants are seeded through the real machine (park -> resume cycles),
+    never by raw INSERT: no role holds INSERT on backlog tables by design
+    (0005), and a grant fabricated after the park would trip the unchanged
+    superseded_park_evidence check anyway (independent review of 29d2152,
+    findings 1-2). Only created_at is backdated, via the admin connection —
+    the one property 0017's window reads."""
+    app_factory, store, worker = rig
+    task = "VOYN-W0-RSW"
+
+    # Three real park->resume cycles: the first park needs the fresh-task
+    # double exhaustion, every later one goes straight to DEFER via the
+    # repark path (prior granted returns >= 1 — live-confirmed by the
+    # independent verification of 4af6832 on real PostgreSQL). Each
+    # grant's event_id precedes the next park, so superseded_park_evidence
+    # never trips.
+    _park_technically(app_factory, store, worker, task)
+    ok, reason, _ = store.resume_deferred(task)
+    assert ok and reason == "OPEN"
+    for _ in range(2):
+        _repark(app_factory, store, task, "cascade_exhausted: again")
+        ok, reason, _ = store.resume_deferred(task)
+        assert ok and reason == "OPEN"
+    _repark(app_factory, store, task, "cascade_exhausted: again")
+
+    # Lifetime budget is now spent (3 grants). Prove the OLD behaviour is
+    # gone by aging those grants out of the window.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_event SET created_at = now() - interval '3 days' "
+            "WHERE task_id = %s AND event = 'resume_deferred' "
+            "AND outcome = 'granted'",
+            (task,),
+        )
+        assert cur.rowcount == 3
+    admin_conn.commit()
+
+    ok, reason, _ = store.resume_deferred(task)
+    assert ok and reason == "OPEN", (
+        "stale resume history must not bury the task forever"
+    )
+
+    # Three RECENT grants (the one above plus two more cycles) refuse the
+    # fourth — the window still stops a park that re-arms itself.
+    for _ in range(2):
+        _repark(app_factory, store, task, "cascade_exhausted: again")
+        ok, reason, _ = store.resume_deferred(task)
+        assert ok and reason == "OPEN"
+    _repark(app_factory, store, task, "cascade_exhausted: again")
+
+    ok, reason, _ = store.resume_deferred(task)
+    assert not ok and reason == "resume_budget_exhausted"
+
+
+# ---------------------------------------------------------------------------
+# VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW (0018): a sanctioned
+# recovery path for a task stuck in READY_TO_REVIEW with no `pr` evidence --
+# invisible to both backlog_transition (no READY_TO_REVIEW -> OPEN move) and
+# backlog_return_to_pool (IN_PROGRESS only).
+# ---------------------------------------------------------------------------
+
+
+def _stick_in_review_without_pr_evidence(app_factory, store, task_id) -> None:
+    """Reproduce the stuck state directly through the machine: dispatch to
+    IN_PROGRESS, then transition straight to READY_TO_REVIEW with no
+    evidence recorded at all -- the exact shape 0011 stopped `backlog_
+    ingest_results` from producing, and the shape any future bug in a
+    different corner of the same pipeline could still produce. `backlog_
+    transition`'s READY_TO_REVIEW move itself carries no evidence
+    requirement (only the DONE move does), so this is a legitimate machine
+    path, not a raw INSERT bypassing it."""
+    assert _dispatch(app_factory, task_id)[0]
+    task = store.get_task(task_id)
+    ok, reason, _rev = store.transition(task_id, "READY_TO_REVIEW", task["revision"])
+    assert ok, reason
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
+def test_recover_stuck_ready_to_review_returns_evidence_free_task_to_open(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SK", repo="repo-sk"))[0]
+    _stick_in_review_without_pr_evidence(app_factory, store, "VOYN-W0-SK")
+
+    ok, reason, revision = store.recover_stuck_ready_to_review("VOYN-W0-SK")
+    assert ok and reason == "OPEN" and revision is not None
+    assert store.get_task("VOYN-W0-SK")["status"] == "OPEN"
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason, detail FROM backlog_event WHERE task_id = %s "
+                "AND event = 'recover_stuck_ready_to_review' AND outcome = 'granted'",
+                ("VOYN-W0-SK",),
+            )
+            rows = cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "no_pr_evidence"
+    assert rows[0][1] == {"from": "READY_TO_REVIEW", "to": "OPEN"}
+
+    # OPEN means a fresh dispatch is possible again.
+    assert _dispatch(app_factory, "VOYN-W0-SK")[0]
+
+
+def test_recover_stuck_ready_to_review_refuses_a_task_with_pr_evidence(rig) -> None:
+    """A READY_TO_REVIEW task that DOES carry `pr` evidence is genuinely
+    reviewable: this recovery path must leave it alone for the real
+    review/merge machinery."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SP", repo="repo-sp"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-SP")[0]
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-SP",
+        {"status": "completed", "pr_url": "https://github.com/o/r/pull/9",
+         "head_sha": "deadbeef"},
+    )
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+    assert store.get_task("VOYN-W0-SP")["status"] == "READY_TO_REVIEW"
+
+    ok, reason, _rev = store.recover_stuck_ready_to_review("VOYN-W0-SP")
+    assert (ok, reason) == (False, "has_pr_evidence")
+    assert store.get_task("VOYN-W0-SP")["status"] == "READY_TO_REVIEW"
+
+
+def test_recover_stuck_ready_to_review_refuses_everything_else(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SX"))[0]  # OPEN
+    assert store.recover_stuck_ready_to_review("VOYN-W0-SX")[:2] == (
+        False, "not_ready_to_review",
+    )
+    assert store.upsert_task(
+        _task("VOYN-W0-SG", kind="gate", status="READY_TO_REVIEW")
+    )[0]
+    assert store.recover_stuck_ready_to_review("VOYN-W0-SG")[:2] == (
+        False, "gate_is_control_record",
+    )
+    assert store.recover_stuck_ready_to_review("VOYN-W0-NOPE")[:2] == (
+        False, "unknown_task",
+    )

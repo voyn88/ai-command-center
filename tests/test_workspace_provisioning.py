@@ -210,6 +210,28 @@ def test_standalone_clone_under_canonical_worker_root_is_exact_and_reusable(
         wp.verify_workspace(wrong)
 
 
+def test_github_https_and_ssh_remotes_have_one_repository_identity():
+    https = "https://github.com/voyn88/aios.git"
+
+    assert wp._repository_remote_identity(https) == wp._repository_remote_identity(
+        "git@github.com:voyn88/aios.git"
+    )
+    assert wp._repository_remote_identity(https) == wp._repository_remote_identity(
+        "ssh://git@github.com/voyn88/aios.git"
+    )
+
+
+def test_repository_identity_never_collapses_different_github_repositories():
+    expected = wp._repository_remote_identity("https://github.com/voyn88/aios.git")
+
+    assert expected != wp._repository_remote_identity(
+        "git@github.com:voyn88/ai-command-center.git"
+    )
+    assert ("literal", "https://example.com/voyn88/aios.git") == (
+        wp._repository_remote_identity("https://example.com/voyn88/aios.git")
+    )
+
+
 def test_branch_is_created_from_base_branch(tmp_path):
     repo = _make_repo(tmp_path / "repo")
     # A distinct base commit so we can prove the worktree forked from it.
@@ -657,6 +679,50 @@ def test_prune_repository_refuses_a_missing_path(tmp_path):
     assert wp.prune_repository(tmp_path / "does-not-exist") == "not_a_repository"
 
 
+# --------------------------------------------------------------------------
+# force_remove_worktree (single ephemeral-worktree removal site)
+# --------------------------------------------------------------------------
+
+
+def test_force_remove_worktree_removes_a_clean_worktree_and_prunes_metadata(
+    tmp_path,
+):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-f"
+    _git(repo, "worktree", "add", "-b", "task/f", str(workspace), "main")
+
+    wp.force_remove_worktree(repo, workspace)
+
+    assert not workspace.exists()
+    assert all(
+        entry.get("branch") != "task/f" for entry in git_info.get_worktrees(repo)
+    )
+
+
+def test_force_remove_worktree_falls_back_to_rmtree_when_git_refuses(tmp_path):
+    """A locked worktree makes a single `--force` refuse the removal outright
+    -- exactly the refusal that, at each of the eight hand-rolled call sites
+    this function replaced, could leave the directory (and some of the time
+    its `.git/worktrees/<name>` entry) behind forever."""
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-g"
+    _git(repo, "worktree", "add", "-b", "task/g", str(workspace), "main")
+    _git(repo, "worktree", "lock", str(workspace))
+
+    wp.force_remove_worktree(repo, workspace)
+
+    assert not workspace.exists()
+    assert all(
+        entry.get("branch") != "task/g" for entry in git_info.get_worktrees(repo)
+    )
+
+
+def test_force_remove_worktree_on_an_already_removed_path_does_not_raise(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+
+    wp.force_remove_worktree(repo, tmp_path / "never-existed")
+
+
 def test_read_agent_head_refuses_symlinked_head_without_leaking_secret(tmp_path):
     """A symlinked .git/HEAD must not let the publisher read (and echo) a file
     outside the workspace. The agent owns .git, so an lstat-then-read HEAD let
@@ -692,6 +758,57 @@ def test_read_agent_head_reads_a_real_head_via_pinned_fd(tmp_path):
     (refs / "x").write_text("0" * 40 + "\n", encoding="ascii")
 
     assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "../../../outside",
+        "/absolute",
+        "feature//x",
+        "feature/../x",
+        "feature/x.lock",
+        "feature/.hidden",
+        "feature/x..y",
+        "feature/x@{1}",
+        "feature/x y",
+        "feature\\x",
+    ],
+)
+def test_read_agent_head_rejects_unsafe_ref_names_before_path_access(
+    tmp_path, branch
+):
+    workspace = tmp_path / "ws"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/x\n", encoding="ascii")
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp._read_agent_head(workspace, branch)
+
+    assert exc_info.value.failed_step == "agent_head_branch"
+    assert not (tmp_path / "outside").exists()
+
+
+def test_dirty_checkpoint_fails_closed_before_writing_on_windows(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(wp.os, "name", "nt")
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.checkpoint_dirty_task_workspace(
+            workspace,
+            expected_branch="feature/x",
+            remote_url="https://example.invalid/repo.git",
+            start_sha="0" * 40,
+            trusted_base_sha="0" * 40,
+            expected_remote_sha=None,
+            expected_inode=(workspace.stat().st_dev, workspace.stat().st_ino),
+            message="checkpoint",
+        )
+
+    assert exc_info.value.failed_step == "dirty_checkpoint_platform"
+    assert list(workspace.iterdir()) == []
 
 
 def test_read_agent_head_handles_short_regular_file_reads(tmp_path, monkeypatch):

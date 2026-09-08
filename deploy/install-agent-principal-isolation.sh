@@ -143,6 +143,9 @@ assert worker is not None
 PY
     chown -R root:root "$release_staging"
     chmod -R a-w "$release_staging"
+    # mktemp -d created the staging root 0700; the lane runs as aicc-worker
+    # and must traverse it (WorkingDirectory=/opt/aicc/current).
+    chmod 0555 "$release_staging"
     # Record the root-owned content manifest from the staging tree BEFORE the
     # rename, so a release directory can never exist without the manifest that
     # authorises its later reuse. A crash between the two leaves only staging,
@@ -199,7 +202,13 @@ if ! path_present "$state_dir/uninstall.json"; then
   # same host lock and make first install fail deterministically.
   run_transaction recover
   systemctl daemon-reload
-  systemctl start aicc-principal-recovery.service
+  # aicc-principal-recovery.service is a WORKER_ONLY_TARGETS unit: a control
+  # host never gets the persistent copy the transaction installs, so starting
+  # it unconditionally here is exactly the worker-only side effect a control
+  # install must not perform.
+  if [ "$install_profile" = "worker" ]; then
+    systemctl start aicc-principal-recovery.service
+  fi
 fi
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -211,9 +220,12 @@ if [ "${1:-}" = "--uninstall" ]; then
       exit 0
     fi
     # INTENT precedes every uninstall mutation, so recovery safely aborted it.
-    # Reactivate the no-op barrier before creating the replacement WAL.
+    # Reactivate the no-op barrier before creating the replacement WAL. Only
+    # the worker profile ever installed the persistent unit this restarts.
     systemctl reset-failed aicc-principal-recovery.service >/dev/null 2>&1 || true
-    systemctl start aicc-principal-recovery.service
+    if [ "$install_profile" = "worker" ]; then
+      systemctl start aicc-principal-recovery.service
+    fi
   fi
   [ -f "$baseline_units" ] && [ -f "$baseline_release" ] || {
     echo "principal-isolation baseline state is missing" >&2
