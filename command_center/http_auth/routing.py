@@ -63,6 +63,7 @@ ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     ("POST", "/api/v1/proposals/{proposal_id}/promote"): "proposals:promote",
     ("POST", "/api/v1/tasks/reorder"): "tasks:reorder",
     ("POST", "/api/v1/advisor/run"): "advisor:run",
+    ("POST", "/api/v1/arena/duel"): "arena:duel:run",
     ("POST", "/api/v1/owner-items"): "owner-items:create",
     ("POST", "/api/v1/owner-items/{item_id}/complete"): "owner-items:complete",
     ("POST", "/api/v1/digest/build"): "digest:build",
