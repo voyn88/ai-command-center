@@ -1,0 +1,22 @@
+# Schedule for aicc-self-assessment.service (VOYN-MIN-AGT-EVO2).
+#
+# Daily is deliberately far tighter than the quarterly cadence the
+# acceptance criterion names. That is intentional, not a mismatch: the
+# service call itself is a cheap idempotent gate (`is_reassessment_due`
+# compares calendar quarters), so daily ticks cost nothing extra on the
+# 89 days out of 90 nothing is due, and buy back the one property a
+# quarter-long timer cannot offer -- a host that was down, or a database
+# that was unreachable, exactly on the day a new quarter turns over is
+# recovered by tomorrow's tick instead of missing the whole quarter's
+# reassessment outright.
+[Unit]
+Description=Run the AICC quarterly self-assessment gate once a day
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=24h
+AccuracySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,54 @@
+# Scheduled quarterly self-assessment (VOYN-MIN-AGT-EVO2): the production
+# caller of `command_center.orchestrator.self_assessment_runner`, which
+# closes the loop between the pure scoring in `self_assessment.py`, its
+# durable cadence in `self_assessment_store.py`, and the real fleet history
+# `self_assessment_source.py` turns into evidence -- none of the three has
+# any effect on its own without something invoking them against live data.
+#
+# Install (control-plane host, beside aicc-queue-reaper):
+#   cp deploy/systemd/aicc-self-assessment.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-self-assessment.timer
+#
+# Identity: reads `work_item_public`/`work_attempt_public`/`work_result`
+# through `WorkQueueReadStore`, the same read-only surface the control
+# plane's own status endpoints use -- aicc_app's existing read grant, no new
+# privilege. /etc/aicc/app.env supplies that role's AICC_PG_* credential.
+#
+# Why a timer and not a loop inside some daemon: `run_quarterly_self_
+# assessment` is a cheap read (`store.last_assessed_at()` plus a pure gate)
+# on every tick that isn't yet due for a new quarter, so a missed tick or an
+# unreachable database on any one tick delays nothing but the next
+# assessment's timestamp -- exactly the contract a oneshot timer needs, the
+# same reasoning `aicc-queue-reaper.timer` already uses for lease recovery.
+#
+# The assessment's own memory (`self_assessment.db`, distinct from the
+# PostgreSQL fleet-execution schema by the same reasoning `daily_audit.py`'s
+# scheduling bookkeeping already uses) lives under this unit's own
+# StateDirectory, addressed through AICC_DATA_DIR exactly like every other
+# local store in this codebase.
+
+[Unit]
+Description=AI Command Center quarterly executor self-assessment
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=aicc-app
+Group=aicc-app
+EnvironmentFile=/etc/aicc/app.env
+Environment=AICC_DATA_DIR=/var/lib/aicc-self-assessment
+WorkingDirectory=/opt/aicc
+StateDirectory=aicc-self-assessment
+StateDirectoryMode=0750
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.orchestrator.self_assessment_runner
+# An assessment against an unreachable database is a failed tick, not an
+# incident: the next tick retries, and the store's own last-assessed
+# timestamp means no evidence is lost -- only the recommendation's arrival
+# is delayed.
+TimeoutStartSec=300s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
