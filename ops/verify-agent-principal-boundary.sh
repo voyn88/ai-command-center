@@ -285,6 +285,19 @@ done; }
 ) || fail "worker lane registry entries could not be parsed safely"
 [ -n "$lane_family_units" ] || fail "no worker lanes found in the registry to verify"
 for family_unit in $worker_family_units $lane_family_units; do
+  # A retired legacy family unit (the staged rollout removes
+  # aicc-worker.service / voyn-aicc-worker.service on hosts that moved to the
+  # template lanes) is `not-found`: it cannot carry the flag and cannot start
+  # an agent either, so there is nothing to prove. Only a unit that EXISTS
+  # must carry the flag exactly (worker-01 2026-09-08 14:45 UTC: the whole
+  # install rolled back on "isolation flag did not reach aicc-worker.service
+  # exactly" for a unit that had been retired weeks earlier).
+  family_load=$(systemctl show "$family_unit" --property=LoadState --value)
+  if [ "$family_load" = not-found ]; then
+    printf '%s\n' "$family_unit" | grep -Fqx -- "$lane_family_units" && \
+      fail "registered worker lane is not loaded: $family_unit"
+    continue
+  fi
   family_env=$(systemctl show "$family_unit" --property=Environment --value)
   family_flag=$(printf '%s\n' "$family_env" | tr ' ' '\n' | \
     grep '^AICC_AGENT_PRINCIPAL_ISOLATION=' || true)
