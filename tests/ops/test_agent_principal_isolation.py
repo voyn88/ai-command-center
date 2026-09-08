@@ -1818,3 +1818,16 @@ def test_boundary_flag_check_skips_a_retired_legacy_family_unit_but_not_a_lane()
     assert 'fail "registered worker lane is not loaded: $family_unit"' in block
     # The flag itself is still required exactly for every loaded unit.
     assert "isolation flag did not reach $family_unit exactly" in block
+
+
+def test_the_worker_data_dir_parent_stays_root_owned():
+    """Review of f4ef507c: `install -d -o aicc-worker /var/lib/aicc /var/lib/aicc/data`
+    handed the PARENT to the worker too. Only the leaf is the worker's."""
+    text = (Path(__file__).parents[2] / "deploy/install-agent-principal-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "install -d -m 0755 -o root -g root /var/lib/aicc\n" in text
+    assert "install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc/data\n" in text
+    for line in text.splitlines():
+        if "-o aicc-worker" in line and "/var/lib/aicc " in line + " ":
+            assert "/var/lib/aicc/data" in line and "/var/lib/aicc /var/lib/aicc/data" not in line, line

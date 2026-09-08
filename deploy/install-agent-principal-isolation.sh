@@ -431,7 +431,12 @@ fi
 # refuses to advance past such a lane.
 stage_worker_data_dir() {
   local legacy_data_dir=${AICC_LEGACY_DATA_DIR:-/home/voynadmin/aicc-preprod/repo/data}
-  install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc /var/lib/aicc/data
+  # The parent stays root-owned, as systemd keeps it for a nested
+  # StateDirectory=: a worker-owned /var/lib/aicc would let that principal
+  # rename or replace entries under the shared state hierarchy (review of
+  # f4ef507c). Only the leaf belongs to the worker.
+  install -d -m 0755 -o root -g root /var/lib/aicc
+  install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc/data
   [ -e /var/lib/aicc/data/project_config.json ] && return 0
   if [ -f "$legacy_data_dir/project_config.json" ]; then
     install -m 0640 -o aicc-worker -g aicc-worker \
