@@ -292,6 +292,7 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
         "/run/aicc-agent-workspace-binds",
         "/run/credentials",
         "/run/voyn-aicc-worker",
+        "/run/aicc-worker-lanes",
         "/run/aicc-agent-homes",
         "/srv/aicc-quarantine",
         str(tmp_path.parent),
@@ -1049,8 +1050,18 @@ def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
     assert "TimeoutStopSec=3660s" in worker_template
     # 195s adopted from main (PR #382) at the merge of the two templates.
     assert "TimeoutStartSec=195s" in worker_template
-    assert "RuntimeDirectory=voyn-aicc-worker/%i" in worker_template
-    assert "PGPASSFILE=/run/voyn-aicc-worker/%i/pgpass" in worker_template
+    assert "RuntimeDirectory=aicc-worker-lanes/%i" in worker_template
+    assert "PGPASSFILE=/run/aicc-worker-lanes/%i/pgpass" in worker_template
+    assert "/run/aicc-worker-lanes/%i/pgpass" in worker_template.split("ExecStartPre=")[1]
+    # The legacy lane (User=voynadmin) owns /run/voyn-aicc-worker 0750 while the
+    # staged rollout still runs it next to the first isolated lane; nesting the
+    # isolated lane's runtime directory under that root killed it at
+    # ExecStartPre (worker-01, 2026-09-08). Never share the legacy root.
+    directives = "\n".join(
+        line for line in worker_template.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "RuntimeDirectory=voyn-aicc-worker" not in directives
+    assert "/run/voyn-aicc-worker" not in directives
     assert "SocketUser=root" in socket_unit
     assert "SocketGroup=aicc-publisher" in socket_unit
     assert "SocketMode=0660" in socket_unit
