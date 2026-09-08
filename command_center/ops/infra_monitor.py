@@ -257,6 +257,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def finding_key(failure: str) -> str:
+    """The stable identity of a failure: its code before the first ':'
+    (`active_workers:2<4` -> `active_workers`), truncated like the column."""
+    return failure.split(":", 1)[0].strip()[:200] or failure[:200]
+
+
 def record_findings(source: str, failures: tuple[str, ...], detail: dict[str, Any]) -> None:
     """Write the measurement to the database through the SECURITY DEFINER
     functions of migration 0021 (granted to aicc_app and aicc_worker). A red
@@ -271,9 +277,19 @@ def record_findings(source: str, failures: tuple[str, ...], detail: dict[str, An
         with pool.connection() as conn, conn.cursor() as cur:
             if failures:
                 for failure in failures:
+                    # Identity is the failure CODE (before the first ':'),
+                    # never the measurement: "dead_letter_growth:53>0" and
+                    # "dead_letter_growth:54>0" are one open finding and one
+                    # task, not one per tick (control-01, 2026-09-08: four
+                    # tasks in ten minutes for the same red probe). The
+                    # measured text travels in the detail.
                     cur.execute(
                         "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
-                        (source, failure[:200], json.dumps(detail, sort_keys=True)),
+                        (
+                            source,
+                            finding_key(failure),
+                            json.dumps({**detail, "failure": failure}, sort_keys=True),
+                        ),
                     )
             else:
                 cur.execute("SELECT monitor_clear_finding(%s)", (source,))

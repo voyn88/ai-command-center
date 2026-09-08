@@ -375,7 +375,12 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(monkeyp
     monkeypatch.setitem(sys.modules, "command_center.db.pool", _Pool)
     monkeypatch.setitem(sys.modules, "command_center.db.config", fake_cfg)
     infra_monitor.record_findings("worker-01:infra", ("active_workers:2<4",), {"x": 1})
-    assert any("monitor_record_finding" in c[0] and c[1][:2] == ("worker-01:infra", "active_workers:2<4") for c in calls)
+    recorded = [c for c in calls if "monitor_record_finding" in c[0]]
+    # Identity is the failure code, the measurement rides in the detail: the
+    # same red probe measured 2<4 then 1<4 is ONE finding, not two tasks.
+    assert recorded[0][1][:2] == ("worker-01:infra", "active_workers")
+    assert json.loads(recorded[0][1][2]) == {"x": 1, "failure": "active_workers:2<4"}
+    assert infra_monitor.finding_key("dead_letter_growth:53>0") == infra_monitor.finding_key("dead_letter_growth:54>0") == "dead_letter_growth"
     calls.clear()
     infra_monitor.record_findings("worker-01:infra", (), {})
     assert any("monitor_clear_finding" in c[0] for c in calls)
