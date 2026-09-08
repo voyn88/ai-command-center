@@ -51,7 +51,7 @@ struct AICCNativeShell: View {
 
     private var content: some View {
         TabView(selection: $tab) {
-            OverviewView(snapshot: model.snapshot, connection: model.connection)
+            OverviewView(snapshot: model.snapshot, connection: model.connection, openCriticalEscalations: model.openCriticalEscalations, onAcknowledge: model.acknowledgeCriticalEscalation)
                 .tabItem { Label(AppTab.overview.title, systemImage: AppTab.overview.icon) }.tag(AppTab.overview)
             WorkView(tasks: model.snapshot.tasks)
                 .tabItem { Label(AppTab.work.title, systemImage: AppTab.work.icon) }.tag(AppTab.work)
@@ -105,6 +105,8 @@ private struct PairingView: View {
 private struct OverviewView: View {
     let snapshot: Snapshot
     let connection: AICCAppModel.ConnectionState
+    let openCriticalEscalations: [CriticalEscalation]
+    let onAcknowledge: (String) -> Void
 
     // Attention first, then the busiest — a calm reader sees what matters.
     private var topProjects: [Project] {
@@ -129,6 +131,9 @@ private struct OverviewView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    ForEach(openCriticalEscalations) { escalation in
+                        CriticalEscalationBanner(escalation: escalation) { onAcknowledge(escalation.id) }
+                    }
                     Text("ДОБРОЕ УТРО").font(.caption2.weight(.bold)).tracking(1.3).foregroundStyle(AICCTheme.plum)
                     Text("Всё идёт\nсвоим ходом.").font(.system(size: 46, weight: .medium, design: .serif)).tracking(-1.5)
                     Text("Я собрала главное и оставила вам только то, что действительно заслуживает внимания.")

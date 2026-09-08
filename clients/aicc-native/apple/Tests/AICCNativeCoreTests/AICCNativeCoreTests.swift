@@ -86,6 +86,29 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+@Test func criticalSnapshotExposesExactlyOneOpenEscalation() throws {
+    let snapshot = try Fixture.criticalSnapshot()
+    #expect(snapshot.criticalEscalations.count == 1)
+    #expect(snapshot.criticalEscalations[0].severity == .critical)
+    #expect(snapshot.openCriticalEscalations().count == 1)
+}
+
+@Test func criticalEscalationCompletesWithOneTapAcknowledgement() throws {
+    let suiteName = "aicc-test-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let snapshot = try Fixture.criticalSnapshot()
+    let escalation = try #require(snapshot.criticalEscalations.first)
+
+    #expect(snapshot.openCriticalEscalations(acknowledged: EscalationAcknowledgementStore.acknowledgedIDs(defaults: defaults)).count == 1)
+
+    // The one tap.
+    let acknowledged = EscalationAcknowledgementStore.acknowledge(escalation.id, defaults: defaults)
+
+    #expect(acknowledged.contains(escalation.id))
+    #expect(snapshot.openCriticalEscalations(acknowledged: acknowledged).isEmpty)
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}

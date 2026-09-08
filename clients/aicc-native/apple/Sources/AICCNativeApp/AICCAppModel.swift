@@ -25,6 +25,7 @@ final class AICCAppModel: ObservableObject {
     @Published private(set) var snapshot: Snapshot
     @Published private(set) var dialogs: [DialogSummary] = []
     @Published private(set) var connection: ConnectionState = .fixture
+    @Published private(set) var acknowledgedEscalationIDs: Set<String>
 
     init() {
         // Start from the owner's last real picture when we have one; the
@@ -35,6 +36,18 @@ final class AICCAppModel: ObservableObject {
         } else {
             snapshot = (try? Fixture.healthySnapshot()) ?? .preview
         }
+        acknowledgedEscalationIDs = EscalationAcknowledgementStore.acknowledgedIDs()
+    }
+
+    /// Critical escalations still waiting on the owner's one-tap action.
+    var openCriticalEscalations: [CriticalEscalation] {
+        snapshot.openCriticalEscalations(acknowledged: acknowledgedEscalationIDs)
+    }
+
+    /// The one tap: records that the owner has seen and handled a critical
+    /// escalation. On-device only — see `EscalationAcknowledgementStore`.
+    func acknowledgeCriticalEscalation(_ id: String) {
+        acknowledgedEscalationIDs = EscalationAcknowledgementStore.acknowledge(id)
     }
 
     /// Whether any device credential is available (env override or Keychain).

@@ -1,0 +1,9 @@
+{
+  "schemaVersion":"1.0","revision":"fixture-crisis-001","generatedAt":"2026-09-08T08:12:00Z","freshness":"fresh",
+  "tasks":[],
+  "lanes":[{"id":"worker-01","state":"healthy","heartbeatAgeSeconds":3}],
+  "events":[{"id":"evt-crisis-001","occurredAt":"2026-09-08T08:12:00Z","summary":"Payment error rate crossed the critical threshold","correlationID":"ESC-9001"}],
+  "criticalEscalations":[
+    {"id":"ESC-9001","title":"Платежи: ошибки выросли до 42% за 5 минут","summary":"Похоже на сбой платёжного шлюза. Нужно подтвердить, что вы это видите — команда уже собирается.","occurredAt":"2026-09-08T08:12:00Z","severity":"critical","actionLabel":"Вижу, подтверждаю"}
+  ]
+}
