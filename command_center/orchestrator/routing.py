@@ -47,13 +47,16 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         # in that table only because its argv builder exists
         # (`build_codex_command`) and the CLI is installed on worker-01.
         {"executor": "codex", "task_type": "implementation"},
-        # Third account, same reasoning one step further: if both the Claude
-        # window and the Codex account are exhausted, Copilot's GitHub
-        # subscription is capacity neither can consume. Three links also means
-        # `max_attempts` is 3 (the attempt budget IS the cascade length), so a
-        # task gets one genuine try per independent quota pool rather than
-        # three tries at one pool.
-        {"executor": "copilot", "task_type": "implementation"},
+        # No copilot link. It was the third account ("capacity neither of the
+        # other two can consume"), but ADR-0010 keeps copilot OFF the isolated
+        # worker principal -- its login credential carries GitHub/repository
+        # authority (`agent_runner.PRINCIPAL_EXECUTOR_BINARIES`) -- and the
+        # whole fleet runs isolated since 2026-09-08. A link the worker refuses
+        # at preflight is exactly the phantom link this module's docstring
+        # warns about: live, it burned the third and last attempt of every
+        # task whose first two failed ("isolated copilot cli unavailable",
+        # 48 dead attempts in 20 minutes). Restore it only together with an
+        # accepted ADR-0010 revision that stages copilot under isolation.
     ],
     "review": [
         # codex first: it is the only review pool currently reachable on the
@@ -62,7 +65,8 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         # resolves to the read-only profile, so codex reviews under
         # `--sandbox read-only` -- a model-only reviewer that never writes.
         {"executor": "codex", "task_type": "review"},
-        {"executor": "copilot", "task_type": "review"},
+        # copilot: see the implementation cascade -- refused under principal
+        # isolation, so it would only burn a review attempt.
         {"executor": "claude", "task_type": "review"},
     ],
 }
