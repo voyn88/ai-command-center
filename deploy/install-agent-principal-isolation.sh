@@ -421,6 +421,27 @@ if [ ! -f "$baseline_release" ]; then
   sync -f "$state_dir"
 fi
 
+# The lanes' mutable data dir (template: StateDirectory=aicc/data,
+# AICC_DATA_DIR=/var/lib/aicc/data). The immutable release has no data/, so
+# project_config.json -- the file that names every project's
+# repository_path -- is carried over from the clone the legacy lanes ran
+# from, once; afterwards the state directory is the authority and this never
+# overwrites it. Without the file every task fails with "repository path not
+# configured" (worker-01, 2026-09-08), and the rollout's lane-input probe
+# refuses to advance past such a lane.
+stage_worker_data_dir() {
+  local legacy_data_dir=${AICC_LEGACY_DATA_DIR:-/home/voynadmin/aicc-preprod/repo/data}
+  install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc /var/lib/aicc/data
+  [ -e /var/lib/aicc/data/project_config.json ] && return 0
+  if [ -f "$legacy_data_dir/project_config.json" ]; then
+    install -m 0640 -o aicc-worker -g aicc-worker \
+      "$legacy_data_dir/project_config.json" /var/lib/aicc/data/project_config.json
+    return 0
+  fi
+  echo "AICC_AGENT_PRINCIPAL_ISOLATION_FAIL: no project_config.json in /var/lib/aicc/data and none to migrate from $legacy_data_dir" >&2
+  return 1
+}
+
 rollback() {
   result=$?
   trap - EXIT HUP INT TERM
@@ -530,6 +551,7 @@ fi
 # maps deploy/aicc/worker-lanes onto it) before this rollout runs on
 # a fresh host and matches the snapshot origin (reviewed on 8a881d3).
 if [ "$install_profile" = "worker" ]; then
+  stage_worker_data_dir
   run_rollout rollout --lanes /etc/aicc/worker-lanes
   "$repo_root/ops/verify-agent-principal-boundary.sh"
 fi
