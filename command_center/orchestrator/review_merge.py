@@ -51,6 +51,15 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
 - ``merge_once``: for each PR that carries an ACCEPT marker AND whose required
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
+  A PR that is only BEHIND main gets `gh pr update-branch`, which mints a
+  fresh head with no marker on it -- ``_carry_over_marker_if_patch_id_stable``
+  then reposts the ACCEPT marker on that new head, with its own audited
+  comment, iff `git patch-id --stable` proves the PR's own diff is
+  byte-identical to what a prior standing marker already accepted; a diff
+  that actually changed, or a base moving faster than carry-over can keep up
+  with (the churn-breaker), instead falls through to a genuine re-review.
+  See that function's section comment for the live incident that motivated
+  it (VOYN-W0-AICC-MARKER-CARRYOVER-ON-BRANCH-UPDATE-REM).
 - ``reconcile_merge_evidence``: report-only audit of existing DONE tasks'
   'sha' evidence against the default branch, for rows written before
   VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY (when that evidence was the
@@ -2574,6 +2583,241 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     return f"flaky_rerun_dispatched:{dispatched}" if dispatched else ""
 
 
+# -- Marker carry-over on branch update (VOYN-W0-AICC-MARKER-CARRYOVER-ON-
+# BRANCH-UPDATE-REM) -----------------------------------------------------
+#
+# Live incident, 2026-08-27 05:06Z: a merge tick brought three BEHIND PRs
+# current with a `gh pr update-branch` GitHub-side merge of the base into
+# the branch. That produces a brand-new head commit -- a real, different
+# sha -- even though the PR's own diff against the (also advanced) base is
+# byte-identical to what was already reviewed and ACCEPTed. The marker
+# check in `_accept_marker_on_latest_review` is exact-sha (deliberately: an
+# ACCEPT must name the commit that will actually merge), so the new head
+# carries no marker and `_pr_is_mergeable` reports `no_accept_marker_on_
+# head` -- indistinguishable from an unreviewed PR. That forces a full
+# independent re-review of a diff nobody changed (~15-30 minutes of model
+# time per PR), and if main advances faster than review can complete, the
+# PR never stops cycling BEHIND -> update -> re-review -> BEHIND again.
+#
+# The fix is not to weaken the exact-sha check -- that is the whole point
+# of `_pr_is_mergeable` -- but to recognize, mechanically, when a new head
+# carries the SAME diff as a prior ACCEPTed head and carry that verdict
+# forward with its own audited paper trail, exactly the way finding
+# verification (`_post_auto_accept_audit`, above) posts an audit comment
+# before ever posting an overriding marker. `git patch-id --stable` is the
+# right invariant: it fingerprints a diff's actual content, ignoring the
+# base commit, parent shas, and hunk-header line numbers that
+# `update-branch` changes but a same-content merge does not.
+_MARKER_CARRYOVER_TAG = re.compile(
+    r"MARKER-CARRYOVER ([0-9a-f]{40})->([0-9a-f]{40})"
+)
+
+#: How many un-merged carry-over cycles may fire on one PR before carry-
+#: over stops being attempted. Without this, a base that never stops
+#: moving turns "carry the verdict forward" into the exact same infinite
+#: churn this feature exists to close, just one layer removed (BEHIND ->
+#: update -> carry-over -> BEHIND again, forever, without ever spending
+#: the wall-clock a full re-review would). Past this many, carry-over
+#: declines outright: the PR keeps its (still un-marked) new head and
+#: falls through to a genuine re-review on the next tick -- the same
+#: fail-closed path a diff that actually changed already takes, so a
+#: runaway base escalates into "get a real verdict," not a silent spin.
+_MAX_MARKER_CARRYOVER_CHURN = 3
+
+
+def _run_git_patch_id(repo_path: str, diff_text: str) -> str | None:
+    """The diff's content fingerprint via `git patch-id --stable`, run
+    with `cwd=repo_path` like every other subprocess call in this module
+    (`_gh`) -- an ambient cwd that is not a checkout at all would make
+    this needlessly fail on hosts where it happens to work by accident.
+    `--stable` rather than the default algorithm so the id does not shift
+    across git versions on different hosts. Byte-capped the same as the
+    review diff fetch. None on any failure -- carry-over fails closed to
+    a full re-review rather than trust a corrupt or empty id."""
+    if len(diff_text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            cwd=repo_path, input=diff_text, capture_output=True, text=True,
+            check=False, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    first_line = (proc.stdout or "").splitlines()[0] if proc.stdout else ""
+    match = re.fullmatch(r"([0-9a-f]{40}) [0-9a-f]{40}", first_line.strip())
+    return match.group(1) if match else None
+
+
+def _compare_diff_text(
+    repo_path: str, owner: str, repo: str, base: str, sha: str
+) -> str | None:
+    """The unified diff text for `base...sha` via the same GitHub compare
+    API call `_pr_diff_and_head` makes for the PR's own base/head -- same
+    byte-size guard applies here too. `sha` reaches this function from
+    text parsed out of a PR review body (`_latest_marker_sha`), not from
+    a field GitHub itself typed as a commit oid the way `base` does, so it
+    gets the identical 40-hex validation `base` gets before either is
+    interpolated into the API path -- both are untrusted the same way, and
+    both are checked the same way, rather than the sha that is actually
+    free-form text being the one left unchecked."""
+    if not re.fullmatch(r"[0-9a-f]{40}", base) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        return None
+    diff = _gh(
+        ["api", f"repos/{owner}/{repo}/compare/{base}...{sha}",
+         "-H", "Accept: application/vnd.github.v3.diff"],
+        repo_path,
+    )
+    if diff.returncode != 0:
+        return None
+    text = diff.stdout
+    if len(text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
+        return None
+    return text
+
+
+def _latest_marker_sha(
+    reviews: list[dict[str, Any]], pr_author_login: str | None
+) -> str | None:
+    """The sha of the most recent standing ACCEPT marker, under exactly
+    the same trust rule `_accept_marker_on_latest_review` already
+    enforces for merge itself: the most recent *live* (non-DISMISSED)
+    review, whose author's login is NOT the PR's own author's login
+    (casefolded) -- generalized to report WHICH sha it accepted rather
+    than only whether it matches one caller-supplied head, since carry-
+    over does not yet know the prior head to check.
+
+    This is deliberately the same author-independence comparison
+    `evaluate()` in `scripts/assert_independent_acceptance.py` makes and
+    not a hardcoded acceptance-bot login: comparing against a literal
+    login would (a) not match if the App were ever reinstalled under a
+    different slug, and (b) if instead compared the WRONG way -- against
+    the PR's own author's login as something a marker's review author
+    should equal, rather than must differ from -- would either never
+    match a genuine bot-authored marker at all (making carry-over a
+    silent no-op) or accept a self-issued marker whenever a marker-shaped
+    body happened to be posted by the PR's own author. Reusing the
+    proven-live independence check, generalized only to extract the sha,
+    is the same trust decision the rest of this module already makes for
+    an actual merge -- not a new one invented for this feature."""
+    live = [review for review in reviews if review.get("state") != "DISMISSED"]
+    if not live:
+        return None
+    latest = max(live, key=lambda r: r.get("submittedAt") or "")
+    match = re.search(r"ACCEPTANCE: ACCEPT ([0-9a-f]{40})", latest.get("body") or "")
+    if match is None:
+        return None
+    if pr_author_login is not None:
+        reviewer_login = (latest.get("author") or {}).get("login")
+        if reviewer_login is None or reviewer_login.casefold() == pr_author_login.casefold():
+            return None
+    return match.group(1)
+
+
+def _accept_marker_churn_count(comments: list[dict[str, Any]]) -> int:
+    """How many marker carry-overs already fired on this PR without a
+    merge landing in between -- the churn-breaker's counter. Counted from
+    the PR's own audit-comment trail (durable GitHub state, survives
+    process/host restarts, and needs no new storage) rather than a local
+    counter: every successful carry-over posts one `MARKER-CARRYOVER`
+    audit comment (see `_carry_over_marker_if_patch_id_stable`) before its
+    marker, so the comment count IS the cycle count."""
+    return sum(
+        1 for comment in comments
+        if _MARKER_CARRYOVER_TAG.search((comment or {}).get("body") or "")
+    )
+
+
+def _carry_over_marker_if_patch_id_stable(
+    repo_path: str, pr_url: str, task_id: str
+) -> bool:
+    """After a `gh pr update-branch` call has already succeeded (the
+    caller's job, not this function's), post a fresh ACCEPT marker on the
+    new head WITHOUT a full re-review, iff the PR's own diff is
+    byte-identical in content to the diff a prior standing ACCEPT marker
+    already covered -- proven via `git patch-id --stable`, invariant
+    across the base-merge commit `update-branch` creates. Returns whether
+    a marker was posted this call; any False is a decline, never an
+    error, and the caller's existing `no_accept_marker_on_head` handling
+    on the next tick is exactly the correct fallback (a full re-review).
+
+    Sequencing mirrors `_post_auto_accept_audit`: the audit comment
+    recording the carry-over is posted BEFORE the marker and gates it --
+    if the audit comment cannot be posted, no marker is posted this call
+    either, so a marker never stands without its own paper trail. The
+    audit tag is checked against existing comments first, so a call that
+    already posted the audit (but was interrupted before the marker) does
+    not repost it -- it still goes on to post the marker."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    if view.returncode != 0:
+        return False
+    try:
+        pr_data = json.loads(view.stdout or "{}")
+        base, head = pr_data["base"]["sha"], pr_data["head"]["sha"]
+        author_login = (pr_data.get("user") or {}).get("login")
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return False
+    if not re.fullmatch(r"[0-9a-f]{40}", head) or not re.fullmatch(r"[0-9a-f]{40}", base):
+        return False
+
+    meta = _gh(["pr", "view", pr_url, "--json", "reviews,comments"], repo_path)
+    if meta.returncode != 0:
+        return False
+    try:
+        meta_data = json.loads(meta.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    reviews = meta_data.get("reviews")
+    comments = meta_data.get("comments")
+    if not isinstance(reviews, list) or not isinstance(comments, list):
+        return False
+
+    if _accept_marker_churn_count(comments) >= _MAX_MARKER_CARRYOVER_CHURN:
+        return False
+
+    prior_sha = _latest_marker_sha(reviews, author_login)
+    if prior_sha is None or prior_sha == head:
+        return False
+
+    old_diff = _compare_diff_text(repo_path, owner, repo, base, prior_sha)
+    new_diff = _compare_diff_text(repo_path, owner, repo, base, head)
+    if old_diff is None or new_diff is None:
+        return False
+
+    old_id = _run_git_patch_id(repo_path, old_diff)
+    new_id = _run_git_patch_id(repo_path, new_diff)
+    if old_id is None or new_id is None or old_id != new_id:
+        return False
+
+    creds = _acceptance_app_credentials()
+    if creds is None:
+        return False
+
+    tag = f"MARKER-CARRYOVER {prior_sha}->{head}"
+    if not any(tag in ((comment or {}).get("body") or "") for comment in comments):
+        body = (
+            f"{tag}\n\n"
+            f"Task: {task_id}\n"
+            f"The ACCEPT marker for {prior_sha} carried over to {head} without "
+            "a new review: `git patch-id --stable` is identical before and "
+            "after `gh pr update-branch` brought this branch current with its "
+            "base, so the reviewed diff itself did not change. CI and the "
+            "acceptance gate remain required for merge.\n"
+        )
+        posted = _gh(["pr", "comment", pr_url, "--body", body], repo_path)
+        if posted.returncode != 0:
+            return False
+
+    ok, _err = _post_marker_as_bot(creds, pr_url, "ACCEPT", head)
+    return ok
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
@@ -2691,7 +2935,23 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                 actions += 1
                 updated = _gh(["pr", "update-branch", pr_url], repo_path)
                 if updated.returncode == 0:
-                    report.skipped.append((task_id, "branch_updated_behind_main"))
+                    # The new head is a fresh, unmarked commit even though
+                    # the PR's own diff may not have changed at all -- see
+                    # the section comment above `_carry_over_marker_if_
+                    # patch_id_stable` for the live churn this closes.
+                    # Best-effort and never a reason to fail this branch
+                    # update: a decline here just leaves the ordinary
+                    # `no_accept_marker_on_head` path to pick it up with a
+                    # real re-review on a later tick, exactly as before
+                    # this existed.
+                    carried = _carry_over_marker_if_patch_id_stable(
+                        repo_path, pr_url, task_id
+                    )
+                    report.skipped.append((
+                        task_id,
+                        "branch_updated_marker_carried_over" if carried
+                        else "branch_updated_behind_main",
+                    ))
                 else:
                     report.skipped.append(
                         (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
