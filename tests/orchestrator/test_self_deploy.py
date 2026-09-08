@@ -47,25 +47,35 @@ def pair(tmp_path):
 @pytest.fixture
 def calls(monkeypatch, tmp_path):
     """Fake the two privileged seams; git stays real."""
-    recorded = {"systemctl": [], "migrate": 0, "smoke_rc": 0, "systemctl_rc": {}}
+    recorded = {"systemctl": [], "migrate": 0, "smoke_rc": 0, "systemctl_rc": {}, "order": []}
 
     def fake_systemctl(args, timeout):
         recorded["systemctl"].append(args)
+        recorded["order"].append(f"systemctl:{args[0]}")
         rc = recorded["systemctl_rc"].get(tuple(args[:1]), 0)
         out = "active" if args[0] == "is-active" and rc == 0 else ""
         return subprocess.CompletedProcess(args, rc, out, "" if rc == 0 else "boom")
 
     def fake_migrations(repo_path, timeout):
         recorded["migrate"] += 1
+        recorded["order"].append("migrate")
         recorded["migrate_cwd"] = repo_path
         return subprocess.CompletedProcess([], 0, "", "")
 
     def fake_smoke(repo_path, timeout):
         return subprocess.CompletedProcess([], recorded["smoke_rc"], "", "import boom")
 
+    def fake_dispatch_smoke(repo_path, timeout):
+        recorded["dispatch_smoke"] = recorded.get("dispatch_smoke", 0) + 1
+        recorded["order"].append("dispatch_smoke")
+        return subprocess.CompletedProcess(
+            [], recorded.get("dispatch_smoke_rc", 0), "", "permission denied for view"
+        )
+
     monkeypatch.setattr(self_deploy, "_systemctl", fake_systemctl)
     monkeypatch.setattr(self_deploy, "_run_migrations", fake_migrations)
     monkeypatch.setattr(self_deploy, "_import_smoke", fake_smoke)
+    monkeypatch.setattr(self_deploy, "_dispatch_smoke", fake_dispatch_smoke)
     return recorded
 
 
@@ -375,3 +385,32 @@ def test_migration_failure_provenance_names_the_partial_database(
     assert report.outcome == "rolled_back"
     assert "database_may_hold_partial_migrations" in report.detail
     assert _git(clone, "rev-parse", "HEAD") == first
+
+
+def test_failed_dispatch_smoke_after_migration_rolls_back_before_restart(pair, calls, tmp_path):
+    """0019 on control-01 (2026-09-08): the migration applied, import-smoke was
+    green, services restarted, and every planner tick died on a view whose
+    owner the migration had changed. The dispatch smoke runs with exactly
+    dispatch's privileges AFTER the migration and BEFORE any restart; a
+    refusal rolls the checkout back with no service touched."""
+    origin, clone, first = pair
+    _commit(origin, "advance with a migration that breaks dispatch")
+    calls["dispatch_smoke_rc"] = 1
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "rolled_back"
+    assert "dispatch_smoke_failed_after_migration" in report.detail
+    assert calls["migrate"] == 1
+    assert calls["dispatch_smoke"] == 1
+    # The safety guarantee is an ORDER: migration, then the dispatch smoke,
+    # then rollback -- and no service start/restart at all (review of
+    # fc167cf7: counts alone passed with the smoke before the migration or
+    # after a restart).
+    assert calls["order"].index("migrate") < calls["order"].index("dispatch_smoke")
+    assert not any(
+        event.startswith("systemctl:") and event.split(":", 1)[1] in {"restart", "start", "reload"}
+        for event in calls["order"]
+    ), calls["order"]
+    assert _git(clone, "rev-parse", "HEAD") == first
+    assert "database_upgrade_ran_not_rolled_back" in report.steps
+    assert "dispatch_smoke_passed" not in report.steps

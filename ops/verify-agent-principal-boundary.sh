@@ -11,7 +11,17 @@ secret_manifest=/etc/aicc/publisher-secret-paths
 lane_registry=/etc/aicc/worker-lanes
 worker_template=/etc/systemd/system/voyn-aicc-worker@.service
 worker_dropin=/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf
-principal_inaccessible_paths="/etc/aicc /etc/voyn /home /root /var/lib/aicc-worker /var/lib/aicc-agent /var/lib/voyn-aicc-credential-rotation /run/aicc-agent-launcher /run/aicc-agent-workspace-binds /run/credentials /run/voyn-aicc-worker /run/aicc-worker-lanes /srv/aicc-quarantine"
+# The same sensitive trees the launcher masks, with the launcher's rule: the
+# '-' prefix tolerates an ABSENT tree (still masked when present). Several are
+# created lazily -- /run/aicc-agent-workspace-binds by the first agent launch,
+# /run/aicc-worker-lanes by a running isolated lane, /srv/aicc-quarantine on
+# first quarantine -- and this boundary test runs before any of them exist
+# (runbook step 6 precedes step 8). An unprefixed missing entry made systemd
+# refuse the canary namespace ("Failed to set up mount namespacing:
+# /run/aicc-agent-workspace-binds: No such file or directory", 226/NAMESPACE,
+# worker-01 2026-09-08 12:24 UTC) and the whole install rolled back with a
+# boundary "failure" that measured nothing.
+principal_inaccessible_paths="-/etc/aicc -/etc/voyn -/home -/root -/var/lib/aicc-worker -/var/lib/aicc-agent -/var/lib/voyn-aicc-credential-rotation -/run/aicc-agent-launcher -/run/aicc-agent-workspace-binds -/run/credentials -/run/voyn-aicc-worker -/run/aicc-worker-lanes -/srv/aicc-quarantine"
 
 fail() {
   echo "AICC_AGENT_PRINCIPAL_BOUNDARY_FAIL: $*" >&2
@@ -275,6 +285,19 @@ done; }
 ) || fail "worker lane registry entries could not be parsed safely"
 [ -n "$lane_family_units" ] || fail "no worker lanes found in the registry to verify"
 for family_unit in $worker_family_units $lane_family_units; do
+  # A retired legacy family unit (the staged rollout removes
+  # aicc-worker.service / voyn-aicc-worker.service on hosts that moved to the
+  # template lanes) is `not-found`: it cannot carry the flag and cannot start
+  # an agent either, so there is nothing to prove. Only a unit that EXISTS
+  # must carry the flag exactly (worker-01 2026-09-08 14:45 UTC: the whole
+  # install rolled back on "isolation flag did not reach aicc-worker.service
+  # exactly" for a unit that had been retired weeks earlier).
+  family_load=$(systemctl show "$family_unit" --property=LoadState --value)
+  if [ "$family_load" = not-found ]; then
+    printf '%s\n' "$family_unit" | grep -Fqx -- "$lane_family_units" && \
+      fail "registered worker lane is not loaded: $family_unit"
+    continue
+  fi
   family_env=$(systemctl show "$family_unit" --property=Environment --value)
   family_flag=$(printf '%s\n' "$family_env" | tr ' ' '\n' | \
     grep '^AICC_AGENT_PRINCIPAL_ISOLATION=' || true)

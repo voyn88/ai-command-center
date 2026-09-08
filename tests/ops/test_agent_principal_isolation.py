@@ -415,10 +415,33 @@ def test_workspace_with_renamable_parent_is_refused(launcher, tmp_path):
         launcher._open_pinned_workspace(workspace)
 
 
+def test_workspace_parent_owned_by_the_client_is_rename_proof_unless_group_writable(
+    launcher, tmp_path
+):
+    """VOYN-W0-AICC-LAUNCHER-PARENT-RULE-REJECTS-WORKER-OWNED-WORKSPACES: the
+    worker lane provisions workspaces under directories it owns; those are
+    rename-proof against the agent when no group/other write bit is set.
+    A group-writable parent (the old 2770 root, agents in that group) is
+    still refused, and so is a parent owned by a third uid."""
+    parent = tmp_path / "ai-command-center-worktrees"
+    parent.mkdir(mode=0o700)
+    workspace = parent / "workspace"
+    workspace.mkdir()
+    me = os.getuid()
+    assert launcher._parent_is_rename_proof(workspace, me) is True
+    assert launcher._parent_is_rename_proof(workspace, me + 1) is False
+    descriptor = launcher._open_pinned_workspace(workspace, me)
+    os.close(descriptor)
+    parent.chmod(0o2770)
+    assert launcher._parent_is_rename_proof(workspace, me) is False
+    with pytest.raises(launcher.LaunchRefused, match="renamable"):
+        launcher._open_pinned_workspace(workspace, me)
+
+
 def test_workspace_bind_source_stays_on_pinned_inode_after_path_replacement(
     launcher, monkeypatch, tmp_path
 ):
-    monkeypatch.setattr(launcher, "_parent_is_rename_proof", lambda workspace: True)
+    monkeypatch.setattr(launcher, "_parent_is_rename_proof", lambda workspace, client_uid=0: True)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "identity").write_text("original", encoding="utf-8")
@@ -1853,3 +1876,181 @@ def test_release_venv_installs_the_accepted_aios_wheels_from_the_root_store():
     preflight = staging.index("import aios_db")
     record = staging.index("run_release release-record")
     assert lock_install < aios_install < preflight < record
+
+
+def test_boundary_script_masks_the_launcher_trees_and_tolerates_absent_ones():
+    """The boundary canary masks exactly the launcher's sensitive trees, each
+    with the '-' prefix: a tree that does not exist yet (the workspace-bind
+    root before the first launch, the lane runtime root before a lane runs,
+    the quarantine root before the first quarantine) must not make systemd
+    refuse the canary namespace -- that refusal rolled back the whole install
+    as a boundary failure that measured nothing (worker-01, 2026-09-08)."""
+    import re
+
+    script = (Path(__file__).parents[2] / "ops" / "verify-agent-principal-boundary.sh").read_text()
+    match = re.search(r'^principal_inaccessible_paths="([^"]+)"', script, re.MULTILINE)
+    assert match, "inaccessible path list not found"
+    entries = match.group(1).split()
+    assert all(entry.startswith("-/") for entry in entries), entries
+    spec = importlib.util.spec_from_file_location(
+        "aicc_agent_launcher", Path(__file__).parents[2] / "ops" / "aicc_agent_launcher.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert {entry[1:] for entry in entries} == set(module.SENSITIVE_AUTHORITY_TREES)
+
+
+def test_boundary_flag_check_skips_a_retired_legacy_family_unit_but_not_a_lane():
+    """A retired legacy family unit (`not-found`) carries no flag and can start
+    nothing, so the flag check skips it; a REGISTERED lane that is not loaded
+    is still a failure (worker-01 2026-09-08 14:45 UTC rolled back on the
+    retired aicc-worker.service)."""
+    script = (Path(__file__).parents[2] / "ops" / "verify-agent-principal-boundary.sh").read_text()
+    block = script.split("for family_unit in $worker_family_units $lane_family_units; do", 1)[1]
+    block = block.split("done", 1)[0]
+    assert 'family_load=$(systemctl show "$family_unit" --property=LoadState --value)' in block
+    assert '[ "$family_load" = not-found ]' in block
+    assert 'fail "registered worker lane is not loaded: $family_unit"' in block
+    # The flag itself is still required exactly for every loaded unit.
+    assert "isolation flag did not reach $family_unit exactly" in block
+
+
+def test_executor_symlink_is_judged_by_owner_only_and_its_target_by_mode(launcher):
+    """VOYN-W0-AICC-LAUNCHER-PARENT-RULE-REJECTS-WORKER-OWNED-WORKSPACES: a
+    symlink's mode is always 0777 and means nothing; refusing it on `& 0o022`
+    refused every toolchain executor. The target keeps the strict rule."""
+    def info(mode, uid):
+        return os.stat_result((mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+
+    link = 0o120777
+    assert launcher._node_is_immutable_root_owned(info(link, 0)) is True
+    assert launcher._node_is_immutable_root_owned(info(link, 1000)) is False
+    assert launcher._node_is_immutable_root_owned(info(0o100755, 0)) is True
+    assert launcher._node_is_immutable_root_owned(info(0o100775, 0)) is False
+    assert launcher._node_is_immutable_root_owned(info(0o100755, 1000)) is False
+
+
+def test_validate_binary_refuses_a_target_that_is_group_writable(launcher, tmp_path, monkeypatch):
+    binary = tmp_path / "bin" / "claude"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o775)
+    link = tmp_path / "claude-link"
+    link.symlink_to(binary)
+    real_stat = os.stat_result
+
+    class RootStat:
+        """Every node reads as root-owned; modes stay real."""
+
+    def fake_stat(self, *, follow_symlinks=True):
+        # Every node reads as root-owned; directories (tmp_path lives under a
+        # 1777 /tmp on Linux runners) read as not group/other-writable so the
+        # path-component rule passes and the TARGET's real mode is judged.
+        result = os.stat(self, follow_symlinks=follow_symlinks)
+        values = list(result)
+        values[4] = 0
+        if stat.S_ISDIR(values[0]):
+            values[0] &= ~0o022
+        return real_stat(values)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(Path, "lstat", lambda self: fake_stat(self, follow_symlinks=False))
+    with pytest.raises(launcher.LaunchRefused, match="executor binary is not immutable root-owned"):
+        launcher._validate_binary(str(link))
+    binary.chmod(0o755)
+    launcher._validate_binary(str(link))
+
+
+def test_the_worker_preflight_names_the_same_executors_the_broker_launches(launcher):
+    """Two authorities for "where is the executor" drift: the worker's
+    preflight pointed at /usr/local/bin (where codex never was) while the
+    broker launches from the toolchain, so codex read as unavailable and
+    every review fell through to the next link (worker-01 2026-09-08)."""
+    from command_center import agent_runner
+
+    # Whole-dictionary equality: a broker-only or worker-only executor is
+    # drift either way (review of 706db212: iterating one side let a
+    # broker-only entry pass). Copilot is absent from BOTH by ADR-0010.
+    assert dict(agent_runner.PRINCIPAL_EXECUTOR_BINARIES) == dict(launcher.EXECUTOR_BINARIES)
+    assert "copilot" not in launcher.EXECUTOR_BINARIES
+
+
+def test_validate_binary_refuses_a_target_that_is_not_a_regular_file(launcher, tmp_path, monkeypatch):
+    """Review of 2a3fa2a3: the owner/mode split left the regular-file
+    requirement unreachable; a root-owned directory or FIFO passed."""
+    real_stat = os.stat_result
+
+    def fake_stat(self, *, follow_symlinks=True):
+        values = list(os.stat(self, follow_symlinks=follow_symlinks))
+        values[4] = 0
+        if stat.S_ISDIR(values[0]):
+            values[0] &= ~0o022
+        return real_stat(values)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(Path, "lstat", lambda self: fake_stat(self, follow_symlinks=False))
+    directory = tmp_path / "bin" / "claude"
+    directory.mkdir(parents=True)
+    directory.chmod(0o755)
+    with pytest.raises(launcher.LaunchRefused, match="not a regular file"):
+        launcher._validate_binary(str(directory))
+    fifo = tmp_path / "bin" / "codex"
+    os.mkfifo(fifo)
+    fifo.chmod(0o755)
+    with pytest.raises(launcher.LaunchRefused, match="not a regular file"):
+        launcher._validate_binary(str(fifo))
+
+
+def test_the_worker_data_dir_parent_stays_root_owned():
+    """Review of f4ef507c: `install -d -o aicc-worker /var/lib/aicc /var/lib/aicc/data`
+    handed the PARENT to the worker too. Only the leaf is the worker's."""
+    text = (Path(__file__).parents[2] / "deploy/install-agent-principal-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "install -d -m 0755 -o root -g root /var/lib/aicc\n" in text
+    assert "install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc/data\n" in text
+    # No worker-owned install may name the parent as a target, in any
+    # position or order (review of 39981fc9: the first version only rejected
+    # one ordering).
+    for line in text.splitlines():
+        if "install" in line and "-o aicc-worker" in line:
+            targets = [word for word in line.split() if word.startswith("/")]
+            assert "/var/lib/aicc" not in targets, line
+            assert targets == ["/var/lib/aicc/data"] or "/var/lib/aicc" not in " ".join(targets), line
+
+
+def test_every_launcher_read_write_path_is_created_by_tmpfiles_before_the_first_connection():
+    """VOYN-W0-AICC-LAUNCHER-BIND-ROOT-MUST-EXIST-BEFORE-FIRST-CONNECTION:
+    a ReadWritePaths= entry only the launcher creates refuses every first
+    connection with 226/NAMESPACE. Every entry is declared in tmpfiles, the
+    entries are STRICT (a '-' would only hide the absence: a directory
+    created after the namespace is built is not writable inside it, review
+    of 5736dd6c), and the socket unit re-applies the tmpfiles declaration
+    before it accepts a connection, so a boot where tmpfiles did not run is
+    repaired at the socket, not tolerated at the namespace."""
+    root = Path(__file__).parents[2]
+    unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text(encoding="utf-8")
+    socket_unit = (root / "deploy/systemd/aicc-agent-launcher.socket").read_text(encoding="utf-8")
+    tmpfiles = (root / "deploy/tmpfiles.d/aicc-agent.conf").read_text(encoding="utf-8")
+    # Only d/D CREATE a directory; z/Z merely adjust one that exists (review
+    # of 446856da: counting them let a `d` demoted to `z` pass).
+    created = {
+        line.split()[1]
+        for line in tmpfiles.splitlines()
+        if line and not line.startswith("#") and line.split()[0] in {"d", "D"}
+    }
+    paths = [
+        path
+        for line in unit.splitlines()
+        if line.startswith("ReadWritePaths=")
+        for path in line.split("=", 1)[1].split()
+    ]
+    assert paths, "launcher unit has no ReadWritePaths="
+    for path in paths:
+        assert not path.startswith("-"), f"{path}: '-' hides the absence instead of curing it"
+        assert path in created, f"{path} is not CREATED (d/D) by tmpfiles.d/aicc-agent.conf"
+    assert (
+        "ExecStartPre=/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/aicc-agent.conf"
+        in socket_unit
+    ), "the socket must re-create the runtime paths before the first connection"
+    assert "/run/aicc-agent-workspace-binds" in created
