@@ -294,8 +294,8 @@ def test_the_check_name_is_the_one_branch_protection_can_require() -> None:
     # verdict on the head. The guard is asserted in tests/test_release_gate_policy.py.
     name = job["name"]
     assert name.endswith("|| 'Acceptance gate (independent verdict on exact SHA)' }}")
-    assert name.startswith("${{ (github.event_name == 'pull_request' && (github.event.action == 'labeled'")
-    assert "'Label event (no gate ran)'" in name
+    assert name.startswith("${{ ((github.event_name == 'pull_request' && (github.event.action == 'labeled'")
+    assert "'Gate not run (label noise or outside review window)'" in name
 
 
 def test_the_gate_asks_for_no_more_access_than_it_reads() -> None:
