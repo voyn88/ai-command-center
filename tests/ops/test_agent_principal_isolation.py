@@ -1803,3 +1803,18 @@ def test_boundary_script_masks_the_launcher_trees_and_tolerates_absent_ones():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert {entry[1:] for entry in entries} == set(module.SENSITIVE_AUTHORITY_TREES)
+
+
+def test_boundary_flag_check_skips_a_retired_legacy_family_unit_but_not_a_lane():
+    """A retired legacy family unit (`not-found`) carries no flag and can start
+    nothing, so the flag check skips it; a REGISTERED lane that is not loaded
+    is still a failure (worker-01 2026-09-08 14:45 UTC rolled back on the
+    retired aicc-worker.service)."""
+    script = (Path(__file__).parents[2] / "ops" / "verify-agent-principal-boundary.sh").read_text()
+    block = script.split("for family_unit in $worker_family_units $lane_family_units; do", 1)[1]
+    block = block.split("done", 1)[0]
+    assert 'family_load=$(systemctl show "$family_unit" --property=LoadState --value)' in block
+    assert '[ "$family_load" = not-found ]' in block
+    assert 'fail "registered worker lane is not loaded: $family_unit"' in block
+    # The flag itself is still required exactly for every loaded unit.
+    assert "isolation flag did not reach $family_unit exactly" in block
