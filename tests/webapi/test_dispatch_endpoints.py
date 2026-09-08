@@ -19,6 +19,7 @@ from command_center import pipeline_settings, tasks_repository, task_pipeline
 from command_center.dispatch import service as dispatch_service
 from command_center.dispatch.models import (
     ASSIGNED,
+    SPEND_MEASUREMENT_ACTUAL,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
@@ -43,6 +44,7 @@ def _sample_plan() -> DispatchPlan:
     return DispatchPlan(
         decisions=(decision,), kill_switch_engaged=False,
         daily_spend_usd=0.0, max_daily_spend_usd=5.0, projected_spend_usd=0.0,
+        spend_measurement=SPEND_MEASUREMENT_ACTUAL,
     )
 
 
@@ -54,6 +56,7 @@ def test_get_plan_returns_serialized_plan(monkeypatch):
     assert body["assignment_count"] == 1
     assert body["decisions"][0]["assigned_executor"] == "ollama"
     assert body["budget_remaining_usd"] == 5.0
+    assert body["spend_measurement"] == {"status": "measured", "kind": "actual"}
 
 
 def test_post_assign_forwards_confirmation(monkeypatch, authenticated_caller):
@@ -180,9 +183,12 @@ def test_put_policy_no_longer_accepts_a_bare_body(monkeypatch):
 
 def test_get_plan_reports_null_spend_not_a_fabricated_zero_when_unreadable(monkeypatch):
     """End-to-end through the *real* service: a trailing-24h spend read that
-    raises must surface as `daily_spend_usd`/`projected_spend_usd` being
-    `null` in the JSON response, never `0.0` — a `0.0` reads as "nothing
-    spent today" to any caller that doesn't also check `budget_unknown`."""
+    raises must surface as `daily_spend_usd`/`projected_spend_usd`/
+    `budget_remaining_usd` all being `null` in the JSON response, never a
+    fabricated `0.0` or the configured ceiling — either reads as a real
+    figure to any caller that doesn't also check `budget_unknown`. The new
+    `spend_measurement` block makes that explicit for any consumer that reads
+    it instead of inferring provenance from `None`."""
     monkeypatch.setattr(apimod, "_root", lambda: _ROOT)
     monkeypatch.setattr(
         dispatch_service,
@@ -214,6 +220,7 @@ def test_get_plan_reports_null_spend_not_a_fabricated_zero_when_unreadable(monke
     assert body["daily_spend_usd"] is None
     assert body["projected_spend_usd"] is None
     assert body["budget_remaining_usd"] is None
+    assert body["spend_measurement"] == {"status": "unavailable", "kind": "unknown"}
     assert body["assignment_count"] == 0
 
 

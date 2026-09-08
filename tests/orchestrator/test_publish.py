@@ -130,6 +130,9 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
 
 
 def test_existing_pr_head_race_fails_before_lease_release(repo, monkeypatch):
+    """A `headRefOid` that never converges (a genuinely different commit,
+    not eventual-consistency lag) must still fail -- after the bounded
+    retry window closes, not on the first read."""
     work, bin_, calls = repo
     _with_path(bin_, monkeypatch)
     (work / "change.txt").write_text("x\n")
@@ -145,12 +148,59 @@ def test_existing_pr_head_race_fails_before_lease_release(repo, monkeypatch):
         "esac\n"
     )
     gh.chmod(0o755)
+    sleeps = []
 
-    result = publish_run(work, _cfg(bin_))
+    result = publish_run(work, _cfg(bin_), sleep=sleeps.append)
 
     assert not result.ok and result.reason == "pr_head_sha_mismatch"
     log = calls.read_text()
     assert log.index("gh pr view") < log.index(" release ")
+    # It must have actually retried (bounded window) rather than failing on
+    # the first snapshot -- one `gh pr view` per read, several sleeps.
+    assert log.count("gh pr view") >= 4
+    assert len(sleeps) >= 3
+
+
+def test_pr_head_sha_reconciles_after_bounded_retry(repo, monkeypatch):
+    """VOYN-W0-AICC-PUBLISH-HEAD-SHA-RACE, live 2026-08-30: `publish_run`
+    returned `ok=False reason=pr_head_sha_mismatch` for an actually
+    successful publish -- `git ls-remote`/`gh pr view` checked right after
+    showed the just-pushed SHA, but the single `gh pr view` snapshot taken
+    inside `_verified_pr_result` had read the PR object before GitHub's own
+    eventual-consistency window closed. Reproduced here: `gh pr view`
+    answers with the PR's stale prior head for its first two reads, then
+    the real head from the third read on -- the publish must not be
+    reported as failed once the PR object catches up inside the bounded
+    retry window."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+    gh = bin_ / "gh"
+    gh.write_text(
+        f'#!/bin/sh\necho "gh $*" >> {calls}\n'
+        'case "$2" in\n'
+        f"  view) n=$(grep -c '^gh pr view' {calls}); "
+        "head=$(git rev-parse HEAD); "
+        'if [ "$n" -lt 3 ]; then oid="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; '
+        'else oid="$head"; fi; '
+        'printf \'{"url":"https://github.com/x/y/pull/1",'
+        '"headRefOid":"%s","baseRefName":"main",'
+        '"state":"OPEN"}\\n\' "$oid"; exit 0 ;;\n'
+        "esac\n"
+    )
+    gh.chmod(0o755)
+    sleeps = []
+
+    result = publish_run(work, _cfg(bin_), sleep=sleeps.append)
+
+    assert result.ok, result.reason
+    assert result.pr_url == "https://github.com/x/y/pull/1"
+    log = calls.read_text()
+    # Reconciled on the third read: two stale snapshots, then the real one.
+    assert log.count("gh pr view") == 3
+    assert len(sleeps) == 2
 
 
 def test_created_pr_remote_race_fails_before_lease_release(repo, monkeypatch):

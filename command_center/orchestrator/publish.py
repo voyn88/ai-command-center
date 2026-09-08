@@ -38,12 +38,28 @@ import json
 import os
 import subprocess
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from command_center.worker import lease_client
 
 _PR_VIEW_DECODE_ERRORS = (TypeError, ValueError)
+
+# Bounded retry for the PR object's `headRefOid` reflecting a push that
+# already landed (VOYN-W0-AICC-PUBLISH-HEAD-SHA-RACE, live 2026-08-30):
+# `git ls-remote` and `gh pr view` immediately after publish showed the
+# just-pushed SHA and the PR still carrying the previous one -- GitHub's PR
+# object eventually-consistent with the ref it tracks, not synchronously
+# updated by the push. A single snapshot cannot tell "not yet reconciled"
+# apart from "genuinely a different commit"; four backoff-spaced re-reads
+# give the API a bounded window to catch up before the difference is taken
+# as real. `git ls-remote` (already checked before this module ever forces
+# the push, and rechecked once more right after `_verified_pr_result`'s
+# head/base/state gate) stays the authority throughout -- this retry exists
+# only to stop the PR object's lag from being reported as its failure.
+_PR_HEAD_SYNC_DELAYS_SECONDS = (0.5, 1.0, 2.0, 4.0)
 
 __all__ = ["PublishConfig", "PublishResult", "publish_run"]
 
@@ -189,6 +205,30 @@ def _pr_snapshot(repo_path: Path, reference: str) -> tuple[int, dict[str, str] |
     return 0, value if isinstance(value, dict) else None
 
 
+def _sync_pr_head(
+    repo_path: Path,
+    reference: str,
+    head_sha: str,
+    snapshot: dict[str, str],
+    sleep: Callable[[float], None],
+) -> dict[str, str]:
+    """Re-read the PR object with backoff until `headRefOid` catches up to
+    `head_sha` or the bounded window closes. A transient re-read failure or
+    a malformed reply is itself just a not-yet-reconciled observation --
+    keep the last good `snapshot` and let the next iteration try again;
+    the caller's own final `git ls-remote` recheck is what actually proves
+    a real race, not this."""
+    current = snapshot
+    for delay in _PR_HEAD_SYNC_DELAYS_SECONDS:
+        if current.get("headRefOid", "").lower() == head_sha.lower():
+            break
+        sleep(delay)
+        status, fresh = _pr_snapshot(repo_path, reference)
+        if status == 0 and fresh is not None:
+            current = fresh
+    return current
+
+
 def _verified_pr_result(
     repo_path: Path,
     cfg: PublishConfig,
@@ -196,6 +236,7 @@ def _verified_pr_result(
     head_sha: str,
     durable_target: str,
     durable_env: dict[str, str] | None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> PublishResult:
     """Resolve/create the PR while the repository writer lease is held.
 
@@ -203,7 +244,8 @@ def _verified_pr_result(
     Validate head, base and open state, then make one final remote read before
     returning success so the lease fences the entire push -> PR handoff.
     """
-    view_status, snapshot = _pr_snapshot(repo_path, branch)
+    reference = branch
+    view_status, snapshot = _pr_snapshot(repo_path, reference)
     if view_status != 0:
         body = f"Autonomous delivery of {cfg.task}.\n\nHEAD_SHA: {head_sha}\n"
         created = _run(
@@ -229,15 +271,15 @@ def _verified_pr_result(
                 head_sha=head_sha,
                 reason=f"pr_create_failed: {created.stderr.strip()[:160]}",
             )
-        pr_reference = created.stdout.strip()
-        if not pr_reference:
+        reference = created.stdout.strip()
+        if not reference:
             return PublishResult(
                 ok=False,
                 branch=branch,
                 head_sha=head_sha,
                 reason="pr_create_missing_url",
             )
-        view_status, snapshot = _pr_snapshot(repo_path, pr_reference)
+        view_status, snapshot = _pr_snapshot(repo_path, reference)
         if view_status != 0:
             return PublishResult(
                 ok=False,
@@ -250,6 +292,7 @@ def _verified_pr_result(
         return PublishResult(
             ok=False, branch=branch, head_sha=head_sha, reason="pr_snapshot_malformed"
         )
+    snapshot = _sync_pr_head(repo_path, reference, head_sha, snapshot, sleep)
     pr_url = snapshot.get("url", "")
     if snapshot.get("headRefOid", "").lower() != head_sha.lower():
         return PublishResult(
@@ -411,10 +454,19 @@ def _leak_guard_gate(
     )
 
 
-def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
+def publish_run(
+    repo_path: Path,
+    cfg: PublishConfig,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> PublishResult:
     """Acquire the lease, push a branch, open a PR. Idempotent on the branch
     name (``backlog/<task>``): a re-run force-updates the same branch and
-    reuses the open PR, so a redelivered attempt does not fan out PRs."""
+    reuses the open PR, so a redelivered attempt does not fan out PRs.
+
+    ``sleep`` backs the bounded PR-head reconciliation retry in
+    ``_verified_pr_result`` -- overridable so tests can exercise the retry
+    schedule without spending real wall-clock time on it."""
     head = _run(["git", "rev-parse", "HEAD"], repo_path)
     if head.returncode != 0:
         return PublishResult(ok=False, reason="cannot read HEAD")
@@ -632,6 +684,7 @@ def publish_run(repo_path: Path, cfg: PublishConfig) -> PublishResult:
             head_sha,
             durable_target,
             durable_env,
+            sleep,
         )
     finally:
         if cfg.release_lease:

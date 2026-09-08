@@ -53,6 +53,8 @@ from command_center.dispatch.models import (
     DEFER_NO_ELIGIBLE_EXECUTOR,
     DEFER_PROJECT_BUDGET,
     DEFER_TAIL_RISK,
+    SPEND_MEASUREMENT_ACTUAL,
+    SPEND_MEASUREMENT_UNAVAILABLE,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
@@ -150,7 +152,17 @@ def plan_dispatch(
             budget_unknown=budget_unknown,
             daily_spend_usd=daily_spend_usd,
             max_daily_spend_usd=max_daily_spend_usd,
+            # `daily_spend_usd` here is a real reading unless the trailing-24h
+            # spend itself couldn't be read (`budget_unknown`), in which case
+            # the caller already passed `None` — never a fabricated ceiling.
+            # `projected_spend_usd` mirrors it exactly, so an unmeasured spend
+            # never sprouts a concrete number one field over.
             projected_spend_usd=daily_spend_usd,
+            spend_measurement=(
+                SPEND_MEASUREMENT_UNAVAILABLE
+                if budget_unknown
+                else SPEND_MEASUREMENT_ACTUAL
+            ),
         )
 
     # `budget_unknown` was False to reach here, so the caller supplied a real
@@ -259,6 +271,7 @@ def plan_dispatch(
         daily_spend_usd=daily_spend_usd,
         max_daily_spend_usd=max_daily_spend_usd,
         projected_spend_usd=projected,
+        spend_measurement=SPEND_MEASUREMENT_ACTUAL,
     )
 
 

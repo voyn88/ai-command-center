@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import threading
 from contextlib import ExitStack
 from pathlib import Path
@@ -154,12 +153,11 @@ def _review_head_checkout(
 
 
 def _remove_review_head_checkout(repository: Path, target: Path) -> None:
-    removed = agent_runner._run_git(
-        ["worktree", "remove", "--force", str(target)], repository, timeout=60
-    )
-    if removed is None or removed.returncode != 0:
-        shutil.rmtree(target, ignore_errors=True)
-        agent_runner._run_git(["worktree", "prune"], repository)
+    """Delegates to the shared force-removal site (VOYN-W0-AICC-WORKTREE-
+    LEAK-RETRY) rather than hand-rolling `remove` + `rmtree` fallback +
+    `prune` here -- this checkout is always a throwaway detached worktree
+    this call itself created, exactly the case that shared site is for."""
+    workspace_provisioning.force_remove_worktree(repository, target)
 
 
 def _task_lease_scope(request: Any) -> str:
