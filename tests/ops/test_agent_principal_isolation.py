@@ -1893,3 +1893,27 @@ def test_the_worker_preflight_names_the_same_executors_the_broker_launches(launc
 
     for name, path in agent_runner.PRINCIPAL_EXECUTOR_BINARIES.items():
         assert path == launcher.EXECUTOR_BINARIES[name], name
+
+
+def test_validate_binary_refuses_a_target_that_is_not_a_regular_file(launcher, tmp_path, monkeypatch):
+    """Review of 2a3fa2a3: the owner/mode split left the regular-file
+    requirement unreachable; a root-owned directory or FIFO passed."""
+    real_stat = os.stat_result
+
+    def fake_stat(self, *, follow_symlinks=True):
+        values = list(os.stat(self, follow_symlinks=follow_symlinks))
+        values[4] = 0
+        return real_stat(values)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(Path, "lstat", lambda self: fake_stat(self, follow_symlinks=False))
+    directory = tmp_path / "bin" / "claude"
+    directory.mkdir(parents=True)
+    directory.chmod(0o755)
+    with pytest.raises(launcher.LaunchRefused, match="not a regular file"):
+        launcher._validate_binary(str(directory))
+    fifo = tmp_path / "bin" / "codex"
+    os.mkfifo(fifo)
+    fifo.chmod(0o755)
+    with pytest.raises(launcher.LaunchRefused, match="not a regular file"):
+        launcher._validate_binary(str(fifo))

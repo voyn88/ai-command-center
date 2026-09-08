@@ -416,7 +416,10 @@ def _validate_binary(path: str) -> None:
     link_info = candidate.lstat()
     if not _node_is_immutable_root_owned(link_info):
         raise LaunchRefused(f"executor link is not immutable root-owned: {path}")
-    if not _node_is_immutable_root_owned(resolved.stat()):
+    target_info = resolved.stat()
+    if not stat.S_ISREG(target_info.st_mode):
+        raise LaunchRefused(f"executor is not a regular file: {resolved}")
+    if not _node_is_immutable_root_owned(target_info):
         raise LaunchRefused(f"executor binary is not immutable root-owned: {resolved}")
 
 
