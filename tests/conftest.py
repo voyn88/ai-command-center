@@ -17,6 +17,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -67,13 +69,70 @@ def _immediate_reconcile(monkeypatch):
     monkeypatch.setattr(supervisor, "_RECONCILE_ABSENCE_GRACE_SECONDS", 0.0)
 
 
+# Every daemon thread `command_center.runtime.supervisor.Supervisor` can start
+# on a run's behalf (see `Supervisor._start_daemon_thread` call sites and
+# `start_completion_autopilot`). A test may reasonably return as soon as it
+# observes the terminal state or report row it cares about, without calling
+# `Supervisor.wait_for_run` — but the finalization tail (the `process_exited`
+# lifecycle event, the auto-commit, the `finalized_at` watermark) keeps
+# running on one of these threads after that, still writing into
+# `AICC_DATA_DIR`.
+_SUPERVISOR_THREAD_PREFIXES = (
+    "run-supervisor-",
+    "run-stdin-",
+    "run-timeout-",
+    "run-stdout-",
+    "run-stderr-",
+    "run-launch-recovery-",
+    "completion-autopilot",
+)
+
+
+def _live_supervisor_threads() -> list[threading.Thread]:
+    return [
+        t
+        for t in threading.enumerate()
+        if t.is_alive() and t.name.startswith(_SUPERVISOR_THREAD_PREFIXES)
+    ]
+
+
+def _join_live_supervisor_threads(timeout: float = 5.0) -> None:
+    """Block until every live Supervisor background thread has exited.
+
+    `isolated_data_dir` removes and recreates the shared `AICC_DATA_DIR` tree
+    between every test. If one of these threads is still writing when
+    `shutil.rmtree` walks the tree, a file it recreates after `rmtree` has
+    already listed a directory's contents makes the subsequent `os.rmdir`
+    fail with `OSError: [Errno 39] Directory not empty` — or, if `rmtree`
+    wins the race, the thread goes on to write into a directory the *next*
+    test has already recreated fresh and unmigrated, surfacing as
+    `sqlite3.OperationalError: no such table: run`. Waiting here, before any
+    removal, closes that window; failing loudly if a thread outlives
+    `timeout` is safer than silently proceeding to remove a directory a
+    thread might still touch.
+    """
+    deadline = time.monotonic() + timeout
+    live = _live_supervisor_threads()
+    while live and time.monotonic() < deadline:
+        for thread in live:
+            thread.join(timeout=0.05)
+        live = _live_supervisor_threads()
+    assert not live, (
+        "Supervisor background thread(s) still running after "
+        f"{timeout}s, would race the shared data dir teardown: "
+        f"{[t.name for t in live]}"
+    )
+
+
 @pytest.fixture(autouse=True)
 def isolated_data_dir():
+    _join_live_supervisor_threads()
     if _TEST_DATA_DIR.exists():
         shutil.rmtree(_TEST_DATA_DIR)
     _TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
     _clear_execution_center_singleton_cache()
     yield _TEST_DATA_DIR
+    _join_live_supervisor_threads()
     if _TEST_DATA_DIR.exists():
         shutil.rmtree(_TEST_DATA_DIR)
 
