@@ -64,6 +64,13 @@ class SelfDeployConfig:
     #: Host-local provenance record (sha, outcome, timestamp per line).
     provenance_path: str = "~/.aicc-self-deploy-provenance.jsonl"
     command_timeout: int = 300
+    #: Marker file the staged worker rollout (ops/aicc_staged_worker_rollout.py)
+    #: holds for its entire duration. A restart issued by this tick while the
+    #: rollout is mid-drain is exactly what raced the rollout's own `stop` of
+    #: the canary lane on worker-01 (live 2026-09-08); refusing while the
+    #: marker exists means the next tick (5 minutes later, after the rollout
+    #: has finished and removed it) picks the deploy back up instead.
+    rollout_lock_path: str = "/run/aicc-staged-rollout.lock"
 
 
 @dataclass(slots=True)
@@ -186,6 +193,9 @@ def self_deploy_once(
         if outcome != "noop":
             _record_provenance(cfg, report)
         return report
+
+    if cfg.rollout_lock_path and Path(cfg.rollout_lock_path).expanduser().exists():
+        return finish("refused", "staged_rollout_in_progress")
 
     fetched = _git(repo_path, ["fetch", cfg.remote, cfg.branch], timeout)
     if fetched.returncode != 0:

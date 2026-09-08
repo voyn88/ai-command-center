@@ -1453,6 +1453,78 @@ def test_worker_to_control_is_one_generation_with_one_rollback_boundary():
     )
 
 
+def test_lane_timers_are_held_before_apply_and_released_after_commit():
+    """Both lane-mutating timers, and the shared rollout lock, must be held
+    for the transaction's full mutating span -- prepare through commit -- not
+    just the `run_rollout rollout` step. `rollback`'s own `run_transaction
+    recover` (armed the moment `transaction_active` becomes 1) mutates the
+    same worker units from a separate, shell-level snapshot on ANY later
+    failure -- including one in `run_transaction apply`, before the rollout
+    step even starts -- so the hold has to begin there too, live worker-01
+    2026-09-08 (VOYN-W0-AICC-ROLLOUT-VS-ROTATE-SELFDEPLOY-TIMERS)."""
+    text = _installer_text()
+    lines = [line.strip() for line in text.splitlines()]
+    active = lines.index("transaction_active=1")
+    hold = lines.index("hold_lane_timers || {")
+    apply_index = lines.index("run_transaction apply")
+    commit = lines.index("run_transaction commit")
+    release_after_commit = lines.index("release_lane_timers", commit)
+
+    assert active < hold < apply_index < commit < release_after_commit
+    # Immediately after commit -- not buried behind
+    # `verify-agent-principal-boundary.sh` or the rollout step, both of which
+    # run before commit and must stay covered by the hold.
+    assert lines[commit + 1] == "transaction_active=0"
+    assert lines[commit + 2] == "release_lane_timers"
+
+
+def test_rollback_always_releases_lane_timers_after_recover():
+    """`rollback`'s release must be unconditional: it has to run whether or
+    not `recover` was even invoked (the guard above it may be false), and
+    whether or not `recover` succeeded -- a rollback that only released the
+    timers on the happy path would leave rotation/self-deploy paused forever
+    on exactly the failure this ticket is about."""
+    text = _installer_text()
+    body_start = text.index("rollback() {\n") + len("rollback() {\n")
+    body_end = text.index("\n}\n", body_start)
+    lines = [line.strip() for line in text[body_start:body_end].splitlines()]
+
+    recover_guard = lines.index(
+        'if [ "$transaction_active" -eq 1 ] && path_present '
+        '"$state_dir/pending.json"; then'
+    )
+    recover_call = lines.index("if ! run_transaction recover; then")
+    guard_fi = next(
+        index
+        for index, line in enumerate(lines)
+        if line == "fi" and index > recover_call
+    )
+    release_index = lines.index("release_lane_timers")
+    baseline_check = lines.index(
+        'if [ "$rollback_complete" -eq 1 ] && [ "$baseline_created" -eq 1 ]; then'
+    )
+
+    assert recover_guard < recover_call < guard_fi < release_index < baseline_check
+    # `release_lane_timers` sits AFTER the guard's closing `fi`, not inside
+    # it: reached even when transaction_active was never 1 (nothing to
+    # recover) or when recover() itself failed.
+    assert lines.count("release_lane_timers") == 1
+
+
+def test_rollout_step_declares_the_transaction_already_holds_the_timers():
+    """The rollout step must tell `rollout()` not to stop/start the timers or
+    touch the lock itself -- the transaction already holds both for a wider
+    span than this one step, and `rollout()`'s own `finally` releasing them
+    early would reopen the gap between a successful rollout and `commit`."""
+    text = _installer_text()
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+    _assert_command_inside_shell_if(
+        text,
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes --assume-timers-held",
+        guard,
+    )
+
+
 def test_worker_to_control_guard_check_rejects_an_intervening_fi():
     """A nearby guard is not proof if it closes before quiesce."""
     guard = 'if [ "$install_profile" = "control" ]; then'
@@ -1528,7 +1600,7 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
 
     for line in (
         "systemctl enable --now aicc-agent-launcher.socket",
-        "run_rollout rollout --lanes /etc/aicc/worker-lanes",
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes --assume-timers-held",
         '"$repo_root/ops/verify-agent-principal-boundary.sh"',
     ):
         # The boundary verifier is also named earlier as `sh -n "..."`, a
@@ -1982,3 +2054,59 @@ def test_every_launcher_read_write_path_is_created_by_tmpfiles_before_the_first_
         in socket_unit
     ), "the socket must re-create the runtime paths before the first connection"
     assert "/run/aicc-agent-workspace-binds" in created
+
+
+def _auth_store(tmp_path, monkeypatch, launcher, payload: bytes):
+    store = tmp_path / "store" / ".claude" / ".credentials.json"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(payload)
+    store.chmod(0o600)
+    monkeypatch.setitem(launcher.MODEL_AUTH_SOURCES, "claude", store)
+    monkeypatch.setattr(
+        launcher, "_read_exact_protected_file", lambda path, **kwargs: Path(path).read_bytes()
+    )
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    return store, home
+
+
+def test_refreshed_model_auth_is_written_back_to_the_store(tmp_path, monkeypatch, launcher):
+    """VOYN-W0-AICC-AGENT-MODEL-AUTH-REFRESH-IS-LOST-WITH-THE-EPHEMERAL-HOME:
+    a token refresh (same keys, new values) in the ephemeral home reaches
+    the root store atomically; the next run is staged from the new token."""
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1", "expiresAt": 1}}).encode()
+    new = json.dumps({"claudeAiOauth": {"accessToken": "b", "refreshToken": "r2", "expiresAt": 2}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    (home / ".claude" / ".credentials.json").write_bytes(new)
+    assert launcher._write_back_model_auth("claude", home) is True
+    assert store.read_bytes() == new
+    assert stat.S_IMODE(store.stat().st_mode) == 0o600
+    assert not list(store.parent.glob(".*.tmp"))
+
+
+def test_unchanged_or_missing_model_auth_is_not_written_back(tmp_path, monkeypatch, launcher):
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1"}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    assert launcher._write_back_model_auth("claude", home) is False
+    (home / ".claude" / ".credentials.json").write_bytes(old)
+    assert launcher._write_back_model_auth("claude", home) is False
+    assert store.read_bytes() == old
+
+
+def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monkeypatch, launcher):
+    """A refresh changes values, never the key set; anything else the agent
+    left behind is not trusted into the store."""
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1"}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    target = home / ".claude" / ".credentials.json"
+    target.write_bytes(b"not json")
+    with pytest.raises(launcher.LaunchRefused, match="not JSON"):
+        launcher._write_back_model_auth("claude", home)
+    target.write_bytes(json.dumps({"claudeAiOauth": {"accessToken": "a"}, "extra": 1}).encode())
+    with pytest.raises(launcher.LaunchRefused, match="changed shape"):
+        launcher._write_back_model_auth("claude", home)
+    target.unlink()
+    target.symlink_to(store)
+    with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
+        launcher._write_back_model_auth("claude", home)
+    assert store.read_bytes() == old

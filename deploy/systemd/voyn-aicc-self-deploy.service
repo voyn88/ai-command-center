@@ -21,4 +21,11 @@ After=network-online.target
 Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
+# Belt-and-suspenders alongside --rollout-lock (which self_deploy_once()
+# checks and refuses on): a tick already queued when the staged rollout
+# stops this unit's timer would otherwise still run to completion and race
+# the rollout's own lane mutations (live 2026-09-08 worker-01;
+# VOYN-W0-AICC-ROLLOUT-VS-ROTATE-SELFDEPLOY-TIMERS). A skipped
+# ExecCondition is not a failure.
+ExecCondition=/usr/bin/test ! -e /run/aicc-staged-rollout.lock
 ExecStart=/bin/bash -lc "set -a && source /home/voynadmin/aicc-preprod/.env && set +a && exec /home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.db self-deploy --repo-path /home/voynadmin/aicc-preprod/repo --migrate"

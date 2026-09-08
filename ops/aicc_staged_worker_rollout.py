@@ -68,6 +68,29 @@ EXPECTED_GROUPS = frozenset({"aicc-workspace", "aicc-publisher"})
 CURRENT_RELEASE = Path("/opt/aicc/current")
 RELEASE_ROOT = Path("/opt/aicc/releases")
 
+# Timers that mutate worker lane units on their own schedule, independent of
+# this rollout. Both must be held for the rollout's entire duration: a
+# credential-rotation tick's reload-then-restart fallback cannot tell "this
+# lane crashed" from "this lane is mid-drain", and a self-deploy tick
+# unconditionally restarts every service in its list. Left running, either
+# can race this script's own stop/start of a lane -- live on worker-01
+# (2026-09-08), self-deploy's restart of the canary collided with this
+# script's own `stop`, and systemd canceled one of the two jobs.
+LANE_MUTATING_TIMERS = (
+    "voyn-aicc-credential-rotation.timer",
+    "voyn-aicc-self-deploy.timer",
+)
+
+# Shared with DEFAULT_ROLLOUT_LOCK_PATH in command_center/ops/
+# credential_rotation.py and rollout_lock_path in
+# command_center/deployment/self_deploy.py -- three root-owned/host-local
+# programs with no import relationship, so the path is duplicated rather
+# than shared as an import; keep all three in sync by hand. Held for the
+# same duration as LANE_MUTATING_TIMERS, as a second, independent defense:
+# a tick already in flight when the timers are stopped, or one started
+# directly rather than through its timer, still sees this file and defers.
+ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
+
 
 class RolloutError(RuntimeError):
     pass
@@ -440,6 +463,57 @@ def verify_snapshot_closure(systemd: Systemd, state: dict[str, object]) -> None:
         raise RolloutError(
             f"template units exist outside service snapshot: {extras}"
         )
+
+
+def hold_lane_mutating_timers(systemd: Systemd) -> None:
+    """Stop every lane-mutating timer before the first lane mutation.
+
+    Fail-closed on a partial stop: if one timer stops but a later one
+    refuses, the ones already stopped are restarted before raising, so a
+    failed hold never leaves the fleet with only some of its guardrails
+    disabled.
+    """
+    stopped: list[str] = []
+    try:
+        for timer in LANE_MUTATING_TIMERS:
+            systemd.run("stop", timer)
+            stopped.append(timer)
+    except BaseException:
+        for timer in stopped:
+            systemd.run("start", timer, check=False)
+        raise
+
+
+def release_lane_mutating_timers(systemd: Systemd) -> None:
+    """Best-effort restart of every timer `hold_lane_mutating_timers` stopped.
+
+    Always called from a `finally`, on both the success and failure path, so
+    a rollout can never exit leaving rotation or self-deploy permanently
+    paused.
+    """
+    for timer in LANE_MUTATING_TIMERS:
+        systemd.run("start", timer, check=False)
+
+
+def write_rollout_lock() -> None:
+    """Create the marker file rotation/self-deploy check before mutating.
+
+    World-readable by design: the rotator and self-deploy run as unprivileged
+    service users and only need to observe that the file exists, never its
+    contents. Written via temp-then-rename so a concurrent reader never
+    observes a partially written file.
+    """
+    ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = ROLLOUT_LOCK_PATH.with_name(
+        f".{ROLLOUT_LOCK_PATH.name}.{os.getpid()}"
+    )
+    temporary.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    temporary.chmod(0o644)
+    os.replace(temporary, ROLLOUT_LOCK_PATH)
+
+
+def remove_rollout_lock() -> None:
+    ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
@@ -1061,6 +1135,7 @@ def rollout(
     uid_for_user=None,
     process_uid=None,
     process_environment=None,
+    timers_already_held: bool = False,
     lane_inputs_visible=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
@@ -1076,54 +1151,89 @@ def rollout(
     # before anything is retired, so an absent authority file cannot strand
     # the host between configurations.
     verify_required_environment_files(systemd, units)
+    # Hold both lane-mutating timers, and the shared lock a tick honours even
+    # if it fires anyway, for the ENTIRE mutating section below -- staged
+    # rollout vs. rotate/self-deploy timers (2026-09-08 worker-01). Nothing
+    # has mutated yet at this point, so a failure to hold aborts cleanly with
+    # no rollback needed.
+    #
+    # `timers_already_held` is how deploy/install-agent-principal-isolation.sh
+    # opts out of this function's own hold/release: that installer wraps its
+    # ENTIRE transaction (prepare through commit) in the same hold, because a
+    # rollout failure here triggers ITS OWN outer `recover`, which restores
+    # the same worker units from a separate, shell-level snapshot -- outside
+    # this function and after this function's own `finally` would otherwise
+    # have already handed the timers back. Skipping the inner hold/release
+    # when the caller already holds it is what keeps that second, outer
+    # restore covered too, instead of just this function's mutations.
+    if not timers_already_held:
+        hold_lane_mutating_timers(systemd)
+        write_rollout_lock()
     try:
-        agent_uid = uid_for_user(agent_user)
-        privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
-        # verify_all() has always refused an aliased agent/privileged UID, but
-        # a caller invoking this mutating rollout directly (bypassing the
-        # separate shell verifier) was not protected by that check: it could
-        # retire a healthy legacy fleet and start the new one under a UID
-        # that is not actually isolated from a privileged principal (review
-        # finding on 5f2f1dd). Refuse before the first mutation.
-        if agent_uid in privileged_uids:
-            raise RolloutError("agent UID aliases a privileged principal")
-        # Legacy claimers retire BEFORE any templated lane starts claiming
-        # (runbook step 5; review on d8920b6) -- and before the loop, so an
-        # empty lane set cannot leave them enabled via a silent no-op.
-        retire_legacy_units(systemd)
-        for unit in units:
-            systemd.run("enable", unit)
-            # A blocking stop is the drain barrier. TimeoutStopSec remains
-            # longer than the maximum job, so PID 1 waits before lane advance.
-            systemd.run("stop", unit)
-            if systemd.property(unit, "ActiveState") != "inactive":
-                raise RolloutError(f"{unit} did not drain to inactive")
-            if systemd.property(unit, "MainPID") != "0":
-                raise RolloutError(f"{unit} retained a stale MainPID after drain")
-            # A daemon-reload or drop-in replacement may race the drain.  The
-            # final pre-start check makes that race fail closed too.
-            verify_unit_configuration(systemd, unit)
-            systemd.run("start", unit)
-            verify_unit(
-                systemd,
-                unit,
-                agent_uid=agent_uid,
-                privileged_uids=privileged_uids,
-                uid_for_user=uid_for_user,
-                process_uid=process_uid,
-                process_environment=process_environment,
-                lane_inputs_visible=lane_inputs_visible,
+        try:
+            agent_uid = uid_for_user(agent_user)
+            privileged_uids = frozenset(
+                uid_for_user(user) for user in privileged_users
             )
-    except BaseException:
-        # Never restart from a service snapshot while the failed file
-        # generation is still installed. The outer write-ahead transaction
-        # first restores the exact prior files and only then restores the
-        # attempt snapshot. Until that ordered recovery, every touched worker
-        # stays fail-closed.
-        for unit in (*units, *LEGACY_WORKER_UNITS):
-            systemd.run("stop", unit, check=False)
-            systemd.run("disable", unit, check=False)
-        raise
+            # verify_all() has always refused an aliased agent/privileged UID,
+            # but a caller invoking this mutating rollout directly (bypassing
+            # the separate shell verifier) was not protected by that check:
+            # it could retire a healthy legacy fleet and start the new one
+            # under a UID that is not actually isolated from a privileged
+            # principal (review finding on 5f2f1dd). Refuse before the first
+            # mutation.
+            if agent_uid in privileged_uids:
+                raise RolloutError("agent UID aliases a privileged principal")
+            # Legacy claimers retire BEFORE any templated lane starts claiming
+            # (runbook step 5; review on d8920b6) -- and before the loop, so
+            # an empty lane set cannot leave them enabled via a silent no-op.
+            retire_legacy_units(systemd)
+            for unit in units:
+                systemd.run("enable", unit)
+                # A blocking stop is the drain barrier. TimeoutStopSec remains
+                # longer than the maximum job, so PID 1 waits before lane
+                # advance.
+                systemd.run("stop", unit)
+                if systemd.property(unit, "ActiveState") != "inactive":
+                    raise RolloutError(f"{unit} did not drain to inactive")
+                if systemd.property(unit, "MainPID") != "0":
+                    raise RolloutError(
+                        f"{unit} retained a stale MainPID after drain"
+                    )
+                # A daemon-reload or drop-in replacement may race the drain.
+                # The final pre-start check makes that race fail closed too.
+                verify_unit_configuration(systemd, unit)
+                systemd.run("start", unit)
+                verify_unit(
+                    systemd,
+                    unit,
+                    agent_uid=agent_uid,
+                    privileged_uids=privileged_uids,
+                    uid_for_user=uid_for_user,
+                    process_uid=process_uid,
+                    process_environment=process_environment,
+                    lane_inputs_visible=lane_inputs_visible,
+                )
+        except BaseException:
+            # Never restart from a service snapshot while the failed file
+            # generation is still installed. The outer write-ahead transaction
+            # first restores the exact prior files and only then restores the
+            # attempt snapshot. Until that ordered recovery, every touched
+            # worker stays fail-closed.
+            for unit in (*units, *LEGACY_WORKER_UNITS):
+                systemd.run("stop", unit, check=False)
+                systemd.run("disable", unit, check=False)
+            raise
+    finally:
+        # Restored on both the success and failure path -- a rollout must
+        # never exit leaving rotation or self-deploy permanently paused.
+        # Skipped when the caller already holds the timers: releasing here
+        # would hand them back before that caller's own later steps (e.g. the
+        # installer's `commit`, or its `recover` on a later failure) are
+        # done needing them held.
+        if not timers_already_held:
+            remove_rollout_lock()
+            release_lane_mutating_timers(systemd)
 
 
 def main() -> int:
@@ -1146,6 +1256,14 @@ def main() -> int:
     parser.add_argument("--agent-user", default="aicc-agent")
     parser.add_argument("--include-unit", action="append", default=[])
     parser.add_argument("--privileged-user", action="append", default=[])
+    parser.add_argument(
+        "--assume-timers-held",
+        action="store_true",
+        help="The caller (deploy/install-agent-principal-isolation.sh) has "
+        "already stopped both lane-mutating timers and written the shared "
+        "rollout lock for a wider transaction than this rollout step alone; "
+        "do not stop/start them or touch the lock here.",
+    )
     args = parser.parse_args()
     systemd = Systemd()
     if args.action == "restore":
@@ -1197,6 +1315,7 @@ def main() -> int:
             units,
             agent_user=args.agent_user,
             privileged_users=privileged_users,
+            timers_already_held=args.assume_timers_held,
         )
     else:
         privileged_users = (
