@@ -421,6 +421,8 @@ def _validate_binary(path: str) -> None:
         raise LaunchRefused(f"executor is not a regular file: {resolved}")
     if not _node_is_immutable_root_owned(target_info):
         raise LaunchRefused(f"executor binary is not immutable root-owned: {resolved}")
+    if not os.access(resolved, os.X_OK):
+        raise LaunchRefused(f"executor is not executable: {path}")
 
 
 def _node_is_immutable_root_owned(info: os.stat_result) -> bool:
@@ -436,11 +438,6 @@ def _node_is_immutable_root_owned(info: os.stat_result) -> bool:
     if stat.S_ISLNK(info.st_mode):
         return True
     return not (info.st_mode & 0o022)
-    info = resolved.stat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-        raise LaunchRefused(f"executor is not an immutable root-owned file: {path}")
-    if not os.access(resolved, os.X_OK):
-        raise LaunchRefused(f"executor is not executable: {path}")
 
 
 def _prepare_agent_home(executor: str, run_id: str) -> Path:
