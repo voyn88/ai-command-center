@@ -1821,26 +1821,34 @@ def test_boundary_flag_check_skips_a_retired_legacy_family_unit_but_not_a_lane()
 
 
 def test_every_launcher_read_write_path_is_created_by_tmpfiles_before_the_first_connection():
-    """systemd builds the per-connection namespace BEFORE the launcher runs, so
+    """VOYN-W0-AICC-LAUNCHER-BIND-ROOT-MUST-EXIST-BEFORE-FIRST-CONNECTION:
     a ReadWritePaths= entry only the launcher creates refuses every first
-    connection with 226/NAMESPACE (worker-01 2026-09-08: ten launches, all
-    "Connection reset by peer" on the worker side). Each entry must be a
-    tmpfiles.d directory and tolerate absence with '-'."""
+    connection with 226/NAMESPACE. Every entry is declared in tmpfiles, the
+    entries are STRICT (a '-' would only hide the absence: a directory
+    created after the namespace is built is not writable inside it, review
+    of 5736dd6c), and the socket unit re-applies the tmpfiles declaration
+    before it accepts a connection, so a boot where tmpfiles did not run is
+    repaired at the socket, not tolerated at the namespace."""
     root = Path(__file__).parents[2]
     unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text(encoding="utf-8")
+    socket_unit = (root / "deploy/systemd/aicc-agent-launcher.socket").read_text(encoding="utf-8")
     tmpfiles = (root / "deploy/tmpfiles.d/aicc-agent.conf").read_text(encoding="utf-8")
     declared = {
         line.split()[1]
         for line in tmpfiles.splitlines()
-        if line.strip() and not line.startswith("#") and line.split()[0] in {"d", "D", "z", "Z"}
+        if line and not line.startswith("#") and line.split()[0] in {"d", "D", "z", "Z"}
     }
     entries = [
-        line.partition("=")[2].split()
+        line.split("=", 1)[1].split()
         for line in unit.splitlines()
         if line.startswith("ReadWritePaths=")
     ]
     assert entries, "launcher unit has no ReadWritePaths="
-    for path in (p for entry in entries for p in entry):
-        assert path.startswith("-"), f"{path} does not tolerate an absent path"
-        assert path[1:] in declared, f"{path[1:]} is not created by tmpfiles.d/aicc-agent.conf"
+    for path in entries[0]:
+        assert not path.startswith("-"), f"{path}: '-' hides the absence instead of curing it"
+        assert path in declared, f"{path} is not created by tmpfiles.d/aicc-agent.conf"
+    assert (
+        "ExecStartPre=/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/aicc-agent.conf"
+        in socket_unit
+    ), "the socket must re-create the runtime paths before the first connection"
     assert "/run/aicc-agent-workspace-binds" in declared

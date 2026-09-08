@@ -27,11 +27,15 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 KeyringMode=private
 RestrictAddressFamilies=AF_UNIX
-# Every entry is declared in deploy/tmpfiles.d/aicc-agent.conf (a test pins
-# that): the namespace is built before ExecStart, so a path only the launcher
-# creates would refuse the connection with 226/NAMESPACE (worker-01,
-# 2026-09-08). The '-' tolerates a boot where tmpfiles has not run yet.
-ReadWritePaths=-/run/aicc-agent-launcher -/run/aicc-agent-homes -/run/aicc-agent-workspace-binds -/srv/aicc-workspaces -/srv/aicc-quarantine
+# Every entry is declared in deploy/tmpfiles.d/aicc-agent.conf and the
+# socket unit re-creates that declaration (systemd-tmpfiles --create) before
+# it accepts the first connection: this namespace is built before ExecStart,
+# so a path only the launcher creates refused the connection with
+# 226/NAMESPACE (worker-01, 2026-09-08). Strict entries, deliberately: a
+# '-' would only let the namespace come up around an ABSENT path, and a
+# directory created afterwards never becomes writable inside it (review of
+# 5736dd6c) -- the connection would fail one step later instead.
+ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine
 UMask=0077
 MemoryMax=256M
 TasksMax=64
