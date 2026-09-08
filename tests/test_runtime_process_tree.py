@@ -59,6 +59,70 @@ def test_grandchild_process_tree_terminates_on_process_group_cancellation(
     assert result_events and result_events[0]["payload"]["result"] == "tree started"
 
 
+def test_setsid_escaped_grandchild_terminates_on_process_group_cancellation(
+    git_repo, configure_project_repo, fake_claude_tree
+):
+    """A descendant that calls `setsid()` leaves the launch-time process
+    group entirely, so `killpg(parent_pgid, ...)` alone can never reach it —
+    it needs a direct, identity-verified `kill(pid, ...)`. Regression for the
+    class of bug in VOYN-W0-AICC-SETSID-ORPHAN: without this, an escaped
+    descendant survives a full cancellation indefinitely."""
+    env_overrides, pidfile_base = fake_claude_tree
+    env_overrides["FAKE_CLAUDE_TREE_GRANDCHILD_SETSID"] = "1"
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
+    )
+    pids = _wait_for_tree_pids(pidfile_base)
+    assert identity.process_exists(pids["grandchild"])
+    assert os.getpgid(pids["grandchild"]) != os.getpgid(pids["parent"]), (
+        "the grandchild must actually have escaped the launch pgid for this test to mean anything"
+    )
+
+    result = sup.cancel(run["id"], confirmed=True, grace_seconds=5)
+
+    assert result["state"] == "CANCELLED"
+    assert identity.process_exists(pids["parent"]) is False
+    assert identity.process_exists(pids["child"]) is False
+    assert identity.process_exists(pids["grandchild"]) is False, (
+        "the setsid-escaped grandchild must not survive cancellation"
+    )
+
+    events = db.list_run_events(sup.db_path, run["id"])
+    lifecycles = [e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"]
+    assert any(lifecycle and "escaped_sigterm_sent" in lifecycle for lifecycle in lifecycles)
+
+
+def test_setsid_escaped_grandchild_terminates_when_it_ignores_sigterm(
+    git_repo, configure_project_repo, fake_claude_tree
+):
+    """Even when the escaped grandchild itself ignores SIGTERM, the direct
+    SIGKILL escalation must still reach it — proving the fix does not just
+    forward one best-effort signal but follows the same grace/escalation
+    contract as the rest of process-group cancellation."""
+    env_overrides, pidfile_base = fake_claude_tree
+    env_overrides["FAKE_CLAUDE_TREE_GRANDCHILD_SETSID"] = "1"
+    env_overrides["FAKE_CLAUDE_TREE_DESCENDANTS_IGNORE_SIGTERM"] = "1"
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p", confirmed=True
+    )
+    pids = _wait_for_tree_pids(pidfile_base)
+
+    result = sup.cancel(run["id"], confirmed=True, grace_seconds=1)
+
+    assert result["state"] == "CANCELLED"
+    assert identity.process_exists(pids["grandchild"]) is False
+
+    events = db.list_run_events(sup.db_path, run["id"])
+    lifecycles = [e["payload"].get("lifecycle") for e in events if e["event_type"] == "lifecycle"]
+    assert any(lifecycle and "escaped_sigkill_sent" in lifecycle for lifecycle in lifecycles)
+
+
 def test_grandchild_process_tree_terminates_even_when_parent_ignores_sigterm(
     git_repo, configure_project_repo, fake_claude_tree
 ):
