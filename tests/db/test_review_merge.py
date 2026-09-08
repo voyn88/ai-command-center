@@ -3572,10 +3572,87 @@ def test_window_listing_is_light_and_details_are_fetched_lazily(monkeypatch):
     assert [n for n, _ in report.active] == [1, 2]
     assert [n for n, _ in report.waiting] == [3, 4]
     viewed = sorted(int(c[2]) for c in calls if c[:2] == ["pr", "view"])
-    assert viewed == [1, 2], "only the candidates that could fill the window are examined"
+    assert viewed == [1, 2, 3, 4], (
+        "beyond-window PRs are still examined for block reasons while budget remains"
+    )
     assert any(c[:2] == ["pr", "edit"] and c[2] == "4" for c in calls), (
         "the tail is still labelled waiting"
     )
+
+
+def _window_fake(monkeypatch, light, views):
+    import subprocess as sp
+
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        calls.append(list(argv))
+        if argv[:2] == ["pr", "list"]:
+            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps(views[int(argv[2])]), "")
+        if argv[:2] == ["pr", "edit"]:
+            return sp.CompletedProcess(argv, 0, "", "")
+        return sp.CompletedProcess(argv, 1, "", "unhandled")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    return calls
+
+
+def test_a_genuinely_blocked_pr_beyond_the_window_is_labelled_blocked(monkeypatch):
+    """Adversarial review of 53183850: stamping everything past the window
+    `waiting` without a detail lookup lost the blocked signal for the whole
+    backlog. A stale PR far down the queue must still come out blocked."""
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 4)}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": []}
+        for n in range(1, 4)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {
+        1: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[1], "committedDate": fresh}]},
+        2: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[2], "committedDate": fresh}]},
+        # Beyond the window AND stale: an old head with no accept marker.
+        3: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[3], "committedDate": "2020-01-01T00:00:00Z"}]},
+    }
+    calls = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=3600))
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.waiting] == [2]
+    assert report.blocked == [(3, "stale_exact_head_acceptance")]
+    assert ["pr", "edit", "3", "--add-label", "review-window:blocked"] in calls
+
+
+def test_out_of_budget_prs_keep_their_blocked_label_and_are_reported(monkeypatch):
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 5)}
+    labels = {3: [{"name": "review-window:blocked"}], 4: []}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": labels.get(n, [])}
+        for n in range(1, 5)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {n: {"reviews": [], "statusCheckRollup": [],
+                 "commits": [{"oid": heads[n], "committedDate": fresh}]} for n in range(1, 5)}
+    calls = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=3600, detail_budget=2)
+    )
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.waiting] == [2]
+    assert [n for n, _ in report.unchecked] == [3, 4]
+    viewed = sorted(int(c[2]) for c in calls if c[:2] == ["pr", "view"])
+    assert viewed == [1, 2], "the budget bounds the detail lookups"
+    # 3 was blocked and was not examined: its label is untouched.
+    assert not any(c[:2] == ["pr", "edit"] and c[2] == "3" for c in calls)
+    # 4 had no window label and becomes waiting without a lookup.
+    assert ["pr", "edit", "4", "--add-label", "review-window:waiting"] in calls
 
 
 def test_window_scans_every_open_pr_not_just_fifty(monkeypatch):

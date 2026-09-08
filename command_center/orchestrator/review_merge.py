@@ -3090,6 +3090,14 @@ class PrWindowConfig:
     #: listing is light (no reviews/checks/commits per PR), so a large limit
     #: is cheap; details are fetched lazily for candidates only.
     scan_limit: int = 300
+    #: How many per-PR detail lookups (`gh pr view` with reviews, checks,
+    #: commits) one tick may spend, candidates included. The block reasons
+    #: (`_window_block_reason`: reject marker, missing/red checks, stale
+    #: head) need those details, so PRs beyond the window are still
+    #: examined while budget remains -- oldest first -- and a PR the budget
+    #: did not reach keeps the label it has: `blocked` is never downgraded
+    #: to `waiting` on no evidence (adversarial review of 53183850).
+    detail_budget: int = 80
     #: A PR whose head commit is older than this (seconds) with no green
     #: acceptance path yet is blocked from the window rather than occupying
     #: a slot indefinitely. Default 48h.
@@ -3116,6 +3124,9 @@ class PrWindowReport:
     #: PRs can be told apart from a genuine stale push rather than a lookup
     #: failure silently inflating its apparent age.
     age_fallback: list[tuple[int, str]] = field(default_factory=list)
+    #: (number, headRefOid) beyond the window that the detail budget did not
+    #: reach this tick; their existing window label was left untouched.
+    unchecked: list[tuple[int, str]] = field(default_factory=list)
     #: Set when the listing itself failed: nothing was labelled this tick,
     #: and the caller must say so loudly rather than print an empty report
     #: (live 2026-09-08: the old all-fields listing exceeded GitHub's
@@ -3369,13 +3380,20 @@ def reconcile_pr_window(
     ordered += [pr for pr in listed_prs if cfg.label_active not in _pr_window_labels(pr)]
 
     selected = 0
+    details_used = 0
     for pr in ordered:
         number = int(pr.get("number") or 0)
         head = str(pr.get("headRefOid") or "")
-        if selected >= cfg.max_active:
-            report.waiting.append((number, head))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
+        window_full = selected >= cfg.max_active
+        if details_used >= max(cfg.detail_budget, 0):
+            # Out of detail budget: no evidence either way this tick. A PR
+            # already labelled blocked keeps that signal; anything else is
+            # (still) waiting. Re-examined on a later tick.
+            report.unchecked.append((number, head))
+            if cfg.label_blocked not in _pr_window_labels(pr):
+                _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
             continue
+        details_used += 1
         detailed = _pr_window_details(repo_path, pr)
         if detailed is None:
             # Unknown is not eligible: an unreadable PR keeps (or gets) the
@@ -3390,6 +3408,10 @@ def reconcile_pr_window(
         if reason is not None:
             report.blocked.append((number, reason))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
+            continue
+        if window_full:
+            report.waiting.append((number, head))
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
             continue
         selected += 1
         report.active.append((number, head))
