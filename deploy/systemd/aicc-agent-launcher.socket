@@ -4,6 +4,12 @@ Requires=aicc-principal-recovery.service
 After=aicc-principal-recovery.service
 
 [Socket]
+# Before the first connection is accepted, every runtime path the
+# per-connection unit names in ReadWritePaths= exists with the declared
+# owner and mode -- the SAME declaration tmpfiles applies at boot, so there
+# is one authority for the list. A path missing at connection time is a
+# 226/NAMESPACE refusal of that connection (worker-01, 2026-09-08).
+ExecStartPre=/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/aicc-agent.conf
 ListenStream=/run/aicc-agent-launcher/control.sock
 SocketUser=root
 SocketGroup=aicc-publisher
