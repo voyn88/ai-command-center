@@ -961,11 +961,21 @@ def render_worker_host_role(role: str) -> list[str]:
     No new identity machinery is needed for this — role membership already
     carries the grants, and revoking a host is `ALTER ROLE ... NOLOGIN`. No
     password is rendered here, for the reason `render_role_creation()` gives.
+
+    `role` is unique per call site (a fresh per-host or per-test name), so two
+    callers never race the SAME `CREATE ROLE` — but `IN ROLE {WORKER_ROLE}`
+    still writes a `pg_auth_members` membership row that references the
+    shared `aicc_worker` role, the same class of cluster-level catalog write
+    `render_role_creation()`'s docstring guards with `pg_advisory_xact_lock`.
+    Taking that same lock here keeps every writer of `aicc_worker`-referencing
+    catalog state serialized through one gate rather than depending on each
+    new call site independently rediscovering the need for it.
     """
     _require_identifier(role)
     return [
         "DO $$\n"
         "BEGIN\n"
+        "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
         "    END IF;\n"
