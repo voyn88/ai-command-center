@@ -39,18 +39,54 @@ chmod 0700 /etc/voyn/secrets
 
 log "stub worker + legacy lane 2 running under voynadmin (legacy runtime root)"
 cat > /usr/local/bin/aicc-stub-worker <<'STUB'
-#!/bin/bash
-# Stand-in for `python -m command_center.worker`: proves the unit envelope,
-# not the worker. READY only after the credential and env file are readable.
-set -u
-env_file="${AICC_WORKER_ENV_FILE:-}"
-if [ -n "$env_file" ] && [ ! -r "$env_file" ]; then echo "stub: cannot read $env_file" >&2; exit 3; fi
-if [ -n "${PGPASSFILE:-}" ] && [ ! -r "$PGPASSFILE" ]; then echo "stub: cannot read $PGPASSFILE" >&2; exit 3; fi
-reload() { systemd-notify --reloading; sleep 0.2; systemd-notify --ready --status=aicc-ready; }
-trap reload HUP
-trap 'exit 0' TERM
-systemd-notify --ready --status=aicc-ready
-while :; do sleep 1; done
+#!/usr/bin/python3
+"""Stand-in for `python -m command_center.worker`: proves the unit envelope,
+not the worker. Notifies from the MAIN PID (NotifyAccess=main in the isolated
+template rejects a child `systemd-notify`), READY only after the credential
+and env file are readable, RELOADING/READY on SIGHUP, exits on SIGTERM."""
+import os
+import signal
+import socket
+import sys
+import time
+
+
+def notify(text: str) -> None:
+    path = os.environ.get("NOTIFY_SOCKET", "")
+    if not path:
+        return
+    if path.startswith("@"):
+        path = "\0" + path[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.connect(path)
+        sock.sendall(text.encode())
+
+
+env_file = os.environ.get("AICC_WORKER_ENV_FILE", "")
+if env_file and not os.access(env_file, os.R_OK):
+    print(f"stub: cannot read {env_file}", file=sys.stderr)
+    sys.exit(3)
+pgpass = os.environ.get("PGPASSFILE", "")
+if pgpass and not os.access(pgpass, os.R_OK):
+    print(f"stub: cannot read {pgpass}", file=sys.stderr)
+    sys.exit(3)
+
+
+def on_hup(signum, frame):
+    notify("RELOADING=1\nMONOTONIC_USEC=%d" % (time.monotonic_ns() // 1000))
+    time.sleep(0.2)
+    notify("READY=1\nSTATUS=aicc-ready")
+
+
+def on_term(signum, frame):
+    sys.exit(0)
+
+
+signal.signal(signal.SIGHUP, on_hup)
+signal.signal(signal.SIGTERM, on_term)
+notify("READY=1\nSTATUS=aicc-ready")
+while True:
+    time.sleep(1)
 STUB
 chmod 0755 /usr/local/bin/aicc-stub-worker
 cat > /etc/systemd/system/voyn-aicc-worker@.service <<'LEGACY'
