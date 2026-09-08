@@ -135,6 +135,8 @@ ALL_TABLES: tuple[str, ...] = (
     "council_vote",
     "digest_item",
     "enrollment_ticket",
+    "executor_availability",
+    "executor_availability_event",
     "market_install_log",
     "market_item",
     "message",
@@ -190,6 +192,7 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "completion_event": "completion_event_id_seq",
         "completion_validation": "completion_validation_id_seq",
         "council_event": "council_event_id_seq",
+        "executor_availability_event": "executor_availability_event_id_seq",
         "model_event": "model_event_id_seq",
         "principal_event": "principal_event_id_seq",
         "proposal_event": "proposal_event_id_seq",
@@ -247,6 +250,17 @@ _APP_QUEUE_TABLES: dict[str, frozenset[str]] = {
 # PostgreSQL authority must expose a dedicated CAS function, never blanket DML.
 _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
     "run_finalization_claim": _NONE,
+}
+
+# Fleet-wide executor availability (0018, VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY):
+# the control plane READS both the live verdict and its history, for the same
+# dashboards/metrics reason it reads `work_item`/`work_event`. Neither table
+# holds a secret or a capability, so a plain table grant (not a redacted view)
+# is enough — unlike `work_attempt`, there is nothing here worth hiding from a
+# role that can already read it.
+_APP_EXECUTOR_TABLES: dict[str, frozenset[str]] = {
+    "executor_availability": _READ,
+    "executor_availability_event": _READ,
 }
 
 # The structured backlog store (0005, BO-S1), the queue-claim idiom again:
@@ -431,6 +445,14 @@ _WORKER_TABLES: dict[str, frozenset[str]] = {
     "work_attempt": _NONE,
     "work_result": _NONE,
     "work_event": _NONE,
+    # Fleet-wide executor availability (0018): a worker reads the live verdict
+    # directly (a plain SELECT — this table holds nothing sensitive, unlike
+    # `work_attempt`), but mutates ONLY through `executor_mark_unavailable` /
+    # `executor_mark_available`, so a compromised host cannot forge
+    # "available" over an account it knows to be exhausted, or erase the
+    # history of having said so.
+    "executor_availability": _READ,
+    "executor_availability_event": _NONE,
 }
 
 # Views are granted separately from tables: `information_schema` reports them
@@ -509,6 +531,17 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_triage(text, text, text)",
 )
 
+# Fleet-wide executor availability (0018): the worker is the sole observer of
+# a provider account's own failures, so it is the sole role that may report
+# one unavailable. There is no `_APP_EXECUTOR_FUNCTIONS`: the control plane
+# reads through the plain table grant above and never claims to know an
+# executor's live state first-hand (the same reasoning that keeps `aicc_app`
+# off `queue_claim()`).
+_WORKER_EXECUTOR_FUNCTIONS = (
+    "executor_mark_unavailable(text, text, integer)",
+    "executor_mark_available(text)",
+)
+
 # The enrolment surface (0003), split by who may do what.
 #
 # A worker gets two entries and no third. It may prove its own identity and
@@ -546,6 +579,11 @@ _OPERATOR_FUNCTIONS = (
     "enroll_sweep_expired()",
     "identity_revoke_principal(text, text)",
     "identity_sweep_expired()",
+    # The same administrative shape as readmitting a host: an incident-scale
+    # override no worker or control-plane compromise should be able to grant
+    # itself. `executor_mark_unavailable` is deliberately absent here — only
+    # a worker directly observes a provider account's own failure.
+    "executor_mark_available(text)",
 )
 
 FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
@@ -555,7 +593,9 @@ FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
         # failure mode of getting it wrong — a role that may execute nothing —
         # is silent in each task's own suite.
         APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS + _APP_BACKLOG_FUNCTIONS,
-        WORKER_ROLE: _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS,
+        WORKER_ROLE: (
+            _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS + _WORKER_EXECUTOR_FUNCTIONS
+        ),
         OPERATOR_ROLE: _OPERATOR_FUNCTIONS,
     }
 )
@@ -589,6 +629,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                         and table not in _APP_ENROLMENT_TABLES
                         and table not in _APP_BACKLOG_TABLES
                         and table not in _FINALIZATION_CLAIM_TABLES
+                        and table not in _APP_EXECUTOR_TABLES
                     },
                     # Declared policies. A second task adding rows here for a
                     # table this one already names must union with it, not
@@ -597,6 +638,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _APP_ENROLMENT_TABLES,
                     _APP_BACKLOG_TABLES,
                     _FINALIZATION_CLAIM_TABLES,
+                    _APP_EXECUTOR_TABLES,
                 )
             ),
             WORKER_ROLE: MappingProxyType(

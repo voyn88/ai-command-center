@@ -177,6 +177,11 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
     # And the enrolment layer: prove its own identity, read only the
     # server-authoritative expiry of that proved credential, rotate its own
     # secret, and nothing else — a worker cannot mint or redeem an enrolment.
+    #
+    # And the fleet-wide availability layer (0018, VOYN-W0-AICC-EXECUTOR-
+    # QUOTA-VISIBILITY): report its own observation of a provider failure, or
+    # clear one early after its own successful run — nothing that lets it
+    # read another host's decisions or bypass the queue-claim protocol above.
     assert granted == {
         "queue_claim",
         "queue_heartbeat",
@@ -185,6 +190,8 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "identity_assert",
         "identity_current_credential",
         "enroll_rotate_self",
+        "executor_mark_unavailable",
+        "executor_mark_available",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 

@@ -370,7 +370,11 @@ def test_failed_copilot_independent_review_is_retryable_infrastructure(
 
     assert not outcome.ok
     assert outcome.retryable
-    assert "provider/auth/quota" in outcome.reason
+    # VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY: the reason now names the
+    # SPECIFIC provider failure (classified from the CLI's own diagnostic
+    # text), not the generic bucket every provider/auth/quota refusal used to
+    # share -- exactly the distinct machine reason this task exists to add.
+    assert "authentication_failed" in outcome.reason
 
 
 def test_api_error_in_cli_output_is_retryable_not_a_success(
@@ -529,16 +533,21 @@ def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "diagnostic",
+    "diagnostic,expected_reason",
     [
-        "AI credit usage limit reached",
-        "not logged in; authentication required",
-        "service unavailable",
-        "network error: connection refused",
+        # VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY: `route_failovers` now names
+        # the SPECIFIC provider failure `providers.CopilotProvider.
+        # classify_failure` reads out of the CLI's own diagnostic text, not a
+        # single reason every provider/auth/quota refusal used to share --
+        # each recorded reason is also what would be fleet-marked unavailable.
+        ("AI credit usage limit reached", "quota_limit"),
+        ("not logged in; authentication required", "authentication_failed"),
+        ("service unavailable", "provider_exit_nonzero"),
+        ("network error: connection refused", "network_error"),
     ],
 )
 def test_copilot_provider_failure_switches_inside_the_same_attempt(
-    handler, monkeypatch, diagnostic
+    handler, monkeypatch, diagnostic, expected_reason
 ):
     run_agent, runs = handler
 
@@ -579,7 +588,7 @@ def test_copilot_provider_failure_switches_inside_the_same_attempt(
         {
             "cascade_step": 1,
             "executor": "copilot",
-            "reason": "provider_auth_or_quota",
+            "reason": expected_reason,
         }
     ]
 
@@ -634,7 +643,10 @@ def test_mutating_provider_failover_requires_unchanged_workspace(
     else:
         assert not outcome.ok and outcome.retryable
         assert [run["executor"] for run in runs] == ["copilot"]
-        assert "provider/auth/quota" in outcome.reason
+        # VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY: the terminal reason now
+        # names the classified cause, not the generic provider/auth/quota
+        # bucket.
+        assert "quota_limit" in outcome.reason
 
 
 def test_unknown_copilot_failure_switches_for_read_only_review(
@@ -703,7 +715,9 @@ def test_provider_failover_never_crosses_the_workspace_mutability_boundary(
 
     assert not outcome.ok and outcome.retryable
     assert [run["executor"] for run in runs] == ["copilot"]
-    assert "provider/auth/quota" in outcome.reason
+    # VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY: the terminal reason now names
+    # the classified cause, not the generic provider/auth/quota bucket.
+    assert "quota_limit" in outcome.reason
 
 
 def test_genuine_task_failure_with_error_flavoured_text_still_ok(
@@ -1033,6 +1047,134 @@ def test_absent_cascade_keeps_the_single_executor_behaviour(handler) -> None:
     assert outcome.ok
     assert outcome.result["cascade_step"] is None
     assert runs[-1]["task_type"] == _payload()["task_type"]
+
+
+# -- fleet-wide executor availability (VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY) -
+
+
+class _FakeAvailabilityStore:
+    """A scripted fleet-wide verdict, the same shape
+    `worker.handlers._fleet_availability`/`_classify_and_record_provider_
+    failure` read through — no real database, no cache TTL to wait out."""
+
+    def __init__(self, unavailable: dict | None = None) -> None:
+        self._unavailable = dict(unavailable or {})
+        self.marked: list[tuple[str, str, int]] = []
+        self.cleared: list[str] = []
+
+    def get(self, executor_id, *, use_cache=True):
+        from command_center.db.executor_availability import ExecutorAvailability
+
+        if executor_id in self._unavailable:
+            reason, until = self._unavailable[executor_id]
+            return ExecutorAvailability(executor_id, "unavailable", reason, until)
+        return ExecutorAvailability(executor_id, "available", None, None)
+
+    def mark_unavailable(self, executor_id, reason, ttl_seconds):
+        self.marked.append((executor_id, reason, ttl_seconds))
+
+    def mark_available(self, executor_id):
+        self.cleared.append(executor_id)
+
+
+def test_fleet_marked_unavailable_executor_is_skipped_before_dispatch(
+    handler, monkeypatch
+) -> None:
+    """Acceptance (1): an executor a DIFFERENT host already proved exhausted
+    is excluded from routing for the rest of its cooldown — never even
+    launched — instead of being rediscovered the hard way on every claim."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, runs = handler
+    fake_store = _FakeAvailabilityStore(
+        {"claude_code": ("quota_limit", "2026-09-06T09:00:00+00:00")}
+    )
+    monkeypatch.setattr(handlers_module, "_executor_availability_store", fake_store)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "review"},
+        {"executor": "codex", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert outcome.result["executor"] == "codex"
+    assert len(runs) == 1
+    assert runs[0]["executor"] == "codex"
+
+
+def test_fleet_exhaustion_of_every_link_reports_a_distinct_machine_reason(
+    handler, monkeypatch
+) -> None:
+    """Acceptance (2): quota exhaustion reports as its own machine reason,
+    `executor_quota_exhausted`, never folded into the local "cli
+    unavailable"/"cli not found" wording those checks already use."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, runs = handler
+    fake_store = _FakeAvailabilityStore(
+        {"claude_code": ("quota_limit", "2026-09-06T09:00:00+00:00")}
+    )
+    monkeypatch.setattr(handlers_module, "_executor_availability_store", fake_store)
+    payload = _payload(cascade=[{"executor": "claude", "task_type": "review"}])
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "executor_quota_exhausted" in outcome.reason
+    assert "quota_limit" in outcome.reason
+    assert runs == []
+
+
+def test_provider_failure_marks_the_executor_unavailable_fleet_wide(
+    handler, monkeypatch
+) -> None:
+    """Acceptance (1): the worker's OWN observation of a provider failure is
+    what feeds the fleet-wide signal a later claim — this host or any other —
+    will read, instead of dying with this one attempt's memory."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    fake_store = _FakeAvailabilityStore()
+    monkeypatch.setattr(handlers_module, "_executor_availability_store", fake_store)
+
+    def rate_limited(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=4,
+            stdout="",
+            stderr="AI credit usage limit reached",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", rate_limited)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "copilot", "task_type": "review"}]
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert fake_store.marked == [("copilot_cli", "quota_limit", 3600)]
+
+
+def test_unreachable_availability_store_fails_open_not_closed(
+    handler, monkeypatch
+) -> None:
+    """An unreachable side channel must never gate a dispatch the local
+    preflight already approved — this system exists to make outages more
+    visible, not to become a second one when its own database is down."""
+    import command_center.worker.handlers as handlers_module
+
+    class _BrokenStore:
+        def get(self, executor_id, *, use_cache=True):
+            raise RuntimeError("connection refused")
+
+        def mark_unavailable(self, executor_id, reason, ttl_seconds):
+            raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(handlers_module, "_executor_availability_store", _BrokenStore())
+    run_agent, runs = handler
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok
+    assert len(runs) == 1
 
 
 # -- machine outcome extraction (BO-S3) ---------------------------------------
