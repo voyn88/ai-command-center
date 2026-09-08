@@ -23,7 +23,12 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID here: this root broker deliberately sets the setgid bit
+# on every workspace directory (fchmod 2770, so files the agent creates
+# inherit the aicc-workspace group the worker reads them through), and
+# RestrictSUIDSGID turns exactly that chmod into EPERM -- every isolated
+# launch died with "[Errno 1] Operation not permitted" (worker-01,
+# 2026-09-08). The AGENT's transient unit keeps its own RestrictSUIDSGID.
 LockPersonality=yes
 KeyringMode=private
 RestrictAddressFamilies=AF_UNIX
