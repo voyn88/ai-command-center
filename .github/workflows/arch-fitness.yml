@@ -38,8 +38,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Label noise (see ci.yml) gets its own group and skips the job below.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) && github.run_id || 'head' }}
   cancel-in-progress: true
 
 permissions:
@@ -47,7 +48,8 @@ permissions:
 
 jobs:
   boundary-fitness:
-    name: Boundary fitness (import ban · anti-engine baseline)
+    name: ${{ (github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) && 'Label event (no gate ran)' || 'Boundary fitness (import ban · anti-engine baseline)' }}
+    if: ${{ !(github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
