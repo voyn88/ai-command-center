@@ -1878,9 +1878,7 @@ def restore_service_snapshot(
                 property_rc, actual = probe(
                     "show", unit, f"--property={name}", "--value"
                 )
-                if property_rc or _normalise_property(actual) != _normalise_property(
-                    expected
-                ):
+                if property_rc or not _properties_match(name, actual, expected):
                     raise RuntimeError(
                         f"service snapshot property did not restore: {unit} {name}"
                     )
@@ -4666,6 +4664,16 @@ def _release_entry(
         raise ReleaseRefused(f"release path is not trusted-owned: {relative}")
     if mode & 0o022 and not stat.S_ISLNK(info.st_mode):
         raise ReleaseRefused(f"release path is group/world writable: {relative}")
+    if stat.S_ISDIR(info.st_mode) and mode & 0o055 != 0o055:
+        # The worker lane runs as the unprivileged `aicc-worker` principal with
+        # `WorkingDirectory=/opt/aicc/current`; a directory it cannot traverse
+        # makes the release unstartable (200/CHDIR at ExecStartPre, observed
+        # live on worker-01 2026-09-02 and 2026-09-07: `mktemp -d` staged the
+        # release root as 0700 and `chmod -R a-w` left it 0500). Refuse to
+        # record or accept such a tree rather than publish a dead release.
+        raise ReleaseRefused(
+            f"release directory is not traversable by the worker principal: {relative}"
+        )
     if stat.S_ISLNK(info.st_mode):
         # A symlink is legitimate inside the interpreter venv, but only as the
         # exact link recorded when root built the release. The target is data,
