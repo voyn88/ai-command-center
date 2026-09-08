@@ -523,6 +523,10 @@ _WORKER_FUNCTIONS = (
     "queue_heartbeat(text, text)",
     "queue_complete(text, text, jsonb)",
     "queue_fail(text, text, text, boolean)",
+    # A second, narrower fail path for a refusal that names no fault in the
+    # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
+    # see 0018_queue_fail_lease_wait.
+    "queue_fail_lease_wait(text, text, text, integer)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a
