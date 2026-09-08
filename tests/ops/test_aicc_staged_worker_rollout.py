@@ -452,6 +452,67 @@ def test_versioned_restore_refuses_property_drift_before_restart():
     assert ("start", unit) not in systemd.calls
 
 
+def test_restore_accepts_activating_notify_worker_with_live_main_pid():
+    """A Type=notify unit forks its MainPID before sending READY=1.
+
+    `restore` reading `is-active` as "activating" with a nonzero MainPID
+    right after `start` is the service coming up normally, not one that
+    failed to go inactive (same shape as the live worker-01 install-recovery
+    wedge, 2026-09-07/08).
+    """
+    module = _module()
+    unit = "voyn-aicc-worker@blue.service"
+
+    class NotifyStartingSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args == ("start", unit):
+                self.calls.append(args)
+                state = self.states[unit]
+                state["ActiveState"] = "activating"
+                state["SubState"] = "start"
+                state["MainPID"] = "4242"
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = NotifyStartingSystemd((unit,))
+    state = module.snapshot(systemd, (unit,))
+    state["units"][unit]["active"] = True
+
+    module.restore(systemd, state)
+
+    assert systemd.states[unit]["ActiveState"] == "activating"
+    assert systemd.states[unit]["MainPID"] == "4242"
+
+
+def test_restore_still_refuses_deactivating_expected_inactive_main_pid():
+    """The activating exemption must not paper over a real stuck unit.
+
+    An expected-inactive unit still "deactivating" with a live MainPID after
+    `stop` is exactly the leftover-process case the assertion exists to
+    catch.
+    """
+    module = _module()
+    unit = "voyn-aicc-worker@blue.service"
+
+    class StuckStoppingSystemd(FakeSystemd):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args == ("stop", unit):
+                self.calls.append(args)
+                state = self.states[unit]
+                state["ActiveState"] = "deactivating"
+                state["SubState"] = "stop"
+                state["MainPID"] = "4242"
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = StuckStoppingSystemd((unit,))
+    state = module.snapshot(systemd, (unit,))
+    state["units"][unit]["active"] = False
+
+    with pytest.raises(module.RolloutError, match="did not restore exactly"):
+        module.restore(systemd, state)
+
+
 def test_staged_rollout_drains_and_proves_each_lane_before_next():
     module = _module()
     units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")

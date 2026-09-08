@@ -586,8 +586,9 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
                     raise RolloutError(
                         f"refusing unsafe snapshot restart: {unit} {name}"
                     )
+        expected_active = raw.get("active") is True
         systemd.run("enable" if raw.get("enabled") is True else "disable", unit)
-        systemd.run("start" if raw.get("active") is True else "stop", unit)
+        systemd.run("start" if expected_active else "stop", unit)
         active = systemd.run("is-active", unit, check=False)
         enabled = systemd.run("is-enabled", unit, check=False)
         load_state = systemd.run(
@@ -596,11 +597,18 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
         main_pid = systemd.run(
             "show", unit, "--property=MainPID", "--value", check=False
         )
+        # A Type=notify unit forks its MainPID before it sends READY=1, so a
+        # start that completes in that window is legitimately reported
+        # "activating" with a live MainPID -- not a service that failed to go
+        # inactive. Only exempt that transitional state when the unit is
+        # actually expected active; an expected-inactive unit stuck
+        # deactivating with a MainPID is still refused below.
+        activating_start = expected_active and active == "activating"
         if (
             load_state in {"", "not-found"}
-            or ((active == "active") is not (raw.get("active") is True))
+            or ((active == "active") is not expected_active and not activating_start)
             or ((enabled == "enabled") is not (raw.get("enabled") is True))
-            or (active != "active" and main_pid not in {"", "0"})
+            or (active != "active" and not activating_start and main_pid not in {"", "0"})
         ):
             raise RolloutError(f"service snapshot did not restore exactly: {unit}")
         if version == 3:
