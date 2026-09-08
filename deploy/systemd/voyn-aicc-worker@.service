@@ -39,6 +39,10 @@ Environment=PGPASSFILE=/run/aicc-worker-lanes/%i/pgpass
 StateDirectory=aicc/data
 StateDirectoryMode=0750
 Environment=AICC_DATA_DIR=/var/lib/aicc/data
+# Root-owned system git config (safe.directory for the bound clone sources):
+# a file, not GIT_CONFIG_COUNT/KEY/VALUE, because git's upload-pack child of
+# a local clone does not inherit the environment form (worker-01 2026-09-08).
+Environment=GIT_CONFIG_SYSTEM=/etc/aicc/gitconfig
 Environment=AICC_WORKER_ENV_FILE=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=/etc/aicc/lease.env
 EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env
