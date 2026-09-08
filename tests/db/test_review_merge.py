@@ -36,6 +36,22 @@ def _snapshot(head, diff=DIFF):
     return review_merge._PRSnapshot.create(diff, BASE, head)
 
 
+def _stub_merge_credentials(monkeypatch):
+    """Wire the dedicated merge identity (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM)
+    so `merge_once`'s privileged `gh pr merge` call resolves credentials and
+    mints a token without touching the network -- mirrors how these tests
+    already stub the acceptance identity for `_post_marker_as_bot`. Each
+    test still supplies its own `_merge_pr_as_bot` fake to control the
+    actual merge outcome."""
+    monkeypatch.setattr(
+        review_merge, "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(
+        review_merge.github_app_auth, "installation_token", lambda creds: "merge-token",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _snapshots(monkeypatch):
     SNAPSHOTS.clear()
@@ -268,16 +284,21 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
+    def fake_merge_pr_as_bot(repo_path, pr_url, token):
+        import subprocess
+        merged_state["merged"] = True
+        return subprocess.CompletedProcess(["gh", "pr", "merge"], 0, "merged", "")
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _stub_merge_credentials(monkeypatch)
+    monkeypatch.setattr(review_merge, "_merge_pr_as_bot", fake_merge_pr_as_bot)
     report = merge_once(app_factory, "/tmp")
     # Evidence is the TARGET-BRANCH merge commit, never the PR head
     # (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY).
     assert ("VOYN-W0-M1", merge_oid) in report.merged
+    assert not report.errors
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1",))
         assert cur.fetchone()[0] == "DONE"
@@ -377,12 +398,16 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
+    def fake_merge_pr_as_bot(repo_path, pr_url, token):
+        import subprocess
+        merged_state["merged"] = True
+        return subprocess.CompletedProcess(["gh", "pr", "merge"], 0, "merged", "")
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _stub_merge_credentials(monkeypatch)
+    monkeypatch.setattr(review_merge, "_merge_pr_as_bot", fake_merge_pr_as_bot)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1C", merge_oid) in report.merged
 
@@ -439,6 +464,148 @@ def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M2",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"  # untouched
+
+
+# --- VOYN-W0-AICC-MERGE-GATEWAY-REM-REM: the merge identity is a gateway ----
+
+def _fake_gh_ready_to_merge(head):
+    """A PR that is fully ready to merge: OPEN, an independent ACCEPT
+    marker on the exact head, every required check green -- the only
+    thing left is the privileged `gh pr merge` call itself."""
+    import subprocess
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": "dimastov-lab"},
+            "reviews": [{
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "voyn88-acceptance-gate[bot]"},
+            }],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "mergeStateStatus": "CLEAN",
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    return fake_gh
+
+
+def test_merge_reports_an_error_not_a_skip_when_the_merge_identity_is_unconfigured(
+    rig, monkeypatch,  # noqa: F811
+):
+    """An unconfigured merge identity is a misconfiguration of the gateway
+    itself -- this tick's only job is merging -- so it must surface in
+    `errors`, never look like an ordinary `skipped` not-yet-ready PR
+    (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM; the exact bug that got PR #630
+    rejected: a real deployment mistake looked byte-for-byte like "nothing
+    to merge yet")."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MG1", "https://github.com/x/y/pull/50")
+    head = "5" * 40
+
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_ready_to_merge(head))
+    monkeypatch.setattr(review_merge, "_merge_app_credentials", lambda: None)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MG1", "merge_bot_not_configured") in report.errors
+    assert not report.merged
+    assert not any(task_id == "VOYN-W0-MG1" for task_id, _ in report.skipped)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MG1",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_reports_an_error_when_the_merge_identitys_token_mint_fails(
+    rig, monkeypatch,  # noqa: F811
+):
+    """A configured-but-unreachable merge identity (bad key, revoked
+    installation, GitHub App API down) is exactly the "GitHub API
+    unavailable" case the gateway must fail closed on, not retry forever
+    silently as an indistinguishable skip."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MG2", "https://github.com/x/y/pull/51")
+    head = "5" * 40
+
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_ready_to_merge(head))
+    monkeypatch.setattr(
+        review_merge, "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+
+    def failing_token(creds):
+        raise review_merge.github_app_auth.AppAuthError("installation token exchange failed")
+
+    monkeypatch.setattr(review_merge.github_app_auth, "installation_token", failing_token)
+    report = merge_once(app_factory, "/tmp")
+    assert any(
+        task_id == "VOYN-W0-MG2" and reason.startswith("merge_bot_auth_failed")
+        for task_id, reason in report.errors
+    )
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MG2",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_reports_an_error_not_a_skip_when_the_readiness_lookup_cannot_reach_github(
+    rig, monkeypatch,  # noqa: F811
+):
+    """`gh pr view` itself failing (network, auth, rate limit) means the
+    tick never learned whether the PR is ready -- distinct from a PR that
+    was read successfully and found not-yet-accepted. Both used to land in
+    the same `skipped` bucket; only the latter still does."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MG3", "https://github.com/x/y/pull/52")
+
+    def failing_gh(argv, repo):
+        import subprocess
+        return subprocess.CompletedProcess(argv, 1, "", "rate limited")
+
+    monkeypatch.setattr(review_merge, "_gh", failing_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert any(
+        task_id == "VOYN-W0-MG3" and reason.startswith("gh_view_failed")
+        for task_id, reason in report.errors
+    )
+    assert not any(task_id == "VOYN-W0-MG3" for task_id, _ in report.skipped)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MG3",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_uses_a_distinct_token_from_the_acceptance_identity(rig, monkeypatch):  # noqa: F811
+    """The merge identity is a THIRD credential, distinct from both the
+    ambient `_gh()` credential and the acceptance identity that posts the
+    marker -- `merge_once` must never fall back to either when its own
+    identity is configured."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MG4", "https://github.com/x/y/pull/53")
+    head = "5" * 40
+    tokens_used = []
+
+    monkeypatch.setattr(review_merge, "_gh", _fake_gh_ready_to_merge(head))
+    monkeypatch.setattr(
+        review_merge, "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("merge-app", "merge-inst", "/dev/null"),
+    )
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("accept-app", "accept-inst", "/dev/null"),
+    )
+
+    def fake_installation_token(creds):
+        tokens_used.append(creds.app_id)
+        return f"token-for-{creds.app_id}"
+
+    monkeypatch.setattr(review_merge.github_app_auth, "installation_token", fake_installation_token)
+
+    def fake_merge_pr_as_bot(repo_path, pr_url, token):
+        import subprocess
+        assert token == "token-for-merge-app"
+        return subprocess.CompletedProcess(["gh", "pr", "merge"], 0, "merged", "")
+
+    monkeypatch.setattr(review_merge, "_merge_pr_as_bot", fake_merge_pr_as_bot)
+    merge_once(app_factory, "/tmp")
+    assert tokens_used == ["merge-app"]
 
 
 def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, monkeypatch):  # noqa: F811, E501
@@ -597,12 +764,16 @@ def test_merge_falls_back_to_an_earlier_live_review_past_a_dismissed_one(rig, mo
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return subprocess.CompletedProcess(argv, 0, "merged", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
+    def fake_merge_pr_as_bot(repo_path, pr_url, token):
+        import subprocess
+        merged_state["merged"] = True
+        return subprocess.CompletedProcess(["gh", "pr", "merge"], 0, "merged", "")
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _stub_merge_credentials(monkeypatch)
+    monkeypatch.setattr(review_merge, "_merge_pr_as_bot", fake_merge_pr_as_bot)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M7", merge_oid) in report.merged
 
@@ -2068,12 +2239,15 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return sp.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merge_calls.append(argv)
-            return sp.CompletedProcess(argv, 0, "queued", "")  # enqueued, NOT merged
         return sp.CompletedProcess(argv, 1, "", "?")
 
+    def fake_merge_pr_as_bot(repo_path, pr_url, token):
+        merge_calls.append(pr_url)
+        return sp.CompletedProcess(["gh", "pr", "merge"], 0, "queued", "")  # enqueued, NOT merged
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _stub_merge_credentials(monkeypatch)
+    monkeypatch.setattr(review_merge, "_merge_pr_as_bot", fake_merge_pr_as_bot)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-MQ", "merge_queued_awaiting_target") in report.skipped
     assert not report.merged
@@ -2609,14 +2783,17 @@ def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch)
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 "mergeStateStatus": "CLEAN",
             }), "")
-        if argv[:2] == ["pr", "merge"]:
-            if url == victim_url:
-                merged_prs.append(url)
-                return sp.CompletedProcess(argv, 0, "merged", "")
-            return sp.CompletedProcess(argv, 1, "", "spurious merge failure")
         return sp.CompletedProcess(argv, 0, "", "")
 
+    def fake_merge_pr_as_bot(repo_path, pr_url, token):
+        if pr_url == victim_url:
+            merged_prs.append(pr_url)
+            return sp.CompletedProcess(["gh", "pr", "merge"], 0, "merged", "")
+        return sp.CompletedProcess(["gh", "pr", "merge"], 1, "", "spurious merge failure")
+
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _stub_merge_credentials(monkeypatch)
+    monkeypatch.setattr(review_merge, "_merge_pr_as_bot", fake_merge_pr_as_bot)
     merged_tasks = []
     # cap 1: each invocation advances the cursor by 1 -> the victim is
     # FIRST within 6 invocations and merges despite five eternal hogs.
