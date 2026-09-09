@@ -60,18 +60,31 @@ class HandlerOutcome:
     result: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     retryable: bool = True
-    # True only for a refusal that names no fault in the work itself -- a
-    # writer-lease race lost to a sibling lane, not a broken commit or a bad
-    # payload (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a
-    # publish that lost that race used to fail through the ordinary
-    # `retryable=True` path, which spends this item's `max_attempts` on
-    # contention it had no part in causing and can dead-letter already
-    # -finished work). Routes to `queue_fail_lease_wait` instead of
-    # `queue_fail`: it refunds the attempt `queue_claim` already spent for
-    # this delivery and counts the wait against its own bounded budget
-    # instead. Meaningless when `ok` is True and implies `retryable` --
-    # there is no such thing as a non-retryable lease wait.
-    lease_wait: bool = False
+    # True only for a refusal that names no fault in the WORK ITEM -- a
+    # writer-lease race lost to a sibling lane, an executor CLI this host
+    # cannot start, a provider that refused on quota, a workspace the fleet
+    # could not provision -- as opposed to a broken commit, a bad payload or
+    # an agent run that genuinely failed. Routes to `queue_fail_lease_wait`
+    # instead of `queue_fail`: it refunds the attempt `queue_claim` already
+    # spent for this delivery and counts the refusal against its own
+    # bounded budget instead. Meaningless when `ok` is True and implies
+    # `retryable` -- there is no such thing as a non-retryable no-fault
+    # refusal.
+    #
+    # Named for the fault, not for the one case that first needed it. It
+    # began as `lease_wait`, wired to exactly one call site (a publish that
+    # lost the writer-lease race,
+    # VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT), while every
+    # sibling refusal of the same class kept spending `max_attempts`. That
+    # budget IS the cascade length (`orchestrator.routing`: two links since
+    # copilot left the isolated fleet), so two refusals the work item had no
+    # part in causing dead-lettered it having never spent a single model
+    # attempt -- the dead-letter growth control-01:queue measures
+    # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH). The database side
+    # keeps its migration-0022 names (`queue_fail_lease_wait`,
+    # `lease_wait_count`, `lease_wait_exhausted`); renaming a shipped
+    # function and column would buy nothing a comment cannot say.
+    no_fault: bool = False
 
 
 class Handler(Protocol):
@@ -311,7 +324,11 @@ class WorkerDaemon:
         try:
             if outcome.ok:
                 accepted = self._store.complete(work, outcome.result)
-            elif outcome.lease_wait:
+            elif outcome.no_fault and outcome.retryable:
+                # `retryable` is re-checked rather than assumed: the refund
+                # path has no non-retryable branch, so a (contradictory)
+                # outcome claiming both must take the ordinary path that can
+                # actually honour "do not deliver this again".
                 accepted = self._store.fail_lease_wait(work, reason=outcome.reason)
             else:
                 accepted = self._store.fail(

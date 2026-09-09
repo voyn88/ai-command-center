@@ -135,12 +135,20 @@ class WorkQueueStore:
     def fail_lease_wait(
         self, work: ClaimedWork, *, reason: str, max_lease_waits: int = 20
     ) -> bool:
-        """Report a failure that names no fault in the work itself -- a
-        writer-lease race lost to a sibling lane
-        (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT). Unlike
-        ``fail``, this refunds the attempt ``queue_claim`` already spent for
-        this delivery and bounds retries against a separate lease-wait
-        budget instead of ``max_attempts``.
+        """Report a failure that names no fault in the work item itself --
+        a writer-lease race lost to a sibling lane
+        (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT, the case this
+        was built for), and since
+        VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH every sibling refusal
+        of the same class: an executor this host cannot start, a provider
+        that refused on quota, a workspace the fleet could not provision.
+        See ``worker.daemon.HandlerOutcome.no_fault`` for the boundary.
+
+        Unlike ``fail``, this refunds the attempt ``queue_claim`` already
+        spent for this delivery and bounds retries against a separate,
+        smaller-than-forever budget (``lease_wait_count``, defaulting to 20
+        waits with the queue's own capped backoff) instead of
+        ``max_attempts``. The SQL keeps its migration-0022 name.
         """
         row = self._call(
             "SELECT * FROM queue_fail_lease_wait(%s, %s, %s, %s)",

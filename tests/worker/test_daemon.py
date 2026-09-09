@@ -102,19 +102,19 @@ def test_a_failing_handler_reports_fail_not_complete() -> None:
     assert not any(c[0] == "complete" for c in store.calls)
 
 
-def test_a_lease_wait_failure_routes_to_the_lease_wait_store_method() -> None:
+def test_a_no_fault_failure_routes_to_the_refund_store_method() -> None:
     """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a publish that
     lost the writer-lease race to a sibling lane names no fault in this
     item's own work. Reporting it through the ordinary `fail(retryable=True)`
     path would still count it against `max_attempts` (the queue already
     advanced `attempt_count` at claim), which is exactly what dead-lettered
-    finished work live on 2026-09-06. `lease_wait=True` must route to the
+    finished work live on 2026-09-06. `no_fault=True` must route to the
     store's separate refund-and-bound path instead."""
     store = ScriptedStore([_work({"kind": "publish"})])
 
     def contended(payload, lease_lost, attempt_no=1):
         return HandlerOutcome(
-            ok=False, reason="publish failed: lease_unavailable: held by x", lease_wait=True
+            ok=False, reason="publish failed: lease_unavailable: held by x", no_fault=True
         )
 
     daemon = WorkerDaemon(store, {"publish": contended}, WorkerConfig(visibility_seconds=3))
@@ -744,3 +744,193 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
     assert any(
         frame == b"WATCHDOG=1" or frame.startswith(b"WATCHDOG=1\n") for frame in frames
     )
+
+
+def test_a_no_fault_outcome_that_forbids_retry_takes_the_ordinary_path() -> None:
+    """`no_fault` implies `retryable` -- the refund path has no
+    non-retryable branch, so it cannot honour "never deliver this again".
+    A contradictory outcome must therefore fall back to `fail`, which can,
+    rather than being silently requeued by the refund path."""
+    store = ScriptedStore([_work({"kind": "contradiction"})])
+
+    def contradictory(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="cannot happen", retryable=False, no_fault=True
+        )
+
+    daemon = WorkerDaemon(
+        store, {"contradiction": contradictory}, WorkerConfig(visibility_seconds=3)
+    )
+    _run_until_idle(daemon, store)
+
+    assert ("fail", "wat-1", "cannot happen", False) in store.calls
+    assert not any(c[0] == "fail_lease_wait" for c in store.calls)
+
+
+# -- VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH ----------------------------
+
+
+class QueueModel:
+    """A store that keeps the queue's ATTEMPT ACCOUNTING, not just a script.
+
+    Deliberately narrow: it mirrors only the three arithmetic rules the
+    dead-letter growth turns on, each already proven against real PostgreSQL
+    in tests/db/test_queue_claim.py --
+
+    * ``queue_claim`` advances ``attempt_count`` when it hands the delivery
+      out (migration 0002);
+    * ``queue_fail`` dead-letters when the report is non-retryable *or*
+      ``attempt_count >= max_attempts`` (0002);
+    * ``queue_fail_lease_wait`` refunds that one increment and counts the
+      refusal against its own bounded ``lease_wait_count`` instead (0022).
+
+    Everything else about the protocol -- locking, tokens, audit -- is out of
+    scope here; what this fake exists to show is which of those two exits the
+    daemon takes, and what the item's state is after N deliveries.
+    """
+
+    def __init__(
+        self,
+        payload: dict,
+        *,
+        max_attempts: int,
+        max_lease_waits: int = 20,
+        delivery_cap: int = 5,
+    ):
+        self.payload = payload
+        self.max_attempts = max_attempts
+        self.max_lease_waits = max_lease_waits
+        # How many times the fleet is willing to redeliver before the test
+        # stops watching; the loop ends on `no_work` either way, so an item
+        # that dead-letters earlier simply never reaches this.
+        self.delivery_cap = delivery_cap
+        self.attempt_count = 0
+        self.lease_wait_count = 0
+        self.state = "ready"
+        self.dead_reason: str | None = None
+        self.deliveries = 0
+
+    def claim(self, queue, *, visibility_seconds):
+        if self.state != "ready" or self.deliveries >= self.delivery_cap:
+            return QueueRefusal(reason="no_work")
+        self.attempt_count += 1
+        self.deliveries += 1
+        self.state = "claimed"
+        return _work(self.payload, attempt_id=f"wat-{self.attempt_count}")
+
+    def heartbeat(self, work):
+        return True
+
+    def complete(self, work, result):
+        self.state = "succeeded"
+        return True
+
+    def fail(self, work, *, reason, retryable):
+        if not retryable or self.attempt_count >= self.max_attempts:
+            self.state = "dead"
+            self.dead_reason = (
+                f"non_retryable: {reason}"
+                if not retryable
+                else f"max_attempts_exhausted: {reason}"
+            )
+        else:
+            self.state = "ready"
+        return True
+
+    def fail_lease_wait(self, work, *, reason):
+        self.lease_wait_count += 1
+        if self.lease_wait_count > self.max_lease_waits:
+            self.state = "dead"
+            self.dead_reason = f"lease_wait_exhausted: {reason}"
+        else:
+            self.attempt_count = max(self.attempt_count - 1, 0)
+            self.state = "ready"
+        return True
+
+
+def _drain(store: QueueModel, handler) -> None:
+    """Let the loop redeliver the item until the queue stops offering it --
+    because it dead-lettered, or because the model's delivery cap is
+    reached. `_run_until_idle`'s convention: the first idle sleep ends the
+    run."""
+    daemon = WorkerDaemon(store, handler, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+
+def test_fleet_refusals_no_longer_dead_letter_the_item_they_never_ran() -> None:
+    """The finding this task closes, at the accounting level.
+
+    The planner sets ``max_attempts`` to the cascade length, and that
+    cascade has been two links since copilot left the isolated fleet
+    (`orchestrator.routing`). So TWO refusals that name no fault in the work
+    item -- a lease a sibling lane holds, an account past its cap, a
+    workspace the host could not provision -- used to be enough to
+    dead-letter a task that had never spent a single model attempt. The
+    monitor 'control-01:queue' measured the resulting pile as
+    `dead_letter_growth` (monitor_finding #469).
+
+    Routed as `no_fault`, the same refusals refund the attempt they were
+    handed and spend the queue's separate bounded budget instead: the item
+    is still `ready` after five of them, with its two model attempts intact.
+    """
+    store = QueueModel({"kind": "agent_run"}, max_attempts=2)
+
+    def contended(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="writer lease unavailable: acquire_failed: held by a sibling lane",
+            retryable=True,
+            no_fault=True,
+        )
+
+    _drain(store, {"agent_run": contended})
+
+    assert store.deliveries == 5
+    assert store.state == "ready", store.dead_reason
+    assert store.dead_reason is None
+    assert store.attempt_count == 0, "every refusal refunded the attempt it spent"
+    assert store.lease_wait_count == 5
+
+
+def test_a_genuine_failure_still_dead_letters_on_the_cascade_budget() -> None:
+    """The other half of the guarantee: the DLQ still works. A handler
+    failure that names the WORK spends `max_attempts` exactly as before, so
+    the fix cannot be mistaken for "nothing ever dead-letters again"."""
+    store = QueueModel({"kind": "agent_run"}, max_attempts=2, delivery_cap=5)
+
+    def broken(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="guarded publish preparation failed", retryable=True
+        )
+
+    _drain(store, {"agent_run": broken})
+
+    assert store.deliveries == 2, "the item is dead after its budget, not re-delivered"
+    assert store.state == "dead"
+    assert store.dead_reason is not None
+    assert store.dead_reason.startswith("max_attempts_exhausted:")
+
+
+def test_permanent_fleet_contention_still_terminates_in_the_dlq() -> None:
+    """The refund budget is bounded, not infinite: contention that never
+    clears still reaches the dead-letter queue -- with a reason that tells
+    an operator it was the fleet, not the item -- so a pathological host
+    cannot hide behind an item that retries forever."""
+    store = QueueModel({"kind": "agent_run"}, max_attempts=2, max_lease_waits=3, delivery_cap=10)
+
+    def contended(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="executor infrastructure failure (provider/auth/quota): capped",
+            retryable=True,
+            no_fault=True,
+        )
+
+    _drain(store, {"agent_run": contended})
+
+    assert store.state == "dead"
+    assert store.dead_reason is not None
+    assert store.dead_reason.startswith("lease_wait_exhausted:")
+    # infra_monitor classifies the DLQ row by its reason: a capacity outage
+    # that outlasts the wait budget must still land in the quota class.
+    assert "quota" in store.dead_reason

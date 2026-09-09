@@ -28,6 +28,35 @@ Outcome discipline:
   infrastructure failures, not task outcomes, however different their raw
   ``exit_code``/``stdout`` shape looks.
 
+Whose fault it was (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH):
+
+A retryable refusal must also say WHOSE fault it names, because the two
+answers spend different budgets. ``HandlerOutcome.no_fault=True`` means the
+refusal is a fact about the FLEET -- contention, capacity, a host-local
+absence -- and not about this work item; it refunds the attempt and counts
+against the queue's separate bounded budget. Everything else spends
+``max_attempts``, which the planner sets to the cascade length: two links,
+so two fleet refusals used to dead-letter a task that had never spent a
+single model attempt, and the control-01 queue monitor measured the result
+as dead-letter growth.
+
+The line is drawn at *what the refusal is evidence of*, and only these are
+``no_fault``:
+
+- contention: a writer lease held by a sibling lane (dispatch preflight,
+  the full-lifecycle acquire, and a publish that lost the push race);
+- capacity/host absence: an executor whose CLI or provider key this host
+  cannot offer, a provider/auth/quota refusal, a Codex sandbox that would
+  not start, a repository this host cannot see;
+- workspace the fleet owes the run: an isolated root, clone or worktree it
+  failed to provide.
+
+A run that *executed* and failed, an agent that produced nothing, a
+publish that pushed badly, a checkpoint that could not authenticate the
+committed prefix, and every payload defect all stay on ``max_attempts``:
+each is evidence about this item, and refunding them would retry a real
+failure against a budget nothing spends down.
+
 Result rows are bounded: stdout/stderr travel as tails, because a jsonb
 column is a coordination record, not a log store -- the full transcript
 stays on the worker host's journal.
@@ -465,9 +494,12 @@ def _run_agent(
         )
     except agent_runner.RunnerError as exc:
         # A repository this host cannot see may exist on another: the row is
-        # host-local state, so let redelivery try elsewhere -- bounded by the
-        # item's own max_attempts.
-        return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
+        # host-local state, so let redelivery try elsewhere. `no_fault`: it is
+        # evidence about this HOST's checkout, never about the work item, so
+        # it must not spend the item's cascade-sized attempt budget.
+        return HandlerOutcome(
+            ok=False, reason=str(exc), retryable=True, no_fault=True
+        )
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
     if not available and link is not None:
@@ -504,8 +536,17 @@ def _run_agent(
             )
             break
     if not available:
+        # Every link the cascade offers is unavailable on this host (no CLI,
+        # no provider key, an open circuit). `no_fault`: capacity the fleet
+        # does not have right now, not a defect in the item -- live, this
+        # exact refusal burned "48 dead attempts in 20 minutes" through
+        # `max_attempts` when copilot stayed in the cascade under isolation
+        # (see `orchestrator.routing`).
         return HandlerOutcome(
-            ok=False, reason=f"{unavailable_reason}: {detail}", retryable=True
+            ok=False,
+            reason=f"{unavailable_reason}: {detail}",
+            retryable=True,
+            no_fault=True,
         )
 
     if lease_lost.is_set():
@@ -591,7 +632,16 @@ def _run_agent(
                     repository, pin_sha=request.review_head_sha
                 )
                 if checkout is None:
-                    return HandlerOutcome(ok=False, reason=failure or "?", retryable=retryable)
+                    # The workspace is what the fleet owes the run; failing
+                    # to provide one is `no_fault` whenever it is retryable
+                    # at all (a permanent source defect keeps the ordinary
+                    # budget, which is what `retryable=False` already says).
+                    return HandlerOutcome(
+                        ok=False,
+                        reason=failure or "?",
+                        retryable=retryable,
+                        no_fault=retryable,
+                    )
                 stack.callback(_remove_read_only_isolated_checkout, checkout)
                 run_repository = checkout
             else:
@@ -602,8 +652,11 @@ def _run_agent(
                 )
             if checkout is None:
                 # Fetch/worktree trouble is repository or network state a
-                # later delivery (or another host) can genuinely cure.
-                return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
+                # later delivery (or another host) can genuinely cure --
+                # `no_fault` for the same reason as the isolated clone above.
+                return HandlerOutcome(
+                    ok=False, reason=failure or "?", retryable=True, no_fault=True
+                )
             stack.callback(_remove_review_head_checkout, repository, checkout)
             run_repository = checkout
         if (
@@ -617,7 +670,12 @@ def _run_agent(
             # shared clone cannot be handed to the launcher.
             checkout, failure, retryable = _read_only_isolated_checkout(repository)
             if checkout is None:
-                return HandlerOutcome(ok=False, reason=failure or "?", retryable=retryable)
+                return HandlerOutcome(
+                    ok=False,
+                    reason=failure or "?",
+                    retryable=retryable,
+                    no_fault=retryable,
+                )
             stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
@@ -631,6 +689,7 @@ def _run_agent(
                     ok=False,
                     reason=f"isolated workspace root unavailable: {exc}",
                     retryable=True,
+                    no_fault=True,
                 )
 
             # Single-writer gate at the dispatch boundary (part B of
@@ -640,11 +699,15 @@ def _run_agent(
             # `repository`. Checked before provisioning: the path is
             # computed deterministically above with no filesystem access, so
             # this can run whether or not the worktree exists yet.
-            # Retryable: a lease is a temporary claim, so redelivery lands
-            # once it is released, bounded by the item's own max_attempts.
+            # Retryable and `no_fault`: a lease is a temporary claim held by
+            # a sibling lane, so redelivery lands once it is released --
+            # exactly the contention migration 0022 refuses to charge to the
+            # item, which until now it only refused at the publish site.
             held = blocking_lease(isolated_workspace)
             if held is not None:
-                return HandlerOutcome(ok=False, reason=held, retryable=True)
+                return HandlerOutcome(
+                    ok=False, reason=held, retryable=True, no_fault=True
+                )
 
             # Full-lifecycle writer lease. `blocking_lease` above is a
             # deliberately read-only preflight (its own docstring: "it never
@@ -724,6 +787,7 @@ def _run_agent(
                         ok=False,
                         reason=f"writer lease unavailable: {exc}",
                         retryable=True,
+                        no_fault=True,
                     )
 
             base_branch = (
@@ -764,6 +828,7 @@ def _run_agent(
                     ok=False,
                     reason=f"workspace isolation failed at {exc.failed_step}: {exc.detail}",
                     retryable=True,
+                    no_fault=True,
                 )
             run_repository = Path(evidence.workspace_path)
 
@@ -1056,6 +1121,9 @@ def _run_agent(
                 ok=False,
                 reason=_tail(run.stderr) or "runner failed to start",
                 retryable=True,
+                # Nothing executed and nothing was billed: the launch itself
+                # is fleet state, so it must not spend the item's budget.
+                no_fault=True,
             )
         if run.is_principal_isolation_error:
             # The separate-UID launcher failed before it could return a
@@ -1074,6 +1142,11 @@ def _run_agent(
                     f"isolation): {_tail(run.stderr or result_text)}"
                 ),
                 retryable=True,
+                # The broker, not the work: the reason already says so, and
+                # `backlog_*`'s own technical-failure list (migration 0012)
+                # already classes it as operational rather than a task
+                # verdict. Spending `max_attempts` on it contradicted both.
+                no_fault=True,
             )
         non_mutating_copilot_failure = (
             executor == "copilot"
@@ -1100,6 +1173,17 @@ def _run_agent(
                     f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
                 ),
                 retryable=True,
+                # The account failed, never the task -- the in-lease failover
+                # a few lines above states the intended accounting outright
+                # ("an exhausted account neither consumes an attempt nor
+                # creates a red work_attempt row"). It only held while a
+                # healthy candidate remained; on the last link the same
+                # refusal fell through to `max_attempts` and dead-lettered
+                # the item. `no_fault` makes the accounting the same either
+                # way. A capacity outage that outlasts the wait budget still
+                # reaches the DLQ, where `infra_monitor`'s
+                # `executor_quota_exhausted` class names it.
+                no_fault=True,
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.
@@ -1117,6 +1201,8 @@ def _run_agent(
                     f"sandbox): {_tail(run.stderr or result_text)}"
                 ),
                 retryable=True,
+                # bwrap never let Codex reach the tools: host sandbox state.
+                no_fault=True,
             )
         # BO-S3b: a successful mutating run publishes its commits as a PR so
         # the autonomous loop closes without a human. Opt-in by env
@@ -1306,15 +1392,18 @@ def _run_agent(
                 # the race). Routing it through the ordinary retryable path
                 # spent this item's `max_attempts` on contention it had no
                 # part in causing, dead-lettering already-finished work.
-                # `lease_wait=True` instead refunds the attempt and bounds
-                # retries against a separate lease-wait budget (see
+                # `no_fault=True` instead refunds the attempt and bounds
+                # retries against a separate wait budget (see
                 # `queue_fail_lease_wait`,
                 # VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT).
+                # Every OTHER publish failure -- a bad push, a dead `gh` --
+                # is evidence about this run's own output and keeps spending
+                # `max_attempts`.
                 return HandlerOutcome(
                     ok=False,
                     reason=f"publish failed: {pub.reason}",
                     retryable=True,
-                    lease_wait=pub.reason.startswith("lease_unavailable"),
+                    no_fault=pub.reason.startswith("lease_unavailable"),
                     result=result,
                 )
         elif isolated_workspace is not None:

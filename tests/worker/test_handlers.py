@@ -1137,7 +1137,7 @@ def test_publish_falls_back_to_project_id_without_a_backlog_task_id(
     assert captured[0].task == "proj"  # _payload()'s project_id
 
 
-def test_lease_unavailable_publish_failure_is_a_lease_wait_not_a_spent_attempt(
+def test_lease_unavailable_publish_failure_is_no_fault_not_a_spent_attempt(
     handler, monkeypatch
 ) -> None:
     """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT, live 2026-09-06
@@ -1145,7 +1145,7 @@ def test_lease_unavailable_publish_failure_is_a_lease_wait_not_a_spent_attempt(
     sibling lane -- neighbouring publishes for OTHER tasks succeeded
     04:57-04:58Z while this one got `lease_unavailable`. That names no fault
     in this run's own (already-committed) work, so the outcome must set
-    `lease_wait=True` -- routing the daemon to the refund-and-bound path
+    `no_fault=True` -- routing the daemon to the refund-and-bound path
     instead of spending this item's `max_attempts` on contention it had no
     part in causing."""
     import command_center.worker.handlers as handlers_module
@@ -1163,11 +1163,11 @@ def test_lease_unavailable_publish_failure_is_a_lease_wait_not_a_spent_attempt(
 
     outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert not outcome.ok and outcome.retryable is True
-    assert outcome.lease_wait is True
+    assert outcome.no_fault is True
     assert "lease_unavailable" in outcome.reason
 
 
-def test_other_publish_failures_are_not_lease_waits(handler, monkeypatch) -> None:
+def test_other_publish_failures_are_not_no_fault(handler, monkeypatch) -> None:
     """Only `lease_unavailable` names contention with no fault of its own;
     every other publish failure (a bad push, a dead `gh`) must keep spending
     the ordinary attempt budget -- a regression here would let a genuinely
@@ -1184,7 +1184,7 @@ def test_other_publish_failures_are_not_lease_waits(handler, monkeypatch) -> Non
 
     outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert not outcome.ok and outcome.retryable is True
-    assert outcome.lease_wait is False
+    assert outcome.no_fault is False
 
 
 def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:
@@ -2056,3 +2056,232 @@ def test_read_only_isolated_checkout_pins_to_the_requested_sha_or_waits_for_it(t
     target, failure, retryable = handlers_module._read_only_isolated_checkout(source, pin_sha=missing)
     assert target is None and retryable is True and "not in the bound clone yet" in failure
     assert list(root.iterdir()) == []
+
+
+# -- VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH: whose fault a refusal names -
+
+
+def _cascade(*executors: str, task_type: str = "implementation"):
+    return [{"executor": e, "task_type": task_type} for e in executors]
+
+
+def test_a_provider_quota_refusal_on_the_last_link_is_no_fault(
+    handler, monkeypatch
+) -> None:
+    """The finding this task closes. A provider/auth/quota refusal happens
+    before any model work, and the in-lease failover a few lines above the
+    return says so outright ("an exhausted account neither consumes an
+    attempt nor creates a red work_attempt row") -- but that accounting only
+    held while a healthy candidate link remained. On the LAST link the very
+    same refusal fell through to the ordinary retryable path and spent one
+    of the item's `max_attempts`, which the planner sets to the cascade
+    length: two of them dead-lettered a task that had never spent a single
+    model attempt, and control-01:queue measured the pile as
+    `dead_letter_growth`."""
+    run_agent, _runs = handler
+
+    def exhausted(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=json.dumps(
+                {
+                    "is_error": True,
+                    "api_error_status": 429,
+                    "result": "You've hit your session limit",
+                }
+            ),
+            stderr="",
+            duration_seconds=0.4,
+            started_at="2026-09-09T00:00:00+00:00",
+            completed_at="2026-09-09T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", exhausted)
+
+    outcome = run_agent(
+        _payload(task_type="independent_review", cascade=_cascade("claude")),
+        _event(),
+        1,
+    )
+    assert not outcome.ok and outcome.retryable
+    assert "provider/auth/quota" in outcome.reason
+    assert outcome.no_fault is True
+
+
+def test_an_executor_unavailable_on_every_link_is_no_fault(
+    handler, monkeypatch
+) -> None:
+    """`orchestrator.routing` records what this cost live: a link whose CLI
+    the isolated principal refuses burned "48 dead attempts in 20 minutes"
+    through `max_attempts`. Absent capacity is a fact about the host, so the
+    refusal must not be charged to the item."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (False, "no cli")
+    )
+
+    outcome = run_agent(
+        _payload(task_type="independent_review", cascade=_cascade("claude")),
+        _event(),
+        1,
+    )
+    assert not outcome.ok and outcome.retryable
+    assert "cli unavailable" in outcome.reason
+    assert outcome.no_fault is True
+    assert runs == []
+
+
+def test_a_repository_this_host_cannot_see_is_no_fault(handler, monkeypatch) -> None:
+    """Host-local state: the row may resolve perfectly on another lane."""
+    run_agent, _runs = handler
+
+    def refuse(project_id, path):
+        raise agent_runner.RunnerError(f"unknown project {project_id!r}")
+
+    monkeypatch.setattr(agent_runner, "validate_repository", refuse)
+
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert outcome.no_fault is True
+
+
+def test_the_runner_never_starting_is_no_fault(handler, monkeypatch) -> None:
+    """Nothing executed and nothing was billed -- the launch is fleet state."""
+    run_agent, _runs = handler
+
+    def never_started(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr="no binary",
+            duration_seconds=0.0,
+            started_at="2026-09-09T00:00:00+00:00",
+            completed_at="2026-09-09T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", never_started)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert outcome.no_fault is True
+
+
+def test_a_workspace_the_fleet_could_not_provision_is_no_fault(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The isolated worktree is what the fleet owes the run; failing to
+    provide one says nothing about the work item."""
+    run_agent, runs = handler
+
+    def refuse(spec):
+        raise workspace_provisioning.WorkspaceVerificationError(
+            failed_step="worktree_add",
+            remediation="free the branch",
+            expected_workspace=spec.workspace_path,
+            actual_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch or "",
+            detail="branch already checked out elsewhere",
+        )
+
+    monkeypatch.setattr(workspace_provisioning, "provision_and_verify", refuse)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "workspace isolation failed" in outcome.reason
+    assert outcome.no_fault is True
+    assert runs == []
+
+
+def test_dispatch_lease_contention_is_no_fault(handler, lease_tool, tmp_path) -> None:
+    """Migration 0022 refused to charge writer-lease contention to the item,
+    but wired the refund to exactly one call site (the publish push). The
+    dispatch-boundary gate is the same contention seen a few seconds
+    earlier, and it was still spending the budget."""
+    run_agent, runs = handler
+    lease_tool(_lease_row(isolated_path(tmp_path)))
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert outcome.no_fault is True
+    assert runs == []
+
+
+def test_the_full_lifecycle_lease_acquire_refusal_is_no_fault(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The other half of the same gate: `blocking_lease` sees nothing, then
+    the acquire itself loses the race to a sibling lane."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'lease already held by another writer' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert "writer lease unavailable" in outcome.reason
+    assert outcome.no_fault is True
+    assert runs == []
+
+
+def test_a_run_that_executed_and_failed_is_never_no_fault(handler, monkeypatch) -> None:
+    """The boundary, stated from the other side: an agent that ran and
+    failed is a RESULT (`ok=True`, the control plane reads it), and a
+    publish that pushed badly is evidence about this run's own output --
+    neither may reach the refund path, or a genuinely broken item would
+    retry against a budget nothing spends down."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+
+    def failed_run(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="partial",
+            stderr="boom",
+            duration_seconds=2.0,
+            started_at="2026-09-09T00:00:00+00:00",
+            completed_at="2026-09-09T00:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_run)
+    executed = run_agent(_payload(), _event(), 1)
+    assert executed.ok and executed.no_fault is False
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", lambda **kw: agent_runner.RunResult(
+        status="completed",
+        exit_code=0,
+        stdout='{"result": "done"}',
+        stderr="",
+        duration_seconds=1.0,
+        started_at="2026-09-09T00:00:00+00:00",
+        completed_at="2026-09-09T00:00:01+00:00",
+    ))
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    monkeypatch.setattr(
+        handlers_module,
+        "publish_run",
+        lambda repository, cfg: PublishResult(ok=False, reason="push_failed: rejected"),
+    )
+    published = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not published.ok and published.retryable
+    assert published.no_fault is False
+
+
+def test_a_payload_defect_is_neither_retryable_nor_no_fault(handler) -> None:
+    """A defect IS evidence about the item -- the refund path would only
+    keep re-delivering something no host can execute."""
+    run_agent, _runs = handler
+    outcome = run_agent(_payload(v=2), _event(), 1)
+    assert not outcome.ok and not outcome.retryable
+    assert outcome.no_fault is False

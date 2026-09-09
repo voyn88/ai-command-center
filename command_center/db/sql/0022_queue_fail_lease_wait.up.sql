@@ -1,4 +1,4 @@
--- 0020: writer-lease contention refuses a publish honestly, but the retry it
+-- 0022: writer-lease contention refuses a publish honestly, but the retry it
 -- earns must not spend from the same budget a real work failure does
 -- (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT).
 --
