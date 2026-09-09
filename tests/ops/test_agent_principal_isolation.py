@@ -2110,3 +2110,20 @@ def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monke
     with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
         launcher._write_back_model_auth("claude", home)
     assert store.read_bytes() == old
+
+
+def test_the_launcher_can_write_the_model_auth_store_it_writes_refreshed_tokens_into():
+    """VOYN-W0-AICC-AGENT-MODEL-AUTH-REFRESH-IS-LOST-WITH-THE-EPHEMERAL-HOME-REM:
+    the write-back at teardown targets /var/lib/aicc-agent; under
+    ProtectSystem=strict that path must be in ReadWritePaths, or the
+    refreshed token is lost with EROFS (worker-01 2026-09-09)."""
+    unit = (Path(__file__).parents[2] / "deploy/systemd/aicc-agent-launcher@.service").read_text()
+    paths = [
+        path
+        for line in unit.splitlines()
+        if line.startswith("ReadWritePaths=")
+        for path in line.split("=", 1)[1].split()
+    ]
+    assert "/var/lib/aicc-agent" in paths
+    tmpfiles = (Path(__file__).parents[2] / "deploy/tmpfiles.d/aicc-agent.conf").read_text()
+    assert "d /var/lib/aicc-agent 0700 root root -" in tmpfiles

@@ -40,7 +40,12 @@ RestrictAddressFamilies=AF_UNIX
 # '-' would only let the namespace come up around an ABSENT path, and a
 # directory created afterwards never becomes writable inside it (review of
 # 5736dd6c) -- the connection would fail one step later instead.
-ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine
+# /var/lib/aicc-agent: the model-auth store the broker writes a refreshed
+# provider credential back into at teardown. Without it the write-back hit
+# EROFS under ProtectSystem=strict, the rotated refresh token died with the
+# ephemeral home, and Claude was dead again after its first refresh
+# (worker-01 2026-09-09 06:38 UTC).
+ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine /var/lib/aicc-agent
 UMask=0077
 MemoryMax=256M
 TasksMax=64
