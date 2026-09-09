@@ -111,12 +111,20 @@ def store(document: dict, root: Path, *, group: str = "aicc-worker", chown: bool
 
     put(root / "token", token + "\n", 0o640)
     put(root / "expires_at", str(document["expires_at"]) + "\n", 0o644)
+    # gh's CURRENT config layout, written complete: given only the legacy
+    # single-token hosts.yml, gh tries to migrate and rewrite the file, which
+    # a lane under ProtectSystem=strict cannot ("failed to write config after
+    # migration: read-only file system", worker-01 2026-09-09).
+    put(root / "gh" / "config.yml", "version: 1\ngit_protocol: https\nprompt: disabled\n", 0o640)
     put(
         root / "gh" / "hosts.yml",
         "github.com:\n"
-        f"    oauth_token: {token}\n"
+        "    users:\n"
+        "        voyn-aicc-fleet[bot]:\n"
+        f"            oauth_token: {token}\n"
+        "    git_protocol: https\n"
         "    user: voyn-aicc-fleet[bot]\n"
-        "    git_protocol: https\n",
+        f"    oauth_token: {token}\n",
         0o640,
     )
 

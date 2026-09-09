@@ -76,6 +76,10 @@ def test_store_writes_token_expiry_and_gh_hosts_lane_readable_and_atomic(tmp_pat
     assert (root / "expires_at").read_text().strip() == "2026-09-09T13:00:00Z"
     hosts = (root / "gh" / "hosts.yml").read_text()
     assert "oauth_token: ghs_secret" in hosts and "git_protocol: https" in hosts
+    # Current gh layout (users: map) plus config.yml, so gh never tries to
+    # migrate/rewrite inside the read-only lane.
+    assert "    users:\n        voyn-aicc-fleet[bot]:\n            oauth_token: ghs_secret" in hosts
+    assert (root / "gh" / "config.yml").read_text().startswith("version: 1\n")
     assert stat.S_IMODE((root / "gh" / "hosts.yml").stat().st_mode) == 0o640
     assert not list(root.glob("*.tmp")) and not list((root / "gh").glob("*.tmp"))
 
