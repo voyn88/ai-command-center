@@ -23,6 +23,32 @@ from urllib.parse import urlsplit
 # has stopped making progress.
 DEFAULT_MAX_CLAIM_SECONDS = 5400.0
 
+# How many items the fleet can hold CLAIMED at once: one per worker lane, since
+# a lane runs a single attempt at a time (`worker.daemon.run_forever` claims,
+# handles, then loops). The default is the canonical lane registry
+# `deploy/aicc/worker-lanes`, and `--claim-capacity` overrides it for a fleet
+# that has scaled;
+# `test_the_claim_capacity_default_matches_the_canonical_lane_registry` pins
+# the two together so adding a lane cannot silently leave this number behind.
+#
+# It has to exist because THE QUEUE IS DESIGNED TO HOLD MORE DISPATCHED WORK
+# THAN THE FLEET CAN CLAIM. `PlanLimits.wip_limit` is 4 against these 2 lanes
+# (`backlog_dispatch` bounds concurrency by per-repository writer leases, and
+# the fleet has three repositories), so a due `ready` item routinely waits for
+# a lane to free -- for as long as a whole attempt, which
+# `voyn-aicc-worker@.service` allows 3660s plus provisioning. That item is
+# queued behind a busy fleet, which is backpressure and not a stall.
+DEFAULT_CLAIM_CAPACITY = 2
+
+# The longest a free lane can take to notice due work: the daemon's idle poll
+# backs off to `WorkerConfig.idle_max_seconds` (30s) and no further, so by then
+# every free lane has polled at least once. Below this floor the work has not
+# yet been offered to a claimer, so `throughput_stalled` -- the one check that
+# fires INSIDE the stall window -- must not read a just-enqueued item as
+# starvation. `test_the_throughput_floor_covers_the_workers_poll_ceiling` pins
+# it against the daemon's own constant.
+CLAIM_POLL_CEILING_SECONDS = 30.0
+
 
 @dataclass(frozen=True, slots=True)
 class QueueSnapshot:
@@ -31,22 +57,33 @@ class QueueSnapshot:
     succeeded: int
     dead: int
     success_age_seconds: float | None
-    #: How long the oldest UNATTENDED pending item has been waiting -- see
-    #: ``_QUEUE_SNAPSHOT_SQL`` for what "unattended" means and why a pending
-    #: item under a live lease is deliberately excluded. ``None`` when every
-    #: pending item is attended (or there is no pending work at all).
-    pending_age_seconds: float | None
     recent_dead: int = 0
     #: dead-lettered in the trailing hour by an executor quota/spend/rate refusal
     recent_quota_dead: int = 0
     #: succeeded in the trailing hour (throughput); None when not measured
     recent_succeeded: int | None = None
-    #: How many pending items are unattended right now. Counted by the same
-    #: filter that produces ``pending_age_seconds``, so the two always agree:
-    #: 0 exactly when the age is ``None``.
-    pending_unattended: int = 0
-    #: Age of the oldest claim that IS under a live lease -- the fleet working,
-    #: not the fleet stuck. ``None`` when nothing is claimed under a live lease.
+    # The three disjoint classes of pending work. `_QUEUE_SNAPSHOT_SQL` says
+    # how each is measured; `evaluate` decides which of them is STARVED,
+    # because that question needs `--claim-capacity` and the database does not
+    # know how many lanes the fleet runs.
+    #: Ready items whose ``available_at`` has passed -- claimable right now by
+    #: any free lane. An item still inside its retry backoff or enqueue delay
+    #: is waiting by design and is deliberately not counted.
+    ready_due: int = 0
+    #: How long the oldest due ready item has been claimable. ``None`` exactly
+    #: when ``ready_due`` is 0 -- one filter produces both.
+    ready_due_age_seconds: float | None = None
+    #: Claims with no live lease: the attempt expired (or vanished) and no
+    #: reaper recovered it. The zombie claim, starved at any capacity.
+    lapsed_claims: int = 0
+    #: How long the oldest lapsed claim has been leaseless. ``None`` exactly
+    #: when ``lapsed_claims`` is 0.
+    lapsed_claim_age_seconds: float | None = None
+    #: Claims under a live, renewing lease -- lanes doing their job. Weighed
+    #: against ``--claim-capacity`` to tell queued work from stalled work.
+    attended_claims: int = 0
+    #: Age of the oldest claim under a live lease. Bounded by
+    #: ``--max-claim-seconds``, never by ``--max-stalled-seconds``.
     live_claim_age_seconds: float | None = None
 
 
@@ -95,40 +132,45 @@ def discover_worker_units() -> dict[str, str]:
 # The queue measurement, as one named statement so a test can execute exactly
 # what production executes against a real server.
 #
-# WHAT "UNATTENDED" MEANS, AND WHY THE STALL CLOCK IS BUILT ON IT
+# WHAT THIS STATEMENT DOES AND DOES NOT DECIDE
+# ---------------------------------------------------------------------------
+# It sorts pending work into three DISJOINT classes and times each one. It
+# does not decide which of them is stalled: that needs the fleet's claim
+# capacity, which lives in `evaluate` because the database cannot know how
+# many worker lanes are running.
+#
+#   * READY AND DUE (`available_at <= now()`) -- claimable this second by any
+#     free lane; `queue_claim` takes the oldest such row with no repository or
+#     lane affinity. A ready item still inside its retry backoff or enqueue
+#     delay is waiting BY DESIGN and is not in this class; counting it made the
+#     queue's own backoff look like a stall.
+#   * LAPSED CLAIM -- claimed, but the attempt's lease expired or vanished and
+#     no reaper recovered it. This is the zombie the stall check was written
+#     for. `aicc-queue-reaper.timer` runs every minute, so a lapse older than
+#     the stall window means recovery itself is broken, at any capacity.
+#   * ATTENDED CLAIM -- claimed under a live, renewing lease. The lease IS the
+#     liveness proof: `queue_heartbeat` only renews while a worker is alive and
+#     still owns the attempt, and the moment it stops, `visible_until` lapses
+#     and the row moves into the class above on its own.
+#
+# WHY THE CLASSES EXIST (monitor_finding #481, `control-01:queue`)
 # ---------------------------------------------------------------------------
 # The stall clock used to be `now() - min(updated_at)` over every ready or
 # claimed row, and `work_item.updated_at` for a claimed row is the moment it
-# was CLAIMED -- heartbeats renew `work_attempt.visible_until`, they never
-# touch the item. So a lane doing exactly what it is deployed to do reported
-# a stall the moment its run passed `--max-stalled-seconds`, and the fleet's
-# own units say that is the ordinary case, not the exception:
-# `voyn-aicc-worker@.service` sets `TimeoutStopSec=3660s` for a single
-# attempt, and the planner's cascade adds worktree provisioning (a 600s clone
-# timeout) on top of the agent's own run. `control-01:queue` therefore went
-# red with `queue_stalled` on healthy work, opened a monitor finding, and the
-# planner minted a task for it (monitor_finding #481) -- a fail-closed
-# monitor that could not be green while the fleet worked.
+# was CLAIMED -- heartbeats renew `work_attempt.visible_until` and never touch
+# the item. So a lane doing exactly what it is deployed to do reported a stall
+# the moment its run passed `--max-stalled-seconds`, and the fleet's own units
+# say that is the ordinary case, not the exception:
+# `voyn-aicc-worker@.service` sets `TimeoutStopSec=3660s` for a single attempt,
+# and the planner's cascade adds worktree provisioning (a 600s clone timeout)
+# on top of the agent's own run.
 #
-# A pending item is UNATTENDED when nobody is accountable for it right now:
-#
-#   * ready and due (`available_at <= now()`) -- a claimer could have taken it
-#     and did not. A ready item still inside its retry backoff or enqueue
-#     delay is waiting BY DESIGN and is not counted; counting it made the
-#     queue's own backoff look like a stall.
-#   * claimed with no live lease -- the attempt expired (or vanished) and no
-#     reaper has recovered it. This is the zombie claim the check was written
-#     for, and it is still caught: `aicc-queue-reaper.timer` runs every
-#     minute, so a lapse older than the stall window means recovery itself is
-#     broken.
-#
-# A claim under a LIVE lease is excluded, because the lease is the liveness
-# proof: `queue_heartbeat` only renews while a worker is alive and still owns
-# the attempt, and the moment it stops, `visible_until` lapses and the row
-# joins the unattended set on its own. Such a claim is measured separately as
-# `live_claim_age_seconds` and bounded by `--max-claim-seconds`, so a handler
-# wedged behind a heartbeat thread that keeps beating is still caught -- just
-# at a ceiling above one legitimate attempt instead of below it.
+# Separating the attended claims was necessary and not sufficient: the ready
+# rows kept the probe red on their own. `PlanLimits.wip_limit` is 4 against 2
+# lanes, so the queue is MEANT to hold work no lane can attend yet, and that
+# surplus row sits ready and due for a whole attempt. Hence the counts below
+# and the capacity comparison in `evaluate`: a due ready item is a stall only
+# when a lane was free to take it.
 _QUEUE_SNAPSHOT_SQL = """
     WITH pending AS (
         SELECT
@@ -138,17 +180,17 @@ _QUEUE_SNAPSHOT_SQL = """
             (w.state = 'claimed'
              AND coalesce(a.state = 'active' AND a.visible_until > now(), false))
                 AS attended,
-            CASE
-                WHEN w.state = 'ready' THEN greatest(w.updated_at, w.available_at)
-                ELSE coalesce(a.visible_until, w.updated_at)
-            END AS waiting_since,
-            (w.state = 'ready' AND w.available_at > now()) AS not_due
+            (w.state = 'ready' AND w.available_at <= now()) AS ready_due,
+            -- A ready item has been claimable since it became due, which is
+            -- its enqueue/retry time when that is later than its last touch.
+            greatest(w.updated_at, w.available_at) AS due_since,
+            -- A claim has been leaseless since the lease lapsed; with no
+            -- attempt row at all, since the claim itself.
+            coalesce(a.visible_until, w.updated_at) AS leaseless_since
           FROM work_item w
           LEFT JOIN work_attempt_public a ON a.attempt_id = w.current_attempt_id
     ), classified AS (
-        SELECT *,
-               (state IN ('ready', 'claimed') AND NOT attended AND NOT not_due)
-                   AS unattended
+        SELECT *, (state = 'claimed' AND NOT attended) AS lapsed_claim
           FROM pending
     )
     SELECT
@@ -158,9 +200,6 @@ _QUEUE_SNAPSHOT_SQL = """
         count(*) FILTER (WHERE state = 'dead'),
         extract(epoch FROM (
             now() - max(updated_at) FILTER (WHERE state = 'succeeded')
-        )),
-        extract(epoch FROM (
-            now() - min(waiting_since) FILTER (WHERE unattended)
         )),
         count(*) FILTER (
             WHERE state = 'dead'
@@ -175,7 +214,15 @@ _QUEUE_SNAPSHOT_SQL = """
             WHERE state = 'succeeded'
               AND updated_at > now() - interval '1 hour'
         ),
-        count(*) FILTER (WHERE unattended),
+        count(*) FILTER (WHERE ready_due),
+        extract(epoch FROM (
+            now() - min(due_since) FILTER (WHERE ready_due)
+        )),
+        count(*) FILTER (WHERE lapsed_claim),
+        extract(epoch FROM (
+            now() - min(leaseless_since) FILTER (WHERE lapsed_claim)
+        )),
+        count(*) FILTER (WHERE attended),
         extract(epoch FROM (
             now() - min(updated_at) FILTER (WHERE attended)
         ))
@@ -197,27 +244,35 @@ def snapshot_from_row(row: tuple[Any, ...]) -> QueueSnapshot:
         succeeded,
         dead,
         success_age,
-        pending_age,
         recent_dead,
         recent_quota_dead,
         recent_succeeded,
-        pending_unattended,
+        ready_due,
+        ready_due_age,
+        lapsed_claims,
+        lapsed_claim_age,
+        attended_claims,
         live_claim_age,
     ) = row
+
+    def seconds(value: Any) -> float | None:
+        return float(value) if value is not None else None
+
     return QueueSnapshot(
         ready=int(ready),
         claimed=int(claimed),
         succeeded=int(succeeded),
         dead=int(dead),
-        success_age_seconds=(float(success_age) if success_age is not None else None),
-        pending_age_seconds=(float(pending_age) if pending_age is not None else None),
+        success_age_seconds=seconds(success_age),
         recent_dead=int(recent_dead),
         recent_quota_dead=int(recent_quota_dead),
         recent_succeeded=int(recent_succeeded),
-        pending_unattended=int(pending_unattended),
-        live_claim_age_seconds=(
-            float(live_claim_age) if live_claim_age is not None else None
-        ),
+        ready_due=int(ready_due),
+        ready_due_age_seconds=seconds(ready_due_age),
+        lapsed_claims=int(lapsed_claims),
+        lapsed_claim_age_seconds=seconds(lapsed_claim_age),
+        attended_claims=int(attended_claims),
+        live_claim_age_seconds=seconds(live_claim_age),
     )
 
 
@@ -275,6 +330,7 @@ def evaluate(
     prometheus_ready: bool,
     max_recent_dead: int = 0,
     max_claim_seconds: float = DEFAULT_MAX_CLAIM_SECONDS,
+    claim_capacity: int = DEFAULT_CLAIM_CAPACITY,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
     failures: list[str] = []
@@ -284,17 +340,30 @@ def evaluate(
         failures.append("prometheus_unready")
 
     # An old last-success timestamp is normal when there is no work. It becomes
-    # context in the report once work appears; the oldest UNATTENDED pending
-    # item is the alert clock (`_QUEUE_SNAPSHOT_SQL` defines unattended and
-    # says why). Unrelated successful work must not hide a zombie claim, and a
-    # lane legitimately holding a live lease for longer than the stall window
-    # must not be reported as one.
+    # context in the report once work appears; the oldest STARVED item is the
+    # alert clock. Unrelated successful work must not hide a zombie claim, and
+    # neither a lane legitimately holding a live lease for longer than the
+    # stall window nor work queued behind a full fleet may be reported as one.
     if queue is not None:
-        pending_is_stale = (
-            queue.pending_age_seconds is not None
-            and queue.pending_age_seconds > max_stalled_seconds
-        )
-        if queue.pending_unattended > 0 and pending_is_stale:
+        # Is any lane free to claim? `greatest(p_wip_limit, 1)` is the same
+        # convention `backlog_dispatch` applies to its own cap: a capacity of
+        # 0 would otherwise mean "no lane can ever claim", which would excuse
+        # every unclaimed item forever.
+        spare_capacity = queue.attended_claims < max(claim_capacity, 1)
+        # STARVED = pending work nobody is accountable for AND nobody is
+        # merely too busy for. A lapsed claim is starved at any capacity: no
+        # lane is holding it, so no lane being free is irrelevant to it.
+        starved_ages = [queue.lapsed_claim_age_seconds]
+        if spare_capacity:
+            starved_ages.append(queue.ready_due_age_seconds)
+        measured = [age for age in starved_ages if age is not None]
+        # The oldest starved item, or None when nothing is starved. Counts are
+        # not consulted: each age comes from the same filter as its count and
+        # is None exactly when that count is 0, so a second gate on the counts
+        # could only ever short-circuit ahead of the threshold it guards.
+        starved_age = max(measured) if measured else None
+
+        if starved_age is not None and starved_age > max_stalled_seconds:
             failures.append("queue_stalled")
         # The other half of the zombie question: a claim whose lease keeps
         # being renewed is progress right up until it is not. The daemon's
@@ -320,17 +389,21 @@ def evaluate(
         # (quota-aware cascade) and budgets get a task, not a guess.
         if queue.recent_quota_dead > 0:
             failures.append(f"executor_quota_exhausted:{queue.recent_quota_dead}")
-        # Throughput: work waiting (past the stall clock) with nothing having
-        # succeeded in the trailing hour is a stalled pipeline even when every
-        # lane shows active -- the lanes may be spinning on refusals. Gated on
-        # UNATTENDED work for the same reason `queue_stalled` is: a fleet whose
-        # every pending item is under a live lease is busy, not starved, and an
-        # hour is a perfectly ordinary length for one attempt here.
+        # Throughput: zero successes in the trailing hour, with starved work to
+        # corroborate it, is a stalled pipeline even when every lane shows
+        # active -- the lanes may be spinning on refusals. It is the one check
+        # that fires INSIDE the stall window, so it carries that window's two
+        # bounds explicitly: above `CLAIM_POLL_CEILING_SECONDS`, because work
+        # no claimer has been offered yet proves nothing (an hour with no
+        # successes is ordinary here -- one attempt may run longer than that --
+        # so a queue that had been empty all night would otherwise go red the
+        # second the first task was enqueued); and at or below the stall
+        # window, above which `queue_stalled` already reports it.
         if (
             queue.recent_succeeded is not None
             and queue.recent_succeeded == 0
-            and queue.pending_unattended > 0
-            and not pending_is_stale
+            and starved_age is not None
+            and CLAIM_POLL_CEILING_SECONDS < starved_age <= max_stalled_seconds
         ):
             failures.append("throughput_stalled:0_succeeded_in_1h")
 
@@ -358,6 +431,17 @@ def build_parser() -> argparse.ArgumentParser:
             "--max-stalled-seconds, which times work nobody is attending: a "
             "long agent run is attended, so it belongs under this ceiling and "
             "not under that clock."
+        ),
+    )
+    parser.add_argument(
+        "--claim-capacity",
+        type=int,
+        default=DEFAULT_CLAIM_CAPACITY,
+        help=(
+            "How many items the fleet can hold claimed at once -- one per "
+            "worker lane. While that many claims are under live leases, due "
+            "ready work is queued behind a busy fleet rather than stalled, "
+            "and only --max-claim-seconds bounds it."
         ),
     )
     parser.add_argument(
@@ -451,6 +535,7 @@ def main(argv: list[str] | None = None) -> int:
             prometheus_ready=metrics_ready,
             max_recent_dead=args.max_recent_dead,
             max_claim_seconds=args.max_claim_seconds,
+            claim_capacity=args.claim_capacity,
         )
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))

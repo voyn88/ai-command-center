@@ -27,16 +27,41 @@ functional application milestones of `app.py`.
   behind a still-beating heartbeat thread is caught at a ceiling above one
   legitimate attempt instead of below it. `throughput_stalled` is gated on the
   same unattended set, so the fix does not merely rename the false positive.
+- Excluding attended claims was half of it. The queue is *designed* to hold
+  more dispatched work than the fleet can claim — `PlanLimits.wip_limit` is 4
+  against the 2 lanes of `deploy/aicc/worker-lanes`, and `backlog_dispatch`
+  bounds concurrency by per-repository writer leases across three fleet
+  repositories — so the surplus item sits `ready` and *due* until a lane frees,
+  which takes a whole attempt and tripped the same clock on its own. A due
+  ready item is now a stall only when a lane was FREE to take it: the snapshot
+  reports three disjoint classes (`ready_due`, `lapsed_claims`,
+  `attended_claims`, each with its own age) and `evaluate` weighs the attended
+  claims against the new `--claim-capacity` (default 2, the lane registry). A
+  lapsed claim stays starved at any capacity — no lane is holding it, so a busy
+  fleet is no explanation for it. Scaling past two lanes means passing
+  `--claim-capacity`; until it is passed the probe under-reports rather than
+  crying wolf, which is the direction a red tick that mints a task should err.
+- `throughput_stalled` also gained a floor: it is the only check that fires
+  inside the stall window, and an hour with no successes is ordinary here (one
+  attempt may run longer), so a queue that had been empty all night went red
+  the second the planner dispatched the first task. It now needs the starved
+  work to be older than `CLAIM_POLL_CEILING_SECONDS` — the daemon's idle poll
+  backs off to `WorkerConfig.idle_max_seconds` (30s) and no further, so below
+  that nothing has been offered to a claimer yet.
 - `tests/db/test_infra_monitor_queue_snapshot.py`: the measurement proved
   against a real server, as `aicc_app` — claims taken through `queue_claim`,
   leases expired the way the protocol expires them, and the lease read through
   `work_attempt_public` (`work_attempt` itself is granted to nobody).
 - `tests/ops/test_infra_monitor.py`: `test_new_pending_work_does_not_turn_an_idle_queue_red`
-  now sets `pending_unattended` alongside `pending_age_seconds`. Gating the
-  stall check on the unattended count made that snapshot unreachable (the count
-  is 0 exactly when the age is `None`), so the test passed through the gate
-  without ever reaching the `10s < 900s` comparison it exists to pin — it no
-  longer failed when the threshold was mutated away.
+  now sets the count alongside the age. Gating the stall check on the
+  unattended count made that snapshot unreachable (the count is 0 exactly when
+  the age is `None`), so the test passed through the gate without ever reaching
+  the `10s < 900s` comparison it exists to pin — it no longer failed when the
+  threshold was mutated away. The redundant count gates are gone with the
+  restructure; the ages alone drive the verdicts. Two defaults are pinned to
+  their sources rather than restated: `--claim-capacity` against
+  `deploy/aicc/worker-lanes`, and the throughput floor against
+  `WorkerConfig.idle_max_seconds`.
 
 ### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
 - `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`

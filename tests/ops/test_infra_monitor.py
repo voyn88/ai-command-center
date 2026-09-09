@@ -42,7 +42,6 @@ def test_idle_queue_is_healthy_even_when_last_success_is_old() -> None:
             succeeded=10,
             dead=2,
             success_age_seconds=9999,
-            pending_age_seconds=None,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
@@ -67,8 +66,8 @@ def test_pending_queue_without_recent_progress_fails_closed() -> None:
             succeeded=10,
             dead=2,
             success_age_seconds=901,
-            pending_age_seconds=901,
-            pending_unattended=3,
+            ready_due=3,
+            ready_due_age_seconds=901,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
@@ -88,7 +87,6 @@ def test_recent_dead_letter_growth_fails_closed() -> None:
             succeeded=10,
             dead=12,
             success_age_seconds=1,
-            pending_age_seconds=None,
             recent_dead=2,
         ),
         minimum_active_workers=1,
@@ -110,7 +108,6 @@ def test_recent_dead_letter_threshold_is_configurable() -> None:
             succeeded=10,
             dead=12,
             success_age_seconds=1,
-            pending_age_seconds=None,
             recent_dead=2,
         ),
         minimum_active_workers=1,
@@ -126,12 +123,10 @@ def test_new_pending_work_does_not_turn_an_idle_queue_red() -> None:
     """A ready, due, unclaimed item ten seconds old is inside the stall
     window, so an old last-success does not make it red.
 
-    ``pending_unattended`` is set to match ``pending_age_seconds``: the two
-    come from one filter in ``_QUEUE_SNAPSHOT_SQL`` and the count is 0
-    exactly when the age is ``None``. Left at its default of 0 beside a
-    non-``None`` age this snapshot could not occur, and the assertion passed
-    through the unattended gate without ever reaching the 10s < 900s
-    comparison it is here to pin.
+    ``ready_due`` is set to match ``ready_due_age_seconds``: the two come
+    from one filter in ``_QUEUE_SNAPSHOT_SQL`` and the count is 0 exactly
+    when the age is ``None``, so a non-``None`` age beside a count of 0 is a
+    snapshot the database cannot produce.
     """
     report = evaluate(
         {
@@ -146,8 +141,8 @@ def test_new_pending_work_does_not_turn_an_idle_queue_red() -> None:
             succeeded=10,
             dead=2,
             success_age_seconds=9999,
-            pending_age_seconds=10,
-            pending_unattended=1,
+            ready_due=1,
+            ready_due_age_seconds=10,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
@@ -158,8 +153,9 @@ def test_new_pending_work_does_not_turn_an_idle_queue_red() -> None:
 
 
 def test_claimed_queue_without_recent_success_fails_closed() -> None:
-    """Claims whose leases have LAPSED (so the snapshot counts them
-    unattended) and that nothing has recovered inside the stall window."""
+    """Claims whose leases have LAPSED (so the snapshot counts them as
+    lapsed, not attended) and that nothing has recovered inside the stall
+    window."""
     report = evaluate(
         {
             "voyn-aicc-worker@1.service": "active",
@@ -173,8 +169,8 @@ def test_claimed_queue_without_recent_success_fails_closed() -> None:
             succeeded=10,
             dead=2,
             success_age_seconds=901,
-            pending_age_seconds=901,
-            pending_unattended=2,
+            lapsed_claims=2,
+            lapsed_claim_age_seconds=901,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
@@ -199,8 +195,8 @@ def test_unrelated_success_does_not_hide_a_zombie_claim() -> None:
             succeeded=11,
             dead=2,
             success_age_seconds=5,
-            pending_age_seconds=901,
-            pending_unattended=1,
+            lapsed_claims=1,
+            lapsed_claim_age_seconds=901,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
@@ -223,7 +219,6 @@ def test_inactive_lane_and_prometheus_failure_are_reported() -> None:
             succeeded=0,
             dead=0,
             success_age_seconds=None,
-            pending_age_seconds=None,
         ),
         minimum_active_workers=2,
         max_stalled_seconds=900,
@@ -322,7 +317,7 @@ def test_main_skip_queue_serializes_null_without_reading_database(
 def test_main_skip_workers_reads_queue_without_inspecting_systemd(
     monkeypatch, capsys
 ) -> None:
-    queue = QueueSnapshot(0, 0, 1, 0, 1.0, None)
+    queue = QueueSnapshot(0, 0, 1, 0, 1.0)
     monkeypatch.setattr(
         infra_monitor,
         "discover_worker_units",
@@ -348,8 +343,12 @@ def test_main_skip_workers_reads_queue_without_inspecting_systemd(
 def _queue(**kw):
     from command_center.ops.infra_monitor import QueueSnapshot
 
+    # Five starved items 60s in: three ready with a lane free to take them,
+    # two claims whose leases lapsed. Inside the stall window and past the
+    # poll ceiling -- the band `throughput_stalled` owns.
     base = dict(ready=3, claimed=2, succeeded=100, dead=0, success_age_seconds=200.0,
-                pending_age_seconds=60.0, recent_dead=0, pending_unattended=5)
+                recent_dead=0, ready_due=3, ready_due_age_seconds=60.0,
+                lapsed_claims=2, lapsed_claim_age_seconds=60.0)
     base.update(kw)
     return QueueSnapshot(**base)
 
@@ -460,8 +459,8 @@ def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(mo
 
 def test_a_live_lease_is_progress_not_a_stall() -> None:
     """THE REGRESSION. One lane 40 minutes into an attempt, heartbeating: the
-    snapshot reports it as an attended claim (`pending_unattended == 0`), and
-    the monitor stays green."""
+    snapshot reports it as an attended claim and nothing as starved, and the
+    monitor stays green."""
     report = evaluate(
         {"voyn-aicc-worker@1.service": "active"},
         QueueSnapshot(
@@ -470,8 +469,7 @@ def test_a_live_lease_is_progress_not_a_stall() -> None:
             succeeded=100,
             dead=0,
             success_age_seconds=4000,
-            pending_age_seconds=None,
-            pending_unattended=0,
+            attended_claims=1,
             live_claim_age_seconds=2400,
             recent_succeeded=0,
         ),
@@ -497,8 +495,7 @@ def test_a_live_lease_does_not_become_a_throughput_stall_either() -> None:
             succeeded=100,
             dead=0,
             success_age_seconds=5000,
-            pending_age_seconds=None,
-            pending_unattended=0,
+            attended_claims=4,
             live_claim_age_seconds=3000,
             recent_succeeded=0,
         ),
@@ -521,8 +518,8 @@ def test_a_claim_whose_lease_lapsed_is_still_a_stall() -> None:
             succeeded=100,
             dead=0,
             success_age_seconds=5,
-            pending_age_seconds=1200,
-            pending_unattended=1,
+            lapsed_claims=1,
+            lapsed_claim_age_seconds=1200,
             live_claim_age_seconds=None,
         ),
         minimum_active_workers=1,
@@ -546,8 +543,7 @@ def test_a_live_lease_held_past_the_ceiling_is_reported_as_overdue() -> None:
             succeeded=100,
             dead=0,
             success_age_seconds=9000,
-            pending_age_seconds=None,
-            pending_unattended=0,
+            attended_claims=1,
             live_claim_age_seconds=9001,
         ),
         minimum_active_workers=1,
@@ -590,6 +586,243 @@ def test_the_snapshot_query_excludes_live_leases_from_the_stall_clock() -> None:
     sql = infra_monitor._QUEUE_SNAPSHOT_SQL
     assert "work_attempt_public" in sql
     assert "a.visible_until > now()" in sql
-    # The lease-less half of "unattended": a ready item still inside its
-    # backoff is waiting by design and must not start the stall clock.
-    assert "w.available_at > now()" in sql
+    # The lease-less half: a ready item still inside its backoff is waiting
+    # by design, so only a DUE one may start the stall clock.
+    assert "w.available_at <= now()" in sql
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, the second half.
+#
+# Excluding attended claims from the stall clock was necessary and not
+# sufficient. The queue is DESIGNED to hold more dispatched work than the fleet
+# can claim -- `PlanLimits.wip_limit` is 4 against the 2 lanes of
+# `deploy/aicc/worker-lanes`, and `backlog_dispatch` bounds concurrency by
+# per-repository writer leases across three fleet repositories -- so a surplus
+# item sits `ready` and DUE until a lane frees. That wait is the length of a
+# whole attempt (`TimeoutStopSec=3660s` plus provisioning), far past
+# `--max-stalled-seconds`, so `control-01:queue` would have gone red again on
+# the ready rows alone once it stopped counting the claimed ones.
+#
+# A due ready item is now a stall only when a lane was FREE to take it:
+# `queue_claim` has no repository or lane affinity and the daemon's idle poll
+# backs off no further than 30s, so a free lane takes due work almost at once.
+
+
+def test_due_work_queued_behind_a_full_fleet_is_backpressure_not_a_stall() -> None:
+    """THE REGRESSION. Two lanes, both holding live leases, and a third
+    dispatched item ready and due for an hour behind them: the fleet is at
+    capacity, which is the planner's WIP limit working, not a stall."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        QueueSnapshot(
+            ready=1,
+            claimed=2,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=4000,
+            recent_succeeded=0,
+            ready_due=1,
+            ready_due_age_seconds=3600,
+            attended_claims=2,
+            live_claim_age_seconds=3600,
+        ),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert report.ok
+    assert report.failures == ()
+
+
+def test_a_free_lane_that_leaves_due_work_unclaimed_is_still_a_stall() -> None:
+    """The same snapshot with one lane free. `queue_claim` takes the oldest
+    due row with no repository or lane affinity, so a free lane that has not
+    claimed for the whole stall window is broken, and capacity must not
+    excuse it."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        QueueSnapshot(
+            ready=1,
+            claimed=1,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=4000,
+            ready_due=1,
+            ready_due_age_seconds=3600,
+            attended_claims=1,
+            live_claim_age_seconds=3600,
+        ),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert not report.ok
+    assert report.failures == ("queue_stalled",)
+
+
+def test_a_full_fleet_never_excuses_a_lapsed_claim() -> None:
+    """Capacity answers "could a lane have taken this?", which is a question
+    only unclaimed work raises. A claim whose lease lapsed is already held by
+    nobody, so a busy fleet is no explanation for it and the zombie check
+    keeps firing at full capacity."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        QueueSnapshot(
+            ready=0,
+            claimed=3,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=10,
+            lapsed_claims=1,
+            lapsed_claim_age_seconds=1200,
+            attended_claims=2,
+            live_claim_age_seconds=1200,
+        ),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert not report.ok
+    assert report.failures == ("queue_stalled",)
+
+
+def test_a_just_enqueued_item_is_not_a_throughput_stall_on_a_quiet_fleet() -> None:
+    """`throughput_stalled` is the one check that fires INSIDE the stall
+    window, so it has to be bounded below as well. An hour with no successes
+    is ordinary here -- a single attempt may run longer than that -- so a
+    queue that had been empty all night would otherwise go red the second the
+    planner dispatched the first task, seconds before a free lane's next
+    poll."""
+    seconds_old = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=1,
+            claimed=0,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=7200,
+            recent_succeeded=0,
+            ready_due=1,
+            ready_due_age_seconds=5,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert seconds_old.ok
+
+    # Past the poll ceiling every free lane has polled at least once, so the
+    # same item still sitting there IS evidence -- the floor is a grace
+    # period, not an exemption.
+    polled_past = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=1,
+            claimed=0,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=7200,
+            recent_succeeded=0,
+            ready_due=1,
+            ready_due_age_seconds=300,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert polled_past.failures == ("throughput_stalled:0_succeeded_in_1h",)
+
+
+def test_the_throughput_floor_covers_the_workers_poll_ceiling() -> None:
+    """The floor is not a number pulled from the air: it is how long a free
+    lane may take to notice due work. The daemon's idle poll backs off to
+    `idle_max_seconds` and no further, so below that nothing has been offered
+    to a claimer yet."""
+    from command_center.worker.daemon import WorkerConfig
+
+    assert infra_monitor.CLAIM_POLL_CEILING_SECONDS >= WorkerConfig().idle_max_seconds
+
+
+def test_the_claim_capacity_default_matches_the_canonical_lane_registry() -> None:
+    """A lane runs one attempt at a time, so capacity is the lane count. The
+    default tracks the registry the install transaction ships; a fleet that
+    grows past it has to say so with --claim-capacity, and this pins the two
+    together so growing it cannot silently leave the monitor behind."""
+    registry = (
+        Path(__file__).resolve().parents[2] / "deploy/aicc/worker-lanes"
+    ).read_text(encoding="utf-8")
+    lanes = [
+        line.strip()
+        for line in registry.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+    assert infra_monitor.DEFAULT_CLAIM_CAPACITY == len(lanes)
+
+
+def test_claim_capacity_is_configurable_and_reaches_the_verdict(
+    monkeypatch, capsys
+) -> None:
+    """The flag has to travel all the way from argv into `evaluate`: a
+    scaled fleet whose third lane sits idle while due work waits is a stall
+    the default two-lane capacity would excuse."""
+    queue = QueueSnapshot(
+        ready=1,
+        claimed=2,
+        succeeded=100,
+        dead=0,
+        success_age_seconds=4000,
+        ready_due=1,
+        ready_due_age_seconds=3600,
+        attended_claims=2,
+        live_claim_age_seconds=3600,
+    )
+    monkeypatch.setattr(infra_monitor, "read_queue_snapshot", lambda: queue)
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+
+    argv = [
+        "--skip-workers",
+        "--minimum-active-workers",
+        "0",
+        "--prometheus-url",
+        "http://metrics/ready",
+    ]
+
+    assert infra_monitor.main(argv) == 0
+    assert json.loads(capsys.readouterr().out)["failures"] == []
+
+    assert infra_monitor.main([*argv, "--claim-capacity", "3"]) == 1
+    assert json.loads(capsys.readouterr().out)["failures"] == ["queue_stalled"]
+
+
+def test_a_capacity_of_zero_cannot_excuse_every_unclaimed_item() -> None:
+    """`backlog_dispatch` reads its own cap as `greatest(p_wip_limit, 1)`;
+    capacity follows that convention rather than letting 0 mean "no lane can
+    ever claim, so nothing is ever late"."""
+    report = evaluate(
+        {},
+        QueueSnapshot(
+            ready=1,
+            claimed=0,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=4000,
+            ready_due=1,
+            ready_due_age_seconds=3600,
+        ),
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=0,
+    )
+
+    assert report.failures == ("queue_stalled",)

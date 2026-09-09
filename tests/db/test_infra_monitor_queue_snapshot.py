@@ -10,6 +10,14 @@ the deployment expects to be the ordinary case: `voyn-aicc-worker@.service`
 gives one attempt `TimeoutStopSec=3660s`, and the handler provisions a
 worktree (a 600s clone timeout) before the agent starts.
 
+Excluding those claims was half the fix. The queue also holds work no lane can
+attend yet -- `PlanLimits.wip_limit` is 4 against the 2 lanes of
+`deploy/aicc/worker-lanes` -- so the surplus item sits `ready` and due for a
+whole attempt and tripped the same clock on its own. The statement therefore
+reports three disjoint classes (due-ready, lapsed claim, attended claim) and
+leaves the starvation verdict to `evaluate`, which is where the fleet's claim
+capacity is known.
+
 Why this file needs a real server rather than a stub cursor:
 
 * The distinction the fix rests on -- attended vs unattended -- is a JOIN from
@@ -158,11 +166,11 @@ def test_a_live_lease_is_attended_and_the_monitor_stays_green(monitor) -> None:
 
     snapshot = measure()
     assert (snapshot.ready, snapshot.claimed) == (0, 1)
-    assert snapshot.pending_unattended == 0
-    assert snapshot.pending_age_seconds is None
+    assert (snapshot.ready_due, snapshot.lapsed_claims) == (0, 0)
+    assert snapshot.attended_claims == 1
     assert snapshot.live_claim_age_seconds is not None
     # The claim IS old -- 2400s, well past the 900s stall window. Before the
-    # fix that number was `pending_age_seconds` and turned the probe red.
+    # fix that number was the stall clock and turned the probe red.
     assert snapshot.live_claim_age_seconds > MAX_STALLED
 
     report = infra_monitor.evaluate(
@@ -188,12 +196,13 @@ def test_a_claim_whose_lease_lapsed_is_unattended_and_red(monitor) -> None:
 
     snapshot = measure()
     assert snapshot.claimed == 1
-    assert snapshot.pending_unattended == 1
+    assert snapshot.lapsed_claims == 1
+    assert snapshot.attended_claims == 0
     assert snapshot.live_claim_age_seconds is None
     # The wait is timed from the LAPSE, not from the claim: how long the item
     # has been nobody's.
-    assert snapshot.pending_age_seconds is not None
-    assert 1100 < snapshot.pending_age_seconds < 1300
+    assert snapshot.lapsed_claim_age_seconds is not None
+    assert 1100 < snapshot.lapsed_claim_age_seconds < 1300
 
     report = infra_monitor.evaluate(
         {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
@@ -211,9 +220,10 @@ def test_a_ready_item_nobody_claims_is_still_a_stall(monitor) -> None:
     )
 
     snapshot = measure()
-    assert snapshot.pending_unattended == 1
-    assert snapshot.pending_age_seconds is not None
-    assert snapshot.pending_age_seconds > MAX_STALLED
+    # Nothing is claimed at all, so every lane was free to take it.
+    assert (snapshot.ready_due, snapshot.attended_claims) == (1, 0)
+    assert snapshot.ready_due_age_seconds is not None
+    assert snapshot.ready_due_age_seconds > MAX_STALLED
 
     report = infra_monitor.evaluate(
         {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
@@ -238,8 +248,8 @@ def test_a_ready_item_inside_its_backoff_is_waiting_by_design(monitor) -> None:
 
     snapshot = measure()
     assert snapshot.ready == 1
-    assert snapshot.pending_unattended == 0
-    assert snapshot.pending_age_seconds is None
+    assert snapshot.ready_due == 0
+    assert snapshot.ready_due_age_seconds is None
 
     report = infra_monitor.evaluate(
         {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
@@ -249,7 +259,7 @@ def test_a_ready_item_inside_its_backoff_is_waiting_by_design(monitor) -> None:
 
 
 def test_one_lapsed_claim_is_not_hidden_by_a_healthy_neighbour(monitor) -> None:
-    """The measurement is a MINIMUM over the unattended set, so a busy lane
+    """The measurement is a MINIMUM over the lapsed set, so a busy lane
     beside a zombie cannot average it away -- the property
     `test_unrelated_success_does_not_hide_a_zombie_claim` pins at the
     `evaluate` level, here proved through the SQL."""
@@ -268,15 +278,53 @@ def test_one_lapsed_claim_is_not_hidden_by_a_healthy_neighbour(monitor) -> None:
 
     snapshot = measure()
     assert snapshot.claimed == 2
-    assert snapshot.pending_unattended == 1
-    assert snapshot.pending_age_seconds is not None
-    assert snapshot.pending_age_seconds > MAX_STALLED
+    assert (snapshot.lapsed_claims, snapshot.attended_claims) == (1, 1)
+    assert snapshot.lapsed_claim_age_seconds is not None
+    assert snapshot.lapsed_claim_age_seconds > MAX_STALLED
 
     report = infra_monitor.evaluate(
         {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
         prometheus_ready=True,
     )
     assert "queue_stalled" in report.failures
+
+
+def test_due_work_behind_a_full_fleet_is_queued_not_stalled(monitor) -> None:
+    """THE SECOND REGRESSION, proved against the server that produces the
+    shape. `PlanLimits.wip_limit` is 4 against 2 lanes, so the queue holds a
+    dispatched item no lane can attend yet: two claims under live leases and a
+    third item ready, due and an hour old behind them.
+
+    The database reports the three classes; only `evaluate` knows the lane
+    count, so the same snapshot is green at the fleet's capacity and red at a
+    capacity that says a third lane was sitting idle."""
+    measure, app, worker, age = monitor
+    for key in ("lane-one", "lane-two"):
+        app.enqueue(QUEUE, idempotency_key=key, payload={"kind": "agent_run"})
+        assert worker.heartbeat(_claim(worker)) is True
+    app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '1 hour', "
+        "available_at = now() - interval '1 hour' WHERE state = 'ready'"
+    )
+
+    snapshot = measure()
+    assert (snapshot.attended_claims, snapshot.lapsed_claims) == (2, 0)
+    assert snapshot.ready_due == 1
+    # The queued item IS old enough to trip the stall clock on its own.
+    assert snapshot.ready_due_age_seconds > MAX_STALLED
+
+    at_capacity = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert at_capacity.ok, at_capacity.failures
+
+    with_a_free_lane = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=3,
+    )
+    assert "queue_stalled" in with_a_free_lane.failures
 
 
 def test_the_monitor_reads_the_lease_through_the_redacted_view(monitor) -> None:
