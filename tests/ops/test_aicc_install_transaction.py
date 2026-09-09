@@ -6277,3 +6277,215 @@ def test_generator_dispatches_an_orphaned_membership_journal_to_the_live_capsule
 
     assert called[0][1][1] == str(recovery)
     assert called[0][1][2] == "recover-boot"
+
+
+# --- VOYN-W0-AICC-INSTALL-ROLLBACK-VS-MODEL-AUTH-WRITEBACK -------------------
+#
+# The model-credential stores are runtime-owned once installed: the launcher
+# writes a refreshed token back after every run (#900), so compare-and-restore
+# cannot treat them as install-owned content. On worker-01 (2026-09-09) it
+# did, refused the whole rollback with "generation target changed before
+# compare-and-restore", and left the host on the new release with a retained
+# WAL and a disabled launcher socket.
+
+CLAUDE_STORE = "/var/lib/aicc-agent/claude/.claude/.credentials.json"
+
+
+def _model_auth_transaction(tmp_path, *, existing: bytes | None):
+    """A generation that installs the Claude store plus one ordinary file."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    store = root / CLAUDE_STORE.lstrip("/")
+    store.parent.mkdir(parents=True)
+    if existing is not None:
+        store.write_bytes(existing)
+        store.chmod(0o600)
+    lanes = root / "etc/aicc/worker-lanes"
+    lanes.parent.mkdir(parents=True)
+    lanes.write_bytes(b"1\n")
+    lanes.chmod(0o644)
+    store_source = tmp_path / "claude.json"
+    store_source.write_bytes(b'{"refreshToken": "installed-by-this-generation"}')
+    lanes_source = tmp_path / "worker-lanes"
+    lanes_source.write_bytes(b"1\n2\n")
+    transaction = module.FileTransaction(root, state)
+    specs = (
+        module.FileSpec(store_source, CLAUDE_STORE, 0o600, os.geteuid(), os.getegid()),
+        _spec(module, lanes_source, "/etc/aicc/worker-lanes", 0o644),
+    )
+    return module, transaction, specs, store, lanes
+
+
+def _refresh(store: Path, payload: bytes = b'{"refreshToken": "rotated-by-the-run"}'):
+    """What ops/aicc_agent_launcher.py `_write_back_model_auth` leaves behind."""
+    store.write_bytes(payload)
+    store.chmod(0o600)
+    return payload
+
+
+def test_rollback_keeps_a_model_credential_the_run_refreshed(tmp_path):
+    """The reported incident, end to end: the launcher rotated the Claude
+    token four minutes into an install whose verify then failed. Rollback must
+    put every other target back and leave the live credential alone -- not
+    refuse, and above all not write the revoked token over it."""
+    module, transaction, specs, store, lanes = _model_auth_transaction(
+        tmp_path, existing=b'{"refreshToken": "before-this-generation"}'
+    )
+    transaction.prepare(specs)
+    transaction.apply()
+    refreshed = _refresh(store)
+
+    transaction.recover()
+
+    assert store.read_bytes() == refreshed
+    assert lanes.read_bytes() == b"1\n"
+    assert not transaction.pending.exists()
+    journal = json.loads(
+        (transaction.state_dir / module.MODEL_AUTH_RETENTION_JOURNAL).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert journal["version"] == module.MODEL_AUTH_RETENTION_VERSION
+    entry = journal["retained"][-1]
+    assert entry["target"] == CLAUDE_STORE
+    assert entry["retained_sha256"] == hashlib.sha256(refreshed).hexdigest()
+    assert entry["expected_sha256"] != entry["retained_sha256"]
+    assert stat.S_IMODE(
+        (transaction.state_dir / module.MODEL_AUTH_RETENTION_JOURNAL).stat().st_mode
+    ) == 0o600
+
+
+def test_rollback_restores_a_model_credential_no_run_touched(tmp_path):
+    """The tolerance is exactly "changed since install" and nothing wider: a
+    store still holding what this generation wrote is rolled back like any
+    other file, and nothing is recorded as retained."""
+    module, transaction, specs, store, _lanes = _model_auth_transaction(
+        tmp_path, existing=b'{"refreshToken": "before-this-generation"}'
+    )
+    transaction.prepare(specs)
+    transaction.apply()
+    assert store.read_bytes() == b'{"refreshToken": "installed-by-this-generation"}'
+
+    transaction.recover()
+
+    assert store.read_bytes() == b'{"refreshToken": "before-this-generation"}'
+    assert not (transaction.state_dir / module.MODEL_AUTH_RETENTION_JOURNAL).exists()
+
+
+@pytest.mark.parametrize(
+    "payload, mode",
+    [
+        (b"not json at all", 0o600),
+        (b'["not", "an", "object"]', 0o600),
+        (b"", 0o600),
+        (b'{"refreshToken": "rotated-by-the-run"}', 0o644),
+    ],
+)
+def test_rollback_refuses_a_store_that_is_not_a_credible_refresh(
+    tmp_path, payload, mode
+):
+    """Runtime ownership is not a licence to accept anything at the path. The
+    launcher writes a 0600 JSON object of the same shape it staged; bytes that
+    are not that were written by something else, and a rollback that kept them
+    would launder a tampered credential into the next run."""
+    module, transaction, specs, store, _lanes = _model_auth_transaction(
+        tmp_path, existing=b'{"refreshToken": "before-this-generation"}'
+    )
+    transaction.prepare(specs)
+    transaction.apply()
+    store.write_bytes(payload)
+    store.chmod(mode)
+
+    with pytest.raises(RuntimeError, match="not a credible refresh"):
+        transaction.recover()
+
+    assert store.read_bytes() == payload
+    assert transaction.pending.exists()
+    assert not (transaction.state_dir / module.MODEL_AUTH_RETENTION_JOURNAL).exists()
+
+
+def test_rollback_keeps_a_store_this_generation_created(tmp_path):
+    """No pre-install file to go back to, so the recorded rollback is a
+    removal. A run has refreshed the store since, and destroying it would take
+    the only credential that still authenticates with it."""
+    module, transaction, specs, store, _lanes = _model_auth_transaction(
+        tmp_path, existing=None
+    )
+    transaction.prepare(specs)
+    transaction.apply()
+    refreshed = _refresh(store)
+
+    transaction.recover()
+
+    assert store.read_bytes() == refreshed
+    journal = json.loads(
+        (transaction.state_dir / module.MODEL_AUTH_RETENTION_JOURNAL).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert journal["retained"][-1]["target"] == CLAUDE_STORE
+
+
+def test_uninstall_removes_a_refreshed_store_it_created(tmp_path):
+    """`teardown` is the one caller that must not retain: leaving a live
+    credential on a host being taken back to no-AICC-state is the outcome an
+    uninstall exists to prevent. It still proves the bytes are a credible
+    write-back first, so an unexplained file at the path fails closed."""
+    module, transaction, specs, store, _lanes = _model_auth_transaction(
+        tmp_path, existing=None
+    )
+    transaction.prepare(specs)
+    transaction.apply()
+    transaction.commit()
+    _refresh(store)
+
+    transaction.uninstall_all()
+
+    assert not store.exists()
+    assert not transaction.current.exists()
+
+
+def test_purge_rollback_keeps_a_store_refreshed_since_prepare(tmp_path):
+    """The removal side of the same ownership. A control-profile generation
+    snapshots the store at prepare(); a run rotating the token before the
+    failure leaves the target present with content that matches neither the
+    snapshot nor absence, which refused the rollback outright."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    store = root / CLAUDE_STORE.lstrip("/")
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b'{"refreshToken": "held-at-prepare"}')
+    store.chmod(0o600)
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((module.removal_spec(CLAUDE_STORE, sensitive=True),))
+    refreshed = _refresh(store)
+
+    transaction.recover()
+
+    assert store.read_bytes() == refreshed
+    journal = json.loads(
+        (state / module.MODEL_AUTH_RETENTION_JOURNAL).read_text(encoding="utf-8")
+    )
+    assert journal["retained"][-1]["target"] == CLAUDE_STORE
+
+
+def test_runtime_owned_stores_are_the_launcher_stores_and_the_sensitive_set():
+    """Three independent copies of the same two paths: the transaction's
+    runtime-ownership set, its sensitive-retirement set, and the launcher's
+    write-back sources. A credential added to one and forgotten in another is
+    either restored over a live token or never destroyed at commit."""
+    module = _module()
+    launcher_spec = importlib.util.spec_from_file_location(
+        "aicc_agent_launcher",
+        Path(__file__).parents[2] / "ops" / "aicc_agent_launcher.py",
+    )
+    launcher = importlib.util.module_from_spec(launcher_spec)
+    launcher_spec.loader.exec_module(launcher)
+
+    assert module.MODEL_AUTH_TARGETS == module.SENSITIVE_TARGETS
+    assert module.MODEL_AUTH_TARGETS == {
+        str(path) for path in launcher.MODEL_AUTH_SOURCES.values()
+    }
+    assert module.MAX_MODEL_AUTH_BYTES == launcher.MAX_MODEL_AUTH_BYTES

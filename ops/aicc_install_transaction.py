@@ -18,6 +18,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, fields
@@ -289,6 +290,75 @@ SENSITIVE_TARGETS = frozenset(
 )
 SENSITIVE_RETIREMENT_VERSION = 2
 SENSITIVE_RETIREMENT_JOURNAL = "sensitive-retirement.json"
+
+#: The two model-credential stores, named again from the OTHER property they
+#: have: once installed they are RUNTIME-OWNED. The launcher writes them back
+#: after a run, because Claude and Codex rotate their refresh token every time
+#: they refresh -- the token the run leaves in the store is the only one that
+#: still authenticates, and the bytes this generation installed are already
+#: revoked (`_write_back_model_auth` in ops/aicc_agent_launcher.py, #900).
+#:
+#: Compare-and-restore cannot treat them like any other installed file, and
+#: did. On worker-01 (2026-09-09) the launcher refreshed the Claude token at
+#: 20:33:57, four minutes into an install whose `verify_unit_configuration`
+#: then failed; the rollback read `install_sha256` c5d4dfcf.., found
+#: 0fd19656.. on disk and raised "generation target changed before
+#: compare-and-restore". That refusal aborted the WHOLE rollback -- durable
+#: WAL retained, lanes left on the new release, launcher socket left stopped
+#: and disabled -- and the only outcome it was protecting against was the one
+#: it would otherwise have produced: writing the revoked token back over the
+#: live one.
+#:
+#: So these targets are restored only while they are UNCHANGED since install.
+#: A store a run refreshed is KEPT, the retention is recorded in
+#: `MODEL_AUTH_RETENTION_JOURNAL`, and the rollback carries on through every
+#: other record. Anything at the path that is not a credible write-back --
+#: different owner, different mode, not a JSON object -- is still refused by
+#: name, because that is not the launcher and a rollback must not accept it
+#: silently.
+#:
+#: Equal to `SENSITIVE_TARGETS` today and asserted equal by the suite: both
+#: names describe the same two files, for two different reasons that must not
+#: be conflated. A third credential that is not runtime-refreshed would join
+#: the one set and not the other.
+MODEL_AUTH_TARGETS = frozenset(
+    {
+        "/var/lib/aicc-agent/claude/.claude/.credentials.json",
+        "/var/lib/aicc-agent/codex/.codex/auth.json",
+    }
+)
+#: Mirrors MAX_MODEL_AUTH_BYTES in ops/aicc_agent_launcher.py: the transaction
+#: accepts as a refresh nothing the launcher would not have written.
+MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
+MODEL_AUTH_RETENTION_JOURNAL = "model-auth-retention.json"
+MODEL_AUTH_RETENTION_VERSION = 1
+
+
+def _credible_model_auth(
+    state: FileState, *, mode: int, uid: int, gid: int
+) -> bool:
+    """Whether a runtime-owned store holds a credible refreshed credential.
+
+    Deliberately not a content comparison -- that the content changed is the
+    premise. What is checked is everything a token refresh does NOT change:
+    the file is still the regular file with the owner and mode the installer
+    wrote (`_read_regular` has already proved regular, single-linked and
+    not-a-symlink), it is no larger than the launcher itself would accept,
+    and it still parses as a non-empty JSON object. The launcher proves more
+    before it writes -- that the top-level key set is identical to the staged
+    copy's -- so a file that fails even this much did not come from the
+    write-back path.
+    """
+    if state.mode != mode or state.uid != uid or state.gid != gid:
+        return False
+    if not state.payload or len(state.payload) > MAX_MODEL_AUTH_BYTES:
+        return False
+    try:
+        document = json.loads(state.payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return isinstance(document, dict) and bool(document)
+
 
 #: The publisher group owns `/etc/aicc/workspace-authority.env` (0640
 #: root:aicc-publisher) on a WORKER host, and `deploy/sysusers.d/aicc-agent.conf`
@@ -4095,8 +4165,20 @@ class FileTransaction:
         *,
         clear_pending: bool = True,
         allow_retired_sensitive: bool = False,
+        teardown: bool = False,
     ) -> None:
         """Undo one generation, or refuse where undoing it is not possible.
+
+        `teardown` is the caller stating that the host is being taken back to
+        having no AICC state at all -- again only `uninstall_all`. It changes
+        exactly one thing: a runtime-owned model-auth store that this
+        generation CREATED is removed even though a run has refreshed it
+        since, because leaving a live credential behind is the one outcome an
+        uninstall may not produce. Every other caller keeps it false, and for
+        them a refreshed store is retained rather than destroyed (see
+        `MODEL_AUTH_TARGETS`). It travels with `allow_retired_sensitive` and
+        is deliberately not folded into it: one says a destroyed backup is not
+        expected back, the other says a live credential is not to be kept.
 
         `allow_retired_sensitive` is the caller stating that a credential
         whose backup the commit destroyed is not expected back. Only
@@ -4157,7 +4239,7 @@ class FileTransaction:
                 )
                 continue
             if record.remove:
-                self._restore_removed(record, target)
+                self._restore_removed(record, target, manifest=manifest)
                 continue
             if record.existed and record.original_symlink is not None:
                 # The target was a symlink this generation replaced. Restore the
@@ -4249,6 +4331,23 @@ class FileTransaction:
                     record.install_uid,
                     record.install_gid,
                 ):
+                    # A runtime-owned credential store is restored only while
+                    # it is unchanged since install. A run refreshed this one,
+                    # so the backup holds a token the provider has already
+                    # revoked: keep what is live, record it, and roll the rest
+                    # of the generation back (worker-01, 2026-09-09).
+                    if record.target in MODEL_AUTH_TARGETS:
+                        self._retain_refreshed_model_auth(
+                            manifest,
+                            record,
+                            target,
+                            current,
+                            expected_sha256=record.install_sha256,
+                            mode=record.install_mode,
+                            uid=record.install_uid,
+                            gid=record.install_gid,
+                        )
+                        continue
                     raise RuntimeError(
                         f"generation target changed before compare-and-restore: {target}"
                     )
@@ -4278,9 +4377,37 @@ class FileTransaction:
                     record.install_uid,
                     record.install_gid,
                 ):
-                    raise RuntimeError(
-                        f"new generation target changed before removal: {target}"
-                    )
+                    if record.target in MODEL_AUTH_TARGETS:
+                        # This generation created the store and a run has
+                        # refreshed it since. Rolling an install back is not a
+                        # reason to destroy the only credential that still
+                        # authenticates, so it is kept and recorded; an
+                        # uninstall is, and removes it -- but only once the
+                        # bytes are proven to be a credible write-back, so
+                        # something else writing to this path still fails
+                        # closed either way.
+                        if not _credible_model_auth(
+                            current,
+                            mode=record.install_mode,
+                            uid=record.install_uid,
+                            gid=record.install_gid,
+                        ):
+                            raise RuntimeError(
+                                "runtime-owned credential store is not a "
+                                f"credible refresh: {target}"
+                            )
+                        if not teardown:
+                            self._record_model_auth_retention(
+                                manifest,
+                                record,
+                                current,
+                                expected_sha256=record.install_sha256,
+                            )
+                            continue
+                    else:
+                        raise RuntimeError(
+                            f"new generation target changed before removal: {target}"
+                        )
                 target.unlink()
                 _fsync_dir(target.parent)
         previous_current = payload.get("previous_current")
@@ -4299,6 +4426,98 @@ class FileTransaction:
             )
         if clear_pending:
             self._clear_pending(manifest)
+
+    def _retain_refreshed_model_auth(
+        self,
+        manifest: Path,
+        record: BackupRecord,
+        target: Path,
+        current: FileState,
+        *,
+        expected_sha256: str,
+        mode: int,
+        uid: int,
+        gid: int,
+    ) -> None:
+        """Leave a runtime-refreshed credential in place, or refuse by name.
+
+        The tolerance is exactly as wide as the launcher's write-back and no
+        wider: bytes that are not a credible refresh of the store are still a
+        compare-and-restore failure, reported with a message that says what is
+        actually wrong instead of the generic drift refusal an operator cannot
+        act on.
+        """
+        if not _credible_model_auth(current, mode=mode, uid=uid, gid=gid):
+            raise RuntimeError(
+                f"runtime-owned credential store is not a credible refresh: {target}"
+            )
+        self._record_model_auth_retention(
+            manifest, record, current, expected_sha256=expected_sha256
+        )
+
+    def _record_model_auth_retention(
+        self,
+        manifest: Path,
+        record: BackupRecord,
+        current: FileState,
+        *,
+        expected_sha256: str,
+    ) -> None:
+        """Durably record a credential this rollback deliberately did not undo.
+
+        A rollback that leaves one file at a version no generation installed
+        is not a silent event. Without this the host reports itself restored
+        while holding a credential whose provenance is only in a log line that
+        has since rotated away -- which is precisely how the worker-01
+        incident had to be reconstructed by hand. The journal is additive,
+        root-only, and evidence for the operator: nothing reads it back as
+        input to a later transaction.
+        """
+        journal = self.state_dir / MODEL_AUTH_RETENTION_JOURNAL
+        retained: list[object] = []
+        if _path_present(journal):
+            payload = _trusted_journal(journal)
+            entries = payload.get("retained")
+            if (
+                payload.get("version") != MODEL_AUTH_RETENTION_VERSION
+                or not isinstance(entries, list)
+            ):
+                raise RuntimeError("model auth retention journal is malformed")
+            retained = entries
+        retained.append(
+            {
+                "target": record.target,
+                "manifest": str(manifest),
+                # What compare-and-restore required to find: the installed
+                # digest for an ordinary record, the pre-removal digest for a
+                # purge record, whose "installed" state is absence.
+                "expected_sha256": expected_sha256,
+                "retained_sha256": current.sha256,
+                "recorded_at": int(time.time()),
+            }
+        )
+        _atomic_bytes(
+            journal,
+            json.dumps(
+                {
+                    "version": MODEL_AUTH_RETENTION_VERSION,
+                    "retained": retained,
+                },
+                sort_keys=True,
+            ).encode(),
+            0o600,
+            os.geteuid(),
+            os.getegid(),
+        )
+        _fsync_dir(self.state_dir)
+        print(
+            "model auth retained by rollback: "
+            f"{record.target} was refreshed at runtime "
+            f"(expected {expected_sha256[:8]}, kept {current.sha256[:8]}); "
+            f"recorded in {journal}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _assert_retired_sensitive_targets_absent(
         self, records: list[BackupRecord]
@@ -4397,7 +4616,9 @@ class FileTransaction:
         finally:
             os.close(parent_fd)
 
-    def _restore_removed(self, record: BackupRecord, target: Path) -> None:
+    def _restore_removed(
+        self, record: BackupRecord, target: Path, *, manifest: Path
+    ) -> None:
         """Undo a removal record: put back exactly what a purge took away.
 
         The mirror image of the two branches above it: an ordinary record's
@@ -4461,6 +4682,24 @@ class FileTransaction:
                 record.original_gid,
             ):
                 return  # apply() has not run yet
+            if record.target in MODEL_AUTH_TARGETS:
+                # The same runtime ownership seen from the removal side: a
+                # run refreshed the store between this generation's prepare()
+                # and the failure being rolled back, so the backup taken at
+                # prepare() time is the revoked token. Put nothing over the
+                # live credential; record that the removal was not undone
+                # byte-for-byte.
+                self._retain_refreshed_model_auth(
+                    manifest,
+                    record,
+                    target,
+                    current,
+                    expected_sha256=record.original_sha256,
+                    mode=record.original_mode,
+                    uid=record.original_uid,
+                    gid=record.original_gid,
+                )
+                return
             raise RuntimeError(
                 f"generation target changed before compare-and-restore: {target}"
             )
@@ -4496,7 +4735,7 @@ class FileTransaction:
             value = json.loads(self.current.read_text(encoding="utf-8"))
             manifest = Path(value["manifest"]).resolve(strict=True)
             transaction = manifest.parent
-            self.restore(manifest, allow_retired_sensitive=True)
+            self.restore(manifest, allow_retired_sensitive=True, teardown=True)
             shutil.rmtree(transaction)
             _fsync_dir(self.state_dir)
         self._remove_orphan_generations()

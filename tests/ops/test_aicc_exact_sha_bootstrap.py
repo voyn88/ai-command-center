@@ -627,3 +627,31 @@ def test_planted_attempts_symlink_cannot_redirect_the_bootstrap(tmp_path, monkey
 
     assert (state / "attempts").is_symlink(), "the link must not have been replaced"
     assert not any(elsewhere.iterdir()), "nothing may be created through the link"
+
+
+def test_a_refused_precondition_reaches_the_operator_verbatim(tmp_path):
+    """VOYN-W0-AICC-INSTALL-ROLLBACK-VS-MODEL-AUTH-WRITEBACK: the installer's
+    pre-apply preflight prints which host precondition failed (today: a stale
+    operator drop-in that would override the principal boundary) on stderr.
+    The bootstrap captures the installer's output, so that message -- not a
+    generic "command failed" -- is what the operator is shown."""
+    module = _module()
+    message = (
+        "AICC_AGENT_PRINCIPAL_ISOLATION_PRECONDITION_FAILED: "
+        "voyn-aicc-worker@1.service: "
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/"
+        "30-github-token-hotfix.conf is merged after "
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/"
+        "20-principal-isolation.conf"
+    )
+    failing = tmp_path / "installer.sh"
+    failing.write_text(
+        f'#!/bin/sh\necho "{message}" >&2\nexit 1\n', encoding="utf-8"
+    )
+    failing.chmod(0o755)
+
+    with pytest.raises(module.BootstrapRefused) as refusal:
+        module._run([str(failing)], cwd=tmp_path, env={"PATH": "/usr/bin:/bin"})
+
+    assert str(refusal.value) == message
+    assert "30-github-token-hotfix.conf" in str(refusal.value)

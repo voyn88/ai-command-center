@@ -420,6 +420,19 @@ done
 run_transaction validate
 sh -n "$repo_root/ops/verify-agent-principal-boundary.sh"
 
+# Host preconditions this install cannot establish for itself, reported
+# BEFORE the first generation is staged and long before `apply`. The one that
+# exists today is drop-in ordering: an operator drop-in whose file name sorts
+# after 20-principal-isolation.conf makes `verify_unit_configuration` refuse
+# every lane no matter what this release writes, and that refusal arrives at
+# the rollout -- the first step AFTER apply -- so the only way out was a full
+# generation rollback (worker-01, 2026-09-09, 30-github-token-hotfix.conf).
+# Failing here instead costs the operator one message naming the file.
+# Worker profile only: a control install removes the worker units outright.
+if [ "$install_profile" = worker ]; then
+  run_rollout preflight --lanes "$repo_root/deploy/aicc/worker-lanes"
+fi
+
 if [ -e "$state_dir" ]; then
   [ ! -L "$state_dir" ] && [ -d "$state_dir" ] && \
     [ "$(stat -c %U:%G:%a "$state_dir")" = root:root:700 ] || {
@@ -486,6 +499,43 @@ stage_worker_data_dir() {
   return 1
 }
 
+# The units this trap took down must never outlive a rollback that could not
+# finish. `run_transaction recover` restores them itself -- but only after its
+# file restore succeeds, and a `recover` that raises returns having already
+# quiesced the snapshot and with the launcher socket this trap disabled a
+# moment earlier still down. Nothing later brings it back: on worker-01
+# (2026-09-09) the host was left with aicc-agent-launcher.socket stopped AND
+# disabled, so every subsequent lane launch failed, while the self-deploy
+# timer restarted below walked into the same retained WAL every tick until an
+# operator intervened by hand.
+#
+# So a failed `recover` is followed by a unit-state restore of its own. The
+# durable WAL stays the authority for the FILES -- this changes nothing about
+# what boot recovery will retry -- but the host is left with its services in
+# the state the attempt snapshot recorded, or, if even that cannot be proven
+# safe, at least with the socket that is the only path by which any lane can
+# start again.
+restore_snapshotted_units() {
+  if [ -f "$attempt_units" ] && run_rollout restore --state "$attempt_units"; then
+    return 0
+  fi
+  echo "service snapshot restore failed after an incomplete rollback" >&2
+  # Worker profile only, and only if the unit file is actually present: a
+  # control install removes the socket on purpose and must not be handed it
+  # back, and a rollback that did restore the file set leaves the unit that
+  # belongs to whichever generation is on disk.
+  if [ "$install_profile" = worker ] && \
+     path_present /etc/systemd/system/aicc-agent-launcher.socket; then
+    systemctl enable --now aicc-agent-launcher.socket >/dev/null 2>&1 || true
+  fi
+  if [ "$install_profile" = worker ] && \
+     [ "$(systemctl is-enabled aicc-agent-launcher.socket 2>/dev/null || true)" != enabled ]; then
+    echo "AICC_AGENT_PRINCIPAL_ISOLATION_FAIL: aicc-agent-launcher.socket is not enabled; no lane can launch until it is" >&2
+    return 1
+  fi
+  return 0
+}
+
 rollback() {
   result=$?
   trap - EXIT HUP INT TERM
@@ -502,6 +552,7 @@ rollback() {
       # service snapshot instead of silently discarding failed stop/disable.
       rollback_complete=0
       echo "principal-isolation rollback incomplete; durable WAL retained" >&2
+      restore_snapshotted_units || true
     fi
   fi
   # Best-effort and unconditional: this transaction must never exit leaving
