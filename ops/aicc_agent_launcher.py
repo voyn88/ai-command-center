@@ -43,6 +43,14 @@ _SYSTEMCTL_ERRORS = (OSError, subprocess.SubprocessError)
 _PROC_STAT_MISSING_ERRORS = (FileNotFoundError, ProcessLookupError)
 
 FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
+# Sub-marker on the SAME fixed failure envelope (exit 125, empty stdout,
+# marker-prefixed stderr line) for a refusal that names concurrent state
+# rather than any fault in the work. Kept as a literal prefix, not a second
+# transport field, because the worker deliberately classifies the launcher's
+# outcome from the envelope alone and never from parsed agent output
+# (`agent_runner.RunResult.is_principal_isolation_error`). Both sides must
+# agree; `tests/ops/test_agent_principal_isolation.py` pins the agreement.
+TRANSIENT_FAILURE_PREFIX = "transient: "
 MAX_TASK_TIMEOUT_SECONDS = 3600
 TRANSIENT_RUNTIME_GRACE_SECONDS = 30
 TRANSIENT_STOP_TIMEOUT_SECONDS = 20
@@ -196,6 +204,25 @@ CLAUDE_GIT_DENIES = [
 
 class LaunchRefused(RuntimeError):
     pass
+
+
+class TransientLaunchRefused(LaunchRefused):
+    """A refusal caused by concurrent, self-clearing state -- never by the work.
+
+    The broker validates a REUSED task workspace it does not own alone: a
+    tail process from the previous run, or a package manager populating the
+    task venv, can change an entry between the walk's own two syscalls. The
+    refusal is correct (never chown/chmod an inode whose identity moved), but
+    it names no fault in the task, the payload or the tree -- retrying it a
+    moment later succeeds. Such a refusal carries the extra
+    ``TRANSIENT_FAILURE_PREFIX`` marker on the broker's fixed failure
+    envelope so the worker refunds the attempt instead of spending one
+    (``agent_runner.RunResult.is_transient_principal_isolation_error`` ->
+    ``queue_fail_lease_wait``). Live 2026-09-09: the same
+    ``.venv/lib/python3.12/site-packages/...`` race spent every cascade
+    attempt of an already-published task and parked it into DEFER_TO_USER
+    (VOYN-W0-AICC-LAUNCHER-WORKSPACE-WALK-RACES-VENV-WRITES).
+    """
 
 
 class WorkspaceBind:
@@ -749,7 +776,12 @@ def _tracked_executables(
             or final.st_mtime_ns != info.st_mtime_ns
             or final.st_ctime_ns != info.st_ctime_ns
         ):
-            raise LaunchRefused("task-local Git index changed while being read")
+            # Also a concurrent-writer race, not a fault in the tree: a Git
+            # process from the previous run's tail rewrote the index under
+            # this read.
+            raise TransientLaunchRefused(
+                "task-local Git index changed while being read"
+            )
     finally:
         os.close(descriptor)
     raw = b"".join(chunks)
@@ -780,6 +812,39 @@ def _tracked_executables(
     if not parsed and errors:
         raise errors[0]
     raise LaunchRefused("task-local Git index checksum or format is ambiguous")
+
+
+# Subtrees the pre-bind walk may find MID-WRITE, and must never refuse a run
+# over. Every name here is (a) regenerable from the repository at any time,
+# (b) never authority for anything -- no credential, no Git object, no
+# checkpoint evidence lives under them -- and (c) written by processes the
+# broker does not synchronise with: a tail from the previous run's test
+# session, or `uv`/`pip` populating the task venv (`uv` also HARD-LINKS from
+# its cache into `site-packages`, which the walk otherwise refuses outright).
+# Inside them the walk grants what it can still safely grant and skips
+# everything else; the grant is only ever withheld, never widened, and the
+# identity check before every chown/chmod is untouched. Outside them the walk
+# still fails closed, so the guarantee that matters -- the broker never
+# chowns an inode whose identity moved under it -- holds tree-wide.
+REGENERABLE_WORKSPACE_TREES = frozenset(
+    {
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+
+
+def _in_regenerable_workspace_tree(relative: Path) -> bool:
+    """Whether a workspace-relative path is inside a regenerable subtree.
+
+    Matched per PATH COMPONENT, so a nested venv (`tests/fixtures/.venv`) or
+    any depth under one counts, and a file merely NAMED like one
+    (`docs/.venv.md`) does not.
+    """
+    return any(part in REGENERABLE_WORKSPACE_TREES for part in relative.parts)
 
 
 def _prepare_workspace_permissions(
@@ -834,10 +899,26 @@ def _prepare_workspace_permissions(
                 with os.scandir(os.dup(directory_fd)) as entries:
                     snapshot = list(entries)
                 for entry in snapshot:
-                    before = entry.stat(follow_symlinks=False)
+                    child_relative = relative / entry.name
+                    # A race under `.venv`/`__pycache__` must cost this entry
+                    # its group grant, not the whole run: see
+                    # REGENERABLE_WORKSPACE_TREES.
+                    regenerable = _in_regenerable_workspace_tree(child_relative)
+                    try:
+                        before = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        # The same race as the open below, one syscall
+                        # earlier: scandir listed the name and a concurrent
+                        # writer removed it before this lstat. It used to
+                        # leave the walk as a bare OSError, which the caller
+                        # reported as an unclassified errno string.
+                        if regenerable:
+                            continue
+                        raise TransientLaunchRefused(
+                            f"workspace entry changed while opening: {child_relative}"
+                        ) from exc
                     if stat.S_ISLNK(before.st_mode):
                         continue
-                    child_relative = relative / entry.name
                     if not (
                         stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode)
                     ):
@@ -845,6 +926,11 @@ def _prepare_workspace_permissions(
                         # permanent condition, not a TOCTOU race: refuse it by
                         # kind BEFORE open() so the diagnosis is honest and
                         # os.open won't hang/ENXIO on it (review on d8920b6).
+                        # Inside a regenerable tree there is nothing worth
+                        # refusing the RUN over, so skip the node instead --
+                        # still before open(), so that hazard stays closed.
+                        if regenerable:
+                            continue
                         raise LaunchRefused(
                             f"unsupported workspace node refused: {child_relative}"
                         )
@@ -854,7 +940,9 @@ def _prepare_workspace_permissions(
                     try:
                         child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
                     except OSError as exc:
-                        raise LaunchRefused(
+                        if regenerable:
+                            continue
+                        raise TransientLaunchRefused(
                             f"workspace entry changed while opening: {child_relative}"
                         ) from exc
                     keep_open = False
@@ -864,7 +952,9 @@ def _prepare_workspace_permissions(
                             before.st_dev,
                             before.st_ino,
                         ):
-                            raise LaunchRefused(
+                            if regenerable:
+                                continue
+                            raise TransientLaunchRefused(
                                 f"workspace entry changed while opening: {child_relative}"
                             )
                         if stat.S_ISDIR(current.st_mode):
@@ -881,6 +971,17 @@ def _prepare_workspace_permissions(
                             keep_open = True
                         elif stat.S_ISREG(current.st_mode):
                             if current.st_nlink != 1:
+                                # Withholding the grant is the safe half of
+                                # this refusal: a second link may reach the
+                                # inode from outside the workspace, so root
+                                # must not widen its mode. Inside a
+                                # regenerable tree that is all it costs --
+                                # `uv` hard-links every wheel from its cache
+                                # into `.venv/lib/.../site-packages`, so
+                                # refusing the RUN here would refuse every
+                                # run whose workspace has a uv-built venv.
+                                if regenerable:
+                                    continue
                                 raise LaunchRefused(
                                     f"hard-linked workspace file refused: {child_relative}"
                                 )
@@ -1756,6 +1857,31 @@ def _prepare_reusable_workspace(
         _prepare_workspace_permissions(workspace, workspace_fd)
 
 
+def _failure_response(
+    detail: object, *, transient: bool | None = None
+) -> dict[str, Any]:
+    """The broker's ONE refusal envelope: exit 125, empty stdout, marker line.
+
+    The worker classifies a launch failure from this envelope's shape alone
+    (`agent_runner.RunResult.is_principal_isolation_error`), never from agent
+    output, so every refusal must be built here rather than assembled inline.
+    A `TransientLaunchRefused` additionally carries `TRANSIENT_FAILURE_PREFIX`
+    so the worker can refund the attempt for a race it had no part in
+    causing; `transient=` overrides the inference for a message that is not
+    an exception.
+    """
+    if transient is None:
+        transient = isinstance(detail, TransientLaunchRefused)
+    prefix = TRANSIENT_FAILURE_PREFIX if transient else ""
+    stderr = f"{FAILURE}: {prefix}{detail}\n".encode()
+    return {
+        "version": 1,
+        "exit_code": 125,
+        "stdout_b64": "",
+        "stderr_b64": base64.b64encode(stderr).decode("ascii"),
+    }
+
+
 def _serve_connected_socket(sock: socket.socket) -> int:
     agent_home: Path | None = None
     unit: str | None = None
@@ -1856,42 +1982,22 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             "stderr_b64": base64.b64encode(stderr).decode("ascii"),
         }
     except (LaunchRefused, OSError, subprocess.SubprocessError) as exc:
-        response = {
-            "version": 1,
-            "exit_code": 125,
-            "stdout_b64": "",
-            "stderr_b64": base64.b64encode(f"{FAILURE}: {exc}\n".encode()).decode(
-                "ascii"
-            ),
-        }
+        response = _failure_response(exc)
     finally:
         if unit is not None:
             try:
                 assert workspace is not None
                 quarantined = _seal_or_quarantine(unit, workspace, manifest["run_id"])
                 if quarantined is not None:
-                    response = {
-                        "version": 1,
-                        "exit_code": 125,
-                        "stdout_b64": "",
-                        "stderr_b64": base64.b64encode(
-                            (
-                                f"{FAILURE}: agent cgroup unsealed; workspace "
-                                f"quarantined at {quarantined}\n"
-                            ).encode()
-                        ).decode("ascii"),
-                    }
+                    response = _failure_response(
+                        f"agent cgroup unsealed; workspace quarantined at {quarantined}"
+                    )
                 elif unit_recorded:
                     _clear_active_workspace_unit(workspace, unit)
             except (AssertionError, LaunchRefused, OSError) as exc:
-                response = {
-                    "version": 1,
-                    "exit_code": 125,
-                    "stdout_b64": "",
-                    "stderr_b64": base64.b64encode(
-                        f"{FAILURE}: agent cgroup unsealed and quarantine failed: {exc}\n".encode()
-                    ).decode("ascii"),
-                }
+                response = _failure_response(
+                    f"agent cgroup unsealed and quarantine failed: {exc}"
+                )
         if agent_home is not None:
             try:
                 _write_back_model_auth(manifest["executor"], agent_home)
@@ -1902,14 +2008,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             try:
                 _cleanup_workspace_bind(workspace_bind)
             except (LaunchRefused, OSError) as exc:
-                response = {
-                    "version": 1,
-                    "exit_code": 125,
-                    "stdout_b64": "",
-                    "stderr_b64": base64.b64encode(
-                        f"{FAILURE}: workspace bind cleanup failed: {exc}\n".encode()
-                    ).decode("ascii"),
-                }
+                response = _failure_response(f"workspace bind cleanup failed: {exc}")
         if workspace_lock is not None:
             os.close(workspace_lock)
         if workspace_fd is not None:
