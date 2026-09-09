@@ -208,8 +208,13 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         spend = 0.0
         budget_unknown = True
 
-    # Same posture for the in-flight run counts: unreadable capacity data is a
-    # gate, never an empty map (see `active_by_executor`).
+    # Same posture for the in-flight run counts, and it needs its own gate
+    # rather than riding on `budget_unknown`: the two figures are read by two
+    # separate queries over two separate connections, so a store that fails
+    # only the `run` read (a lock, a permissions change, schema drift, a file
+    # swapped between the two calls) would otherwise plan against "nothing is
+    # running" while the spend read looks perfectly healthy. See
+    # `active_by_executor` for why an empty map is not a safe stand-in.
     capacity_unknown = False
     try:
         active = active_by_executor(resolved_db)

@@ -218,6 +218,36 @@ def test_capacity_unknown_defers_everything_even_when_budget_allows():
     )
 
 
+def test_an_empty_active_map_is_not_a_substitute_for_unknown_capacity():
+    # The regression this gate exists for, shown as a contrast. With a
+    # per-agent limit of 1 and one run genuinely in flight, the truthful count
+    # map defers. Passing `{}` — exactly what the old swallow-into-an-empty-map
+    # read returned on an unreadable store — assigns instead. That is the
+    # effective concurrency limit being *raised* by a failed read, which is why
+    # the read must not degrade silently into "nothing is running".
+    policy = DispatchPolicy(
+        prefer_local=True,
+        local_executor_ids=frozenset({"ollama"}),
+        per_agent_limits={"ollama": AgentLimit(max_concurrent=1, max_spend_usd=0.0)},
+    )
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    tasks = [_task("t1")]
+
+    truthful = _plan(tasks, executors, policy, active_by_executor={"ollama": 1})
+    assert truthful.assignments == ()
+    assert truthful.decisions[0].reason == models.DEFER_AGENT_CAPACITY
+
+    pretend_idle = _plan(tasks, executors, policy, active_by_executor={})
+    assert len(pretend_idle.assignments) == 1  # the fail-open, demonstrated
+
+    # With the gate engaged instead, the same unreadable store defers.
+    gated = _plan(
+        tasks, executors, policy, active_by_executor={}, capacity_unknown=True
+    )
+    assert gated.assignments == ()
+    assert gated.decisions[0].reason == models.DEFER_CAPACITY_DATA_UNAVAILABLE
+
+
 def test_budget_unknown_takes_priority_over_capacity_unknown_in_the_reason():
     policy = DispatchPolicy()
     plan = _plan(

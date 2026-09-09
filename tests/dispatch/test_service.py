@@ -274,6 +274,15 @@ def test_active_by_executor_propagates_an_unreadable_store(tmp_path):
         service.active_by_executor(corrupt)
 
 
+def test_active_by_executor_still_reads_a_healthy_store(tmp_path):
+    # The propagation above must not have turned every read into a failure:
+    # a migrated, empty store still reads cleanly as "nothing in flight".
+    healthy = tmp_path / "runtime.db"
+    runtime_db.migrate(healthy)
+
+    assert service.active_by_executor(healthy) == {}
+
+
 def _free_local_pool(monkeypatch):
     """The default-shaped pool from the bug report: one free, available, local
     executor — the configuration in which a simulated spend figure can never
@@ -335,6 +344,41 @@ def test_plan_fails_closed_end_to_end_against_an_unreadable_database(
     assert plan.assignments == ()
     assert all(
         d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
+def test_plan_fails_closed_when_the_store_breaks_between_the_two_reads(
+    monkeypatch, tmp_path
+):
+    # Why the capacity gate has to exist in its own right rather than riding on
+    # `budget_unknown`: the trailing-24h spend and the in-flight run counts are
+    # two separate queries over two separate connections, so a store that dies
+    # *between* them leaves the spend read looking perfectly healthy while the
+    # capacity read fails. Nothing is stubbed over `active_by_executor` here —
+    # the real read hits the real (now corrupt) file. Without its own gate this
+    # planned against "nothing is running" and assigned.
+    _enable_master_switch()
+    _free_local_pool(monkeypatch)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+
+    db = tmp_path / "runtime.db"
+    runtime_db.migrate(db)
+
+    def _spend_then_break(*_a, **_k):
+        db.write_bytes(b"not a sqlite database")  # the store dies mid-plan
+        return 0.0
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _spend_then_break)
+
+    plan = service.plan(ROOT, db_path=db)
+
+    assert plan.budget_unknown is False  # the spend read genuinely succeeded
+    assert plan.capacity_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_CAPACITY_DATA_UNAVAILABLE for d in plan.decisions
     )
 
 
