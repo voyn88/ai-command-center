@@ -2149,3 +2149,20 @@ def test_agent_git_trusts_exactly_the_bound_workspace(launcher, monkeypatch, tmp
     assert "--setenv=GIT_CONFIG_KEY_0=safe.directory" in command
     assert "--setenv=GIT_CONFIG_VALUE_0=/workspace" in command
     assert not any(v.startswith("--setenv=GIT_CONFIG_VALUE_0=") and v != "--setenv=GIT_CONFIG_VALUE_0=/workspace" for v in command)
+
+
+def test_the_launcher_can_write_the_model_auth_store_it_writes_refreshed_tokens_into():
+    """VOYN-W0-AICC-AGENT-MODEL-AUTH-REFRESH-IS-LOST-WITH-THE-EPHEMERAL-HOME-REM:
+    the write-back at teardown targets /var/lib/aicc-agent; under
+    ProtectSystem=strict that path must be in ReadWritePaths, or the
+    refreshed token is lost with EROFS (worker-01 2026-09-09)."""
+    unit = (Path(__file__).parents[2] / "deploy/systemd/aicc-agent-launcher@.service").read_text()
+    paths = [
+        path
+        for line in unit.splitlines()
+        if line.startswith("ReadWritePaths=")
+        for path in line.split("=", 1)[1].split()
+    ]
+    assert "/var/lib/aicc-agent" in paths
+    tmpfiles = (Path(__file__).parents[2] / "deploy/tmpfiles.d/aicc-agent.conf").read_text()
+    assert "d /var/lib/aicc-agent 0700 root root -" in tmpfiles
