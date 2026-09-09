@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 import subprocess
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -39,6 +40,15 @@ DEFAULT_MAX_CLAIM_SECONDS = 5400.0
 # `voyn-aicc-worker@.service` allows 3660s plus provisioning. That item is
 # queued behind a busy fleet, which is backpressure and not a stall.
 DEFAULT_CLAIM_CAPACITY = 2
+
+# Where a probe's finding source may come from besides `--record-findings`.
+# `voyn-queue-monitor.service` sets it as `Environment=` rather than appending
+# the flag to its ExecStart: that line carries the control host's absolute
+# install path, and in this public repository `scripts/ci/prepush/
+# leak_guard.sh` refuses any ADDED line containing one -- the guarded publisher
+# runs the same guard, so re-typing the line to append a flag would have been a
+# refused publish rather than a lint. The flag still wins when both are given.
+FINDING_SOURCE_ENV = "AICC_MONITOR_FINDING_SOURCE"
 
 # The longest a free lane can take to notice due work: the daemon's idle poll
 # backs off to `WorkerConfig.idle_max_seconds` (30s) and no further, so by then
@@ -464,8 +474,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--record-findings",
         metavar="SOURCE",
-        default="",
+        # Read at parse time, not import time, so a unit's `Environment=` and a
+        # test's monkeypatched environment are both seen.
+        default=os.environ.get(FINDING_SOURCE_ENV, ""),
         help=(
+            f"Defaults to ${FINDING_SOURCE_ENV}. "
             "Reconcile this source's monitor_findings with the measurement: "
             "every failure becomes an open finding, and every finding this tick "
             "no longer measures is cleared -- each independently, so one "

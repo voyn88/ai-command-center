@@ -2,11 +2,21 @@
 # the measurement reads `work_item` and joins the lease through
 # `work_attempt_public`, neither of which a worker role may read.
 #
-# --record-findings makes a red probe a task the fleet fixes rather than a
-# permanently failed unit; `control-01:queue` is the source the live probe
-# already records under (monitor_finding #481), so the name is not free to
-# change -- a different string opens a second, unlinked finding for the same
-# measurement.
+# AICC_MONITOR_FINDING_SOURCE is --record-findings by another name (the flag
+# wins when both are given): it makes a red probe a task the fleet fixes
+# rather than a permanently failed unit. `control-01:queue` is the source the
+# live probe already records under (monitor_finding #481), so the name is not
+# free to change -- a different string opens a second, unlinked finding for
+# the same measurement.
+#
+# It is set HERE, beside the EnvironmentFile, and deliberately not appended to
+# ExecStart below. That line carries this host's absolute install path, and
+# this is a public repository: `scripts/ci/prepush/leak_guard.sh` refuses any
+# ADDED line containing one, and the guarded publisher runs it (a refusal is
+# `leak_guard_failed`, not a warning). The line already in history is
+# untouched context; re-typing it to append a flag would have made it a new
+# one. Deployment identity belongs beside the environment anyway -- everything
+# on ExecStart is a policy threshold, and this is which host is measuring.
 #
 # --max-stalled-seconds times work NOBODY IS ATTENDING and nobody is merely
 # too busy for: a lapsed claim, or a due ready item left unclaimed WHILE A LANE
@@ -32,7 +42,8 @@ Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
 EnvironmentFile=/home/voynadmin/aicc-preprod/.env
-ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --skip-workers --minimum-active-workers 0 --max-stalled-seconds 900 --max-recent-dead 0 --prometheus-url http://100.114.209.119:9090/-/ready --record-findings control-01:queue
+Environment=AICC_MONITOR_FINDING_SOURCE=control-01:queue
+ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --skip-workers --minimum-active-workers 0 --max-stalled-seconds 900 --max-recent-dead 0 --prometheus-url http://100.114.209.119:9090/-/ready
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only

@@ -246,24 +246,65 @@ def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
     assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" in queue_unit
 
 
-def test_the_queue_probe_records_under_the_source_the_live_findings_carry() -> None:
+def test_the_queue_probe_records_under_the_source_the_live_findings_carry(
+    monkeypatch,
+) -> None:
     """`monitor_finding` rows are keyed by (source, failure code), and the
     planner mints ONE task per open finding from that pair. The live
     control-01 probe records under `control-01:queue` (monitor_finding #481),
     so the unit may not drift to another spelling: a second source would open
-    a second, unlinked finding for the same measurement."""
+    a second, unlinked finding for the same measurement.
+
+    The unit carries the source as `Environment=` and the parser defaults to
+    it, so this asserts the whole path rather than the spelling alone -- the
+    two are useless apart, and only the environment reaches the CLI here (the
+    ExecStart line is this host's absolute install path, which the public-repo
+    leak guard forbids re-adding; see the unit's own comment)."""
     queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
+    source = next(
+        line.split("=", 2)[2]
+        for line in queue_unit.splitlines()
+        if line.startswith(f"Environment={infra_monitor.FINDING_SOURCE_ENV}=")
+    )
+    assert source == "control-01:queue"
+
+    monkeypatch.setenv(infra_monitor.FINDING_SOURCE_ENV, source)
+    args = infra_monitor.build_parser().parse_args(
+        ["--skip-workers", "--prometheus-url", "http://metrics/ready"]
+    )
+    assert args.record_findings == "control-01:queue"
+
     exec_start = next(
         line for line in queue_unit.splitlines() if line.startswith("ExecStart=")
     )
-
-    assert "--record-findings control-01:queue" in exec_start
     # The stall window is the UNATTENDED clock and must stay well under the
     # claim ceiling; conflating the two is what this unit was red for. The
     # ceiling itself is not spelled here -- the default IS the policy, and
     # `test_the_claim_ceiling_clears_one_legitimate_attempt` pins it.
     assert "--max-stalled-seconds 900" in exec_start
     assert "--max-claim-seconds" not in exec_start
+
+
+def test_an_explicit_source_still_wins_over_the_environment(monkeypatch) -> None:
+    """The environment is a default, not an override: a worker host that
+    exports one source must not silently rewrite what an operator (or the
+    worker-host unit, which passes no source at all and must keep recording
+    nothing) asked for on the command line."""
+    monkeypatch.setenv(infra_monitor.FINDING_SOURCE_ENV, "control-01:queue")
+    argv = ["--skip-queue", "--prometheus-url", "http://metrics/ready"]
+
+    explicit = infra_monitor.build_parser().parse_args(
+        [*argv, "--record-findings", "worker-01:infra"]
+    )
+    assert explicit.record_findings == "worker-01:infra"
+
+    monkeypatch.delenv(infra_monitor.FINDING_SOURCE_ENV)
+    # Unset is the worker host: `voyn-infra-monitor.service` names no source,
+    # so it measures and reports without touching `monitor_finding` at all.
+    assert infra_monitor.build_parser().parse_args(argv).record_findings == ""
+    assert "AICC_MONITOR_FINDING_SOURCE" not in Path(
+        "deploy/systemd/voyn-infra-monitor.service"
+    ).read_text()
 
 
 def test_evaluate_can_skip_queue_without_hiding_worker_failures() -> None:

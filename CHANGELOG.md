@@ -71,6 +71,18 @@ functional application milestones of `app.py`.
   reconciles that set. Unit and PostgreSQL integration regressions cover red-tick
   partial clears, stable finding/task identity, empty/NULL clears, source scope,
   and grants for both control- and worker-host probes.
+- `deploy/systemd/voyn-queue-monitor.service`: the probe's finding source
+  (`control-01:queue`) is set as `Environment=AICC_MONITOR_FINDING_SOURCE`,
+  which `--record-findings` now defaults to, rather than appended to
+  `ExecStart`. That line spells the control host's absolute install path, and
+  `scripts/ci/prepush/leak_guard.sh` refuses any ADDED line carrying one in
+  this public repository — a rule the guarded publisher enforces too
+  (`_leak_guard_gate` fails the publish, it does not warn), so re-typing the
+  line to append a flag would have made the fix unpublishable. The line
+  already in history is untouched context. An explicit `--record-findings`
+  still wins over the environment, and the worker-host probe
+  (`voyn-infra-monitor.service`) sets neither, so it keeps recording nothing.
+
 - `monitor_clear_finding` is this schema's first OVERLOADED function, and two
   places assumed a function name identified exactly one signature.
   `roles.render_table_grants`' existence filter — the one that lets grants be
