@@ -133,3 +133,73 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
         "priority": 100,
     }]
     assert calls[0]["priority"] > 0
+
+
+def _run_import(tmp_path, monkeypatch, capsys, text, *extra):
+    """Drive `main(["backlog-import", ...])` far enough to reach the file
+    check, with a connection object that is `None`.
+
+    Nothing here fakes the store: the point is that the refusal below happens
+    with no database work at all, and `None` proves it -- any code path that
+    reached for the connection would raise instead of returning a code.
+    """
+    from contextlib import nullcontext
+
+    from command_center.db import cli as cli_module
+    from command_center.db import pool
+
+    path = tmp_path / "backlog.md"
+    path.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(cli_module, "load_config", lambda: object())
+    monkeypatch.setattr(pool, "open_pool", lambda config: None)
+    monkeypatch.setattr(pool, "connection", lambda: nullcontext(None))
+    code = cli_module.main(["backlog-import", str(path), *extra])
+    return code, capsys.readouterr()
+
+
+def test_backlog_import_refuses_a_file_the_exporter_generated(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The bidirectional bridge (ADR-0011) is safe only while import reads the
+    AUTHORED file and export writes the rendering, and until now nothing
+    enforced that -- it was a convention in prose.
+
+    Pointed at a rendering, `backlog-import` would not fail: the exporter
+    emits `- VOYN_RECOMMENDATION | ...` lines, which `parse_backlog` does not
+    recognise as tasks even to report as `unparsed`, so the run would print
+    "inserted 0, updated 0, unchanged 0" and exit 0 while nothing the owner
+    typed ever reached the store -- and `ops/aicc_backlog_publish.py`, which
+    only checks the exit code, would report a healthy publish every five
+    minutes. A misconfigured path has to fail loudly instead.
+    """
+    from datetime import UTC, datetime
+
+    from command_center.db import backlog_export
+
+    rendered = backlog_export.render_projection(
+        [], generated_at=datetime(2026, 9, 9, tzinfo=UTC)
+    )
+    code, captured = _run_import(tmp_path, monkeypatch, capsys, rendered)
+
+    assert code == 1
+    assert "refused" in captured.err
+    # Names the fix, not just the fault: which file to point at, and which
+    # direction $AICC_MASTER_BACKLOG runs in.
+    assert "AICC_MASTER_BACKLOG" in captured.err
+    assert "inserted" not in captured.out
+
+
+def test_backlog_import_still_accepts_an_authored_backlog(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The guard's other direction, and the one that would hurt more if it
+    were wrong: refusing the owner's real file would freeze the store while
+    reporting a clean refusal every tick. `--parse-only` keeps this on the
+    same no-database path as the refusal test above."""
+    authored = "- **VOYN-W0-X** | Wave 0 | OPEN | P0 | d | `s` | body\n"
+    code, captured = _run_import(
+        tmp_path, monkeypatch, capsys, authored, "--parse-only"
+    )
+
+    assert code == 0
+    assert "parsed: 1 tasks" in captured.out

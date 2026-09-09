@@ -86,6 +86,21 @@ safe. The bridge is safe only as long as the owner treats their own file as
 *input* and the rendered `$AICC_MASTER_BACKLOG` as *output*, and never
 edits the generated file directly or repoints `backlog-import` at it.
 
+Half of that precondition is now enforced rather than merely asked for.
+`backlog-import` refuses any file whose header carries
+`backlog_export.GENERATED_MARKER` (`is_generated_projection`), because
+"inert" is not the same as "safe to do": aimed at a rendering, the import
+would have *succeeded* — parsing zero tasks, printing
+`inserted 0, updated 0, unchanged 0`, exiting 0 — and
+`ops/aicc_backlog_publish.py`, which only inspects the exit code, would have
+reported a healthy publish every five minutes while nothing the owner typed
+reached the store. A repointed path now fails loudly on the first tick. The
+other half — the owner editing the generated file in place — stays a
+convention: those edits are overwritten by the next export tick and leave no
+trace to detect. The rendered header says so at the top of the file, and now
+also stamps when it was rendered and from how many rows, so a reader holding
+only the text can tell a live projection from one whose tick has died.
+
 ## Decision
 
 Both directions stay live for the migration window, and neither is allowed

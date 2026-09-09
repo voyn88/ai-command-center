@@ -4,8 +4,10 @@ parses (VOYN-W0-AICC-BACKLOG-EXPORT-PROJECTION)."""
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
@@ -13,6 +15,11 @@ from command_center import backlog_client
 from command_center.db import backlog_export
 from command_center.db.backlog_parser import ParsedTask, parse_backlog
 from command_center.db.backlog_store import BacklogStore
+
+#: The render clock every test below pins, so a rendered file is a
+#: function of its inputs alone and an expected header can be written out
+#: byte for byte.
+_GENERATED_AT = datetime(2026, 9, 9, 6, 30, tzinfo=UTC)
 
 _ROWS = [
     {
@@ -46,7 +53,7 @@ def test_roundtrip_through_the_real_parser():
     """The one consumer contract: every rendered line must come back from
     `parse_recommendations` as a record, never as a ParseError — including
     the row built to break field separation."""
-    text = backlog_export.render_projection(_ROWS)
+    text = backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
     result = backlog_client.parse_recommendations(text)
     assert result.errors == []
     assert len(result.records) == len(_ROWS)
@@ -80,7 +87,7 @@ def test_every_parser_field_is_rendered_in_order():
 def test_header_survives_the_parser_as_prose():
     """The generated header (and its do-not-edit warning) must never parse
     as records or errors."""
-    text = backlog_export.render_projection([])
+    text = backlog_export.render_projection([], generated_at=_GENERATED_AT)
     result = backlog_client.parse_recommendations(text)
     assert result.records == [] and result.errors == []
 
@@ -100,7 +107,9 @@ def test_status_translates_execution_vocabulary_into_planning_vocabulary():
         {**_ROWS[0], "status": "IN_PROGRESS"},
         {**_ROWS[0], "task_id": "VOYN-W0-AICC-UNTRIAGED", "status": "UNTRIAGED"},
     ]
-    result = backlog_client.parse_recommendations(backlog_export.render_projection(rows))
+    result = backlog_client.parse_recommendations(
+        backlog_export.render_projection(rows, generated_at=_GENERATED_AT)
+    )
     approved, untriaged = result.records
     assert approved.status == "PO-Approved"
     assert approved.is_approved is True
@@ -133,9 +142,88 @@ def test_reimporting_a_projection_through_the_real_importer_is_a_no_op():
     not match that shape at all -- not even as a reported "unparsed" line, it
     is simply invisible to the importer. The two formats occupy disjoint
     syntax, which is the actual mechanism keeping a manual re-import inert."""
-    report = parse_backlog(backlog_export.render_projection(_ROWS))
+    report = parse_backlog(
+        backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
+    )
     assert report.tasks == []
     assert report.unparsed == []
+
+
+def test_the_header_stamps_when_it_was_rendered_and_from_how_many_rows():
+    """The projection has to be able to tell its own reader that it is stale.
+
+    The failure this exporter exists to end was a *silent* one: a console
+    rendering a two-week-old file with nothing in the content to say so. The
+    console reads freshness from mtime, but mtime lives in the filesystem,
+    not in the text -- it does not survive a copy or an scp, and the owner
+    reading the rendered markdown in an editor never sees it. So the stamp
+    goes in the file, and this pins that it is really there, in UTC, with the
+    row count beside it."""
+    text = backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
+    assert "Rendered 2026-09-09T06:30:00Z from 2 task row(s)" in text
+    assert "Rendered 2026-09-09T06:30:00Z from 0 task row(s)" in (
+        backlog_export.render_projection([], generated_at=_GENERATED_AT)
+    )
+    # Rendered in UTC whatever the caller's zone, so two ticks' stamps are
+    # comparable and neither is ambiguous about which clock it means.
+    other_zone = _GENERATED_AT.astimezone(timezone(timedelta(hours=5)))
+    assert other_zone != _GENERATED_AT.replace(tzinfo=None)
+    assert "Rendered 2026-09-09T06:30:00Z" in (
+        backlog_export.render_projection([], generated_at=other_zone)
+    )
+
+
+def test_the_render_clock_is_an_argument_not_a_hidden_now():
+    """Two renders of the same rows must be byte-identical -- the property
+    that lets a test assert on a whole rendered file at all, and the reason
+    `generated_at` is a required keyword rather than a `datetime.now()` read
+    inside the renderer. Required, not defaulted: a silently omitted stamp
+    would leave the projection claiming nothing about its own age, which is
+    exactly the state the header exists to end."""
+    first = backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
+    second = backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
+    assert first == second
+    with pytest.raises(TypeError):
+        backlog_export.render_projection(_ROWS)
+
+
+def test_a_rendering_is_recognised_as_generated_and_an_authored_file_is_not():
+    """`is_generated_projection` is the check `backlog-import` refuses on, so
+    it has to be right in both directions.
+
+    False negatives re-open the silent no-op it exists to prevent; false
+    positives are worse -- they would refuse the owner's real backlog and
+    freeze the store. The marker is matched as a whole line and only inside
+    the header for that reason: the authored backlog legitimately *describes*
+    this exporter inside a task body (BO-S4 is a task in it), and quoting the
+    sentence there must not make the file unimportable."""
+    rendered = backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
+    assert backlog_export.is_generated_projection(rendered) is True
+
+    authored = "- **VOYN-W0-X** | Wave 0 | OPEN | P0 | d | `s` | body\n"
+    assert backlog_export.is_generated_projection(authored) is False
+
+    quoted_deep_in_a_body = (
+        "# VOYN master backlog\n\n"
+        + "filler\n" * backlog_export._HEADER_SCAN_LINES
+        + "- **VOYN-W0-BO-S4** | Wave 0 | OPEN | P0 | "
+        + f"{backlog_export.GENERATED_MARKER}\n"
+        + f"  {backlog_export.GENERATED_MARKER}\n"
+    )
+    assert backlog_export.is_generated_projection(quoted_deep_in_a_body) is False
+
+
+def test_the_generated_marker_is_the_line_the_header_actually_carries():
+    """The marker is a constant read by the importer and interpolated by the
+    exporter; if the header were reworded around it, the refusal would go
+    quietly dead. Pins that the emitted file really contains it as its own
+    line -- the exact form `is_generated_projection` matches."""
+    lines = backlog_export.render_projection(
+        [], generated_at=_GENERATED_AT
+    ).splitlines()
+    assert backlog_export.GENERATED_MARKER in lines
+    position = lines.index(backlog_export.GENERATED_MARKER)
+    assert position < backlog_export._HEADER_SCAN_LINES
 
 
 def _task(task_id: str, **overrides) -> ParsedTask:

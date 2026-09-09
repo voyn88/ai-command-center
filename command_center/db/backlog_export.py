@@ -11,9 +11,16 @@ predated the store (live: the console booted 2026-09-03 rendered a file
 from 2026-08-20 — two weeks of a working fleet invisible to its owner).
 
 This module is the missing half, and it is a PROJECTION in the strict
-sense: read-only over ``backlog_task``, deterministic, regenerated whole on
-every run, never merged with the previous file, and carrying a header that
-says so — editing the output is editing a rendering, not the backlog.
+sense: read-only over ``backlog_task``, deterministic (the render clock is
+an argument, not a ``now()`` read inside), regenerated whole on every run,
+never merged with the previous file, and carrying a header that says so —
+editing the output is editing a rendering, not the backlog. That header
+also stamps when the file was rendered and from how many rows, so a reader
+holding only the text can tell a live projection from one whose tick died;
+and it carries ``GENERATED_MARKER``, the line ``backlog-import`` uses to
+refuse importing a rendering back into the store (``is_generated_projection``)
+instead of accepting it as an authored file and reporting a successful
+zero-task import.
 
 The format is not ours to choose: ``backlog_client.parse_recommendations``
 is the one consumer contract (exactly ``RECOMMENDATION_FIELDS`` in exactly
@@ -114,16 +121,67 @@ from command_center.db.backlog_parser import EXECUTABLE_STATUSES
 #: say, a DEFER_TO_USER task.
 _STATUS_NOT_YET_APPROVED = "PO-Review"
 
-_HEADER = (
-    "# VOYN master backlog — generated projection\n"
-    "\n"
-    "This file is RENDERED from the canonical PostgreSQL backlog store\n"
-    "(`backlog_task`); it is regenerated whole and never read back. Do not\n"
-    "edit: changes here change a rendering, not the backlog.\n"
-    "\n"
-    "## 0B. Machine records\n"
-    "\n"
-)
+#: The one line by which a file can be recognised as this module's own
+#: output. ``backlog-import`` keys off it to refuse importing a rendering
+#: back into the store (``is_generated_projection``), so it is defined here —
+#: beside the code that emits it — and interpolated into the header rather
+#: than written twice, where the two copies could drift apart and quietly
+#: disarm that refusal.
+GENERATED_MARKER = "This file is RENDERED from the canonical PostgreSQL backlog store"
+
+#: How far into a file ``GENERATED_MARKER`` still counts as the file's own
+#: provenance claim. Bounded on purpose: the owner's hand-authored backlog
+#: legitimately *describes* this exporter inside a task body — BO-S4 is a task
+#: in that very file — and a body quoting the sentence must not make the whole
+#: authored file unimportable. Either it is in the header or it is prose.
+_HEADER_SCAN_LINES = 20
+
+
+def _utc_stamp(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _header(generated_at: datetime, row_count: int) -> str:
+    """The prose preamble: what this file is, and how old it is.
+
+    The age line is not decoration. The failure that created this exporter
+    was a *silently* stale projection — a console rendering a two-week-old
+    file with nothing in the content to say so. The console itself now reads
+    freshness from the file's mtime (``master_backlog_panel`` shows it), but
+    mtime is a property of the filesystem, not of the text: it does not
+    survive a copy, an scp or a checkout, and it is invisible to the owner
+    reading the rendered markdown in an editor, which is exactly the audience
+    BO-S4 renders this file for. A stamp inside the file travels with it.
+    """
+    return (
+        "# VOYN master backlog — generated projection\n"
+        "\n"
+        f"{GENERATED_MARKER}\n"
+        "(`backlog_task`); it is regenerated whole and never read back. Do not\n"
+        "edit: changes here change a rendering, not the backlog.\n"
+        "\n"
+        f"Rendered {_utc_stamp(generated_at)} from {row_count} task row(s) by\n"
+        "`backlog-export` (aicc-backlog-export.timer, every 5 minutes). If that\n"
+        "stamp is far behind the current time, the export tick has stopped and\n"
+        "every record below is stale — check the timer on the control host\n"
+        "rather than trusting what follows.\n"
+        "\n"
+        "## 0B. Machine records\n"
+        "\n"
+    )
+
+
+def is_generated_projection(text: str) -> bool:
+    """True when ``text`` is this module's own output rather than an authored
+    backlog.
+
+    Exists for the import direction: ``backlog-import`` refuses a file this
+    returns True for. Matches the marker as a whole line (never a substring)
+    and only within the header, for the reasons on the two constants above.
+    """
+    head = text.splitlines()[:_HEADER_SCAN_LINES]
+    return any(line.strip() == GENERATED_MARKER for line in head)
+
 
 #: Two character classes can break a record and both are removed outright
 #: rather than escaped (the projection is for reading; an escaped value
@@ -158,10 +216,7 @@ def _planning_status(execution_status: object) -> str:
 def render_record(row: dict[str, Any]) -> str:
     """One ``- VOYN_RECOMMENDATION | ...`` line from one ``backlog_task`` row."""
     updated = row.get("updated_at")
-    if isinstance(updated, datetime):
-        ts = updated.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    else:
-        ts = _clean(updated)
+    ts = _utc_stamp(updated) if isinstance(updated, datetime) else _clean(updated)
     values = {
         "ts": ts,
         "status": _planning_status(row.get("status")),
@@ -184,8 +239,22 @@ def render_record(row: dict[str, Any]) -> str:
     return "- " + backlog_client.FIELD_SEP.join(tokens)
 
 
-def render_projection(rows: list[dict[str, Any]]) -> str:
-    return _HEADER + "\n".join(render_record(row) for row in rows) + "\n"
+def render_projection(rows: list[dict[str, Any]], *, generated_at: datetime) -> str:
+    """The whole file: header (stamped ``generated_at``) plus one record line
+    per row.
+
+    ``generated_at`` is a required argument rather than a ``datetime.now()``
+    read inside this function, so the renderer stays a pure function of its
+    inputs — the tick supplies the clock, and a test can render a byte-exact
+    expected file. Required rather than defaulted, because a stamp silently
+    omitted would leave the projection claiming nothing about its own age,
+    which is the state this header exists to end.
+    """
+    return (
+        _header(generated_at, len(rows))
+        + "\n".join(render_record(row) for row in rows)
+        + "\n"
+    )
 
 
 def fetch_rows(conn: Any) -> list[dict[str, Any]]:

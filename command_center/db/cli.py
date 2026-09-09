@@ -417,10 +417,34 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-import":
                 from pathlib import Path
 
+                from command_center.db import backlog_export
                 from command_center.db.backlog_parser import parse_backlog
                 from command_center.db.backlog_store import BacklogStore
 
                 text = Path(args.path).read_text(encoding="utf-8")
+                # The bridge's one unenforced precondition, now enforced
+                # (ADR-0011): import reads the AUTHORED file, export writes
+                # the rendering, and the two must never be pointed at each
+                # other. Aimed at a rendering, this command would otherwise
+                # succeed loudly and do nothing at all -- the exporter emits
+                # `- VOYN_RECOMMENDATION | ...` lines, which `parse_backlog`
+                # does not recognise as tasks even to report as `unparsed`
+                # (tests/db/test_backlog_export.py proves that no-op), so
+                # every run would print "inserted 0, updated 0, unchanged 0"
+                # and exit 0 while nothing the owner typed ever reached the
+                # store. A misconfigured path must fail, not look healthy.
+                if backlog_export.is_generated_projection(text):
+                    print(
+                        f"refused: {args.path} is a backlog-export rendering "
+                        "(its header names it a generated projection), not an "
+                        "authored backlog; importing it would report success "
+                        "and change nothing. Point backlog-import at the "
+                        "authored file -- $AICC_MASTER_BACKLOG is this "
+                        "pipeline's output, never its input. See "
+                        "docs/adr/0011-backlog-projection-bidirectional-bridge.md",
+                        file=sys.stderr,
+                    )
+                    return 1
                 if args.parse_only:
                     parsed = parse_backlog(text)
                     print(f"parsed: {len(parsed.tasks)} tasks")
@@ -451,18 +475,23 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "backlog-export":
+                import datetime as _dt
                 from pathlib import Path as _Path
 
                 from command_center import projection_writer
                 from command_center.db import backlog_export
 
                 rows = backlog_export.fetch_rows(conn)
+                # The renderer takes its clock as an argument so it stays a
+                # pure function of its inputs; the tick is what owns "now".
+                generated_at = _dt.datetime.now(_dt.UTC)
                 # Atomic whole-file replace lives in projection_writer — a
                 # reader (the console) must never see a half-written
                 # projection, and durable-write calls must stay out of this
                 # frozen-category module (AIOS boundary gate).
                 projection_writer.write_atomically(
-                    _Path(args.output), backlog_export.render_projection(rows)
+                    _Path(args.output),
+                    backlog_export.render_projection(rows, generated_at=generated_at),
                 )
                 print(f"rendered {len(rows)} records -> {args.output}")
                 return 0
