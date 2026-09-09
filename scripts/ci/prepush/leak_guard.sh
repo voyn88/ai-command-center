@@ -21,13 +21,13 @@
 #      is the reproducible leak vector, and it is blocked by name.)
 #   2. No ADDED line containing an absolute macOS or worker home path.
 #      (The literals are never written out in this file -- see the
-#      HOME_ROOT_* halves --
-#      so the guard can scan itself.) Added lines only: tracked files
-#      already contain historical, legitimate home-path examples (
-#      ROADMAP_STATE.md, UI panel
-#      docstrings), and flagging context lines would make every adjacent
-#      edit a false positive. This guard's own file is excluded -- it must
-#      name the patterns it hunts.
+#      HOME_ROOT_* halves -- so the guard can scan itself.) Added lines
+#      only: tracked files already contain historical, legitimate
+#      home-path examples (ROADMAP_STATE.md, UI panel docstrings), and
+#      flagging context lines would make every adjacent
+#      edit a false positive. No file is excluded, this one included: it
+#      names the patterns it hunts by assembling them from halves at
+#      runtime, so it never carries a literal of its own.
 #
 # Check 2 has two narrow exemptions
 # (VOYN-W0-AICC-LEAK-GUARD-BLOCKS-FILES-THAT-ALREADY-CARRY-HOME-PATHS: some
