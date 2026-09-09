@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { describe, test, expect, vi, beforeEach } from 'vitest'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, describe, test, expect, vi, beforeEach } from 'vitest'
 import Tasks from '../Tasks'
 import { fetchHome } from '../../lib/api'
 import type { HomeDTO } from '../../lib/api'
@@ -185,6 +185,7 @@ describe('Tasks — chat-text backlog intake (S6a)', () => {
         body: 'a new task',
         repo: null,
       },
+      transcript: null,
     })
     vi.mocked(confirmBacklogTask).mockResolvedValue({ task_id: 'VOYN-NEW', reason: 'inserted', changed: true })
     render(<Tasks onNavigate={vi.fn()} />)
@@ -193,7 +194,9 @@ describe('Tasks — chat-text backlog intake (S6a)', () => {
     fireEvent.change(textarea, { target: { value: 'add a new task, wave 0, P1' } })
     fireEvent.click(screen.getByText('Propose'))
 
-    await waitFor(() => expect(draftBacklogTask).toHaveBeenCalledWith('add a new task, wave 0, P1'))
+    await waitFor(() =>
+      expect(draftBacklogTask).toHaveBeenCalledWith('add a new task, wave 0, P1', 'chat'),
+    )
     const preview = await screen.findByLabelText('Proposed line — edit if needed, then confirm:')
     expect(preview).toHaveValue('- **VOYN-NEW** | Wave 0 | OPEN | P1 | | `slug` | a new task')
 
@@ -221,6 +224,7 @@ describe('Tasks — chat-text backlog intake (S6a)', () => {
         body: 'dup',
         repo: null,
       },
+      transcript: null,
     })
     vi.mocked(confirmBacklogTask).mockRejectedValue(
       new Error('POST /api/v1/backlog/intake/confirm -> VOYN-W0-EXAMPLE already exists — chat intake creates new tasks only'),
@@ -273,5 +277,145 @@ describe('Tasks — backlog reprioritization (S6d)', () => {
     fireEvent.click(within(row).getByText('Save'))
 
     expect(await within(row).findByText(/Someone else changed this task first/)).toBeInTheDocument()
+  })
+})
+
+describe('Tasks — dictated backlog intake (S6b)', () => {
+  class FakeRecognition {
+    static last: FakeRecognition | null = null
+    lang = ''
+    continuous = false
+    interimResults = false
+    maxAlternatives = 0
+    stopped = false
+    onresult: ((event: unknown) => void) | null = null
+    onerror: ((event: { error: string }) => void) | null = null
+    onend: (() => void) | null = null
+
+    constructor() {
+      FakeRecognition.last = this
+    }
+
+    start() {}
+    stop() {
+      this.stopped = true
+      this.onend?.()
+    }
+    abort() {}
+
+    hear(transcript: string) {
+      const entry = [{ transcript }] as unknown as ArrayLike<{ transcript: string }> & { isFinal: boolean }
+      entry.isFinal = true
+      this.onresult?.({ resultIndex: 0, results: [entry] })
+    }
+  }
+
+  const installRecognizer = () => {
+    ;(window as unknown as Record<string, unknown>).webkitSpeechRecognition = FakeRecognition
+  }
+
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).webkitSpeechRecognition
+    FakeRecognition.last = null
+  })
+
+  test('no microphone button in a browser that cannot dictate', async () => {
+    render(<Tasks onNavigate={vi.fn()} />)
+
+    await screen.findByLabelText('Add or reprioritize by chat')
+    expect(screen.queryByText('🎤 Dictate')).not.toBeInTheDocument()
+  })
+
+  test('dictated words land in the same box and draft as a transcript', async () => {
+    installRecognizer()
+    vi.mocked(draftBacklogTask).mockResolvedValue({
+      ok: true,
+      line: '- **VOYN-W0-APP-CONTROL-S9** | Wave 0 | UNTRIAGED | P0 | | `dictated` | dictated task',
+      task: {
+        task_id: 'VOYN-W0-APP-CONTROL-S9',
+        wave: '0',
+        priority: 'P0',
+        status: 'UNTRIAGED',
+        kind: 'feature',
+        title: 'dictated task',
+        body: 'dictated task',
+        repo: null,
+      },
+      transcript: {
+        heard: 'заведи воин W0 APP CONTROL, пи ноль',
+        text: 'заведи VOYN W0 APP CONTROL, P0',
+        corrections: [
+          { heard: 'воин', written: 'VOYN' },
+          { heard: 'пи ноль', written: 'P0' },
+        ],
+      },
+    })
+    render(<Tasks onNavigate={vi.fn()} />)
+
+    fireEvent.click(await screen.findByText('🎤 Dictate'))
+    expect(screen.getByText('Listening…')).toBeInTheDocument()
+
+    act(() => FakeRecognition.last!.hear('заведи воин W0 APP CONTROL, пи ноль'))
+    expect(screen.getByLabelText('Add or reprioritize by chat')).toHaveValue(
+      'заведи воин W0 APP CONTROL, пи ноль',
+    )
+
+    fireEvent.click(screen.getByText('Stop'))
+    fireEvent.click(screen.getByText('Propose'))
+
+    await waitFor(() =>
+      expect(draftBacklogTask).toHaveBeenCalledWith('заведи воин W0 APP CONTROL, пи ноль', 'voice'),
+    )
+    // what the server repaired is on screen, not applied behind the owner's back
+    expect(await screen.findByText(/Heard and corrected:/)).toBeInTheDocument()
+    expect(screen.getByText(/«воин» → VOYN/)).toBeInTheDocument()
+    expect(screen.getByText(/«пи ноль» → P0/)).toBeInTheDocument()
+  })
+
+  test('dictation appends to what is already typed instead of erasing it', async () => {
+    installRecognizer()
+    render(<Tasks onNavigate={vi.fn()} />)
+
+    const textarea = await screen.findByLabelText('Add or reprioritize by chat')
+    fireEvent.change(textarea, { target: { value: 'почини экспорт' } })
+    fireEvent.click(screen.getByText('🎤 Dictate'))
+    act(() => FakeRecognition.last!.hear('волна ноль'))
+
+    expect(textarea).toHaveValue('почини экспорт волна ноль')
+  })
+
+  test('a refused microphone is explained, and typing still works', async () => {
+    installRecognizer()
+    render(<Tasks onNavigate={vi.fn()} />)
+
+    fireEvent.click(await screen.findByText('🎤 Dictate'))
+    act(() => FakeRecognition.last!.onerror?.({ error: 'not-allowed' }))
+
+    expect(
+      await screen.findByText('Microphone access was refused — allow it for this site and try again.'),
+    ).toBeInTheDocument()
+    expect(screen.getByText('🎤 Dictate')).toBeInTheDocument()
+    expect(screen.queryByText('Listening…')).not.toBeInTheDocument()
+  })
+
+  test('text typed by hand is never sent as a transcript', async () => {
+    installRecognizer()
+    vi.mocked(draftBacklogTask).mockResolvedValue({
+      ok: false,
+      reason: 'not a task line',
+      raw_output: 'nope',
+      transcript: null,
+    })
+    render(<Tasks onNavigate={vi.fn()} />)
+
+    fireEvent.change(await screen.findByLabelText('Add or reprioritize by chat'), {
+      target: { value: 'воин вернулся с войны' },
+    })
+    fireEvent.click(screen.getByText('Propose'))
+
+    await waitFor(() =>
+      expect(draftBacklogTask).toHaveBeenCalledWith('воин вернулся с войны', 'chat'),
+    )
+    expect(screen.queryByText(/Heard and corrected:/)).not.toBeInTheDocument()
   })
 })

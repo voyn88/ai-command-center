@@ -13,6 +13,19 @@ Two-step, stateless by design:
   to race or expire — then inserts through ``BacklogStore.upsert_task``, the
   same ``SECURITY DEFINER`` path the Markdown importer already uses.
 
+Voice intake (``VOYN-W0-APP-CONTROL-S6b``) is the SAME two steps with one
+extra hop in front of the model call: ``draft`` accepts ``source: "voice"``
+and runs the text through :func:`command_center.db.voice_transcript.
+normalize_transcript` first, returning what it heard, what it wrote and every
+substitution it made. Transcription itself happens on the device (the Web
+Speech API, ``web/src/lib/voiceInput.ts``): the recognizer the owner's iPhone
+and Mac already have needs no model weights, no audio upload and no new
+server dependency for a tailnet-only deployment, and it keeps the owner's
+audio on the owner's device. The decision is deliberately reversible — a
+server-side Whisper route would post to this same endpoint with the same
+``source`` flag, and the term repair, which is where the real difficulty
+lives, is transport-agnostic and already server-side.
+
 Chat intake creates NEW backlog records only. ``backlog_upsert_task`` is also
 the Markdown-reconciliation path and CAN overwrite an existing row's status,
 wave, priority, title and body directly, bypassing ``backlog_transition``'s
@@ -41,7 +54,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, HTTPException
 
 from command_center import agent_runner
-from command_center.db import backlog_intake
+from command_center.db import backlog_intake, voice_transcript
 from command_center.db.backlog_parser import ParsedTask
 from command_center.db.backlog_store import BacklogStore
 from command_center.db.pool import PoolNotOpenError
@@ -89,20 +102,52 @@ def _task_payload(task: ParsedTask) -> dict:
     }
 
 
+_SOURCES = ("chat", "voice")
+
+
 @router.post("/draft")
 def draft(payload: dict = Body(...)) -> dict:
     text = payload.get("text")
     if not (isinstance(text, str) and text.strip()):
         raise HTTPException(status_code=422, detail="text is required")
+    source = payload.get("source", "chat")
+    if source not in _SOURCES:
+        raise HTTPException(
+            status_code=422, detail=f"source must be one of {', '.join(_SOURCES)}"
+        )
 
-    raw_output = _call_model(backlog_intake.build_intake_prompt(text))
+    dictated = source == "voice"
+    transcript = None
+    if dictated:
+        normalized = voice_transcript.normalize_transcript(text)
+        text = normalized.text
+        transcript = {
+            "heard": payload["text"].strip(),
+            "text": normalized.text,
+            "corrections": [
+                {"heard": correction.heard, "written": correction.written}
+                for correction in normalized.corrections
+            ],
+        }
+        if not text:
+            raise HTTPException(status_code=422, detail="text is required")
+
+    raw_output = _call_model(
+        backlog_intake.build_intake_prompt(text, dictated=dictated)
+    )
     result = backlog_intake.draft_from_model_output(raw_output)
     if not result.ok or result.task is None:
-        return {"ok": False, "reason": result.reason, "raw_output": result.raw_output}
+        return {
+            "ok": False,
+            "reason": result.reason,
+            "raw_output": result.raw_output,
+            "transcript": transcript,
+        }
     return {
         "ok": True,
         "line": result.raw_output,
         "task": _task_payload(result.task),
+        "transcript": transcript,
     }
 
 

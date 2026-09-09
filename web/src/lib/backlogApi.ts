@@ -87,9 +87,17 @@ export type DraftedTask = {
   repo: string | null
 }
 
+/** What the server heard, what it wrote, and every term it repaired — voice
+ * intake only (S6b); null for typed text, which is never repaired. */
+export type Transcript = {
+  heard: string
+  text: string
+  corrections: { heard: string; written: string }[]
+}
+
 export type DraftResult =
-  | { ok: true; line: string; task: DraftedTask }
-  | { ok: false; reason: string; raw_output: string }
+  | { ok: true; line: string; task: DraftedTask; transcript: Transcript | null }
+  | { ok: false; reason: string; raw_output: string; transcript: Transcript | null }
 
 async function authedPost<T>(path: string, body: unknown): Promise<T> {
   const token = getOwnerToken()
@@ -113,9 +121,17 @@ async function authedPost<T>(path: string, body: unknown): Promise<T> {
 
 /** Step 1 of chat/voice intake (S6a/S6b): send free text, get back a
  * proposed backlog line for the owner to read (and, if needed, edit) before
- * anything is written. */
-export function draftBacklogTask(text: string): Promise<DraftResult> {
-  return authedPost('/api/v1/backlog/intake/draft', { text })
+ * anything is written.
+ *
+ * `source: 'voice'` marks the text as a machine transcript, which is the
+ * server's cue to repair dictated domain terms (`voice_transcript.py`) before
+ * the model sees them and to report what it changed. Typed text is sent
+ * as-is — a repair table must never edit words the owner actually typed. */
+export function draftBacklogTask(
+  text: string,
+  source: 'chat' | 'voice' = 'chat',
+): Promise<DraftResult> {
+  return authedPost('/api/v1/backlog/intake/draft', { text, source })
 }
 
 /** Step 2: the (possibly edited) line is re-parsed from scratch on the

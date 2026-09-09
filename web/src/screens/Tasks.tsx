@@ -29,7 +29,15 @@ import {
   fetchBacklogTasks,
   reassignBacklogTask,
 } from '../lib/backlogApi'
-import type { BacklogStatusCounts, BacklogTask, BacklogTaskDetail, DraftResult } from '../lib/backlogApi'
+import type {
+  BacklogStatusCounts,
+  BacklogTask,
+  BacklogTaskDetail,
+  DraftResult,
+  Transcript,
+} from '../lib/backlogApi'
+import { dictationSupported, startDictation } from '../lib/voiceInput'
+import type { DictationError, DictationHandle } from '../lib/voiceInput'
 import {
   enqueueAudit,
   fetchQueueItem,
@@ -365,24 +373,73 @@ function BacklogTaskRow({ item, onReassigned }: { item: BacklogTask; onReassigne
   )
 }
 
-/** Chat-text intake (S6a): draft a proposed backlog line from free text,
- * let the owner read (and edit) it, then confirm. Voice (S6b) is a separate
- * transcription step feeding the same text box. */
-function BacklogIntake({ onCreated }: { onCreated: () => void }) {
+/** What the server repaired in a dictated transcript (S6b) — shown above the
+ * proposed line so a misheard term is visible and correctable, never a silent
+ * rewrite of what the owner said. */
+function TranscriptRepairs({ transcript }: { transcript: Transcript }) {
   const { t } = useTranslation()
+  if (transcript.corrections.length === 0) return null
+  return (
+    <p style={{ margin: 0, color: 'var(--tx3)', fontSize: '.85rem' }}>
+      {t('voiceCorrections')}{' '}
+      {transcript.corrections
+        .map((correction) => `«${correction.heard}» → ${correction.written}`)
+        .join(', ')}
+    </p>
+  )
+}
+
+/** Chat and voice intake (S6a/S6b): draft a proposed backlog line from free
+ * text — typed, or dictated into the same box through the device's own
+ * recognizer — let the owner read (and edit) it, then confirm. Dictation only
+ * fills the text box; every word still goes through the same draft → confirm
+ * gate, because a transcript is a suggestion, not an instruction. */
+function BacklogIntake({ onCreated }: { onCreated: () => void }) {
+  const { t, i18n } = useTranslation()
   const [text, setText] = useState('')
   const [line, setLine] = useState<string | null>(null)
   const [parseFailed, setParseFailed] = useState(false)
   const [phase, setPhase] = useState<'idle' | 'drafting' | 'previewing' | 'confirming' | 'locked' | 'draftError' | 'confirmError' | 'duplicate' | 'success'>('idle')
+  const [dictation, setDictation] = useState<DictationHandle | null>(null)
+  const [voiceError, setVoiceError] = useState<DictationError | null>(null)
+  // Sticky for the whole entry: text that arrived by microphone stays flagged
+  // as a transcript even after the owner edits a word by hand, so the server
+  // still repairs the terms it did not touch.
+  const [dictated, setDictated] = useState(false)
+  const [transcript, setTranscript] = useState<Transcript | null>(null)
+  const canDictate = dictationSupported()
+
+  const listen = () => {
+    if (dictation) {
+      dictation.stop()
+      return
+    }
+    setVoiceError(null)
+    // Whatever is already in the box is kept: dictation appends to the
+    // owner's own words instead of overwriting them.
+    const typed = text.trim()
+    const handle = startDictation({
+      lang: i18n.language.startsWith('ru') ? 'ru-RU' : 'en-US',
+      onText: (heard) => {
+        setDictated(true)
+        setText(typed ? `${typed} ${heard}` : heard)
+      },
+      onError: setVoiceError,
+      onEnd: () => setDictation(null),
+    })
+    setDictation(handle)
+  }
 
   const draft = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!text.trim() || phase === 'drafting') return
+    dictation?.stop()
     setPhase('drafting')
     try {
-      const result: DraftResult = await draftBacklogTask(text.trim())
+      const result: DraftResult = await draftBacklogTask(text.trim(), dictated ? 'voice' : 'chat')
       setParseFailed(!result.ok)
       setLine(result.ok ? result.line : result.raw_output)
+      setTranscript(result.transcript ?? null)
       setPhase('previewing')
     } catch (error) {
       setPhase(error instanceof QueueAuthError ? 'locked' : 'draftError')
@@ -397,6 +454,8 @@ function BacklogIntake({ onCreated }: { onCreated: () => void }) {
       setPhase('success')
       setText('')
       setLine(null)
+      setTranscript(null)
+      setDictated(false)
       onCreated()
     } catch (error) {
       if (error instanceof QueueAuthError) setPhase('locked')
@@ -409,6 +468,7 @@ function BacklogIntake({ onCreated }: { onCreated: () => void }) {
 
   const cancel = () => {
     setLine(null)
+    setTranscript(null)
     setPhase('idle')
   }
 
@@ -425,12 +485,27 @@ function BacklogIntake({ onCreated }: { onCreated: () => void }) {
             rows={2}
             style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
           />
-          <button type="submit" className="execution-back" disabled={!text.trim() || phase === 'drafting'}>
-            {phase === 'drafting' ? t('intakeDrafting') : t('intakeDraft')}
-          </button>
+          <div style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap', alignItems: 'center' }}>
+            <button type="submit" className="execution-back" disabled={!text.trim() || phase === 'drafting'}>
+              {phase === 'drafting' ? t('intakeDrafting') : t('intakeDraft')}
+            </button>
+            {canDictate && (
+              <button
+                type="button"
+                className="task-toggle"
+                onClick={listen}
+                aria-pressed={dictation !== null}
+                title={t('voiceHint')}
+              >
+                {dictation ? t('voiceStop') : t('voiceStart')}
+              </button>
+            )}
+            {dictation && <span style={{ color: 'var(--accent-2)' }}>{t('voiceListening')}</span>}
+          </div>
         </form>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '.6rem' }}>
+          {transcript && <TranscriptRepairs transcript={transcript} />}
           <p style={{ margin: 0, color: parseFailed ? 'var(--bad)' : 'var(--tx3)' }}>
             {parseFailed ? t('intakeParseFailed') : t('intakePreview')}
           </p>
@@ -449,6 +524,19 @@ function BacklogIntake({ onCreated }: { onCreated: () => void }) {
             <button type="button" className="task-toggle" onClick={cancel}>{t('intakeCancel')}</button>
           </div>
         </div>
+      )}
+      {voiceError && (
+        <p style={{ color: 'var(--bad)', margin: 0 }}>
+          {t(
+            voiceError === 'denied'
+              ? 'voiceDenied'
+              : voiceError === 'no-speech'
+                ? 'voiceNoSpeech'
+                : voiceError === 'network'
+                  ? 'voiceNetwork'
+                  : 'voiceError',
+          )}
+        </p>
       )}
       {phase === 'locked' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeLocked')}</p>}
       {phase === 'draftError' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeDraftError')}</p>}

@@ -1,4 +1,4 @@
-"""Endpoint tests for chat-text backlog intake (VOYN-W0-APP-CONTROL-S6a).
+"""Endpoint tests for chat/voice backlog intake (VOYN-W0-APP-CONTROL-S6a/S6b).
 
 `BacklogStore` and the model call are both faked — the SQL-level behaviour of
 `backlog_upsert_task` is already proven in `tests/db/test_backlog_store.py`
@@ -80,6 +80,73 @@ def test_draft_propagates_a_failed_model_call(client, monkeypatch):
     monkeypatch.setattr(intake_routes, "_call_model", _fail)
     resp = client.post("/api/v1/backlog/intake/draft", json={"text": "file a task"})
     assert resp.status_code == 502
+
+
+# -- draft from dictation (S6b) -----------------------------------------------
+
+
+def test_a_dictated_draft_repairs_the_transcript_before_the_model_sees_it(
+    client, monkeypatch
+):
+    seen = {}
+
+    def _capture(prompt):
+        seen["prompt"] = prompt
+        return _VALID_LINE
+
+    monkeypatch.setattr(intake_routes, "_call_model", _capture)
+    resp = client.post(
+        "/api/v1/backlog/intake/draft",
+        json={"text": "заведи воин W0 APP CONTROL, волна ноль, пи ноль", "source": "voice"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["transcript"]["text"] == "заведи VOYN W0 APP CONTROL, Wave 0, P0"
+    assert body["transcript"]["heard"] == "заведи воин W0 APP CONTROL, волна ноль, пи ноль"
+    assert {"heard": "воин", "written": "VOYN"} in body["transcript"]["corrections"]
+    assert "VOYN W0 APP CONTROL" in seen["prompt"], "the model must see the repaired text"
+    assert "DICTATED" in seen["prompt"], "and be told the text came from speech"
+
+
+def test_a_dictated_draft_reports_its_transcript_even_when_the_parse_fails(
+    client, monkeypatch
+):
+    # the owner has to be able to tell a misheard word from a bad model reply,
+    # so the repair trail survives the refusal path too.
+    monkeypatch.setattr(intake_routes, "_call_model", lambda prompt: "не строка задачи")
+    resp = client.post(
+        "/api/v1/backlog/intake/draft", json={"text": "воин ноль", "source": "voice"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["transcript"]["corrections"] == [{"heard": "воин", "written": "VOYN"}]
+
+
+def test_typed_text_is_never_transcript_repaired(client, monkeypatch):
+    seen = {}
+
+    def _capture(prompt):
+        seen["prompt"] = prompt
+        return _VALID_LINE
+
+    monkeypatch.setattr(intake_routes, "_call_model", _capture)
+    resp = client.post(
+        "/api/v1/backlog/intake/draft", json={"text": "воин вернулся с войны"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["transcript"] is None
+    assert "воин вернулся с войны" in seen["prompt"]
+    assert "DICTATED" not in seen["prompt"]
+
+
+def test_draft_refuses_an_unknown_source(client, monkeypatch):
+    monkeypatch.setattr(intake_routes, "_call_model", lambda prompt: _VALID_LINE)
+    resp = client.post(
+        "/api/v1/backlog/intake/draft", json={"text": "file a task", "source": "telepathy"}
+    )
+    assert resp.status_code == 422
 
 
 # -- confirm --------------------------------------------------------------------

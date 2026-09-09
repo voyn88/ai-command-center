@@ -141,6 +141,15 @@ export const en = {
   intakeError: 'Could not add the task. Try again.',
   intakeLocked: 'Access key missing or rejected — unlock below and try again.',
   intakeDraftError: 'Could not reach the assistant. Try again.',
+  voiceStart: '🎤 Dictate',
+  voiceStop: 'Stop',
+  voiceListening: 'Listening…',
+  voiceHint: 'Dictate the task — the words land in the box above, edit them before proposing.',
+  voiceCorrections: 'Heard and corrected:',
+  voiceDenied: 'Microphone access was refused — allow it for this site and try again.',
+  voiceNoSpeech: 'Nothing was heard. Try again, closer to the microphone.',
+  voiceNetwork: 'Speech recognition is offline — type the task instead.',
+  voiceError: 'Dictation failed. Type the task instead.',
 }
 
 export const ru = {
@@ -283,6 +292,15 @@ export const ru = {
   intakeError: 'Не удалось добавить задачу. Попробуйте ещё раз.',
   intakeLocked: 'Ключ доступа отсутствует или отклонён — введите его ниже и повторите.',
   intakeDraftError: 'Не удалось связаться с ассистентом. Попробуйте ещё раз.',
+  voiceStart: '🎤 Голосом',
+  voiceStop: 'Стоп',
+  voiceListening: 'Слушаю…',
+  voiceHint: 'Продиктуйте задачу — слова попадут в поле выше, их можно поправить перед отправкой.',
+  voiceCorrections: 'Услышано и исправлено:',
+  voiceDenied: 'Доступ к микрофону запрещён — разрешите его для этого сайта и повторите.',
+  voiceNoSpeech: 'Ничего не услышал. Повторите ближе к микрофону.',
+  voiceNetwork: 'Распознавание речи недоступно — наберите задачу текстом.',
+  voiceError: 'Не удалось распознать речь. Наберите задачу текстом.',
 }
 
 i18n

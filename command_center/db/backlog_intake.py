@@ -11,6 +11,12 @@ text is a task. This module owns exactly that seam (prompt in, ``ParsedTask``
 or a refusal out) and nothing else — no database access, no HTTP, no model
 client, so it is as hermetically testable as the parser it wraps.
 
+Dictated text (``VOYN-W0-APP-CONTROL-S6b``) reaches this module already
+repaired by :mod:`command_center.db.voice_transcript`; all this module adds
+for it is one extra paragraph of instruction — a recognizer splits an id into
+separate words («VOYN W0 APP CONTROL») and the model must be told to join
+them rather than invent a new id.
+
 Status is forced to ``UNTRIAGED`` regardless of what the model wrote: a raw
 request from chat is exactly the "raw finding" case
 ``backlog_triage`` (migration 0008) exists for — it must not be able to walk
@@ -41,15 +47,30 @@ Rules, all mandatory:
 - The slug is a short kebab-case identifier inside backticks, e.g. `voice-chat-intake`.
 - The description is one plain sentence: no `|` characters, no line breaks.
 - Reply with EXACTLY ONE line matching this shape and nothing else: no preamble, no explanation, no markdown fence.
-
+{dictation_note}
 Owner's request:
 {text}
 """
 
+_DICTATION_NOTE = """
+The request below was DICTATED and machine-transcribed, so it may read as \
+speech: id parts can arrive as separate words ("VOYN W0 APP CONTROL" means \
+the id VOYN-W0-APP-CONTROL — join them with hyphens, never invent a \
+different id), punctuation may be missing, and words may be misheard. Fix \
+only the transcription: do not add scope the owner did not ask for.
+"""
 
-def build_intake_prompt(text: str) -> str:
-    """The instruction sent to the model — pure string building, no I/O."""
-    return _PROMPT_TEMPLATE.format(text=text.strip())
+
+def build_intake_prompt(text: str, *, dictated: bool = False) -> str:
+    """The instruction sent to the model — pure string building, no I/O.
+
+    ``dictated`` adds the transcription caveat for voice intake (S6b); the
+    grammar itself is identical either way, because the line is judged by the
+    same parser no matter how the owner produced the words.
+    """
+    return _PROMPT_TEMPLATE.format(
+        text=text.strip(), dictation_note=_DICTATION_NOTE if dictated else ""
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

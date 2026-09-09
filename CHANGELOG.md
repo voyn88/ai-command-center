@@ -37,6 +37,43 @@ functional application milestones of `app.py`.
   unchanged) — only through this application-layer port, exactly like AIOS
   status.
 
+### Added — voice intake for the backlog (`VOYN-W0-APP-CONTROL-S6b`)
+
+- Decision (the task left the transcription engine open): transcription runs
+  **on the device** through the Web Speech API (`web/src/lib/voiceInput.ts`),
+  not through a server-side Whisper. The owner's iPhone and Mac already have
+  the recognizer, so a tailnet-only preprod gains voice with no model weights,
+  no audio upload and no new server dependency, and the PWA (S3) gets it
+  without a native shell. The decision is reversible: a Whisper route would
+  post to the same endpoint with the same `source` flag, and the part that is
+  actually hard is already server-side.
+- `command_center/db/voice_transcript.py`: the deterministic repair of
+  dictated domain terms — the trap the task record names. A recognizer has
+  never heard of this vocabulary, so it writes the namespace token as a
+  Russian word (`воин`/`война`/`вояж`), the priority as words (`пи ноль`) or
+  as the Cyrillic homoglyph `р0` that renders like `P0` and is refused by the
+  ASCII-only parser field, and the wave as `волна ноль`. A closed table fixes
+  those exactly; anything outside the table is left as dictated rather than
+  guessed at, and every substitution is reported as a `Correction`. Pure
+  module — no I/O, no model — so it is equally the normalizer for a later
+  server-side transcription path.
+- `POST /api/v1/backlog/intake/draft` accepts `source: "chat" | "voice"`
+  (default `chat`). A voice draft is repaired before the model sees it, is
+  given one extra prompt paragraph (a recognizer splits an id into separate
+  words — join them, never invent a new id), and returns a `transcript`
+  block: what was heard, what was written, and every correction. Typed text
+  is never repaired — a repair table must not edit words the owner actually
+  typed. No new route and no new credential: it is the same `http_auth`
+  boundary and the same `backlog:intake:draft` operation as S6a.
+- Tasks screen: a microphone button beside «Предложить», rendered only where
+  the browser has a recognizer (Firefox and locked-down WebViews keep the
+  typed path, no dead control). Dictated words land in the same text box the
+  owner would have typed into and stay editable; the corrections the server
+  made are shown above the proposed line; the same draft → confirm gate still
+  applies, because a transcript is a suggestion, not an instruction. Refused
+  microphone, silence and offline recognition each get their own message
+  (`web/src/lib/i18n.ts`, both languages).
+
 ### Added — chat-text backlog intake (`VOYN-W0-APP-CONTROL-S6a`)
 
 - `command_center/db/backlog_intake.py`: turns a free-text owner request into
