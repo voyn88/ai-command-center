@@ -152,12 +152,20 @@ def test_model_auth_allowlist_is_provider_specific(launcher, monkeypatch, tmp_pa
         launcher._validate_environment_file(env_file, "claude")
 
 
-def test_codex_keeps_inner_workspace_write_sandbox(launcher, tmp_path):
+def test_codex_development_profile_runs_without_its_inner_sandbox_inside_the_unit(launcher, tmp_path):
+    """Owner decision 2026-09-09: the systemd unit is the boundary; Codex's
+    bubblewrap on top mounted .git read-only and no commit could land. The
+    prompt is still terminated with `--` so it cannot pick a sandbox."""
     command = launcher._provider_command(_manifest(tmp_path))
-    assert command[command.index("--sandbox") + 1] == "workspace-write"
-    assert "danger-full-access" not in command
+    assert command[command.index("--sandbox") + 1] == "danger-full-access"
     assert command[-2] == "--"
     assert command[-1] == "make one local commit"
+
+
+def test_codex_read_only_profile_keeps_the_read_only_sandbox(launcher, tmp_path):
+    command = launcher._provider_command(_manifest(tmp_path, profile="read_only"))
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert "danger-full-access" not in command
 
 
 def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
@@ -177,8 +185,11 @@ def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
     ],
 )
 def test_root_launcher_provider_argv_cannot_drift_from_worker_policy(
-    launcher, tmp_path, executor, task_type
+    launcher, tmp_path, executor, task_type, monkeypatch
 ):
+    # The broker only ever runs under principal isolation; the worker's
+    # builder must produce the same argv in that mode.
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
     profile = agent_runner.profile_for_task_type(task_type)
     manifest = _manifest(
         tmp_path,
@@ -2110,6 +2121,34 @@ def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monke
     with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
         launcher._write_back_model_auth("claude", home)
     assert store.read_bytes() == old
+
+
+def test_agent_units_keep_proc_subset_pid_for_every_executor(launcher, monkeypatch, tmp_path):
+    """No executor needs /proc/sys: Codex runs without bubblewrap inside the
+    unit (see the danger-full-access test), so the tight subset stays."""
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *args, **kwargs: False)
+    for executor, profile in (("codex", "trusted_development"), ("codex", "read_only"), ("claude", "trusted_development")):
+        command = launcher._systemd_command(
+            _manifest(tmp_path, executor=executor, profile=profile), Path("/run/aicc-agent-homes/t"),
+            "aicc-agent-t.service", "aicc-agent-launcher@t.service", tmp_path.parent, tmp_path,
+        )
+        assert "--property=ProcSubset=pid" in command, (executor, profile)
+
+
+def test_agent_git_trusts_exactly_the_bound_workspace(launcher, monkeypatch, tmp_path):
+    """The workspace is worker-owned (nobody inside the agent's uid view); with
+    system/global git config disabled, only the command-line scope can carry
+    safe.directory, and it names /workspace alone."""
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *args, **kwargs: False)
+    command = launcher._systemd_command(
+        _manifest(tmp_path), Path("/run/aicc-agent-homes/t"), "aicc-agent-t.service",
+        "aicc-agent-launcher@t.service", tmp_path.parent, tmp_path,
+    )
+    assert "--setenv=GIT_CONFIG_NOSYSTEM=1" in command and "--setenv=GIT_CONFIG_GLOBAL=/dev/null" in command
+    assert "--setenv=GIT_CONFIG_COUNT=1" in command
+    assert "--setenv=GIT_CONFIG_KEY_0=safe.directory" in command
+    assert "--setenv=GIT_CONFIG_VALUE_0=/workspace" in command
+    assert not any(v.startswith("--setenv=GIT_CONFIG_VALUE_0=") and v != "--setenv=GIT_CONFIG_VALUE_0=/workspace" for v in command)
 
 
 def test_the_launcher_can_write_the_model_auth_store_it_writes_refreshed_tokens_into():
