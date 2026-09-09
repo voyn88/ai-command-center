@@ -93,5 +93,69 @@ Do not force this import to close the ticket. Either:
    actually run, at which point wiring `runtime/`'s (now-new) read calls to
    the pool is a real, small step inside that larger change.
 
-No source changes accompany this note. The two guard tests above were run
-unmodified to confirm current behavior; they were not touched.
+## Resolution — option 1, mechanised (2026-09-09)
+
+Option 1 was taken, with one change to it. "Already true and needs no change"
+was the finding, but it understated the risk: the property held only by
+convention. Nothing in the tree checked that a PostgreSQL connection came from
+the pool, so the survey above was accurate on the day it was written and had
+no way to stay accurate. The cost the item is worried about is real; the way it
+returns is not a store that forgot the pool, it is the *next* store, written by
+copying a driver example that says `psycopg.connect(dsn)`.
+
+`tests/architecture/pool_routing.py` and `test_pool_routing_fitness.py` turn
+the convention into a gate, with three rules over the AST of `command_center/`:
+
+1. **No unpooled connection** — no driver `connect()` call outside the one
+   declared exemption.
+2. **No second pool** — only `db/pool.py` may build one. `pool.open_pool()` at
+   startup is explicitly *not* a violation; reaching past it to
+   `adapter.open_pool()` or `psycopg_pool.ConnectionPool` is.
+3. **The fallback stays the pool** — a store that offers
+   `connection_factory=None` must still resolve `pool.connection()` when the
+   caller omits it. Rules 1 and 2 do not cover this: a store can lose the pool
+   without ever naming a driver, and every test injects a factory, so nothing
+   else would fail.
+
+The rules are keyed on what a name is *bound* to in the file, not on spelling,
+which is what keeps the desktop's several hundred Qt `signal.connect(...)`
+calls and `runtime/db/core.py`'s SQLite `db.connect(db_path)` out of the
+results while still catching `import psycopg as pg; pg.connect(dsn)`,
+`from psycopg import connect as _open`, and the `importlib.import_module`
+form. `sqlite3` is out of scope by design: the rule is about PostgreSQL's
+backend-per-connection cost, and the authority store has no pool to bypass.
+
+The gate imports no driver and no `command_center.db` module, so it runs in
+the serverless configuration — which, per `tests/db/mirror_discovery.py`, is
+exactly where the declaration checks are the only ones still running.
+
+Two findings from building it, both recorded in the tests rather than only
+here:
+
+- **One exemption exists and is pinned.**
+  `command_center/ops/credential_rotation.py` probes a *candidate* credential
+  before installing it. The pool is built from the credential currently in
+  force, so routing that probe through it would test the old password and
+  report the new one healthy. It is one connection per rotation, not per
+  query. `test_the_only_unpooled_connection_is_the_credential_probe` pins the
+  allow-list to exactly that file — including a check that removing the
+  exemption makes the file a violation again, so it cannot pass by having
+  quietly stopped connecting.
+- **Rule 3 asks only about a default the caller can omit.** The first draft
+  flagged `orchestrator/planner.py`, whose `Planner(connection_factory)` takes
+  the factory as a *required* argument; its caller in `db/cli.py` passes a
+  connection from `pool.connection()`. Satisfying the draft would have meant
+  either giving `Planner` a pool fallback nothing calls or exempting it by
+  name, both worse than narrowing the rule to the case it protects — the
+  behaviour a caller gets when it says nothing. A required factory is covered
+  by rules 1 and 2 at the caller, which is where the decision actually is.
+
+What this does **not** do is move a read onto the pool, because the survey
+above found none left to move, and it does not touch the SRV-01b gating. The
+`runtime/` half of the item stays option 2: still blocked, still tracked
+there. Verified by mutation rather than by the gate merely being green — a
+`psycopg.connect()` planted in `db/work_queue_read.py`, an
+`adapter.open_pool()` planted in `worker/__main__.py`, and `db/backlog_store.py`
+stripped of its fallback were each caught by the rule that owns them, and the
+tree restored after each. The two guard tests quoted above were re-run
+unmodified and still pass; they were not touched.
