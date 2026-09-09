@@ -691,6 +691,19 @@ def apply_runtime_retention(
         `BEGIN IMMEDIATE`/`COMMIT`, so the write lock is only ever held for one
         bounded batch — never for the whole backlog at once.
 
+    Batching is not free: the sweep used to be one transaction, so it was
+    all-or-nothing. It no longer is. If a batch raises (SQLITE_BUSY past the
+    retry budget, a full disk, a corrupt page), that batch rolls back but every
+    batch that already committed stays committed, and the return value — the
+    only place the count lives — is lost with the exception. Callers must read
+    a raised error as "an unknown number of rows, up to the whole backlog, may
+    already be gone", not as "nothing happened". Deleting *some* old terminal
+    events early is harmless in a way half-deleting live state would not be,
+    which is why this is an acceptable trade here and not a general one; the
+    next call simply resumes from what is left. `maintenance.archive_and_prune`
+    makes the same trade, but because it also writes a cold archive it can
+    afford to name the exact count and the backup that undoes the run.
+
     Does not VACUUM here — reclaiming disk is a separate, heavier, lock-holding
     operation the operator should run deliberately (see `maybe_apply_runtime_retention`).
     """

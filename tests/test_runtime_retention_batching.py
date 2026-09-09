@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import gzip
 import json
+import sqlite3
 import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -288,3 +289,69 @@ def test_batch_mismatch_rolls_back_only_its_own_batch(tmp_path, monkeypatch):
     assert str(sorted(archive_dir.glob("runtime-backup-*.db"))[-1]) in message
     # The failing batch is intact; only the first, already-committed one is gone.
     assert _event_count(db_path, old_run) == OLD_EVENTS - BATCH_SIZE
+
+
+def test_apply_runtime_retention_rejects_non_positive_batch_size(tmp_path):
+    """A non-positive `LIMIT` is unbounded in SQLite, so accepting one would
+    silently restore the single-sweep DELETE this function exists to prevent."""
+    db_path = tmp_path / "runtime.db"
+    _seed(db_path, old_events=1, fresh_events=0)
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="batch_size"):
+            db.apply_runtime_retention(db_path, retention_days=30, batch_size=bad)
+
+
+class _FailingDeleteConnection:
+    """Connection proxy whose `nth` DELETE raises the way a batch that outlasts
+    its busy budget would — injected past the first batch boundary."""
+
+    def __init__(self, conn, *, fail_on: int) -> None:
+        self._conn = conn
+        self._fail_on = fail_on
+        self._deletes = 0
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, parameters=()):
+        if sql.lstrip().upper().startswith("DELETE"):
+            self._deletes += 1
+            if self._deletes == self._fail_on:
+                raise sqlite3.OperationalError("database is locked")
+        return self._conn.execute(sql, parameters)
+
+
+def test_apply_runtime_retention_failure_keeps_committed_batches_and_resumes(
+    tmp_path, monkeypatch
+):
+    """Batching traded the all-or-nothing sweep for bounded ones, so a raise
+    part-way through is not a no-op: the batches that already committed stay
+    committed (and the count goes with the exception), and the next call
+    resumes from what is left rather than starting over."""
+    db_path = tmp_path / "runtime.db"
+    old_run, fresh_run = _seed(db_path, old_events=OLD_EVENTS, fresh_events=3)
+    original_connect = db.connect
+
+    @contextlib.contextmanager
+    def _failing_connect(path):
+        with original_connect(path) as conn:
+            yield _FailingDeleteConnection(conn, fail_on=3)
+
+    monkeypatch.setattr(db, "connect", _failing_connect)
+
+    with pytest.raises(sqlite3.OperationalError):
+        db.apply_runtime_retention(db_path, retention_days=30, batch_size=BATCH_SIZE)
+
+    monkeypatch.undo()
+    # Two batches committed before the third raised; the third rolled back.
+    assert _event_count(db_path, old_run) == OLD_EVENTS - 2 * BATCH_SIZE
+    assert _event_count(db_path, fresh_run) == 3
+
+    # The next call finishes the remainder instead of redoing the whole sweep.
+    removed = db.apply_runtime_retention(
+        db_path, retention_days=30, batch_size=BATCH_SIZE
+    )
+    assert removed == OLD_EVENTS - 2 * BATCH_SIZE
+    assert _event_count(db_path, old_run) == 0
+    assert _event_count(db_path, fresh_run) == 3
