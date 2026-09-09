@@ -581,8 +581,9 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next(tmp_path, monkey
     # Both lane-mutating timers are held before the FIRST lane mutation (the
     # legacy retirement) and released only after the LAST -- staged rollout
     # vs. rotate/self-deploy timers, live worker-01 (2026-09-08).
-    assert systemd.calls[0] == ("stop", "voyn-aicc-credential-rotation.timer")
-    assert systemd.calls[1] == ("stop", "voyn-aicc-self-deploy.timer")
+    stops = [call for call in systemd.calls if call[0] == "stop"]
+    assert stops[0] == ("stop", "voyn-aicc-credential-rotation.timer")
+    assert stops[1] == ("stop", "voyn-aicc-self-deploy.timer")
     assert systemd.calls[-2] == ("start", "voyn-aicc-credential-rotation.timer")
     assert systemd.calls[-1] == ("start", "voyn-aicc-self-deploy.timer")
     # The shared lock a tick honours even if it fires anyway is gone once the
@@ -1703,3 +1704,17 @@ def test_lane_inputs_probe_refuses_a_config_without_any_repository_path(tmp_path
     assert "project 'AICC' has no absolute repository_path" in real._lane_inputs_visible(1, 1002, str(tmp_path))
     (tmp_path / "project_config.json").write_text("not json", encoding="utf-8")
     assert "is not valid JSON" in real._lane_inputs_visible(1, 1002, str(tmp_path))
+
+
+def test_hold_skips_timers_that_are_not_installed_on_the_host():
+    """Installer integration (systemd container) has no rotation/self-deploy
+    timers; `systemctl stop` on a not-found unit fails, so the hold must skip
+    absent timers instead of refusing the whole rollout (main red since #873)."""
+    module = _module()
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states.pop("voyn-aicc-credential-rotation.timer", None)
+    systemd.states.pop("voyn-aicc-self-deploy.timer", None)
+
+    module.hold_lane_mutating_timers(systemd)
+
+    assert [call for call in systemd.calls if call[0] == "stop"] == []
