@@ -46,7 +46,11 @@ class PlanLimits:
     planner_lease_ttl_seconds: int = 300
     #: Per-tick dispatch cap, distinct from WIP: one tick must stay short.
     max_dispatches_per_tick: int = 4
-    timeout_seconds: int = 900
+    #: Wall-time envelope handed to each dispatched RUN. 900 s timed out 6 of
+    #: the first 68 isolated implementation runs on 2026-09-09 (VOYN-W0-AICC-
+    #: FLEET-LAST-MILE-PUBLISH); 45 min matches the launcher's own run bound
+    #: while staying under the 2 h repo lease horizon above.
+    timeout_seconds: int = 2700
     #: Per-tick cap on DEFER_TO_USER auto-resumes (VOYN-W0-AICC-DEFER-AUTO-
     #: RESUME). Bounded so a large parked backlog drains gradually across
     #: ticks instead of flooding OPEN in one; 0 disables the reconcile.
