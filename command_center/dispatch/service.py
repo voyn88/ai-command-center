@@ -125,6 +125,16 @@ def collect_queued_tasks(root: Path) -> list[QueuedTask]:
     return queued
 
 
+class UnattributableActiveRun(RuntimeError):
+    """A run is occupying a concurrency slot that cannot be charged to any
+    executor — either the row could not be read at all, or it is in an active
+    state with no usable `provider_id`.
+
+    This is a *capacity* failure, not a row to skip past. See
+    `active_by_executor` for why skipping it fails open.
+    """
+
+
 def active_by_executor(db_path: Path) -> dict[str, int]:
     """Count currently-active runs per executor, so per-agent concurrency
     limits account for work already in flight. Read-only.
@@ -134,8 +144,26 @@ def active_by_executor(db_path: Path) -> dict[str, int]:
     raises the effective concurrency ceiling to the full per-agent limit on top
     of however many runs are actually in flight but unreadable. `plan()` turns
     the failure into the `capacity_unknown` gate instead, which fails closed.
-    Individual malformed *rows* are still skipped (a row that cannot be read
-    is not a store that cannot be read).
+
+    The same reasoning applies one level down, to a single row, which is why an
+    unreadable or unattributable *active* row is not skipped either. Dropping it
+    does not under-report capacity conservatively — it under-reports it in the
+    one direction that hands out more concurrency, because the run keeps
+    occupying its slot whether or not this query can name the holder. Skipping
+    is only safe for rows that are provably idle, so:
+
+    * a row that cannot be read raises — an unreadable row cannot be shown to
+      be idle, so it cannot be dismissed as such;
+    * a row in an active state with a falsy `provider_id` raises — the slot is
+      occupied and no per-agent limit can be soundly enforced against it;
+    * a row in a non-active state is ignored regardless of its `provider_id`,
+      which is genuinely safe: it holds no slot to account for.
+
+    An empty `provider_id` is reachable despite the column's `NOT NULL DEFAULT
+    'claude_code'`: `runtime.db.execution.create_run` only rejects empty
+    provider ids when it is given a `provider_route`, and `''` satisfies NOT
+    NULL. Rare is not the same as impossible, and the failure direction here is
+    the unsafe one.
     """
     counts: dict[str, int] = {}
     with runtime_db.connect(db_path) as conn:
@@ -147,10 +175,18 @@ def active_by_executor(db_path: Path) -> dict[str, int]:
             # wire each executor to `providers.get_provider(id)`), so the run's
             # `provider_id` is the executor whose concurrency slot it occupies.
             executor = row["provider_id"]
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            raise UnattributableActiveRun(
+                "a run row could not be read; it cannot be assumed idle"
+            ) from exc
+        if state not in _ACTIVE_RUN_STATES:
             continue
-        if state in _ACTIVE_RUN_STATES and executor:
-            counts[executor] = counts.get(executor, 0) + 1
+        if not executor:
+            raise UnattributableActiveRun(
+                f"a run in state {state!r} has no provider_id; its concurrency "
+                "slot cannot be charged to any executor"
+            )
+        counts[executor] = counts.get(executor, 0) + 1
     return counts
 
 
@@ -214,7 +250,10 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # only the `run` read (a lock, a permissions change, schema drift, a file
     # swapped between the two calls) would otherwise plan against "nothing is
     # running" while the spend read looks perfectly healthy. See
-    # `active_by_executor` for why an empty map is not a safe stand-in.
+    # `active_by_executor` for why an empty map is not a safe stand-in — and
+    # why the same gate also catches `UnattributableActiveRun`, the row-level
+    # form of the identical fail-open (a run that holds a concurrency slot no
+    # executor can be charged for is not a row to skip past).
     capacity_unknown = False
     try:
         active = active_by_executor(resolved_db)

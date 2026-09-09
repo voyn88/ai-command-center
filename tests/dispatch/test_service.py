@@ -283,6 +283,104 @@ def test_active_by_executor_still_reads_a_healthy_store(tmp_path):
     assert service.active_by_executor(healthy) == {}
 
 
+def _insert_run(db_path: Path, *, state: str, provider_id: str) -> None:
+    """Write one `run` row directly, bypassing `create_run`.
+
+    Deliberately raw sqlite3 rather than `runtime_db.connect`: the row being
+    built is one `create_run` would refuse to build in this shape, and
+    `active_by_executor` only ever reads the `run` table, so the session/task
+    foreign keys are irrelevant to what is under test. Columns are derived from
+    `PRAGMA table_info` so a later migration adding a NOT NULL column does not
+    silently turn these tests into an INSERT error.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cols = conn.execute("PRAGMA table_info(run)").fetchall()
+        values: dict[str, object] = {}
+        for _cid, name, col_type, notnull, default, _pk in cols:
+            if not notnull or default is not None:
+                continue
+            if name == "state":
+                values[name] = state
+            elif name == "provider_id":
+                values[name] = provider_id
+            else:
+                values[name] = 0 if col_type.upper() == "INTEGER" else f"x-{name}"
+        values["provider_id"] = provider_id  # may carry a DEFAULT; set it anyway
+        names = ", ".join(values)
+        marks = ", ".join("?" for _ in values)
+        conn.execute(
+            f"INSERT INTO run ({names}) VALUES ({marks})", tuple(values.values())
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_active_by_executor_counts_an_attributable_active_run(tmp_path):
+    # Negative control for the two tests below: a well-formed active run is
+    # counted against its executor, so refusing an unattributable one cannot be
+    # mistaken for refusing everything.
+    db = tmp_path / "runtime.db"
+    runtime_db.migrate(db)
+    _insert_run(db, state="RUNNING", provider_id="ollama")
+
+    assert service.active_by_executor(db) == {"ollama": 1}
+
+
+def test_active_by_executor_refuses_an_active_run_it_cannot_attribute(tmp_path):
+    # The row-level form of the fail-open this task exists to close. A run in an
+    # active state with no `provider_id` is occupying a concurrency slot that
+    # cannot be charged to anyone; skipping it (the old `and executor` guard)
+    # reports that slot as free, which *raises* the effective per-agent ceiling
+    # by exactly the work it failed to attribute. `NOT NULL DEFAULT
+    # 'claude_code'` does not prevent this: `create_run` only rejects empty
+    # provider ids when given a `provider_route`, and '' satisfies NOT NULL.
+    db = tmp_path / "runtime.db"
+    runtime_db.migrate(db)
+    _insert_run(db, state="RUNNING", provider_id="")
+
+    with pytest.raises(service.UnattributableActiveRun):
+        service.active_by_executor(db)
+
+
+def test_active_by_executor_ignores_an_idle_run_with_no_provider(tmp_path):
+    # The refusal is scoped to rows that actually hold a slot. A *terminal* run
+    # with no `provider_id` accounts for no in-flight work, so it must not gate
+    # dispatch — otherwise one historical row would wedge the planner forever.
+    db = tmp_path / "runtime.db"
+    runtime_db.migrate(db)
+    _insert_run(db, state="SUCCEEDED", provider_id="")
+
+    assert service.active_by_executor(db) == {}
+
+
+def test_plan_fails_closed_on_an_unattributable_active_run(monkeypatch, tmp_path):
+    # End to end, with neither runtime.db read stubbed: the row-level refusal
+    # has to reach `plan()` as the `capacity_unknown` gate, not escape as an
+    # unhandled error and not get quietly counted as zero.
+    _enable_master_switch()
+    _free_local_pool(monkeypatch)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+
+    db = tmp_path / "runtime.db"
+    runtime_db.migrate(db)
+    _insert_run(db, state="RUNNING", provider_id="")
+
+    plan = service.plan(ROOT, db_path=db)
+
+    assert plan.budget_unknown is False  # the spend read is fine; capacity is not
+    assert plan.capacity_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_CAPACITY_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
 def _free_local_pool(monkeypatch):
     """The default-shaped pool from the bug report: one free, available, local
     executor — the configuration in which a simulated spend figure can never
