@@ -189,6 +189,14 @@ def _backlog_tasks(
     to the approved/not-approved Next/Backlog split below, with no
     IN_PROGRESS/READY_TO_REVIEW/DONE distinction, until that gap is closed
     (see docs/adr/0011-backlog-projection-bidirectional-bridge.md).
+
+    Freshness is likewise not surfaced here: a generated file states its own
+    render time (`projection.stamp`, which the console's Master Backlog panel
+    now shows instead of `mtime`), but these task records carry no field for
+    it, so a desktop client reading a file whose export tick died sees stale
+    tasks with nothing to say so. Naming a signal to plumb, not a missing
+    parser — closing it is the gateway contract's own change, not this
+    function's.
     """
     projection = backlog_client.load_projection(backlog_path)
     rich = backlog_client.load_rich_records(backlog_path)

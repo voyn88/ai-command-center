@@ -205,12 +205,61 @@ def test_a_rendering_is_recognised_as_generated_and_an_authored_file_is_not():
 
     quoted_deep_in_a_body = (
         "# VOYN master backlog\n\n"
-        + "filler\n" * backlog_export._HEADER_SCAN_LINES
+        + "filler\n" * backlog_client.HEADER_SCAN_LINES
         + "- **VOYN-W0-BO-S4** | Wave 0 | OPEN | P0 | "
         + f"{backlog_export.GENERATED_MARKER}\n"
         + f"  {backlog_export.GENERATED_MARKER}\n"
     )
     assert backlog_export.is_generated_projection(quoted_deep_in_a_body) is False
+
+
+def test_the_header_stamp_is_readable_by_the_projection_reader(tmp_path):
+    """The stamp is not decoration for a human — it is the freshness signal the
+    console shows (`Projection.stamp`, `master_backlog_panel._render_freshness`).
+    So it is not enough that the header *mentions* a render time: the real
+    rendered file has to parse back through `backlog_client.parse_generated_stamp`
+    at the exact clock and row count it was rendered with.
+
+    This is the guard against the failure the whole stamp exists to prevent
+    recurring in a new form. Reword the header so the stamp stops parsing, and
+    nothing breaks loudly: `parse_generated_stamp` returns None, the panel
+    silently falls back to mtime, and a projection whose tick died reads as
+    fresh the moment it is copied anywhere -- exactly the 2026-08-20-file-on-a-
+    2026-09-03-console failure, restored quietly."""
+    text = backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
+    stamp = backlog_client.parse_generated_stamp(text)
+    assert stamp == backlog_client.GeneratedStamp(
+        rendered_at=_GENERATED_AT, row_count=len(_ROWS)
+    )
+
+    # ... and through the whole read path the console actually calls, so the
+    # stamp's position in the file (inside the header scan bound) is pinned too.
+    rendered = tmp_path / "VOYN_TASKS_BACKLOG.md"
+    rendered.write_text(text, encoding="utf-8")
+    projection = backlog_client.load_projection(rendered)
+    assert projection.stamp == stamp
+    # A file straight off the tick agrees with its own header by construction;
+    # this is the baseline the panel's "edited after render" warning fires
+    # against.
+    assert backlog_client.stamp_matches_content(projection) is True
+
+
+def test_an_empty_store_still_renders_a_readable_stamp(tmp_path):
+    """The zero-row render is the one most likely to be mistaken for a broken
+    file, so it has to be the most legible: a stamp saying "0 rows, just now"
+    distinguishes an empty store from a dead tick, which is the whole
+    distinction this header exists to make."""
+    rendered = tmp_path / "empty.md"
+    rendered.write_text(
+        backlog_export.render_projection([], generated_at=_GENERATED_AT),
+        encoding="utf-8",
+    )
+    projection = backlog_client.load_projection(rendered)
+    assert projection.stamp == backlog_client.GeneratedStamp(
+        rendered_at=_GENERATED_AT, row_count=0
+    )
+    assert projection.records == []
+    assert backlog_client.stamp_matches_content(projection) is True
 
 
 def test_the_generated_marker_is_the_line_the_header_actually_carries():
@@ -223,7 +272,7 @@ def test_the_generated_marker_is_the_line_the_header_actually_carries():
     ).splitlines()
     assert backlog_export.GENERATED_MARKER in lines
     position = lines.index(backlog_export.GENERATED_MARKER)
-    assert position < backlog_export._HEADER_SCAN_LINES
+    assert position < backlog_client.HEADER_SCAN_LINES
 
 
 def _task(task_id: str, **overrides) -> ParsedTask:

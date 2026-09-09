@@ -40,6 +40,12 @@ see ``docs/adr/0011-backlog-projection-bidirectional-bridge.md`` for the
 condition and 2026-11-01 date under which the import side retires and this
 file becomes purely generated output.
 
+A generated file also carries a header stamping when it was rendered and from
+how many store rows; ``load_projection`` reads it into ``Projection.stamp``, so
+a reader can tell a live projection from one whose export tick died without
+trusting ``mtime`` — which any copy of the file resets to now. See the
+"Generated-projection header" section below.
+
 The master file lives outside this repo (it belongs to the Backlog Engine
 project), so its path is *configuration*, resolved exactly like every other
 runtime location — an explicit argument, else the ``AICC_MASTER_BACKLOG``
@@ -54,6 +60,7 @@ import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 # --- Wire format ------------------------------------------------------------
@@ -93,6 +100,122 @@ FIELD_SEP = " | "
 #: Only records at this status are handed to executors (backlog rule: "Clod
 #: исполняет только записи со статусом ``PO-Approved``").
 STATUS_APPROVED = "PO-Approved"
+
+
+# --- Generated-projection header ---------------------------------------------
+#
+# Since BO-S4 this file is normally *rendered* rather than authored, and the
+# rendering stamps its own age and size into its header
+# (``command_center/db/backlog_export.py``). That stamp is a format contract
+# between the writer and every reader, so — exactly like ``RECOMMENDATION_FIELDS``
+# above — it is defined here, on the reading side, and the exporter renders
+# through it; the two cannot drift into a stamp nobody can read.
+#
+# The stamp exists because the freshness signal we had *lies*. ``mtime`` is a
+# property of the filesystem, not of the text: ``cp``, ``scp``, a checkout, a
+# container build, an editor's save-in-place all reset it to now, so a
+# projection rendered two weeks ago reads as seconds old the moment it moves
+# host. That is precisely the failure BO-S4 was opened for — a console booted
+# 2026-09-03 rendering a file that stopped being true on 2026-08-20, with
+# nothing on screen to say so — and mtime is structurally unable to close it,
+# because on the reader's host the file really was written seconds ago. An age
+# written *into* the text travels with the text.
+
+#: How far into a file a header claim still counts as that file's own header.
+#: Bounded on purpose, and shared by both readers of this header (this module,
+#: and ``backlog_export.is_generated_projection`` on the import side): the
+#: owner's hand-authored backlog legitimately *describes* the exporter inside a
+#: task body — BO-S4 is a task in that very file — and a body quoting one of
+#: these lines must never be mistaken for the file's own provenance claim.
+HEADER_SCAN_LINES = 20
+
+#: UTC, second precision, explicit ``Z``: one unambiguous zone, so two ticks'
+#: stamps are directly comparable and neither is ambiguous about which clock it
+#: means.
+_STAMP_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+#: The whole-line shape of the stamp. Anchored at both ends and never matched as
+#: a substring (machine-fields rule), so prose that merely mentions a render time
+#: is not read as one.
+_GENERATED_STAMP = re.compile(
+    r"^Rendered (?P<at>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) "
+    r"from (?P<rows>\d+) task row\(s\)$"
+)
+
+#: Three consecutive missed ticks of ``aicc-backlog-export.timer`` (5 min).
+#: One missed tick is normal jitter — the timer's own ``AccuracySec``, a slow
+#: query, a restart — and alarming on it would train the owner to ignore the
+#: alarm. Three in a row is not jitter.
+PROJECTION_STALE_AFTER = timedelta(minutes=15)
+
+
+@dataclass(frozen=True)
+class GeneratedStamp:
+    """A generated projection's own claim about when it was rendered and from
+    how many store rows.
+
+    Read straight out of the file's header, so it survives every copy that
+    destroys ``mtime`` — which is the entire point of it existing.
+    """
+
+    rendered_at: datetime
+    row_count: int
+
+    def age(self, now: datetime) -> timedelta:
+        """How far behind ``now`` this rendering is. Negative if the writer's
+        clock runs ahead of the reader's, which is reported as-is rather than
+        clamped: a projection stamped in the future is a real problem (two hosts
+        disagreeing about the time) and hiding it behind ``max(0, ...)`` would
+        make it look perfectly fresh forever."""
+        return now - self.rendered_at
+
+    def is_stale(
+        self, now: datetime, limit: timedelta = PROJECTION_STALE_AFTER
+    ) -> bool:
+        """Whether the export tick that writes this file has stopped."""
+        return self.age(now) > limit
+
+
+def render_generated_stamp(rendered_at: datetime, row_count: int) -> str:
+    """The header's one machine-readable line, rendered.
+
+    ``backlog_export`` interpolates the result into its header rather than
+    formatting the line itself, so the exporter cannot reword the one line this
+    module parses without this function changing too.
+    """
+    stamped = rendered_at.astimezone(UTC).strftime(_STAMP_TIME_FORMAT)
+    return f"Rendered {stamped} from {row_count} task row(s)"
+
+
+def parse_generated_stamp(text: str) -> GeneratedStamp | None:
+    """The stamp a ``backlog-export`` rendering carries, or ``None`` for a file
+    that makes no such claim.
+
+    ``None`` is the normal answer for the owner's hand-authored backlog, which
+    has no tick behind it and therefore no cadence to be late against; a caller
+    showing freshness falls back to ``mtime`` for that file. Only the header is
+    scanned, for the reason on ``HEADER_SCAN_LINES``.
+
+    A line that is stamp-shaped but not a real moment (``2026-13-45T99:99:99Z``
+    — the regex constrains digit counts, not calendars) is skipped rather than
+    raised. This module's contract is that a malformed file degrades the read,
+    never crashes it; ``load_projection`` calls this on every file it opens,
+    including the owner's own, so a single mistyped character in a header must
+    not take the whole Master Backlog page down.
+    """
+    for line in text.splitlines()[:HEADER_SCAN_LINES]:
+        match = _GENERATED_STAMP.match(line.strip())
+        if match is None:
+            continue
+        try:
+            rendered_at = datetime.strptime(match["at"], _STAMP_TIME_FORMAT)
+        except ValueError:
+            continue
+        return GeneratedStamp(
+            rendered_at=rendered_at.replace(tzinfo=UTC),
+            row_count=int(match["rows"]),
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -155,6 +278,13 @@ class Projection:
     ``source_mtime`` is the file's modification time at read; the caller re-reads
     to get a fresh projection, which is what makes the view "live" without ACC
     ever holding its own copy of the truth.
+
+    ``stamp`` is the *file's own* claim about its age (``GeneratedStamp``), set
+    when the file is a ``backlog-export`` rendering and ``None`` when it is
+    hand-authored. Prefer it over ``source_mtime`` wherever both exist: mtime
+    describes when this host last touched these bytes, ``stamp`` describes when
+    the store they mirror was actually read, and only the second survives the
+    copy that moved the file here.
     """
 
     records: list[BacklogRecommendation] = field(default_factory=list)
@@ -162,6 +292,7 @@ class Projection:
     source_path: Path | None = None
     source_mtime: float | None = None
     exists: bool = False
+    stamp: GeneratedStamp | None = None
 
 
 def _is_record_line(stripped: str) -> bool:
@@ -238,7 +369,32 @@ def load_projection(path: str | os.PathLike[str] | None = None) -> Projection:
         source_path=resolved,
         source_mtime=resolved.stat().st_mtime,
         exists=True,
+        stamp=parse_generated_stamp(text),
     )
+
+
+def stamp_matches_content(projection: Projection) -> bool | None:
+    """Whether a generated projection still holds as many record lines as its
+    header says it was rendered with. ``None`` when there is no stamp to check
+    against.
+
+    For a file straight off an export tick this is true by construction — the
+    header's count is ``len(rows)`` and the body is one line per row — so a
+    mismatch means record lines were added or removed after rendering. That is
+    a partial detector for ADR-0011's one convention that is otherwise
+    unenforceable ("the owner must not edit the generated file directly"):
+    it catches inserted and deleted records, and does *not* catch a field
+    edited in place, which changes no count. Partial, and worth having: the
+    edit it catches is the one that silently changes what the panel totals.
+
+    Errors count toward the total on purpose. A line the parser rejects is
+    still a line that was rendered; excluding them would report every
+    unreadable record as a missing one and confuse two different problems.
+    """
+    if projection.stamp is None:
+        return None
+    present = len(projection.records) + len(projection.errors)
+    return projection.stamp.row_count == present
 
 
 def approved_recommendations(

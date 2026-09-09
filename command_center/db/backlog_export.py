@@ -16,11 +16,16 @@ an argument, not a ``now()`` read inside), regenerated whole on every run,
 never merged with the previous file, and carrying a header that says so —
 editing the output is editing a rendering, not the backlog. That header
 also stamps when the file was rendered and from how many rows, so a reader
-holding only the text can tell a live projection from one whose tick died;
-and it carries ``GENERATED_MARKER``, the line ``backlog-import`` uses to
-refuse importing a rendering back into the store (``is_generated_projection``)
-instead of accepting it as an authored file and reporting a successful
-zero-task import.
+holding only the text can tell a live projection from one whose tick died —
+machine-readably, not just to a human: the stamp's format belongs to
+``backlog_client`` (``render_generated_stamp``/``parse_generated_stamp``),
+which renders it here and reads it back into ``Projection.stamp``, so the
+console's freshness metric shows the file's own age instead of an ``mtime``
+that any copy of the file resets to now. The header also carries
+``GENERATED_MARKER``, the line ``backlog-import`` uses to refuse importing a
+rendering back into the store (``is_generated_projection``) instead of
+accepting it as an authored file and reporting a successful zero-task
+import.
 
 The format is not ours to choose: ``backlog_client.parse_recommendations``
 is the one consumer contract (exactly ``RECOMMENDATION_FIELDS`` in exactly
@@ -129,13 +134,6 @@ _STATUS_NOT_YET_APPROVED = "PO-Review"
 #: disarm that refusal.
 GENERATED_MARKER = "This file is RENDERED from the canonical PostgreSQL backlog store"
 
-#: How far into a file ``GENERATED_MARKER`` still counts as the file's own
-#: provenance claim. Bounded on purpose: the owner's hand-authored backlog
-#: legitimately *describes* this exporter inside a task body — BO-S4 is a task
-#: in that very file — and a body quoting the sentence must not make the whole
-#: authored file unimportable. Either it is in the header or it is prose.
-_HEADER_SCAN_LINES = 20
-
 
 def _utc_stamp(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -152,6 +150,13 @@ def _header(generated_at: datetime, row_count: int) -> str:
     survive a copy, an scp or a checkout, and it is invisible to the owner
     reading the rendered markdown in an editor, which is exactly the audience
     BO-S4 renders this file for. A stamp inside the file travels with it.
+
+    The stamp line is rendered by ``backlog_client.render_generated_stamp``
+    rather than formatted here, because it is not prose: it is the one line of
+    this header a machine reads back (``backlog_client.parse_generated_stamp``,
+    into ``Projection.stamp``, which is what the console's freshness metric now
+    shows). Writing it on both sides would let a reworded header quietly stop
+    parsing while still looking right to a human.
     """
     return (
         "# VOYN master backlog — generated projection\n"
@@ -160,11 +165,12 @@ def _header(generated_at: datetime, row_count: int) -> str:
         "(`backlog_task`); it is regenerated whole and never read back. Do not\n"
         "edit: changes here change a rendering, not the backlog.\n"
         "\n"
-        f"Rendered {_utc_stamp(generated_at)} from {row_count} task row(s) by\n"
-        "`backlog-export` (aicc-backlog-export.timer, every 5 minutes). If that\n"
-        "stamp is far behind the current time, the export tick has stopped and\n"
-        "every record below is stale — check the timer on the control host\n"
-        "rather than trusting what follows.\n"
+        f"{backlog_client.render_generated_stamp(generated_at, row_count)}\n"
+        "\n"
+        "Written by `backlog-export` (aicc-backlog-export.timer, every 5\n"
+        "minutes). If the stamp above is far behind the current time, the export\n"
+        "tick has stopped and every record below is stale — check the timer on\n"
+        "the control host rather than trusting what follows.\n"
         "\n"
         "## 0B. Machine records\n"
         "\n"
@@ -177,9 +183,11 @@ def is_generated_projection(text: str) -> bool:
 
     Exists for the import direction: ``backlog-import`` refuses a file this
     returns True for. Matches the marker as a whole line (never a substring)
-    and only within the header, for the reasons on the two constants above.
+    and only within the header — ``backlog_client.HEADER_SCAN_LINES``, the same
+    bound the read side applies to the stamp line, so the two readers of this
+    header agree on where it ends; the constant carries the reasoning.
     """
-    head = text.splitlines()[:_HEADER_SCAN_LINES]
+    head = text.splitlines()[: backlog_client.HEADER_SCAN_LINES]
     return any(line.strip() == GENERATED_MARKER for line in head)
 
 

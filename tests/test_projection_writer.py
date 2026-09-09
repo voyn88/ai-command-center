@@ -7,8 +7,6 @@ that guarantee directly, independent of the backlog domain."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from command_center import projection_writer

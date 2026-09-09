@@ -96,10 +96,30 @@ would have *succeeded* — parsing zero tasks, printing
 reported a healthy publish every five minutes while nothing the owner typed
 reached the store. A repointed path now fails loudly on the first tick. The
 other half — the owner editing the generated file in place — stays a
-convention: those edits are overwritten by the next export tick and leave no
-trace to detect. The rendered header says so at the top of the file, and now
-also stamps when it was rendered and from how many rows, so a reader holding
-only the text can tell a live projection from one whose tick has died.
+convention, but is no longer entirely undetectable. The rendered header says
+"do not edit" at the top of the file, and stamps when it was rendered and from
+how many store rows; both halves of that stamp are now read by machine
+(`backlog_client.parse_generated_stamp` → `Projection.stamp`), not just by a
+human scrolling past:
+
+- The render time is what the console's freshness metric shows, replacing the
+  file's `mtime`. That substitution is the point: `mtime` answers "when did
+  *this host* last write these bytes" and is reset to now by any `cp`, `scp`,
+  checkout or container build, so a projection whose export tick died a week
+  ago reads as seconds old the moment it moves — the same silent staleness
+  this ADR's export half was built to end, re-entering through the freshness
+  indicator itself. A stamp inside the text travels with the text. Past
+  `PROJECTION_STALE_AFTER` (15 min = three missed ticks; one missed tick is
+  ordinary jitter and alarming on it would train the owner to ignore the
+  alarm) the panel says the tick is dead instead of showing an age.
+- The row count gives the convention a partial enforcement it did not have.
+  A file straight off a tick carries exactly as many record lines as its
+  header claims, so a count that no longer matches means record lines were
+  added or removed after the render, and the panel says the file was edited.
+  This catches inserted and deleted records; it does *not* catch a field
+  edited in place, which changes no count. Partial, and stated as partial —
+  the convention still stands, it is simply no longer trace-free in the case
+  where a hand edit changes what the panel totals.
 
 ## Decision
 

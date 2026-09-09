@@ -10,6 +10,8 @@ degrades to an empty-but-usable projection when the master store is absent.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from command_center import backlog_client as bc
@@ -173,6 +175,193 @@ def test_filter_records_search_and_facets():
     assert bc.filter_records(records, query="dashboard", domain="api") == []
 
 
+# --- The generated projection's own render stamp -----------------------------
+#
+# Since BO-S4 this file is normally rendered by `backlog-export`, and the
+# rendering stamps its own age into its header. These pin the reading half of
+# that contract; `tests/db/test_backlog_export.py` pins that the exporter's
+# header really carries a line this side can read.
+
+
+def _stamped(rendered_at: str, rows: int, *, body: str = _REC) -> str:
+    """A file shaped like a real export header: title, marker prose, stamp."""
+    return "\n".join(
+        [
+            "# VOYN master backlog — generated projection",
+            "",
+            "This file is RENDERED from the canonical PostgreSQL backlog store",
+            "(`backlog_task`); it is regenerated whole and never read back.",
+            "",
+            f"Rendered {rendered_at} from {rows} task row(s)",
+            "",
+            "## 0B. Machine records",
+            "",
+            body,
+        ]
+    )
+
+
+def test_the_render_stamp_round_trips_through_its_own_renderer():
+    """`render_generated_stamp` and `parse_generated_stamp` are two halves of
+    one line format; if either drifts the stamp goes quietly unreadable and the
+    console silently falls back to mtime — the exact signal BO-S4 replaced."""
+    moment = datetime(2026, 9, 9, 6, 30, tzinfo=timezone.utc)
+    line = bc.render_generated_stamp(moment, 394)
+    assert line == "Rendered 2026-09-09T06:30:00Z from 394 task row(s)"
+    parsed = bc.parse_generated_stamp(line)
+    assert parsed == bc.GeneratedStamp(rendered_at=moment, row_count=394)
+
+
+def test_the_stamp_is_rendered_in_utc_whatever_the_writers_zone():
+    """Two hosts' stamps have to be comparable, and a reader must never have to
+    guess which clock a stamp means."""
+    moment = datetime(2026, 9, 9, 6, 30, tzinfo=timezone.utc)
+    elsewhere = moment.astimezone(timezone(timedelta(hours=5)))
+    line = bc.render_generated_stamp(elsewhere, 1)
+    assert line == bc.render_generated_stamp(moment, 1)
+    assert bc.parse_generated_stamp(line).rendered_at == moment
+
+
+def test_an_authored_file_carries_no_stamp():
+    """`None`, not an exception and not a fabricated age: the owner's own
+    backlog has no export tick behind it, so it has no cadence to be late
+    against and the caller falls back to mtime for it."""
+    assert bc.parse_generated_stamp(_REC) is None
+    assert bc.parse_generated_stamp("") is None
+
+
+def test_a_stamp_quoted_deep_in_a_body_is_not_the_files_own_claim():
+    """Bounded to the header for the same reason the import-side marker check
+    is: the authored backlog legitimately *describes* this machinery inside a
+    task body, and prose that quotes a stamp must not make the file claim to
+    be a rendering."""
+    quoted = "\n".join(
+        ["# VOYN master backlog"]
+        + ["filler"] * bc.HEADER_SCAN_LINES
+        + ["Rendered 2026-09-09T06:30:00Z from 394 task row(s)"]
+    )
+    assert bc.parse_generated_stamp(quoted) is None
+
+
+def test_a_stamp_shaped_sentence_is_not_matched_as_a_substring():
+    """Machine-fields rule: whole line or nothing. A header sentence that
+    merely mentions a render time is prose, not a claim."""
+    prose = "See: Rendered 2026-09-09T06:30:00Z from 394 task row(s) is the shape."
+    assert bc.parse_generated_stamp(prose) is None
+
+
+def test_a_stamp_shaped_line_that_is_not_a_real_moment_degrades_the_read(tmp_path):
+    """The regex pins digit counts, not calendars, so `2026-13-45T99:99:99Z` is
+    stamp-shaped and impossible. This module's whole contract is that a
+    malformed file is *reported or ignored*, never fatal — and `load_projection`
+    runs this on every file it opens, so one mistyped character in a header must
+    not take the Master Backlog page down with an unhandled ValueError."""
+    impossible = "Rendered 2026-13-45T99:99:99Z from 1 task row(s)"
+    assert bc.parse_generated_stamp(impossible) is None
+
+    f = tmp_path / "VOYN_TASKS_BACKLOG.md"
+    f.write_text(_stamped("2026-02-30T00:00:00Z", 1), encoding="utf-8")
+    proj = bc.load_projection(f)  # must not raise
+    assert proj.stamp is None
+    assert [r.issue_id for r in proj.records] == ["VOYN-W1-UI"]  # records still land
+
+
+def test_a_valid_stamp_after_an_impossible_one_still_wins(tmp_path):
+    """Skipping, not aborting: a broken line is not evidence that the rest of
+    the header is unreadable."""
+    text = "\n".join(
+        [
+            "# VOYN master backlog",
+            "Rendered 2026-13-45T00:00:00Z from 9 task row(s)",
+            "Rendered 2026-09-09T06:30:00Z from 1 task row(s)",
+        ]
+    )
+    assert bc.parse_generated_stamp(text) == bc.GeneratedStamp(
+        rendered_at=datetime(2026, 9, 9, 6, 30, tzinfo=timezone.utc), row_count=1
+    )
+
+
+def test_load_projection_reads_the_stamp_out_of_a_generated_file(tmp_path):
+    f = tmp_path / "VOYN_TASKS_BACKLOG.md"
+    f.write_text(_stamped("2026-09-09T06:30:00Z", 1), encoding="utf-8")
+    proj = bc.load_projection(f)
+    assert proj.stamp == bc.GeneratedStamp(
+        rendered_at=datetime(2026, 9, 9, 6, 30, tzinfo=timezone.utc), row_count=1
+    )
+    assert [r.issue_id for r in proj.records] == ["VOYN-W1-UI"]
+
+
+def test_a_hand_authored_projection_has_no_stamp_and_still_reports_mtime(tmp_path):
+    f = tmp_path / "VOYN_TASKS_BACKLOG.md"
+    f.write_text(_REC, encoding="utf-8")
+    proj = bc.load_projection(f)
+    assert proj.stamp is None
+    assert proj.source_mtime is not None  # the fallback the panel still uses
+
+
+def test_staleness_is_measured_against_the_ticks_own_cadence():
+    """One missed 5-minute tick is jitter (AccuracySec, a slow query, a
+    restart); three in a row is a dead timer. The threshold has to sit between
+    those two, or the alarm is either useless or ignored."""
+    rendered = datetime(2026, 9, 9, 6, 30, tzinfo=timezone.utc)
+    stamp = bc.GeneratedStamp(rendered_at=rendered, row_count=1)
+    assert stamp.is_stale(rendered + timedelta(minutes=6)) is False
+    assert stamp.is_stale(rendered + timedelta(minutes=16)) is True
+    assert stamp.age(rendered + timedelta(minutes=16)) == timedelta(minutes=16)
+
+
+def test_a_stamp_from_the_future_is_reported_not_clamped():
+    """A projection stamped ahead of the reader's clock means two hosts
+    disagree about the time — a real problem. Clamping the age to zero would
+    render it as permanently, perfectly fresh instead."""
+    rendered = datetime(2026, 9, 9, 6, 30, tzinfo=timezone.utc)
+    stamp = bc.GeneratedStamp(rendered_at=rendered, row_count=1)
+    assert stamp.age(rendered - timedelta(hours=2)) == timedelta(hours=-2)
+    assert stamp.is_stale(rendered - timedelta(hours=2)) is False
+
+
+def test_a_stamp_disagreeing_with_the_record_count_is_reported(tmp_path):
+    """A generated file holds exactly as many record lines as its header says,
+    so a mismatch means lines were added or removed after the render — the one
+    trace ADR-0011's "do not edit the generated file" convention can leave.
+    Detects inserted/deleted records; an edit that changes a field in place
+    changes no count and is still invisible, which is why the ADR keeps calling
+    it a convention."""
+    f = tmp_path / "VOYN_TASKS_BACKLOG.md"
+    f.write_text(_stamped("2026-09-09T06:30:00Z", 1), encoding="utf-8")
+    assert bc.stamp_matches_content(bc.load_projection(f)) is True
+
+    deleted = tmp_path / "deleted.md"
+    deleted.write_text(_stamped("2026-09-09T06:30:00Z", 2), encoding="utf-8")
+    assert bc.stamp_matches_content(bc.load_projection(deleted)) is False
+
+    f.write_text(_stamped("2026-09-09T06:30:00Z", 1, body=_REC), encoding="utf-8")
+    assert bc.stamp_matches_content(bc.load_projection(f)) is True
+
+
+def test_an_unreadable_record_line_counts_as_present_not_missing():
+    """A line the parser rejects is still a line that was rendered. Counting
+    only good records would report every parse error a second time as a
+    phantom deleted row and blur two different problems together."""
+    broken = "- VOYN_RECOMMENDATION | ts=2026 | status=PO-Approved"
+    projection = bc.Projection(
+        records=bc.parse_recommendations(_REC).records,
+        errors=bc.parse_recommendations(broken).errors,
+        stamp=bc.GeneratedStamp(
+            rendered_at=datetime(2026, 9, 9, 6, 30, tzinfo=timezone.utc), row_count=2
+        ),
+    )
+    assert len(projection.errors) == 1
+    assert bc.stamp_matches_content(projection) is True
+
+
+def test_stamp_checks_are_inert_without_a_stamp():
+    """No stamp is not "mismatch": an authored file never had a row count to
+    disagree with, and reporting one would fire the panel's edited-file warning
+    on every hand-authored backlog."""
+    assert bc.stamp_matches_content(bc.Projection()) is None
+
+
 # --- UI page (Streamlit AppTest) -------------------------------------------
 
 
@@ -213,9 +402,81 @@ def test_page_renders_connected_projection_with_counts(monkeypatch, tmp_path):
     metric_values = {m.label: m.value for m in at.metric}
     assert metric_values["Всего записей"] == "2"
     assert metric_values["Approved"] == "1"
-    # Freshness/source surfaced.
+    # Freshness/source surfaced. This fixture is hand-authored -- no render
+    # stamp -- so the metric falls back to mtime and says so, rather than
+    # implying a tick stands behind a file that has none.
     assert "master store" in [m.value for m in at.metric]
+    assert "Актуальность (mtime)" in [m.label for m in at.metric]
     assert body  # smoke
+
+
+def _rendered_fixture(tmp_path, *, rendered_at, rows=1, name="VOYN_TASKS_BACKLOG.md"):
+    """A real `backlog-export` rendering, produced by the real exporter.
+
+    Handwriting the header here would test the panel against a fixture rather
+    than against the file production actually writes -- the drift the stamp's
+    single-definition format exists to prevent.
+    """
+    from command_center.db import backlog_export
+
+    store_rows = [
+        {
+            "task_id": f"VOYN-W0-AICC-EXPORTED-{index}",
+            "wave": "0",
+            "priority": "P0",
+            "status": "OPEN",
+            "title": f"exported row {index}",
+            "repo": "ai-command-center",
+            "updated_at": rendered_at,
+        }
+        for index in range(rows)
+    ]
+    f = tmp_path / name
+    f.write_text(
+        backlog_export.render_projection(store_rows, generated_at=rendered_at),
+        encoding="utf-8",
+    )
+    return f
+
+
+def test_page_shows_a_generated_projections_own_render_stamp(monkeypatch, tmp_path):
+    """For a rendered file the freshness metric must read the header, not the
+    filesystem: this fixture is written *now*, so mtime cannot distinguish it
+    from a stale one, and only the stamp carries the truth."""
+    fresh = datetime.now(timezone.utc)
+    at = _run_page(monkeypatch, _rendered_fixture(tmp_path, rendered_at=fresh))
+    assert not at.exception
+    labels = [m.label for m in at.metric]
+    assert "Актуальность (рендер)" in labels
+    assert "Актуальность (mtime)" not in labels
+    assert not at.error  # a fresh tick raises nothing
+
+
+def test_page_says_the_export_tick_is_dead_for_an_old_stamp(monkeypatch, tmp_path):
+    """The failure BO-S4 exists to end, reproduced exactly: a file written to
+    disk seconds ago (fresh mtime) whose content stopped being true long ago.
+    mtime called this fresh; the stamp has to call it dead."""
+    ancient = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    at = _run_page(monkeypatch, _rendered_fixture(tmp_path, rendered_at=ancient))
+    assert not at.exception
+    assert any("устарела" in str(e.value) for e in at.error)
+
+
+def test_page_flags_a_generated_file_edited_after_its_render(monkeypatch, tmp_path):
+    """Deleting a record line from a rendering leaves the header promising more
+    rows than the body holds -- the one trace ADR-0011's "do not edit the
+    generated file" convention can leave behind."""
+    path = _rendered_fixture(tmp_path, rendered_at=datetime.now(timezone.utc), rows=2)
+    kept = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if "VOYN-W0-AICC-EXPORTED-1" not in line
+    ]
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    at = _run_page(monkeypatch, path)
+    assert not at.exception
+    assert any("не совпадает со штампом" in str(w.value) for w in at.warning)
 
 
 def test_page_explains_when_backlog_not_connected(monkeypatch, tmp_path):
