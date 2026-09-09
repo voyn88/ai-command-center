@@ -558,3 +558,66 @@ def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeyp
 
     assert total == pytest.approx(5.5)
     assert "unparseable" in caplog.text
+
+
+def test_daily_spend_usd_refuses_costs_that_are_not_usable_dollar_figures(
+    tmp_path, monkeypatch, caplog
+):
+    """`json.loads` accepts the non-standard `NaN`/`Infinity` literals by
+    default, and either one silently destroys the spend cap.
+
+    A single `NaN` row makes the whole sum `NaN`, and `nan >= max_daily_spend
+    _usd` is `False` — so the cap stops gating for the entire trailing-24h
+    window with no error and no log line, which is precisely the failure this
+    task exists to remove, reached by a different route. An infinity is the
+    mirror image: the cap jams shut against spend nobody incurred. A negative
+    figure is not a spend either, and would silently hide real spend that
+    sits beside it. Each is refused *and logged*, and the well-formed rows
+    around it still add up."""
+
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor(self._rows)
+
+    rows = [
+        {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
+        {"payload": '{"type": "result", "total_cost_usd": NaN}'},
+        {"payload": '{"type": "result", "total_cost_usd": Infinity}'},
+        {"payload": {"type": "result", "total_cost_usd": -100.0}},
+        {"payload": {"type": "result", "total_cost_usd": "1.5"}},
+        # Matched by the `LIKE` prefilter without carrying a cost of its own:
+        # ordinary, and deliberately not logged as a problem.
+        {"payload": {"type": "assistant", "text": "total_cost_usd was asked"}},
+        {"payload": {"type": "result", "total_cost_usd": 3.5}},
+    ]
+
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn(rows)
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+    with caplog.at_level("WARNING"):
+        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+    # Finite, and every good row still counted.
+    assert total == pytest.approx(5.5)
+    # And the cap it feeds still works, which `nan` would have silently ended.
+    assert total >= 1.0
+
+    refused = [r.getMessage() for r in caplog.records if "total_cost_usd" in r.getMessage()]
+    assert len(refused) == 4
+    assert any("nan" in m.lower() for m in refused)
+    assert any("inf" in m.lower() for m in refused)
+    assert any("-100.0" in m for m in refused)
+    assert any("str" in m for m in refused)

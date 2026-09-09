@@ -2419,8 +2419,21 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     error and no log line — a spend cap that reads 0 stops gating without
     ever saying so. Only malformed JSON *text* is tolerated (and logged); a
     row of an unexpected shape is now visible instead of silently dropped.
+
+    A reported cost that is not a usable dollar figure — `NaN`, an infinity,
+    or a negative — is refused (and logged) rather than summed. `json.loads`
+    accepts the non-standard `NaN`/`Infinity` literals by default, and both
+    poison the total in exactly the way this task exists to stop: one `NaN`
+    row makes the whole sum `NaN`, and `nan >= max_daily_spend_usd` is
+    `False`, so the cap silently stops gating for the entire trailing-24h
+    window with no error and no log line — the original defect's signature,
+    reached by a different route. An infinity is the mirror image, jamming
+    the cap shut against a spend nobody actually incurred. Skipping the bad
+    row keeps the sum finite, keeps every other row counted, and leaves a log
+    line naming the row that was refused.
     """
     import json as _json
+    import math as _math
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
@@ -2454,6 +2467,25 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             )
             continue
         cost = payload.get("total_cost_usd")
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total += float(cost)
+        if cost is None:
+            # The `LIKE` prefilter matches on substring, so a payload can
+            # mention the key (nested, or in free text) without carrying a
+            # cost of its own. Nothing to add and nothing wrong: not logged.
+            continue
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            _LOG.warning(
+                "daily_spend_usd: ignoring run_event whose total_cost_usd is a "
+                "%s, not a number: %r",
+                type(cost).__name__,
+                cost,
+            )
+            continue
+        if not _math.isfinite(cost) or cost < 0:
+            _LOG.warning(
+                "daily_spend_usd: ignoring run_event with an unusable "
+                "total_cost_usd: %r",
+                cost,
+            )
+            continue
+        total += float(cost)
     return total
