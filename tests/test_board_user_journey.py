@@ -14,6 +14,7 @@ spend):
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -35,16 +36,16 @@ def _at(page_key: str = "execution_center", **session_state) -> AppTest:
     return at
 
 
-def _wait_until_finalized(db_path, run_id: str, *, timeout: float = 15.0) -> None:
+def _wait_until_finalized(db_path, run_id: str, *, timeout: float = 30.0) -> None:
     """Wait for the run's *last* write, not for the first one visible.
 
-    The relaunch below is supervised by the board's own
-    `ExecutionCenterAPI` singleton, not by this test's `api`, so
-    `Supervisor.wait_for_run` (an in-memory registry private to the launching
-    instance) reads "already settled" here and waits for nothing. The durable
-    counterpart is `finalized_at`, and it is written *after* the report row —
-    deliberately, so that "finalized" means the report and the auto-commit
-    already happened (see `db.execution.mark_run_finalized`).
+    The relaunch below is supervised by the board's own `ExecutionCenterAPI`
+    singleton, not by this test's `api`, so `Supervisor.wait_for_run` (an
+    in-memory registry private to the launching instance) reads "already
+    settled" here and waits for nothing. The durable counterpart is
+    `finalized_at`, and it is written *after* the report row — deliberately, so
+    that "finalized" means the report and the auto-commit already happened (see
+    `db.execution.mark_run_finalized`).
 
     This used to wait on `db.get_report(...) is not None` instead, and that
     marker is true while the supervising daemon thread is still finishing:
@@ -53,12 +54,29 @@ def _wait_until_finalized(db_path, run_id: str, *, timeout: float = 15.0) -> Non
     that directory, and roughly once in twenty runs SQLite recreated the WAL
     pair mid-`rmtree` — `OSError: [Errno 39] Directory not empty`, an ERROR at
     teardown, and a red shard (VOYN-W0-AICC-FLAKY-TEST-DATA-DIR-TEARDOWN-RACE).
+
+    `db.wait_for_run_finalized` is deliberately *not* used: it waits only for
+    the `finalized_at` stamp of a run that is already terminal, and returns the
+    row untouched the moment it sees a non-terminal state (see its docstring —
+    a caller in another process must not read "still RUNNING" as a reason to
+    block). The run here is still `RUNNING` when the relaunch returns, so that
+    call would come straight back and assert on a run that had not even
+    started finishing. Polling the same durable marker covers the whole
+    progression — `RUNNING` → terminal → finalized — which is the one that has
+    to be over before the data dir can be removed.
     """
-    run = runtime_db.wait_for_run_finalized(db_path, run_id, timeout=timeout)
-    assert run is not None, f"run {run_id!r} disappeared while waiting for it to finish"
-    assert run.get("finalized_at"), (
-        f"run {run_id!r} did not finish within {timeout}s (state={run['state']!r})"
-    )
+    deadline = time.monotonic() + timeout
+    while True:
+        run = runtime_db.get_run(db_path, run_id)
+        assert run is not None, f"run {run_id!r} disappeared while waiting for it to finish"
+        if run.get("finalized_at"):
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"run {run_id!r} was not finalized within {timeout}s "
+                f"(state={run['state']!r})"
+            )
+        time.sleep(0.05)
 
 
 # --------------------------------------------------------------------------
