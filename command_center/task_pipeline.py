@@ -2248,10 +2248,15 @@ def _locked_tick(
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
         status = daily_spend_status(api.db_path)
         if status.known:
+            # `known` is exactly "amount is a real reading" (see `SpendStatus`).
+            assert status.amount is not None
             spend_budget_exhausted = status.amount >= settings.max_daily_spend_usd
         else:
             spend_status_unknown = True
-            errors.append("daily_spend_budget: trailing-24h spend status unknown")
+            errors.append(
+                "daily_spend_budget: trailing-24h spend unreadable, status "
+                f"unknown ({status.error})"
+            )
     if (
         settings.auto_launch_active
         and not spend_budget_exhausted
@@ -2491,10 +2496,16 @@ class SpendStatus:
     caller must branch on `known` before ever looking at `amount`, never
     collapse "unknown" into a spend figure (a fabricated `0.0`) or into a
     budget verdict (VOYN-W0-AICC-REPORT-319: spend-unknown is not a verdict).
+
+    `error` carries *why* the read failed (`None` when it did not), so a caller
+    reporting the unknown state can say what went wrong instead of only that
+    something did -- the diagnostic detail an `except Exception` at the call
+    site used to keep, and the reason "unknown" is actionable at all.
     """
 
     known: bool
     amount: float | None
+    error: str | None = None
 
 
 def daily_spend_status(db_path: Path) -> SpendStatus:
@@ -2509,7 +2520,8 @@ def daily_spend_status(db_path: Path) -> SpendStatus:
     "budget exhausted").
     """
     try:
-        return SpendStatus(known=True, amount=daily_spend_usd(db_path))
+        return SpendStatus(known=True, amount=daily_spend_usd(db_path), error=None)
     except Exception as exc:  # noqa: BLE001 — any read failure => status unknown
-        _LOG.warning("daily_spend_usd read failed; spend status unknown: %s", exc)
-        return SpendStatus(known=False, amount=None)
+        detail = f"{type(exc).__name__}: {exc}"
+        _LOG.warning("daily_spend_usd read failed; spend status unknown: %s", detail)
+        return SpendStatus(known=False, amount=None, error=detail)

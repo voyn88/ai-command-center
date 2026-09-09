@@ -211,6 +211,58 @@ def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
     assert plan.as_dict()["projected_spend_usd"] is None
 
 
+def test_plan_reads_the_spend_through_the_shared_status_helper(monkeypatch, pool):
+    """VOYN-W0-AICC-REPORT-319: `plan()` must derive `budget_unknown` from
+    `task_pipeline.daily_spend_status` — the single place a read failure turns
+    into "unknown" — rather than wrapping `daily_spend_usd` in an
+    `except Exception` of its own. Two call sites each catching for themselves
+    is exactly how the plan and the pipeline's launch gate drifted into
+    disagreeing about what an unreadable spend means."""
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+
+    monkeypatch.setattr(
+        task_pipeline,
+        "daily_spend_status",
+        lambda *_a, **_k: task_pipeline.SpendStatus(
+            known=False, amount=None, error="RuntimeError: db unreachable"
+        ),
+    )
+
+    plan = service.plan(ROOT)
+
+    assert plan.budget_unknown is True
+    assert plan.daily_spend_usd is None
+    assert plan.assignments == ()
+    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+
+
+def test_plan_takes_the_amount_from_a_known_status(monkeypatch, pool):
+    """The mirror of the above: a `known` status is a real measurement and must
+    be reported as one, cap enforcement included."""
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    settings = pipeline_settings.load_settings(ROOT)
+    import dataclasses
+
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=5.0)
+    )
+    _queued_task(title="t1")
+
+    monkeypatch.setattr(
+        task_pipeline,
+        "daily_spend_status",
+        lambda *_a, **_k: task_pipeline.SpendStatus(known=True, amount=1.5),
+    )
+
+    plan = service.plan(ROOT)
+
+    assert plan.budget_unknown is False
+    assert plan.daily_spend_usd == 1.5
+
+
 def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
     _enable_master_switch()
     _spend_unavailable(monkeypatch)

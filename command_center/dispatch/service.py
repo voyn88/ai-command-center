@@ -6,7 +6,8 @@ never reimplementing them:
 * queued tasks       -> `tasks_repository.load_tasks` (single reader of the board)
 * executor pool      -> `executors.EXECUTORS` + their live availability probes
 * permitted per task -> `project_config.allowed_execution_providers`
-* daily spend        -> `task_pipeline.daily_spend_usd` (the trailing-24h primitive)
+* daily spend        -> `task_pipeline.daily_spend_status` (the trailing-24h
+                        primitive plus whether it could be read at all)
 * spend ceiling      -> `pipeline_settings.max_daily_spend_usd`
 * kill switch        -> `pipeline_settings.enabled` (the master switch the
                         `task_pipeline.kill_switch` sets off)

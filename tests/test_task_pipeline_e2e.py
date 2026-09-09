@@ -563,11 +563,31 @@ def test_daily_spend_status_unknown_is_not_reported_as_exhausted(
     status = task_pipeline.daily_spend_status(api.db_path)
     assert status.known is False
     assert status.amount is None
+    # The status carries *why*, so the tick can report a reason and not just
+    # that something went wrong.
+    assert "db unreachable" in (status.error or "")
 
     gated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert gated.launched() == []
     assert gated.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN
     assert gated.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+    # Failing closed silently is the other half of the bug: the tick must say
+    # the spend was unreadable, and say what the read failed with.
+    spend_errors = [e for e in gated.errors if e.startswith("daily_spend_budget:")]
+    assert spend_errors, gated.errors
+    assert "db unreachable" in spend_errors[0]
+    assert "unknown" in spend_errors[0]
+
+    # Once the read works again the same helper reports a real measurement, and
+    # a spend under the cap launches: "unknown" was a transient state, not a
+    # sticky verdict.
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", lambda *_a, **_k: 0.25)
+    recovered = task_pipeline.daily_spend_status(api.db_path)
+    assert (recovered.known, recovered.amount, recovered.error) == (True, 0.25, None)
+
+    ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
+    assert ungated.launch_status != task_pipeline.LAUNCH_SPEND_UNKNOWN
+    assert [d.task_id for d in ungated.launched()] == ["s"]
 
 
 def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeypatch, caplog):
