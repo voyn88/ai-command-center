@@ -43,6 +43,12 @@ Environment=AICC_DATA_DIR=/var/lib/aicc/data
 # a file, not GIT_CONFIG_COUNT/KEY/VALUE, because git's upload-pack child of
 # a local clone does not inherit the environment form (worker-01 2026-09-08).
 Environment=GIT_CONFIG_SYSTEM=/etc/aicc/gitconfig
+# gh (the publisher's `gh pr create`) reads the installation token from this
+# lane-only config dir; the AGENT's launcher points GH_CONFIG_DIR elsewhere,
+# so untrusted model code never holds it. No prompts: a missing token is a
+# legible failure, not a hang.
+Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
+Environment=GIT_TERMINAL_PROMPT=0
 Environment=AICC_WORKER_ENV_FILE=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=/etc/aicc/lease.env
 EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env

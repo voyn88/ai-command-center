@@ -16,3 +16,12 @@
 	directory = /home/voynadmin/Projects/ai-command-center/.git
 	directory = /home/voynadmin/Projects/aios
 	directory = /home/voynadmin/Projects/aios/.git
+
+# Lane git authentication: the GitHub App installation token the host timer
+# (voyn-aicc-github-token.timer) stores lane-readable; SSH remotes are
+# rewritten to HTTPS because the lanes hold no SSH key (ADR-0010).
+[credential]
+	helper = /usr/local/libexec/aicc-git-credential
+[url "https://github.com/"]
+	insteadOf = git@github.com:
+	insteadOf = ssh://git@github.com/
