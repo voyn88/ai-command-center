@@ -26,6 +26,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -133,6 +134,18 @@ def archive_and_prune(
                         handle.write(line + "\n")
                         digest.update(line.encode("utf-8"))
                         batch_archived += 1
+                    # Force this batch's archive bytes down to disk *before* the
+                    # COMMIT that erases the rows. Batching split the one
+                    # all-or-nothing transaction into many, so "the archive and
+                    # the deletion can never disagree" now has to be re-earned
+                    # per batch: without this, a hard kill after a batch commits
+                    # loses whatever was still sitting in the gzip/text buffers,
+                    # leaving rows deleted that no archive holds. `flush()` on
+                    # the gzip stream emits a Z_SYNC_FLUSH marker, so even a
+                    # trailer-less archive left by a kill decompresses up to the
+                    # last committed batch.
+                    handle.flush()
+                    os.fsync(handle.fileno())
                     ids = [row["id"] for row in rows]
                     id_placeholders = ",".join("?" for _ in ids)
                     batch_deleted = conn.execute(

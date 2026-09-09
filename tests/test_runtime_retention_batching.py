@@ -10,8 +10,10 @@ batch/transaction rather than a single unbounded sweep.
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import json
+import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -140,3 +142,61 @@ def test_archive_and_prune_rejects_non_positive_batch_size(tmp_path):
         maintenance.archive_and_prune(
             db_path, retention_days=30, archive_dir=tmp_path / "cold", batch_size=0
         )
+
+
+def _recoverable_archive_lines(archive_dir: Path) -> int:
+    """Lines readable from the (possibly trailer-less) archive on disk.
+
+    A crash leaves the gzip stream unterminated, so `gzip.open` would raise at
+    EOF; decompressing incrementally recovers everything flushed so far, which
+    is exactly what an operator would have left to restore from.
+    """
+    archives = sorted(archive_dir.glob("run-events-*.jsonl.gz"))
+    if not archives:
+        return 0
+    raw = archives[-1].read_bytes()
+    data = zlib.decompressobj(zlib.MAX_WBITS | 16).decompress(raw)
+    return data.decode("utf-8").count("\n")
+
+
+def test_archive_and_prune_archive_is_on_disk_before_each_batch_commits(
+    tmp_path, monkeypatch
+):
+    """Batching split one all-or-nothing transaction into many, so the module's
+    "archive and deletion can never disagree" invariant has to hold at *every*
+    commit point — not just at the end. A hard kill between batches must never
+    leave rows deleted that the archive on disk does not already hold.
+    """
+    db_path = tmp_path / "runtime.db"
+    old_run, _fresh_run = _seed(db_path, old_events=OLD_EVENTS, fresh_events=3)
+    archive_dir = tmp_path / "cold"
+
+    original = maintenance.transaction
+    observed: list[tuple[int, int]] = []
+
+    @contextlib.contextmanager
+    def _observing_transaction(conn):
+        with original(conn) as opened:
+            yield opened
+        # The batch is committed now; whatever it deleted must already be
+        # durable in the archive file.
+        observed.append(
+            (
+                OLD_EVENTS - _event_count(db_path, old_run),
+                _recoverable_archive_lines(archive_dir),
+            )
+        )
+
+    monkeypatch.setattr(maintenance, "transaction", _observing_transaction)
+
+    maintenance.archive_and_prune(
+        db_path,
+        retention_days=30,
+        archive_dir=archive_dir,
+        batch_size=BATCH_SIZE,
+    )
+
+    assert observed  # the wrapper actually ran
+    for deleted, archived_on_disk in observed:
+        assert archived_on_disk >= deleted, (deleted, archived_on_disk, observed)
+    assert observed[-1] == (OLD_EVENTS, OLD_EVENTS)
