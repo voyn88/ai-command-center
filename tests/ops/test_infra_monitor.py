@@ -406,3 +406,226 @@ def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(mo
     assert out["ok"] is True and out["findings_recorded"] is False
     assert "db down" in out["findings_error"]
     assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# The PR review-window reconciler, watched by its effect and not by its unit.
+#
+# VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL: the labeller had
+# never been installed on the control host, the window-gated workflows (CI,
+# Acceptance gate, boundary fitness) run on a PR only while it carries a
+# review-window label, and so every fleet PR opened with no CI whatsoever --
+# 24 of them, plus #907 on 2026-09-09 -- with nothing anywhere saying so. The
+# probe below is that missing alarm, and it is deliberately blind to WHY:
+# absent, disabled, crashing or out of GitHub quota all read the same.
+# ---------------------------------------------------------------------------
+
+_HOUR_AGO = "2026-09-09T20:00:00Z"
+_NOW = 1788988800.0  # 2026-09-09T21:20:00Z, an hour and twenty minutes later
+
+
+def _pr(number: int, labels: tuple[str, ...] = (), created: str = _HOUR_AGO) -> dict:
+    return {
+        "number": number,
+        "url": f"https://github.com/voyn/aicc/pull/{number}",
+        "createdAt": created,
+        "labels": [{"name": name} for name in labels],
+    }
+
+
+def _fleet(*numbers: int) -> frozenset[str]:
+    return frozenset(f"voyn/aicc/pull/{number}" for number in numbers)
+
+
+def test_an_unlabelled_fleet_pr_past_the_grace_period_is_a_finding() -> None:
+    """The exact live shape: an open PR the fleet opened, an hour old, with no
+    window label on it, while the reconciler is not running anywhere."""
+    snapshot = infra_monitor.PrWindowSnapshot(
+        unlabelled=infra_monitor.unlabelled_evidence_prs(
+            [_pr(907), _pr(906, ("review-window:waiting",))],
+            _fleet(906, 907),
+            now=_NOW,
+            labels=infra_monitor.window_label_names(),
+            grace_seconds=900,
+        ),
+        open_prs=2,
+        evidence_prs=2,
+        grace_seconds=900,
+    )
+
+    report = evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        pr_window=snapshot,
+    )
+
+    assert snapshot.unlabelled == ((907, 4800),)
+    assert not report.ok
+    (failure,) = report.failures
+    assert failure.startswith("pr_window_unlabelled:1_prs_oldest_4800s>900s:")
+    assert failure.endswith(":907")
+    # One finding for the reconciler however many PRs it has left unlabelled:
+    # the count is a measurement and measurements ride in the detail.
+    assert infra_monitor.finding_key(failure) == "pr_window_unlabelled"
+
+
+def test_a_labelled_young_or_unrelated_pr_is_not_a_finding() -> None:
+    """Three distinct reasons a missing label proves nothing: the reconciler
+    already labelled it (blocked is a label like any other), the PR is younger
+    than the grace period so no tick was due yet, and the PR is not the
+    fleet's -- somebody else's pull request is somebody else's business."""
+    unlabelled = infra_monitor.unlabelled_evidence_prs(
+        [
+            _pr(901, ("review-window:blocked",)),
+            _pr(902, created="2026-09-09T21:15:00Z"),
+            _pr(903),
+        ],
+        _fleet(901, 902),
+        now=_NOW,
+        labels=infra_monitor.window_label_names(),
+        grace_seconds=900,
+    )
+
+    assert unlabelled == ()
+
+
+def test_a_probe_that_could_not_measure_is_its_own_failure_class(monkeypatch) -> None:
+    """Fail closed, but say which thing failed: "gh is broken" and "the
+    reconciler is not labelling" want different fixes, and one must never be
+    filed as the other."""
+    monkeypatch.setattr(
+        infra_monitor,
+        "_open_prs",
+        lambda repo, limit: (_ for _ in ()).throw(RuntimeError("gh pr list failed: 403")),
+    )
+    monkeypatch.setattr(infra_monitor, "read_pr_evidence", frozenset)
+
+    snapshot = infra_monitor.read_pr_window_snapshot(
+        "/repo", grace_seconds=900, scan_limit=200
+    )
+    report = evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        pr_window=snapshot,
+    )
+
+    assert snapshot.unlabelled == () and "403" in snapshot.error
+    assert not report.ok
+    assert infra_monitor.finding_key(report.failures[0]) == "pr_window_probe_failed"
+
+
+def test_the_probe_matches_evidence_to_pull_requests_by_identity() -> None:
+    """The `pr` evidence a task recorded and the url `gh pr list` prints are
+    two spellings of one pull request. Comparing them raw would make a
+    trailing slash or a capitalised host empty the intersection silently --
+    a monitor reporting a healthy fleet because it matched nothing at all."""
+    assert (
+        infra_monitor.pr_identity("https://GitHub.com/Voyn/AICC/pull/907/")
+        == infra_monitor.pr_identity("https://github.com/voyn/aicc/pull/907")
+        == "voyn/aicc/pull/907"
+    )
+    assert infra_monitor.pr_identity("https://github.com/voyn/aicc/issues/907") is None
+    assert infra_monitor.pr_identity("") is None
+
+
+def test_the_probe_costs_one_github_request_and_is_off_by_default(monkeypatch) -> None:
+    """It shares a GraphQL quota with the review, merge and window ticks
+    themselves (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS), so it lists
+    once, fetches no per-PR detail, and asks for the OLDEST open PRs -- the
+    ones a missing label has hurt longest. A host that passes no repo runs it
+    at all."""
+    calls: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["cwd"] == "/repo"
+        return _Completed()
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", fake_run)
+    monkeypatch.setattr(infra_monitor, "read_pr_evidence", frozenset)
+
+    infra_monitor.read_pr_window_snapshot("/repo", grace_seconds=900, scan_limit=200)
+
+    assert len(calls) == 1
+    assert calls[0][:5] == ["gh", "pr", "list", "--state", "open"]
+    assert "sort:created-asc" in calls[0]
+    assert "--limit" in calls[0] and "200" in calls[0]
+    assert "statusCheckRollup" not in " ".join(calls[0])
+    assert infra_monitor.build_parser().parse_args(
+        ["--prometheus-url", "http://m/ready"]
+    ).pr_window_repo == ""
+    # The control unit turns it on by environment, because its ExecStart names
+    # an absolute home path this public repository cannot restate.
+    monkeypatch.setenv("AICC_PR_WINDOW_REPO", "/clone")
+    assert infra_monitor.build_parser().parse_args(
+        ["--prometheus-url", "http://m/ready"]
+    ).pr_window_repo == "/clone"
+
+
+def test_main_skips_the_pr_window_probe_unless_a_repo_is_given(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor,
+        "read_pr_window_snapshot",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("probe must not run")),
+    )
+
+    result = infra_monitor.main(
+        ["--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
+         "--prometheus-url", "http://m/ready"]
+    )
+
+    assert json.loads(capsys.readouterr().out)["pr_window"] is None
+    assert result == 0
+
+
+def test_main_reports_the_pr_window_probe_when_a_repo_is_given(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor,
+        "read_pr_window_snapshot",
+        lambda repo, **kwargs: infra_monitor.PrWindowSnapshot(
+            unlabelled=((907, 4800),),
+            open_prs=25,
+            evidence_prs=25,
+            grace_seconds=kwargs["grace_seconds"],
+        ),
+    )
+
+    result = infra_monitor.main(
+        ["--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
+         "--prometheus-url", "http://m/ready", "--pr-window-repo", "/repo"]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["pr_window"]["unlabelled"] == [[907, 4800]]
+    assert payload["pr_window"]["grace_seconds"] == 900
+    assert any(f.startswith("pr_window_unlabelled:") for f in payload["failures"])
+    assert result == 1
+
+
+def test_the_control_probe_watches_the_pr_window_and_records_its_findings() -> None:
+    """The probe rides the control-host unit because that is where the
+    backlog database (the `pr` evidence) and the fleet's gh identity are; the
+    worker probe has neither. It is switched on by environment rather than by
+    a flag: that unit's ExecStart names an absolute home path, which a public
+    repository cannot restate in an added line (leak_guard.sh). Its finding
+    then reaches the planner through that unit's own --record-findings source,
+    exactly like every other failure class."""
+    queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
+    worker_unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
+
+    assert "Environment=AICC_PR_WINDOW_REPO=." in queue_unit
+    assert "--record-findings" not in worker_unit
+    assert "AICC_PR_WINDOW_REPO" not in worker_unit

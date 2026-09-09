@@ -1,0 +1,51 @@
+# The PR review-window labeller, as a control host can actually run it
+# (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
+#
+# The window-gated workflows -- CI, the Acceptance gate, boundary fitness --
+# run on a pull request only while it carries a `review-window:` label, and
+# the only thing that puts one there is this tick. The one committed spelling
+# of it (deploy/systemd/aicc-backlog-pr-window.{service,timer}) names a host
+# layout the control plane does not have and never had, so nothing installed
+# it there and nothing ran it: every fleet PR opened with no CI at all -- 24
+# red-or-checkless PRs, and #907 on 2026-09-09 -- until an operator labelled
+# them by hand.
+#
+# What this unit needs from the host is therefore, deliberately, almost
+# nothing: the release tree the same install transaction publishes and
+# verifies, and a `gh` the running user is logged in as. In particular NO
+# database credential -- the reconciler reads and writes GitHub only, and
+# `command_center.db backlog-pr-window` runs before any pool is opened for
+# exactly that reason (see command_center/db/cli.py). A tick that needed an
+# EnvironmentFile is a tick that needs a host layout, and needing a host
+# layout is the whole reason this one was never deployed.
+[Unit]
+Description=AICC PR review-window tick (label every open PR active/waiting/blocked)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The control plane's own principal, as every other repo-owned control unit
+# runs (voyn-aicc-self-deploy, voyn-queue-monitor, voyn-infra-monitor). The
+# agent/worker identities are worker-profile only: a control host does not
+# have them, which is precisely what the control profile guarantees.
+User=voynadmin
+WorkingDirectory=/opt/aicc/current
+# The release tree is a `git archive` of the committed tree, not a clone, so
+# `gh` cannot infer the repository from a remote. Naming it outright is also
+# what keeps this unit free of any host's directory layout. A host that wants
+# a different repository, or a clone as the working directory, overrides
+# either value in the optional env file below.
+Environment=GH_REPO=dimastov-lab/ai-command-center
+Environment=AICC_FLEET_REPO=/opt/aicc/current
+Environment=GIT_TERMINAL_PROMPT=0
+EnvironmentFile=-/etc/aicc/pr-window.env
+# Only ever relabels: never merges, approves, or weakens a gate
+# (command_center/orchestrator/review_merge.py: reconcile_pr_window).
+ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.db backlog-pr-window --repo-path ${AICC_FLEET_REPO}
+# One tick's per-PR detail lookups are bounded (PrWindowConfig.detail_budget)
+# but they are all `gh` calls, so a slow GitHub is the whole runtime. Bounded
+# well inside the timer interval so a wedged tick cannot outlive the next.
+TimeoutStartSec=240s
+NoNewPrivileges=true
+PrivateTmp=true

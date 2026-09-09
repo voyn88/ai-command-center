@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the AICC PR review-window tick every five minutes
+
+[Timer]
+OnBootSec=4min
+# Inactive, not Active: the next tick is scheduled from the end of the last
+# one, so a slow tick (its whole runtime is `gh` calls) never queues another
+# behind itself. The randomisation desynchronises this tick from the review
+# and merge ticks it shares a GitHub quota with
+# (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+Unit=voyn-aicc-pr-window.service
+
+[Install]
+WantedBy=timers.target

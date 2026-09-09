@@ -164,10 +164,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "backlog-pr-window",
         help="One PR-window tick: label every open PR active/waiting/"
-        "blocked in a bounded rotation (aicc-backlog-pr-window.timer). "
+        "blocked in a bounded rotation (voyn-aicc-pr-window.timer). "
         "Only ever relabels -- never merges, approves, or weakens a gate. "
-        "Needs --repo-path.",
-    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+        "GitHub only: opens no database connection, so it runs on any host "
+        "with a gh identity. Needs --repo-path.",
+    ).add_argument(
+        "--repo-path",
+        default=".",
+        help="Directory to run gh in. A clone, or any directory when GH_REPO "
+        "names the repository (the deploy-managed unit uses the release tree).",
+    )
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -289,6 +295,44 @@ def main(argv: list[str] | None = None) -> int:
         # A refusal or rollback exits non-zero so systemd surfaces the
         # failed tick to the operator; noop/deployed is success.
         return 0 if deploy_report.outcome in ("noop", "deployed") else 1
+
+    if args.command == "backlog-pr-window":
+        # Deliberately BEFORE any database configuration or pool, like
+        # self-deploy above and for a sharper reason: the PR-window
+        # reconciler reads and writes GitHub and nothing else -- it takes no
+        # connection factory and touches no table -- so a database credential
+        # was a requirement that bought the tick nothing and cost it a host.
+        # It is what tied the tick to the one layout that had one
+        # (User=aicc-worker, /etc/ai-command-center.env), which the control
+        # plane does not have, which is why the labeller was never deployed
+        # there at all and every fleet PR opened without CI
+        # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL). The
+        # deploy-managed unit needs no EnvironmentFile, and the tick keeps
+        # labelling while the database is down.
+        from command_center.orchestrator.review_merge import reconcile_pr_window
+
+        window = reconcile_pr_window(args.repo_path)
+        if window.error is not None:
+            print(f"pr-window tick failed: {window.error}", file=sys.stderr)
+            if window.quota is not None:
+                # The quota line is exactly what tells an operator whether a
+                # failed listing was a rate limit, and under whose identity
+                # -- print it on the way out, not only on the happy path.
+                print(window.quota.line())
+            return 1
+        for number, head in window.active:
+            print(f"ACTIVE    #{number} -> {head}")
+        for number, head in window.waiting:
+            print(f"WAITING   #{number} -> {head}")
+        for number, reason in window.blocked:
+            print(f"BLOCKED   #{number}: {reason}")
+        for number, head in window.age_fallback:
+            print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+        for number, head in window.unreadable:
+            print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
+        if window.quota is not None:
+            print(window.quota.line())
+        return 0
 
     try:
         config = load_config()
@@ -629,35 +673,6 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
-
-            if args.command == "backlog-pr-window":
-                from command_center.orchestrator.review_merge import (
-                    reconcile_pr_window,
-                )
-
-                report = reconcile_pr_window(args.repo_path)
-                if report.error is not None:
-                    print(f"pr-window tick failed: {report.error}", file=sys.stderr)
-                    if report.quota is not None:
-                        # The quota line is exactly what tells an operator
-                        # whether a failed listing was a rate limit, and
-                        # under whose identity -- print it on the way out,
-                        # not only on the happy path.
-                        print(report.quota.line())
-                    return 1
-                for number, head in report.active:
-                    print(f"ACTIVE    #{number} -> {head}")
-                for number, head in report.waiting:
-                    print(f"WAITING   #{number} -> {head}")
-                for number, reason in report.blocked:
-                    print(f"BLOCKED   #{number}: {reason}")
-                for number, head in report.age_fallback:
-                    print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
-                for number, head in report.unreadable:
-                    print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
-                if report.quota is not None:
-                    print(report.quota.line())
-                return 0
 
             if args.command == "downgrade":
                 if not args.confirmed:

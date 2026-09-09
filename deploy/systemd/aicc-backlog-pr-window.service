@@ -1,3 +1,12 @@
+# The /srv layout of the PR-window tick, kept for the hosts that have it.
+#
+# NOT the control plane's: this names User=aicc-worker, /usr/bin/python and an
+# /srv/ai-command-center clone, none of which control-01 has ever had, so this
+# unit could not be installed there and never was -- the labeller simply did
+# not run and every fleet PR opened without CI
+# (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL). The control
+# host installs deploy/systemd/voyn-aicc-pr-window.{service,timer} instead,
+# through the control profile of ops/aicc_install_transaction.py.
 [Unit]
 Description=AICC backlog PR-window tick
 After=postgresql.service

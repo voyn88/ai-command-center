@@ -246,6 +246,15 @@ def _verified_pr_result(
     """
     reference = branch
     view_status, snapshot = _pr_snapshot(repo_path, reference)
+    # `gh pr view <branch>` resolves to the most recent PR of that branch
+    # even when it is CLOSED or MERGED. A retired attempt (fleet PR #387 for
+    # VOYN-W0-AICC-REPORT-319, closed 2026-08-25) then masqueraded as "the"
+    # PR: its stale head never converged and every re-run of the task died
+    # with pr_head_sha_mismatch instead of opening a new PR
+    # (VOYN-W0-AICC-PUBLISH-IGNORES-CLOSED-PR-OF-SAME-BRANCH). Only an OPEN
+    # PR is an existing PR; anything else means create.
+    if view_status == 0 and snapshot is not None and snapshot.get("state") != "OPEN":
+        view_status, snapshot = 1, None
     if view_status != 0:
         body = f"Autonomous delivery of {cfg.task}.\n\nHEAD_SHA: {head_sha}\n"
         created = _run(
