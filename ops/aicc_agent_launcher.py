@@ -920,7 +920,18 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
             binary,
             "exec",
             "--sandbox",
-            "read-only" if profile == "read_only" else "workspace-write",
+            # Inside THIS unit the boundary is systemd's: a dynamic uid, only
+            # /workspace and /agent-home writable, ProtectSystem=strict, no
+            # capabilities. Codex's own workspace-write sandbox (bubblewrap)
+            # on top of it mounts .git read-only, so the commit the fleet
+            # contract requires could never land ("Unable to create
+            # .git/index.lock: Read-only file system", worker-01 2026-09-09).
+            # The development profile therefore runs Codex without its inner
+            # sandbox HERE ONLY (owner decision 2026-09-09); outside the
+            # broker, agent_runner.build_codex_command keeps workspace-write.
+            # The read-only profile keeps Codex's read-only sandbox: it is a
+            # second, cheaper enforcement of the same promise.
+            "read-only" if profile == "read_only" else "danger-full-access",
             "--color",
             "never",
         ]
@@ -1049,15 +1060,7 @@ def _systemd_command(
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=tmpfs",
         "--property=ProtectProc=invisible",
-        # Codex's workspace-write sandbox is bubblewrap, and bwrap reads
-        # /proc/sys/kernel/overflowuid before it can build its own namespace;
-        # ProcSubset=pid hides /proc/sys entirely, so every mutating Codex run
-        # died with "bwrap: Can't read /proc/sys/kernel/overflowuid" and the
-        # write-preflight never passed (worker-01 2026-09-09). /proc/sys stays
-        # read-only (ProtectKernelTunables) and the read-only profile keeps the
-        # tighter subset -- it never needs bwrap.
-        "--property=ProcSubset="
-        + ("all" if executor == "codex" and manifest["profile"] != "read_only" else "pid"),
+        "--property=ProcSubset=pid",
         "--property=ProtectControlGroups=yes",
         "--property=ProtectKernelTunables=yes",
         "--property=ProtectKernelModules=yes",

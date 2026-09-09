@@ -152,12 +152,20 @@ def test_model_auth_allowlist_is_provider_specific(launcher, monkeypatch, tmp_pa
         launcher._validate_environment_file(env_file, "claude")
 
 
-def test_codex_keeps_inner_workspace_write_sandbox(launcher, tmp_path):
+def test_codex_development_profile_runs_without_its_inner_sandbox_inside_the_unit(launcher, tmp_path):
+    """Owner decision 2026-09-09: the systemd unit is the boundary; Codex's
+    bubblewrap on top mounted .git read-only and no commit could land. The
+    prompt is still terminated with `--` so it cannot pick a sandbox."""
     command = launcher._provider_command(_manifest(tmp_path))
-    assert command[command.index("--sandbox") + 1] == "workspace-write"
-    assert "danger-full-access" not in command
+    assert command[command.index("--sandbox") + 1] == "danger-full-access"
     assert command[-2] == "--"
     assert command[-1] == "make one local commit"
+
+
+def test_codex_read_only_profile_keeps_the_read_only_sandbox(launcher, tmp_path):
+    command = launcher._provider_command(_manifest(tmp_path, profile="read_only"))
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert "danger-full-access" not in command
 
 
 def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
@@ -177,8 +185,11 @@ def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
     ],
 )
 def test_root_launcher_provider_argv_cannot_drift_from_worker_policy(
-    launcher, tmp_path, executor, task_type
+    launcher, tmp_path, executor, task_type, monkeypatch
 ):
+    # The broker only ever runs under principal isolation; the worker's
+    # builder must produce the same argv in that mode.
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
     profile = agent_runner.profile_for_task_type(task_type)
     manifest = _manifest(
         tmp_path,
@@ -2112,23 +2123,16 @@ def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monke
     assert store.read_bytes() == old
 
 
-def test_codex_workspace_write_unit_exposes_proc_sys_for_bwrap_only_there(launcher, monkeypatch, tmp_path):
-    """VOYN-W0-AICC-CODEX-WORKSPACE-WRITE-PREFLIGHT-FAILS-UNDER-ISOLATION: bwrap
-    needs /proc/sys/kernel/overflowuid; ProcSubset=pid hid it and every
-    mutating Codex run failed. Only the Codex write profile widens the subset;
-    /proc/sys stays read-only via ProtectKernelTunables."""
+def test_agent_units_keep_proc_subset_pid_for_every_executor(launcher, monkeypatch, tmp_path):
+    """No executor needs /proc/sys: Codex runs without bubblewrap inside the
+    unit (see the danger-full-access test), so the tight subset stays."""
     monkeypatch.setattr(launcher, "_validate_environment_file", lambda *args, **kwargs: False)
-
-    def command(**updates):
-        return launcher._systemd_command(
-            _manifest(tmp_path, **updates), Path("/run/aicc-agent-homes/t"),
+    for executor, profile in (("codex", "trusted_development"), ("codex", "read_only"), ("claude", "trusted_development")):
+        command = launcher._systemd_command(
+            _manifest(tmp_path, executor=executor, profile=profile), Path("/run/aicc-agent-homes/t"),
             "aicc-agent-t.service", "aicc-agent-launcher@t.service", tmp_path.parent, tmp_path,
         )
-
-    assert "--property=ProcSubset=all" in command(executor="codex", profile="trusted_development")
-    assert "--property=ProcSubset=pid" in command(executor="codex", profile="read_only")
-    assert "--property=ProcSubset=pid" in command(executor="claude", profile="trusted_development")
-    assert "--property=ProtectKernelTunables=yes" in command(executor="codex", profile="trusted_development")
+        assert "--property=ProcSubset=pid" in command, (executor, profile)
 
 
 def test_agent_git_trusts_exactly_the_bound_workspace(launcher, monkeypatch, tmp_path):
