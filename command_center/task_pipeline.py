@@ -2374,7 +2374,12 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
 
     1. **Persist the master switch off** (`pipeline_settings.enabled=False`)
        *first*, so every subsequent tick — in this process or any other —
-       refuses to launch even if step 2 is interrupted mid-way.
+       refuses to launch even if step 2 is interrupted mid-way. A settings
+       document that cannot be read is *replaced* with the most restrictive one
+       (`pipeline_settings.stopped_settings()`) rather than left alone: the
+       stop is what this call promises, and skipping the write leaves
+       automation armed the instant the file is readable again. The old bytes
+       are preserved next to the file and both facts are reported.
     2. **Cancel every actively supervised run** in this process instance
        (SIGTERM, then SIGKILL after the grace period — the supervisor's
        ordinary confirmed-cancellation path; working trees are left intact).
@@ -2385,17 +2390,75 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     master switch guarantees they are never followed by new launches.
 
     Returns a truthful report: ``{"disabled": bool, "cancelled": [run_id],
-    "cancel_errors": {run_id: str}, "not_cancellable": [run_id]}``.
+    "cancel_errors": {run_id: str}, "not_cancellable": [run_id],
+    "settings_unreadable": str | None, "settings_quarantined_to": str | None,
+    "settings_write_error": str | None}`` — the last three non-None only when
+    the previous settings document could not be read. ``disabled`` is what was
+    actually persisted, not what was attempted: it is False when replacing an
+    unreadable document failed, because the switch is then still whatever the
+    unreadable file says and the runs cancelled below can be followed by new
+    ones.
     """
     from command_center.runtime import context_service
 
     context_service.require_launch_confirmation(confirmed, what="Kill switch")
 
-    settings = pipeline_settings.load_settings(root)
-    if settings.enabled:
-        pipeline_settings.save_settings(
-            root, dataclasses.replace(settings, enabled=False)
-        )
+    # Step 1 has to *persist*, and an unreadable settings file is precisely
+    # where it used to silently not. Through `load_settings` this read is
+    # total, so a torn file arrived here as `enabled=False` — the `if` below
+    # was skipped, nothing was written, and the report still said
+    # `disabled: True`. Measured on these modules: an operator running
+    # `enabled=True, auto_launch=True` whose settings file is momentarily
+    # unreadable gets a kill switch that cancels the live runs, reports
+    # success, and writes nothing — so the moment the file reads again
+    # (a permissions blip restored, a half-written file completed by its
+    # writer), `enabled` is still `True` and the next tick launches. The stop
+    # was a no-op reported as an emergency stop.
+    #
+    # So the document is read directly here, and an unreadable one is
+    # overwritten rather than inherited. This is the one caller that overwrites
+    # instead of refusing, and the asymmetry is the point: refusing to write is
+    # the fail-closed answer for `update_settings` (an edit that inherits an
+    # unreadable file would *delete* guardrails), while for a kill switch
+    # refusing to write is the fail-open one — it leaves automation armed. What
+    # is written is `stopped_settings()`, not the substituted defaults, so the
+    # replacement cannot raise a ceiling either (`max_daily_spend_usd` would
+    # otherwise land as `0.0`, i.e. no cap, which is the state the operator
+    # would re-enable into). The old bytes are kept beside the file first,
+    # since nothing can reconstruct the ceiling they held.
+    settings_unreadable: str | None = None
+    settings_write_error: str | None = None
+    quarantined: Path | None = None
+    disabled = True
+    try:
+        document = pipeline_settings.read_settings_document(root)
+    except pipeline_settings.UnreadableSettings as exc:
+        settings_unreadable = str(exc)
+        quarantined = pipeline_settings.quarantine_unreadable_settings(root)
+        try:
+            pipeline_settings.save_settings(
+                root, pipeline_settings.stopped_settings()
+            )
+        except Exception as write_exc:  # noqa: BLE001 — reported, never hidden
+            # A directory that cannot be read is often one that cannot be
+            # written either, and this half failing must not take step 2 down
+            # with it: cancelling the live runs is the more urgent effect, and
+            # it does not depend on the file at all. So the failure is carried
+            # into the report — `disabled` says what is actually true — and
+            # cancellation proceeds. The switch not being persisted is exactly
+            # the fact an operator has to be told, since nothing else will stop
+            # the next tick.
+            settings_write_error = str(write_exc)
+            disabled = False
+    else:
+        settings = pipeline_settings.PipelineSettings.from_dict(document)
+        if settings.enabled:
+            # Left raising, unlike the branch above: here the file is readable,
+            # so a write failure is not the same story as an unreadable tree,
+            # and the caller's existing contract for it is unchanged.
+            pipeline_settings.save_settings(
+                root, dataclasses.replace(settings, enabled=False)
+            )
 
     cancelled: list[str] = []
     cancel_errors: dict[str, str] = {}
@@ -2415,10 +2478,22 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
             else:
                 cancel_errors[run["id"]] = str(exc)
     return {
-        "disabled": True,
+        "disabled": disabled,
         "cancelled": cancelled,
         "cancel_errors": cancel_errors,
         "not_cancellable": not_cancellable,
+        # Non-None only when the previous settings could not be read and were
+        # therefore replaced wholesale. Reported rather than logged-and-hidden
+        # because the operator has to know that the switch is off *and* that
+        # their spend ceiling, concurrency caps and review gate are no longer
+        # what they set them to — they are the most restrictive values this
+        # module can express, and restating them is a deliberate act.
+        "settings_unreadable": settings_unreadable,
+        "settings_quarantined_to": str(quarantined) if quarantined else None,
+        # Non-None only when replacing an unreadable document *also* failed —
+        # in which case `disabled` is False, because nothing was persisted and
+        # the next tick is still free to launch.
+        "settings_write_error": settings_write_error,
     }
 
 

@@ -1040,6 +1040,31 @@ def test_an_unreadable_settings_document_never_reads_as_an_absent_spend_ceiling(
     assert plan.as_dict()["max_daily_spend_usd"] is None
 
 
+def test_plan_fails_closed_on_a_settings_file_that_is_not_utf8(monkeypatch, pool):
+    """The one corrupt-file shape the typed exception used to miss.
+
+    A torn write that cuts a multi-byte sequence in half decodes as a
+    `UnicodeDecodeError` — a `ValueError`, so it never reached
+    `read_settings_document`'s `except OSError` arm and escaped untyped. It
+    still failed closed *here*, because this gate catches `Exception`, but it
+    sailed past every caller that catches `UnreadableSettings` by name.
+    """
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+    path = pipeline_settings.settings_file_path(ROOT)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'{"enabled": true, "max_daily_spend_usd": 5.\xff\xfe')
+
+    with pytest.raises(pipeline_settings.UnreadableSettings):
+        pipeline_settings.read_settings_document(ROOT)
+
+    plan = service.plan(ROOT)
+
+    assert plan.settings_unknown is True
+    assert plan.assignments == ()
+
+
 def test_a_torn_settings_file_cannot_dispatch_more_than_the_config_it_replaced(
     monkeypatch, pool
 ):

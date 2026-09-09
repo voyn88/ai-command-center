@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import pathlib
 
 import pytest
 
@@ -102,11 +103,27 @@ def test_settings_missing_file_resolves_to_defaults(tmp_path):
     assert pipeline_settings.load_settings(tmp_path) == PipelineSettings()
 
 
-def test_settings_malformed_file_resolves_to_defaults(tmp_path):
+def test_settings_malformed_file_resolves_to_the_most_restrictive_document(tmp_path):
+    """Still total, still nothing enabled — but no longer the plain defaults.
+
+    A malformed file is a *failure*, not a fresh install, and the defaults
+    answer it more permissively than the file they stand in for: `0.0` means no
+    spend cap and `2` is above an operator's configured `1`. See
+    `test_load_settings_substitutes_the_most_restrictive_document_not_the_defaults`.
+    """
     path = pipeline_settings.settings_file_path(tmp_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not json", encoding="utf-8")
-    assert pipeline_settings.load_settings(tmp_path) == PipelineSettings()
+
+    settings = pipeline_settings.load_settings(tmp_path)
+
+    # Compared through `as_dict` because NaN != NaN makes dataclass equality
+    # useless on the substituted ceiling — and that ceiling is the point.
+    assert settings.as_dict() == pipeline_settings.stopped_settings().as_dict()
+    assert math.isnan(settings.max_daily_spend_usd)
+    assert settings.enabled is False
+    assert settings.auto_launch_active is False
+    assert settings.auto_merge_active is False
 
 
 def test_settings_wrong_types_fall_back_per_field_never_enabling():
@@ -296,6 +313,210 @@ def test_toggling_a_switch_on_a_torn_file_cannot_delete_the_spend_ceiling(tmp_pa
     restored = pipeline_settings.load_settings(tmp_path)
     assert restored.max_daily_spend_usd == 5.0
     assert restored.max_global_concurrency == 1
+
+
+def test_a_settings_file_that_is_not_utf8_is_typed_unreadable(tmp_path):
+    """`read_text` raises `UnicodeDecodeError` — a `ValueError`, not an
+    `OSError` — so this file used to escape `read_settings_document` untyped.
+
+    That matters because *every* caller handles the typed exception and none
+    handles the bare one: `load_settings` promises to be total, the autopilot
+    panel's write guard catches `UnreadableSettings` to refuse the write, and
+    `kill_switch` catches it to replace the document. A torn write that cuts a
+    multi-byte sequence in half is exactly this file, so the shape is not
+    exotic — it is one of the likelier ways the file breaks.
+    """
+    path = pipeline_settings.settings_file_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'{"enabled": true, "max_daily_spend_usd": 5.\xff\xfe')
+
+    with pytest.raises(pipeline_settings.UnreadableSettings):
+        pipeline_settings.read_settings_document(tmp_path)
+
+    # And the total reader stays total rather than raising into the UI.
+    assert pipeline_settings.load_settings(tmp_path).enabled is False
+
+
+def test_load_settings_substitutes_the_most_restrictive_document_not_the_defaults(
+    tmp_path,
+):
+    """Staying total is not a licence to answer more permissively than the file
+    that could not be read.
+
+    The plain defaults are the right answer to "nothing configured yet" and the
+    wrong one here, because four of their fields are at the *permissive* end:
+    the spend ceiling reads `0.0` (no cap), both concurrency caps read `2` —
+    above an operator who configured `1`, and read straight into
+    `db.create_run`'s atomic global cap — the review gate reads open, and the
+    two attempt budgets authorise relaunches, hence spend, that a configured
+    `0`/`1` did not.
+    """
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True,
+            max_daily_spend_usd=5.0,
+            max_global_concurrency=1,
+            max_agent_concurrency=1,
+            require_independent_review=True,
+            max_rework_attempts=0,
+            max_run_attempts=1,
+        ),
+    )
+    pipeline_settings.settings_file_path(tmp_path).write_text(
+        '{"enabled": true, "max_daily', encoding="utf-8"
+    )
+
+    substituted = pipeline_settings.load_settings(tmp_path)
+
+    # Nothing is permitted that the unreadable document might have forbidden.
+    assert substituted.enabled is False
+    assert substituted.auto_launch_active is False
+    assert math.isnan(substituted.max_daily_spend_usd)  # never 0.0 == no cap
+    assert substituted.max_global_concurrency == pipeline_settings.MIN_CONCURRENCY
+    assert substituted.max_agent_concurrency == pipeline_settings.MIN_CONCURRENCY
+    assert substituted.require_independent_review is True
+    assert substituted.max_rework_attempts == pipeline_settings.MIN_REWORK_ATTEMPTS
+    assert substituted.max_run_attempts == pipeline_settings.MIN_RUN_ATTEMPTS
+    # The defaults would have loosened three of those on the way past.
+    defaults = PipelineSettings()
+    assert defaults.max_global_concurrency > substituted.max_global_concurrency
+    assert defaults.max_daily_spend_usd == 0.0
+    assert defaults.require_independent_review is False
+
+    # A *missing* file is still a fresh install, not a failure: plain defaults.
+    pipeline_settings.settings_file_path(tmp_path).unlink()
+    assert pipeline_settings.load_settings(tmp_path) == PipelineSettings()
+
+
+class _NoRunsApi:
+    """The narrowest thing `kill_switch` needs: something to ask for runs."""
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+
+    def list_runs(self):
+        return []
+
+
+def test_kill_switch_persists_the_stop_when_the_settings_are_unreadable(tmp_path):
+    """The measured fail-open: an emergency stop that stopped nothing.
+
+    `kill_switch` read the settings through the *total* reader, so a torn file
+    arrived as `enabled=False`, the `if settings.enabled` write was skipped —
+    and the report still said `disabled: True`. Nothing was persisted. The
+    moment the file read again (a permissions blip restored, a half-written
+    file completed by its writer), `enabled` was still `True` and the next tick
+    launched, with the operator believing the machine was stopped.
+
+    Refusing to write is the fail-closed answer for `update_settings`, whose
+    write would *inherit* the unreadable file and delete guardrails. Here it is
+    the fail-open one: it leaves automation armed. So this caller overwrites —
+    with `stopped_settings()`, so the replacement cannot raise a ceiling
+    either, and after preserving the bytes it is about to destroy.
+    """
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(enabled=True, auto_launch=True, max_daily_spend_usd=5.0),
+    )
+    path = pipeline_settings.settings_file_path(tmp_path)
+    path.write_text('{"enabled": true, "max_daily_spend_us', encoding="utf-8")
+
+    report = task_pipeline.kill_switch(
+        tmp_path, _NoRunsApi(tmp_path / "runtime.db"), confirmed=True
+    )
+
+    assert report["disabled"] is True
+    # The stop is on disk, not merely claimed in the report.
+    persisted = pipeline_settings.read_settings_document(tmp_path)
+    assert persisted["enabled"] is False
+    assert persisted["auto_launch"] is False
+    # And the replacement did not launder the ceiling into "no cap": null reads
+    # back as unusable, which keeps dispatch refusing after a re-enable.
+    assert persisted["max_daily_spend_usd"] is None
+    assert math.isnan(pipeline_settings.load_settings(tmp_path).max_daily_spend_usd)
+
+    # The operator is told their configuration was replaced, and where the
+    # bytes went — nothing else can reconstruct the ceiling they held.
+    assert report["settings_unreadable"]
+    quarantined = pathlib.Path(report["settings_quarantined_to"])
+    assert quarantined.read_text(encoding="utf-8") == (
+        '{"enabled": true, "max_daily_spend_us'
+    )
+
+    # A later tick, in this process or any other, launches nothing.
+    assert pipeline_settings.load_settings(tmp_path).auto_launch_active is False
+
+
+def test_kill_switch_still_cancels_when_the_replacement_write_fails(tmp_path, monkeypatch):
+    """The two effects are independent, so one failing must not take the other.
+
+    A directory whose settings file cannot be read often cannot be written
+    either. Cancelling the live runs does not depend on that file at all and is
+    the more urgent half, so it proceeds — and the report says `disabled:
+    False`, because nothing was persisted and the next tick is still free to
+    launch. Claiming `True` here would be the same false report this test's
+    sibling exists to remove, one branch over.
+    """
+    pipeline_settings.save_settings(
+        tmp_path, PipelineSettings(enabled=True, auto_launch=True)
+    )
+    pipeline_settings.settings_file_path(tmp_path).write_text("{torn", encoding="utf-8")
+
+    def _no_write(*_args, **_kwargs):
+        raise PermissionError("read-only data directory")
+
+    monkeypatch.setattr(pipeline_settings, "save_settings", _no_write)
+
+    class _OneRunningApi:
+        def __init__(self):
+            self.cancelled = []
+
+        def list_runs(self):
+            return [{"id": "r1", "state": "RUNNING"}]
+
+        def request_cancel(self, run_id, *, confirmed):
+            assert confirmed is True
+            self.cancelled.append(run_id)
+
+    api = _OneRunningApi()
+    report = task_pipeline.kill_switch(tmp_path, api, confirmed=True)
+
+    assert api.cancelled == ["r1"]  # the urgent half happened
+    assert report["cancelled"] == ["r1"]
+    assert report["disabled"] is False  # and the report does not pretend
+    assert "read-only data directory" in report["settings_write_error"]
+    assert report["settings_unreadable"]
+
+
+def test_kill_switch_leaves_a_readable_settings_document_otherwise_intact(tmp_path):
+    """The healthy path is unchanged: the master switch goes off and every
+    other field the operator set is preserved, including the spend ceiling."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True,
+            auto_launch=True,
+            max_daily_spend_usd=5.0,
+            max_global_concurrency=1,
+        ),
+    )
+
+    report = task_pipeline.kill_switch(
+        tmp_path, _NoRunsApi(tmp_path / "runtime.db"), confirmed=True
+    )
+
+    after = pipeline_settings.load_settings(tmp_path)
+    assert after.enabled is False
+    assert after.max_daily_spend_usd == 5.0
+    assert after.max_global_concurrency == 1
+    assert report["settings_unreadable"] is None
+    assert report["settings_quarantined_to"] is None
+    assert report["settings_write_error"] is None
+    assert report["disabled"] is True
+    assert not pipeline_settings.settings_file_path(tmp_path).with_suffix(
+        ".json" + pipeline_settings.UNREADABLE_SUFFIX
+    ).exists()
 
 
 def test_update_settings_still_works_on_a_healthy_and_on_an_absent_file(tmp_path):

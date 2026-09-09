@@ -252,6 +252,22 @@ def test_an_unreadable_policy_file_raises_rather_than_reading_as_unconfigured():
         path.chmod(0o644)
 
 
+def test_a_policy_file_that_is_not_utf8_raises_the_typed_exception():
+    """A decode failure is a `ValueError`, not an `OSError`.
+
+    So it does not reach the `except OSError` arm, and without an arm of its
+    own it escapes `load_policy` as a bare `UnicodeDecodeError` — past every
+    `except UnreadablePolicy` its callers were written with. A torn write that
+    cuts a multi-byte sequence in half produces exactly this file.
+    """
+    path = policy_config.policy_file_path(ROOT)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'{"per_agent_limits": {"claude_code": {"max_conc\xff\xfe')
+
+    with pytest.raises(policy_config.UnreadablePolicy):
+        policy_config.load_policy(ROOT)
+
+
 def test_a_corrupt_policy_no_longer_reads_as_a_guardrail_free_one():
     # The measured fail-open, stated as the property that closes it. An
     # operator's per-agent and per-project limits must not be *silently*

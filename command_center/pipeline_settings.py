@@ -31,8 +31,10 @@ of `st.session_state`:
   operator's own kill switch) while the spend ceiling reads `0.0`, i.e. no cap.
   `read_settings_document` therefore separates the two and raises
   `UnreadableSettings` for the latter; `load_settings` stays total for the
-  display surfaces, while `update_settings` and `dispatch.service.plan` — the
-  writer, and the reader that reports a cause to an operator — handle it.
+  display surfaces, but answers with `stopped_settings()` rather than the
+  defaults, so staying total cannot itself raise a ceiling. The callers for
+  which the *cause* is load-bearing — `dispatch.service.plan`,
+  `update_settings` and `task_pipeline.kill_switch` — handle the exception.
 
 Storage is `data/pipeline_settings.json`, using the same atomic-write +
 sibling-lock-file convention as `execution_queue.json` and `tasks.json` (see
@@ -53,6 +55,12 @@ from pathlib import Path
 from command_center import models, storage
 
 SETTINGS_FILE_NAME = "pipeline_settings.json"
+# Where `quarantine_unreadable_settings` parks the bytes of a settings file
+# that had to be overwritten. A fixed name rather than a timestamped one: the
+# only writer is the kill switch, and a second kill switch only reaches it if
+# the file is unreadable *again*, in which case the newer corruption is the one
+# worth keeping.
+UNREADABLE_SUFFIX = ".unreadable"
 SETTINGS_LOCK_FILE_NAME = "pipeline_settings.lock"
 SETTINGS_LOCK_TIMEOUT_SECONDS = 30.0
 _SETTINGS_LOCK_POLL_SECONDS = 0.05
@@ -348,6 +356,52 @@ class PipelineSettings:
         )
 
 
+def stopped_settings() -> PipelineSettings:
+    """The most restrictive document this module can express: the stand-in for
+    a settings file that exists and cannot be read.
+
+    The plain defaults (`PipelineSettings()`) are *not* that document, and the
+    difference is the whole reason this exists. They are the right answer to
+    "nothing has been configured yet", where every field's default is also its
+    restrictive value. As the answer to "the operator's configuration could not
+    be read" they quietly *raise* four ceilings, because for these fields the
+    default is the permissive end:
+
+    * `max_daily_spend_usd=0.0` means **no cap** (see `_spend_ceiling`), so the
+      defaults do not weaken a configured ceiling, they delete it. Carried here
+      as NaN, which every reader already refuses to launch against;
+    * `max_global_concurrency` / `max_agent_concurrency` default to `2`, which
+      is *more* than an operator who configured `1`, and these are read
+      straight into `db.create_run`'s atomic global cap and the scheduler's
+      registry — so the laundered value is enforced, not merely displayed;
+    * `require_independent_review=False` is the *open* gate; the closed one is
+      the restrictive answer;
+    * `max_rework_attempts=2` and `max_run_attempts=3` each authorise
+      relaunches — and therefore spend — that a configured `0`/`1` did not;
+    * `run_timeout_seconds` defaults to 45 minutes, longer than any value an
+      operator could have set, and a longer run is a more expensive one.
+
+    Nothing here reconstructs what was configured — that information is gone
+    with the file. The guarantee is only that no field permits more than the
+    unreadable document might have, which is what lets a total reader keep
+    being total without also being wrong.
+    """
+    return PipelineSettings(
+        enabled=False,
+        auto_launch=False,
+        auto_merge_after_checks=False,
+        auto_rework=False,
+        auto_remediate_workspace=False,
+        require_independent_review=True,
+        max_global_concurrency=MIN_CONCURRENCY,
+        max_agent_concurrency=MIN_CONCURRENCY,
+        max_rework_attempts=MIN_REWORK_ATTEMPTS,
+        max_run_attempts=MIN_RUN_ATTEMPTS,
+        run_timeout_seconds=MIN_RUN_TIMEOUT_SECONDS,
+        max_daily_spend_usd=float("nan"),
+    )
+
+
 @contextlib.contextmanager
 def settings_lock(root: Path, *, timeout: float = SETTINGS_LOCK_TIMEOUT_SECONDS):
     """Cross-process mutual exclusion for the settings read-modify-write cycle
@@ -414,6 +468,16 @@ def read_settings_document(root: Path) -> dict:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
+    except UnicodeDecodeError as exc:
+        # Not folded into the `OSError` arm below: a decode failure is a
+        # `ValueError`, so without this it escapes *untyped*, and every caller
+        # here catches the typed exception — `load_settings` (which promises to
+        # be total), the autopilot panel's write guard, `kill_switch`. A
+        # truncated multi-byte sequence is one of the likelier shapes a torn
+        # write actually takes, so this is the case, not a curiosity.
+        raise UnreadableSettings(
+            f"pipeline settings at {path} are not UTF-8 text: {exc}"
+        ) from exc
     except OSError as exc:
         raise UnreadableSettings(
             f"pipeline settings at {path} could not be read: {exc}"
@@ -443,20 +507,57 @@ def load_settings(root: Path) -> PipelineSettings:
     saved yet. Unlocked by design (a plain read of an atomically-written file);
     use `update_settings` for anything that writes.
 
-    Deliberately **total**: an unreadable file yields the all-off defaults, so
-    the display surfaces and the pipeline tick keep the fail-closed behaviour
-    they already have (`enabled=False` disables every automatic action). What
-    it cannot do is tell its caller *why* everything is off. A caller for which
-    that distinction is load-bearing — because it reports the reason to an
-    operator, or because it is about to write the laundered values back — reads
-    `read_settings_document` directly and handles `UnreadableSettings`. Both
-    such callers exist today: `dispatch.service.plan` and `update_settings`.
+    Deliberately **total**: an unreadable file yields `stopped_settings()` —
+    every switch off *and* every ceiling at its most restrictive — so the
+    display surfaces and the pipeline tick keep the fail-closed behaviour they
+    already have (`enabled=False` disables every automatic action) without the
+    caps quietly being raised to the defaults on the way. What it cannot do is
+    tell its caller *why* everything is off. A caller for which that
+    distinction is load-bearing — because it reports the reason to an operator,
+    or because it is about to write the substituted values back — reads
+    `read_settings_document` directly and handles `UnreadableSettings`. Three
+    such callers exist today: `dispatch.service.plan`, `update_settings` and
+    `task_pipeline.kill_switch`.
     """
     try:
         document = read_settings_document(root)
     except UnreadableSettings:
-        document = {}
+        # `stopped_settings()`, not the plain defaults: staying total is not a
+        # licence to answer with a *more permissive* configuration than the one
+        # that could not be read. See that function for the four ceilings the
+        # defaults silently raise here — the spend cap being the sharpest, since
+        # its default means "no cap".
+        return stopped_settings()
     return PipelineSettings.from_dict(document)
+
+
+def quarantine_unreadable_settings(root: Path) -> Path | None:
+    """Copy the current (unreadable) settings file aside, returning where it
+    landed, or None if there was nothing to copy or the copy failed.
+
+    Used by the one caller that has to *overwrite* an unreadable settings file
+    rather than refuse — `task_pipeline.kill_switch`, whose whole contract is
+    that the stop is persisted. Overwriting destroys the only record of what
+    the operator had configured, including the spend ceiling no reader can
+    reconstruct, so the bytes are kept: unreadable to this parser is not the
+    same as meaningless to a human, and a torn file usually still carries the
+    numbers that were in it.
+
+    Never raises. The stop must not depend on the copy succeeding — a full
+    disk or a read-only directory is a reason to lose the old bytes, never a
+    reason to leave automation enabled.
+    """
+    path = settings_file_path(root)
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    destination = path.with_suffix(path.suffix + UNREADABLE_SUFFIX)
+    try:
+        destination.write_bytes(raw)
+    except OSError:
+        return None
+    return destination
 
 
 def save_settings(root: Path, settings: PipelineSettings) -> PipelineSettings:

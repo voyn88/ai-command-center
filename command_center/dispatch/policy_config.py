@@ -93,6 +93,13 @@ def _read_policy_document(root: Path) -> dict:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}
+    except UnicodeDecodeError as exc:
+        # A decode failure is a `ValueError`, not an `OSError`, so it needs its
+        # own arm or it escapes untyped past every `except UnreadablePolicy`.
+        # Mirrors `pipeline_settings.read_settings_document`.
+        raise UnreadablePolicy(
+            f"dispatch policy at {path} is not UTF-8 text: {exc}"
+        ) from exc
     except OSError as exc:
         raise UnreadablePolicy(
             f"dispatch policy at {path} could not be read: {exc}"
