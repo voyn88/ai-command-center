@@ -624,4 +624,21 @@ transaction_active=0
 release_lane_timers
 rm -f -- "$attempt_units"
 trap - EXIT HUP INT TERM
+# The control plane's own ticks: installed as files by the generation above,
+# started here. Deliberately AFTER commit and after the trap is disarmed --
+# this timer is not in the rollback's service snapshot (that snapshot only
+# admits worker and launcher units, RESTORABLE_UNIT_RE), so enabling it while
+# the trap is armed would leave an enablement symlink behind for a unit file
+# the rollback removes. A committed file activated afterwards is the whole
+# transaction's guarantee: enabling cannot fail into an inconsistent
+# generation, and a failure here is a legible non-zero exit over an installed,
+# committed unit that an operator can simply start.
+#
+# `enable --now` is idempotent, so a re-install of a host that already runs
+# the tick is a no-op. This is what makes "deployed" true of the PR
+# review-window labeller instead of "someone typed it once on 2026-09-09"
+# (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
+if [ "$install_profile" = "control" ]; then
+  systemctl enable --now voyn-aicc-pr-window.timer
+fi
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"
