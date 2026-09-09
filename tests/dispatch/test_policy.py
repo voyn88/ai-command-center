@@ -223,6 +223,36 @@ def test_budget_unknown_reports_no_spend_figure_rather_than_a_fabricated_zero():
     assert body["budget_unknown"] is True
 
 
+def test_a_none_spend_fails_closed_even_when_the_caller_forgets_the_flag():
+    """`daily_spend_usd=None` means "could not be read" all by itself, so it
+    must engage the gate without `budget_unknown=True` beside it.
+
+    Before this, the only thing between a `None` spend and an assignment was
+    an `assert` — which `python -O` strips. With assertions off and the
+    default (zero, i.e. unset) daily cap, the ceiling check is skipped
+    entirely, so every task was picked for assignment against a spend nobody
+    could read; the plan then died on `None + cost` instead of deferring. A
+    guardrail an interpreter flag can remove is the same defect class as the
+    spend cap that silently read `0.0`.
+    """
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    plan = _plan(
+        [_task("t1"), _task("t2")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=0.0,
+        # deliberately NOT passing budget_unknown=True
+    )
+
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+
+
 def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
     policy = DispatchPolicy()
     executors = [_executor("claude_code", cost=0.0)]

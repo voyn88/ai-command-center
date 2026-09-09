@@ -18,7 +18,10 @@ The hard guarantees, enforced structurally here:
    `DEFER_COST_DATA_UNAVAILABLE`. This is deliberately a hard gate rather than
    a simulated spend figure: a faked number can be silently absorbed by a
    zero/unset daily cap or by a free executor, which would make "no cost
-   data" fail *open* instead of closed.
+   data" fail *open* instead of closed. The gate is derived from the data as
+   well as the flag — `daily_spend_usd=None` *means* "unreadable", so it
+   engages the gate on its own, and the guarantee therefore survives both a
+   caller that forgets the flag and `python -O` (which strips `assert`).
 2. **Budget is never exceeded.** An executor is only assigned when the
    *projected* cumulative spend (the trailing-24h spend already incurred plus
    every assignment made so far in this plan plus this one) stays at or under
@@ -119,6 +122,17 @@ def plan_dispatch(
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
 
+    # `daily_spend_usd is None` *is* "the trailing-24h spend could not be
+    # read" — that is the field's whole contract. Deriving the gate from the
+    # value, instead of trusting the flag beside it, means a caller that
+    # hands over `None` but forgets `budget_unknown=True` still fails closed,
+    # and it keeps the guarantee *structural*: the only thing standing
+    # between a `None` spend and an assignment used to be the `assert` below,
+    # and an `assert` is stripped by `python -O`/`PYTHONOPTIMIZE`. A
+    # guardrail that a runtime flag can silently remove is the same defect
+    # class as the spend cap that silently read `0.0`.
+    budget_unknown = budget_unknown or daily_spend_usd is None
+
     # (1) Kill switch / unknown budget first: no assignment is even
     #     considered. Checked ahead of the per-task loop, exactly like the
     #     kill switch, so a caller can never accidentally leave a code path
@@ -150,8 +164,10 @@ def plan_dispatch(
             projected_spend_usd=daily_spend_usd,
         )
 
-    # `budget_unknown` was False to reach here, so the caller supplied a real
-    # trailing-24h figure rather than the `None` it sends when the read fails.
+    # Provably true: `budget_unknown` absorbed `daily_spend_usd is None` above
+    # and every such plan returned from the gate. This line narrows the type
+    # for the checker; it is no longer what enforces the guarantee, so the
+    # code below stays fail-closed even with assertions stripped.
     assert daily_spend_usd is not None
 
     # (3) SLA/priority order.
