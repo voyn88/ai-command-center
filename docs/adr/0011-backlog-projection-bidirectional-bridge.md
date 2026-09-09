@@ -111,6 +111,18 @@ then, an owner decision is required (extend with a new explicit date, or
 replace hand-editing with a store-backed authoring surface) rather than
 letting the bridge continue silently past its window.
 
+**The date is enforced, not just recorded.**
+`tests/test_backlog_bridge_retirement.py` parses the `**Target date:**` line
+above — this ADR stays the single source of truth for it — and fails the
+suite from that date onward for as long as the import side still exists
+(`ops/aicc_backlog_publish.py`, its launchd job, the `backlog-import`
+subcommand). It also pins that every file quoting the date quotes *this*
+one. Without that check the date had the same defect as the alternative
+rejected below: nothing would have looked at it. The test stops firing on
+its own once the import side is deleted, and is deleted in that same
+commit; extending the window means moving the date here, which is exactly
+the explicit owner decision this section asks for.
+
 ## Rejected alternatives
 
 - **Export only, freeze import immediately:** would strand the owner's
