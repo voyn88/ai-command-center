@@ -28,6 +28,7 @@ for the latter.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -114,10 +115,20 @@ def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int
 
 def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
     """A float within `[minimum, maximum]`, or `default`; bools rejected like
-    `_bounded_int`, out-of-range falls back rather than clamping."""
+    `_bounded_int`, out-of-range falls back rather than clamping.
+
+    Non-finite values fall back too, and the explicit check is load-bearing:
+    the range test alone does not reject NaN, because `NaN < minimum` and
+    `NaN > maximum` are *both* False. A NaN that survived here would land in
+    `max_daily_spend_usd`, where the ceiling is only enforced when it is
+    `> 0` — also False for NaN — so a corrupt settings file would silently
+    read as "no spend cap configured" instead of falling back to the default.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     number = float(value)
+    if not math.isfinite(number):
+        return default
     if number < minimum or number > maximum:
         return default
     return number

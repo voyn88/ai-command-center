@@ -185,6 +185,115 @@ def test_budget_unknown_defers_everything_with_a_nonzero_ceiling_and_free_execut
     assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
 
 
+# --------------------------------------------------------------------------
+# Budget arithmetic that cannot be performed. A NaN does not *fail* the
+# ceiling comparisons, it *satisfies* all of them, so it is the one input that
+# silently inverts the engine's "budget is never exceeded" guarantee.
+# --------------------------------------------------------------------------
+
+
+def test_a_non_finite_spend_total_blocks_everything():
+    """The measured fail-open, at engine level: a NaN trailing-24h spend used
+    to sail past a real ceiling for every task, because `NaN + cost > ceiling`
+    is False. It must engage the cost-data gate instead."""
+    policy = DispatchPolicy(cost_matrix={"claude_code": 50.0})
+    executors = [_executor("claude_code", cost=50.0)]
+    tasks = [_task("t1"), _task("t2"), _task("t3")]
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        plan = _plan(
+            tasks, executors, policy, daily_spend_usd=bad, max_daily_spend_usd=5.0
+        )
+        assert plan.budget_unknown is True, bad
+        assert plan.assignments == (), bad
+        assert all(
+            d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions
+        ), bad
+
+
+def test_a_non_finite_ceiling_blocks_everything():
+    """A corrupt ceiling is not an absent one. `max_daily_spend_usd` is only
+    enforced when `> 0`, which is False for NaN — so a NaN ceiling would read
+    as "no cap configured" and buy unlimited spend."""
+    policy = DispatchPolicy(cost_matrix={"claude_code": 50.0})
+    executors = [_executor("claude_code", cost=50.0)]
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        plan = _plan(
+            [_task("t1")],
+            executors,
+            policy,
+            daily_spend_usd=0.0,
+            max_daily_spend_usd=bad,
+        )
+        assert plan.budget_unknown is True, bad
+        assert plan.assignments == (), bad
+
+
+def test_a_non_finite_per_task_cost_blocks_only_its_own_executor():
+    """A cost that cannot be compared cannot be shown to fit, so the executor
+    carrying it is blocked — but the gate is per-executor, not a whole-plan
+    refusal, so a healthy alternative is still assignable."""
+    policy = DispatchPolicy(prefer_local=False)
+    executors = [
+        _executor("broken", cost=float("nan")),
+        _executor("claude_code", cost=1.0),
+    ]
+    plan = _plan(
+        [_task("t1")], executors, policy, daily_spend_usd=0.0, max_daily_spend_usd=10.0
+    )
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_a_non_finite_cost_on_the_only_executor_defers_rather_than_assigns():
+    policy = DispatchPolicy(prefer_local=False)
+    executors = [_executor("broken", cost=float("nan"))]
+    plan = _plan(
+        [_task("t1")], executors, policy, daily_spend_usd=0.0, max_daily_spend_usd=10.0
+    )
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
+
+
+def test_a_non_finite_cost_is_blocked_even_with_no_ceiling_configured():
+    """The `max_daily_spend_usd > 0` guard means an unset ceiling skips the
+    comparison entirely, so the finite-cost check must not live behind it."""
+    policy = DispatchPolicy(prefer_local=False)
+    executors = [_executor("broken", cost=float("inf"))]
+    plan = _plan(
+        [_task("t1")], executors, policy, daily_spend_usd=0.0, max_daily_spend_usd=0.0
+    )
+
+    assert plan.assignments == ()
+
+
+def test_a_gated_plan_serializes_as_valid_json():
+    """A refusal has to stay readable: `json` emits bare `NaN`, which RFC 8259
+    forbids and `JSON.parse` rejects, so a corrupt spend figure would turn the
+    plan endpoint's 200 into an unparseable body — hiding the very reason it
+    is refusing."""
+    import json
+
+    policy = DispatchPolicy(cost_matrix={"claude_code": 50.0})
+    executors = [_executor("claude_code", cost=50.0)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=float("nan"),
+        max_daily_spend_usd=float("nan"),
+    )
+
+    body = json.dumps(plan.as_dict(), allow_nan=False)  # raises if NaN leaked
+    parsed = json.loads(body)
+    assert parsed["budget_unknown"] is True
+    assert parsed["daily_spend_usd"] is None
+    assert parsed["max_daily_spend_usd"] is None
+    assert parsed["budget_remaining_usd"] is None
+
+
 def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
     policy = DispatchPolicy()
     executors = [_executor("claude_code", cost=0.0)]

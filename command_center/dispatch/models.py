@@ -9,6 +9,7 @@ the reason instead of parsing prose.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 # --------------------------------------------------------------------------
@@ -322,6 +323,11 @@ class DispatchPlan:
 
     @property
     def budget_remaining_usd(self) -> float:
+        if not math.isfinite(self.max_daily_spend_usd):
+            # Not "unlimited" — unknowable. `inf` here would render as a null
+            # remaining, i.e. exactly how an unset ceiling reads, so a corrupt
+            # ceiling would be indistinguishable from a deliberately absent one.
+            return float("nan")
         if self.max_daily_spend_usd <= 0:
             return float("inf")
         return self.max_daily_spend_usd - self.projected_spend_usd
@@ -332,10 +338,12 @@ class DispatchPlan:
             "kill_switch_engaged": self.kill_switch_engaged,
             "budget_unknown": self.budget_unknown,
             "capacity_unknown": self.capacity_unknown,
-            "daily_spend_usd": self.daily_spend_usd,
-            "max_daily_spend_usd": self.max_daily_spend_usd,
-            "projected_spend_usd": self.projected_spend_usd,
-            "budget_remaining_usd": (None if remaining == float("inf") else remaining),
+            "daily_spend_usd": _json_safe(self.daily_spend_usd),
+            "max_daily_spend_usd": _json_safe(self.max_daily_spend_usd),
+            "projected_spend_usd": _json_safe(self.projected_spend_usd),
+            "budget_remaining_usd": (
+                None if remaining == float("inf") else _json_safe(remaining)
+            ),
             "assignment_count": len(self.assignments),
             "deferred_count": len(self.deferred),
             "decisions": [d.as_dict() for d in self.decisions],
@@ -345,6 +353,18 @@ class DispatchPlan:
 # --------------------------------------------------------------------------
 # Small coercion helpers (shared by the fail-closed `from_dict`s)
 # --------------------------------------------------------------------------
+
+
+def _json_safe(value: float) -> float | None:
+    """`None` for a non-finite amount, the number otherwise.
+
+    Python's `json` emits bare `NaN`/`Infinity` for these, which RFC 8259 does
+    not allow — `JSON.parse` rejects it outright. A plan that reports a corrupt
+    spend figure must still be *readable*, because the reason it is refusing is
+    in the same response; `budget_unknown` is what carries the meaning, so the
+    unrepresentable number degrades to null rather than to a parse error.
+    """
+    return value if math.isfinite(value) else None
 
 
 def _as_dict(value: object) -> dict:

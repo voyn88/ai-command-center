@@ -480,6 +480,150 @@ def test_plan_fails_closed_when_the_store_breaks_between_the_two_reads(
     )
 
 
+def _insert_costed_run(db_path: Path, *, cost_literal: str) -> None:
+    """A completed run inside the trailing-24h window plus one result event
+    whose `total_cost_usd` is written as the raw JSON literal `cost_literal`.
+
+    The literal is inserted as text rather than via `json.dumps` so a bare
+    `NaN` — which `json.loads` accepts by default, and which a provider or a
+    damaged row can therefore produce — is exercised exactly as it would be
+    read back.
+    """
+    import sqlite3
+
+    from command_center import models as _models
+
+    now = _models.iso_now()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO run (id, session_id, task_id, sequence, state, project, "
+            "task_type, repository_path, prompt, created_at, updated_at, "
+            "completed_at, provider_id) VALUES "
+            "('r1','s1','t1',1,'SUCCEEDED','AICC','implementation','/tmp/x','p',"
+            "?,?,?,'claude_code')",
+            (now, now, now),
+        )
+        conn.execute(
+            "INSERT INTO run_event (run_id, seq, event_type, payload_json, created_at) "
+            "VALUES ('r1', 1, 'stream_event', ?, ?)",
+            (f'{{"type":"result","total_cost_usd":{cost_literal}}}', now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _paid_pool(monkeypatch):
+    """One available cloud executor at $50/task — expensive enough that a real
+    ceiling must stop it, so an assignment can only mean the ceiling failed."""
+    monkeypatch.setattr(
+        service,
+        "collect_executor_pool",
+        lambda policy: [
+            ExecutorProfile(
+                id="claude_code", label="Claude Code", kind="cli", is_local=False,
+                available=True, cost_per_task_usd=50.0,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        project_config,
+        "allowed_execution_providers",
+        lambda project_id: ("claude_code",),
+    )
+
+
+def test_plan_fails_closed_on_a_corrupt_cost_row(monkeypatch, tmp_path):
+    """The other half of the reported defect: the store is perfectly readable,
+    the data in it is not.
+
+    A `total_cost_usd` of NaN does not raise on read, so no existing gate
+    engaged — and because every ceiling test is a `>` comparison, and every
+    such comparison against NaN is False, one row silently disabled the daily
+    ceiling for the whole system. Measured before the fix: 5 of 5 assigned,
+    $250 committed against a $5 ceiling.
+    """
+    _enable_master_switch()
+    _paid_pool(monkeypatch)
+    policy_config.save_policy(
+        ROOT, DispatchPolicy(prefer_local=False, cost_matrix={"claude_code": 50.0})
+    )
+    import dataclasses
+
+    pipeline_settings.save_settings(
+        ROOT,
+        dataclasses.replace(
+            pipeline_settings.load_settings(ROOT), max_daily_spend_usd=5.0
+        ),
+    )
+    for i in range(5):
+        _queued_task(title=f"t{i}")
+
+    db = tmp_path / "runtime.db"
+    runtime_db.migrate(db)
+    _insert_costed_run(db, cost_literal="NaN")
+
+    plan = service.plan(ROOT, db_path=db)
+
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
+def test_plan_still_assigns_against_an_ordinary_cost_row(monkeypatch, tmp_path):
+    """Control for the refusal above: a well-formed prior cost is summed and
+    compared normally, so failing closed on corrupt data has not simply
+    stopped dispatch everywhere."""
+    _enable_master_switch()
+    _paid_pool(monkeypatch)
+    policy_config.save_policy(
+        ROOT, DispatchPolicy(prefer_local=False, cost_matrix={"claude_code": 50.0})
+    )
+    import dataclasses
+
+    pipeline_settings.save_settings(
+        ROOT,
+        dataclasses.replace(
+            pipeline_settings.load_settings(ROOT), max_daily_spend_usd=500.0
+        ),
+    )
+    _queued_task(title="t0")
+
+    db = tmp_path / "runtime.db"
+    runtime_db.migrate(db)
+    _insert_costed_run(db, cost_literal="1.25")
+
+    plan = service.plan(ROOT, db_path=db)
+
+    assert plan.budget_unknown is False
+    assert plan.daily_spend_usd == pytest.approx(1.25)
+    assert len(plan.assignments) == 1
+
+
+def test_assign_is_a_noop_on_a_corrupt_cost_row(monkeypatch, tmp_path):
+    """The refusal must hold for the *write* path too, not just the dry run."""
+    _enable_master_switch()
+    _paid_pool(monkeypatch)
+    policy_config.save_policy(
+        ROOT, DispatchPolicy(prefer_local=False, cost_matrix={"claude_code": 50.0})
+    )
+    task = _queued_task(title="t0")
+
+    db = tmp_path / "runtime.db"
+    runtime_db.migrate(db)
+    _insert_costed_run(db, cost_literal="NaN")
+
+    result = service.assign(ROOT, CALLER, confirmed=True, db_path=db)
+
+    assert result["applied"] is False
+    assert result["reason"] == "cost_data_unavailable"
+    stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
+    assert stored.get("executor") in (None, "")
+
+
 # --------------------------------------------------------------------------
 # assign() applies through tasks_repository
 # --------------------------------------------------------------------------

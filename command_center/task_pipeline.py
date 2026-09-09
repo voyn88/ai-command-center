@@ -2401,14 +2401,37 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
     }
 
 
+class CorruptCostData(RuntimeError):
+    """A run event reported a `total_cost_usd` that is not a usable amount of
+    money — non-finite (NaN/±inf) or negative.
+
+    Raised rather than skipped, because skipping is the fail-open direction:
+    the run really did cost something, and dropping its cost understates the
+    trailing-24h total, which is the one figure every spend ceiling is checked
+    against. NaN is the sharpest case — it does not merely understate, it
+    *neutralises* the ceiling, since every `>` comparison against NaN is False.
+
+    Both callers already fail closed on an exception from `daily_spend_usd`
+    (`dispatch.service.plan` raises the `budget_unknown` gate; the pipeline
+    tick sets `spend_budget_exhausted`), so raising routes corrupt cost data
+    into the same refusal an unreadable database gets — which is the point:
+    a cost that cannot be trusted must not read as "no cost".
+    """
+
+
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
     work started in it). Reads only the final `result` stream events, which are
     the single truthful cost source — nothing is estimated or fabricated; a
     run whose provider reported no cost contributes 0.
+
+    A cost that is *present but unusable* is not the same as one that is
+    absent: it raises `CorruptCostData` rather than contributing 0. See that
+    class for why skipping it would fail open.
     """
     import json as _json
+    import math as _math
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
@@ -2431,5 +2454,21 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
             continue
         cost = payload.get("total_cost_usd")
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            total += float(cost)
+            amount = float(cost)
+            # `json.loads` accepts bare NaN/Infinity by default, so a provider
+            # (or a corrupted row) can put either straight into this sum.
+            if not _math.isfinite(amount) or amount < 0:
+                raise CorruptCostData(
+                    f"run event reported total_cost_usd={cost!r}, which is not "
+                    "a usable amount of money; refusing to report a spend "
+                    "total derived from it"
+                )
+            total += amount
+    # Belt and braces: a sum of individually-finite costs can still overflow to
+    # +inf, and an infinite total disables every ceiling comparison just as a
+    # NaN one does.
+    if not _math.isfinite(total):
+        raise CorruptCostData(
+            "trailing-24h spend total is not finite; refusing to report it"
+        )
     return total

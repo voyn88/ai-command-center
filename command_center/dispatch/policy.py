@@ -26,12 +26,22 @@ The hard guarantees, enforced structurally here:
    guess conservatively, it guesses *zero work in flight*, which raises the
    effective concurrency limit exactly when the runtime store cannot be
    consulted.
+1d. **Budget arithmetic that cannot be performed blocks everything.** A
+   non-finite spend figure or ceiling (NaN/±inf) engages the same
+   `DEFER_COST_DATA_UNAVAILABLE` gate. This is not defensive paranoia about a
+   caller: NaN is the one input that *silently inverts* guarantee 2 below,
+   because every `>` comparison against NaN is False, so a NaN spend total
+   reads as "under every ceiling" for every task. A number that cannot be
+   compared is not a budget, and this engine — the thing that makes the
+   guarantee — is where that has to be caught.
 2. **Budget is never exceeded.** An executor is only assigned when the
    *projected* cumulative spend (the trailing-24h spend already incurred plus
    every assignment made so far in this plan plus this one) stays at or under
    the configured daily ceiling — and likewise under the per-agent and
    per-project ceilings. The check happens before the assignment is recorded,
-   so an over-budget assignment cannot be produced.
+   so an over-budget assignment cannot be produced. Because the comparison is
+   only meaningful on finite numbers, a non-finite per-task cost blocks the
+   executor it belongs to rather than sailing past every ceiling.
 3. **SLA/priority is never bypassed.** Tasks are consumed in a fixed order:
    priority weight (desc), then SLA deadline (earliest first), then age. A
    lower-priority task can never take capacity a higher-priority task in the
@@ -41,6 +51,8 @@ The hard guarantees, enforced structurally here:
 """
 
 from __future__ import annotations
+
+import math
 
 from command_center.dispatch.models import (
     ASSIGNED,
@@ -127,6 +139,14 @@ def plan_dispatch(
     guarantees this function structurally enforces."""
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
+
+    # Budget arithmetic that cannot be performed is budget data we do not have,
+    # so it takes the gate that already exists for exactly that. Folded in here
+    # rather than trusted to the caller because `plan_dispatch` is what promises
+    # the ceiling holds; a NaN would not trip any `>` check further down, it
+    # would quietly satisfy all of them.
+    if not math.isfinite(daily_spend_usd) or not math.isfinite(max_daily_spend_usd):
+        budget_unknown = True
 
     # (1) Kill switch / unreadable guardrail inputs first: no assignment is
     #     even considered. Checked ahead of the per-task loop, exactly like the
@@ -267,6 +287,12 @@ def _budget_block(
     global daily ceiling first (the kill-switch's budget sibling), then the
     per-agent concurrency/spend guardrails, then the per-project ceiling.
     """
+    # A cost that is not a finite number cannot be shown to fit any ceiling —
+    # and would defeat every comparison below rather than fail one — so the
+    # executor carrying it is blocked outright.
+    if not math.isfinite(cost):
+        return DEFER_DAILY_BUDGET
+
     # Global daily spend ceiling. `<= ceiling` after adding this cost.
     if max_daily_spend_usd > 0 and (projected + cost) > max_daily_spend_usd:
         return DEFER_DAILY_BUDGET

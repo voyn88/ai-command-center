@@ -458,6 +458,96 @@ def test_kill_switch_stops_running_work_and_blocks_future_launches(
     assert after.launched() == []
 
 
+def _seed_run_with_cost(api, cost):
+    """One completed run in the trailing-24h window whose provider reported
+    `cost` as its `total_cost_usd`. Returns nothing; the row is what matters."""
+    task = runtime_db.create_task(
+        api.db_path, project="AIOS", title="prior", task_type="implementation"
+    )
+    session = runtime_db.create_session(
+        api.db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    run = runtime_db.create_run(
+        api.db_path, session_id=session["id"], task_id=task["id"],
+        project="AIOS", task_type="implementation", repository_path="/tmp/x",
+        prompt="prior", is_resume=False,
+    )
+    runtime_db.append_run_event(
+        api.db_path, run["id"], "stream_event",
+        {"type": "result", "total_cost_usd": cost},
+    )
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (models.iso_now(), run["id"]),
+            )
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -1.5])
+def test_daily_spend_refuses_a_cost_that_is_not_usable_money(tmp_path, api, bad):
+    """A `total_cost_usd` that is present but unusable raises rather than
+    contributing 0 to the total.
+
+    Skipping it is the fail-open direction — the run really did cost something,
+    so dropping it understates the one figure every ceiling is compared
+    against. NaN is the sharpest case and the reason this is a hard refusal
+    rather than a clamp: it does not merely understate the total, it makes the
+    total *incomparable*, and `projected > ceiling` is False for NaN, so a
+    single such row silently disables every spend ceiling in the system.
+
+    `json.loads` accepts bare `NaN`/`Infinity` by default, so this is reachable
+    from a provider payload and not only from a hand-corrupted row.
+    """
+    _seed_run_with_cost(api, bad)
+
+    with pytest.raises(task_pipeline.CorruptCostData):
+        task_pipeline.daily_spend_usd(api.db_path)
+
+
+def test_daily_spend_still_sums_ordinary_costs(tmp_path, api):
+    """Control for the refusal above: well-formed costs (including a genuine
+    zero) still add up, so failing closed on corrupt data has not turned every
+    read into an error."""
+    _seed_run_with_cost(api, 0.75)
+    _seed_run_with_cost(api, 0.0)
+    _seed_run_with_cost(api, 1.25)
+
+    assert task_pipeline.daily_spend_usd(api.db_path) == pytest.approx(2.0)
+
+
+def test_a_corrupt_cost_row_stops_the_pipeline_launching(tmp_path, api, fake_claude):
+    """The refusal has to reach the *tick*, which is the thing that launches.
+
+    `tick` already fails closed on any error from `daily_spend_usd`
+    (`spend_budget_exhausted = True`), so raising is what routes corrupt cost
+    data into the existing refusal. Without the raise this row summed to NaN
+    and `NaN >= 1.0` is False — the budget read as "not exhausted" and the
+    launch went ahead.
+    """
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-nan")
+    wt = tmp_path / "wt" / "n"
+    task = _task("n", "AIOS", wt, branch="task/n")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"n": task})
+    configs = project_config.load_project_configs()
+
+    _seed_run_with_cost(api, float("nan"))
+
+    gated = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+    assert gated.launched() == []
+    assert gated.launch_status == task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+
+
 def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     """NIGHT-W7-AICC-AUTONOMY spend budget: with the trailing-24h provider
     cost at/over `max_daily_spend_usd`, a tick launches nothing and says why

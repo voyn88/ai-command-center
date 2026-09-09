@@ -126,6 +126,26 @@ def test_out_of_range_concurrency_falls_back_to_the_default():
     assert settings.max_agent_concurrency == pipeline_settings.DEFAULT_MAX_AGENT_CONCURRENCY
 
 
+def test_a_non_finite_spend_ceiling_falls_back_to_the_default():
+    """A NaN ceiling must not read as "no ceiling configured".
+
+    The range test in `_bounded_float` does not reject NaN on its own —
+    `NaN < minimum` and `NaN > maximum` are both False — so without an explicit
+    finite check a NaN survives into `max_daily_spend_usd`. Every spend gate is
+    written as `max_daily_spend_usd > 0`, which is *also* False for NaN, so the
+    ceiling would be skipped entirely: a corrupt settings file would silently
+    buy unlimited spend. Infinities are rejected for the same reason (`inf`
+    passes `> 0`, but then nothing can ever exceed it).
+    """
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        settings = PipelineSettings.from_dict({"max_daily_spend_usd": bad})
+        assert settings.max_daily_spend_usd == 0.0, bad
+
+    # Control: a finite in-range ceiling is still accepted unchanged, so the
+    # guard above cannot be passing by rejecting everything.
+    assert PipelineSettings.from_dict({"max_daily_spend_usd": 7.5}).max_daily_spend_usd == 7.5
+
+
 def test_a_lone_auto_launch_flag_cannot_launch_without_the_master_switch():
     settings = PipelineSettings(enabled=False, auto_launch=True, auto_merge_after_checks=True)
     assert settings.auto_launch_active is False
