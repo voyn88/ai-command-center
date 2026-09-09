@@ -1,3 +1,18 @@
+# The control-plane queue probe. It connects as `aicc_app` (the .env below):
+# the measurement reads `work_item` and joins the lease through
+# `work_attempt_public`, neither of which a worker role may read.
+#
+# --record-findings makes a red probe a task the fleet fixes rather than a
+# permanently failed unit; `control-01:queue` is the source the live probe
+# already records under (monitor_finding #481), so the name is not free to
+# change -- a different string opens a second, unlinked finding for the same
+# measurement.
+#
+# --max-stalled-seconds times work NOBODY IS ATTENDING (ready and due, or
+# claimed with a lapsed lease). It is deliberately not a bound on how long one
+# attempt may run: `voyn-aicc-worker@.service` gives a single attempt
+# TimeoutStopSec=3660s. A claim under a live, heartbeating lease is bounded by
+# --max-claim-seconds instead, which is left at its default here.
 [Unit]
 Description=VOYN durable queue fail-closed monitor
 After=network-online.target tailscaled.service postgresql.service prometheus.service
@@ -8,7 +23,7 @@ Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
 EnvironmentFile=/home/voynadmin/aicc-preprod/.env
-ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --skip-workers --minimum-active-workers 0 --max-stalled-seconds 900 --max-recent-dead 0 --prometheus-url http://100.114.209.119:9090/-/ready
+ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --skip-workers --minimum-active-workers 0 --max-stalled-seconds 900 --max-recent-dead 0 --prometheus-url http://100.114.209.119:9090/-/ready --record-findings control-01:queue
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only

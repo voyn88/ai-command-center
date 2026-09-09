@@ -8,6 +8,30 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the queue monitor called a working fleet stalled (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `command_center/ops/infra_monitor.py`: the stall clock was
+  `now() - min(work_item.updated_at)` over every ready or claimed row. For a
+  claimed row that timestamp is the moment it was CLAIMED — `queue_heartbeat`
+  renews `work_attempt.visible_until` and never touches the item — so any
+  attempt outrunning `--max-stalled-seconds` (900s) read as a stall, and the
+  deployment expects that to be ordinary: `voyn-aicc-worker@.service` gives one
+  attempt `TimeoutStopSec=3660s`, plus a 600s worktree clone before the agent
+  starts. `control-01:queue` therefore went red with `queue_stalled` on healthy
+  work, opened a `monitor_finding` (#481) and had the planner mint a task for
+  it — a fail-closed monitor that could not be green while the fleet worked.
+  The clock now measures only UNATTENDED pending work: ready and *due* (an item
+  inside its retry backoff is waiting by design), or claimed with no live
+  lease — the zombie the check was written for, which is still caught. A claim
+  under a live lease is reported separately as `live_claim_age_seconds` and
+  bounded by the new `--max-claim-seconds` (default 5400s), so a handler wedged
+  behind a still-beating heartbeat thread is caught at a ceiling above one
+  legitimate attempt instead of below it. `throughput_stalled` is gated on the
+  same unattended set, so the fix does not merely rename the false positive.
+- `tests/db/test_infra_monitor_queue_snapshot.py`: the measurement proved
+  against a real server, as `aicc_app` — claims taken through `queue_claim`,
+  leases expired the way the protocol expires them, and the lease read through
+  `work_attempt_public` (`work_attempt` itself is granted to nobody).
+
 ### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
 - `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`
   (`clients/aicc-native/apple/Sources/AICCNativeCore/AICCNativeCore.swift`):

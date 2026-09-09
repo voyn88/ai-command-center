@@ -68,6 +68,7 @@ def test_pending_queue_without_recent_progress_fails_closed() -> None:
             dead=2,
             success_age_seconds=901,
             pending_age_seconds=901,
+            pending_unattended=3,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
@@ -146,6 +147,8 @@ def test_new_pending_work_does_not_turn_an_idle_queue_red() -> None:
 
 
 def test_claimed_queue_without_recent_success_fails_closed() -> None:
+    """Claims whose leases have LAPSED (so the snapshot counts them
+    unattended) and that nothing has recovered inside the stall window."""
     report = evaluate(
         {
             "voyn-aicc-worker@1.service": "active",
@@ -160,6 +163,7 @@ def test_claimed_queue_without_recent_success_fails_closed() -> None:
             dead=2,
             success_age_seconds=901,
             pending_age_seconds=901,
+            pending_unattended=2,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
@@ -185,6 +189,7 @@ def test_unrelated_success_does_not_hide_a_zombie_claim() -> None:
             dead=2,
             success_age_seconds=5,
             pending_age_seconds=901,
+            pending_unattended=1,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,
@@ -231,6 +236,26 @@ def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
     assert "EnvironmentFile=" not in worker_unit
     assert "--skip-workers" in queue_unit
     assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" in queue_unit
+
+
+def test_the_queue_probe_records_under_the_source_the_live_findings_carry() -> None:
+    """`monitor_finding` rows are keyed by (source, failure code), and the
+    planner mints ONE task per open finding from that pair. The live
+    control-01 probe records under `control-01:queue` (monitor_finding #481),
+    so the unit may not drift to another spelling: a second source would open
+    a second, unlinked finding for the same measurement."""
+    queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
+    exec_start = next(
+        line for line in queue_unit.splitlines() if line.startswith("ExecStart=")
+    )
+
+    assert "--record-findings control-01:queue" in exec_start
+    # The stall window is the UNATTENDED clock and must stay well under the
+    # claim ceiling; conflating the two is what this unit was red for. The
+    # ceiling itself is not spelled here -- the default IS the policy, and
+    # `test_the_claim_ceiling_clears_one_legitimate_attempt` pins it.
+    assert "--max-stalled-seconds 900" in exec_start
+    assert "--max-claim-seconds" not in exec_start
 
 
 def test_evaluate_can_skip_queue_without_hiding_worker_failures() -> None:
@@ -313,7 +338,7 @@ def _queue(**kw):
     from command_center.ops.infra_monitor import QueueSnapshot
 
     base = dict(ready=3, claimed=2, succeeded=100, dead=0, success_age_seconds=200.0,
-                pending_age_seconds=60.0, recent_dead=0)
+                pending_age_seconds=60.0, recent_dead=0, pending_unattended=5)
     base.update(kw)
     return QueueSnapshot(**base)
 
@@ -406,3 +431,154 @@ def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(mo
     assert out["ok"] is True and out["findings_recorded"] is False
     assert "db down" in out["findings_error"]
     assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #481)
+# ---------------------------------------------------------------------------
+# `control-01:queue` reported `queue_stalled` against a healthy fleet. The
+# stall clock was `now() - min(work_item.updated_at)` over every ready or
+# claimed row, and for a claimed row that timestamp is the moment it was
+# CLAIMED -- heartbeats renew `work_attempt.visible_until` and never touch the
+# item. Any attempt outrunning `--max-stalled-seconds` (900s) therefore read as
+# a stall, and the deployment's own units expect attempts far longer than that
+# (`voyn-aicc-worker@.service`: TimeoutStopSec=3660s for one attempt, plus a
+# 600s worktree clone before the agent starts). The monitor could not be green
+# while the fleet did its job.
+
+
+def test_a_live_lease_is_progress_not_a_stall() -> None:
+    """THE REGRESSION. One lane 40 minutes into an attempt, heartbeating: the
+    snapshot reports it as an attended claim (`pending_unattended == 0`), and
+    the monitor stays green."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=0,
+            claimed=1,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=4000,
+            pending_age_seconds=None,
+            pending_unattended=0,
+            live_claim_age_seconds=2400,
+            recent_succeeded=0,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert report.ok
+    assert report.failures == ()
+
+
+def test_a_live_lease_does_not_become_a_throughput_stall_either() -> None:
+    """The other half of the same false positive: gating the throughput check
+    on `ready + claimed` merely renamed the failure, because a fleet whose
+    only work is one hour-long attempt has nothing succeeded in the trailing
+    hour by construction."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=0,
+            claimed=4,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=5000,
+            pending_age_seconds=None,
+            pending_unattended=0,
+            live_claim_age_seconds=3000,
+            recent_succeeded=0,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert report.ok
+
+
+def test_a_claim_whose_lease_lapsed_is_still_a_stall() -> None:
+    """The zombie the check exists for survives the fix: no live lease, and
+    the reaper (every minute) has not recovered it inside the stall window."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=0,
+            claimed=1,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=5,
+            pending_age_seconds=1200,
+            pending_unattended=1,
+            live_claim_age_seconds=None,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert not report.ok
+    assert "queue_stalled" in report.failures
+
+
+def test_a_live_lease_held_past_the_ceiling_is_reported_as_overdue() -> None:
+    """A heartbeat thread beating beside a wedged handler keeps the lease
+    live forever, so "attended" cannot mean "never checked": the claim is
+    bounded, just above one whole legitimate attempt instead of below it."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=0,
+            claimed=1,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=9000,
+            pending_age_seconds=None,
+            pending_unattended=0,
+            live_claim_age_seconds=9001,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_claim_seconds=5400,
+    )
+
+    assert not report.ok
+    assert report.failures == ("claim_overdue:9001s>5400s",)
+    # One finding, not one per tick: the measurement rides in the detail.
+    assert infra_monitor.finding_key(report.failures[0]) == "claim_overdue"
+
+
+def test_the_claim_ceiling_clears_one_legitimate_attempt() -> None:
+    """The default is not a number pulled from the air: the worker unit gives
+    a single attempt TimeoutStopSec=3660s, and the handler provisions a
+    worktree (600s clone timeout) before the agent starts."""
+    unit = (
+        Path(__file__).resolve().parents[2]
+        / "deploy/systemd/voyn-aicc-worker@.service"
+    ).read_text(encoding="utf-8")
+    stop_timeout = int(
+        next(
+            line for line in unit.splitlines() if line.startswith("TimeoutStopSec=")
+        ).split("=", 1)[1].rstrip("s")
+    )
+    assert infra_monitor.DEFAULT_MAX_CLAIM_SECONDS > stop_timeout
+
+
+def test_the_snapshot_query_excludes_live_leases_from_the_stall_clock() -> None:
+    """The clock is only as honest as the SQL that feeds it: without the join
+    to `work_attempt_public` the monitor cannot tell an attended claim from an
+    abandoned one, and this file's evaluate-level tests would pass over a
+    snapshot that still measured `min(updated_at)` across every pending row.
+
+    `tests/db/test_infra_monitor_queue_snapshot.py` executes this same
+    statement against a real server; this one keeps the join from being
+    dropped in a checkout with no PostgreSQL to hand."""
+    sql = infra_monitor._QUEUE_SNAPSHOT_SQL
+    assert "work_attempt_public" in sql
+    assert "a.visible_until > now()" in sql
+    # The lease-less half of "unattended": a ready item still inside its
+    # backoff is waiting by design and must not start the stall clock.
+    assert "w.available_at > now()" in sql
