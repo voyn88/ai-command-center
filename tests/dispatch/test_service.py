@@ -788,3 +788,167 @@ def test_a_missing_policy_file_still_dispatches(monkeypatch, pool):
 
     assert plan.policy_unknown is False
     assert len(plan.assignments) == 1
+
+
+# --------------------------------------------------------------------------
+# The configured spend ceiling — the fourth guardrail input that can be
+# corrupt, and the only one whose permissive reading is spelled the same as
+# its legitimate "unset" one (`0.0` = no cap).
+# --------------------------------------------------------------------------
+
+
+def _write_raw_ceiling(value):
+    """Put `max_daily_spend_usd` into the settings file verbatim, the way a
+    hand-edit, a torn write or a non-Python client would — bypassing
+    `PipelineSettings`, which is the thing under test."""
+    from command_center import storage
+
+    path = pipeline_settings.settings_file_path(ROOT)
+    data = storage.read_json(path, {})
+    data["max_daily_spend_usd"] = value
+    storage.atomic_write_json(path, data)
+    return path
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["5.0", 20_000, -5, None, "abc", float("nan"), float("inf")],
+    ids=["string", "out_of_range", "negative", "null", "garbage", "nan", "inf"],
+)
+def test_plan_fails_closed_on_a_corrupt_configured_ceiling(monkeypatch, pool, raw):
+    """A ceiling that is present but unusable must refuse, not read as unset.
+
+    Measured against the real `plan()` before this was closed: $100.00 already
+    spent against a configured $5.00 ceiling defers both tasks — but write the
+    *same* ceiling in any of these corrupt forms and it assigned 2 of 2 with
+    `budget_unknown=False`, because each one decayed to `0.0`, which every
+    spend gate reads as "no cap configured".
+    """
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _spend(monkeypatch, 100.0)
+    _write_raw_ceiling(raw)
+    _queued_task(title="t1", executor="claude_code", executor_pinned=True)
+    _queued_task(title="t2", executor="claude_code", executor_pinned=True)
+
+    plan = service.plan(ROOT)
+
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions
+    )
+    # The refusal has to be *transmittable*: `json.dump` emits bare `NaN`,
+    # which `JSON.parse` rejects, so the reason would arrive unreadable.
+    assert plan.as_dict()["max_daily_spend_usd"] is None
+
+
+def test_a_corrupt_ceiling_cannot_dispatch_more_than_the_ceiling_it_replaced(
+    monkeypatch, pool
+):
+    """The differential the bug report asks for, end to end.
+
+    Same operator intent ($5.00/day), same spend, same queue — only the
+    ceiling's *representation* differs. A failed read must never widen what a
+    plan is allowed to do.
+    """
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _spend(monkeypatch, 100.0)
+    _queued_task(title="t1", executor="claude_code", executor_pinned=True)
+    _queued_task(title="t2", executor="claude_code", executor_pinned=True)
+
+    _write_raw_ceiling(5.0)
+    healthy = service.plan(ROOT)
+    assert healthy.assignments == ()
+    # Refused on the *budget*, not on a data gate — the ceiling was evaluated.
+    assert healthy.budget_unknown is False
+    assert all(d.reason == models.DEFER_DAILY_BUDGET for d in healthy.decisions)
+
+    _write_raw_ceiling("5.0")
+    corrupt = service.plan(ROOT)
+
+    assert len(corrupt.assignments) <= len(healthy.assignments)
+    assert corrupt.budget_unknown is True
+
+
+def test_a_corrupt_ceiling_still_refuses_when_nothing_has_been_spent(
+    monkeypatch, pool
+):
+    """The sharpest form: no spend, a free local executor, and the default
+    `prefer_local` — the exact shape the report measured as assigning 2 of 2.
+
+    Nothing about the *spend* stops this plan; only the fact that the ceiling
+    governing it cannot be evaluated does. A gate that needed the budget to be
+    exhausted first would not fire here at all.
+    """
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _spend(monkeypatch, 0.0)
+    _write_raw_ceiling("5.0")
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+
+    plan = service.plan(ROOT)
+
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+
+
+def test_assign_is_a_noop_on_a_corrupt_configured_ceiling(monkeypatch, pool):
+    """`plan()` refusing is only half of it — `assign()` must not write."""
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _spend(monkeypatch, 0.0)
+    _write_raw_ceiling(-5)
+    task = _queued_task(title="t1")
+
+    result = service.assign(ROOT, CALLER, confirmed=True)
+
+    assert result["applied"] is False
+    assert result["reason"] == "cost_data_unavailable"
+    stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
+    assert not stored.get("executor")
+
+
+def test_an_unset_ceiling_still_dispatches(monkeypatch, pool):
+    """The fallback's legitimate case. `0.0`/absent means "no budget
+    configured" — the shipped default — and must keep dispatching, or this
+    whole gate would just be a disguised outage."""
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _spend(monkeypatch, 0.0)
+    _queued_task(title="t1")
+
+    _write_raw_ceiling(0.0)
+    assert len(service.plan(ROOT).assignments) == 1
+    assert service.plan(ROOT).budget_unknown is False
+
+    # And with the key absent entirely, as on a fresh install.
+    from command_center import storage
+
+    path = pipeline_settings.settings_file_path(ROOT)
+    data = storage.read_json(path, {})
+    data.pop("max_daily_spend_usd", None)
+    storage.atomic_write_json(path, data)
+
+    assert len(service.plan(ROOT).assignments) == 1
+    assert service.plan(ROOT).budget_unknown is False
+
+
+def test_a_corrupt_ceiling_is_tellable_apart_in_the_log(monkeypatch, pool, caplog):
+    """An unreachable database and a hand-edited ceiling both surface as
+    `budget_unknown`, and they need different remedies — so the log has to
+    name which store produced the refusal."""
+    _enable_master_switch()
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _spend(monkeypatch, 0.0)
+    _write_raw_ceiling("5.0")
+    _queued_task(title="t1")
+
+    with caplog.at_level("WARNING"):
+        plan = service.plan(ROOT)
+
+    assert plan.budget_unknown is True
+    assert "daily spend ceiling" in caplog.text
+    assert str(pipeline_settings.settings_file_path(ROOT)) in caplog.text

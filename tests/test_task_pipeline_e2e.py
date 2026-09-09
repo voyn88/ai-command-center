@@ -603,3 +603,51 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     )
     ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert [d.task_id for d in ungated.launched()] == ["s"]
+
+
+def test_a_corrupt_spend_ceiling_stops_the_pipeline_launching(tmp_path, api, fake_claude):
+    """The tick's own half of the ceiling fail-open.
+
+    The branch that reads the trailing-24h spend is guarded by
+    `max_daily_spend_usd > 0`, and that test is False for a corrupt ceiling
+    exactly as it is for the unset `0.0` — so before this was closed, a
+    ceiling hand-edited into nonsense did not merely go unenforced, it skipped
+    the budget check altogether and launched.
+
+    `launch_status` is what this asserts on rather than `launched()`, and
+    deliberately: an empty launch list is not evidence on its own (a sandbox
+    where nothing launches would satisfy it either way), whereas
+    `LAUNCH_BUDGET_EXHAUSTED` can only be reached through the gate itself.
+    """
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-ceil")
+    wt = tmp_path / "wt" / "c"
+    task = _task("c", "AIOS", wt, branch="task/c")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"c": task})
+    configs = project_config.load_project_configs()
+
+    def _tick_with_ceiling(ceiling: float):
+        pipeline_settings.save_settings(
+            tmp_path,
+            PipelineSettings(
+                enabled=True, auto_launch=True, max_daily_spend_usd=ceiling,
+                max_global_concurrency=2, max_agent_concurrency=2,
+            ),
+        )
+        # The corruption has to survive the write: `as_dict` cannot emit NaN
+        # as JSON, so it persists as null and `load_settings` must read that
+        # back as unusable rather than as "no cap".
+        return task_pipeline.tick(
+            tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+        )
+
+    gated = _tick_with_ceiling(float("nan"))
+    assert gated.launched() == []
+    assert gated.launch_status == task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+    assert any("not a usable amount of money" in e for e in gated.errors)
+
+    # Control: an *unset* ceiling is the shipped default and must not engage
+    # the budget gate — otherwise the assertion above would pass for a
+    # pipeline that simply refuses everything.
+    ungated = _tick_with_ceiling(0.0)
+    assert ungated.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED

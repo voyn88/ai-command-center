@@ -17,6 +17,13 @@ of `st.session_state`:
   concurrency caps: an unparseable or out-of-range value falls back to the
   conservative default rather than being clamped up from garbage.
 
+  Note what "conservative" means per field, because it is not always the
+  default. For the switches and the concurrency caps the default *is* the
+  restrictive answer, so falling back to it is safe. For `max_daily_spend_usd`
+  it is the opposite — `0.0` means "no cap" — so that field does not fall back
+  at all: a value that is present but unusable is carried as NaN and refuses
+  dispatch. See `_spend_ceiling`.
+
 Storage is `data/pipeline_settings.json`, using the same atomic-write +
 sibling-lock-file convention as `execution_queue.json` and `tasks.json` (see
 `command_center.storage`), so a read-modify-write from two Streamlit sessions
@@ -113,25 +120,66 @@ def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int
     return number
 
 
-def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
-    """A float within `[minimum, maximum]`, or `default`; bools rejected like
-    `_bounded_int`, out-of-range falls back rather than clamping.
+def _spend_ceiling(data: dict, key: str, *, maximum: float) -> float:
+    """The daily spend ceiling `data[key]` configures: the amount when it is
+    usable money, `0.0` ("no ceiling configured") when the key is **absent**,
+    and NaN when the key is present but is not usable money.
 
-    Non-finite values fall back too, and the explicit check is load-bearing:
-    the range test alone does not reject NaN, because `NaN < minimum` and
-    `NaN > maximum` are *both* False. A NaN that survived here would land in
-    `max_daily_spend_usd`, where the ceiling is only enforced when it is
-    `> 0` — also False for NaN — so a corrupt settings file would silently
-    read as "no spend cap configured" instead of falling back to the default.
+    This deliberately does *not* share `_bounded_int`'s fallback-to-default
+    rule, and the asymmetry is the whole point. Falling back is safe for the
+    concurrency caps because their defaults are the *restrictive* answer: a
+    hand-edited `200` decaying to `2` can only ever launch less work. It is
+    exactly backwards for a spend ceiling, whose default `0.0` means "no cap"
+    (see the field, and every `max_daily_spend_usd > 0` guard). Under the
+    fallback rule a corrupt ceiling did not degrade to something stricter, it
+    *deleted the operator's cap* — and silently, since `0.0` is also what a
+    never-configured ceiling reads as.
+
+    Measured on the real `dispatch.service.plan` before this changed: a
+    configured $5.00 ceiling with $100.00 already spent defers both queued
+    tasks with `daily_budget_exhausted`; write that same ceiling as `"5.0"`,
+    `20000`, `-5`, `null` or `NaN` and the identical call assigns 2 of 2 with
+    `budget_unknown=False`.
+
+    So corruption is *carried* rather than normalised away, exactly as
+    `dispatch.models._configured_amount` carries a corrupt policy ceiling:
+    NaN is a value no `>` comparison silently accepts, which routes it into
+    the fail-closed gate the readers already have (`plan_dispatch` engages
+    `budget_unknown`; the pipeline tick engages `spend_budget_exhausted`).
+
+    A *missing* key stays `0.0`, so a fresh install with no settings file
+    dispatches normally. JSON `null` is not in that group: it is precisely
+    what `as_dict` writes for a NaN, so reading it back as unusable is what
+    makes the refusal survive a save/load round trip instead of being cleared
+    the next time an unrelated field is edited.
+
+    Out-of-range is unusable rather than a fallback for the same reason: an
+    operator who typed `20000` meant a large cap, and the one reading that
+    must never win is "no cap at all".
     """
+    if key not in data:
+        return 0.0
+    value = data[key]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return default
+        return float("nan")
     number = float(value)
-    if not math.isfinite(number):
-        return default
-    if number < minimum or number > maximum:
-        return default
+    # The range test alone does not reject NaN (`NaN < 0` and `NaN > maximum`
+    # are *both* False), and `json.loads` parses bare `NaN` by default.
+    if not math.isfinite(number) or number < 0.0 or number > maximum:
+        return float("nan")
     return number
+
+
+def _json_safe_amount(value: float) -> float | None:
+    """`None` for a non-finite amount, the number otherwise.
+
+    `atomic_write_json` calls `json.dump`, which emits bare `NaN` — invalid
+    JSON that `JSON.parse` rejects, so persisting an unusable ceiling verbatim
+    would corrupt the settings file for every other reader. Null round-trips
+    back through `_spend_ceiling` as unusable, which is the meaning that has
+    to survive. Mirrors `dispatch.models._json_safe`.
+    """
+    return value if math.isfinite(value) else None
 
 
 def _concurrency(value: object, default: int) -> int:
@@ -164,6 +212,11 @@ class PipelineSettings:
     # Daily agent-spend ceiling in USD, summed from the providers' own
     # result-event `total_cost_usd` over the trailing 24h. `0.0` = no budget
     # (off, the default). Gates NEW launches only — running work finishes.
+    #
+    # NaN = "a ceiling is configured but cannot be read as money". Because
+    # `0.0` here means *no cap*, an unusable value must not decay to it; see
+    # `_spend_ceiling`. Both readers treat NaN as a refusal to launch rather
+    # than as an absent ceiling.
     max_daily_spend_usd: float = 0.0
     updated_at: str | None = None
     updated_by: str | None = None
@@ -232,7 +285,7 @@ class PipelineSettings:
             "max_rework_attempts": self.max_rework_attempts,
             "max_run_attempts": self.max_run_attempts,
             "run_timeout_seconds": self.run_timeout_seconds,
-            "max_daily_spend_usd": self.max_daily_spend_usd,
+            "max_daily_spend_usd": _json_safe_amount(self.max_daily_spend_usd),
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
         }
@@ -270,8 +323,8 @@ class PipelineSettings:
                 MIN_RUN_ATTEMPTS,
                 MAX_RUN_ATTEMPTS,
             ),
-            max_daily_spend_usd=_bounded_float(
-                data.get("max_daily_spend_usd"), 0.0, 0.0, 10_000.0
+            max_daily_spend_usd=_spend_ceiling(
+                data, "max_daily_spend_usd", maximum=10_000.0
             ),
             run_timeout_seconds=_bounded_int(
                 data.get("run_timeout_seconds"),

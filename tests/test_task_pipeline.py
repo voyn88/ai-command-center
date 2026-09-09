@@ -10,6 +10,7 @@ fake-Claude scenario lives in `test_task_pipeline_e2e.py`.
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
@@ -126,24 +127,85 @@ def test_out_of_range_concurrency_falls_back_to_the_default():
     assert settings.max_agent_concurrency == pipeline_settings.DEFAULT_MAX_AGENT_CONCURRENCY
 
 
-def test_a_non_finite_spend_ceiling_falls_back_to_the_default():
-    """A NaN ceiling must not read as "no ceiling configured".
+def test_an_unusable_spend_ceiling_is_carried_as_nan_not_as_no_ceiling():
+    """A corrupt ceiling must not read as "no ceiling configured".
 
-    The range test in `_bounded_float` does not reject NaN on its own —
-    `NaN < minimum` and `NaN > maximum` are both False — so without an explicit
-    finite check a NaN survives into `max_daily_spend_usd`. Every spend gate is
-    written as `max_daily_spend_usd > 0`, which is *also* False for NaN, so the
-    ceiling would be skipped entirely: a corrupt settings file would silently
-    buy unlimited spend. Infinities are rejected for the same reason (`inf`
-    passes `> 0`, but then nothing can ever exceed it).
+    Every spend gate is written as `max_daily_spend_usd > 0`, and `0.0` is the
+    documented "no cap" value — so falling back to the default here is not the
+    conservative answer it is for the concurrency caps, it is the *most
+    permissive one available*. NaN, `inf` and a wrongly-typed or out-of-range
+    value all had to become something no `>` test silently accepts, which is
+    what `_spend_ceiling` carries them as.
     """
-    for bad in (float("nan"), float("inf"), float("-inf")):
+    for bad in (
+        float("nan"), float("inf"), float("-inf"),  # non-finite
+        "5.0", "abc", None, True,                   # wrongly typed
+        -5, 20_000,                                 # out of range
+    ):
         settings = PipelineSettings.from_dict({"max_daily_spend_usd": bad})
-        assert settings.max_daily_spend_usd == 0.0, bad
+        assert math.isnan(settings.max_daily_spend_usd), bad
+        # The property that matters downstream: it is not readable as "unset".
+        assert not settings.max_daily_spend_usd > 0, bad
 
-    # Control: a finite in-range ceiling is still accepted unchanged, so the
+    # Control 1: a finite in-range ceiling is still accepted unchanged, so the
     # guard above cannot be passing by rejecting everything.
     assert PipelineSettings.from_dict({"max_daily_spend_usd": 7.5}).max_daily_spend_usd == 7.5
+
+    # Control 2: an *absent* key is genuinely "no cap configured", not
+    # corruption — a fresh install with no settings file must still dispatch.
+    assert PipelineSettings.from_dict({}).max_daily_spend_usd == 0.0
+    # ...and an explicit 0.0 is the same deliberate "off".
+    assert PipelineSettings.from_dict({"max_daily_spend_usd": 0.0}).max_daily_spend_usd == 0.0
+
+
+def test_an_unusable_spend_ceiling_survives_a_save_load_round_trip(tmp_path):
+    """The refusal must outlive persistence.
+
+    `as_dict` cannot write NaN verbatim (`json.dump` emits bare `NaN`, which
+    `JSON.parse` rejects), so it degrades to null — and null has to read back
+    as *unusable*, not as "unset". Otherwise saving any unrelated setting once
+    would launder a corrupt ceiling into an absent one and quietly restore the
+    unlimited spend this gate exists to refuse.
+    """
+    corrupt = PipelineSettings.from_dict({"max_daily_spend_usd": "5.0"})
+    assert math.isnan(corrupt.max_daily_spend_usd)
+
+    assert corrupt.as_dict()["max_daily_spend_usd"] is None  # valid JSON
+    reloaded = PipelineSettings.from_dict(corrupt.as_dict())
+    assert math.isnan(reloaded.max_daily_spend_usd)
+
+    # Through the real file, the way `save_settings`/`load_settings` do it.
+    pipeline_settings.save_settings(tmp_path, corrupt)
+    assert "NaN" not in pipeline_settings.settings_file_path(tmp_path).read_text()
+    assert math.isnan(pipeline_settings.load_settings(tmp_path).max_daily_spend_usd)
+
+    # Control: a healthy ceiling round-trips as itself.
+    pipeline_settings.save_settings(tmp_path, PipelineSettings(max_daily_spend_usd=7.5))
+    assert pipeline_settings.load_settings(tmp_path).max_daily_spend_usd == 7.5
+
+
+def test_editing_an_unrelated_setting_cannot_launder_a_corrupt_ceiling(tmp_path):
+    """Toggling one switch must not quietly restore unlimited spend.
+
+    `update_settings` re-reads the file and merges through `from_dict`, so a
+    corrupt ceiling passes through that merge on every unrelated edit. If it
+    were laundered into `0.0` there, the *recoverable* corrupt file would
+    become a permanently cap-free one — with an operator's name stamped on the
+    write that did it. Same failure mode `update_policy` refuses for the
+    dispatch policy's limit maps.
+    """
+    path = pipeline_settings.settings_file_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"enabled": True, "max_daily_spend_usd": "5.0"}))
+    assert math.isnan(pipeline_settings.load_settings(tmp_path).max_daily_spend_usd)
+
+    updated = pipeline_settings.update_settings(
+        tmp_path, actor="operator", auto_launch=True
+    )
+
+    assert updated.auto_launch is True  # the intended edit landed
+    assert math.isnan(updated.max_daily_spend_usd)
+    assert math.isnan(pipeline_settings.load_settings(tmp_path).max_daily_spend_usd)
 
 
 def test_a_lone_auto_launch_flag_cannot_launch_without_the_master_switch():

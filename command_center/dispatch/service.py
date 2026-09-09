@@ -21,6 +21,7 @@ the task up and launches it on the recorded executor.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -238,6 +239,22 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # The kill switch IS the master switch: `task_pipeline.kill_switch` persists
     # `enabled=False`. Dispatch must never launch while it is off.
     kill_switch_engaged = not settings.enabled
+
+    # The configured ceiling is the fourth guardrail input that can be corrupt,
+    # and it fails closed one level down: `plan_dispatch` refuses a non-finite
+    # `max_daily_spend_usd` via its own `_usable` check, so nothing here has to
+    # gate it. What is missing without this branch is the *telling apart* — the
+    # plan would report `budget_unknown` identically whether the runtime store
+    # was unreachable or the operator's cap was hand-edited into nonsense, and
+    # those have nothing like the same remedy. Logged for the same reason the
+    # three reads below are: the response carries the typed refusal, the log
+    # carries which store produced it.
+    if not math.isfinite(settings.max_daily_spend_usd):
+        logger.warning(
+            "dispatch: configured daily spend ceiling at %s is not usable "
+            "money — failing closed (budget_unknown)",
+            pipeline_settings.settings_file_path(root),
+        )
 
     # Fail closed for real: when the trailing-24h spend can't be read, refuse
     # dispatch outright via `budget_unknown` rather than *simulating* a spend

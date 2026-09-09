@@ -2225,14 +2225,35 @@ def _locked_tick(
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
     spend_budget_exhausted = False
-    if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
-        try:
-            spend_budget_exhausted = (
-                daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
+    if settings.auto_launch_active:
+        import math as _math
+
+        if not _math.isfinite(settings.max_daily_spend_usd):
+            # A ceiling that is not usable money is not an absent ceiling, and
+            # only an explicit check separates them here: this branch is
+            # guarded by `> 0`, which is False for NaN exactly as it is for
+            # the unset `0.0`, so a corrupt ceiling would otherwise skip the
+            # budget check altogether and launch — the fail-open this gate
+            # exists to close. `pipeline_settings._spend_ceiling` carries the
+            # corruption as NaN precisely so it can be caught here rather than
+            # arriving pre-laundered into "no cap configured".
+            _record(
+                ValueError(
+                    "max_daily_spend_usd is configured but is not a usable "
+                    "amount of money; refusing to launch against an "
+                    "unevaluable spend ceiling"
+                ),
+                "daily_spend_budget",
             )
-        except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
-            _record(exc, "daily_spend_budget")
             spend_budget_exhausted = True
+        elif settings.max_daily_spend_usd > 0:
+            try:
+                spend_budget_exhausted = (
+                    daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
+                )
+            except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+                _record(exc, "daily_spend_budget")
+                spend_budget_exhausted = True
     if settings.auto_launch_active and not spend_budget_exhausted:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
