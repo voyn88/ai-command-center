@@ -1,0 +1,31 @@
+# Leak-guard allowlist -- scripts/ci/prepush/leak_guard.sh, check 2, rule B.
+#
+# Files that carry an absolute deployment-account home path BY DESIGN, where
+# refusing every added line with one means the file cannot be edited at all
+# (VOYN-W0-AICC-LEAK-GUARD-BLOCKS-FILES-THAT-ALREADY-CARRY-HOME-PATHS). This
+# is deliberately tiny: everywhere else -- code, docs, tests -- an added home
+# path is still refused unless the same path is already in the base version
+# of that same file (rule A).
+#
+# Format, one entry per line:   <glob> <TOKEN>
+#   <glob>   shell glob against the repository-relative path. `*` spans
+#            directory separators, so `ops/ci/**` covers every depth under it.
+#   <TOKEN>  which home root the entry permits. WORKER_HOME is the only token
+#            the guard implements -- the deployment account root, already
+#            public in these files by design. There is deliberately NO token
+#            for personal machine home roots: those are refused everywhere,
+#            allowlist or not. An unknown token makes the guard refuse.
+# `#` starts a comment line. Blank lines are ignored.
+#
+# The guard reads this file from the BASE commit, never from the working
+# tree: a branch cannot widen the guard that is judging it. A new entry is
+# live only once it has landed on the base branch through review.
+
+# The installer-integration fixture builds a clone at the worker's real path
+# and bind-mounts it into the container -- the path IS the thing under test.
+ops/ci/** WORKER_HOME
+
+# systemd units: WorkingDirectory=, EnvironmentFile=, BindReadOnlyPaths= and
+# the ExecStart lines of the preprod lane all name the deployment account's
+# tree; a unit cannot be expressed without it.
+deploy/systemd/** WORKER_HOME
