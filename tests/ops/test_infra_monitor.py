@@ -619,8 +619,10 @@ def test_the_control_probe_watches_the_pr_window_and_records_its_findings() -> N
     """The probe rides the control-host unit because that is where the
     backlog database (the `pr` evidence) and the fleet's gh identity are; the
     worker probe has neither. It is switched on by environment rather than by
-    a flag: that unit's ExecStart names an absolute home path, which a public
-    repository cannot restate in an added line (leak_guard.sh). Its finding
+    a flag -- originally because that unit's ExecStart names an absolute home
+    path and the leak guard refused any added line restating one, a
+    restriction its allowlist has since lifted for deploy/systemd/**; the
+    knob stays put because the two spellings are equivalent. Its finding
     then reaches the planner through that unit's own --record-findings source,
     exactly like every other failure class."""
     queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
