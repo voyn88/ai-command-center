@@ -200,3 +200,91 @@ def test_archive_and_prune_archive_is_on_disk_before_each_batch_commits(
     for deleted, archived_on_disk in observed:
         assert archived_on_disk >= deleted, (deleted, archived_on_disk, observed)
     assert observed[-1] == (OLD_EVENTS, OLD_EVENTS)
+
+
+def test_integrity_failure_names_what_was_already_pruned_and_the_backup(
+    tmp_path, monkeypatch
+):
+    """Batching traded the all-or-nothing transaction for bounded ones, so a
+    late failure can no longer claim the database was left unmodified. The
+    error has to say what is already gone and how to get it back.
+    """
+    db_path = tmp_path / "runtime.db"
+    old_run, _fresh_run = _seed(db_path, old_events=OLD_EVENTS, fresh_events=3)
+    archive_dir = tmp_path / "cold"
+
+    monkeypatch.setattr(maintenance, "_integrity_ok", lambda conn: False)
+
+    with pytest.raises(maintenance.MaintenanceError) as excinfo:
+        maintenance.archive_and_prune(
+            db_path,
+            retention_days=30,
+            archive_dir=archive_dir,
+            batch_size=BATCH_SIZE,
+        )
+
+    backup = sorted(archive_dir.glob("runtime-backup-*.db"))[-1]
+    message = str(excinfo.value)
+    assert str(OLD_EVENTS) in message  # rows already committed as pruned
+    assert str(backup) in message  # ...and the way back
+    assert _event_count(db_path, old_run) == 0  # they really are gone
+    monkeypatch.undo()  # the forced failure was the prune's check, not the backup's
+    maintenance.restore_backup(backup, db_path)
+    assert _event_count(db_path, old_run) == OLD_EVENTS  # the way back works
+
+
+class _ShortRowcount:
+    """A delete result that under-reports how many rows it removed."""
+
+    def __init__(self, rowcount: int) -> None:
+        self.rowcount = rowcount
+
+
+class _ShortDeleteConnection:
+    """Connection proxy whose `nth` DELETE reports one row fewer than it
+    deleted — the archive/delete disagreement `archive_and_prune` refuses to
+    accept, injected at a batch boundary that is not the first."""
+
+    def __init__(self, conn, *, fail_on: int) -> None:
+        self._conn = conn
+        self._fail_on = fail_on
+        self._deletes = 0
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, parameters=()):
+        cursor = self._conn.execute(sql, parameters)
+        if sql.lstrip().upper().startswith("DELETE"):
+            self._deletes += 1
+            if self._deletes == self._fail_on:
+                return _ShortRowcount(cursor.rowcount - 1)
+        return cursor
+
+
+def test_batch_mismatch_rolls_back_only_its_own_batch(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    old_run, _fresh_run = _seed(db_path, old_events=OLD_EVENTS, fresh_events=3)
+    archive_dir = tmp_path / "cold"
+    original_connect = maintenance.connect
+
+    @contextlib.contextmanager
+    def _short_delete_connect(path):
+        with original_connect(path) as conn:
+            yield _ShortDeleteConnection(conn, fail_on=2)
+
+    monkeypatch.setattr(maintenance, "connect", _short_delete_connect)
+
+    with pytest.raises(maintenance.MaintenanceError) as excinfo:
+        maintenance.archive_and_prune(
+            db_path,
+            retention_days=30,
+            archive_dir=archive_dir,
+            batch_size=BATCH_SIZE,
+        )
+
+    message = str(excinfo.value)
+    assert f"{BATCH_SIZE} rows pruned by earlier batches" in message
+    assert str(sorted(archive_dir.glob("runtime-backup-*.db"))[-1]) in message
+    # The failing batch is intact; only the first, already-committed one is gone.
+    assert _event_count(db_path, old_run) == OLD_EVENTS - BATCH_SIZE
