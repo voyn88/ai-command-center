@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 from command_center import agent_runner
+from command_center.orchestrator import local_model_gates
 from command_center.orchestrator.planner import PlanLimits, _payload_for
-from command_center.orchestrator.routing import ROUTING_MATRIX, cascade_for
+from command_center.orchestrator.routing import (
+    BOUNDED_IMPLEMENTATION_TASK_CLASS,
+    ROUTING_MATRIX,
+    cascade_for,
+    classify_task_class,
+)
 
 #: The executors the worker can actually run, read from the SAME table the
 #: worker itself gates on (`handlers._run_agent` refuses any executor absent
@@ -110,3 +116,71 @@ def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> Non
     assert "HEAD_SHA: <the branch head commit sha>" in prompt
     # The instruction that asked the agent to publish its own work is gone.
     assert "When you open or update a pull request" not in prompt
+
+
+# --------------------------------------------------------------------------
+# BOUNDED_IMPLEMENTATION_TASK_CLASS (AICC Fleet decision 2026-09-03): aider
+# leads the cascade, but ONLY once local_model_gates says it is promoted.
+
+
+def test_bounded_implementation_drops_the_unpromoted_aider_link():
+    assert local_model_gates.is_promoted(BOUNDED_IMPLEMENTATION_TASK_CLASS) is False
+    cascade = cascade_for(BOUNDED_IMPLEMENTATION_TASK_CLASS)
+    assert "aider" not in [link["executor"] for link in cascade]
+    assert cascade == cascade_for("implementation")
+
+
+def test_bounded_implementation_leads_with_aider_once_promoted():
+    for _ in range(local_model_gates.PROMOTION_SAMPLE_FLOOR):
+        local_model_gates.record_benchmark_run(BOUNDED_IMPLEMENTATION_TASK_CLASS, True)
+    assert local_model_gates.is_promoted(BOUNDED_IMPLEMENTATION_TASK_CLASS) is True
+
+    cascade = cascade_for(BOUNDED_IMPLEMENTATION_TASK_CLASS)
+    assert cascade[0]["executor"] == "aider"
+    assert cascade[0]["task_type"] == "implementation"
+
+
+def test_promoting_bounded_implementation_never_touches_plain_implementation():
+    for _ in range(local_model_gates.PROMOTION_SAMPLE_FLOOR):
+        local_model_gates.record_benchmark_run(BOUNDED_IMPLEMENTATION_TASK_CLASS, True)
+    assert "aider" not in [link["executor"] for link in cascade_for("implementation")]
+
+
+def test_classify_task_class_matches_only_an_exact_bracketed_title_prefix():
+    for title in ("[docs] fix typos", "[fixture] bump golden value", "[mechanical] rename"):
+        assert classify_task_class(title, "irrelevant body") == BOUNDED_IMPLEMENTATION_TASK_CLASS
+    # Case-insensitive, and leading whitespace is trimmed.
+    assert classify_task_class("  [DOCS] Fix Typos", "x") == BOUNDED_IMPLEMENTATION_TASK_CLASS
+
+
+def test_classify_task_class_requires_the_prefix_to_end_at_the_bracket():
+    """`[Mechanical Refactor]` must NOT match `[mechanical]`: the space right
+    after "mechanical" breaks the exact-prefix match, so a title that merely
+    mentions the word does not silently downgrade a task's executor lane."""
+    assert classify_task_class("[Mechanical Refactor] do a big rewrite", "x") == "implementation"
+
+
+def test_classify_task_class_never_scans_the_body():
+    """Opting in is a title-only, author decision -- incidental body wording
+    (an attacker's or a careless author's) must not silently downgrade a
+    mutating task into the weaker executor lane."""
+    assert classify_task_class("Refactor the auth module", "[docs] just kidding") == (
+        "implementation"
+    )
+
+
+def test_classify_task_class_default_is_plain_implementation():
+    assert classify_task_class("Implement the new widget", "body") == "implementation"
+
+
+def test_bounded_implementation_dispatch_flows_from_title_to_cascade():
+    task = {
+        "task_id": "VOYN-W0-BOUNDED",
+        "wave": "0",
+        "priority": "P2",
+        "title": "[docs] fix a typo in the README",
+        "body": "Fix the typo.",
+    }
+    payload, budget = _payload_for(task, PlanLimits(), ("AICC", "/srv/repo"))
+    assert payload["cascade"] == cascade_for(BOUNDED_IMPLEMENTATION_TASK_CLASS)
+    assert budget == len(cascade_for(BOUNDED_IMPLEMENTATION_TASK_CLASS))

@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from command_center.orchestrator.routing import cascade_for
+from command_center.orchestrator.routing import cascade_for, classify_task_class
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
 __all__ = ["PlanLimits", "PlanReport", "plan_once"]
@@ -195,7 +195,7 @@ def _payload_for(
     ``untrusted=False`` is on the authority of the planner being the control
     plane acting on the canonical store.
     """
-    cascade = cascade_for("implementation")
+    cascade = cascade_for(classify_task_class(task["title"], task["body"]))
     project_id, repository_path = route
     if mode == "split":
         prompt = (
