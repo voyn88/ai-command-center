@@ -1119,6 +1119,18 @@ class RotationController:
         last_errors: dict[str, str] = {}
         while pending and self.monotonic() < deadline:
             for unit in tuple(pending):
+                # The deadline is re-checked per LANE, not per poll round.
+                # `systemd.state()` is a bounded subprocess, not a free read:
+                # one wedged systemctl costs its full timeout. Checking only
+                # between rounds let a round overrun the bound by (pending
+                # lanes x that timeout), so the single wait the registry
+                # redesign made lane-count-independent was the one that grew
+                # with fleet size -- and post-mutation that overrun is spent
+                # from the window `_post_rotation_budget` reserves for the
+                # rollback. Per-lane the worst case is one such call, exactly
+                # like the single-lane `_wait()` path.
+                if self.monotonic() >= deadline:
+                    break
                 try:
                     if self._healthy(self.systemd.state(unit)):
                         pending.remove(unit)

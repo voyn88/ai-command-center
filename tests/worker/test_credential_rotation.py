@@ -619,6 +619,73 @@ def test_fleet_readiness_wait_is_bounded_by_the_credential_deadline(
     assert clock[0] <= usable + controller.config.poll_max
 
 
+@pytest.mark.parametrize("lane_count", [2, 40])
+def test_fleet_readiness_wait_does_not_scale_its_overrun_with_lane_count(
+    tmp_path: Path, lane_count: int
+) -> None:
+    """`systemd.state()` is a bounded subprocess, not a free read: a wedged
+    systemctl costs its full timeout. Checking the deadline only between poll
+    rounds let one round overrun by (pending lanes x that timeout) -- a 120s
+    bound ran 1200s at 40 lanes. Post-mutation this wait runs inside
+    _activate_fleet(), so that overrun is spent from the window
+    _post_rotation_budget reserves for the rollback, and it reintroduces the
+    lane-count dependence the registry-derived fleet transaction removed."""
+
+    call_cost = 30.0  # SubprocessSystemd._run's default systemctl timeout.
+    lanes = tuple(f"voyn-aicc-worker@{n}.service" for n in range(1, lane_count + 1))
+    clock = [0.0]
+    events: list[tuple] = []
+
+    class WedgedSystemd:
+        """Every `systemctl show` burns its whole subprocess timeout."""
+
+        def state(self, unit: str) -> UnitState:
+            clock[0] += call_cost
+            return UnitState("active", "running", "starting", 100)
+
+        def drain(self, unit: str) -> None: ...
+
+        def reload(self, unit: str, timeout: float) -> None: ...
+
+        def reload_many(self, units: tuple[str, ...], timeout: float) -> None: ...
+
+        def restart(self, unit: str, timeout: float) -> None: ...
+
+    controller = RotationController(
+        _config(
+            tmp_path,
+            worker_units=lanes,
+            prerequisite_timeout=120.0,
+            poll_initial=1.0,
+            poll_max=1.0,
+        ),
+        WedgedSystemd(),
+        FakeAuthority(events),
+        Audit(),
+        monotonic=lambda: clock[0],
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        port_probe=lambda host, port, timeout: None,
+    )
+    controller._controller_deadline = clock[0] + 100_000.0
+    usable = 120.0
+    controller._set_credential_deadline(
+        NOW + timedelta(seconds=CREDENTIAL_SAFETY_MARGIN_SECONDS + usable),
+        CREDENTIAL_SAFETY_MARGIN_SECONDS + usable,
+        "test credential",
+    )
+
+    start = clock[0]
+    with pytest.raises(RotationError, match="worker readiness failed"):
+        controller._wait_workers_healthy()
+
+    # Worst case is one in-flight probe past the deadline, exactly like the
+    # single-lane _wait() path -- the SAME bound at 2 lanes and at 40, which
+    # is the point. The superseded per-round check allowed one probe per
+    # pending lane, so it met this bound only while the fleet stayed small
+    # (it spent 1200s of a 120s budget at 40 lanes).
+    assert clock[0] - start <= usable + call_cost
+
+
 def test_retry_lifetime_covers_every_failed_attempt_and_all_delays(
     tmp_path: Path,
 ) -> None:
@@ -961,16 +1028,22 @@ def test_controller_refuses_mutation_when_preflight_consumed_recovery_budget(
     )
     controller.monotonic = lambda: clock[0]
 
-    original_state = systemd.state
+    # Burn the budget in the LAST pre-mutation authority round-trip (the
+    # refresh at step 8 of rotate()), not inside a bounded readiness wait:
+    # that wait now refuses an overrun of its own deadline rather than
+    # absorbing it, so staging the jump there would prove the readiness
+    # bound instead of the mutation-budget guard this test is about.
+    original_expiry = authority.current_expiry
     advanced = [False]
 
-    def state(unit: str) -> UnitState:
-        if unit == LANE_1 and not advanced[0]:
+    def slow_second_expiry(config):
+        result = original_expiry(config)
+        if not advanced[0] and events.count(("expiry", config.password)) >= 2:
             advanced[0] = True
             clock[0] = 700.0
-        return original_state(unit)
+        return result
 
-    systemd.state = state  # type: ignore[method-assign]
+    authority.current_expiry = slow_second_expiry  # type: ignore[method-assign]
 
     with pytest.raises(RotationError, match="before credential mutation"):
         controller.rotate()
