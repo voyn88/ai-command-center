@@ -164,7 +164,14 @@ def test_budget_unknown_defers_everything_even_with_zero_ceiling():
     policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
     executors = [_executor("ollama", cost=0.0, is_local=True)]
     tasks = [_task("t1", priority="Critical"), _task("t2", priority="High")]
-    plan = _plan(tasks, executors, policy, max_daily_spend_usd=0.0, budget_unknown=True)
+    plan = _plan(
+        tasks,
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=0.0,
+        budget_unknown=True,
+    )
 
     assert plan.budget_unknown is True
     assert plan.assignments == ()
@@ -178,11 +185,42 @@ def test_budget_unknown_defers_everything_with_a_nonzero_ceiling_and_free_execut
     policy = DispatchPolicy(cost_matrix={"ollama": 0.0})
     executors = [_executor("ollama", cost=0.0)]
     plan = _plan(
-        [_task("t1")], executors, policy, max_daily_spend_usd=5.0, budget_unknown=True
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=5.0,
+        budget_unknown=True,
     )
 
     assert plan.assignments == ()
     assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
+
+
+def test_budget_unknown_reports_no_spend_figure_rather_than_a_fabricated_zero():
+    """An unreadable spend must not be *reported* as `0.0`. A dashboard or an
+    operator reading `daily_spend_usd` off the plan would take a fabricated
+    zero for "nothing spent today" — the very reading this task exists to
+    stop — so every derived figure reads "unknown" too."""
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=5.0,
+        budget_unknown=True,
+    )
+
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.budget_remaining_usd is None
+    body = plan.as_dict()
+    assert body["daily_spend_usd"] is None
+    assert body["projected_spend_usd"] is None
+    assert body["budget_remaining_usd"] is None
+    assert body["budget_unknown"] is True
 
 
 def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
@@ -192,6 +230,7 @@ def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
         [_task("t1")],
         executors,
         policy,
+        daily_spend_usd=None,
         kill_switch_engaged=True,
         budget_unknown=True,
     )

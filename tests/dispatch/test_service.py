@@ -205,6 +205,8 @@ def test_plan_logs_when_spend_lookup_fails_closed(monkeypatch, pool, caplog):
     assert plan.assignments == ()
     assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
     assert "daily_spend_usd failed" in caplog.text
+    # The swallowed exception itself, not just a bare "something went wrong".
+    assert "db unreachable" in caplog.text
 
 
 def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
@@ -225,6 +227,9 @@ def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
     assert plan.budget_unknown is True
     assert plan.assignments == ()
     assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+    # And the unreadable spend is reported as "no data", not as `0.0`.
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
 
 
 def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
