@@ -93,7 +93,13 @@ MAX_PROMPT_BYTES = 128 * 1024
 # combined encoded size below MAX_MANIFEST_BYTES, which is also the client's
 # bounded line-reader limit; oversized output becomes retryable infrastructure
 # while its potentially modified task workspace is preserved.
-MAX_OUTPUT_BYTES = 512 * 1024
+# Per-stream retention bound for agent stdout/stderr held in root memory. An
+# agent that writes more keeps running; only the oldest bytes are dropped and
+# the retained tail is prefixed with a marker (the final report is at the end
+# of the stream for both providers). Refusing the whole run on overflow cost 12
+# of the first 68 isolated implementation runs on 2026-09-09.
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+OUTPUT_TRUNCATED_MARKER = b"[aicc-agent-launcher: earlier agent output dropped; tail retained]\n"
 MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
@@ -1095,10 +1101,18 @@ def _authorised_peer(uid: int) -> bool:
 def _bounded_collect(
     proc: subprocess.Popen[bytes], on_limit: Any
 ) -> tuple[bytes, bytes]:
-    """Incrementally drain both pipes without letting root memory grow unbounded."""
+    """Incrementally drain both pipes without letting root memory grow unbounded.
+
+    Each stream keeps at most ``MAX_OUTPUT_BYTES`` of its most recent output;
+    overflow drops the oldest bytes and records the stream as truncated so the
+    returned bytes start with ``OUTPUT_TRUNCATED_MARKER``.  ``on_limit`` is
+    invoked once per stream on first overflow (observability hook; it must not
+    kill the agent).
+    """
     if proc.stdout is None or proc.stderr is None:
         raise LaunchRefused("agent output pipes are unavailable")
     collected = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    truncated: set[int] = set()
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ)
     selector.register(proc.stderr, selectors.EVENT_READ)
@@ -1110,16 +1124,23 @@ def _bounded_collect(
                     selector.unregister(key.fileobj)
                     continue
                 buffer = collected[key.fd]
-                if len(buffer) + len(chunk) > MAX_OUTPUT_BYTES:
-                    on_limit()
-                    raise LaunchRefused("agent output exceeded the bounded transport")
                 buffer.extend(chunk)
+                if len(buffer) > MAX_OUTPUT_BYTES:
+                    if key.fd not in truncated:
+                        truncated.add(key.fd)
+                        on_limit()
+                    del buffer[: len(buffer) - MAX_OUTPUT_BYTES]
     finally:
         selector.close()
     proc.wait(timeout=25)
-    return bytes(collected[proc.stdout.fileno()]), bytes(
-        collected[proc.stderr.fileno()]
-    )
+
+    def finish(fd: int) -> bytes:
+        data = bytes(collected[fd])
+        if fd in truncated:
+            return OUTPUT_TRUNCATED_MARKER + data
+        return data
+
+    return finish(proc.stdout.fileno()), finish(proc.stderr.fileno())
 
 
 def _systemctl(
@@ -1771,7 +1792,15 @@ def _serve_connected_socket(sock: socket.socket) -> int:
 
         def collect() -> None:
             try:
-                result["value"] = _bounded_collect(proc, lambda: _seal_unit(unit))
+                result["value"] = _bounded_collect(
+                    proc,
+                    lambda: print(
+                        f"agent output exceeded {MAX_OUTPUT_BYTES} bytes; "
+                        f"retaining tail (unit {unit})",
+                        file=sys.stderr,
+                        flush=True,
+                    ),
+                )
             except (LaunchRefused, OSError, subprocess.SubprocessError) as exc:
                 result["error"] = exc
 

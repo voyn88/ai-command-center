@@ -854,28 +854,31 @@ def test_model_auth_reader_is_nofollow_and_exact_mode(launcher, tmp_path):
         )
 
 
-def test_output_limit_is_incremental_and_triggers_seal(launcher, monkeypatch):
+def test_output_limit_keeps_the_tail_and_lets_the_agent_finish(launcher, monkeypatch):
     monkeypatch.setattr(launcher, "MAX_OUTPUT_BYTES", 1024)
     proc = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            "import os; os.write(1, b'x' * 4096)",
+            "import os; os.write(1, b'x' * 4096 + b'FINAL'); os.write(2, b'e' * 10)",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    sealed: list[bool] = []
+    limited: list[bool] = []
     try:
-        with pytest.raises(launcher.LaunchRefused, match="bounded transport"):
-            launcher._bounded_collect(
-                proc,
-                lambda: (sealed.append(True), proc.kill()),
-            )
+        stdout, stderr = launcher._bounded_collect(proc, lambda: limited.append(True))
     finally:
         proc.kill()
         proc.wait()
-    assert sealed == [True]
+    # Overflow is observed once, the run is not refused, and the retained
+    # stdout is the marked tail (the final report lives at the end).
+    assert limited == [True]
+    assert proc.returncode == 0
+    assert stdout.startswith(launcher.OUTPUT_TRUNCATED_MARKER)
+    body = stdout[len(launcher.OUTPUT_TRUNCATED_MARKER) :]
+    assert len(body) == 1024 and body.endswith(b"FINAL")
+    assert stderr == b"e" * 10
 
 
 def test_sigterm_ignoring_unit_escalates_and_is_proven_inactive(launcher, monkeypatch):
