@@ -2169,3 +2169,114 @@ def test_the_launcher_can_write_the_model_auth_store_it_writes_refreshed_tokens_
     assert "/var/lib/aicc-agent" in paths
     tmpfiles = (Path(__file__).parents[2] / "deploy/tmpfiles.d/aicc-agent.conf").read_text()
     assert "d /var/lib/aicc-agent 0700 root root -" in tmpfiles
+
+
+# ---------------------------------------------------------------------------
+# The control plane's own ticks are deploy-managed, not hand-made.
+#
+# VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL: the PR
+# review-window labeller had exactly one committed unit
+# (deploy/systemd/aicc-backlog-pr-window.{service,timer}) and it names a
+# layout control-01 does not have -- User=aicc-worker, /usr/bin/python,
+# /srv/ai-command-center. Nothing installed it there, control-01 runs
+# hand-made voyn-aicc-{planner,review,merge,reaper,self-deploy} units only,
+# and the window-gated workflows (CI, Acceptance gate, boundary fitness) run
+# on a PR ONLY while it carries a review-window label. So every fleet PR
+# opened with no CI at all -- 24 red-or-checkless PRs and #907 on 2026-09-09 --
+# until an operator installed a unit by hand at 21:15 UTC. A hand-made unit
+# lasts exactly as long as the host does; these tests are what makes the
+# rebuilt host keep it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
+    """The unit is part of the control generation, so a rebuilt control host
+    gets the labeller without an operator remembering it."""
+    tx, control = _specs("control", tmp_path)
+    _tx, worker = _specs("worker", tmp_path)
+
+    assert tx.CONTROL_ONLY_UNITS == (
+        "voyn-aicc-pr-window.service",
+        "voyn-aicc-pr-window.timer",
+    )
+    for unit in tx.CONTROL_ONLY_UNITS:
+        assert f"/etc/systemd/system/{unit}" in control
+    # A control-only unit is exactly that: the worker profile neither installs
+    # it nor is expected to, and the worker-only drop set is unchanged by it.
+    assert control - worker == {
+        f"/etc/systemd/system/{unit}" for unit in tx.CONTROL_ONLY_UNITS
+    }
+    assert worker - control == tx.WORKER_ONLY_TARGETS
+
+
+def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
+    """Why the tick was never deployed, stated as a test.
+
+    The committed aicc-backlog-pr-window units name a layout nothing on the
+    control plane has -- User=aicc-worker, /usr/bin/python, an
+    /srv/ai-command-center clone, an /etc/ai-command-center.env credential --
+    so installing them there was never possible and nobody did. The control
+    spelling depends on exactly two things the control profile itself
+    guarantees: the release tree this same transaction publishes and verifies,
+    and the operator principal every other repo-owned control unit runs as. No
+    clone, no database credential, no required EnvironmentFile, and no home
+    directory: a unit that needs a host layout is a unit that does not get
+    installed."""
+    root = Path(__file__).parents[2]
+    service = (root / "deploy/systemd/voyn-aicc-pr-window.service").read_text()
+    timer = (root / "deploy/systemd/voyn-aicc-pr-window.timer").read_text()
+    reference = (root / "deploy/systemd/voyn-aicc-self-deploy.service").read_text()
+    release = "/opt/aicc/current"
+    directives = [
+        line for line in service.splitlines() if line and not line.startswith("#")
+    ]
+    body = "\n".join(directives)
+
+    assert f"WorkingDirectory={release}" in directives
+    assert (
+        f"ExecStart={release}/.venv/bin/python -m command_center.db "
+        "backlog-pr-window --repo-path ${AICC_FLEET_REPO}" in directives
+    )
+    # The release tree is a `git archive`, not a clone: gh has no remote to
+    # read the repository from, so the unit names it (overridably).
+    assert any(line.startswith("Environment=GH_REPO=") for line in directives)
+    assert "Environment=AICC_FLEET_REPO=/opt/aicc/current" in directives
+    # Optional (`-`) and only an override: a REQUIRED environment file is a
+    # host layout, and requiring one is the mistake this unit exists to undo.
+    for line in directives:
+        if line.startswith("EnvironmentFile="):
+            assert line.startswith("EnvironmentFile=-"), line
+    for borrowed in ("User=voynadmin", "Type=oneshot"):
+        assert borrowed in directives and borrowed in reference
+    # None of the layout that was never on this host, and no home path at all
+    # (this is a public repository; see scripts/ci/prepush/leak_guard.sh).
+    for absent in ("/srv/ai-command-center", "/usr/bin/python", "aicc-worker",
+                   "/home", "/Users"):
+        assert absent not in body
+    # Scheduled from the END of the last tick: the tick's whole runtime is gh
+    # calls, and OnUnitActiveSec would queue a second one behind a slow first.
+    assert "OnUnitInactiveSec=5min" in timer
+    assert "OnUnitActiveSec" not in timer
+    assert "WantedBy=timers.target" in timer
+
+
+def test_the_installer_starts_the_pr_window_timer_after_it_commits(tmp_path):
+    """Installed and enabled, or the file is just a file. Deliberately after
+    `run_transaction commit` AND after the rollback trap is disarmed: this
+    timer is not in the rollback's service snapshot (RESTORABLE_UNIT_RE admits
+    only worker and launcher units), so enabling it inside the transaction
+    would leave an enablement symlink pointing at a unit file the rollback
+    removes."""
+    tx, _control = _specs("control", tmp_path)
+    text = _installer_text()
+    enable = f"systemctl enable --now {tx.CONTROL_ONLY_TIMER}"
+
+    assert tx.CONTROL_ONLY_TIMER in tx.CONTROL_ONLY_UNITS
+    _assert_command_inside_shell_if(
+        text, enable, 'if [ "$install_profile" = "control" ]; then'
+    )
+    assert text.index("run_transaction commit") < text.index(enable)
+    assert text.index("trap - EXIT HUP INT TERM") < text.index(enable)
+    assert text.index(enable) < text.index(
+        "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
+    ), "a failed enable must not be announced as a completed install"
