@@ -123,6 +123,16 @@ def test_recent_dead_letter_threshold_is_configurable() -> None:
 
 
 def test_new_pending_work_does_not_turn_an_idle_queue_red() -> None:
+    """A ready, due, unclaimed item ten seconds old is inside the stall
+    window, so an old last-success does not make it red.
+
+    ``pending_unattended`` is set to match ``pending_age_seconds``: the two
+    come from one filter in ``_QUEUE_SNAPSHOT_SQL`` and the count is 0
+    exactly when the age is ``None``. Left at its default of 0 beside a
+    non-``None`` age this snapshot could not occur, and the assertion passed
+    through the unattended gate without ever reaching the 10s < 900s
+    comparison it is here to pin.
+    """
     report = evaluate(
         {
             "voyn-aicc-worker@1.service": "active",
@@ -137,6 +147,7 @@ def test_new_pending_work_does_not_turn_an_idle_queue_red() -> None:
             dead=2,
             success_age_seconds=9999,
             pending_age_seconds=10,
+            pending_unattended=1,
         ),
         minimum_active_workers=4,
         max_stalled_seconds=900,

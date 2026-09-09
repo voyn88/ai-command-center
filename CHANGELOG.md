@@ -31,6 +31,12 @@ functional application milestones of `app.py`.
   against a real server, as `aicc_app` — claims taken through `queue_claim`,
   leases expired the way the protocol expires them, and the lease read through
   `work_attempt_public` (`work_attempt` itself is granted to nobody).
+- `tests/ops/test_infra_monitor.py`: `test_new_pending_work_does_not_turn_an_idle_queue_red`
+  now sets `pending_unattended` alongside `pending_age_seconds`. Gating the
+  stall check on the unattended count made that snapshot unreachable (the count
+  is 0 exactly when the age is `None`), so the test passed through the gate
+  without ever reaching the `10s < 900s` comparison it exists to pin — it no
+  longer failed when the threshold was mutated away.
 
 ### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
 - `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`
