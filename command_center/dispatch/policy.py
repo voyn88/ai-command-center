@@ -12,6 +12,17 @@ The hard guarantees, enforced structurally here:
    single assignment is even considered — every task is deferred with
    `DEFER_KILL_SWITCH`. There is no code path that assigns while the switch is
    engaged.
+1a. **Unreadable settings block everything, and are checked ahead of even the
+   kill switch.** `settings_unknown=True` defers every task with
+   `DEFER_SETTINGS_DATA_UNAVAILABLE`. The ordering is not a preference: the
+   settings document is what *names* the kill switch and the daily ceiling, so
+   while it is unreadable "the kill switch is engaged" is not a false statement
+   this engine is entitled to make — it is not a statement at all. Falling back
+   to the all-off defaults is the one fallback that gets *both* directions
+   wrong at once: the switches decay to off (safe, but reported as an operator
+   decision nobody made) while `max_daily_spend_usd` decays to `0.0`, which
+   means *no cap*. See `pipeline_settings.UnreadableSettings` for the measured
+   path from there to unbounded dispatch.
 1b. **Unknown budget blocks everything, the same way.** `budget_unknown=True`
    (the caller could not read the trailing-24h spend) is checked in the same
    place, before any assignment, and defers every task with
@@ -83,6 +94,7 @@ from command_center.dispatch.models import (
     DEFER_NO_ELIGIBLE_EXECUTOR,
     DEFER_POLICY_DATA_UNAVAILABLE,
     DEFER_PROJECT_BUDGET,
+    DEFER_SETTINGS_DATA_UNAVAILABLE,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
@@ -152,6 +164,7 @@ def plan_dispatch(
     budget_unknown: bool = False,
     capacity_unknown: bool = False,
     policy_unknown: bool = False,
+    settings_unknown: bool = False,
     active_by_executor: dict[str, int] | None = None,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
@@ -175,8 +188,22 @@ def plan_dispatch(
     #     that assigns while the trailing-24h spend or the in-flight run counts
     #     are unreadable. The reason reported is the most fundamental of the
     #     engaged gates, in that order.
-    if kill_switch_engaged or policy_unknown or budget_unknown or capacity_unknown:
-        if kill_switch_engaged:
+    if (
+        settings_unknown
+        or kill_switch_engaged
+        or policy_unknown
+        or budget_unknown
+        or capacity_unknown
+    ):
+        if settings_unknown:
+            # Ahead of the kill switch, which is the only gate that outranks
+            # the rest: the switch's value *lives in* the settings document, so
+            # an unreadable document does not leave the switch off, it leaves
+            # it unknown. Reporting `kill_switch_engaged` here would attribute
+            # the refusal to a deliberate operator action and send them to the
+            # remedy that overwrites their own spend ceiling with "no cap".
+            reason = DEFER_SETTINGS_DATA_UNAVAILABLE
+        elif kill_switch_engaged:
             reason = DEFER_KILL_SWITCH
         elif policy_unknown:
             # Ahead of the two runtime-store gates because it is the more
@@ -199,10 +226,14 @@ def plan_dispatch(
         )
         return DispatchPlan(
             decisions=decisions,
-            kill_switch_engaged=kill_switch_engaged,
+            # Never reported as engaged while the settings are unknown — see
+            # the ordering note above; the caller passes `False` for the same
+            # reason, and this keeps the invariant even if it does not.
+            kill_switch_engaged=kill_switch_engaged and not settings_unknown,
             budget_unknown=budget_unknown,
             capacity_unknown=capacity_unknown,
             policy_unknown=policy_unknown,
+            settings_unknown=settings_unknown,
             daily_spend_usd=daily_spend_usd,
             max_daily_spend_usd=max_daily_spend_usd,
             projected_spend_usd=daily_spend_usd,

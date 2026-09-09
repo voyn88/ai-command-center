@@ -775,3 +775,93 @@ def test_a_policy_gated_plan_serializes_as_valid_json():
     assert payload["assignment_count"] == 0
     assert payload["decisions"][0]["reason"] == "policy_data_unavailable"
     assert payload["decisions"][0]["explanation"]
+
+
+# --------------------------------------------------------------------------
+# Unreadable settings block everything, and outrank even the kill switch —
+# the switch's own value lives in the document that could not be read.
+# --------------------------------------------------------------------------
+
+
+def test_settings_unknown_defers_everything():
+    """Same hard gate as the other three, in the configuration that used to
+    fail open: no cap configured (the default) and a free local executor."""
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    tasks = [_task("t1", priority="Critical"), _task("t2", priority="High")]
+
+    plan = _plan(
+        tasks, executors, policy, max_daily_spend_usd=0.0, settings_unknown=True
+    )
+
+    assert plan.settings_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_SETTINGS_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
+def test_settings_unknown_outranks_the_kill_switch_in_the_reported_reason():
+    """The ordering is the fix, not a cosmetic preference.
+
+    `kill_switch_engaged` is derived from `settings.enabled`, so when the
+    settings document is unreadable the caller's `enabled` is an artefact of
+    the fallback rather than an operator decision. Reporting the kill switch
+    would name a cause nobody chose and send the operator to the remedy —
+    turn the master switch back on — that overwrites their spend ceiling with
+    `0.0`, i.e. no cap at all.
+    """
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.5)]
+
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        kill_switch_engaged=True,
+        settings_unknown=True,
+    )
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_SETTINGS_DATA_UNAVAILABLE
+    # And the flag itself is not asserted either: whether the switch is
+    # engaged is exactly what is unknown.
+    assert plan.kill_switch_engaged is False
+    assert plan.settings_unknown is True
+
+
+def test_settings_unknown_outranks_every_other_data_gate():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.5)]
+
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        settings_unknown=True,
+        policy_unknown=True,
+        budget_unknown=True,
+        capacity_unknown=True,
+    )
+
+    assert plan.decisions[0].reason == models.DEFER_SETTINGS_DATA_UNAVAILABLE
+    # Every engaged gate is still reported, so nothing is hidden by the
+    # ordering — only the single headline reason is chosen.
+    assert plan.policy_unknown is True
+    assert plan.budget_unknown is True
+    assert plan.capacity_unknown is True
+
+
+def test_settings_unknown_is_transmitted_in_the_plan_dict():
+    policy = DispatchPolicy()
+    executors = [_executor("claude_code", cost=0.5)]
+
+    parsed = _plan(
+        [_task("t1")], executors, policy, settings_unknown=True
+    ).as_dict()
+
+    assert parsed["settings_unknown"] is True
+    assert parsed["kill_switch_engaged"] is False
+    assert models.DEFER_SETTINGS_DATA_UNAVAILABLE in models.DEFER_REASONS
+    # The typed reason carries its own explanation, like every other one.
+    assert parsed["decisions"][0]["explanation"] != models.DEFER_SETTINGS_DATA_UNAVAILABLE

@@ -952,3 +952,210 @@ def test_a_corrupt_ceiling_is_tellable_apart_in_the_log(monkeypatch, pool, caplo
     assert plan.budget_unknown is True
     assert "daily spend ceiling" in caplog.text
     assert str(pipeline_settings.settings_file_path(ROOT)) in caplog.text
+
+
+# --------------------------------------------------------------------------
+# The pipeline settings document — the fifth guardrail input that can fail to
+# load, and the last one still read through a swallow-and-default. Its
+# fallback is the only one that is wrong in *both* directions at once.
+# --------------------------------------------------------------------------
+
+
+def _tear_settings_file(raw: str = '{"enabled": true, "max_daily_spend_us'):
+    """Leave a settings file that exists but cannot be parsed — a torn write,
+    a half-flushed page, a hand-edit. Written verbatim, bypassing
+    `PipelineSettings`, which is the thing under test."""
+    path = pipeline_settings.settings_file_path(ROOT)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(raw, encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ['{"enabled": true, "max_daily_spend_us', "", "   ", "[]", '"a string"', "null"],
+    ids=["torn", "empty", "blank", "list", "string", "null"],
+)
+def test_plan_fails_closed_on_an_unreadable_settings_document(monkeypatch, pool, raw):
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+    _tear_settings_file(raw)
+
+    plan = service.plan(ROOT)
+
+    assert plan.settings_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_SETTINGS_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
+def test_an_unreadable_settings_document_is_not_reported_as_the_kill_switch(
+    monkeypatch, pool
+):
+    """The misattribution is the whole defect, not a cosmetic complaint.
+
+    Before this gate, a torn settings file read as the all-off defaults, so
+    `not settings.enabled` was True and the plan reported
+    `kill_switch_engaged` — an operator decision nobody had made. The remedy
+    that names points at (turn the master switch back on) is precisely the one
+    that destroys the configuration; see the writer test below.
+    """
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+    _tear_settings_file()
+
+    plan = service.plan(ROOT)
+
+    assert plan.kill_switch_engaged is False
+    assert plan.settings_unknown is True
+    assert plan.as_dict()["settings_unknown"] is True
+
+
+def test_an_unreadable_settings_document_never_reads_as_an_absent_spend_ceiling(
+    monkeypatch, pool
+):
+    """The unsafe half of the old fallback, isolated.
+
+    `max_daily_spend_usd` decays to `0.0` under the all-off defaults, and
+    `0.0` does not mean a strict cap — it means *no cap*. So the placeholder
+    the service substitutes must not be a number that any ceiling check would
+    accept, and the plan must not transmit one either.
+    """
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+    _tear_settings_file()
+
+    plan = service.plan(ROOT)
+
+    assert not plan.max_daily_spend_usd > 0  # NaN, not the permissive 0.0
+    # And the refusal does not rest on the new gate alone: an unusable ceiling
+    # independently engages the budget gate one level down.
+    assert plan.budget_unknown is True
+    # Transmittable: `json.dump` emits bare `NaN`, which `JSON.parse` rejects.
+    assert plan.as_dict()["max_daily_spend_usd"] is None
+
+
+def test_a_torn_settings_file_cannot_dispatch_more_than_the_config_it_replaced(
+    monkeypatch, pool
+):
+    """The differential, end to end. Same operator intent, same queue — only
+    the settings file's *readability* differs. A failed read must never widen
+    what a plan is allowed to do."""
+    import dataclasses
+
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+
+    pipeline_settings.save_settings(
+        ROOT,
+        dataclasses.replace(
+            pipeline_settings.load_settings(ROOT), enabled=True, max_daily_spend_usd=5.0
+        ),
+    )
+    healthy = service.plan(ROOT)
+    assert healthy.settings_unknown is False
+
+    _tear_settings_file()
+    torn = service.plan(ROOT)
+
+    assert len(torn.assignments) <= len(healthy.assignments)
+    assert torn.assignments == ()
+    assert torn.settings_unknown is True
+
+
+def test_assign_is_a_noop_when_the_settings_document_is_unreadable(monkeypatch, pool):
+    """`plan()` refusing is only half of it — `assign()` must not write."""
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    task = _queued_task(title="t1")
+    _tear_settings_file()
+
+    result = service.assign(ROOT, CALLER, confirmed=True)
+
+    assert result["applied"] is False
+    assert result["reason"] == "settings_data_unavailable"
+    stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
+    assert not stored.get("executor")
+
+
+def test_a_missing_settings_file_still_dispatches(monkeypatch, pool):
+    """The fallback's legitimate case, and the thing this gate must not break:
+    a fresh install has no settings file at all. That is "nothing configured
+    yet", not a failure — the master switch is simply off, which is the
+    shipped default and reports as the kill switch, truthfully."""
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+    path = pipeline_settings.settings_file_path(ROOT)
+    if path.exists():
+        path.unlink()
+
+    plan = service.plan(ROOT)
+
+    assert plan.settings_unknown is False
+    assert plan.kill_switch_engaged is True
+
+    _enable_master_switch()
+    assert len(service.plan(ROOT).assignments) == 1
+    assert service.plan(ROOT).settings_unknown is False
+
+
+def test_an_unreadable_settings_document_is_tellable_apart_in_the_log(
+    monkeypatch, pool, caplog
+):
+    """Five stores can now produce a refusal and they need different remedies,
+    so the log has to name which one failed — and must not blame the ceiling
+    for a document that could not be read at all."""
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+    _tear_settings_file()
+
+    with caplog.at_level("WARNING"):
+        plan = service.plan(ROOT)
+
+    assert plan.settings_unknown is True
+    assert "pipeline settings unreadable" in caplog.text
+    assert str(pipeline_settings.settings_file_path(ROOT)) in caplog.text
+    # The corrupt-*ceiling* line names a different remedy and must not fire
+    # here: the ceiling was never read, so it cannot be the thing at fault.
+    assert "daily spend ceiling" not in caplog.text
+
+
+def test_assign_reports_the_same_refusal_precedence_the_engine_does(monkeypatch, pool):
+    """Several gates engage at once, so the *order* they are tested in decides
+    which remedy the operator is sent to.
+
+    An unreadable settings document also yields an unusable ceiling, so it
+    engages `budget_unknown` too. Testing that first made `assign()` answer
+    "the trailing-24h spend could not be read" — pointing at the runtime
+    store — to a caller whose actual problem is a torn settings file. That is
+    this ticket's misattribution reintroduced one layer up, which is why the
+    precedence is asserted rather than left to read naturally.
+    """
+    _spend(monkeypatch, 0.0)
+    policy_config.save_policy(ROOT, DispatchPolicy())
+    _queued_task(title="t1")
+    _tear_settings_file()
+
+    computed = service.plan(ROOT)
+    # Both gates really are engaged — the test would be vacuous otherwise.
+    assert computed.settings_unknown is True
+    assert computed.budget_unknown is True
+
+    result = service.assign(ROOT, CALLER, confirmed=True)
+
+    assert result["applied"] is False
+    assert result["reason"] == "settings_data_unavailable"
+    # The reason `assign` reports and the reason the plan's decisions carry
+    # are the same fact, so they must not be able to drift apart.
+    assert {d.reason for d in computed.decisions} == {
+        models.DEFER_SETTINGS_DATA_UNAVAILABLE
+    }

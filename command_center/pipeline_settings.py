@@ -24,6 +24,16 @@ of `st.session_state`:
   at all: a value that is present but unusable is carried as NaN and refuses
   dispatch. See `_spend_ceiling`.
 
+  The same asymmetry applies one level up, to the *document*. Falling back to
+  the all-off defaults is right for a file that does not exist yet and wrong
+  for one that exists and cannot be read, because it launders the failure into
+  a configuration: the switches read off (safe, but indistinguishable from an
+  operator's own kill switch) while the spend ceiling reads `0.0`, i.e. no cap.
+  `read_settings_document` therefore separates the two and raises
+  `UnreadableSettings` for the latter; `load_settings` stays total for the
+  display surfaces, while `update_settings` and `dispatch.service.plan` — the
+  writer, and the reader that reports a cause to an operator — handle it.
+
 Storage is `data/pipeline_settings.json`, using the same atomic-write +
 sibling-lock-file convention as `execution_queue.json` and `tasks.json` (see
 `command_center.storage`), so a read-modify-write from two Streamlit sessions
@@ -35,6 +45,7 @@ for the latter.
 from __future__ import annotations
 
 import contextlib
+import json
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -347,11 +358,105 @@ def settings_lock(root: Path, *, timeout: float = SETTINGS_LOCK_TIMEOUT_SECONDS)
         yield
 
 
+class UnreadableSettings(RuntimeError):
+    """The settings file exists but could not be turned into a settings
+    document — an OS error, malformed JSON, or a document that is not a JSON
+    object.
+
+    Worth a distinct exception, rather than the all-off defaults every reader
+    used to get, because those defaults are only the *safe* answer to one of
+    the two questions they currently answer. As "nothing has been configured
+    yet" they are exactly right: every switch off, nothing automatic can
+    happen. As "the configuration could not be read" they are a fabrication,
+    and one that runs in both directions at once:
+
+    * the switches decay to *off*, which is safe but **misattributed** — a
+      reader sees `enabled=False` and reports the operator's master kill
+      switch as engaged, when in fact the file that would have said so is
+      unreadable. The remedy the operator is then pointed at is the wrong one;
+    * `max_daily_spend_usd` decays to `0.0`, which is **not** safe, because
+      `0.0` here means *no cap* (see `_spend_ceiling`). The same laundering
+      that turns the switches restrictive turns the spend ceiling permissive.
+
+    Put together they compose into a fail-open path with no corrupt data left
+    anywhere in it. Measured on the real modules: an operator running
+    `enabled=True, max_daily_spend_usd=5.0, max_global_concurrency=1` suffers a
+    torn write; `dispatch.service.plan` reports `kill_switch_engaged`; the
+    operator turns the switch back on; `update_settings` merges that one change
+    onto the laundered defaults and **persists** `max_daily_spend_usd: 0.0` and
+    `max_global_concurrency: 2`, stamped `updated_by` with their own name as
+    though they had asked for it. From that write on, every gate reads healthy
+    and dispatch is unbounded — the ceiling is not bypassed, it is *gone*.
+
+    This is the same defect `dispatch.policy_config.UnreadablePolicy` closes
+    for `dispatch_policy.json`, on the file that actually holds the ceiling
+    this ticket is about. As there, a *missing* file is still the defaults —
+    that is a fresh install, not a failure.
+    """
+
+
+def read_settings_document(root: Path) -> dict:
+    """The settings file's JSON object, `{}` when nothing has been saved yet.
+
+    Fails closed on everything in between; see `UnreadableSettings`. Read
+    directly rather than through `storage.read_json`, whose swallow-and-default
+    is right for a display surface and wrong for a guardrail: it collapses
+    "absent", "malformed" and "unreadable" into one value before `from_dict`
+    can tell them apart.
+
+    An existing but empty file counts as unreadable rather than unconfigured:
+    writes go through `storage.atomic_write_json`, which never produces a
+    zero-byte settings file, so emptiness is a torn write rather than a state
+    an operator can legitimately have asked for.
+    """
+    path = settings_file_path(root)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise UnreadableSettings(
+            f"pipeline settings at {path} could not be read: {exc}"
+        ) from exc
+    if not raw.strip():
+        raise UnreadableSettings(
+            f"pipeline settings at {path} are empty; an atomically-written "
+            "settings file is never zero bytes, so this is a torn write, not "
+            "an unconfigured pipeline"
+        )
+    try:
+        document = json.loads(raw)
+    except ValueError as exc:
+        raise UnreadableSettings(
+            f"pipeline settings at {path} are not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(document, dict):
+        raise UnreadableSettings(
+            f"pipeline settings at {path} are a {type(document).__name__}, not "
+            "a JSON object; they cannot express a settings document"
+        )
+    return document
+
+
 def load_settings(root: Path) -> PipelineSettings:
     """Read the persisted settings, or the all-off defaults if nothing has been
     saved yet. Unlocked by design (a plain read of an atomically-written file);
-    use `update_settings` for anything that writes."""
-    return PipelineSettings.from_dict(storage.read_json(settings_file_path(root), {}))
+    use `update_settings` for anything that writes.
+
+    Deliberately **total**: an unreadable file yields the all-off defaults, so
+    the display surfaces and the pipeline tick keep the fail-closed behaviour
+    they already have (`enabled=False` disables every automatic action). What
+    it cannot do is tell its caller *why* everything is off. A caller for which
+    that distinction is load-bearing — because it reports the reason to an
+    operator, or because it is about to write the laundered values back — reads
+    `read_settings_document` directly and handles `UnreadableSettings`. Both
+    such callers exist today: `dispatch.service.plan` and `update_settings`.
+    """
+    try:
+        document = read_settings_document(root)
+    except UnreadableSettings:
+        document = {}
+    return PipelineSettings.from_dict(document)
 
 
 def save_settings(root: Path, settings: PipelineSettings) -> PipelineSettings:
@@ -372,7 +477,20 @@ def update_settings(root: Path, *, actor: str | None = None, **changes) -> Pipel
     Unknown field names raise `TypeError` rather than being silently dropped: a
     typo'd `auto_merge=True` must not read as "auto-merge is enabled" while
     persisting nothing. Values pass through the same fail-closed coercion as
-    `from_dict`."""
+    `from_dict`.
+
+    Raises `UnreadableSettings` rather than merging onto the all-off defaults
+    when the current file is present but unusable, and that matters more here
+    than on any read path: this is the call that makes a *recoverable* torn
+    file permanently guardrail-free. The merge base would be the laundered
+    defaults, so the write persists `max_daily_spend_usd: 0.0` — which means
+    **no cap**, not the operator's ceiling — plus the default concurrency caps,
+    over the top of whatever was actually configured, and stamps `updated_by`
+    with the authenticated operator as if they had asked for it. Toggling one
+    switch is not consent to drop every limit the file used to hold. The remedy
+    is `save_settings`, which states the whole document explicitly instead of
+    inheriting the unreadable part. Mirrors
+    `dispatch.policy_config.update_policy`."""
     unknown = set(changes) - {
         "enabled",
         "auto_launch",
@@ -390,7 +508,7 @@ def update_settings(root: Path, *, actor: str | None = None, **changes) -> Pipel
         raise TypeError(f"Unknown pipeline setting(s): {', '.join(sorted(unknown))}")
 
     with settings_lock(root):
-        current = PipelineSettings.from_dict(storage.read_json(settings_file_path(root), {}))
+        current = PipelineSettings.from_dict(read_settings_document(root))
         merged = PipelineSettings.from_dict({**current.as_dict(), **changes})
         updated = replace(merged, updated_at=models.iso_now(), updated_by=actor)
         storage.atomic_write_json(settings_file_path(root), updated.as_dict())

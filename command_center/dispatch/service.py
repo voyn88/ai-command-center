@@ -11,6 +11,15 @@ never reimplementing them:
 * kill switch        -> `pipeline_settings.enabled` (the master switch the
                         `task_pipeline.kill_switch` sets off)
 
+Five of those inputs can fail to load, and each failure is turned into a typed
+gate that `plan_dispatch` checks *before* any assignment is considered
+(`settings_unknown`, `policy_unknown`, `budget_unknown`, `capacity_unknown`,
+plus the kill switch itself). None of them substitutes a plausible-looking
+value, because every one of the plausible values is the permissive one: an
+empty run-count map means "nothing is running", a default policy means "no
+limits configured", `0.0` spend means "nothing spent" and a `0.0` ceiling
+means "no cap".
+
 `plan(...)` is a dry run (no writes). `assign(...)` applies the plan by
 recording the chosen executor onto each assigned task **through
 `tasks_repository`** (the board's single writer) — it never launches a
@@ -234,11 +243,61 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         policy = DispatchPolicy()
         policy_unknown = True
 
-    settings = pipeline_settings.load_settings(root)
+    # The settings document is the fifth guardrail input that can fail to
+    # load, and the last one still being read through a swallow-and-default.
+    # It is also the only one whose fallback is wrong in *both* directions at
+    # once, which is what makes it worth its own gate rather than being left to
+    # fail closed incidentally:
+    #
+    #   * the switches decay to off, so `not settings.enabled` reads True and
+    #     the plan reports `kill_switch_engaged` — a cause the operator never
+    #     chose, pointing at a remedy (turn the master switch back on) that
+    #     runs `update_settings`, which used to merge that one change onto the
+    #     laundered defaults and *persist* `max_daily_spend_usd: 0.0`;
+    #   * `0.0` is not a strict ceiling, it is *no* ceiling (see
+    #     `pipeline_settings._spend_ceiling`), so from that write onward the
+    #     plan dispatches unbounded with every flag reading healthy.
+    #
+    # Measured end to end on these modules: `enabled=True`,
+    # `max_daily_spend_usd=5.0`, `max_global_concurrency=1`; tear the file;
+    # `plan()` says `kill_switch_engaged`; re-enable; the file now reads
+    # `max_daily_spend_usd: 0.0`, `max_global_concurrency: 2`, stamped
+    # `updated_by` with the operator's own id. Neither half is corrupt data by
+    # then — the guardrails are simply gone.
+    #
+    # `read_settings_document` raises only for a file that exists and cannot be
+    # used — a *missing* file is still the defaults, so a fresh install
+    # dispatches normally.
+    settings_unknown = False
+    try:
+        settings = pipeline_settings.PipelineSettings.from_dict(
+            pipeline_settings.read_settings_document(root)
+        )
+    except Exception:  # noqa: BLE001 — no settings => fail closed: block dispatch
+        logger.warning(
+            "dispatch: pipeline settings unreadable at %s — failing closed "
+            "(settings_unknown)",
+            pipeline_settings.settings_file_path(root),
+            exc_info=True,
+        )
+        # NaN, not the `0.0` default, for the ceiling this stands in for: `0.0`
+        # is the value that means "no cap", so it is the one reading a failed
+        # read must never produce. Carrying it as NaN also engages
+        # `budget_unknown` independently in `plan_dispatch`, so the refusal
+        # does not rest on the new gate alone.
+        settings = pipeline_settings.PipelineSettings(
+            max_daily_spend_usd=float("nan")
+        )
+        settings_unknown = True
 
     # The kill switch IS the master switch: `task_pipeline.kill_switch` persists
     # `enabled=False`. Dispatch must never launch while it is off.
-    kill_switch_engaged = not settings.enabled
+    #
+    # Not reported as engaged when the settings could not be read: the switch's
+    # value lives in that document, so `not settings.enabled` would be an
+    # artefact of the placeholder above, not a fact about the operator's
+    # configuration. `settings_unknown` carries that refusal instead.
+    kill_switch_engaged = (not settings.enabled) and not settings_unknown
 
     # The configured ceiling is the fourth guardrail input that can be corrupt,
     # and it fails closed one level down: `plan_dispatch` refuses a non-finite
@@ -249,7 +308,7 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # those have nothing like the same remedy. Logged for the same reason the
     # three reads below are: the response carries the typed refusal, the log
     # carries which store produced it.
-    if not math.isfinite(settings.max_daily_spend_usd):
+    if not settings_unknown and not math.isfinite(settings.max_daily_spend_usd):
         logger.warning(
             "dispatch: configured daily spend ceiling at %s is not usable "
             "money — failing closed (budget_unknown)",
@@ -324,6 +383,7 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         budget_unknown=budget_unknown,
         capacity_unknown=capacity_unknown,
         policy_unknown=policy_unknown,
+        settings_unknown=settings_unknown,
         active_by_executor=active,
     )
 
@@ -349,9 +409,10 @@ def assign(
     process — the existing pipeline does that on the recorded executor, so
     supervisor semantics are untouched.
 
-    Fail-closed: if the kill switch is engaged, or the dispatch policy, the
-    trailing-24h spend or the in-flight run counts could not be read, nothing
-    is applied even when the caller passed `confirmed=True`. `confirmed` is a
+    Fail-closed: if the kill switch is engaged, or the pipeline settings, the
+    dispatch policy, the trailing-24h spend or the in-flight run counts could
+    not be read, nothing is applied even when the caller passed
+    `confirmed=True`. `confirmed` is a
     required explicit opt-in for the *write*, mirroring every other mutating
     action in this codebase.
     """
@@ -363,10 +424,31 @@ def assign(
             "reason": "confirmation_required",
             "plan": computed.as_dict(),
         }
+    # Checked in the *same precedence* the engine reports its headline defer
+    # reason in, and that is load-bearing rather than tidy. Several gates are
+    # routinely engaged at once — an unreadable settings document also yields
+    # an unusable ceiling, hence `budget_unknown` too — so whichever is tested
+    # first is the cause the operator is told about and the remedy they will
+    # go and apply. Any other order would answer "the trailing-24h spend could
+    # not be read" (go look at the runtime store) to a question whose real
+    # answer is "your settings file is torn", which is the exact
+    # misattribution this ticket is about, reintroduced one layer up.
+    if computed.settings_unknown:
+        return {
+            "applied": False,
+            "reason": "settings_data_unavailable",
+            "plan": computed.as_dict(),
+        }
     if computed.kill_switch_engaged:
         return {
             "applied": False,
             "reason": "kill_switch_engaged",
+            "plan": computed.as_dict(),
+        }
+    if computed.policy_unknown:
+        return {
+            "applied": False,
+            "reason": "policy_data_unavailable",
             "plan": computed.as_dict(),
         }
     if computed.budget_unknown:
@@ -379,12 +461,6 @@ def assign(
         return {
             "applied": False,
             "reason": "capacity_data_unavailable",
-            "plan": computed.as_dict(),
-        }
-    if computed.policy_unknown:
-        return {
-            "applied": False,
-            "reason": "policy_data_unavailable",
             "plan": computed.as_dict(),
         }
 

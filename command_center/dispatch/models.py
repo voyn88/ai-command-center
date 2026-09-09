@@ -24,6 +24,7 @@ DEFER_KILL_SWITCH = "kill_switch_engaged"
 DEFER_COST_DATA_UNAVAILABLE = "cost_data_unavailable"
 DEFER_CAPACITY_DATA_UNAVAILABLE = "capacity_data_unavailable"
 DEFER_POLICY_DATA_UNAVAILABLE = "policy_data_unavailable"
+DEFER_SETTINGS_DATA_UNAVAILABLE = "settings_data_unavailable"
 DEFER_DAILY_BUDGET = "daily_budget_exhausted"
 DEFER_AGENT_BUDGET = "agent_budget_exceeded"
 DEFER_PROJECT_BUDGET = "project_budget_exceeded"
@@ -37,6 +38,7 @@ DEFER_REASONS = frozenset(
         DEFER_COST_DATA_UNAVAILABLE,
         DEFER_CAPACITY_DATA_UNAVAILABLE,
         DEFER_POLICY_DATA_UNAVAILABLE,
+        DEFER_SETTINGS_DATA_UNAVAILABLE,
         DEFER_DAILY_BUDGET,
         DEFER_AGENT_BUDGET,
         DEFER_PROJECT_BUDGET,
@@ -68,6 +70,13 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "is readable again, because the per-agent and per-project limits it "
         "carries are expressed by their presence, so falling back to the "
         "defaults would silently drop every configured guardrail."
+    ),
+    DEFER_SETTINGS_DATA_UNAVAILABLE: (
+        "The pipeline settings could not be read: dispatch is refused until "
+        "they are readable again. The all-off defaults are not a safe stand-in "
+        "here — they would report the operator's kill switch as engaged when "
+        "it is simply unknown, and they read the daily spend ceiling as 0.0, "
+        "which means no cap at all."
     ),
     DEFER_DAILY_BUDGET: (
         "Assigning any eligible executor would exceed the daily spend budget."
@@ -373,6 +382,14 @@ class DispatchPlan:
     # capacity conservatively, it under-reports the work already running, which
     # lets a plan assign on top of runs it cannot see.
     capacity_unknown: bool = False
+    # True when the pipeline settings could not be read. The one gate whose
+    # absence was not merely a weaker refusal but a *wrong* one: the all-off
+    # defaults made `kill_switch_engaged` report True, naming a cause the
+    # operator had not chosen and a remedy (turn the switch back on) that
+    # writes the laundered ceiling to disk. See `pipeline_settings
+    # .UnreadableSettings`. While this is True the kill switch is not reported
+    # as engaged, because whether it is engaged is exactly what is unknown.
+    settings_unknown: bool = False
     # True when the dispatch policy itself could not be read. Same posture, and
     # the sharpest of the three: the defaults it would otherwise fall back to
     # carry *empty* limit maps, and empty reads as "no per-agent concurrency
@@ -403,6 +420,7 @@ class DispatchPlan:
         remaining = self.budget_remaining_usd
         return {
             "kill_switch_engaged": self.kill_switch_engaged,
+            "settings_unknown": self.settings_unknown,
             "budget_unknown": self.budget_unknown,
             "capacity_unknown": self.capacity_unknown,
             "policy_unknown": self.policy_unknown,

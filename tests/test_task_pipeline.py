@@ -208,6 +208,113 @@ def test_editing_an_unrelated_setting_cannot_launder_a_corrupt_ceiling(tmp_path)
     assert math.isnan(pipeline_settings.load_settings(tmp_path).max_daily_spend_usd)
 
 
+def test_an_unreadable_settings_file_is_told_apart_from_an_absent_one(tmp_path):
+    """`storage.read_json` collapses "absent", "malformed" and "unreadable"
+    into one value, and the two ends of that collapse need opposite answers.
+
+    Absent is a fresh install: the all-off defaults are exactly right.
+    Unreadable is a failure, and the same defaults get it wrong in *both*
+    directions at once — the switches decay to off (safe, but reported as an
+    operator decision nobody made) while `max_daily_spend_usd` decays to
+    `0.0`, which means no cap at all.
+    """
+    path = pipeline_settings.settings_file_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Absent: still the defaults, no exception. A fresh install must work.
+    assert pipeline_settings.read_settings_document(tmp_path) == {}
+
+    for raw in ('{"enabled": tru', "", "   ", "[]", '"a string"', "null", "42"):
+        path.write_text(raw, encoding="utf-8")
+        with pytest.raises(pipeline_settings.UnreadableSettings):
+            pipeline_settings.read_settings_document(tmp_path)
+
+    # Control: a well-formed document is returned verbatim.
+    path.write_text(json.dumps({"enabled": True}), encoding="utf-8")
+    assert pipeline_settings.read_settings_document(tmp_path) == {"enabled": True}
+
+
+def test_load_settings_stays_total_on_an_unreadable_file(tmp_path):
+    """The display surfaces and the pipeline tick keep the reader they have.
+
+    `load_settings` is deliberately total — it must not start raising into
+    `app.py` and the UI panels. What it cannot do is tell its caller *why*
+    everything is off, which is why the two callers for which that is
+    load-bearing read the document directly.
+    """
+    path = pipeline_settings.settings_file_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"enabled": tru', encoding="utf-8")
+
+    settings = pipeline_settings.load_settings(tmp_path)
+
+    assert settings.enabled is False  # fail closed, as before
+    assert settings.auto_launch_active is False
+
+
+def test_toggling_a_switch_on_a_torn_file_cannot_delete_the_spend_ceiling(tmp_path):
+    """The measured fail-open chain, pinned end to end.
+
+    An operator running `enabled=True, max_daily_spend_usd=5.0,
+    max_global_concurrency=1` suffers a torn write. Every reader now sees the
+    all-off defaults, so the dispatch plan used to report `kill_switch_engaged`
+    — and the remedy that names is "turn the master switch back on". Doing so
+    merged that one change onto the laundered defaults and *persisted*
+    `max_daily_spend_usd: 0.0` (no cap) and `max_global_concurrency: 2`,
+    stamped `updated_by` with the operator's own id, as though they had asked
+    for it. No corrupt data survived anywhere: the guardrails were simply gone,
+    and every gate read healthy from then on.
+
+    So the write is refused. This panel-and-API-facing mutator cannot restate
+    the ceiling — nothing passes `max_daily_spend_usd` to it — so it must not
+    inherit an unreadable one.
+    """
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=5.0,
+            max_global_concurrency=1,
+        ),
+    )
+    path = pipeline_settings.settings_file_path(tmp_path)
+    before = path.read_text(encoding="utf-8")
+
+    path.write_text('{"enabled": true, "max_daily_spend_us', encoding="utf-8")
+
+    with pytest.raises(pipeline_settings.UnreadableSettings):
+        pipeline_settings.update_settings(tmp_path, actor="operator", enabled=True)
+
+    # Nothing was written: the torn file is still torn, which is recoverable.
+    # A laundered one would not have been.
+    assert path.read_text(encoding="utf-8") == '{"enabled": true, "max_daily_spend_us'
+
+    # And the documented remedy works: `save_settings` states the whole
+    # document explicitly rather than inheriting the unreadable part.
+    pipeline_settings.save_settings(
+        tmp_path, PipelineSettings.from_dict(json.loads(before))
+    )
+    restored = pipeline_settings.load_settings(tmp_path)
+    assert restored.max_daily_spend_usd == 5.0
+    assert restored.max_global_concurrency == 1
+
+
+def test_update_settings_still_works_on_a_healthy_and_on_an_absent_file(tmp_path):
+    """The refusal must not cost the ordinary path anything."""
+    # Absent file: a fresh install can still opt in.
+    first = pipeline_settings.update_settings(tmp_path, actor="op", enabled=True)
+    assert first.enabled is True
+
+    # Healthy file: an unrelated edit preserves the configured ceiling.
+    import dataclasses
+
+    pipeline_settings.save_settings(
+        tmp_path, dataclasses.replace(first, max_daily_spend_usd=5.0)
+    )
+    second = pipeline_settings.update_settings(tmp_path, actor="op", auto_launch=True)
+    assert second.auto_launch is True
+    assert second.max_daily_spend_usd == 5.0
+
+
 def test_a_lone_auto_launch_flag_cannot_launch_without_the_master_switch():
     settings = PipelineSettings(enabled=False, auto_launch=True, auto_merge_after_checks=True)
     assert settings.auto_launch_active is False

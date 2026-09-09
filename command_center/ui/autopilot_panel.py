@@ -234,7 +234,26 @@ def render_autopilot_controls(root: Path, *, key_prefix: str = "autopilot") -> p
         "run_timeout_seconds": int(run_timeout),
     }
     if changes != {k: v for k, v in settings.as_dict().items() if k in changes}:
-        settings = pipeline_settings.update_settings(root, actor="desktop_ui", **changes)
+        try:
+            settings = pipeline_settings.update_settings(
+                root, actor="desktop_ui", **changes
+            )
+        except pipeline_settings.UnreadableSettings as exc:
+            # The write is refused, not retried, and saying so is the point.
+            # This panel restates every *toggle* but has no control for
+            # `max_daily_spend_usd`, so that field would be inherited from the
+            # unreadable file — i.e. from the all-off defaults, where it reads
+            # `0.0`, meaning **no cap**. Writing here would therefore trade a
+            # recoverable torn file for a permanent one with the operator's
+            # spend ceiling silently deleted and their name stamped on it.
+            st.error(
+                "Настройки пайплайна на диске не читаются, поэтому изменение "
+                "не сохранено: запись поверх нечитаемого файла удалила бы "
+                "дневной лимит трат (он в этом файле, а у панели нет для него "
+                "контрола). Восстановите или удалите файл и повторите.\n\n"
+                f"`{pipeline_settings.settings_file_path(root)}`\n\n{exc}",
+                icon=":material/error:",
+            )
 
     if settings.enabled and settings.auto_launch:
         st.warning(
