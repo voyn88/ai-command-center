@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from command_center.ops import infra_monitor
 from command_center.ops.infra_monitor import (
     QueueSnapshot,
@@ -376,9 +378,16 @@ def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> N
     assert healthy.ok
 
 
-def test_findings_are_recorded_and_cleared_through_the_definer_functions(monkeypatch) -> None:
-    from command_center.ops import infra_monitor
+@pytest.fixture
+def recorded_statements(monkeypatch):
+    """Every statement `record_findings` executes, in order, over a fake pool.
 
+    A fake rather than a server because what is under test here is the CALL
+    SEQUENCE -- which failures are recorded, and with which keys the clear is
+    asked to spare them. What those statements then DO to the rows is a
+    property of the SECURITY DEFINER functions, and is proved against a real
+    server in `tests/db/test_monitor_finding_clear.py`.
+    """
     calls: list[tuple] = []
 
     class _Cur:
@@ -409,6 +418,13 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(monkeyp
     monkeypatch.setitem(sys.modules, "command_center.db", fake_db)
     monkeypatch.setitem(sys.modules, "command_center.db.pool", _Pool)
     monkeypatch.setitem(sys.modules, "command_center.db.config", fake_cfg)
+    return calls
+
+
+def test_findings_are_recorded_and_cleared_through_the_definer_functions(
+    recorded_statements,
+) -> None:
+    calls = recorded_statements
     infra_monitor.record_findings("worker-01:infra", ("active_workers:2<4",), {"x": 1})
     recorded = [c for c in calls if "monitor_record_finding" in c[0]]
     # Identity is the failure code, the measurement rides in the detail: the
@@ -418,7 +434,48 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(monkeyp
     assert infra_monitor.finding_key("dead_letter_growth:53>0") == infra_monitor.finding_key("dead_letter_growth:54>0") == "dead_letter_growth"
     calls.clear()
     infra_monitor.record_findings("worker-01:infra", (), {})
-    assert any("monitor_clear_finding" in c[0] for c in calls)
+    # A green tick clears the whole source, which is what an empty list of
+    # still-failing keys means to `monitor_clear_finding(text, text[])`.
+    cleared = [c for c in calls if "monitor_clear_finding" in c[0]]
+    assert cleared == [("SELECT monitor_clear_finding(%s, %s)", ("worker-01:infra", []))]
+
+
+def test_a_resolved_failure_is_cleared_while_its_red_siblings_stay_open(
+    recorded_statements,
+) -> None:
+    """THE FINDING-LIFECYCLE REGRESSION (monitor_finding #481).
+
+    `control-01:queue` reports six independent failures and clears them
+    through ONE source. The clear used to run only on an all-green tick, and
+    the probe is deployed with `--max-recent-dead 0` -- one dead-lettered item
+    in the trailing hour is enough to keep `dead_letter_growth` red -- so a
+    `queue_stalled` finding that has measured healthy for days had no
+    reachable way out: the tick that would have cleared it never came.
+
+    Now every tick reconciles: what is still measured is recorded, and the
+    complement is cleared by name. `dead_letter_growth` keeps its row (and
+    with it its `opened_at` and the task the planner linked), `queue_stalled`
+    is not in the spared list and goes.
+    """
+    calls = recorded_statements
+    infra_monitor.record_findings(
+        "control-01:queue", ("dead_letter_growth:53>0",), {"ok": False}
+    )
+
+    assert [c[1][1] for c in calls if "monitor_record_finding" in c[0]] == [
+        "dead_letter_growth"
+    ]
+    (clear,) = [c for c in calls if "monitor_clear_finding" in c[0]]
+    source, spared = clear[1]
+    assert source == "control-01:queue"
+    # Keyed like the recording call, never the raw measurement: sparing
+    # "dead_letter_growth:53>0" would match no row, so the finding this tick
+    # just recorded would be cleared by the same tick.
+    assert spared == ["dead_letter_growth"]
+    assert "queue_stalled" not in spared
+    # And it runs on a RED tick, which is the whole change: the clear used to
+    # be the else-branch of `if failures`.
+    assert calls.index(clear) > 0
 
 
 def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(monkeypatch, capsys) -> None:

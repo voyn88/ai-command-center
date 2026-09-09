@@ -268,12 +268,20 @@ def _check_compliance(admin_conn) -> list[str]:
 
     # ---- function grants ---------------------------------------------------
     with admin_conn.cursor() as cur:
+        # Keyed by name AND arity, not name alone: from 0024 on,
+        # `monitor_clear_finding` is TWO functions (`(text)` and
+        # `(text, text[])`), and a name-only match would call both declared
+        # signatures ambiguous and then report both granted overloads as EXTRA
+        # -- four violations for a schema that is exactly compliant. Arity is
+        # how `roles._function_key` matches, and how PostgreSQL resolves this
+        # pair; a genuine same-name/same-arity clash is still AMBIGUOUS below.
         cur.execute(
-            "SELECT p.proname || '(' || pg_get_function_arguments(p.oid) || ')' "
+            "SELECT p.proname || '/' || p.pronargs, "
+            "p.proname || '(' || pg_get_function_arguments(p.oid) || ')' "
             "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
             "WHERE n.nspname = 'public'"
         )
-        all_db_functions = [row[0] for row in cur.fetchall()]
+        all_db_functions = [(row[0], row[1]) for row in cur.fetchall()]
 
     for role in (roles.APP_ROLE, roles.WORKER_ROLE):
         declared_sigs = list(roles.FUNCTION_PRIVILEGES.get(role, ()))
@@ -281,8 +289,10 @@ def _check_compliance(admin_conn) -> list[str]:
         # Resolve declared short signatures to catalog form
         declared_canonical: set[str] = set()
         for sig in declared_sigs:
-            name = sig.split("(")[0]
-            matches = [f for f in all_db_functions if f.startswith(f"{name}(")]
+            key = roles._function_key(sig)
+            matches = [
+                canonical for fn_key, canonical in all_db_functions if fn_key == key
+            ]
             if not matches:
                 violations.append(
                     f"MISSING FUNCTION: role={role} declared function {sig!r} not found in db"

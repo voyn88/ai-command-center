@@ -344,6 +344,17 @@ def test_function_signature_guard_rejects_injection(bad: str) -> None:
         roles._require_function_signature(bad)
 
 
+def test_function_signature_guard_accepts_only_suffix_array_types() -> None:
+    roles._require_function_signature("monitor_clear_finding(text, text[])")
+    for bad in (
+        "monitor_clear_finding(text, text[]evil)",
+        "monitor_clear_finding(text, text])",
+        "monitor_clear_finding(text, text[; DROP TABLE task])",
+    ):
+        with pytest.raises(ValueError):
+            roles._require_function_signature(bad)
+
+
 def test_a_worker_host_role_is_a_login_member_of_the_worker_group() -> None:
     """Per-host identity with no new machinery, and no password in the SQL."""
     statement = roles.render_worker_host_role("aicc_worker_host_a")[0]
@@ -390,3 +401,55 @@ def test_identity_sequences_match_the_ddl() -> None:
 def test_identifier_guard_rejects_injection(bad: str) -> None:
     with pytest.raises(ValueError, match="not a safe"):
         roles.render_grants(bad)
+
+
+def test_an_overloaded_function_is_filtered_by_arity_not_by_name() -> None:
+    """A database between 0021 and 0024 has `monitor_clear_finding(text)` and
+    not `monitor_clear_finding(text, text[])`.
+
+    `apply_table_grants` runs the whole matrix in ONE transaction, so emitting
+    a GRANT for the absent overload does not skip one privilege -- it aborts
+    every grant in the run. Before 0024 no name in this schema had two
+    signatures, which is what made matching on the bare name look sufficient.
+    """
+    one_arg = "GRANT EXECUTE ON FUNCTION public.monitor_clear_finding(text) TO"
+    two_arg = "GRANT EXECUTE ON FUNCTION public.monitor_clear_finding(text, text[]) TO"
+
+    def _emitted(existing: set[str]) -> tuple[bool, bool]:
+        rendered = "\n".join(
+            roles.render_table_grants(
+                existing_relations=set(roles.ALL_TABLES) | set(roles.ALL_VIEWS),
+                existing_functions=existing,
+            )
+        )
+        return one_arg in rendered, two_arg in rendered
+
+    every_function = {
+        roles._function_key(signature)
+        for privileges in roles.FUNCTION_PRIVILEGES.values()
+        for signature in privileges
+    }
+    assert _emitted(every_function) == (True, True)
+    # The pre-0024 catalog: same name, one arity.
+    assert _emitted(every_function - {"monitor_clear_finding/2"}) == (True, False)
+    # And the filter is not merely dropping both: the arity it keeps is the
+    # arity it was told about.
+    assert _emitted(every_function - {"monitor_clear_finding/1"}) == (False, True)
+
+
+def test_function_keys_are_name_and_argument_count() -> None:
+    """The key `apply_table_grants` builds from `pg_proc.pronargs` must be the
+    key the declared signatures render to -- a mismatch would skip every
+    function grant silently rather than raise."""
+    assert roles._function_key("backlog_dispatch_smoke()") == "backlog_dispatch_smoke/0"
+    assert roles._function_key("monitor_clear_finding(text)") == "monitor_clear_finding/1"
+    assert (
+        roles._function_key("monitor_clear_finding(text, text[])")
+        == "monitor_clear_finding/2"
+    )
+    # Arguments carrying a DEFAULT are declared and counted here exactly as
+    # `pronargs` counts them.
+    assert (
+        roles._function_key("monitor_record_finding(text, text, jsonb)")
+        == "monitor_record_finding/3"
+    )

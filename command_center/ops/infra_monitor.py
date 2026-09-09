@@ -466,8 +466,10 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SOURCE",
         default="",
         help=(
-            "Record every failure as an open monitor_finding under this source "
-            "(and clear the source's findings when healthy), so the planner turns "
+            "Reconcile this source's monitor_findings with the measurement: "
+            "every failure becomes an open finding, and every finding this tick "
+            "no longer measures is cleared -- each independently, so one "
+            "lingering red check cannot hold the others open. The planner turns "
             "a red monitor into a pipeline task instead of a failed unit."
         ),
     )
@@ -481,35 +483,59 @@ def finding_key(failure: str) -> str:
 
 
 def record_findings(source: str, failures: tuple[str, ...], detail: dict[str, Any]) -> None:
-    """Write the measurement to the database through the SECURITY DEFINER
-    functions of migration 0021 (granted to aicc_app and aicc_worker). A red
-    monitor becomes a task the fleet fixes; a healthy one clears its rows.
+    """Reconcile this source's open findings with what this tick measured,
+    through the SECURITY DEFINER functions of migrations 0021 and 0024
+    (granted to aicc_app and aicc_worker). Every failure still measured is
+    recorded (or refreshed); every OTHER open finding of this source is
+    cleared, whether or not anything is still red.
+
+    A red monitor becomes a task the fleet fixes; a failure that has stopped
+    measuring is done being one -- even when a sibling check is still red.
+    That independence is the whole point: the findings are keyed per failure
+    because the planner mints one task per failure, so clearing them only on
+    an all-green tick made every one of them hostage to the worst of them
+    (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #481: this probe
+    runs with `--max-recent-dead 0`, so one dead-lettered item an hour keeps
+    `dead_letter_growth` red forever, and `queue_stalled` -- healthy again
+    since the stall clock was fixed -- had no reachable way out behind it).
+
     Never lets a recording problem mask the measurement: raises, and main()
     reports monitor_error while still exiting non-zero."""
     from command_center.db import pool
     from command_center.db.config import load_config
 
+    # Identity is the failure CODE (before the first ':'), never the
+    # measurement: "dead_letter_growth:53>0" and "dead_letter_growth:54>0" are
+    # one open finding and one task, not one per tick (control-01,
+    # 2026-09-08: four tasks in ten minutes for the same red probe). The
+    # measured text travels in the detail. It is also what the clear below
+    # matches on, so the two calls have to agree on it -- hence one list,
+    # zipped with the failures it came from, rather than the key computed
+    # twice.
+    keyed = [(finding_key(failure), failure) for failure in failures]
+
     pool.open_pool(load_config())
     try:
         with pool.connection() as conn, conn.cursor() as cur:
-            if failures:
-                for failure in failures:
-                    # Identity is the failure CODE (before the first ':'),
-                    # never the measurement: "dead_letter_growth:53>0" and
-                    # "dead_letter_growth:54>0" are one open finding and one
-                    # task, not one per tick (control-01, 2026-09-08: four
-                    # tasks in ten minutes for the same red probe). The
-                    # measured text travels in the detail.
-                    cur.execute(
-                        "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
-                        (
-                            source,
-                            finding_key(failure),
-                            json.dumps({**detail, "failure": failure}, sort_keys=True),
-                        ),
-                    )
-            else:
-                cur.execute("SELECT monitor_clear_finding(%s)", (source,))
+            for key, failure in keyed:
+                cur.execute(
+                    "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                    (
+                        source,
+                        key,
+                        json.dumps({**detail, "failure": failure}, sort_keys=True),
+                    ),
+                )
+            # Clearing runs on EVERY tick, not only a green one. With no
+            # failures the argument is empty and this is exactly 0021's
+            # `monitor_clear_finding(source)`; with failures it clears the
+            # complement, leaving the still-red rows untouched so they keep
+            # their `opened_at`, their `finding_id` and the `task_id` the
+            # planner linked to them.
+            cur.execute(
+                "SELECT monitor_clear_finding(%s, %s)",
+                (source, [key for key, _failure in keyed]),
+            )
             conn.commit()
     finally:
         pool.close_pool()

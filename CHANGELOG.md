@@ -62,6 +62,33 @@ functional application milestones of `app.py`.
   their sources rather than restated: `--claim-capacity` against
   `deploy/aicc/worker-lanes`, and the throughput floor against
   `WorkerConfig.idle_max_seconds`.
+- A healthy `queue_stalled` measurement could still leave its finding open:
+  the monitor recorded findings independently but cleared them only when every
+  check sharing the source was green. On `control-01:queue`, an unrelated
+  `dead_letter_growth` failure therefore held finding #481 open after the stall
+  fix. Migration 0024 adds a compatible two-argument clear function that closes
+  only findings absent from the current measurement; every monitor tick now
+  reconciles that set. Unit and PostgreSQL integration regressions cover red-tick
+  partial clears, stable finding/task identity, empty/NULL clears, source scope,
+  and grants for both control- and worker-host probes.
+- `monitor_clear_finding` is this schema's first OVERLOADED function, and two
+  places assumed a function name identified exactly one signature.
+  `roles.render_table_grants`' existence filter — the one that lets grants be
+  re-asserted against a database at an intermediate migration version — matched
+  on the bare name, so between 0021 and 0024 it would have emitted a GRANT for
+  the two-argument form while only the one-argument form existed; the whole
+  matrix applies in one transaction, so that is not one skipped privilege but
+  every grant in the run aborting. `tests/db/test_grant_compliance.py` resolved
+  declared signatures by name prefix the same way and would have called both
+  forms `AMBIGUOUS` and both granted overloads `EXTRA` on a schema that is
+  exactly compliant. Both now key on name AND arity (`roles._function_key`,
+  read from `pg_proc.pronargs`) — arity because it is what PostgreSQL resolves
+  this pair by and it is an integer, so no type-name spelling has to agree
+  between the declared matrix and the catalog; matching rendered types would
+  put `timestamptz` against `timestamp with time zone` and skip a grant
+  SILENTLY, and a missing grant is an outage the next deploy inherits while a
+  surplus statement is a loud error. A same-name/same-arity clash is still
+  reported as ambiguous.
 
 ### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
 - `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`
