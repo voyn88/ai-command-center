@@ -80,9 +80,20 @@ def test_store_writes_token_expiry_and_gh_hosts_lane_readable_and_atomic(tmp_pat
     assert not list(root.glob("*.tmp")) and not list((root / "gh").glob("*.tmp"))
 
 
+def test_store_accepts_the_long_installation_tokens_github_issues(tmp_path):
+    """Live tokens are ~400 characters; a 200-char cap in the helper truncated
+    the token and every private-repo fetch failed (worker-01 2026-09-09)."""
+    module = _module()
+    long_token = "ghs_" + "a" * 387
+    module.store({"token": long_token, "expires_at": "x"}, tmp_path / "g", chown=False)
+    assert (tmp_path / "g" / "token").read_text() == long_token + "\n"
+    helper = (Path(__file__).parents[2] / "ops/aicc_git_credential").read_text()
+    assert "head -c 1024" in helper and "head -c 200" not in helper
+
+
 def test_store_refuses_a_token_of_unexpected_shape(tmp_path):
     module = _module()
-    for bad in ("", "not-a-token", "ghs_" + "x" * 300, "ghs_with space"):
+    for bad in ("", "not-a-token", "ghs_" + "x" * 1100, "ghs_with space"):
         with pytest.raises(ValueError):
             module.store({"token": bad, "expires_at": "x"}, tmp_path / "g", chown=False)
     assert not (tmp_path / "g" / "token").exists()

@@ -90,7 +90,9 @@ def mint(app_id: str, installation_id: str, pem: Path, *, repositories, permissi
 def store(document: dict, root: Path, *, group: str = "aicc-worker", chown: bool = True) -> None:
     """Write token, expiry and a gh hosts.yml atomically, lane-readable only."""
     token = str(document["token"])
-    if not token.startswith(("ghs_", "ghp_")) or len(token) > 200 or any(c.isspace() for c in token):
+    # Installation tokens run to ~400 characters (a 200-char cap truncated the
+    # live token and every private-repo fetch failed, worker-01 2026-09-09).
+    if not token.startswith(("ghs_", "ghp_")) or len(token) > 1024 or any(c.isspace() for c in token):
         raise ValueError("installation token has an unexpected shape")
     gid = grp.getgrnam(group).gr_gid if chown else -1
     root.mkdir(mode=0o750, parents=True, exist_ok=True)
