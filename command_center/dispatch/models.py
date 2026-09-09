@@ -20,7 +20,9 @@ ASSIGNED = "assigned"
 
 # Deferred (stays queued). Each is a *typed* reason, never force-run.
 DEFER_KILL_SWITCH = "kill_switch_engaged"
-DEFER_COST_DATA_UNAVAILABLE = "cost_data_unavailable"
+# The trailing-24h spend could not be read. This is deliberately not a budget
+# verdict: no comparison with the ceiling was possible.
+DEFER_SPEND_UNKNOWN = "spend_unknown"
 DEFER_DAILY_BUDGET = "daily_budget_exhausted"
 DEFER_AGENT_BUDGET = "agent_budget_exceeded"
 DEFER_PROJECT_BUDGET = "project_budget_exceeded"
@@ -35,7 +37,7 @@ DEFER_TAIL_RISK = "tail_risk_limit_exceeded"
 DEFER_REASONS = frozenset(
     {
         DEFER_KILL_SWITCH,
-        DEFER_COST_DATA_UNAVAILABLE,
+        DEFER_SPEND_UNKNOWN,
         DEFER_DAILY_BUDGET,
         DEFER_AGENT_BUDGET,
         DEFER_PROJECT_BUDGET,
@@ -53,7 +55,7 @@ REASON_EXPLANATIONS: dict[str, str] = {
     DEFER_KILL_SWITCH: (
         "Kill switch engaged (master switch off): no automatic dispatch."
     ),
-    DEFER_COST_DATA_UNAVAILABLE: (
+    DEFER_SPEND_UNKNOWN: (
         "Trailing-24h spend could not be read: dispatch is refused until cost "
         "data is available again, so budget guardrails can never be silently "
         "bypassed by a database outage."

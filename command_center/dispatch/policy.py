@@ -15,7 +15,7 @@ The hard guarantees, enforced structurally here:
 1b. **Unknown budget blocks everything, the same way.** `budget_unknown=True`
    (the caller could not read the trailing-24h spend) is checked in the same
    place, before any assignment, and defers every task with
-   `DEFER_COST_DATA_UNAVAILABLE`. This is deliberately a hard gate rather than
+   `DEFER_SPEND_UNKNOWN`. This is deliberately a hard gate rather than
    a simulated spend figure: a faked number can be silently absorbed by a
    zero/unset daily cap or by a free executor, which would make "no cost
    data" fail *open* instead of closed.
@@ -46,7 +46,7 @@ from command_center.dispatch.models import (
     ASSIGNED,
     DEFER_AGENT_BUDGET,
     DEFER_AGENT_CAPACITY,
-    DEFER_COST_DATA_UNAVAILABLE,
+    DEFER_SPEND_UNKNOWN,
     DEFER_DAILY_BUDGET,
     DEFER_KILL_SWITCH,
     DEFER_NO_AVAILABLE_EXECUTOR,
@@ -133,7 +133,7 @@ def plan_dispatch(
     #     that assigns while the trailing-24h spend is unreadable.
     if kill_switch_engaged or budget_unknown:
         reason = (
-            DEFER_KILL_SWITCH if kill_switch_engaged else DEFER_COST_DATA_UNAVAILABLE
+            DEFER_KILL_SWITCH if kill_switch_engaged else DEFER_SPEND_UNKNOWN
         )
         decisions = tuple(
             DispatchDecision(

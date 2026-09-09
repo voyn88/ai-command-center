@@ -30,6 +30,7 @@ from command_center import task_pipeline
 from command_center.project_config import is_sensitive
 from command_center.dispatch import policy_config
 from command_center.dispatch.models import (
+    DEFER_SPEND_UNKNOWN,
     DispatchPlan,
     DispatchPolicy,
     ExecutorProfile,
@@ -243,7 +244,7 @@ def assign(
     if computed.budget_unknown:
         return {
             "applied": False,
-            "reason": "cost_data_unavailable",
+            "reason": DEFER_SPEND_UNKNOWN,
             "plan": computed.as_dict(),
         }
 

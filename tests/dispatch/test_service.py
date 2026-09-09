@@ -202,7 +202,7 @@ def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
 
     assert plan.budget_unknown is True
     assert plan.assignments == ()
-    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+    assert all(d.reason == models.DEFER_SPEND_UNKNOWN for d in plan.decisions)
     # The measurement itself must read as "unknown", not as a fabricated
     # `0.0` that a caller could mistake for "nothing spent today".
     assert plan.daily_spend_usd is None
@@ -235,7 +235,7 @@ def test_plan_reads_the_spend_through_the_shared_status_helper(monkeypatch, pool
     assert plan.budget_unknown is True
     assert plan.daily_spend_usd is None
     assert plan.assignments == ()
-    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+    assert all(d.reason == models.DEFER_SPEND_UNKNOWN for d in plan.decisions)
 
 
 def test_plan_takes_the_amount_from_a_known_status(monkeypatch, pool):
@@ -272,7 +272,7 @@ def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
     result = service.assign(ROOT, CALLER, confirmed=True)
 
     assert result["applied"] is False
-    assert result["reason"] == "cost_data_unavailable"
+    assert result["reason"] == models.DEFER_SPEND_UNKNOWN
     stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
     assert stored.get("executor") in (None, "")
 
