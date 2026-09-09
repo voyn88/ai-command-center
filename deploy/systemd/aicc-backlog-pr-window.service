@@ -6,4 +6,9 @@ After=postgresql.service
 Type=oneshot
 User=aicc-worker
 EnvironmentFile=-/etc/ai-command-center.env
+# The (repo, PR, head) detail cache `gh_access` writes: systemd creates
+# /var/cache/aicc-gh owned by this unit's User and exports $CACHE_DIRECTORY,
+# which is the only well-known writable location a tick running as
+# aicc-worker has (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+CacheDirectory=aicc-gh
 ExecStart=/usr/bin/python -m command_center.db backlog-pr-window --repo-path /srv/ai-command-center

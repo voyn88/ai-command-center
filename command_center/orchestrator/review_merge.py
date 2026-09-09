@@ -68,6 +68,15 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
 All four are refusal-as-data, driven by oneshot timers, and idempotent: a
 task already reviewed is skipped, a marker already posted is skipped, an
 already-merged PR closes the task once.
+
+Every `gh` call any of them makes goes through `_gh` -> `gh_access.run`,
+which is what gives the control plane its OWN GitHub identity (the
+`voyn-aicc-fleet` App installation token, with its own quota) instead of
+whatever human credential happens to be ambient on control-01, counts the
+call for the tick report's quota line, and lets the hot loops speak REST
+where they used to spend GraphQL points per open pull request. See that
+module for the incident that forced it
+(VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
 """
 
 from __future__ import annotations
@@ -87,7 +96,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from command_center.orchestrator import github_app_auth
+from command_center.orchestrator import gh_access, github_app_auth
 from command_center.orchestrator.routing import cascade_for
 
 __all__ = [
@@ -158,6 +167,10 @@ class LoopReport:
     #: Fresh, bounded identities dispatched to replace succeeded review runs
     #: whose final result cannot be parsed for the current PR head.
     retried: list[tuple[str, str]] = field(default_factory=list)
+    #: What this tick spent at GitHub and under which identity -- see
+    #: `gh_access.GhQuota`. None when the report was built outside a tick
+    #: scope (a unit test constructing one by hand).
+    quota: gh_access.GhQuota | None = None
 
 
 @dataclass
@@ -270,33 +283,13 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
             continue
         branch = _task_branch(row_task_id)
-        listed = _gh(
-            [
-                "pr",
-                "list",
-                "--head",
-                branch,
-                "--state",
-                "open",
-                "--json",
-                "url,headRefName",
-            ],
-            repo_path,
-        )
-        if listed.returncode != 0:
-            report.skipped.append((row_task_id, "pr_list_failed"))
+        decoded, failure = _open_pulls_for_branch(repo_path, branch)
+        if decoded is None:
+            report.skipped.append((row_task_id, failure))
             continue
-        try:
-            decoded = json.loads(listed.stdout or "[]")
-        except ValueError:
-            report.skipped.append((row_task_id, "pr_list_undecodable"))
-            continue
-        if not isinstance(decoded, list):
-            report.skipped.append((row_task_id, "pr_list_wrong_shape"))
-            continue
-        # `--head` is a filter, not a guarantee of exact equality, so the
-        # branch is compared here as well: a prefix match would let a task
-        # adopt its own remediation task's pull request.
+        # The `head=` filter is GitHub's, not this code's, so the branch is
+        # compared here as well rather than trusted: a prefix match would let
+        # a task adopt its own remediation task's pull request.
         matches = [
             entry
             for entry in decoded
@@ -335,11 +328,162 @@ def reconcile_pr_evidence(
     return report
 
 
-def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["gh", *argv], cwd=repo_path, capture_output=True, text=True,
-        check=False, timeout=120,
+def _open_pulls_for_branch(
+    repo_path: str, branch: str
+) -> tuple[list[dict[str, Any]] | None, str]:
+    """Open pull requests whose head is `branch`, as `[{url, headRefName}]`.
+
+    REST (`GET /repos/{owner}/{repo}/pulls?head=owner:branch`) rather than
+    `gh pr list --head` (GraphQL): this runs once per unrecorded task on
+    every review tick, and the review tick is one of the three that stopped
+    dead when the shared human GraphQL quota ran out.
+
+    The `head` filter is `owner:branch`, so only pull requests opened from a
+    branch in THIS repository match -- which is exactly what
+    `reconcile_pr_evidence` may adopt anyway: `publish_run` pushes
+    `backlog/<task id>` to origin, and a fork's branch of the same name is
+    somebody else's work, not this task's evidence.
+
+    Returns `(None, reason)` when the lookup produced no evidence at all, so
+    the caller can report the skip rather than mistake a failed lookup for
+    "this task has no pull request"."""
+    origin = _origin_owner_repo(repo_path)
+    if origin is None:
+        return None, "pr_list_failed: no github origin remote"
+    owner, repo = origin
+    head = urllib.parse.quote(f"{owner}:{branch}", safe="")
+    outcome, decoded = _rest_json(
+        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
     )
+    if outcome == _REST_FAILED:
+        return None, "pr_list_failed"
+    if outcome == _REST_UNDECODABLE:
+        return None, "pr_list_undecodable"
+    if not isinstance(decoded, list):
+        return None, "pr_list_wrong_shape"
+    listed = []
+    for item in decoded:
+        if not isinstance(item, dict):
+            continue
+        listed.append(
+            {
+                "url": str(item.get("html_url") or ""),
+                "headRefName": str((item.get("head") or {}).get("ref") or ""),
+            }
+        )
+    return listed, ""
+
+
+def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
+    """Every `gh` call this module makes, under the control plane's OWN
+    identity and counted for the tick's quota line.
+
+    Until VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS this was a bare
+    `subprocess.run(["gh", ...])`, so every tick spent whatever credential
+    was ambient on control-01 -- one human's OAuth token, whose GraphQL
+    quota that same human's laptop tools also spend. Live 2026-09-09
+    21:15-22:10 UTC that quota was exhausted (`GraphQL: API rate limit
+    already exceeded for user ID 297853521`) and all three ticks failed at
+    once for an hour. `gh_access.run` sends the identical argv under the
+    fleet App's installation token -- its own, separate quota -- whenever
+    the host has one, falls back to the ambient credential when it does
+    not, and counts the call either way."""
+    return gh_access.run(argv, repo_path)
+
+
+#: `origin` in the forms this fleet's checkouts actually carry: HTTPS (what
+#: `/etc/aicc/gitconfig` rewrites SSH remotes to) or the SSH form a
+#: hand-made clone kept.
+_ORIGIN_REMOTE = re.compile(
+    r"^(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
+)
+
+
+def _origin_owner_repo(repo_path: str) -> tuple[str, str] | None:
+    """(owner, repo) of the checkout's `origin`, read from git rather than
+    from GitHub: the REST paths below need the slug, and asking `gh` for it
+    (`gh repo view --json nameWithOwner`) would spend one more GraphQL call
+    per tick on a fact the local clone already knows for free."""
+    try:
+        proc = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = _ORIGIN_REMOTE.match((proc.stdout or "").strip())
+    return (match.group("owner"), match.group("repo")) if match else None
+
+
+#: `_rest_json` outcomes. A refused call and a 200 whose body is not JSON are
+#: kept apart because the operator-facing skip reasons have always told them
+#: apart (`pr_list_failed` vs `pr_list_undecodable`), and the two point at
+#: different problems: a quota/permission wall versus a broken response.
+_REST_OK = "ok"
+_REST_FAILED = "failed"
+_REST_UNDECODABLE = "undecodable"
+
+
+def _rest_json(repo_path: str, path: str) -> tuple[str, Any]:
+    """One REST call through `gh api`, as `(outcome, decoded)`.
+
+    REST, not the GraphQL-backed `gh pr` porcelain, wherever a loop runs
+    once per OPEN PULL REQUEST rather than once per task: REST's budget is
+    5000 plain requests an hour against the installation, while GraphQL's is
+    a node-point budget the full-fat `gh pr list` could exhaust by itself
+    (it already had to be cut down once for the 500,000-node ceiling, and
+    then exhausted the human's hourly points anyway --
+    VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+
+    Either failure means the same thing to a caller that only wanted
+    evidence -- keep what the pull request already had and re-examine next
+    tick -- but they are reported apart so a skip reason can say which."""
+    proc = _gh(["api", path], repo_path)
+    if proc.returncode != 0:
+        return _REST_FAILED, None
+    try:
+        return _REST_OK, json.loads(proc.stdout or "null")
+    except ValueError:
+        return _REST_UNDECODABLE, None
+
+
+def _rest_pages(
+    repo_path: str,
+    path: str,
+    *,
+    per_page: int = 100,
+    max_pages: int = 5,
+    extract: Any = None,
+) -> tuple[bool, list[Any]]:
+    """Every item of a paginated REST collection, oldest page first.
+
+    `gh api --paginate` would fetch every page unconditionally; this stops
+    at the first short page (the common case: one call) and never spends
+    more than `max_pages`, so one pathological pull request cannot consume a
+    tick's whole budget. `extract` pulls the list out of an envelope
+    response (`check-runs` wraps its items in `check_runs`)."""
+    joiner = "&" if "?" in path else "?"
+    items: list[Any] = []
+    for page in range(1, max_pages + 1):
+        outcome, decoded = _rest_json(
+            repo_path, f"{path}{joiner}per_page={per_page}&page={page}"
+        )
+        if outcome != _REST_OK:
+            return False, items
+        batch = extract(decoded) if extract is not None else decoded
+        if not isinstance(batch, list):
+            return False, items
+        items.extend(batch)
+        if len(batch) < per_page:
+            break
+    return True, items
 
 
 def _acceptance_app_credentials() -> github_app_auth.GitHubAppCredentials | None:
@@ -1136,6 +1280,24 @@ def _scan_commit(
 
 
 def review_once(
+    factory: Any,
+    enqueue: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
+) -> LoopReport:
+    """One review tick, scoped to one GitHub identity and one quota counter
+    (`gh_access.tick`): every `gh` call below is counted and the totals --
+    plus the identity's remaining budget -- come back on the report. See
+    `_review_once` for what the tick actually does."""
+    with gh_access.tick(repo_path) as quota:
+        report = _review_once(factory, enqueue, repo_path, cfg, task_id=task_id)
+        report.quota = quota
+    return report
+
+
+def _review_once(
     factory: Any,
     enqueue: Any,
     repo_path: str,
@@ -2919,6 +3081,30 @@ def _carry_over_marker_if_patch_id_stable(
 
 
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
+    """One merge tick, scoped to one GitHub identity and one quota counter
+    (`gh_access.tick`) exactly as `review_once` is; `_merge_once` is the
+    tick itself.
+
+    Deliberately NOT served from the PR-detail cache the window tick uses:
+    merging is irreversible and decided on an ACCEPT marker plus a green
+    rollup, and both are read fresh here every time.
+
+    Equally deliberately still on `gh pr view` (GraphQL) rather than the REST
+    endpoints the window loop moved to. The window loop touches every OPEN
+    PULL REQUEST on every tick, which is what made it worth four REST calls
+    per PR; this loop is bounded by READY_TO_REVIEW *tasks* (`scan_cap`), and
+    one `pr view` answers state, reviews, rollup and `mergeStateStatus`
+    together -- rewriting it in REST would cost MORE requests for the same
+    decision. What it needed was a quota nobody else spends, and that is what
+    the fleet App's identity gives it
+    (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS)."""
+    with gh_access.tick(repo_path) as quota:
+        report = _merge_once(factory, repo_path, cfg)
+        report.quota = quota
+    return report
+
+
+def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
     as evidence, only once GitHub reports the PR actually MERGED (see
@@ -3202,27 +3388,29 @@ class PrWindowConfig:
     #: scan_cap`/`max_active_reviews`) are never handed a larger live set
     #: than they can examine.
     max_active: int = 5
-    #: How many open PRs `gh pr list` is asked for. Requested in ascending-
-    #: created order (see `reconcile_pr_window`), so a repo with more open
-    #: PRs than this limit still keeps the OLDEST ones in view -- the ones
-    #: FIFO fairness cares about -- instead of truncating them out before
-    #: they are ever sorted. (VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM-REM:
-    #: `gh pr list` with no explicit sort returns newest-created-first, so a
-    #: plain `--limit` truncated the oldest, un-reviewed backlog out of
-    #: consideration entirely on any repo busier than this number.)
+    #: Page size for the open-PR listing, requested in ascending-created
+    #: order (see `reconcile_pr_window`), so a repo with more open PRs than
+    #: one page still keeps the OLDEST ones in view -- the ones FIFO
+    #: fairness cares about -- instead of truncating them out before they
+    #: are ever sorted. (VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM-REM: `gh pr
+    #: list` with no explicit sort returned newest-created-first, so a plain
+    #: `--limit` truncated the oldest, un-reviewed backlog out of
+    #: consideration entirely on any repo busier than that number.)
     #: Every open PR must be seen, or the ones beyond the scan never get a
-    #: label at all (67 unlabelled PRs on 2026-09-07 at 180+ open). The
-    #: listing is light (no reviews/checks/commits per PR), so a large limit
-    #: is cheap; details are fetched lazily for candidates only.
-    scan_limit: int = 300
-    #: The listing is exhaustive, not bounded: `scan_limit` is the first page
-    #: size, and a page that comes back full is retried at twice the size
-    #: until a page comes back short (review of d16dc0e4: a fixed 300 still
-    #: silently omitted PR 301+). This is the ceiling past which the tick
-    #: refuses to pretend it saw everything and reports `pr_list_truncated`.
+    #: label at all (67 unlabelled PRs on 2026-09-07 at 180+ open). Clamped
+    #: to GitHub's REST maximum of 100 per page; the listing is light (no
+    #: reviews/checks/commits per PR) and details are fetched lazily for
+    #: candidates only.
+    scan_limit: int = 100
+    #: The listing is exhaustive, not bounded: pages are read until one
+    #: comes back short (review of d16dc0e4: a fixed 300 silently omitted PR
+    #: 301+). This is the ceiling past which the tick refuses to pretend it
+    #: saw everything and reports `pr_list_truncated`.
     scan_hard_cap: int = 5000
-    #: How many per-PR detail lookups (`gh pr view` with reviews, checks,
-    #: commits) one tick may spend, candidates included. The block reasons
+    #: How many per-PR detail FETCHES (reviews + check rollup + head commit
+    #: date, over REST) one tick may spend, candidates included. A PR served
+    #: from the (repo, PR, head) cache costs no call and therefore no
+    #: budget. The block reasons
     #: (`_window_block_reason`: reject marker, missing/red checks, stale
     #: head) need those details, so PRs beyond the window are still
     #: examined while budget remains -- oldest first -- and a PR the budget
@@ -3258,9 +3446,9 @@ class PrWindowReport:
     #: (number, headRefOid) beyond the window that the detail budget did not
     #: reach this tick; their existing window label was left untouched.
     unchecked: list[tuple[int, str]] = field(default_factory=list)
-    #: (number, headRefOid) whose detail lookup (`gh pr view`) failed this
-    #: tick; their existing window label was left untouched -- a transient
-    #: GitHub error is no evidence about eligibility (review of d16dc0e4).
+    #: (number, headRefOid) whose detail lookup failed this tick; their
+    #: existing window label was left untouched -- a transient GitHub error
+    #: is no evidence about eligibility (review of d16dc0e4).
     unreadable: list[tuple[int, str]] = field(default_factory=list)
     #: Set when the listing itself failed: nothing was labelled this tick,
     #: and the caller must say so loudly rather than print an empty report
@@ -3268,6 +3456,9 @@ class PrWindowReport:
     #: 500,000 GraphQL node limit at 50 PRs and the tick silently did nothing
     #: for days -- VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE).
     error: str | None = None
+    #: What this tick spent at GitHub and under which identity -- see
+    #: `gh_access.GhQuota`.
+    quota: gh_access.GhQuota | None = None
 
 
 def _independent_latest_reject_marker(
@@ -3428,22 +3619,36 @@ def _set_pr_window_labels(
 ) -> bool:
     """Delta-only label write: only the window labels this reconciler owns
     are ever touched, and only when the current set differs from the single
-    desired one -- a PR already correctly labelled costs zero `gh` calls."""
+    desired one -- a PR already correctly labelled costs zero `gh` calls.
+
+    Written through the REST labels endpoints rather than `gh pr edit`
+    (GraphQL) so that the whole window tick -- listing, details and writes --
+    runs on the REST budget: a tick that can read every PR but cannot label
+    one is no more use to an operator than a tick that failed outright
+    (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS)."""
     parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
     if parsed is None:
         return False
-    _owner, _repo, number = parsed
+    owner, repo, number = parsed
     window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked}
     current = _pr_window_labels(pr) & window_labels
     if current == {desired}:
         return True
-    argv = ["pr", "edit", number]
-    for name in current - {desired}:
-        argv += ["--remove-label", name]
+    issues = f"repos/{owner}/{repo}/issues/{number}/labels"
+    ok = True
+    for name in sorted(current - {desired}):
+        removed = _gh(
+            ["api", "--method", "DELETE", f"{issues}/{urllib.parse.quote(name)}"],
+            repo_path,
+        )
+        ok = ok and removed.returncode == 0
     if desired not in current:
-        argv += ["--add-label", desired]
-    result = _gh(argv, repo_path)
-    return result.returncode == 0
+        added = _gh(
+            ["api", "--method", "POST", issues, "-f", f"labels[]={desired}"],
+            repo_path,
+        )
+        ok = ok and added.returncode == 0
+    return ok
 
 
 def reconcile_pr_window(
@@ -3471,52 +3676,26 @@ def reconcile_pr_window(
     active PR out and back in on no real change, restarting its review
     cycle for nothing."""
     report = PrWindowReport()
-    # Light listing only: reviews, checks and commits multiply the GraphQL
-    # node budget per PR and the full-field request died at 50 PRs
-    # ("requests up to 520,100 possible nodes which exceeds the maximum
-    # limit of 500,000"). Details are fetched per candidate below, and only
-    # until the window is full: a PR far down the queue cannot be selected
-    # this tick, so evaluating it would be wasted API budget.
-    # Exhaustive: page size doubles while a page comes back full, so every
-    # open PR is seen or the tick says loudly that it was not (`pr_list_
-    # truncated`); a bounded `--limit` silently dropped PR N+1 onward
-    # (review of d16dc0e4). `gh pr list` pages the GraphQL cursor itself.
-    limit = max(cfg.scan_limit, 1)
-    while True:
-        listed = _gh(
-            [
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--search",
-                "sort:created-asc",
-                "--limit",
-                str(limit),
-                "--json",
-                "number,url,headRefOid,createdAt,author,labels",
-            ],
-            repo_path,
-        )
-        if listed.returncode != 0:
-            report.error = f"pr_list_failed: {(listed.stderr or '').strip()[:200]}"
-            return report
-        try:
-            prs = json.loads(listed.stdout or "[]")
-        except ValueError:
-            report.error = "pr_list_unparseable"
-            return report
-        if not isinstance(prs, list):
-            report.error = "pr_list_unparseable"
-            return report
-        if len(prs) < limit:
-            break
-        if limit >= max(cfg.scan_hard_cap, 1):
-            report.error = f"pr_list_truncated: {limit} open PRs listed and the page was full"
-            return report
-        limit = min(limit * 2, max(cfg.scan_hard_cap, 1))
+    with gh_access.tick(repo_path) as quota:
+        report.quota = quota
+        cache = gh_access.detail_cache()
+        _reconcile_pr_window(repo_path, cfg, report, cache)
+    return report
+
+
+def _reconcile_pr_window(
+    repo_path: str,
+    cfg: PrWindowConfig,
+    report: PrWindowReport,
+    cache: gh_access.PrDetailCache,
+) -> None:
+    """The body of `reconcile_pr_window`, inside the tick's quota scope."""
+    prs, failure = _list_open_pulls(repo_path, cfg)
+    if prs is None:
+        report.error = failure
+        return
     now = time.time()
-    listed_prs = [pr for pr in prs if isinstance(pr, dict)]
+    listed_prs = list(prs)
     listed_prs.sort(
         key=lambda pr: (str(pr.get("createdAt") or ""), int(pr.get("number") or 0))
     )
@@ -3531,7 +3710,11 @@ def reconcile_pr_window(
         number = int(pr.get("number") or 0)
         head = str(pr.get("headRefOid") or "")
         window_full = selected >= cfg.max_active
-        if details_used >= max(cfg.detail_budget, 0):
+        # A cache hit costs no API call, so it costs no detail budget
+        # either: the budget exists to bound this tick's GitHub traffic, and
+        # a PR whose head has not moved since the last tick generates none.
+        detailed = _pr_window_details(repo_path, pr, cache, fetch=False)
+        if detailed is None and details_used >= max(cfg.detail_budget, 0):
             # Out of detail budget: no evidence either way this tick, so no
             # label write at all -- whatever the PR carried (active, waiting,
             # blocked, nothing) stays. Writing `waiting` here demoted an
@@ -3539,10 +3722,11 @@ def reconcile_pr_window(
             # the budget (review of 5dec6322). Re-examined on a later tick.
             report.unchecked.append((number, head))
             continue
-        details_used += 1
-        detailed = _pr_window_details(repo_path, pr)
         if detailed is None:
-            # Unknown is not evidence: a failed `gh pr view` says nothing
+            details_used += 1
+            detailed = _pr_window_details(repo_path, pr, cache)
+        if detailed is None:
+            # Unknown is not evidence: a failed detail lookup says nothing
             # about eligibility, so the PR's existing label (active,
             # blocked, waiting or none) stays exactly as it was and the PR is
             # reported unreadable for this tick (review of d16dc0e4: stamping
@@ -3566,31 +3750,235 @@ def reconcile_pr_window(
         report.active.append((number, head))
         _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
 
-    return report
+
+#: One REST page of pull requests. GitHub's ceiling for `per_page`, so a
+#: `scan_limit` above it is clamped rather than silently ignored.
+_REST_PAGE_MAX = 100
 
 
-_PR_WINDOW_DETAIL_FIELDS = "reviews,statusCheckRollup,commits"
+def _light_pr_from_rest(item: Any) -> dict[str, Any] | None:
+    """One REST pull request in the shape the window rules already speak
+    (`headRefOid`, `createdAt`, `author.login`, `labels[].name`) -- the same
+    keys `gh pr list --json` produced, so only the transport changed here,
+    not a single eligibility rule."""
+    if not isinstance(item, dict) or not isinstance(item.get("number"), int):
+        return None
+    return {
+        "number": item["number"],
+        "url": str(item.get("html_url") or ""),
+        "headRefOid": str((item.get("head") or {}).get("sha") or ""),
+        "createdAt": str(item.get("created_at") or ""),
+        "author": {"login": (item.get("user") or {}).get("login")},
+        "labels": [
+            {"name": str(label.get("name") or "")}
+            for label in (item.get("labels") or [])
+            if isinstance(label, dict)
+        ],
+    }
 
 
-def _pr_window_details(repo_path: str, pr: dict[str, Any]) -> dict[str, Any] | None:
+def _list_open_pulls(
+    repo_path: str, cfg: PrWindowConfig
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Every open pull request, oldest-created first, over REST.
+
+    Was `gh pr list --search sort:created-asc --json ...`: GraphQL, and the
+    single heaviest repeating call the control plane made -- once per tick
+    over every open PR, on the quota of whichever human's token happened to
+    be ambient (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS). The REST
+    listing costs one plain request per 100 PRs from the fleet App's own
+    budget and cannot blow a node limit at all, so the field trimming that
+    the GraphQL version needed (no reviews/checks/commits) is no longer a
+    workaround, just the right amount of data: details are fetched per
+    candidate below, and only while the detail budget lasts.
+
+    Exhaustive, as before: pages are read until one comes back short, so
+    every open PR is seen or the tick says loudly that it was not
+    (`pr_list_truncated`) rather than silently dropping PR N+1 onward
+    (review of d16dc0e4). Ascending creation order is requested from GitHub
+    for the same reason it was before -- with a cap in play, the PRs that
+    must survive truncation are the oldest ones (see the docstring of
+    `reconcile_pr_window`)."""
+    origin = _origin_owner_repo(repo_path)
+    if origin is None:
+        return None, "pr_list_failed: no github origin remote"
+    owner, repo = origin
+    per_page = min(max(cfg.scan_limit, 1), _REST_PAGE_MAX)
+    hard_cap = max(cfg.scan_hard_cap, 1)
+    listed: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        outcome, decoded = _rest_json(
+            repo_path,
+            f"repos/{owner}/{repo}/pulls?state=open&sort=created&direction=asc"
+            f"&per_page={per_page}&page={page}",
+        )
+        if outcome == _REST_FAILED:
+            return None, "pr_list_failed"
+        if outcome != _REST_OK or not isinstance(decoded, list):
+            return None, "pr_list_unparseable"
+        listed.extend(
+            pr for pr in map(_light_pr_from_rest, decoded) if pr is not None
+        )
+        if len(decoded) < per_page:
+            return listed, None
+        if len(listed) >= hard_cap:
+            return None, (
+                f"pr_list_truncated: {len(listed)} open PRs listed "
+                "and the page was full"
+            )
+        page += 1
+
+
+def _rest_check_rollup(
+    repo_path: str, owner: str, repo: str, head: str
+) -> list[dict[str, Any]] | None:
+    """The head's checks in `statusCheckRollup` shape, from the two REST
+    endpoints GraphQL merged into one field.
+
+    Both are read, not just check-runs: GitHub's rollup mixes CheckRuns with
+    legacy StatusContexts, `_check_is_green` already handles both shapes,
+    and dropping the legacy half would silently stop seeing a red commit
+    status. Values are upper-cased because every rule in this module (and
+    `_check_is_green` in particular) was written against GraphQL's
+    SCREAMING_CASE enums; REST spells the identical states in lower case."""
+    ok, runs = _rest_pages(
+        repo_path,
+        f"repos/{owner}/{repo}/commits/{head}/check-runs",
+        max_pages=3,
+        extract=lambda body: (body or {}).get("check_runs")
+        if isinstance(body, dict)
+        else None,
+    )
+    if not ok:
+        return None
+    rollup: list[dict[str, Any]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        conclusion = run.get("conclusion")
+        rollup.append(
+            {
+                "name": str(run.get("name") or "?"),
+                "status": str(run.get("status") or "").upper(),
+                "conclusion": str(conclusion).upper() if conclusion else None,
+                "startedAt": run.get("started_at"),
+                "completedAt": run.get("completed_at"),
+                "detailsUrl": run.get("details_url") or run.get("html_url"),
+            }
+        )
+    outcome, statuses = _rest_json(
+        repo_path, f"repos/{owner}/{repo}/commits/{head}/status?per_page=100"
+    )
+    if outcome != _REST_OK or not isinstance(statuses, dict):
+        return None
+    for status in statuses.get("statuses") or []:
+        if not isinstance(status, dict):
+            continue
+        rollup.append(
+            {
+                "name": str(status.get("context") or "?"),
+                "state": str(status.get("state") or "").upper(),
+                "startedAt": status.get("created_at"),
+                "completedAt": status.get("updated_at"),
+                "detailsUrl": status.get("target_url"),
+            }
+        )
+    return rollup
+
+
+def _rest_reviews(
+    repo_path: str, owner: str, repo: str, number: int
+) -> list[dict[str, Any]] | None:
+    """The PR's reviews in `gh pr view --json reviews` shape. The marker
+    rules select the latest LIVE review by `submittedAt` and compare
+    `author.login`, so those are the two fields that must survive the
+    translation intact."""
+    ok, reviews = _rest_pages(
+        repo_path, f"repos/{owner}/{repo}/pulls/{number}/reviews", max_pages=5
+    )
+    if not ok:
+        return None
+    translated: list[dict[str, Any]] = []
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        translated.append(
+            {
+                "state": str(review.get("state") or "").upper(),
+                "submittedAt": review.get("submitted_at"),
+                "body": review.get("body") or "",
+                "author": {"login": (review.get("user") or {}).get("login")},
+            }
+        )
+    return translated
+
+
+def _pr_window_details(
+    repo_path: str,
+    pr: dict[str, Any],
+    cache: gh_access.PrDetailCache | None = None,
+    *,
+    fetch: bool = True,
+) -> dict[str, Any] | None:
     """The per-PR fields the eligibility rules need (reviews, check rollup,
-    commits), fetched with one `gh pr view` -- unless the listing already
-    carried them (tests and any future richer listing). None when the
-    lookup fails, which the caller treats as not-eligible-this-tick."""
+    head commit date), over REST and cached by (repo, PR, head sha).
+
+    Was one `gh pr view --json reviews,statusCheckRollup,commits` -- GraphQL,
+    per open PR, per five-minute tick. The cache is what makes the REST
+    version cheaper rather than merely different: the head sha is part of
+    the KEY, so a push invalidates the entry immediately and the only
+    staleness ever served is a review or a check that landed on an unchanged
+    head within the TTL. Labelling is the one thing this reconciler does,
+    and a label that trails a check flip by one tick is not a gate: the
+    merge tick reads reviews and checks fresh, never from here.
+
+    None when the lookup fails, which the caller treats as
+    not-eligible-this-tick and leaves the PR's existing label alone."""
     if all(key in pr for key in ("reviews", "statusCheckRollup", "commits")):
         return pr
     number = int(pr.get("number") or 0)
-    view = _gh(
-        ["pr", "view", str(number), "--json", _PR_WINDOW_DETAIL_FIELDS], repo_path
-    )
-    if view.returncode != 0:
+    head = str(pr.get("headRefOid") or "")
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    if parsed is not None:
+        owner, repo = parsed[0], parsed[1]
+    else:
+        origin = _origin_owner_repo(repo_path)
+        if origin is None:
+            return None
+        owner, repo = origin
+    slug = f"{owner}/{repo}"
+    quota = gh_access.current_quota()
+    if cache is not None and head:
+        cached = cache.get(slug, number, head)
+        if cached is not None:
+            if quota is not None:
+                quota.cache_hits += 1
+            merged = dict(pr)
+            merged.update(cached)
+            return merged
+    if not fetch:
+        # Cache-only probe: the caller is deciding whether this PR costs any
+        # API budget at all, so it must never spend one to find out.
         return None
-    try:
-        details = json.loads(view.stdout or "{}")
-    except ValueError:
+    if cache is not None and head and quota is not None:
+        quota.cache_misses += 1
+    reviews = _rest_reviews(repo_path, owner, repo, number)
+    if reviews is None:
         return None
-    if not isinstance(details, dict):
+    rollup = _rest_check_rollup(repo_path, owner, repo, head) if head else []
+    if rollup is None:
         return None
+    details: dict[str, Any] = {"reviews": reviews, "statusCheckRollup": rollup}
+    # The head commit's own date comes from the same REST family and lands in
+    # the cached payload, so `_pr_age_seconds` reads it for free on a cache
+    # hit instead of repeating the lookup (or falling back to `createdAt`,
+    # which measures from PR open rather than from the last push).
+    committed = _head_commit_committed_date(repo_path, pr) if head else None
+    if committed:
+        details["commits"] = [{"oid": head, "committedDate": committed}]
+    if cache is not None and head:
+        cache.put(slug, number, head, details)
     merged = dict(pr)
     merged.update(details)
     return merged
