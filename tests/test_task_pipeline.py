@@ -1339,3 +1339,40 @@ def test_the_dispatcher_passes_the_configured_timeout(tmp_path, git_repo, api, m
         PipelineSettings(enabled=True, auto_launch=True, run_timeout_seconds=3600),
     )
     assert seen["timeout_seconds"] == 3600
+
+
+def test_an_unreadable_spend_blocks_launches_loudly_rather_than_silently(
+    tmp_path, api, monkeypatch, caplog
+):
+    """`tick` fails closed when the trailing-24h spend cannot be read — no cost
+    data, no new launches — and that refusal must be *legible*.
+
+    `_record` only puts a one-line summary into this tick's `errors`, which
+    reaches a human solely through an open Live Execution Center page, and
+    `start_background_sync`'s daemon discards the whole `PipelineTickResult`.
+    So on a headless host the record went nowhere: every launch stopped for as
+    long as the fault lasted with no error and no log line anywhere. That is
+    the mirror image of the silently zeroed spend cap this task exists to
+    close, and `dispatch.service.plan` already logs its own fail-closed
+    lookup for exactly this reason. The traceback is part of the contract:
+    "why did nothing launch today?" is answerable only from the underlying
+    exception."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(enabled=True, auto_launch=True, max_daily_spend_usd=1.0),
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("runtime.db is unreadable")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _boom)
+
+    with caplog.at_level("WARNING"):
+        result = task_pipeline.tick(tmp_path, api, {}, advance_wait_seconds=1)
+
+    assert result.launch_status == task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+    assert any(e.startswith("daily_spend_budget:") for e in result.errors)
+    assert "daily_spend_usd failed" in caplog.text
+    # The cause, not just the symptom.
+    assert "runtime.db is unreadable" in caplog.text
+    assert "Traceback" in caplog.text

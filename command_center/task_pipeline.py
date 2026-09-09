@@ -2234,6 +2234,24 @@ def _locked_tick(
                 daily_spend_usd(api.db_path) >= settings.max_daily_spend_usd
             )
         except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
+            # Recorded *and* logged. `_record` only appends a one-line summary
+            # to this tick's `errors`, which reaches a human solely through an
+            # open Live Execution Center page; `start_background_sync`'s daemon
+            # throws the whole `PipelineTickResult` away, so on a headless host
+            # the record goes nowhere. Without this line an unreadable spend
+            # figure stops every launch for as long as the fault lasts with no
+            # error and no log line anywhere — the mirror image of the silently
+            # zeroed cap this task exists to close, and the same reason
+            # `dispatch.service.plan` logs its own fail-closed lookup. WARNING
+            # with the traceback, because "why did nothing launch today?" is
+            # answerable only from the underlying exception.
+            _LOG.warning(
+                "task_pipeline.tick: daily_spend_usd failed, failing closed at "
+                "the configured ceiling (%.2f) — new launches are blocked until "
+                "cost data is readable again",
+                settings.max_daily_spend_usd,
+                exc_info=True,
+            )
             _record(exc, "daily_spend_budget")
             spend_budget_exhausted = True
     if settings.auto_launch_active and not spend_budget_exhausted:
