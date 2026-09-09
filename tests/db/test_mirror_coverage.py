@@ -153,6 +153,26 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
     ),
+    "tick_skip_event": Exclusion(
+        reason=(
+            "PostgreSQL-native from birth (migration 0018): the ledger the "
+            "review/merge ticks write their own structured skip reasons to, "
+            "so the tick-stall watchdog reads a table instead of parsing "
+            "journald. No SQLite authority ever held a skip reason -- it was "
+            "a print() line before this migration -- so there is no source "
+            "for a mirror to dual-write from."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
+    "tick_stall_escalation": Exclusion(
+        reason=(
+            "PostgreSQL-native from birth (migration 0018): one row per "
+            "escalated stall episode, written by the watchdog in the same "
+            "transaction as the OPEN backlog task it creates. No SQLite "
+            "authority preceded it, so there is nothing for a mirror to copy."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
     "queue_entry": Exclusion(
         reason=(
             "Mirrored under a contract of its own rather than the shared one: the "

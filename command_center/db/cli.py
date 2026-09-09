@@ -168,6 +168,22 @@ def build_parser() -> argparse.ArgumentParser:
         "Only ever relabels -- never merges, approves, or weakens a gate. "
         "Needs --repo-path.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    tick_stall_watchdog = sub.add_parser(
+        "tick-stall-watchdog",
+        help="One watchdog tick (VOYN-W0-AICC-TICK-STALL-WATCHDOG): read "
+        "tick_skip_event for a (task_id, reason) pair skipped on the last "
+        "N consecutive backlog-review/backlog-merge ticks and open one "
+        "OPEN/P1 backlog task per stall episode (voyn-aicc-tick-stall-"
+        "watchdog.timer). Idempotent per episode; never mutates the "
+        "stalled task.",
+    )
+    tick_stall_watchdog.add_argument(
+        "--consecutive-threshold",
+        type=int,
+        default=5,
+        help="Consecutive ticks with the same skip reason that count as a "
+        "stall (default 5).",
+    )
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -529,14 +545,24 @@ def main(argv: list[str] | None = None) -> int:
 
                 from command_center.db.work_queue_store import WorkQueueStore
                 from command_center.orchestrator.review_merge import (
+                    next_tick_seq,
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    record_tick_skips,
                     review_once,
                 )
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
+                # One shared ordinal for every skip this tick records --
+                # `review_once`/`reconcile_review_once`/
+                # `publish_review_verdicts` all run inside this one CLI
+                # invocation and must collapse into ONE tick for the stall
+                # watchdog's "N consecutive ticks", not up to three
+                # (VOYN-W0-AICC-TICK-STALL-WATCHDOG).
+                tick_seq = next_tick_seq(lambda: _nc(conn))
+                all_skipped: list[tuple[str, str]] = []
                 # Before selecting anything: a task whose PR exists but was
                 # never recorded is invisible to every gate downstream. This
                 # derives that evidence from the task's own branch, so a pull
@@ -548,6 +574,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"PR-FOUND  {evidence_task_id} -> {pr}")
                 for evidence_task_id, reason in evidence.skipped:
                     print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                all_skipped.extend(evidence.skipped)
                 report = review_once(
                     lambda: _nc(conn),
                     enqueue,
@@ -558,6 +585,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REVIEW    {task_id} -> {pr}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                all_skipped.extend(report.skipped)
                 retry_report = reconcile_review_once(
                     lambda: _nc(conn),
                     enqueue,
@@ -568,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"RETRY     {task_id} -> {retry_key}")
                 for task_id, reason in retry_report.skipped:
                     print(f"RETRY-SKIP {task_id}: {reason}")
+                all_skipped.extend(retry_report.skipped)
                 marker_report = publish_review_verdicts(
                     lambda: _nc(conn), args.repo_path, task_id=args.task_id,
                     # The same queue writer review_once uses: a REJECT
@@ -581,18 +610,26 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REMEDIATE {task_id} -> {new_task_id}")
                 for task_id, reason in marker_report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                all_skipped.extend(marker_report.skipped)
+                record_tick_skips(lambda: _nc(conn), tick_seq, "backlog-review", all_skipped)
                 return 0
 
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
 
-                from command_center.orchestrator.review_merge import merge_once
+                from command_center.orchestrator.review_merge import (
+                    merge_once,
+                    next_tick_seq,
+                    record_tick_skips,
+                )
 
+                tick_seq = next_tick_seq(lambda: _nc(conn))
                 report = merge_once(lambda: _nc(conn), args.repo_path)
                 for task_id, head in report.merged:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                record_tick_skips(lambda: _nc(conn), tick_seq, "backlog-merge", report.skipped)
                 return 0
 
             if args.command == "backlog-merge-reconcile":
@@ -635,6 +672,25 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
                 for number, head in report.unreadable:
                     print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
+                return 0
+
+            if args.command == "tick-stall-watchdog":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.tick_stall_watchdog import (
+                    WatchdogConfig,
+                    detect_and_escalate,
+                )
+
+                cfg = WatchdogConfig(consecutive_threshold=args.consecutive_threshold)
+                report = detect_and_escalate(lambda: _nc(conn), cfg)
+                for task_id, reason, count, escalation_task_id in report.escalated:
+                    print(
+                        f"ESCALATED {task_id}: {reason} x{count} -> "
+                        f"{escalation_task_id}"
+                    )
+                for task_id, reason, count in report.already_escalated:
+                    print(f"KNOWN     {task_id}: {reason} x{count}")
                 return 0
 
             if args.command == "downgrade":
