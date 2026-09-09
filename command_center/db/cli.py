@@ -40,6 +40,21 @@ def _default_queue_path() -> Path:
     return execution_queue.queue_file_path(runtime_core.ROOT)
 
 
+def _default_runs_jsonl_path() -> Path:
+    """`data/runs.jsonl` -- the v1.2 run journal, the JSONL leg of the cutover.
+
+    Resolved the same way `agent_runner` resolves it (`storage.resolve_data_dir`,
+    so `AICC_DATA_DIR` redirects both together) rather than read off
+    `agent_runner.RUNS_FILE`: that constant is bound at import time, and
+    importing `agent_runner` here would pull the whole runner into an admin CLI
+    that otherwise touches nothing but the database.
+    """
+    from command_center import storage
+    from command_center.runtime.db import core as runtime_core
+
+    return storage.resolve_data_dir(runtime_core.ROOT) / "runs.jsonl"
+
+
 def _default_legacy_migration_dir(leaf: str) -> Path:
     from command_center import storage
     from command_center.runtime.db import core as runtime_core
@@ -267,6 +282,19 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument(
         "--report-dir", default=None, help="Directory for the migration and reconciliation reports."
     )
+    migrate.add_argument(
+        "--runs-path",
+        default=None,
+        help="Legacy v1.2 data/runs.jsonl (default: the configured data dir's runs.jsonl).",
+    )
+    migrate.add_argument(
+        "--drain-legacy-runs",
+        action="store_true",
+        help="Before snapshotting, drain any v1.2 runs.jsonl records that have no v2 "
+        "session yet into the SQLite store (the existing, idempotent import_legacy_runs). "
+        "Without this, undrained records are reported as legacy_runs_jsonl differences and "
+        "the cutover is refused rather than silently stranding them.",
+    )
 
     reconcile_p = sub.add_parser(
         "legacy-reconcile",
@@ -276,6 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile_p.add_argument("--sqlite-path", default=None)
     reconcile_p.add_argument("--queue-path", default=None)
+    reconcile_p.add_argument("--runs-path", default=None)
     reconcile_p.add_argument("--snapshot-dir", default=None)
     reconcile_p.add_argument("--report-dir", default=None)
 
@@ -287,6 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lock_p.add_argument("--sqlite-path", default=None)
     lock_p.add_argument("--queue-path", default=None)
+    lock_p.add_argument("--runs-path", default=None)
     lock_p.add_argument(
         "--report", required=True, help="Reconciliation report written by legacy-migrate/legacy-reconcile."
     )
@@ -297,6 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unlock_p.add_argument("--sqlite-path", default=None)
     unlock_p.add_argument("--queue-path", default=None)
+    unlock_p.add_argument("--runs-path", default=None)
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
@@ -347,6 +378,45 @@ def main(argv: list[str] | None = None) -> int:
         # A refusal or rollback exits non-zero so systemd surfaces the
         # failed tick to the operator; noop/deployed is success.
         return 0 if deploy_report.outcome in ("noop", "deployed") else 1
+
+    if args.command in ("legacy-lock", "legacy-unlock"):
+        # Deliberately BEFORE any database configuration or pool, for the same
+        # reason `self-deploy` is: both are pure filesystem operations on the
+        # legacy sources, and `legacy-unlock` is the ROLLBACK. Requiring a
+        # reachable PostgreSQL to undo a cutover would gate the recovery on the
+        # thing an operator is most likely rolling back *because* it is broken.
+        # The reconciliation `legacy-lock` gates on was already computed against
+        # the database and written to a file; re-reading that file needs nothing
+        # live.
+        from command_center.db import legacy_migration as lm
+
+        sqlite_path = Path(args.sqlite_path) if args.sqlite_path else _default_sqlite_path()
+        queue_path = Path(args.queue_path) if args.queue_path else _default_queue_path()
+        runs_path = Path(args.runs_path) if args.runs_path else _default_runs_jsonl_path()
+        # runs.jsonl only if it exists -- an install that never ran v1.2 has
+        # none, and `lock_legacy_sources` would refuse a path the report
+        # legitimately does not cover.
+        targets = [sqlite_path, queue_path]
+        if runs_path.exists():
+            targets.append(runs_path)
+
+        if args.command == "legacy-unlock":
+            for path in lm.unlock_legacy_sources(targets):
+                print(f"unlocked: {path}")
+            return 0
+
+        try:
+            locked = lm.lock_legacy_sources(
+                targets, reconciliation=lm.read_reconciliation_report(Path(args.report))
+            )
+        except ValueError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        for path in locked:
+            print(f"locked: {path}")
+        if not locked:
+            print("nothing to lock; every legacy source was already read-only")
+        return 0
 
     try:
         config = load_config()
@@ -470,8 +540,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "backlog-import":
-                from pathlib import Path
-
                 from command_center.db.backlog_parser import parse_backlog
                 from command_center.db.backlog_store import BacklogStore
 
@@ -506,8 +574,6 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "backlog-export":
-                from pathlib import Path as _Path
-
                 from command_center import projection_writer
                 from command_center.db import backlog_export
 
@@ -517,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
                 # projection, and durable-write calls must stay out of this
                 # frozen-category module (AIOS boundary gate).
                 projection_writer.write_atomically(
-                    _Path(args.output), backlog_export.render_projection(rows)
+                    Path(args.output), backlog_export.render_projection(rows)
                 )
                 print(f"rendered {len(rows)} records -> {args.output}")
                 return 0
@@ -656,15 +722,40 @@ def main(argv: list[str] | None = None) -> int:
 
                 sqlite_path = Path(args.sqlite_path) if args.sqlite_path else _default_sqlite_path()
                 queue_path = Path(args.queue_path) if args.queue_path else _default_queue_path()
+                runs_path = Path(args.runs_path) if args.runs_path else _default_runs_jsonl_path()
                 snapshot_dir = (
                     Path(args.snapshot_dir) if args.snapshot_dir else _default_legacy_migration_dir("snapshots")
                 )
                 report_dir = Path(args.report_dir) if args.report_dir else _default_legacy_migration_dir("reports")
                 factory = lambda: nullcontext(conn)  # noqa: E731
 
+                # Before the snapshot, never after: draining writes v2 rows into
+                # the SQLite store, and a snapshot taken first would not contain
+                # them. Idempotent, so a re-run after a fixed finding drains only
+                # what is still outstanding.
+                if getattr(args, "drain_legacy_runs", False):
+                    from command_center import storage
+                    from command_center.runtime import legacy_import
+
+                    legacy_records = storage.read_jsonl(runs_path)
+                    drained = legacy_import.import_legacy_runs(
+                        sqlite_path,
+                        legacy_runs=sorted(
+                            storage.fold_latest_by_id(legacy_records).values(),
+                            key=lambda run: run.get("created_at") or "",
+                            reverse=True,
+                        ),
+                    )
+                    print(f"drained {len(drained)} v1.2 run(s) from {runs_path} into {sqlite_path}")
+
                 sqlite_snapshot = lm.snapshot_sqlite_db(sqlite_path, snapshot_dir)
                 queue_snapshot = lm.snapshot_json_file(queue_path, snapshot_dir, name="execution_queue")
                 queue_entries = json.loads(queue_snapshot.path.read_text(encoding="utf-8"))
+                runs_snapshot = (
+                    lm.snapshot_json_file(runs_path, snapshot_dir, name="runs") if runs_path.exists() else None
+                )
+                if runs_snapshot is None:
+                    print(f"no {runs_path}; skipping the JSONL leg", file=sys.stderr)
 
                 if args.command == "legacy-migrate":
                     migration_report = lm.import_snapshot(
@@ -692,6 +783,7 @@ def main(argv: list[str] | None = None) -> int:
                     connection_factory=factory,
                     queue_snapshot=queue_snapshot,
                     queue_entries=queue_entries,
+                    runs_snapshot=runs_snapshot,
                 )
                 lm.write_report(reconciliation, report_dir / "reconciliation-report.json")
                 for table_reconciliation in reconciliation.tables:
@@ -709,34 +801,6 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 print("reconciliation is NOT clean; legacy-lock will refuse", file=sys.stderr)
                 return 1
-
-            if args.command == "legacy-lock":
-                from command_center.db import legacy_migration as lm
-
-                sqlite_path = Path(args.sqlite_path) if args.sqlite_path else _default_sqlite_path()
-                queue_path = Path(args.queue_path) if args.queue_path else _default_queue_path()
-                reconciliation = lm.read_reconciliation_report(Path(args.report))
-                try:
-                    locked = lm.lock_legacy_sources(
-                        [sqlite_path, queue_path], reconciliation=reconciliation
-                    )
-                except ValueError as exc:
-                    print(f"refused: {exc}", file=sys.stderr)
-                    return 1
-                for path in locked:
-                    print(f"locked: {path}")
-                if not locked:
-                    print("nothing to lock; both sources were already read-only")
-                return 0
-
-            if args.command == "legacy-unlock":
-                from command_center.db import legacy_migration as lm
-
-                sqlite_path = Path(args.sqlite_path) if args.sqlite_path else _default_sqlite_path()
-                queue_path = Path(args.queue_path) if args.queue_path else _default_queue_path()
-                for path in lm.unlock_legacy_sources([sqlite_path, queue_path]):
-                    print(f"unlocked: {path}")
-                return 0
 
             if args.command == "downgrade":
                 if not args.confirmed:

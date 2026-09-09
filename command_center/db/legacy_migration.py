@@ -38,6 +38,29 @@ itself a best-effort mirror of it, written by `_mirror_to_runtime_db` and
 allowed to fall behind on a failed write. Importing that table from the
 SQLite snapshot would migrate a mirror's mirror; every function here that
 touches it instead takes the queue's own frozen JSON snapshot.
+
+`data/runs.jsonl` is the JSONL leg of "SQLite/JSON/JSONL", and it reaches
+PostgreSQL only indirectly. It is the v1.2 synchronous run journal;
+`command_center/runtime/legacy_import.py` drains it into the v2 SQLite store
+one way, linking each legacy record to a `session` via `session.legacy_run_id`,
+and `runtime/runs_read.list_unified_runs` still merges whatever has not been
+drained into the live Runs view. So a legacy run that was never drained is in
+no mirrored table, is therefore in no SQLite snapshot, and a snapshot-to-
+PostgreSQL comparison cannot notice it is gone -- the reconciliation would
+report clean while the cutover stranded it in a file about to be made
+read-only. `undrained_legacy_runs` closes that hole by comparing the JSONL's
+own ids against `session.legacy_run_id` *in PostgreSQL*, and `reconcile`
+reports the result as the `legacy_runs_jsonl` row so the same `clean` flag
+that gates `lock_legacy_sources` covers the JSONL leg too. Draining is the
+existing, idempotent `import_legacy_runs`, run before the snapshot is taken;
+nothing here rewrites `runs.jsonl` itself.
+
+`data/activity.jsonl` is deliberately *not* in scope: it is an append-only UI
+activity log with no table on the PostgreSQL side at all (no mirror declares
+one), so it is not a legacy *copy* of migrated state and there is nothing to
+reconcile it against. Locking it would only break `activity_log.record()`.
+Giving it a home in PostgreSQL is a schema change, and so SRV-01's work, not
+this migration's.
 """
 
 from __future__ import annotations
@@ -70,6 +93,8 @@ __all__ = [
     "TableReconciliation",
     "ReconciliationReport",
     "reconcile",
+    "legacy_run_ids",
+    "undrained_legacy_runs",
     "write_report",
     "read_reconciliation_report",
     "lock_legacy_sources",
@@ -96,6 +121,42 @@ def _stamp(taken_at: str) -> str:
     return taken_at.replace(":", "").replace("-", "").replace("+00:00", "Z")
 
 
+#: SQLite siblings that hold committed data the main file does not yet.
+_SQLITE_SIDECARS = ("-wal", "-shm")
+
+
+def _fingerprint(path: Path) -> dict[str, dict]:
+    """Size and mtime of a *live* legacy source, as of right now.
+
+    Recorded in the reconciliation report and re-checked by
+    `lock_legacy_sources`, which is the only thing standing between a
+    reconciliation and the writes that can land after it: the report proves
+    PostgreSQL matched the source at 10:00, and by itself says nothing about
+    whether the application kept writing until the operator ran the cutover at
+    10:30. Those thirty minutes of rows exist only in the file about to be made
+    read-only.
+
+    Not a SHA-256, because the point is to be cheap enough to run on every
+    lock of a multi-gigabyte `runtime.db`, and because size-plus-mtime already
+    detects the case that actually happens -- a live writer appending -- rather
+    than a deliberately size-and-mtime-preserving forgery, which is not this
+    check's threat model.
+
+    The `-wal`/`-shm` siblings are fingerprinted with the file itself. A
+    WAL-mode commit lands in `runtime.db-wal` and need not touch the main
+    file's mtime at all, so a fingerprint of `runtime.db` alone would call a
+    database that took writes unchanged -- exactly the reassurance this must
+    not give.
+    """
+    parts: dict[str, dict] = {}
+    for candidate in (path, *(path.with_name(path.name + s) for s in _SQLITE_SIDECARS)):
+        if not candidate.exists():
+            continue
+        stats = candidate.stat()
+        parts[candidate.name] = {"size": stats.st_size, "mtime_ns": stats.st_mtime_ns}
+    return parts
+
+
 # --------------------------------------------------------------------------
 # Snapshot + checksum
 # --------------------------------------------------------------------------
@@ -109,6 +170,12 @@ class Snapshot:
     path: Path
     sha256: str
     taken_at: str
+    #: `_fingerprint` of the *live* source as the copy finished. Carried
+    #: through to the reconciliation report, so `lock_legacy_sources` compares
+    #: against the moment the data being reconciled was actually read --
+    #: covering the whole import-and-reconcile window, which on a large
+    #: database is where nearly all the writes-after-snapshot risk lives.
+    source_fingerprint: dict[str, dict] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +183,7 @@ class Snapshot:
             "path": str(self.path),
             "sha256": self.sha256,
             "taken_at": self.taken_at,
+            "source_fingerprint": self.source_fingerprint,
         }
 
 
@@ -153,7 +221,13 @@ def snapshot_sqlite_db(source_path: Path, snapshot_dir: Path, *, name: str = "ru
     finally:
         source_conn.close()
     digest = _freeze_and_checksum(dest)
-    return Snapshot(source=source_path, path=dest, sha256=digest, taken_at=taken_at)
+    return Snapshot(
+        source=source_path,
+        path=dest,
+        sha256=digest,
+        taken_at=taken_at,
+        source_fingerprint=_fingerprint(source_path),
+    )
 
 
 def snapshot_json_file(source_path: Path, snapshot_dir: Path, *, name: str) -> Snapshot:
@@ -169,7 +243,13 @@ def snapshot_json_file(source_path: Path, snapshot_dir: Path, *, name: str) -> S
     dest = snapshot_dir / f"{name}-{_stamp(taken_at)}{source_path.suffix}"
     shutil.copy2(source_path, dest)
     digest = _freeze_and_checksum(dest)
-    return Snapshot(source=source_path, path=dest, sha256=digest, taken_at=taken_at)
+    return Snapshot(
+        source=source_path,
+        path=dest,
+        sha256=digest,
+        taken_at=taken_at,
+        source_fingerprint=_fingerprint(source_path),
+    )
 
 
 def verify_snapshot(snapshot: Snapshot) -> None:
@@ -371,6 +451,56 @@ def import_snapshot(
 
 
 # --------------------------------------------------------------------------
+# The JSONL leg: data/runs.jsonl
+# --------------------------------------------------------------------------
+
+
+def legacy_run_ids(runs_snapshot: Snapshot) -> list[str]:
+    """Distinct v1.2 run ids in a frozen `runs.jsonl` snapshot.
+
+    Read exactly the way the application reads it -- `storage.read_jsonl` then
+    `fold_latest_by_id` -- which is what `agent_runner.load_runs` does and
+    therefore what `legacy_import` drained and what `list_unified_runs` still
+    shows. `runs.jsonl` is append-only, one snapshot per write, so the raw line
+    count is not the run count and a malformed line is skipped rather than
+    fatal. Deriving the id set any other way would let this check disagree with
+    the reader whose data it is supposed to be protecting.
+    """
+    from command_center import storage
+
+    verify_snapshot(runs_snapshot)
+    records = storage.read_jsonl(runs_snapshot.path)
+    return sorted(storage.fold_latest_by_id(records))
+
+
+def undrained_legacy_runs(
+    runs_snapshot: Snapshot, *, connection_factory: Callable[[], Any] | None = None
+) -> list[str]:
+    """v1.2 run ids that no PostgreSQL `session` claims via `legacy_run_id`.
+
+    Asked of PostgreSQL rather than of the SQLite snapshot on purpose: the
+    question a cutover needs answered is "is this record safe in the new
+    authority," and a record can be in the SQLite store yet absent from
+    PostgreSQL because its table's import failed. Checking the destination
+    answers the real question in one pass instead of chaining two.
+
+    A non-empty result means `runs.jsonl` is still the only writable home of
+    those runs. `import_legacy_runs` is the fix, and it is idempotent, so the
+    remedy for a dirty result is simply to run it and reconcile again.
+    """
+    ids = legacy_run_ids(runs_snapshot)
+    if not ids:
+        return []
+    session_mirror = mirror_registry.mirror_classes()["session"][0]
+    drained = {
+        row.get("legacy_run_id")
+        for row in session_mirror(connection_factory=connection_factory).list_records()
+        if row.get("legacy_run_id")
+    }
+    return [run_id for run_id in ids if run_id not in drained]
+
+
+# --------------------------------------------------------------------------
 # Reconciliation
 # --------------------------------------------------------------------------
 
@@ -428,6 +558,12 @@ class ReconciliationReport:
     generated_at: str
     snapshot_sha256: dict[str, str]
     tables: list[TableReconciliation]
+    #: `{str(live source path): _fingerprint(...)}` as of the moment each
+    #: snapshot was taken -- not of report time, so the window this covers is
+    #: the whole of import-and-reconcile. `lock_legacy_sources` refuses any
+    #: path missing from here or whose fingerprint has since moved, so a report
+    #: can only authorize the cutover of the exact files it actually read.
+    sources: dict[str, dict] = field(default_factory=dict)
 
     @property
     def clean(self) -> bool:
@@ -437,6 +573,7 @@ class ReconciliationReport:
         return {
             "generated_at": self.generated_at,
             "snapshot_sha256": self.snapshot_sha256,
+            "sources": self.sources,
             "clean": self.clean,
             "tables": [
                 {
@@ -457,6 +594,7 @@ def reconcile(
     connection_factory: Callable[[], Any] | None = None,
     queue_snapshot: Snapshot | None = None,
     queue_entries: list[dict] | None = None,
+    runs_snapshot: Snapshot | None = None,
 ) -> ReconciliationReport:
     """Compare a frozen snapshot against PostgreSQL, table by table.
 
@@ -473,13 +611,23 @@ def reconcile(
     hooks are already proven against, rather than a second implementation
     that could disagree with it about what "the same row" means.
 
-    Verifies both snapshots' checksums before reading them, so a
+    Verifies every snapshot's checksum before reading it, so a
     reconciliation report can never describe a snapshot that has since
     changed on disk.
+
+    `runs_snapshot` adds the JSONL leg (see this module's docstring) as the
+    `legacy_runs_jsonl` row: a v1.2 run that was never drained into the v2
+    store is in no mirrored table and so in no SQLite snapshot, which makes it
+    invisible to every other check here. Reporting it as an ordinary dirty row
+    means the single `clean` flag `lock_legacy_sources` already gates on covers
+    it too, rather than adding a second gate an operator could satisfy one of.
+    Omit it only for a partial run, never for a real cutover.
     """
     verify_snapshot(sqlite_snapshot)
     if queue_snapshot is not None:
         verify_snapshot(queue_snapshot)
+    if runs_snapshot is not None:
+        verify_snapshot(runs_snapshot)
 
     specs = _discovered_specs()
     mirrors = {table: mirror for table, (mirror, _module) in mirror_registry.mirror_classes().items()}
@@ -513,11 +661,38 @@ def reconcile(
             )
         )
 
+    if runs_snapshot is not None:
+        undrained = undrained_legacy_runs(runs_snapshot, connection_factory=connection_factory)
+        all_ids = legacy_run_ids(runs_snapshot)
+        tables.append(
+            TableReconciliation(
+                table="legacy_runs_jsonl",
+                source_rows=len(all_ids),
+                mirror_rows=len(all_ids) - len(undrained),
+                differences=[
+                    {
+                        "id": run_id,
+                        "fields": ["legacy_run_id"],
+                        "authority": run_id,
+                        "mirror": None,
+                    }
+                    for run_id in undrained
+                ],
+            )
+        )
+
     checksums = {"sqlite": sqlite_snapshot.sha256}
+    sources = {str(sqlite_snapshot.source): sqlite_snapshot.source_fingerprint}
     if queue_snapshot is not None:
         checksums["queue_json"] = queue_snapshot.sha256
+        sources[str(queue_snapshot.source)] = queue_snapshot.source_fingerprint
+    if runs_snapshot is not None:
+        checksums["runs_jsonl"] = runs_snapshot.sha256
+        sources[str(runs_snapshot.source)] = runs_snapshot.source_fingerprint
 
-    return ReconciliationReport(generated_at=_now_iso(), snapshot_sha256=checksums, tables=tables)
+    return ReconciliationReport(
+        generated_at=_now_iso(), snapshot_sha256=checksums, tables=tables, sources=sources
+    )
 
 
 def write_report(report: MigrationReport | ReconciliationReport, path: Path) -> None:
@@ -549,6 +724,7 @@ def read_reconciliation_report(path: Path) -> ReconciliationReport:
         generated_at=payload["generated_at"],
         snapshot_sha256=payload["snapshot_sha256"],
         tables=tables,
+        sources=payload.get("sources", {}),
     )
 
 
@@ -571,12 +747,36 @@ def lock_legacy_sources(paths: Iterable[Path], *, reconciliation: Reconciliation
     writable copy of rows PostgreSQL does not yet have. Returns only the
     paths this call actually changed, so an operator's cutover log does not
     claim to have locked a file that was already read-only.
+
+    Refuses just as hard when the report does not *cover* a path, or covers it
+    with a fingerprint that has since moved. "Clean" is a claim about specific
+    files at a specific moment, and both halves of that are load-bearing: a
+    clean report from another install, or from before the last half hour of
+    application writes, is not evidence about the file in front of this call.
+    Without the check the gate reads as protection while accepting any clean
+    report at all -- see `_fingerprint`.
     """
     if not reconciliation.clean:
         raise ValueError(
             "refusing to lock legacy sources: the reconciliation report is not clean "
             "(pass a report with `clean == True`, produced after every finding is resolved)"
         )
+    paths = list(paths)
+    for path in paths:
+        recorded = reconciliation.sources.get(str(path))
+        if recorded is None:
+            raise ValueError(
+                f"refusing to lock {path}: the reconciliation report does not cover it "
+                f"(it reconciled {sorted(reconciliation.sources) or 'nothing'}). A report "
+                "that never looked at this file is not evidence that PostgreSQL has its rows."
+            )
+        current = _fingerprint(path)
+        if current != recorded:
+            raise ValueError(
+                f"refusing to lock {path}: it changed since the reconciliation at "
+                f"{reconciliation.generated_at} (recorded {recorded}, found {current}). "
+                "Those writes are not in PostgreSQL; re-run the migration and reconcile again."
+            )
     locked: list[Path] = []
     for path in paths:
         mode = path.stat().st_mode

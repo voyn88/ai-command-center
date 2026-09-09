@@ -125,8 +125,18 @@ def test_wave_order_over_the_real_registry_is_acyclic_and_covers_every_mirror() 
 # --- cutover / rollback: no database needed ----------------------------------
 
 
-def _clean_report() -> lm.ReconciliationReport:
-    return lm.ReconciliationReport(generated_at="now", snapshot_sha256={}, tables=[])
+def _clean_report(*covered: Path) -> lm.ReconciliationReport:
+    """A clean report that covers `covered` as they are on disk right now.
+
+    `lock_legacy_sources` refuses a path the report does not cover or whose
+    fingerprint has moved, so a cutover test has to hand it a report describing
+    the real files -- which is the property, not boilerplate around it."""
+    return lm.ReconciliationReport(
+        generated_at="now",
+        snapshot_sha256={},
+        tables=[],
+        sources={str(path): lm._fingerprint(path) for path in covered},
+    )
 
 
 def _dirty_report() -> lm.ReconciliationReport:
@@ -147,14 +157,15 @@ def test_lock_and_unlock_legacy_sources_round_trip(tmp_path: Path) -> None:
     target = tmp_path / "runtime.db"
     target.write_bytes(b"legacy contents")
 
-    locked = lm.lock_legacy_sources([target], reconciliation=_clean_report())
+    report = _clean_report(target)
+    locked = lm.lock_legacy_sources([target], reconciliation=report)
     assert locked == [target]
     assert target.stat().st_mode & stat.S_IWUSR == 0
     with pytest.raises(PermissionError):
         target.open("ab")
 
     # Locking again changes nothing further and reports no newly-locked paths.
-    assert lm.lock_legacy_sources([target], reconciliation=_clean_report()) == []
+    assert lm.lock_legacy_sources([target], reconciliation=report) == []
 
     unlocked = lm.unlock_legacy_sources([target])
     assert unlocked == [target]
@@ -162,6 +173,57 @@ def test_lock_and_unlock_legacy_sources_round_trip(tmp_path: Path) -> None:
     with target.open("ab"):
         pass  # writable again; the legacy source's contents were never touched
     assert target.read_bytes() == b"legacy contents"
+
+
+def test_lock_legacy_sources_refuses_a_path_the_report_does_not_cover(tmp_path: Path) -> None:
+    """A clean report is evidence about the files it read, not a global pass."""
+    reconciled = tmp_path / "runtime.db"
+    reconciled.write_bytes(b"reconciled")
+    never_looked_at = tmp_path / "execution_queue.json"
+    never_looked_at.write_bytes(b"[]")
+
+    with pytest.raises(ValueError, match="does not cover it"):
+        lm.lock_legacy_sources(
+            [reconciled, never_looked_at], reconciliation=_clean_report(reconciled)
+        )
+    # Refused for the whole set before touching any of it: a partial cutover
+    # that locked the covered file and stopped would be worse than none.
+    assert reconciled.stat().st_mode & stat.S_IWUSR != 0
+    assert never_looked_at.stat().st_mode & stat.S_IWUSR != 0
+
+
+def test_lock_legacy_sources_refuses_a_source_written_since_the_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """The window this closes: reconcile says clean, the app keeps writing,
+    and the cutover would strand those rows in a file about to go read-only."""
+    target = tmp_path / "runtime.db"
+    target.write_bytes(b"as reconciled")
+    report = _clean_report(target)
+
+    with target.open("ab") as handle:
+        handle.write(b" + rows written after the reconciliation")
+
+    with pytest.raises(ValueError, match="changed since the reconciliation"):
+        lm.lock_legacy_sources([target], reconciliation=report)
+    assert target.stat().st_mode & stat.S_IWUSR != 0
+
+
+def test_lock_legacy_sources_notices_a_write_that_only_lands_in_the_wal(tmp_path: Path) -> None:
+    """A WAL-mode commit need not touch the main file's mtime at all, so a
+    fingerprint of `runtime.db` alone would call a database that took writes
+    unchanged. The `-wal` sibling is fingerprinted with it."""
+    target = tmp_path / "runtime.db"
+    target.write_bytes(b"main file, untouched by what follows")
+    report = _clean_report(target)
+    before = target.stat()
+
+    (tmp_path / "runtime.db-wal").write_bytes(b"a committed page the main file does not have")
+
+    after = target.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    with pytest.raises(ValueError, match="changed since the reconciliation"):
+        lm.lock_legacy_sources([target], reconciliation=report)
 
 
 def test_write_report_persists_json(tmp_path: Path) -> None:
@@ -186,6 +248,21 @@ def test_read_reconciliation_report_round_trips_through_write_report(tmp_path: P
     assert restored.clean is False and report.clean is False
     assert [t.table for t in restored.tables] == [t.table for t in report.tables]
     assert restored.tables[0].differences == report.tables[0].differences
+
+
+def test_read_reconciliation_report_carries_the_source_fingerprints(tmp_path: Path) -> None:
+    """The review-then-act split runs `lock` against a report read back off
+    disk, so a `sources` block that did not survive the round trip would turn
+    the cutover gate into an unconditional refusal."""
+    target = tmp_path / "runtime.db"
+    target.write_bytes(b"legacy contents")
+    out = tmp_path / "reconciliation-report.json"
+    lm.write_report(_clean_report(target), out)
+
+    restored = lm.read_reconciliation_report(out)
+
+    assert restored.sources == {str(target): lm._fingerprint(target)}
+    assert lm.lock_legacy_sources([target], reconciliation=restored) == [target]
 
 
 # --- against a real PostgreSQL ------------------------------------------------
@@ -357,3 +434,144 @@ def test_queue_entry_imports_and_reconciles_from_its_own_json_authority(
     queue_table = next(t for t in dirty.tables if t.table == "queue_entry")
     assert not queue_table.clean
     assert any(d["id"] == "__order__" for d in queue_table.differences)
+
+
+# --- the JSONL leg: data/runs.jsonl -------------------------------------------
+
+
+def _write_runs_jsonl(path: Path, runs: list[dict]) -> None:
+    """`runs.jsonl` as `agent_runner` writes it: append-only, one JSON snapshot
+    per line, later lines superseding earlier ones with the same id."""
+    path.write_text(
+        "".join(json.dumps(run, ensure_ascii=False) + "\n" for run in runs), encoding="utf-8"
+    )
+
+
+def _legacy_run(run_id: str, *, status: str = "completed") -> dict:
+    return {
+        "id": run_id,
+        "project": "P",
+        "task_type": "implementation",
+        "task_id": f"legacy-task-{run_id}",
+        "repository_path": "/repo",
+        "prompt": f"legacy prompt {run_id}",
+        "status": status,
+        "created_at": f"2026-08-13T00:00:0{run_id[-1]}",
+        "started_at": "2026-08-13T00:00:00",
+        "completed_at": "2026-08-13T00:01:00",
+        "exit_code": 0,
+    }
+
+
+def test_legacy_run_ids_folds_the_append_only_journal_like_the_app_does(tmp_path: Path) -> None:
+    """The line count is not the run count: `runs.jsonl` holds one snapshot per
+    write, and a malformed line is skipped rather than fatal -- exactly what
+    `agent_runner.load_runs` does, because that is whose data this protects."""
+    runs_path = tmp_path / "runs.jsonl"
+    runs_path.write_text(
+        json.dumps(_legacy_run("r1", status="running")) + "\n"
+        + json.dumps(_legacy_run("r1", status="completed")) + "\n"
+        + "{ this line is not json\n"
+        + "\n"
+        + json.dumps(_legacy_run("r2")) + "\n",
+        encoding="utf-8",
+    )
+    snapshot = lm.snapshot_json_file(runs_path, tmp_path / "snapshots", name="runs")
+
+    assert lm.legacy_run_ids(snapshot) == ["r1", "r2"]
+
+
+def test_undrained_legacy_runs_and_reconcile_flag_a_run_that_never_reached_postgres(
+    tmp_path: Path, pg_connection_factory
+) -> None:
+    """The hole this closes. A v1.2 run that was never drained into the v2
+    store is in no mirrored table, so it is in no SQLite snapshot either, and
+    a snapshot-to-PostgreSQL comparison alone reports clean while the cutover
+    would strand it in a file it is about to make read-only."""
+    db_path = tmp_path / "runtime.db"
+    _seed_runtime_db(db_path)
+    runs_path = tmp_path / "runs.jsonl"
+    _write_runs_jsonl(runs_path, [_legacy_run("r1"), _legacy_run("r2")])
+
+    sqlite_snapshot = lm.snapshot_sqlite_db(db_path, tmp_path / "snapshots")
+    runs_snapshot = lm.snapshot_json_file(runs_path, tmp_path / "snapshots", name="runs")
+    lm.import_snapshot(sqlite_snapshot, connection_factory=pg_connection_factory)
+
+    # Every mirrored table matches -- and two runs exist only in the JSONL.
+    without_the_jsonl_leg = lm.reconcile(sqlite_snapshot, connection_factory=pg_connection_factory)
+    assert without_the_jsonl_leg.clean
+
+    assert lm.undrained_legacy_runs(runs_snapshot, connection_factory=pg_connection_factory) == [
+        "r1",
+        "r2",
+    ]
+    report = lm.reconcile(
+        sqlite_snapshot, connection_factory=pg_connection_factory, runs_snapshot=runs_snapshot
+    )
+    assert not report.clean
+    jsonl = next(t for t in report.tables if t.table == "legacy_runs_jsonl")
+    assert (jsonl.source_rows, jsonl.mirror_rows) == (2, 0)
+    assert [d["id"] for d in jsonl.differences] == ["r1", "r2"]
+    assert report.snapshot_sha256["runs_jsonl"] == runs_snapshot.sha256
+
+    # And the cutover is refused on the strength of that one dirty row.
+    with pytest.raises(ValueError, match="not clean"):
+        lm.lock_legacy_sources([db_path, runs_path], reconciliation=report)
+    assert runs_path.stat().st_mode & stat.S_IWUSR != 0
+
+
+def test_draining_runs_jsonl_before_the_snapshot_makes_the_jsonl_leg_reconcile_clean(
+    tmp_path: Path, pg_connection_factory
+) -> None:
+    """The remedy, in the order an operator must run it: drain into the SQLite
+    store *first*, because a snapshot taken before the drain cannot contain the
+    sessions the drain creates.
+
+    The drain is stood in for by the one call `import_legacy_runs` makes that
+    this check actually reads -- `create_session(..., legacy_run_id=...)`.
+    Driving the real importer here would re-test `legacy_import` (which has its
+    own suite) and would drag in its process-identity capture and report
+    generation, neither of which the JSONL leg's reconciliation looks at.
+    """
+    db_path = tmp_path / "runtime.db"
+    _seed_runtime_db(db_path)
+    runs_path = tmp_path / "runs.jsonl"
+    _write_runs_jsonl(runs_path, [_legacy_run("r1"), _legacy_run("r2")])
+
+    for legacy_id in ("r1", "r2"):
+        task = runtime_execution.create_task(
+            db_path, project="P", title=f"imported {legacy_id}", task_type="implementation"
+        )
+        runtime_execution.create_session(
+            db_path,
+            task_id=task["id"],
+            project="P",
+            repository_path="/repo",
+            legacy_run_id=legacy_id,
+        )
+
+    sqlite_snapshot = lm.snapshot_sqlite_db(db_path, tmp_path / "snapshots")
+    runs_snapshot = lm.snapshot_json_file(runs_path, tmp_path / "snapshots", name="runs")
+    migration = lm.import_snapshot(sqlite_snapshot, connection_factory=pg_connection_factory)
+    assert migration.ok, [t for t in migration.tables if not t.ok]
+
+    assert lm.undrained_legacy_runs(runs_snapshot, connection_factory=pg_connection_factory) == []
+    report = lm.reconcile(
+        sqlite_snapshot, connection_factory=pg_connection_factory, runs_snapshot=runs_snapshot
+    )
+    assert report.clean, [t for t in report.tables if not t.clean]
+    jsonl = next(t for t in report.tables if t.table == "legacy_runs_jsonl")
+    assert (jsonl.source_rows, jsonl.mirror_rows) == (2, 2)
+
+    # Now the cutover is allowed, and it covers runs.jsonl too -- the JSONL
+    # authority does not stay writable behind the SQLite one.
+    locked = lm.lock_legacy_sources([db_path, runs_path], reconciliation=report)
+    assert set(locked) == {db_path, runs_path}
+    assert runs_path.stat().st_mode & stat.S_IWUSR == 0
+    with pytest.raises(PermissionError):
+        runs_path.open("ab")
+
+    # Rollback restores both, contents untouched.
+    lm.unlock_legacy_sources([db_path, runs_path])
+    assert runs_path.stat().st_mode & stat.S_IWUSR != 0
+    assert lm.legacy_run_ids(runs_snapshot) == ["r1", "r2"]

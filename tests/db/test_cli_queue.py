@@ -14,7 +14,8 @@ import pytest
 # vendored `aios_db` wheel — present in CI, optional in a bare local checkout.
 pytest.importorskip("aios_db")
 
-from command_center.db.cli import _review_enqueue, build_parser  # noqa: E402
+from command_center.db import legacy_migration as lm  # noqa: E402
+from command_center.db.cli import _review_enqueue, build_parser, main  # noqa: E402
 
 
 def test_queue_reap_takes_no_arguments() -> None:
@@ -126,6 +127,28 @@ def test_legacy_unlock_takes_no_required_arguments() -> None:
     assert args.sqlite_path is None and args.queue_path is None
 
 
+def test_every_legacy_command_can_address_the_jsonl_leg(tmp_path) -> None:
+    """`runs.jsonl` is the third legacy source, and rollback has to reach the
+    same set the cutover locked -- a `--runs-path` on migrate but not on unlock
+    would leave a redirected install with no supported way to undo it."""
+    for command in ("legacy-migrate", "legacy-reconcile", "legacy-unlock"):
+        assert build_parser().parse_args([command]).runs_path is None
+        scoped = build_parser().parse_args([command, "--runs-path", str(tmp_path / "runs.jsonl")])
+        assert scoped.runs_path == str(tmp_path / "runs.jsonl")
+
+    locked = build_parser().parse_args(
+        ["legacy-lock", "--report", "r.json", "--runs-path", str(tmp_path / "runs.jsonl")]
+    )
+    assert locked.runs_path == str(tmp_path / "runs.jsonl")
+
+
+def test_legacy_migrate_drain_is_opt_in() -> None:
+    """Draining writes v2 rows into the legacy SQLite store. A migration that
+    did that unasked would mutate the very authority it is about to freeze."""
+    assert build_parser().parse_args(["legacy-migrate"]).drain_legacy_runs is False
+    assert build_parser().parse_args(["legacy-migrate", "--drain-legacy-runs"]).drain_legacy_runs is True
+
+
 def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
     """A review-class enqueue must outrank the priority=0 implementation
     dispatch enqueues (`backlog_dispatch`), or it queues FIFO behind runs
@@ -159,3 +182,84 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
         "priority": 100,
     }]
     assert calls[0]["priority"] > 0
+
+
+# --- the cutover commands, dispatched for real -------------------------------
+#
+# These two are the exception to this module's "parsing only, no database"
+# rule, and deliberately so: `legacy-lock`/`legacy-unlock` are pure filesystem
+# operations that must run with no database at all, so dispatching them here
+# costs nothing and covers what a parser test structurally cannot. It is also
+# the gap that hid a real defect -- `main()` carried a function-local
+# `from pathlib import Path`, which made `Path` local to the whole function and
+# left `legacy-lock --report ...` raising `UnboundLocalError` before it did
+# anything. Every existing test stopped at `parse_args`, so the cutover command
+# was broken end to end while the suite stayed green.
+
+
+def _legacy_sources(tmp_path):
+    sqlite_path = tmp_path / "runtime.db"
+    sqlite_path.write_bytes(b"legacy sqlite")
+    queue_path = tmp_path / "execution_queue.json"
+    queue_path.write_text("[]", encoding="utf-8")
+    runs_path = tmp_path / "runs.jsonl"
+    runs_path.write_text("", encoding="utf-8")
+    return sqlite_path, queue_path, runs_path
+
+
+def _report_file(tmp_path, report) -> str:
+    out = tmp_path / "reconciliation-report.json"
+    lm.write_report(report, out)
+    return str(out)
+
+
+def _argv(command, paths, *extra):
+    sqlite_path, queue_path, runs_path = paths
+    return [
+        command,
+        "--sqlite-path", str(sqlite_path),
+        "--queue-path", str(queue_path),
+        "--runs-path", str(runs_path),
+        *extra,
+    ]
+
+
+def test_legacy_lock_and_unlock_run_without_any_database_configuration(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Rollback must not need a reachable PostgreSQL -- a broken database is
+    exactly when an operator reaches for it."""
+    for variable in ("AICC_PG_HOST", "AICC_PG_PORT", "AICC_PG_DB", "AICC_PG_USER",
+                     "AICC_PG_PASSWORD", "AICC_PG_SSLMODE"):
+        monkeypatch.delenv(variable, raising=False)
+    paths = _legacy_sources(tmp_path)
+    report = lm.ReconciliationReport(
+        generated_at="now",
+        snapshot_sha256={},
+        tables=[],
+        sources={str(path): lm._fingerprint(path) for path in paths},
+    )
+
+    assert main(_argv("legacy-lock", paths, "--report", _report_file(tmp_path, report))) == 0
+    assert all(not (path.stat().st_mode & 0o200) for path in paths)
+    assert "locked:" in capsys.readouterr().out
+
+    assert main(_argv("legacy-unlock", paths)) == 0
+    assert all(path.stat().st_mode & 0o200 for path in paths)
+
+
+def test_legacy_lock_refuses_a_dirty_report_with_a_message_not_a_traceback(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.delenv("AICC_PG_HOST", raising=False)
+    paths = _legacy_sources(tmp_path)
+    dirty = lm.ReconciliationReport(
+        generated_at="now",
+        snapshot_sha256={},
+        tables=[lm.TableReconciliation("task", 1, 0, [{"id": "x"}])],
+        sources={str(path): lm._fingerprint(path) for path in paths},
+    )
+
+    assert main(_argv("legacy-lock", paths, "--report", _report_file(tmp_path, dirty))) == 1
+    assert "refused:" in capsys.readouterr().err
+    assert all(path.stat().st_mode & 0o200 for path in paths)
