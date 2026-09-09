@@ -2425,9 +2425,18 @@ def kill_switch(root: Path, api, *, confirmed: bool) -> dict:
 def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """Sum of the providers' own reported `total_cost_usd` over the trailing
     24 hours (runs whose `completed_at` falls in the window, plus still-running
-    work started in it). Reads only the final `result` stream events, which are
-    the single truthful cost source — nothing is estimated or fabricated; a
-    run whose provider reported no cost contributes 0.
+    work started in it). The providers' own reported figures are the single
+    truthful cost source — nothing is estimated or fabricated; a run whose
+    provider reported no cost contributes 0.
+
+    Every event in the window carrying a usable `total_cost_usd` counts,
+    rather than only those whose payload `type` is `result`. In practice that
+    *is* the final result message — the only shape today's provider reports a
+    cost on — but the filter is deliberately not narrowed to it: a provider
+    that reports its cost on some other message type would then be summed as
+    $0, which is this task's own failure (a cap that silently reads too low)
+    reached by a different route. Counting every truthful figure errs, if at
+    all, toward the cap engaging.
 
     `payload` may already be a `dict` rather than JSON text — a `jsonb`-backed
     read (the PostgreSQL mirror this table has, VOYN-W0-AICC-SRV-01B) hands
