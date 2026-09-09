@@ -989,8 +989,18 @@ class RotationController:
         """
         waves = len(self._activation_waves())
         authority_timeout = self._authority_timeout(config)
+        # A wave costs one reload bound plus one readiness bound, and every
+        # wave may run twice (activation, then rollback). The readiness bound
+        # is NOT always the reload timeout: a multi-lane wave proves readiness
+        # through _wait_workers_healthy(), which is bounded by
+        # ``prerequisite_timeout``. Pricing every readiness wait at
+        # ``reload_timeout`` silently under-counted the budget whenever the
+        # prerequisite wait was the longer of the two.
+        readiness_timeout = max(
+            self.config.reload_timeout, self.config.prerequisite_timeout
+        )
         hot_budget = (
-            4 * waves * self.config.reload_timeout
+            2 * waves * (self.config.reload_timeout + readiness_timeout)
             + (2 * waves + 1) * authority_timeout
             + CREDENTIAL_SAFETY_MARGIN_SECONDS
         )
@@ -1007,12 +1017,6 @@ class RotationController:
             return hot_budget, False
         raise RotationError(
             "database credential TTL is below hot activation/rollback budget"
-        )
-
-    def _resume_budget(self, config: PostgresConfig) -> float:
-        authority_timeout = self._authority_timeout(config)
-        return len(self._activation_waves()) * (
-            2 * self.config.reload_timeout + authority_timeout
         )
 
     def _require_current_attempt_budget(
@@ -1102,9 +1106,14 @@ class RotationController:
         self.audit.emit("tunnel_ready", unit=self.config.tunnel_unit)
 
     def _wait_workers_healthy(self) -> None:
+        # Credential-bounded like every other readiness wait: post-mutation
+        # this runs inside _activate_fleet(), and a wait that outlived the
+        # issued credential's usable window would consume the very budget
+        # the rollback path still needs. Pre-mutation the current
+        # credential's proved window is the same correct bound.
         pending = set(self.config.worker_units)
         deadline = self.monotonic() + self._bounded_timeout(
-            self.config.prerequisite_timeout, "fleet readiness"
+            self.config.prerequisite_timeout, "fleet readiness", credential=True
         )
         delay = self.config.poll_initial
         last_errors: dict[str, str] = {}

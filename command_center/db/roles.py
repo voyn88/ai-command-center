@@ -489,12 +489,14 @@ _APP_BACKLOG_FUNCTIONS = (
 
 # The enrolment surface (0003), split by who may do what.
 #
-# A worker gets two entries and no third. It may prove its own identity and
-# rotate its own secret — rotation is authorised by possession of the current
-# secret, so it changes WHICH secret works and nothing else — and it may not
-# mint a ticket (enrolment is not a peer-to-peer gossip protocol), redeem one
-# (a single compromised host must not be able to consume the fleet's pending
-# enrolments), or revoke anything.
+# A worker gets three entries and no fourth. It may prove its own identity,
+# read the expiry of the credential it just proved (0013 — the rotator needs a
+# server-authoritative clock and lifetime, and this exposes only the caller's
+# own already-proved credential), and rotate its own secret — rotation is
+# authorised by possession of the current secret, so it changes WHICH secret
+# works and nothing else. It may not mint a ticket (enrolment is not a
+# peer-to-peer gossip protocol), redeem one (a single compromised host must not
+# be able to consume the fleet's pending enrolments), or revoke anything.
 _WORKER_ENROLMENT_FUNCTIONS = (
     "identity_assert(text)",
     "identity_current_credential(text)",

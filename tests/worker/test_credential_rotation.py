@@ -546,6 +546,79 @@ def test_hot_budget_has_no_lane_count_ceiling() -> None:
     assert budget_for(26) == budget_for(1_000)
 
 
+def test_post_rotation_budget_prices_the_real_fleet_readiness_bound(
+    tmp_path: Path,
+) -> None:
+    """The multi-lane wave proves readiness through _wait_workers_healthy(),
+    which is bounded by ``prerequisite_timeout``. A budget that priced every
+    readiness wait at ``reload_timeout`` under-counted the activation plus
+    rollback window whenever the prerequisite wait was the longer of the two,
+    so the credential could expire inside a recovery the budget claimed to
+    cover."""
+
+    events: list[tuple] = []
+    controller, _, _ = _controller(tmp_path, events)
+    controller.config = replace(
+        controller.config, reload_timeout=10.0, prerequisite_timeout=600.0
+    )
+    config = load_config(read_environment_file(controller.config.env_file))
+    waves = len(controller._activation_waves())
+    authority_timeout = authority_timeout_seconds(config)
+
+    budget, restart_allowed = controller._post_rotation_budget(config)
+
+    assert not restart_allowed
+    assert budget == (
+        2 * waves * (10.0 + 600.0)
+        + (2 * waves + 1) * authority_timeout
+        + CREDENTIAL_SAFETY_MARGIN_SECONDS
+    )
+    # The superseded formula (4 * waves * reload_timeout) would have claimed a
+    # window shorter than a single wave's readiness wait.
+    assert budget > (
+        4 * waves * 10.0
+        + (2 * waves + 1) * authority_timeout
+        + CREDENTIAL_SAFETY_MARGIN_SECONDS
+    )
+
+
+def test_fleet_readiness_wait_is_bounded_by_the_credential_deadline(
+    tmp_path: Path,
+) -> None:
+    """Post-mutation this wait runs inside _activate_fleet(). Left unbounded
+    by the credential it would spend the window the rollback still needs, so
+    it must stop at the proved expiry minus the safety margin rather than at
+    its own prerequisite timeout."""
+
+    events: list[tuple] = []
+    clock = [0.0]
+    systemd = FakeSystemd(events)
+    systemd.status[LANE_2] = "aicc-drain-requested"
+    controller = RotationController(
+        _config(tmp_path, prerequisite_timeout=600.0, poll_initial=1.0, poll_max=1.0),
+        systemd,
+        FakeAuthority(events),
+        Audit(),
+        monotonic=lambda: clock[0],
+        sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        port_probe=lambda host, port, timeout: None,
+    )
+    controller._controller_deadline = clock[0] + 7200.0
+    usable = 20.0
+    controller._set_credential_deadline(
+        NOW + timedelta(seconds=CREDENTIAL_SAFETY_MARGIN_SECONDS + usable),
+        CREDENTIAL_SAFETY_MARGIN_SECONDS + usable,
+        "test credential",
+    )
+
+    with pytest.raises(RotationError, match="worker readiness failed"):
+        controller._wait_workers_healthy()
+
+    # Bounded by the credential's usable window (plus one poll), never by the
+    # 600-second prerequisite timeout.
+    assert clock[0] <= usable + controller.config.poll_max
+
+
 def test_retry_lifetime_covers_every_failed_attempt_and_all_delays(
     tmp_path: Path,
 ) -> None:
@@ -1207,8 +1280,12 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
             read_environment_file(_environment(tmp_path / "authority.env"))
         )
     )
+    # A multi-lane wave proves readiness through _wait_workers_healthy(),
+    # which is bounded by --prerequisite-timeout, so the readiness half of
+    # each wave costs max(reload, prerequisite) -- not reload_timeout.
+    readiness_timeout = max(reload_timeout, prerequisite_timeout)
     safe_post_rotation = (
-        waves * 4 * reload_timeout
+        2 * waves * (reload_timeout + readiness_timeout)
         + (2 * waves + 1) * authority_timeout
         + CREDENTIAL_SAFETY_MARGIN_SECONDS
     )
