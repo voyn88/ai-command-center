@@ -1025,6 +1025,17 @@ def _systemd_command(
         "--setenv=PATH=/usr/local/bin:/usr/bin:/bin",
         "--setenv=GIT_CONFIG_NOSYSTEM=1",
         "--setenv=GIT_CONFIG_GLOBAL=/dev/null",
+        # The bound workspace is owned by the WORKER (a foreign uid inside the
+        # agent's dynamic-user view -- it reads as nobody), and git refuses a
+        # repository owned by someone else unless a protected config trusts
+        # it. With system and global config disabled above, the command-line
+        # form is the only protected scope left: trust exactly /workspace,
+        # the one tree the agent is meant to work in. Without it every git
+        # command the agent ran failed with "dubious ownership" and no Codex
+        # commit could ever land (worker-01 2026-09-09).
+        "--setenv=GIT_CONFIG_COUNT=1",
+        "--setenv=GIT_CONFIG_KEY_0=safe.directory",
+        "--setenv=GIT_CONFIG_VALUE_0=/workspace",
         "--setenv=GIT_TERMINAL_PROMPT=0",
         "--setenv=GCM_INTERACTIVE=never",
         "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",

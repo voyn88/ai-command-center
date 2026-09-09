@@ -2129,3 +2129,19 @@ def test_codex_workspace_write_unit_exposes_proc_sys_for_bwrap_only_there(launch
     assert "--property=ProcSubset=pid" in command(executor="codex", profile="read_only")
     assert "--property=ProcSubset=pid" in command(executor="claude", profile="trusted_development")
     assert "--property=ProtectKernelTunables=yes" in command(executor="codex", profile="trusted_development")
+
+
+def test_agent_git_trusts_exactly_the_bound_workspace(launcher, monkeypatch, tmp_path):
+    """The workspace is worker-owned (nobody inside the agent's uid view); with
+    system/global git config disabled, only the command-line scope can carry
+    safe.directory, and it names /workspace alone."""
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *args, **kwargs: False)
+    command = launcher._systemd_command(
+        _manifest(tmp_path), Path("/run/aicc-agent-homes/t"), "aicc-agent-t.service",
+        "aicc-agent-launcher@t.service", tmp_path.parent, tmp_path,
+    )
+    assert "--setenv=GIT_CONFIG_NOSYSTEM=1" in command and "--setenv=GIT_CONFIG_GLOBAL=/dev/null" in command
+    assert "--setenv=GIT_CONFIG_COUNT=1" in command
+    assert "--setenv=GIT_CONFIG_KEY_0=safe.directory" in command
+    assert "--setenv=GIT_CONFIG_VALUE_0=/workspace" in command
+    assert not any(v.startswith("--setenv=GIT_CONFIG_VALUE_0=") and v != "--setenv=GIT_CONFIG_VALUE_0=/workspace" for v in command)
