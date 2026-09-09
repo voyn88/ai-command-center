@@ -488,7 +488,17 @@ def undrained_legacy_runs(
     those runs. `import_legacy_runs` is the fix, and it is idempotent, so the
     remedy for a dirty result is simply to run it and reconcile again.
     """
-    ids = legacy_run_ids(runs_snapshot)
+    return _undrained(legacy_run_ids(runs_snapshot), connection_factory=connection_factory)
+
+
+def _undrained(ids: list[str], *, connection_factory: Callable[[], Any] | None) -> list[str]:
+    """`undrained_legacy_runs` once the ids are already in hand.
+
+    Split out so `reconcile` can report the total and the outstanding set
+    without reading and re-checksumming the snapshot twice -- `runs.jsonl` is
+    an append-only journal that can reach tens of megabytes on an install with
+    real v1.2 history, and the SHA-256 is over the whole file.
+    """
     if not ids:
         return []
     session_mirror = mirror_registry.mirror_classes()["session"][0]
@@ -662,8 +672,8 @@ def reconcile(
         )
 
     if runs_snapshot is not None:
-        undrained = undrained_legacy_runs(runs_snapshot, connection_factory=connection_factory)
         all_ids = legacy_run_ids(runs_snapshot)
+        undrained = _undrained(all_ids, connection_factory=connection_factory)
         tables.append(
             TableReconciliation(
                 table="legacy_runs_jsonl",
