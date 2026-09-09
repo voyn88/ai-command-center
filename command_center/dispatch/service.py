@@ -202,7 +202,37 @@ def _resolve_db_path(db_path: Path | None) -> Path:
 def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     """Dry run: what would be assigned, and why. No writes."""
     resolved_db = _resolve_db_path(db_path)
-    policy = policy_config.load_policy(root)
+
+    # The policy is the third input that can fail to load, and the one whose
+    # fallback is least obviously unsafe — which is exactly why it needs the
+    # same explicit gate. A default `DispatchPolicy` is the right answer to
+    # "no policy has been saved yet" and the wrong one to "the policy could
+    # not be read", because every guardrail in that file is carried by its
+    # *presence*: `per_agent_limits` and `per_project_limits` default to
+    # empty, and empty is not a conservative limit, it is no limit. Measured
+    # on this function: a policy pinning `claude_code` to `max_concurrent=1`
+    # assigns 1 of 3 queued tasks; corrupt the file and the same call assigns
+    # 3 of 3 with every other flag still reporting healthy.
+    #
+    # `policy_config.load_policy` raises only for a file that exists and
+    # cannot be used — a *missing* file is still the defaults, so a fresh
+    # install dispatches normally.
+    policy_unknown = False
+    try:
+        policy = policy_config.load_policy(root)
+    except Exception:  # noqa: BLE001 — no policy => fail closed: block dispatch
+        logger.warning(
+            "dispatch: policy unreadable under %s — failing closed "
+            "(policy_unknown)",
+            root,
+            exc_info=True,
+        )
+        # Only used to keep `collect_executor_pool` total; the gate below
+        # returns before any assignment is considered, so nothing this policy
+        # would permit can be acted on.
+        policy = DispatchPolicy()
+        policy_unknown = True
+
     settings = pipeline_settings.load_settings(root)
 
     # The kill switch IS the master switch: `task_pipeline.kill_switch` persists
@@ -276,6 +306,7 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         kill_switch_engaged=kill_switch_engaged,
         budget_unknown=budget_unknown,
         capacity_unknown=capacity_unknown,
+        policy_unknown=policy_unknown,
         active_by_executor=active,
     )
 
@@ -301,11 +332,11 @@ def assign(
     process — the existing pipeline does that on the recorded executor, so
     supervisor semantics are untouched.
 
-    Fail-closed: if the kill switch is engaged, or the trailing-24h spend or
-    the in-flight run counts could not be read, nothing is applied even when
-    the caller passed `confirmed=True`. `confirmed` is a required explicit
-    opt-in for the *write*, mirroring every other mutating action in this
-    codebase.
+    Fail-closed: if the kill switch is engaged, or the dispatch policy, the
+    trailing-24h spend or the in-flight run counts could not be read, nothing
+    is applied even when the caller passed `confirmed=True`. `confirmed` is a
+    required explicit opt-in for the *write*, mirroring every other mutating
+    action in this codebase.
     """
     computed = plan(root, db_path=db_path)
 
@@ -331,6 +362,12 @@ def assign(
         return {
             "applied": False,
             "reason": "capacity_data_unavailable",
+            "plan": computed.as_dict(),
+        }
+    if computed.policy_unknown:
+        return {
+            "applied": False,
+            "reason": "policy_data_unavailable",
             "plan": computed.as_dict(),
         }
 

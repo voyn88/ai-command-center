@@ -34,6 +34,16 @@ The hard guarantees, enforced structurally here:
    False, so a NaN spend total reads as "under every ceiling" for every task.
    A number that cannot be compared is not a budget, and this engine — the
    thing that makes the guarantee — is where that has to be caught.
+1e. **An unreadable policy blocks everything, and blocks it first.**
+   `policy_unknown=True` (the caller could not load the dispatch policy) takes
+   the same hard gate, deferring with `DEFER_POLICY_DATA_UNAVAILABLE`. It is
+   checked ahead of the other two data gates because the policy is what names
+   the ceilings they are checked against. Falling back to a default
+   `DispatchPolicy` is the sharpest fail-open of the three: its limit maps are
+   *empty*, and empty means "no per-agent concurrency limit, no per-agent
+   spend limit, no project ceiling", so an unreadable policy would not
+   loosen the guardrails, it would delete them — silently, since a plan built
+   that way reports every other flag healthy.
 2. **Budget is never exceeded.** An executor is only assigned when the
    *projected* cumulative spend (the trailing-24h spend already incurred plus
    every assignment made so far in this plan plus this one) stays at or under
@@ -71,6 +81,7 @@ from command_center.dispatch.models import (
     DEFER_KILL_SWITCH,
     DEFER_NO_AVAILABLE_EXECUTOR,
     DEFER_NO_ELIGIBLE_EXECUTOR,
+    DEFER_POLICY_DATA_UNAVAILABLE,
     DEFER_PROJECT_BUDGET,
     DispatchDecision,
     DispatchPlan,
@@ -140,6 +151,7 @@ def plan_dispatch(
     kill_switch_engaged: bool,
     budget_unknown: bool = False,
     capacity_unknown: bool = False,
+    policy_unknown: bool = False,
     active_by_executor: dict[str, int] | None = None,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
@@ -163,9 +175,15 @@ def plan_dispatch(
     #     that assigns while the trailing-24h spend or the in-flight run counts
     #     are unreadable. The reason reported is the most fundamental of the
     #     engaged gates, in that order.
-    if kill_switch_engaged or budget_unknown or capacity_unknown:
+    if kill_switch_engaged or policy_unknown or budget_unknown or capacity_unknown:
         if kill_switch_engaged:
             reason = DEFER_KILL_SWITCH
+        elif policy_unknown:
+            # Ahead of the two runtime-store gates because it is the more
+            # fundamental failure: the policy is what *names* the ceilings the
+            # other two check against, so "the budget could not be read" is not
+            # even a well-posed statement while the policy is unknown.
+            reason = DEFER_POLICY_DATA_UNAVAILABLE
         elif budget_unknown:
             reason = DEFER_COST_DATA_UNAVAILABLE
         else:
@@ -184,6 +202,7 @@ def plan_dispatch(
             kill_switch_engaged=kill_switch_engaged,
             budget_unknown=budget_unknown,
             capacity_unknown=capacity_unknown,
+            policy_unknown=policy_unknown,
             daily_spend_usd=daily_spend_usd,
             max_daily_spend_usd=max_daily_spend_usd,
             projected_spend_usd=daily_spend_usd,

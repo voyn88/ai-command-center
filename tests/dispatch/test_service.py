@@ -670,3 +670,121 @@ def test_assign_is_a_noop_while_kill_switch_engaged(monkeypatch, pool):
     assert result["reason"] == "kill_switch_engaged"
     stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
     assert stored.get("executor") in (None, "")
+
+
+# --------------------------------------------------------------------------
+# An unreadable dispatch policy fails closed
+# (VOYN-W0-AICC-DISPATCH-FAILCLOSED-FALSE)
+# --------------------------------------------------------------------------
+
+
+def _corrupt_policy_file():
+    path = policy_config.policy_file_path(ROOT)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"per_agent_limits": {"claude_c', encoding="utf-8")
+    return path
+
+
+def test_plan_fails_closed_when_the_policy_cannot_be_read(monkeypatch, pool):
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    _queued_task(title="a")
+    _queued_task(title="b")
+    _corrupt_policy_file()
+
+    plan = service.plan(ROOT)
+
+    assert plan.policy_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_POLICY_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
+def test_a_corrupt_policy_cannot_dispatch_more_than_the_policy_it_replaced(
+    monkeypatch, pool
+):
+    """The measured fail-open, end to end through the real `plan()`.
+
+    An operator pins `claude_code` to one concurrent run and forbids `ollama`
+    for this project. The healthy policy assigns 1 of 3. Corrupting the same
+    file used to assign **3 of 3** — every flag on the plan still reporting
+    healthy — because the defaults it fell back to carry empty limit maps.
+    """
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    monkeypatch.setattr(
+        project_config, "allowed_execution_providers", lambda _p: ("claude_code",)
+    )
+    for title in ("a", "b", "c"):
+        _queued_task(title=title)
+
+    policy_config.save_policy(
+        ROOT,
+        DispatchPolicy(
+            prefer_local=False,
+            cost_matrix={"claude_code": 0.5},
+            per_agent_limits={
+                "claude_code": models.AgentLimit(max_concurrent=1, max_spend_usd=0.0)
+            },
+        ),
+        actor="operator",
+    )
+
+    healthy = service.plan(ROOT)
+    assert len(healthy.assignments) == 1
+    assert healthy.policy_unknown is False
+
+    _corrupt_policy_file()
+    corrupt = service.plan(ROOT)
+
+    # The property: a failed read can never widen what a plan is allowed to do.
+    assert len(corrupt.assignments) <= len(healthy.assignments)
+    assert corrupt.assignments == ()
+    assert corrupt.policy_unknown is True
+
+
+def test_the_plan_says_which_read_failed(monkeypatch, pool):
+    # An unreadable policy and an unreadable runtime store must stay tellable
+    # apart in the response, not collapse into one generic refusal.
+    _enable_master_switch()
+    _spend_unavailable(monkeypatch)
+    _queued_task(title="a")
+    assert service.plan(ROOT).decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
+
+    _spend(monkeypatch, 0.0)
+    _corrupt_policy_file()
+    assert (
+        service.plan(ROOT).decisions[0].reason
+        == models.DEFER_POLICY_DATA_UNAVAILABLE
+    )
+
+
+def test_assign_is_a_noop_when_the_policy_cannot_be_read(monkeypatch, pool):
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    task = _queued_task(title="a")
+    _corrupt_policy_file()
+
+    result = service.assign(ROOT, CALLER, confirmed=True)
+
+    assert result["applied"] is False
+    assert result["reason"] == "policy_data_unavailable"
+    stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
+    assert not stored.get("executor")
+
+
+def test_a_missing_policy_file_still_dispatches(monkeypatch, pool):
+    # The fallback's legitimate case must keep working: no policy saved yet is
+    # a fresh install, not a failure, so dispatch proceeds normally.
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    _queued_task(title="a")
+    path = policy_config.policy_file_path(ROOT)
+    if path.exists():
+        path.unlink()
+
+    plan = service.plan(ROOT)
+
+    assert plan.policy_unknown is False
+    assert len(plan.assignments) == 1

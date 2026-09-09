@@ -686,3 +686,92 @@ def test_a_negative_spend_figure_or_ceiling_engages_the_cost_data_gate():
         assert plan.budget_unknown is True, (spend, ceiling)
         assert plan.assignments == (), (spend, ceiling)
         assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
+
+
+# --------------------------------------------------------------------------
+# Unreadable policy is the third data gate (VOYN-W0-AICC-DISPATCH-FAILCLOSED-FALSE)
+# --------------------------------------------------------------------------
+
+
+def test_policy_unknown_defers_everything_even_when_budget_allows():
+    # The policy could not be loaded. There is budget to spare and a free
+    # executor, so nothing *else* would stop these tasks — which is the point:
+    # only an explicit gate can, exactly as for the other two data reads.
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    plan = _plan([_task("t1"), _task("t2")], executors, policy, policy_unknown=True)
+
+    assert plan.policy_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_POLICY_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
+def test_default_limits_are_not_a_substitute_for_an_unreadable_policy():
+    # The regression this gate exists for, shown as a contrast — the policy
+    # analogue of `test_an_empty_active_map_is_not_a_substitute_for_unknown_capacity`.
+    #
+    # An operator has pinned `ollama` to one concurrent run. Loading the real
+    # policy defers the second task. Falling back to a *default* DispatchPolicy
+    # — what an unreadable policy file used to produce — assigns both, because
+    # its `per_agent_limits` is empty and empty means "no limit". The failed
+    # read does not weaken the guardrail, it deletes it.
+    configured = DispatchPolicy(
+        prefer_local=True,
+        local_executor_ids=frozenset({"ollama"}),
+        per_agent_limits={"ollama": AgentLimit(max_concurrent=1, max_spend_usd=0.0)},
+    )
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    tasks = [_task("t1"), _task("t2")]
+
+    truthful = _plan(tasks, executors, configured)
+    assert len(truthful.assignments) == 1
+    assert truthful.decisions[1].reason == models.DEFER_AGENT_CAPACITY
+
+    # The fail-open, demonstrated: the defaults impose nothing at all.
+    defaulted = _plan(tasks, executors, DispatchPolicy())
+    assert len(defaulted.assignments) == 2
+
+    # With the gate engaged, the same unreadable policy assigns nothing.
+    gated = _plan(tasks, executors, DispatchPolicy(), policy_unknown=True)
+    assert gated.assignments == ()
+    assert gated.decisions[0].reason == models.DEFER_POLICY_DATA_UNAVAILABLE
+
+
+def test_policy_unknown_takes_priority_over_the_two_runtime_store_gates():
+    # The policy names the ceilings the other two gates check against, so
+    # "the budget could not be read" is not a well-posed statement while the
+    # policy itself is unknown. The kill switch still outranks it.
+    plan = _plan(
+        [_task("t1")],
+        [_executor("claude_code", cost=0.0)],
+        DispatchPolicy(),
+        policy_unknown=True,
+        budget_unknown=True,
+        capacity_unknown=True,
+    )
+    assert plan.decisions[0].reason == models.DEFER_POLICY_DATA_UNAVAILABLE
+
+    with_switch = _plan(
+        [_task("t1")],
+        [_executor("claude_code", cost=0.0)],
+        DispatchPolicy(),
+        kill_switch_engaged=True,
+        policy_unknown=True,
+    )
+    assert with_switch.decisions[0].reason == models.DEFER_KILL_SWITCH
+
+
+def test_a_policy_gated_plan_serializes_as_valid_json():
+    import json
+
+    plan = _plan(
+        [_task("t1")], [_executor("ollama", cost=0.0)], DispatchPolicy(),
+        policy_unknown=True,
+    )
+    payload = json.loads(json.dumps(plan.as_dict()))
+    assert payload["policy_unknown"] is True
+    assert payload["assignment_count"] == 0
+    assert payload["decisions"][0]["reason"] == "policy_data_unavailable"
+    assert payload["decisions"][0]["explanation"]

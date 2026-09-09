@@ -23,6 +23,7 @@ ASSIGNED = "assigned"
 DEFER_KILL_SWITCH = "kill_switch_engaged"
 DEFER_COST_DATA_UNAVAILABLE = "cost_data_unavailable"
 DEFER_CAPACITY_DATA_UNAVAILABLE = "capacity_data_unavailable"
+DEFER_POLICY_DATA_UNAVAILABLE = "policy_data_unavailable"
 DEFER_DAILY_BUDGET = "daily_budget_exhausted"
 DEFER_AGENT_BUDGET = "agent_budget_exceeded"
 DEFER_PROJECT_BUDGET = "project_budget_exceeded"
@@ -35,6 +36,7 @@ DEFER_REASONS = frozenset(
         DEFER_KILL_SWITCH,
         DEFER_COST_DATA_UNAVAILABLE,
         DEFER_CAPACITY_DATA_UNAVAILABLE,
+        DEFER_POLICY_DATA_UNAVAILABLE,
         DEFER_DAILY_BUDGET,
         DEFER_AGENT_BUDGET,
         DEFER_PROJECT_BUDGET,
@@ -60,6 +62,12 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "In-flight run counts could not be read: dispatch is refused until the "
         "runtime store is readable again, so per-agent concurrency limits can "
         "never be silently bypassed by a database outage."
+    ),
+    DEFER_POLICY_DATA_UNAVAILABLE: (
+        "The dispatch policy could not be read: dispatch is refused until it "
+        "is readable again, because the per-agent and per-project limits it "
+        "carries are expressed by their presence, so falling back to the "
+        "defaults would silently drop every configured guardrail."
     ),
     DEFER_DAILY_BUDGET: (
         "Assigning any eligible executor would exceed the daily spend budget."
@@ -365,6 +373,12 @@ class DispatchPlan:
     # capacity conservatively, it under-reports the work already running, which
     # lets a plan assign on top of runs it cannot see.
     capacity_unknown: bool = False
+    # True when the dispatch policy itself could not be read. Same posture, and
+    # the sharpest of the three: the defaults it would otherwise fall back to
+    # carry *empty* limit maps, and empty reads as "no per-agent concurrency
+    # limit, no per-agent spend limit, no project ceiling" — so an unreadable
+    # policy does not weaken the guardrails, it removes them.
+    policy_unknown: bool = False
 
     @property
     def assignments(self) -> tuple[DispatchDecision, ...]:
@@ -391,6 +405,7 @@ class DispatchPlan:
             "kill_switch_engaged": self.kill_switch_engaged,
             "budget_unknown": self.budget_unknown,
             "capacity_unknown": self.capacity_unknown,
+            "policy_unknown": self.policy_unknown,
             "daily_spend_usd": _json_safe(self.daily_spend_usd),
             "max_daily_spend_usd": _json_safe(self.max_daily_spend_usd),
             "projected_spend_usd": _json_safe(self.projected_spend_usd),

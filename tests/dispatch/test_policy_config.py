@@ -10,6 +10,8 @@ import json
 import math
 from pathlib import Path
 
+import pytest
+
 from command_center.dispatch import policy_config
 from command_center.http_auth.identity import Principal
 from command_center.dispatch.models import (
@@ -196,3 +198,115 @@ def test_update_policy_overlays_only_named_fields():
 
     # And it is persisted, not just returned.
     assert policy_config.load_policy(ROOT).prefer_local is False
+
+
+# --------------------------------------------------------------------------
+# A policy that exists but cannot be read is not the defaults
+# (VOYN-W0-AICC-DISPATCH-FAILCLOSED-FALSE)
+# --------------------------------------------------------------------------
+
+
+def _corrupt_the_policy_file(payload: str) -> Path:
+    path = policy_config.policy_file_path(ROOT)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+    return path
+
+
+def test_a_missing_policy_file_is_still_the_defaults():
+    # The case the fallback is actually for: a fresh install must dispatch.
+    path = policy_config.policy_file_path(ROOT)
+    if path.exists():
+        path.unlink()
+    assert policy_config.load_policy(ROOT).prefer_local is True
+
+
+def test_malformed_json_raises_instead_of_returning_defaults():
+    _corrupt_the_policy_file('{"per_agent_limits": {"claude_c')
+    with pytest.raises(policy_config.UnreadablePolicy):
+        policy_config.load_policy(ROOT)
+
+
+def test_an_empty_policy_file_is_a_torn_write_not_an_unset_policy():
+    # `atomic_write_json` never produces zero bytes, so emptiness is a failed
+    # write — and reading it as "unset" would drop every configured limit.
+    _corrupt_the_policy_file("")
+    with pytest.raises(policy_config.UnreadablePolicy):
+        policy_config.load_policy(ROOT)
+
+
+def test_a_json_document_that_is_not_an_object_raises():
+    for payload in ("[1, 2, 3]", '"a string"', "null", "42"):
+        _corrupt_the_policy_file(payload)
+        with pytest.raises(policy_config.UnreadablePolicy):
+            policy_config.load_policy(ROOT)
+
+
+def test_an_unreadable_policy_file_raises_rather_than_reading_as_unconfigured():
+    path = _corrupt_the_policy_file(json.dumps({"prefer_local": False}))
+    path.chmod(0o000)
+    try:
+        with pytest.raises(policy_config.UnreadablePolicy):
+            policy_config.load_policy(ROOT)
+    finally:
+        path.chmod(0o644)
+
+
+def test_a_corrupt_policy_no_longer_reads_as_a_guardrail_free_one():
+    # The measured fail-open, stated as the property that closes it. An
+    # operator's per-agent and per-project limits must not be *silently*
+    # replaced by empty maps, because empty means "no limit".
+    healthy = DispatchPolicy(
+        cost_matrix={"claude_code": 0.5},
+        per_agent_limits={
+            "claude_code": AgentLimit(max_concurrent=1, max_spend_usd=0.5)
+        },
+        per_project_limits={"AICC": 2.0},
+    )
+    policy_config.save_policy(ROOT, healthy, actor="init")
+    loaded = policy_config.load_policy(ROOT)
+    assert loaded.per_agent_limits["claude_code"].max_concurrent == 1
+    assert loaded.per_project_limits == {"AICC": 2.0}
+
+    _corrupt_the_policy_file('{"per_agent_limits": {"claude_c')
+    with pytest.raises(policy_config.UnreadablePolicy):
+        policy_config.load_policy(ROOT)
+
+
+def test_update_policy_refuses_to_persist_over_an_unreadable_policy():
+    # Editing one field is not consent to drop every limit the file held. A
+    # merge onto the defaults would write the empty limit maps back to disk
+    # under an authenticated operator's name, turning a recoverable corrupt
+    # file into a permanently guardrail-free one.
+    policy_config.save_policy(
+        ROOT,
+        DispatchPolicy(
+            per_agent_limits={
+                "claude_code": AgentLimit(max_concurrent=1, max_spend_usd=0.5)
+            },
+            per_project_limits={"AICC": 2.0},
+        ),
+        actor="init",
+    )
+    path = _corrupt_the_policy_file('{"per_agent_limits": {"claude_c')
+
+    with pytest.raises(policy_config.UnreadablePolicy):
+        policy_config.update_policy(
+            ROOT,
+            {"prefer_local": False},
+            principal=Principal(principal_id="editor", tenant_id="tenant-1"),
+        )
+
+    # Nothing was written: the corrupt bytes are still there, so the operator
+    # can restore the file rather than discover the limits were quietly lost.
+    assert path.read_text(encoding="utf-8") == '{"per_agent_limits": {"claude_c'
+
+
+def test_save_policy_is_the_remedy_for_a_corrupt_file():
+    # `save_policy` states the whole policy rather than inheriting the
+    # unreadable part, so it stays available as the repair path.
+    _corrupt_the_policy_file("{not json")
+    policy_config.save_policy(
+        ROOT, DispatchPolicy(per_project_limits={"AICC": 3.0}), actor="repair"
+    )
+    assert policy_config.load_policy(ROOT).per_project_limits == {"AICC": 3.0}
