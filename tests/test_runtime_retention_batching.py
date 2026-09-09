@@ -355,3 +355,159 @@ def test_apply_runtime_retention_failure_keeps_committed_batches_and_resumes(
     assert removed == OLD_EVENTS - 2 * BATCH_SIZE
     assert _event_count(db_path, old_run) == 0
     assert _event_count(db_path, fresh_run) == 3
+
+
+class _RecordingCursor:
+    """Wraps a cursor to count the rows actually handed back to the caller."""
+
+    def __init__(self, cursor, record: dict):
+        self._cursor = cursor
+        self._record = record
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        self._record["rows"] += len(rows)
+        return rows
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is not None:
+            self._record["rows"] += 1
+        return row
+
+    def __iter__(self):
+        for row in self._cursor:
+            self._record["rows"] += 1
+            yield row
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _RecordingConnection:
+    """Records every statement issued, with how many rows it deleted (DML) or
+    handed back (reads)."""
+
+    def __init__(self, conn, statements: list[dict]):
+        self._conn = conn
+        self._statements = statements
+
+    def execute(self, sql, parameters=(), /):
+        cursor = self._conn.execute(sql, parameters)
+        record = {
+            "sql": " ".join(sql.split()),
+            "params": len(parameters),
+            "rows": 0,
+            # Valid immediately after a DML statement; meaningless (-1) for reads.
+            "deleted": cursor.rowcount,
+        }
+        self._statements.append(record)
+        return _RecordingCursor(cursor, record)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _record_statements(
+    monkeypatch, module, probe_target: str = "connect"
+) -> list[dict]:
+    """Record every statement the sweep issues through `module`'s `connect`."""
+    statements: list[dict] = []
+    original = getattr(module, probe_target)
+
+    @contextlib.contextmanager
+    def _recording_connect(db_path):
+        with original(db_path) as conn:
+            yield _RecordingConnection(conn, statements)
+
+    monkeypatch.setattr(module, probe_target, _recording_connect)
+    return statements
+
+
+def _run_event_statements(statements: list[dict]) -> tuple[list[dict], list[dict]]:
+    """The `run_event` deletes and the `run_event` reads, in issue order."""
+    touching = [s for s in statements if "run_event" in s["sql"]]
+    deletes = [s for s in touching if s["sql"].startswith("DELETE")]
+    reads = [s for s in touching if s["sql"].startswith("SELECT")]
+    return deletes, reads
+
+
+def test_apply_runtime_retention_never_issues_an_unbounded_statement(
+    tmp_path, monkeypatch
+):
+    """The acceptance criterion, pinned per *statement* rather than per
+    transaction: no single `DELETE` may remove more than `batch_size` rows, and
+    no single read may hand back more than `batch_size` rows.
+
+    Counting transactions proves the sweep committed more than once, but it
+    cannot catch a regression that keeps the loop and widens the statement
+    inside it — restoring the predicate `DELETE` (`WHERE run_id IN (SELECT
+    ...)`) would bind only a handful of parameters and still delete the entire
+    backlog in one statement. Row counts are what actually bound the work.
+    """
+    db_path = tmp_path / "runtime.db"
+    old_run, fresh_run = _seed(db_path, old_events=OLD_EVENTS, fresh_events=3)
+
+    statements = _record_statements(monkeypatch, db)
+
+    removed = db.apply_runtime_retention(
+        db_path, retention_days=30, batch_size=BATCH_SIZE
+    )
+
+    assert removed == OLD_EVENTS
+    assert _event_count(db_path, old_run) == 0
+    assert _event_count(db_path, fresh_run) == 3
+
+    deletes, reads = _run_event_statements(statements)
+    # 25 rows in batches of 10 cannot be one statement's worth of work.
+    assert len(deletes) == 3
+    assert [s["deleted"] for s in deletes] == [BATCH_SIZE, BATCH_SIZE, 5]
+    assert sum(s["deleted"] for s in deletes) == OLD_EVENTS
+    for statement in deletes:
+        assert statement["deleted"] <= BATCH_SIZE, statement
+        # Deleting by explicit id keeps each batch's delete count equal to what
+        # was just read; a predicate delete would bind no ids at all.
+        assert statement["params"] == statement["deleted"], statement
+    assert reads  # the doomed set is read, never assumed
+    for statement in reads:
+        assert statement["rows"] <= BATCH_SIZE, statement
+
+
+def test_archive_and_prune_never_reads_the_whole_doomed_set_into_memory(
+    tmp_path, monkeypatch
+):
+    """`archive_and_prune`'s extra sin in the ticket was `fetchall()`-ing every
+    doomed row before writing the archive. Each read must stay within one batch
+    — and every archived row must still reach the archive.
+    """
+    db_path = tmp_path / "runtime.db"
+    old_run, fresh_run = _seed(db_path, old_events=OLD_EVENTS, fresh_events=3)
+
+    statements = _record_statements(monkeypatch, maintenance)
+
+    report = maintenance.archive_and_prune(
+        db_path,
+        retention_days=30,
+        archive_dir=tmp_path / "cold",
+        batch_size=BATCH_SIZE,
+    )
+
+    assert report["archived_events"] == report["pruned_events"] == OLD_EVENTS
+    assert _event_count(db_path, old_run) == 0
+    assert _event_count(db_path, fresh_run) == 3
+
+    deletes, reads = _run_event_statements(statements)
+    assert len(deletes) == 3
+    assert [s["deleted"] for s in deletes] == [BATCH_SIZE, BATCH_SIZE, 5]
+    for statement in deletes:
+        assert statement["deleted"] <= BATCH_SIZE, statement
+        assert statement["params"] == statement["deleted"], statement
+    assert reads
+    for statement in reads:
+        # The full-row reads that feed the archive are the ones the ticket
+        # named; none of them may span the whole backlog.
+        assert statement["rows"] <= BATCH_SIZE, statement
+
+    # Bounding the reads must not cost the archive any rows.
+    with gzip.open(report["archive_path"], "rt", encoding="utf-8") as handle:
+        assert sum(1 for _ in handle) == OLD_EVENTS
