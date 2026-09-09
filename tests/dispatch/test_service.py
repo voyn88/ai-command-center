@@ -58,10 +58,28 @@ def _spend(monkeypatch, value: float):
 
 
 def _spend_unavailable(monkeypatch):
+    """The store could not be queried. `SpendUnknownError` — not a bare
+    `RuntimeError` — because that typed signal is now the *only* failure the
+    service treats as "the spend is unknown"; anything else is a bug and must
+    propagate (see `test_plan_lets_a_bug_in_the_spend_read_propagate`)."""
+
     def _raise(*_a, **_k):
-        raise RuntimeError("db unreachable")
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SPEND_UNKNOWN_STORAGE_UNAVAILABLE, "db unreachable"
+        )
 
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+
+
+def _ceiling(value: float):
+    """Configure a real daily ceiling — the only configuration in which the
+    trailing-24h spend is measured at all."""
+    import dataclasses
+
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=value)
+    )
 
 
 def _enable_master_switch():
@@ -143,6 +161,7 @@ def test_collect_queued_tasks_reads_pin_and_priority(monkeypatch):
 
 def test_plan_prefers_free_local_executor(monkeypatch, pool):
     _enable_master_switch()
+    _ceiling(5.0)
     _spend(monkeypatch, 0.0)
     policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
     _queued_task(title="t1")
@@ -186,14 +205,13 @@ def test_plan_enforces_daily_budget_from_pipeline_settings(monkeypatch, pool):
     assert plan.decisions[0].reason == models.DEFER_DAILY_BUDGET
 
 
-def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
-    monkeypatch, pool
-):
-    # The exact repro from the bug report: master switch on, default
-    # `pipeline_settings` (max_daily_spend_usd=0.0, i.e. no configured cap),
-    # default policy (ollama cost 0.0, prefer_local=True) — a DB outage on the
-    # spend read must still refuse dispatch, not assign 2-for-2.
+def test_plan_fails_closed_when_cost_data_is_unavailable(monkeypatch, pool):
+    # Master switch on, a configured ceiling, default policy (ollama cost 0.0,
+    # prefer_local=True) — a DB outage on the spend read must refuse dispatch,
+    # not assign 2-for-2. A free executor cannot sidestep it: the gate is
+    # structural, not arithmetic.
     _enable_master_switch()
+    _ceiling(5.0)
     _spend_unavailable(monkeypatch)
     policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
     _queued_task(title="t1")
@@ -221,6 +239,7 @@ def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
 
 def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
     _enable_master_switch()
+    _ceiling(5.0)
     _spend_unavailable(monkeypatch)
     policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
     task = _queued_task(title="t1")
@@ -231,6 +250,83 @@ def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
     assert result["reason"] == "cost_data_unavailable"
     stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
     assert stored.get("executor") in (None, "")
+
+
+def test_plan_never_measures_the_spend_without_a_ceiling(monkeypatch, pool):
+    """`max_daily_spend_usd <= 0` (the default) means there is no ceiling, so
+    the trailing-24h spend is not read at all — and a store that cannot be
+    queried therefore cannot stop dispatch in a configuration where no figure
+    would gate anything. The plan says so explicitly (`not_measured`) instead
+    of reporting a `0.0` nobody measured."""
+    _enable_master_switch()
+
+    def _never(*_a, **_k):
+        raise AssertionError("the spend must not be measured without a ceiling")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _never)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert plan.budget_unknown is False
+    assert plan.assignments[0].assigned_executor == "ollama"
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_NOT_MEASURED
+    assert plan.as_dict()["spend_measurement"] == {
+        "status": "not_measured",
+        "kind": "unknown",
+    }
+
+
+def test_plan_lets_a_bug_in_the_spend_read_propagate(monkeypatch, pool):
+    """`except Exception` around the spend read also caught `AttributeError`,
+    `KeyError` and a mistyped call — bugs, silently converted into "cost data
+    unavailable". Only `SpendUnknownError` means that; anything else flies."""
+    _enable_master_switch()
+    _ceiling(5.0)
+
+    def _bug(*_a, **_k):
+        raise AttributeError("'NoneType' object has no attribute 'db_path'")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _bug)
+    _queued_task(title="t1")
+
+    with pytest.raises(AttributeError):
+        service.plan(ROOT)
+
+
+def test_both_callers_of_the_spend_primitive_agree_on_a_corrupt_cost_event(
+    monkeypatch, pool
+):
+    """The two callers of `task_pipeline.daily_spend_usd` — this service and
+    `task_pipeline.tick` — must reach the same verdict on the same corrupt
+    row: refuse to dispatch, and report it as an unestablished spend rather
+    than as a ceiling that was reached. Here: the service half (the tick half
+    is `test_tick_reports_an_unreadable_spend_as_unknown_not_as_the_cap_being_hit`
+    in `tests/test_task_pipeline_e2e.py`). Previously one caller turned this
+    into "budget exhausted" and the other was not wrapped at all."""
+    _enable_master_switch()
+    _ceiling(5.0)
+
+    def _corrupt(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SPEND_UNKNOWN_CORRUPT_COST_EVENT, "unparseable payload_json"
+        )
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _corrupt)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert plan.budget_unknown is True
+    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+    # Not "the ceiling was reached" — nobody measured it.
+    assert plan.daily_spend_usd is None
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_UNAVAILABLE
 
 
 # --------------------------------------------------------------------------

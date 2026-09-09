@@ -6,6 +6,8 @@ database, no filesystem, no HTTP — the engine is pure by construction.
 
 from __future__ import annotations
 
+import pytest
+
 from command_center.dispatch import models
 from command_center.dispatch.models import (
     AgentLimit,
@@ -201,6 +203,66 @@ def test_budget_unknown_reports_no_spend_figure_rather_than_a_fabricated_zero():
     assert plan.as_dict()["daily_spend_usd"] is None
     assert plan.as_dict()["projected_spend_usd"] is None
     assert plan.as_dict()["budget_remaining_usd"] is None
+
+
+def test_unmeasured_spend_without_a_ceiling_plans_normally_and_says_so():
+    """With `max_daily_spend_usd <= 0` there is no ceiling, so the caller does
+    not read the trailing-24h spend at all and passes `None` with
+    `budget_unknown=False`. Nothing gates on the figure, so planning proceeds
+    — but the plan reports the provenance as `not_measured` and keeps every
+    spend field `None` rather than inventing the `0.0` nobody measured."""
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+
+    plan = _plan(
+        [_task("t1")],
+        executors,
+        policy,
+        daily_spend_usd=None,
+        max_daily_spend_usd=0.0,
+    )
+
+    assert plan.budget_unknown is False
+    assert plan.assignments[0].assigned_executor == "ollama"
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_NOT_MEASURED
+    assert plan.as_dict()["spend_measurement"] == {
+        "status": "not_measured",
+        "kind": "unknown",
+    }
+
+
+def test_an_unmeasured_spend_under_a_live_ceiling_is_refused_loudly():
+    """The one combination that must never be planned: a real ceiling to
+    enforce and no figure to enforce it against, without the caller saying
+    `budget_unknown`. Quietly treating the missing figure as 0 is exactly the
+    fail-open this engine exists to prevent, so it raises instead."""
+    policy = DispatchPolicy()
+
+    with pytest.raises(ValueError):
+        _plan(
+            [_task("t1")],
+            [_executor("claude_code", cost=0.5)],
+            policy,
+            daily_spend_usd=None,
+            max_daily_spend_usd=5.0,
+        )
+
+
+def test_a_measured_spend_still_reports_actual_provenance():
+    policy = DispatchPolicy()
+    plan = _plan(
+        [_task("t1")],
+        [_executor("claude_code", cost=0.5)],
+        policy,
+        daily_spend_usd=0.25,
+        max_daily_spend_usd=5.0,
+    )
+
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_ACTUAL
+    assert plan.daily_spend_usd == 0.25
+    assert plan.projected_spend_usd == pytest.approx(0.75)
 
 
 def test_budget_unknown_defers_everything_with_a_nonzero_ceiling_and_free_executor():

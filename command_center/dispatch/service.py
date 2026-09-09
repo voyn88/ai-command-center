@@ -23,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from command_center import activity_log
 from command_center import executors as executors_module
 from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
@@ -177,13 +178,37 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # `0.0`, so the reported `daily_spend_usd`/`projected_spend_usd` in the
     # plan also read as "unknown" rather than "nothing spent today" — the same
     # fail-closed standard the assignment decision already gets.
+    #
+    # Two things this deliberately does *not* do:
+    #
+    # * It does not measure when there is no ceiling (`max_daily_spend_usd <=
+    #   0`, the default). Nothing would gate on the figure, so a DB outage or
+    #   one corrupt cost event must not be able to block dispatch there. The
+    #   plan then reports the spend as `not_measured` rather than as a `0.0`
+    #   nobody read — same rule as everywhere else in this contract.
+    # * It does not catch `Exception`. Only `SpendUnknownError` — the typed
+    #   "this sum is not knowable" signal — means "fail closed"; an
+    #   `AttributeError`/`KeyError`/mistyped call inside `daily_spend_usd` is
+    #   a bug and flies up instead of being laundered into a budget verdict.
+    #   `task_pipeline.tick` handles the identical exception the identical
+    #   way, so the two callers of this primitive cannot drift apart on the
+    #   same corrupt row.
     budget_unknown = False
-    spend: float | None
-    try:
-        spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
-        spend = None
-        budget_unknown = True
+    spend: float | None = None
+    if settings.max_daily_spend_usd > 0:
+        try:
+            spend = task_pipeline.daily_spend_usd(resolved_db)
+        except task_pipeline.SpendUnknownError as exc:
+            spend = None
+            budget_unknown = True
+            activity_log.log_event(
+                task_pipeline.EV_PIPELINE_SPEND_UNKNOWN,
+                message=(
+                    "Диспетчеризация остановлена: расход за 24ч не удалось установить "
+                    f"({exc.kind}) — потолок ${settings.max_daily_spend_usd:.2f} "
+                    f"не проверен. {exc}"
+                ),
+            )
 
     return plan_dispatch(
         collect_queued_tasks(root),
