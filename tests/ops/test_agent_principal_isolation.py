@@ -2110,3 +2110,22 @@ def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monke
     with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
         launcher._write_back_model_auth("claude", home)
     assert store.read_bytes() == old
+
+
+def test_codex_workspace_write_unit_exposes_proc_sys_for_bwrap_only_there(launcher, monkeypatch, tmp_path):
+    """VOYN-W0-AICC-CODEX-WORKSPACE-WRITE-PREFLIGHT-FAILS-UNDER-ISOLATION: bwrap
+    needs /proc/sys/kernel/overflowuid; ProcSubset=pid hid it and every
+    mutating Codex run failed. Only the Codex write profile widens the subset;
+    /proc/sys stays read-only via ProtectKernelTunables."""
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *args, **kwargs: False)
+
+    def command(**updates):
+        return launcher._systemd_command(
+            _manifest(tmp_path, **updates), Path("/run/aicc-agent-homes/t"),
+            "aicc-agent-t.service", "aicc-agent-launcher@t.service", tmp_path.parent, tmp_path,
+        )
+
+    assert "--property=ProcSubset=all" in command(executor="codex", profile="trusted_development")
+    assert "--property=ProcSubset=pid" in command(executor="codex", profile="read_only")
+    assert "--property=ProcSubset=pid" in command(executor="claude", profile="trusted_development")
+    assert "--property=ProtectKernelTunables=yes" in command(executor="codex", profile="trusted_development")

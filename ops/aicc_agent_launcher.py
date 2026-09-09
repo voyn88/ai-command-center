@@ -1038,7 +1038,15 @@ def _systemd_command(
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=tmpfs",
         "--property=ProtectProc=invisible",
-        "--property=ProcSubset=pid",
+        # Codex's workspace-write sandbox is bubblewrap, and bwrap reads
+        # /proc/sys/kernel/overflowuid before it can build its own namespace;
+        # ProcSubset=pid hides /proc/sys entirely, so every mutating Codex run
+        # died with "bwrap: Can't read /proc/sys/kernel/overflowuid" and the
+        # write-preflight never passed (worker-01 2026-09-09). /proc/sys stays
+        # read-only (ProtectKernelTunables) and the read-only profile keeps the
+        # tighter subset -- it never needs bwrap.
+        "--property=ProcSubset="
+        + ("all" if executor == "codex" and manifest["profile"] != "read_only" else "pid"),
         "--property=ProtectControlGroups=yes",
         "--property=ProtectKernelTunables=yes",
         "--property=ProtectKernelModules=yes",
