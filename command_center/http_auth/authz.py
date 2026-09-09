@@ -28,8 +28,16 @@ Where the grants live. The map is configuration, not source: a JSON file named
 by ``AICC_HTTP_GRANTS_FILE`` mapping ``principal_id -> [operation, ...]``. An
 absent file is not an error and not an implicit allow — it is an empty map, so
 an unconfigured deployment refuses every mutating request. A file naming an
-operation outside :data:`OPERATIONS` raises at load: a typo must not quietly
-become a grant that never matches, nor a guard that never fires.
+operation outside :data:`OPERATIONS` or :data:`CONSOLE_OPERATIONS` raises at
+load: a typo must not quietly become a grant that never matches, nor a guard
+that never fires.
+
+One grant file, two closed inventories. :data:`OPERATIONS` covers the 29 HTTP
+routes and is checked bidirectionally against
+``routing.ROUTE_OPERATIONS`` (an operation nothing routes to is dead).
+:data:`CONSOLE_OPERATIONS` covers privileged actions reachable from the
+Streamlit console, which has no route table to agree with, so it is its own
+inventory rather than folded into ``OPERATIONS`` — see :func:`is_console_permitted`.
 """
 
 from __future__ import annotations
@@ -40,9 +48,11 @@ from pathlib import Path
 from types import MappingProxyType
 
 __all__ = [
+    "CONSOLE_OPERATIONS",
     "OPERATIONS",
     "GrantsConfigurationError",
     "UnknownOperationError",
+    "is_console_permitted",
     "is_permitted",
     "load_grants",
     "reset_grants_cache",
@@ -118,6 +128,32 @@ OPERATIONS: frozenset[str] = frozenset(
     }
 )
 
+#: The closed inventory of privileged operations reachable from the Streamlit
+#: console (``app.py`` / ``command_center/ui/``), gated by
+#: ``command_center.ui.console_identity.require_console_operation``.
+#:
+#: This is a second closed inventory rather than a merger into
+#: :data:`OPERATIONS` on purpose: every entry in ``OPERATIONS`` is checked
+#: against ``routing.ROUTE_OPERATIONS`` in both directions (an operation
+#: nothing routes to is dead) — a check that is meaningless for a console
+#: action, which has no HTTP route to agree with. Merging the two sets would
+#: force that HTTP-specific invariant to either break or be weakened for
+#: every console entry added here. Keeping them disjoint (asserted by
+#: ``tests/http_auth/test_console_authorization.py``) also means an operation
+#: valid on one surface can never accidentally authorize the other, even
+#: though both are checked against the same grant file.
+#:
+#: Deliberately small at introduction (``VOYN-W0-AICC-CONSOLE-NO-AUTH``): the
+#: console reaches many more privileged call sites (agent launch, git writes,
+#: `gh` operations) than are gated today. Those are tracked as
+#: ``VOYN-W0-AICC-STREAMLIT-AUTHZ-DEEP-01`` rather than left unrecorded.
+CONSOLE_OPERATIONS: frozenset[str] = frozenset(
+    {
+        # app.py:run_start_task_script — scripts/start-task.sh
+        "console:start_task",
+    }
+)
+
 _EMPTY: MappingProxyType[str, frozenset[str]] = MappingProxyType({})
 
 _cache: tuple[str, float, MappingProxyType[str, frozenset[str]]] | None = None
@@ -146,7 +182,7 @@ def _parse(raw: object, source: str) -> MappingProxyType[str, frozenset[str]]:
             raise GrantsConfigurationError(
                 f"{source}: grants for {principal_id!r} must be a list of operation names"
             )
-        unknown = sorted(set(operations) - OPERATIONS)
+        unknown = sorted(set(operations) - OPERATIONS - CONSOLE_OPERATIONS)
         if unknown:
             # Fail closed and loud. An unrecognised operation name is either a
             # typo (a grant that would never match) or a stale name left behind
@@ -194,5 +230,17 @@ def load_grants() -> MappingProxyType[str, frozenset[str]]:
 def is_permitted(principal_id: str, operation: str) -> bool:
     """Deny by default. An unknown *operation* is an error, not a denial."""
     if operation not in OPERATIONS:
+        raise UnknownOperationError(operation)
+    return operation in load_grants().get(principal_id, frozenset())
+
+
+def is_console_permitted(principal_id: str, operation: str) -> bool:
+    """Deny by default, for :data:`CONSOLE_OPERATIONS` instead of :data:`OPERATIONS`.
+
+    Same grant file, same memoisation, same shape as :func:`is_permitted` —
+    only the closed inventory checked against differs, because the console's
+    operations have no HTTP route to be validated against.
+    """
+    if operation not in CONSOLE_OPERATIONS:
         raise UnknownOperationError(operation)
     return operation in load_grants().get(principal_id, frozenset())

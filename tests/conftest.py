@@ -11,6 +11,7 @@ its *contents* between tests rather than re-pointing it.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import shlex
@@ -40,6 +41,43 @@ def restore_main_module_after_streamlit_apptest():
 
 _TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="aicc_test_data_"))
 os.environ["AICC_DATA_DIR"] = str(_TEST_DATA_DIR)
+
+
+@pytest.fixture(autouse=True)
+def bypass_console_identity_gate(request, monkeypatch):
+    """Every AppTest-driven UI test in this suite (~150 call sites across
+    tests/test_*_ui.py etc.) exercises page *behavior*, not the identity gate
+    itself: `app.py`'s top-level `console_identity.require_identity()` call
+    (VOYN-W0-AICC-CONSOLE-NO-AUTH) would otherwise dead-end every one of them
+    on the sign-in form before any page content renders.
+
+    It also fixes a bare-import hazard: `isolated_generated_dir` below does a
+    plain `import app` with no Streamlit `ScriptRunContext`, and `st.stop()` is
+    a silent no-op with no such context (confirmed against streamlit's own
+    `stop()` — it only acts `if ctx and ctx.script_requests`), so without this
+    running first, `_render_login`'s "not submitted" branch falls straight
+    through into an `UnboundLocalError` reading an unset `principal`.
+    `isolated_generated_dir` below requests this fixture by name (rather than
+    relying on autouse declaration order) precisely to force it to run first.
+
+    The gate's own behaviour (login form, re-verification, deny/fail-closed
+    paths) is covered for real, with this bypass switched off via the
+    `console_identity_gate` marker, by `tests/test_console_identity.py`.
+    """
+    if request.node.get_closest_marker("console_identity_gate"):
+        yield
+        return
+    try:
+        from command_center.ui import console_identity
+    except ImportError:
+        yield
+        return
+    from command_center.http_auth.identity import Principal
+
+    fake_principal = Principal(principal_id="test-operator", tenant_id="test-tenant", capabilities=())
+    monkeypatch.setattr(console_identity, "require_identity", lambda **_kwargs: fake_principal)
+    monkeypatch.setattr(console_identity, "require_console_operation", lambda _operation: fake_principal)
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -154,7 +192,7 @@ def isolated_module_data_constants(isolated_data_dir, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def isolated_generated_dir(isolated_data_dir, monkeypatch):
+def isolated_generated_dir(isolated_data_dir, monkeypatch, bypass_console_identity_gate):
     """Closes the same class of gap `isolated_reports_dir` closes for `REPORTS_ROOT`,
     for `app.GENERATED_DIR` / `command_center.workspace_home.GENERATED_DIR` (both
     `ROOT / "generated"`).
@@ -200,10 +238,41 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
     hard-imports streamlit at line 10, so on a headless worker machine this
     autouse fixture would fail setup for every test in the tree — including
     the worker-daemon tests whose whole point is running where the desktop
-    does not. No streamlit means no `app`, means nothing here to isolate."""
+    does not. No streamlit means no `app`, means nothing here to isolate.
+
+    The `import app` below always runs with the identity gate faked, even for
+    a `console_identity_gate`-marked test where `bypass_console_identity_gate`
+    deliberately left it real: this import is a bare module exec with no
+    Streamlit `ScriptRunContext` (the same hazard class documented on that
+    fixture), so it must never be the thing that drives `console_identity`'s
+    real login flow — that is `tests/test_console_identity.py`'s job, run
+    through `AppTest`, which supplies a real context. Without this, a
+    real-gate test's own `import app` here would (a) hit the bare-mode
+    `st.stop()`-is-a-no-op hazard and, worse, (b) push an `st.form` block onto
+    the ambient `contextvars` state (`elements.form`'s `context_dg_stack`)
+    that a same-context `AppTest` run started moments later in the test body
+    inherits, surfacing as a spurious "Forms cannot be nested in other forms"
+    on the test's own, unrelated first `st.form` call. Scoped to only this
+    import (`pytest.MonkeyPatch.context()` undoes on exit) so the test body's
+    own `AppTest` run still exercises the real gate."""
     try:
-        import app
+        from command_center.ui import console_identity
+        from command_center.http_auth.identity import Principal
     except ImportError:
+        console_identity = None
+
+    identity_ctx = pytest.MonkeyPatch.context() if console_identity is not None else contextlib.nullcontext()
+    with identity_ctx as identity_patch:
+        if identity_patch is not None:
+            fake_principal = Principal(principal_id="test-operator", tenant_id="test-tenant", capabilities=())
+            identity_patch.setattr(console_identity, "require_identity", lambda **_kwargs: fake_principal)
+            identity_patch.setattr(console_identity, "require_console_operation", lambda _operation: fake_principal)
+        try:
+            import app
+        except ImportError:
+            app = None
+
+    if app is None:
         yield
         return
     from command_center import workspace_home
