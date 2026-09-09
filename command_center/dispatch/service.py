@@ -20,6 +20,7 @@ the task up and launches it on the recorded executor.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,8 @@ from command_center.runtime import db as runtime_db
 
 if TYPE_CHECKING:  # a type-only import: the service layer stays free of FastAPI
     from command_center.http_auth.identity import Principal
+
+logger = logging.getLogger(__name__)
 
 # Kanban statuses that mean "waiting to be dispatched" — not yet running,
 # not in review, not done. These are the only tasks a dispatch plan considers.
@@ -124,15 +127,19 @@ def collect_queued_tasks(root: Path) -> list[QueuedTask]:
 
 def active_by_executor(db_path: Path) -> dict[str, int]:
     """Count currently-active runs per executor, so per-agent concurrency
-    limits account for work already in flight. Read-only; a query failure
-    yields an empty map (the concurrency guard then only counts this plan's own
-    assignments, which is still safe — it can never *raise* a limit)."""
+    limits account for work already in flight. Read-only.
+
+    A read failure **propagates** — it is not swallowed into an empty map. An
+    empty map is not a conservative guess: it says "nothing is running", which
+    raises the effective concurrency ceiling to the full per-agent limit on top
+    of however many runs are actually in flight but unreadable. `plan()` turns
+    the failure into the `capacity_unknown` gate instead, which fails closed.
+    Individual malformed *rows* are still skipped (a row that cannot be read
+    is not a store that cannot be read).
+    """
     counts: dict[str, int] = {}
-    try:
-        with runtime_db.connect(db_path) as conn:
-            rows = conn.execute("SELECT provider_id, state FROM run").fetchall()
-    except Exception:  # noqa: BLE001
-        return counts
+    with runtime_db.connect(db_path) as conn:
+        rows = conn.execute("SELECT provider_id, state FROM run").fetchall()
     for row in rows:
         try:
             state = row["state"]
@@ -174,12 +181,47 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # past any ceiling either. Only an explicit gate, structurally checked in
     # `plan_dispatch` before any assignment (like the kill switch), actually
     # stops dispatch.
+    #
+    # Note the deliberate consequence: a runtime store that has never been
+    # migrated reads the same as one that is corrupt, and both refuse. This
+    # module does not migrate it into existence to make the refusal go away —
+    # `plan()` is a dry run and DDL is not its business, and "CREATE TABLE IF
+    # NOT EXISTS then report $0 spend" would hand back exactly the fail-open
+    # this gate exists to close. The remedy is to initialize the store (any
+    # normal app/supervisor startup does), and the log line below names the
+    # store and carries the underlying error so an outage, a missing file and
+    # a corrupt file stay tellable apart.
     budget_unknown = False
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
     except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
+        # Logged with the traceback because the *plan* deliberately reports
+        # only the typed reason: an operator still has to be able to tell a
+        # missing/locked database from a corrupt one, and that distinction
+        # belongs in the log, not in an HTTP response.
+        logger.warning(
+            "dispatch: trailing-24h spend unreadable at %s — failing closed "
+            "(budget_unknown)",
+            resolved_db,
+            exc_info=True,
+        )
         spend = 0.0
         budget_unknown = True
+
+    # Same posture for the in-flight run counts: unreadable capacity data is a
+    # gate, never an empty map (see `active_by_executor`).
+    capacity_unknown = False
+    try:
+        active = active_by_executor(resolved_db)
+    except Exception:  # noqa: BLE001 — no run counts => fail closed: block dispatch
+        logger.warning(
+            "dispatch: in-flight run counts unreadable at %s — failing closed "
+            "(capacity_unknown)",
+            resolved_db,
+            exc_info=True,
+        )
+        active = {}
+        capacity_unknown = True
 
     return plan_dispatch(
         collect_queued_tasks(root),
@@ -189,7 +231,8 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         max_daily_spend_usd=settings.max_daily_spend_usd,
         kill_switch_engaged=kill_switch_engaged,
         budget_unknown=budget_unknown,
-        active_by_executor=active_by_executor(resolved_db),
+        capacity_unknown=capacity_unknown,
+        active_by_executor=active,
     )
 
 
@@ -214,10 +257,11 @@ def assign(
     process — the existing pipeline does that on the recorded executor, so
     supervisor semantics are untouched.
 
-    Fail-closed: if the kill switch is engaged, or the trailing-24h spend
-    could not be read, nothing is applied even when the caller passed
-    `confirmed=True`. `confirmed` is a required explicit opt-in for the
-    *write*, mirroring every other mutating action in this codebase.
+    Fail-closed: if the kill switch is engaged, or the trailing-24h spend or
+    the in-flight run counts could not be read, nothing is applied even when
+    the caller passed `confirmed=True`. `confirmed` is a required explicit
+    opt-in for the *write*, mirroring every other mutating action in this
+    codebase.
     """
     computed = plan(root, db_path=db_path)
 
@@ -237,6 +281,12 @@ def assign(
         return {
             "applied": False,
             "reason": "cost_data_unavailable",
+            "plan": computed.as_dict(),
+        }
+    if computed.capacity_unknown:
+        return {
+            "applied": False,
+            "reason": "capacity_data_unavailable",
             "plan": computed.as_dict(),
         }
 

@@ -201,6 +201,38 @@ def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
     assert plan.decisions[0].reason == models.DEFER_KILL_SWITCH
 
 
+def test_capacity_unknown_defers_everything_even_when_budget_allows():
+    # In-flight run counts unreadable: an *empty* count map would say "nothing
+    # is running" and let the per-agent concurrency limit be spent all over
+    # again on top of runs nobody can see, so the gate blocks instead.
+    policy = DispatchPolicy(prefer_local=True, local_executor_ids=frozenset({"ollama"}))
+    executors = [_executor("ollama", cost=0.0, is_local=True)]
+    plan = _plan(
+        [_task("t1"), _task("t2")], executors, policy, capacity_unknown=True
+    )
+
+    assert plan.capacity_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_CAPACITY_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
+def test_budget_unknown_takes_priority_over_capacity_unknown_in_the_reason():
+    policy = DispatchPolicy()
+    plan = _plan(
+        [_task("t1")],
+        [_executor("claude_code", cost=0.0)],
+        policy,
+        budget_unknown=True,
+        capacity_unknown=True,
+    )
+
+    assert plan.budget_unknown is True
+    assert plan.capacity_unknown is True
+    assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
+
+
 # --------------------------------------------------------------------------
 # Kill switch is respected — nothing is assigned while engaged
 # --------------------------------------------------------------------------

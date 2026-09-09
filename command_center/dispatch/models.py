@@ -21,6 +21,7 @@ ASSIGNED = "assigned"
 # Deferred (stays queued). Each is a *typed* reason, never force-run.
 DEFER_KILL_SWITCH = "kill_switch_engaged"
 DEFER_COST_DATA_UNAVAILABLE = "cost_data_unavailable"
+DEFER_CAPACITY_DATA_UNAVAILABLE = "capacity_data_unavailable"
 DEFER_DAILY_BUDGET = "daily_budget_exhausted"
 DEFER_AGENT_BUDGET = "agent_budget_exceeded"
 DEFER_PROJECT_BUDGET = "project_budget_exceeded"
@@ -32,6 +33,7 @@ DEFER_REASONS = frozenset(
     {
         DEFER_KILL_SWITCH,
         DEFER_COST_DATA_UNAVAILABLE,
+        DEFER_CAPACITY_DATA_UNAVAILABLE,
         DEFER_DAILY_BUDGET,
         DEFER_AGENT_BUDGET,
         DEFER_PROJECT_BUDGET,
@@ -52,6 +54,11 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "Trailing-24h spend could not be read: dispatch is refused until cost "
         "data is available again, so budget guardrails can never be silently "
         "bypassed by a database outage."
+    ),
+    DEFER_CAPACITY_DATA_UNAVAILABLE: (
+        "In-flight run counts could not be read: dispatch is refused until the "
+        "runtime store is readable again, so per-agent concurrency limits can "
+        "never be silently bypassed by a database outage."
     ),
     DEFER_DAILY_BUDGET: (
         "Assigning any eligible executor would exceed the daily spend budget."
@@ -299,6 +306,11 @@ class DispatchPlan:
     # dispatch is refused wholesale rather than guessing a spend figure that a
     # zero/unset daily cap or a free executor could silently sail past.
     budget_unknown: bool = False
+    # True when the in-flight run counts could not be read. Same fail-closed
+    # posture, for the same reason: an *empty* count map does not under-report
+    # capacity conservatively, it under-reports the work already running, which
+    # lets a plan assign on top of runs it cannot see.
+    capacity_unknown: bool = False
 
     @property
     def assignments(self) -> tuple[DispatchDecision, ...]:
@@ -319,6 +331,7 @@ class DispatchPlan:
         return {
             "kill_switch_engaged": self.kill_switch_engaged,
             "budget_unknown": self.budget_unknown,
+            "capacity_unknown": self.capacity_unknown,
             "daily_spend_usd": self.daily_spend_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,

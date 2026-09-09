@@ -18,6 +18,7 @@ from command_center import task_pipeline
 from command_center.dispatch import models, policy_config, service
 from command_center.dispatch.models import DispatchPolicy, ExecutorProfile
 from command_center.http_auth.identity import Principal
+from command_center.runtime import db as runtime_db
 
 ROOT = Path("/unused-AICC_DATA_DIR-overrides")
 
@@ -62,6 +63,13 @@ def _spend_unavailable(monkeypatch):
         raise RuntimeError("db unreachable")
 
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+
+
+def _capacity_unavailable(monkeypatch):
+    def _raise(*_a, **_k):
+        raise RuntimeError("db unreachable")
+
+    monkeypatch.setattr(service, "active_by_executor", _raise)
 
 
 def _enable_master_switch():
@@ -217,6 +225,117 @@ def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
     assert result["reason"] == "cost_data_unavailable"
     stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
     assert stored.get("executor") in (None, "")
+
+
+def test_plan_fails_closed_when_in_flight_run_counts_are_unavailable(
+    monkeypatch, pool
+):
+    # Spend reads fine, but the run table does not: the concurrency guard would
+    # otherwise plan against "nothing is running" and assign 2-for-2.
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    _capacity_unavailable(monkeypatch)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+
+    plan = service.plan(ROOT)
+
+    assert plan.capacity_unknown is True
+    assert plan.budget_unknown is False
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_CAPACITY_DATA_UNAVAILABLE for d in plan.decisions
+    )
+
+
+def test_assign_is_a_noop_when_in_flight_run_counts_are_unavailable(monkeypatch, pool):
+    _enable_master_switch()
+    _spend(monkeypatch, 0.0)
+    _capacity_unavailable(monkeypatch)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    task = _queued_task(title="t1")
+
+    result = service.assign(ROOT, CALLER, confirmed=True)
+
+    assert result["applied"] is False
+    assert result["reason"] == "capacity_data_unavailable"
+    stored = {t["id"]: t for t in tasks_repository.load_tasks(ROOT)}[task["id"]]
+    assert stored.get("executor") in (None, "")
+
+
+def test_active_by_executor_propagates_an_unreadable_store(tmp_path):
+    # The read must NOT degrade to an empty map: `plan()` needs the failure to
+    # reach it so the `capacity_unknown` gate engages.
+    corrupt = tmp_path / "runtime.db"
+    corrupt.write_bytes(b"not a sqlite database")
+
+    with pytest.raises(Exception):
+        service.active_by_executor(corrupt)
+
+
+def _free_local_pool(monkeypatch):
+    """The default-shaped pool from the bug report: one free, available, local
+    executor — the configuration in which a simulated spend figure can never
+    exceed any ceiling."""
+    monkeypatch.setattr(
+        service,
+        "collect_executor_pool",
+        lambda policy: [
+            ExecutorProfile(
+                id="ollama", label="Ollama", kind="cli", is_local=True,
+                available=True, cost_per_task_usd=0.0,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        project_config, "allowed_execution_providers", lambda project_id: ("ollama",)
+    )
+
+
+def test_plan_assigns_end_to_end_against_a_readable_database(monkeypatch, tmp_path):
+    # Control arm for the test below: same defaults, nothing stubbed out over
+    # the two runtime.db reads, only the store is actually readable. This is
+    # the "2 of 2 assigned" the bug report measured — correct here, because the
+    # guardrail inputs really were consulted.
+    _enable_master_switch()
+    _free_local_pool(monkeypatch)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+    readable = tmp_path / "runtime.db"
+    runtime_db.migrate(readable)
+
+    plan = service.plan(ROOT, db_path=readable)
+
+    assert pipeline_settings.load_settings(ROOT).max_daily_spend_usd == 0.0
+    assert len(plan.assignments) == 2
+
+
+def test_plan_fails_closed_end_to_end_against_an_unreadable_database(
+    monkeypatch, tmp_path
+):
+    # The measured repro, with neither runtime.db read stubbed: default
+    # `pipeline_settings` (max_daily_spend_usd=0.0, so the ceiling check is
+    # skipped entirely) and a free local executor (whose $0 cost can never push
+    # a simulated total past a ceiling either) — exactly where the old "assume
+    # the ceiling is hit" fallback assigned 2 of 2. It must now assign none.
+    _enable_master_switch()
+    _free_local_pool(monkeypatch)
+    policy_config.save_policy(ROOT, DispatchPolicy(prefer_local=True))
+    _queued_task(title="t1")
+    _queued_task(title="t2")
+    unreadable = tmp_path / "runtime.db"
+    unreadable.write_bytes(b"not a sqlite database")
+
+    plan = service.plan(ROOT, db_path=unreadable)
+
+    assert pipeline_settings.load_settings(ROOT).max_daily_spend_usd == 0.0
+    assert plan.budget_unknown is True
+    assert plan.assignments == ()
+    assert all(
+        d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions
+    )
 
 
 # --------------------------------------------------------------------------

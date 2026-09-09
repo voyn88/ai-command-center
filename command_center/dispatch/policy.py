@@ -19,6 +19,13 @@ The hard guarantees, enforced structurally here:
    a simulated spend figure: a faked number can be silently absorbed by a
    zero/unset daily cap or by a free executor, which would make "no cost
    data" fail *open* instead of closed.
+1c. **Unknown in-flight capacity blocks everything too.** `capacity_unknown=True`
+   (the caller could not read the per-executor active-run counts) is the same
+   hard gate, deferring with `DEFER_CAPACITY_DATA_UNAVAILABLE`. Substituting an
+   empty count map is the same porous trick as a simulated spend: it does not
+   guess conservatively, it guesses *zero work in flight*, which raises the
+   effective concurrency limit exactly when the runtime store cannot be
+   consulted.
 2. **Budget is never exceeded.** An executor is only assigned when the
    *projected* cumulative spend (the trailing-24h spend already incurred plus
    every assignment made so far in this plan plus this one) stays at or under
@@ -39,6 +46,7 @@ from command_center.dispatch.models import (
     ASSIGNED,
     DEFER_AGENT_BUDGET,
     DEFER_AGENT_CAPACITY,
+    DEFER_CAPACITY_DATA_UNAVAILABLE,
     DEFER_COST_DATA_UNAVAILABLE,
     DEFER_DAILY_BUDGET,
     DEFER_KILL_SWITCH,
@@ -112,6 +120,7 @@ def plan_dispatch(
     max_daily_spend_usd: float,
     kill_switch_engaged: bool,
     budget_unknown: bool = False,
+    capacity_unknown: bool = False,
     active_by_executor: dict[str, int] | None = None,
 ) -> DispatchPlan:
     """Produce the dispatch plan. Pure and total; see module docstring for the
@@ -119,14 +128,19 @@ def plan_dispatch(
     active_by_executor = dict(active_by_executor or {})
     executor_by_id = {ex.id: ex for ex in executors}
 
-    # (1) Kill switch / unknown budget first: no assignment is even
-    #     considered. Checked ahead of the per-task loop, exactly like the
+    # (1) Kill switch / unreadable guardrail inputs first: no assignment is
+    #     even considered. Checked ahead of the per-task loop, exactly like the
     #     kill switch, so a caller can never accidentally leave a code path
-    #     that assigns while the trailing-24h spend is unreadable.
-    if kill_switch_engaged or budget_unknown:
-        reason = (
-            DEFER_KILL_SWITCH if kill_switch_engaged else DEFER_COST_DATA_UNAVAILABLE
-        )
+    #     that assigns while the trailing-24h spend or the in-flight run counts
+    #     are unreadable. The reason reported is the most fundamental of the
+    #     engaged gates, in that order.
+    if kill_switch_engaged or budget_unknown or capacity_unknown:
+        if kill_switch_engaged:
+            reason = DEFER_KILL_SWITCH
+        elif budget_unknown:
+            reason = DEFER_COST_DATA_UNAVAILABLE
+        else:
+            reason = DEFER_CAPACITY_DATA_UNAVAILABLE
         decisions = tuple(
             DispatchDecision(
                 task_id=t.id,
@@ -140,6 +154,7 @@ def plan_dispatch(
             decisions=decisions,
             kill_switch_engaged=kill_switch_engaged,
             budget_unknown=budget_unknown,
+            capacity_unknown=capacity_unknown,
             daily_spend_usd=daily_spend_usd,
             max_daily_spend_usd=max_daily_spend_usd,
             projected_spend_usd=daily_spend_usd,
