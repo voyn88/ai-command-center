@@ -383,3 +383,35 @@ def test_shipped_allowlist_covers_the_files_that_carry_paths_by_design():
     assert ["ops/ci/**", "WORKER_HOME"] in entries
     assert ["deploy/systemd/**", "WORKER_HOME"] in entries
     assert all(token == "WORKER_HOME" for _, token in entries)
+
+
+def test_mnemonic_prefixes_do_not_break_the_staged_file_lookup(repo):
+    """`git diff --cached` under diff.mnemonicPrefix labels the added side
+    `i/<path>`, and diff.noprefix drops the prefix entirely. The guard pins
+    a/ and b/ so the `+++` header stays the file's real path: otherwise a
+    carried path would be attributed to a file that does not exist and
+    refused (rule A can only ask about a file it can name)."""
+    _git(repo, "config", "diff.mnemonicPrefix", "true")
+    carrier = _on_main(repo, "deploy/install.sh", f"REPO={WORK_HOME}/Projects/aicc\n")
+    carrier.write_text(f"REPO={WORK_HOME}/Projects/aicc\ncd {WORK_HOME}/Projects/aicc\n")
+    _git(repo, "add", "-A")  # staged, not committed: the --cached scan
+    r = _guard(repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_a_path_starting_with_the_diff_prefix_is_not_mistruncated(repo):
+    """Pinning also disambiguates the header for a file that really lives
+    under `b/`: with diff.noprefix the header would read `+++ b/thing.sh`
+    and a naive prefix strip would look the base up under `thing.sh`."""
+    _git(repo, "config", "diff.noprefix", "true")
+    carrier = _on_main(repo, "b/install.sh", f"REPO={WORK_HOME}/Projects/aicc\n")
+    carrier.write_text(f"REPO={WORK_HOME}/Projects/aicc\ncd {WORK_HOME}/Projects/aicc\n")
+    _commit(repo, "carried path re-added")
+    r = _guard(repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    (repo / "b" / "leak.py").write_text(f'P = "{USER_HOME}/Desktop"\n')
+    _commit(repo, "leak")
+    r = _guard(repo)
+    assert r.returncode == 1
+    assert "leak.py" in r.stdout

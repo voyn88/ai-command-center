@@ -178,7 +178,11 @@ occurrence_is_exempt() {  # <base-ref> <path> <token>
 # Added lines with the file they land in. `+++ b/<path>` opens each file's
 # hunks; everything else starting with '+' is added content.
 added_lines_with_path() {
-    git diff --unified=0 "$@" -- . | awk '
+    # Prefixes pinned and quotepath off: the `+++ b/<path>` header is how the
+    # file is identified, and diff.mnemonicPrefix / diff.noprefix /
+    # core.quotepath in an operator's config would otherwise reshape it.
+    git -c core.quotepath=false diff --unified=0 \
+        --src-prefix=a/ --dst-prefix=b/ "$@" -- . | awk '
         /^\+\+\+ /{
             p = substr($0, 5)
             if (p ~ /^".*"$/) p = substr(p, 2, length(p) - 2)
