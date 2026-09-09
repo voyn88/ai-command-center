@@ -88,7 +88,11 @@ from pathlib import Path
 from typing import Any
 
 from command_center.orchestrator import github_app_auth
-from command_center.orchestrator.routing import cascade_for
+from command_center.orchestrator.routing import (
+    cascade_for,
+    model_only_review_cascade as _model_only_review_cascade,
+    verification_review_cascade as _verification_review_cascade,
+)
 
 __all__ = [
     "LoopReport",
@@ -457,35 +461,6 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # new contract rather than silently reusing a verdict given for an older,
 # looser policy.
 _REVIEW_POLICY_VERSION = "v8"
-
-_MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
-    {"copilot", "claude", "codex", "openai_http"}
-)
-
-
-def _model_only_review_cascade() -> list[dict[str, Any]]:
-    route = cascade_for("review")
-    return [
-        {**link, "task_type": "independent_review", "capability": "model_only"}
-        for link in route
-        if isinstance(link, dict)
-        and link.get("executor") in _MODEL_ONLY_REVIEW_EXECUTORS
-    ]
-
-
-def _verification_review_cascade() -> list[dict[str, Any]]:
-    """Same executor route as the reviews, different task type: a
-    `verification_review` run resolves to the read-only profile (Claude:
-    Read/Grep/Glob; Codex: `--sandbox read-only`) instead of MODEL_ONLY's
-    zero tools -- verification is exactly the task that must read the tree."""
-    route = cascade_for("review")
-    return [
-        {**link, "task_type": "verification_review", "capability": "read_only"}
-        for link in route
-        if isinstance(link, dict)
-        and link.get("executor") in _MODEL_ONLY_REVIEW_EXECUTORS
-    ]
-
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
     match = _PR_URL.match(pr_url)
