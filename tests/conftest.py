@@ -137,6 +137,20 @@ _RMTREE_RETRY_SLEEP_SECONDS = 0.025
 #: writer or deleter can make one `rmtree` pass fail while the next succeeds.
 _TRANSIENT_RMTREE_ERRNOS = frozenset({errno.ENOTEMPTY, errno.EBUSY, errno.ENOENT})
 
+#: The real clock, captured at import, because this teardown runs *before*
+#: `monkeypatch`'s undo. A test is free to patch `time.monotonic` on the shared
+#: `time` module — `tests/ops/test_agent_principal_isolation.py` drives a
+#: SIGTERM escalation with `monkeypatch.setattr(launcher.time, "monotonic",
+#: lambda: next(iter((0.0, 0.0, 11.0, 11.0, 12.0))))`, and `launcher.time` *is*
+#: the `time` module, so the patch is global. Calling `time.monotonic()` from a
+#: fixture teardown that runs while that patch is still installed exhausts the
+#: iterator and raises `StopIteration`, which surfaces as a teardown ERROR (and
+#: as `RuntimeError: generator raised StopIteration` through pytest-qt's
+#: teardown hook) — the same shard-killing shape this task exists to remove.
+#: Binding the functions here keeps the wait on a clock no test can replace.
+_monotonic = time.monotonic
+_sleep = time.sleep
+
 
 def live_background_writers() -> list[str]:
     """Everything in this process that could still write into the data dir.
@@ -187,14 +201,14 @@ def quiesce_background_writers(
     error rather than racing silently.
     """
     _stop_unbounded_pollers()
-    deadline = time.monotonic() + max(timeout, 0.0)
+    deadline = _monotonic() + max(timeout, 0.0)
     while True:
         writers = live_background_writers()
         if not writers:
             return []
-        if time.monotonic() >= deadline:
+        if _monotonic() >= deadline:
             return writers
-        time.sleep(_WRITER_QUIESCE_POLL_SECONDS)
+        _sleep(_WRITER_QUIESCE_POLL_SECONDS)
 
 
 def remove_data_dir_when_quiet(
@@ -215,7 +229,7 @@ def remove_data_dir_when_quiet(
             if error.errno not in _TRANSIENT_RMTREE_ERRNOS:
                 raise
             last_error = error
-            time.sleep(_RMTREE_RETRY_SLEEP_SECONDS)
+            _sleep(_RMTREE_RETRY_SLEEP_SECONDS)
     leftovers = sorted(entry.name for entry in directory.iterdir()) if directory.is_dir() else []
     raise AssertionError(
         f"Could not remove the isolated data dir {directory}: something kept "

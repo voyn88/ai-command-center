@@ -342,3 +342,38 @@ def test_a_real_run_is_still_a_live_writer_after_its_report_row_exists(
 
     conftest.remove_data_dir_when_quiet(data_dir)
     assert not data_dir.exists()
+
+
+def test_teardown_survives_a_test_that_patched_the_global_clock(data_dir_writer, monkeypatch):
+    """The teardown must not run on a clock a test is allowed to replace.
+
+    Fixture teardown runs *before* `monkeypatch`'s undo, so a test that patched
+    `time.monotonic` on the shared `time` module is still patched while the data
+    dir is removed. `tests/ops/test_agent_principal_isolation.py` does exactly
+    that — a finite iterator of five readings, because it is driving a SIGTERM
+    escalation deterministically — and `launcher.time` *is* the `time` module,
+    so the patch is global rather than scoped to the launcher.
+
+    A teardown that called `time.monotonic()` exhausted that iterator and raised
+    `StopIteration`, which pytest-qt's teardown hook re-raised as `RuntimeError:
+    generator raised StopIteration`. That is a teardown ERROR — the same thing
+    that fails a whole shard and the manifest gate, just reached by a different
+    route than the `rmtree` race itself.
+
+    The replacement clock here is *empty*, so the assertion is the strict one:
+    the teardown reads the patched clock zero times. A budget of "enough
+    readings" would let a regression pass by happening to be fast enough, and
+    the real iterator's length is an unrelated test's implementation detail.
+    """
+    writer = data_dir_writer()
+    writer.stop()
+
+    readings = iter(())
+    monkeypatch.setattr(time, "monotonic", lambda: next(readings))
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    try:
+        conftest.remove_data_dir_when_quiet(writer.directory)
+    finally:
+        monkeypatch.undo()
+
+    assert not writer.directory.exists()
