@@ -159,3 +159,72 @@ there. Verified by mutation rather than by the gate merely being green — a
 stripped of its fallback were each caught by the rule that owns them, and the
 tree restored after each. The two guard tests quoted above were re-run
 unmodified and still pass; they were not touched.
+
+## Hardening pass — the gate had holes in the shapes it was built for (2026-09-09)
+
+The gate above was re-examined against the argument it was written from: the
+cost returns through *the next store, written by copying a driver example*. On
+that test it was not yet doing its job. Four holes, each found by asking what a
+copied example actually looks like rather than by reading the code for style:
+
+1. **`psycopg.Connection.connect(dsn)` was invisible to rule 1.** This is
+   psycopg 3's documented explicit-class API — the form its own docs lead with
+   for anything beyond the one-liner, and `AsyncConnection.connect` with it. The
+   rule matched `<driver>.connect(...)` one attribute deep, so the bare function
+   was caught and the class method, two deep, was not. The gate reported green
+   about a rule it was only half enforcing.
+2. **The whole of psycopg2's pooling API was invisible to rule 2.**
+   `psycopg2.pool.SimpleConnectionPool`, `ThreadedConnectionPool` and
+   `PersistentConnectionPool` are how a second pool gets built in most material
+   still on the web, and none of the three names was known to the scanner —
+   while `psycopg_pool.ConnectionPool`, the form nobody copies by accident, was.
+3. **`import command_center.db.adapter` + `command_center.db.adapter.open_pool(...)`
+   escaped rule 2**, where `from command_center.db import adapter` was caught.
+   The same held for reaching `aios_db.open_pool` directly, which is the AIOS
+   boundary gate's business first but should not need a second gate switched on
+   to be recognised as a pool.
+4. **Rule 3 failed correct code.** It knew one spelling of the pool import, so a
+   store saying `import command_center.db.pool as pool`, `from
+   command_center.db.pool import connection`, or `from . import pool` read as a
+   store that had *lost* its fallback. That is the failure mode that gets a gate
+   deleted rather than fixed: the repair it invites is rewriting a correct
+   import until the complaint stops, which teaches that the gate is about
+   spelling.
+
+The fix is one change, not four patches. Every `name.attr.attr` chain is now
+resolved back through the file's own imports — including `import a.b.c` binding
+`a`, relative imports resolved against the file's package, aliases of aliases,
+and the literal `importlib` form — to the dotted path it denotes, and the three
+rules are predicates over that path (`<driver>.…​.connect`, a raw opener or a
+driver pool class, `command_center.db.pool.connection`). The binding-not-
+spelling property that keeps Qt's `signal.connect()` and SQLite's
+`db.connect()` clean is unchanged; it is applied to the whole chain instead of
+its first link. A *reference* now counts as well as a call, because
+`partial(psycopg.connect, dsn)` — or a `connection_factory=` argument — hands
+the driver to something that will call it later.
+
+Scope widened at the same time, from `command_center/` to every non-test file
+in the repository (397 files, all three rules clean). A rule keyed to one
+package is evaded by choosing another package, and the backend cost is paid by
+the PostgreSQL server, which does not know which directory the connecting
+process was started from. `tests/` remains the deliberate exclusion, for the
+reason already stated: the suites connect *as each role* to prove the grants,
+which is the one thing a pooled connection cannot do.
+
+One exemption was added and deliberately narrowed: `command_center/db/adapter.py`
+may name `aios_db.open_pool`, because being the single place that name appears
+is the entire reason that file exists. It may not construct a driver pool, and
+both directions are pinned. The `credential_rotation.py` exemption is unchanged.
+
+Verified by mutation against the real tree, comparing this scanner to the one
+at `349ef11` on the same three edits: a `psycopg.Connection.connect` planted in
+`db/work_queue_read.py`, a `psycopg2.pool.ThreadedConnectionPool` planted in
+`worker/__main__.py`, and a dotted `command_center.db.adapter.open_pool` planted
+in `scripts/mirror_slice_checks.py` were **all three missed at `349ef11`** (the
+third because the file was out of scope) and are each caught now, by the rule
+that owns them. In the other direction, rewriting `db/backlog_store.py`'s real
+import to `import command_center.db.pool as pool` fails the old gate and passes
+this one. `tests/architecture` 58 passed; the two SRV-01b guard tests were
+re-run unmodified and still pass. No read was moved onto the pool — the survey
+above still finds none left to move — and the `runtime/` half of the item stays
+option 2, blocked on SRV-01b.

@@ -29,7 +29,7 @@ def _parse(path) -> ast.AST:
 
 
 def test_every_postgres_connection_is_taken_from_the_process_pool() -> None:
-    """No file under `command_center/` opens its own PostgreSQL connection.
+    """No non-test file in the repository opens its own PostgreSQL connection.
 
     This is the gate the backlog item's cost argument actually needs. A pool
     that most callers use is not a pool: one module calling `psycopg.connect()`
@@ -91,7 +91,7 @@ def test_every_injectable_store_keeps_the_pool_as_its_fallback() -> None:
         if not declared:
             continue
         stores[rel] = declared
-        if not routing.resolves_the_pool_fallback(tree):
+        if not routing.resolves_the_pool_fallback(tree, rel):
             unrouted.append(f"{rel}: {', '.join(declared)}")
 
     assert stores, (
@@ -308,3 +308,199 @@ def test_the_second_pool_rule_distinguishes_the_opener_from_the_constructor() ->
     # `pool.py` itself is the one module allowed to do it.
     assert routing.find_second_pools(via_adapter, routing.POOL_MODULE) == []
     assert routing.find_second_pools(driver_pool, routing.POOL_MODULE) == []
+
+
+def test_rule_one_catches_the_drivers_own_class_api() -> None:
+    """`psycopg.Connection.connect(...)` is the form the driver's docs lead with.
+
+    The first draft matched `<name>.connect(...)` where `<name>` was itself a
+    bound driver — one attribute deep — so the module-level function was caught
+    and psycopg 3's explicit-class API, two deep, was not. A gate that catches
+    only the spelling nobody copies is worse than no gate, because it reports
+    green about a rule it is not enforcing.
+    """
+    for source in (
+        "import psycopg\ndef go(dsn):\n    return psycopg.Connection.connect(dsn)\n",
+        (
+            "import psycopg\nasync def go(dsn):\n"
+            "    return await psycopg.AsyncConnection.connect(dsn)\n"
+        ),
+        (
+            "from psycopg import Connection\n"
+            "def go(dsn):\n    return Connection.connect(dsn)\n"
+        ),
+        (
+            "from psycopg import AsyncConnection as C\n"
+            "async def go(dsn):\n    return await C.connect(dsn)\n"
+        ),
+    ):
+        assert routing.find_unpooled_connections(
+            ast.parse(source), "command_center/db/new_store.py"
+        ), source
+
+
+def test_a_driver_handed_over_uncalled_is_still_a_bypass() -> None:
+    """`partial(psycopg.connect, dsn)` connects; it just does it somewhere else.
+
+    Rules that only inspect `ast.Call` watch the reference go past. Naming the
+    driver is the decision, and that is what the scanner reports on — so the
+    injection seam every store in `db/` offers cannot be used to smuggle the
+    driver in as a `connection_factory`.
+    """
+    handed_over = ast.parse(
+        "import psycopg\n"
+        "from functools import partial\n"
+        "def build(dsn):\n"
+        "    return partial(psycopg.connect, dsn)\n"
+    )
+    found = routing.find_unpooled_connections(handed_over, "command_center/db/x.py")
+    assert found and "hands out" in found[0][1]
+
+    injected = ast.parse(
+        "import psycopg\n"
+        "from command_center.db.work_queue_read import WorkQueueReadStore\n"
+        "def store(dsn):\n"
+        "    return WorkQueueReadStore(\n"
+        "        connection_factory=lambda: psycopg.connect(dsn)\n"
+        "    )\n"
+    )
+    assert routing.find_unpooled_connections(injected, "command_center/api/x.py")
+
+
+def test_rule_two_covers_both_drivers_pooling_apis() -> None:
+    """psycopg2's pool module is a second pool as much as psycopg_pool's is.
+
+    `psycopg2.pool.ThreadedConnectionPool` and its siblings are the whole of
+    that driver's pooling API. The first draft knew only `psycopg_pool`'s two
+    class names, so a pool built the psycopg2 way — the form most search results
+    still show — passed clean while the psycopg 3 form was caught.
+    """
+    for source in (
+        (
+            "import psycopg2.pool\n"
+            "def build(dsn):\n"
+            "    return psycopg2.pool.ThreadedConnectionPool(1, 5, dsn)\n"
+        ),
+        (
+            "from psycopg2.pool import SimpleConnectionPool\n"
+            "def build(dsn):\n"
+            "    return SimpleConnectionPool(1, 5, dsn)\n"
+        ),
+        (
+            "from psycopg2.pool import PersistentConnectionPool as P\n"
+            "def build(dsn):\n"
+            "    return P(1, 5, dsn)\n"
+        ),
+        (
+            "import psycopg_pool\n"
+            "def build(dsn):\n"
+            "    return psycopg_pool.NullConnectionPool(dsn)\n"
+        ),
+    ):
+        assert routing.find_second_pools(
+            ast.parse(source), "command_center/worker/runner.py"
+        ), source
+
+
+def test_rule_two_reads_the_dotted_module_spelling() -> None:
+    """`import a.b.c` then `a.b.c.f()` binds `a` and says the rest inline.
+
+    Both raw openers are reachable that way, and neither was seen when the
+    scanner only resolved a single `Name.attr`.
+    """
+    dotted_adapter = ast.parse(
+        "import command_center.db.adapter\n"
+        "def build(dsn):\n"
+        "    return command_center.db.adapter.open_pool(dsn)\n"
+    )
+    assert routing.find_second_pools(dotted_adapter, "command_center/worker/runner.py")
+
+    # `aios_db` is the AIOS boundary gate's business first — only `db/adapter.py`
+    # may import it — but rule 2 does not want to depend on a second gate staying
+    # switched on to know what a pool is.
+    direct = ast.parse(
+        "from aios_db import open_pool\ndef build(dsn):\n    return open_pool(dsn)\n"
+    )
+    assert routing.find_second_pools(direct, "command_center/worker/runner.py")
+
+
+def test_the_aios_seam_may_forward_the_raw_opener_but_not_build_a_pool() -> None:
+    """`db/adapter.py` exists to be the one place `aios_db.open_pool` is named.
+
+    Exempting the seam for exactly that name — and for nothing else — is what
+    keeps rule 2 from failing correct code if the re-export ever becomes a
+    wrapper, without turning the adapter into a second place a driver pool can
+    be constructed.
+    """
+    forwarding = ast.parse(
+        "from aios_db import open_pool\n"
+        "def open(dsn, **kwargs):\n"
+        "    return open_pool(dsn, **kwargs)\n"
+    )
+    assert routing.find_second_pools(forwarding, routing.ADAPTER_MODULE) == []
+
+    driver_pool = ast.parse(
+        "from psycopg_pool import ConnectionPool\n"
+        "def build(dsn):\n"
+        "    return ConnectionPool(dsn)\n"
+    )
+    assert routing.find_second_pools(driver_pool, routing.ADAPTER_MODULE)
+
+    # The real file, so the exemption cannot be pointing at a renamed module.
+    path = routing.REPO_ROOT / routing.ADAPTER_MODULE
+    assert "aios_db" in path.read_text(encoding="utf-8")
+    assert routing.find_second_pools(_parse(path), routing.ADAPTER_MODULE) == []
+
+
+def test_rule_three_accepts_every_way_of_reaching_the_pool() -> None:
+    """Too narrow, this rule fails correct code — the way a gate gets deleted.
+
+    The first draft recognised `from command_center.db import pool` and nothing
+    else, so three ordinary spellings of the same import read as a store that
+    had *lost* its fallback. The remedy a developer applies to a gate like that
+    is to rewrite a correct import until the gate stops complaining, which
+    teaches that the gate is about spelling.
+    """
+    rel = "command_center/db/x.py"
+    body = "def _connection(self):\n        return {}\n"
+    for header, call in (
+        ("from command_center.db import pool", "pool.connection()"),
+        ("import command_center.db.pool as pool", "pool.connection()"),
+        ("from command_center.db.pool import connection", "connection()"),
+        ("import command_center.db.pool", "command_center.db.pool.connection()"),
+        # Relative, which only resolves because the scanner is told which file
+        # it is reading — the reason `resolves_the_pool_fallback` takes a path.
+        ("from . import pool", "pool.connection()"),
+    ):
+        source = f"{header}\nclass Store:\n    " + body.format(call)
+        assert routing.resolves_the_pool_fallback(ast.parse(source), rel), source
+
+    # And the case the rule exists for still reads as unrouted.
+    dropped = ast.parse(
+        "class Store:\n"
+        "    def __init__(self, connection_factory=None):\n"
+        "        self._factory = connection_factory\n"
+        "    def _connection(self):\n"
+        "        return self._factory()\n"
+    )
+    assert routing.resolves_the_pool_fallback(dropped, rel) is False
+
+
+def test_the_scan_is_the_repository_and_not_one_package() -> None:
+    """A rule keyed to one directory is evaded by choosing another directory.
+
+    The backend cost is paid by the PostgreSQL server, which does not know which
+    package the connecting process was started from. `tests/` is the one
+    deliberate exclusion — the suites connect *as each role* to prove the
+    grants, which is the single thing a pooled connection cannot do.
+    """
+    scanned = {
+        path.relative_to(routing.REPO_ROOT).as_posix()
+        for path in routing.iter_scanned_files()
+    }
+    assert "command_center/db/pool.py" in scanned
+    assert not [rel for rel in scanned if rel.startswith("tests/")]
+
+    # Packages outside `command_center/` that ship code and could hold a store.
+    for prefix in ("scripts/", "ops/"):
+        assert [rel for rel in scanned if rel.startswith(prefix)], prefix

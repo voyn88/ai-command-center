@@ -15,10 +15,9 @@ by writing the one obvious line.
 
 Three mechanical rules, consumed by `test_pool_routing_fitness.py`:
 
-1. **No unpooled connection.** No file under `command_center/` may call a
-   PostgreSQL driver's `connect()`. The one exception is declared in
-   :data:`UNPOOLED_CONNECT_ALLOWED` with its reason, and the test pins that map
-   so it cannot quietly grow.
+1. **No unpooled connection.** No scanned file may reach a PostgreSQL driver's
+   `connect`. The one exception is declared in :data:`UNPOOLED_CONNECT_ALLOWED`
+   with its reason, and the test pins that map so it cannot quietly grow.
 2. **No second pool.** Only `command_center/db/pool.py` may build a pool. A
    pool built anywhere else is a second, unmanaged connection budget against
    the same server — the failure mode the singleton exists to prevent, and one
@@ -29,18 +28,55 @@ Three mechanical rules, consumed by `test_pool_routing_fitness.py`:
    injection point is for tests; production reaches it through the default, and
    a store that loses the default loses the pool without failing anything.
 
-Scope is `command_center/` and deliberately not `tests/`: the suites open
-connections *as each role* to prove the grants, which is the one thing a pooled
-connection cannot do. `sqlite3` is out of scope too — this rule is about the
-PostgreSQL backend-per-connection cost, and SQLite is the authority store with
-no pool to bypass.
+Scope is every non-test module in the repository, not only `command_center/`.
+Rules keyed to one package are avoided by moving the file: the cost is paid by
+the *server*, which does not care which directory the connecting process was
+started from, so an operational script under `scripts/` or a service module
+under `native_gateway/` is in scope on the same argument. `tests/` is the
+deliberate exclusion: the suites open connections *as each role* to prove the
+grants, which is the one thing a pooled connection cannot do. `sqlite3` is out
+of scope too — this rule is about the PostgreSQL backend-per-connection cost,
+and SQLite is the authority store with no pool to bypass.
 
-Structural, over the AST, and keyed on *binding* rather than spelling: a call is
-flagged because the name it is called on was bound to a driver in that same
-file, not because the text `connect` appears. That is what keeps the desktop's
-several hundred Qt `signal.connect(...)` calls and `runtime/db/core.py`'s
-`db.connect(db_path)` out of the results while still catching
-`import psycopg as pg; pg.connect(dsn)`.
+Structural, over the AST, and keyed on *binding* rather than spelling. Every
+`name.attr.attr` chain is resolved back through the file's own imports to the
+dotted path it actually denotes, and the rules match on that path. So
+`signal.connect(...)` — the desktop's several hundred Qt calls — and
+`runtime/db/core.py`'s `db.connect(db_path)` resolve to nothing and stay clean,
+while `import psycopg as pg; pg.connect(...)`, `from psycopg import connect as
+_open`, `psycopg.Connection.connect(...)` and the `importlib.import_module`
+form all resolve onto `psycopg.connect` and are caught by one rule rather than
+one clause per spelling.
+
+Resolving the whole chain, rather than only `Name.attr`, is what the first
+draft of this scanner got wrong, in both directions:
+
+* `psycopg.Connection.connect(dsn)` and `psycopg.AsyncConnection.connect(dsn)`
+  — psycopg 3's *documented* explicit-class API, and therefore a likelier
+  copy-paste than the bare function — resolve through a two-deep chain and were
+  missed by rule 1 entirely.
+* `psycopg2.pool.ThreadedConnectionPool` and its siblings are the whole of
+  psycopg2's pooling API, and every one of them was missed by rule 2: the
+  constructor names were unknown to it, and the dotted form resolved to
+  nothing. A second pool built the psycopg2 way passed the gate clean.
+* `import command_center.db.adapter` followed by
+  `command_center.db.adapter.open_pool(...)` was missed for the same reason,
+  where the `from command_center.db import adapter` spelling was caught.
+* Rule 3 recognised exactly one way to reach the pool
+  (`from command_center.db import pool`), so `import command_center.db.pool as
+  pool`, `from command_center.db.pool import connection` and `from . import
+  pool` all read as *lost fallbacks* — a gate failing correct code, which is
+  the failure mode that gets a gate deleted rather than fixed.
+
+A reference counts, not only a call: `functools.partial(psycopg.connect, dsn)`
+hands the driver to something that will call it later, and a rule that only
+looked at `ast.Call` would watch it go past.
+
+Acknowledged limit, stated rather than papered over (the same one
+`aios_boundary` records for its own driver detection): a module reached through
+a *non-literal* dynamic import, or through a name rebound at runtime, is beyond
+a static scanner. Literal `importlib`/`__import__`, aliases, relative imports
+and attribute chains are resolved.
 """
 
 from __future__ import annotations
@@ -51,13 +87,18 @@ from pathlib import Path
 from tests.architecture.aios_boundary import REPO_ROOT, iter_python_files
 
 __all__ = [
+    "ADAPTER_MODULE",
     "DRIVER_MODULES",
+    "POOL_CONNECTION",
+    "POOL_CONSTRUCTORS",
     "POOL_MODULE",
+    "RAW_POOL_OPENERS",
     "UNPOOLED_CONNECT_ALLOWED",
     "find_second_pools",
     "find_unpooled_connections",
     "injectable_stores",
     "iter_scanned_files",
+    "resolve_references",
     "resolves_the_pool_fallback",
 ]
 
@@ -65,18 +106,43 @@ __all__ = [
 #: absent on purpose: it has no server to fork a backend on.
 DRIVER_MODULES = frozenset({"psycopg", "psycopg2", "psycopg_pool"})
 
-#: Pool constructors exported by `psycopg_pool`.
-POOL_CONSTRUCTORS = frozenset({"ConnectionPool", "AsyncConnectionPool"})
+#: Pool classes exported by the drivers. `psycopg_pool` supplies the first
+#: four; the rest are psycopg2's `psycopg2.pool` module, which is a complete
+#: second way to hold a connection budget and has to be named to be seen.
+POOL_CONSTRUCTORS = frozenset(
+    {
+        "ConnectionPool",
+        "AsyncConnectionPool",
+        "NullConnectionPool",
+        "AsyncNullConnectionPool",
+        "SimpleConnectionPool",
+        "ThreadedConnectionPool",
+        "PersistentConnectionPool",
+    }
+)
+
+#: Raw pool openers: the un-singletoned constructors `pool.py` wraps. Reaching
+#: either from anywhere else is rule 2's violation. `aios_db.open_pool` is
+#: primarily the AIOS boundary gate's business (only `db/adapter.py` may import
+#: that package at all) but is named here too, so that the rule about pools
+#: does not depend on a different gate staying switched on.
+RAW_POOL_OPENERS = frozenset(
+    {"command_center.db.adapter.open_pool", "aios_db.open_pool"}
+)
 
 #: The one module allowed to build a pool.
 POOL_MODULE = "command_center/db/pool.py"
 
-#: The `aios-db` seam. Its `open_pool` is the raw, un-singletoned constructor
-#: `pool.py` wraps; reaching it from anywhere else is rule 2's violation.
-ADAPTER_MODULE = "command_center.db.adapter"
+#: The declared `aios-db` seam. Forwarding `aios_db.open_pool` is the whole
+#: reason this file exists (the AIOS boundary gate lets no other module import
+#: that package at all), so naming that opener here is not rule 2's violation
+#: *in this one file* — but constructing a driver pool still is. Exempting the
+#: seam only for the name it is the seam for is the narrowest form that does
+#: not fail correct code if the re-export ever becomes a wrapper.
+ADAPTER_MODULE = "command_center/db/adapter.py"
 
-#: The package this gate polices.
-SCANNED_PREFIX = "command_center/"
+#: What rule 3 requires an injectable store to still be able to reach.
+POOL_CONNECTION = "command_center.db.pool.connection"
 
 #: Files allowed to open a connection outside the pool, and why. A map rather
 #: than a set so the reason is reviewed alongside the exemption, and pinned by
@@ -94,12 +160,8 @@ UNPOOLED_CONNECT_ALLOWED: dict[str, str] = {
 
 
 def iter_scanned_files() -> list[Path]:
-    """Every non-test `*.py` under `command_center/`."""
-    return [
-        path
-        for path in iter_python_files()
-        if _rel(path).startswith(SCANNED_PREFIX) and not _is_test_path(_rel(path))
-    ]
+    """Every non-test `*.py` in the repository."""
+    return [path for path in iter_python_files() if not _is_test_path(_rel(path))]
 
 
 def _rel(path: Path) -> str:
@@ -113,6 +175,59 @@ def _is_test_path(rel_path: str) -> bool:
 
 def _top(module_name: str) -> str:
     return module_name.split(".", 1)[0]
+
+
+def _package_of(rel_path: str | None) -> str | None:
+    """The dotted package a file lives in, for resolving relative imports.
+
+    `command_center/db/backlog_store.py` -> `command_center.db`. Returns None
+    when the caller did not say which file this tree came from, in which case a
+    relative import simply does not resolve — a synthetic tree in a test has no
+    package to be relative to.
+    """
+    if rel_path is None:
+        return None
+    parts = rel_path.split("/")[:-1]
+    return ".".join(parts) if parts else ""
+
+
+def _absolute_module(node: ast.ImportFrom, rel_path: str | None) -> str | None:
+    """`from . import pool` inside `command_center/db/` -> `command_center.db`."""
+    module = node.module or ""
+    if not node.level:
+        return module
+    package = _package_of(rel_path)
+    if package is None:
+        return None
+    ancestors = package.split(".") if package else []
+    climb = node.level - 1
+    if climb:
+        if climb > len(ancestors):
+            return None
+        ancestors = ancestors[:-climb]
+    base = ".".join(ancestors)
+    if not module:
+        return base
+    return f"{base}.{module}" if base else module
+
+
+def _dotted_parts(node: ast.AST) -> list[str] | None:
+    """`a.b.c` -> `["a", "b", "c"]`; anything else -> None.
+
+    Only pure name/attribute chains resolve. `f().connect` has a call in the
+    middle and denotes whatever `f()` returned, which this scanner does not
+    claim to know.
+    """
+    parts: list[str] = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    parts.append(current.id)
+    parts.reverse()
+    return parts
 
 
 def _literal_import_target(node: ast.AST) -> str | None:
@@ -142,132 +257,135 @@ def _literal_import_target(node: ast.AST) -> str | None:
     return None
 
 
-class _Bindings:
-    """What each name in one module is bound to, for the three questions asked.
+def _aliases(tree: ast.AST, rel_path: str | None) -> dict[str, str]:
+    """What every name bound by an import in this module actually denotes.
 
-    Built per file rather than per call site because the whole point is that a
-    call is judged by what its receiver *is*, not by what it is spelled. A file
-    that never imports a driver cannot violate rule 1 no matter how many
-    `.connect(...)` calls it makes — which is exactly the desktop's situation.
+    Built per file, because the whole point is that a call is judged by what its
+    receiver *is*, not by what it is spelled. A file that never imports a driver
+    cannot violate rule 1 no matter how many `.connect(...)` calls it makes —
+    which is exactly the desktop's situation.
+
+    `import a.b.c` binds `a`, so the alias maps `a` to itself and the rest of
+    the chain is read literally off the source; every other form binds the last
+    component and maps it to its full dotted path.
     """
-
-    def __init__(self) -> None:
-        self.driver_modules: set[str] = set()
-        self.driver_connects: set[str] = set()
-        self.pool_constructors: set[str] = set()
-        self.adapter_modules: set[str] = set()
-        self.adapter_open_pools: set[str] = set()
-        self.pool_modules: set[str] = set()
-
-
-def _bindings(tree: ast.AST) -> _Bindings:
-    found = _Bindings()
+    aliases: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                bound = alias.asname or _top(alias.name)
-                if _top(alias.name) in DRIVER_MODULES:
-                    found.driver_modules.add(bound)
-                if alias.name == ADAPTER_MODULE and alias.asname:
-                    found.adapter_modules.add(alias.asname)
+                if alias.asname:
+                    aliases[alias.asname] = alias.name
+                else:
+                    aliases[_top(alias.name)] = _top(alias.name)
         elif isinstance(node, ast.ImportFrom):
-            module = node.module or ""
-            if _top(module) in DRIVER_MODULES:
-                for alias in node.names:
-                    bound = alias.asname or alias.name
-                    if alias.name == "connect":
-                        found.driver_connects.add(bound)
-                    elif alias.name in POOL_CONSTRUCTORS:
-                        found.pool_constructors.add(bound)
-            if module == ADAPTER_MODULE:
-                for alias in node.names:
-                    if alias.name == "open_pool":
-                        found.adapter_open_pools.add(alias.asname or alias.name)
-            # `from command_center.db import adapter` / `import pool`
-            if module == "command_center.db":
-                for alias in node.names:
-                    bound = alias.asname or alias.name
-                    if alias.name == "adapter":
-                        found.adapter_modules.add(bound)
-                    elif alias.name == "pool":
-                        found.pool_modules.add(bound)
+            module = _absolute_module(node, rel_path)
+            if module is None:
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                bound = alias.asname or alias.name
+                aliases[bound] = f"{module}.{alias.name}" if module else alias.name
         elif isinstance(node, ast.Assign):
-            target_module = _literal_import_target(node.value)
-            if target_module and _top(target_module) in DRIVER_MODULES:
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        found.driver_modules.add(target.id)
-    return found
+            target = _literal_import_target(node.value)
+            if target is None and isinstance(node.value, (ast.Name, ast.Attribute)):
+                # `pg = psycopg`: an alias for an alias, which is a rename with
+                # extra steps and must not be a hiding place.
+                parts = _dotted_parts(node.value)
+                if parts and parts[0] in aliases:
+                    target = ".".join([aliases[parts[0]], *parts[1:]])
+            if target is None:
+                continue
+            for element in node.targets:
+                if isinstance(element, ast.Name):
+                    aliases[element.id] = target
+    return aliases
 
 
-def find_unpooled_connections(tree: ast.AST, rel_path: str) -> list[tuple[int, str]]:
-    """Rule 1: driver `connect()` calls, other than the declared exemption."""
-    if rel_path in UNPOOLED_CONNECT_ALLOWED:
+def resolve_references(
+    tree: ast.AST, rel_path: str | None = None
+) -> list[tuple[int, str, bool]]:
+    """Every imported thing this module names, as `(line, dotted path, called)`.
+
+    One pass, and the three rules are predicates over its output. Chains are
+    reported at their full length only — the `psycopg` in
+    `psycopg.Connection.connect` is not also reported on its own — so a single
+    misuse produces a single finding.
+    """
+    aliases = _aliases(tree, rel_path)
+    if not aliases:
         return []
-    bound = _bindings(tree)
-    if not (bound.driver_modules or bound.driver_connects):
+    called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    inner = {
+        id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+    found: list[tuple[int, str, bool]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            continue
+        if id(node) in inner:
+            continue  # part of a longer chain; the outermost node carries it
+        if not isinstance(node.ctx, ast.Load):
+            continue
+        parts = _dotted_parts(node)
+        if not parts or parts[0] not in aliases:
+            continue
+        resolved = ".".join([aliases[parts[0]], *parts[1:]])
+        found.append((node.lineno, resolved, id(node) in called))
+    return sorted(found)
+
+
+def _how(called: bool) -> str:
+    return "opens" if called else "hands out"
+
+
+def find_unpooled_connections(
+    tree: ast.AST, rel_path: str | None = None
+) -> list[tuple[int, str]]:
+    """Rule 1: a PostgreSQL driver's `connect`, other than the declared exemption.
+
+    Matched as "a name that resolves into a driver distribution and ends in
+    `connect`", which covers the module-level function (`psycopg.connect`), the
+    class methods psycopg 3's own documentation leads with
+    (`psycopg.Connection.connect`, `psycopg.AsyncConnection.connect`), and
+    psycopg2's `psycopg2.connect`, without needing a clause each.
+    """
+    if rel_path is not None and rel_path in UNPOOLED_CONNECT_ALLOWED:
         return []
     found: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr == "connect"
-            and isinstance(func.value, ast.Name)
-            and func.value.id in bound.driver_modules
-        ):
+    for lineno, resolved, called in resolve_references(tree, rel_path):
+        parts = resolved.split(".")
+        if parts[0] in DRIVER_MODULES and parts[-1] == "connect":
             found.append(
-                (node.lineno, f"{func.value.id}.connect(...) opens a connection outside the pool")
-            )
-        elif isinstance(func, ast.Name) and func.id in bound.driver_connects:
-            found.append(
-                (node.lineno, f"{func.id}(...) opens a connection outside the pool")
+                (lineno, f"{resolved} {_how(called)} a connection outside the pool")
             )
     return sorted(found)
 
 
-def find_second_pools(tree: ast.AST, rel_path: str) -> list[tuple[int, str]]:
+def find_second_pools(
+    tree: ast.AST, rel_path: str | None = None
+) -> list[tuple[int, str]]:
     """Rule 2: a pool built outside `pool.py`.
 
     `pool.open_pool(...)` is *not* a violation and must not be: it is the
     singleton opener, and the entry points (`api/app.py`, `webapi/app.py`,
     `worker/__main__.py`, `db/cli.py`) are supposed to call it at startup. What
-    is flagged is reaching past it to the raw constructor — `adapter.open_pool`
-    or `psycopg_pool.ConnectionPool` — which yields a pool no `close_pool()`
-    closes and no `replace_pool()` rotates.
+    is flagged is reaching past it to a raw constructor — `adapter.open_pool`,
+    or any of the drivers' own pool classes — which yields a pool no
+    `close_pool()` closes and no `replace_pool()` rotates.
     """
     if rel_path == POOL_MODULE:
         return []
-    bound = _bindings(tree)
     found: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr == "open_pool"
-            and isinstance(func.value, ast.Name)
-            and func.value.id in bound.adapter_modules
-        ):
-            found.append(
-                (node.lineno, f"{func.value.id}.open_pool(...) builds a second pool")
-            )
-        elif isinstance(func, ast.Name) and func.id in bound.adapter_open_pools:
-            found.append((node.lineno, f"{func.id}(...) builds a second pool"))
-        elif isinstance(func, ast.Name) and func.id in bound.pool_constructors:
-            found.append((node.lineno, f"{func.id}(...) builds a second pool"))
-        elif (
-            isinstance(func, ast.Attribute)
-            and func.attr in POOL_CONSTRUCTORS
-            and isinstance(func.value, ast.Name)
-            and func.value.id in bound.driver_modules
-        ):
-            found.append(
-                (node.lineno, f"{func.value.id}.{func.attr}(...) builds a second pool")
-            )
+    for lineno, resolved, called in resolve_references(tree, rel_path):
+        parts = resolved.split(".")
+        is_raw_opener = resolved in RAW_POOL_OPENERS and not (
+            rel_path == ADAPTER_MODULE and resolved == "aios_db.open_pool"
+        )
+        is_driver_pool = parts[0] in DRIVER_MODULES and parts[-1] in POOL_CONSTRUCTORS
+        if is_raw_opener or is_driver_pool:
+            verb = "builds" if called else "hands out"
+            found.append((lineno, f"{resolved} {verb} a second pool"))
     return sorted(found)
 
 
@@ -292,8 +410,8 @@ def _defaulted_parameters(args: ast.arguments) -> set[str]:
 def injectable_stores(tree: ast.AST) -> list[str]:
     """Classes taking the package's `connection_factory=None` constructor shape.
 
-    Detected by the parameter, not by a name or a base class: the seven stores
-    that have it share no ancestor (`PostgresTableMirror` is one of them, the
+    Detected by the parameter, not by a name or a base class: the stores that
+    have it share no ancestor (`PostgresTableMirror` is one of them, the
     admin/read surfaces are plain classes), and a rule keyed on the base would
     miss exactly the hand-written ones.
 
@@ -322,8 +440,8 @@ def injectable_stores(tree: ast.AST) -> list[str]:
     return sorted(found)
 
 
-def resolves_the_pool_fallback(tree: ast.AST) -> bool:
-    """Rule 3: the module reaches `pool.connection()` somewhere.
+def resolves_the_pool_fallback(tree: ast.AST, rel_path: str | None = None) -> bool:
+    """Rule 3: the module reaches `command_center.db.pool.connection` somewhere.
 
     Asserted at module rather than method granularity on purpose. The stores
     resolve the pool inside `_connection`, but that name is a convention, and
@@ -331,19 +449,12 @@ def resolves_the_pool_fallback(tree: ast.AST) -> bool:
     `mirror_discovery` documents for its own first two attempts. What matters is
     that the module still knows how to reach the pool at all; a store that drops
     the fallback has no other way to spell it.
+
+    Every spelling that reaches it counts, which is the point: this rule is the
+    one that fails *correct* code when it is too narrow, and a store rewritten
+    to say `from . import pool` has not lost anything.
     """
-    bound = _bindings(tree)
-    if not bound.pool_modules:
-        return False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr == "connection"
-            and isinstance(func.value, ast.Name)
-            and func.value.id in bound.pool_modules
-        ):
-            return True
-    return False
+    return any(
+        resolved == POOL_CONNECTION
+        for _, resolved, _ in resolve_references(tree, rel_path)
+    )
