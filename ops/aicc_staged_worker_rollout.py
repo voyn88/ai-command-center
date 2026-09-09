@@ -476,6 +476,15 @@ def hold_lane_mutating_timers(systemd: Systemd) -> None:
     stopped: list[str] = []
     try:
         for timer in LANE_MUTATING_TIMERS:
+            # A host where the timer is not installed (fresh installer
+            # container, a control host without rotation) has nothing to
+            # hold; `systemctl stop` on a not-found unit is an error, not a
+            # no-op (Installer integration red on main since #873).
+            load_state = systemd.run(
+                "show", timer, "--property=LoadState", "--value", check=False
+            )
+            if load_state in {"", "not-found"}:
+                continue
             systemd.run("stop", timer)
             stopped.append(timer)
     except BaseException:
