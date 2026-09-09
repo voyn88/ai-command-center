@@ -22,7 +22,14 @@ from pathlib import Path
 # (review on d8920b6). Both scripts are invoked by absolute path, so add
 # this file's own directory to the path before importing its sibling.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from aicc_install_transaction import SNAPSHOT_PROPERTIES
+# `_GENERATED_DROPIN_PREFIXES` is imported for the same reason: the drop-in
+# preflight below must ignore exactly the boot-generated drop-ins the snapshot
+# comparison already ignores, and two hand-copied lists of tmpfs prefixes
+# would drift.
+from aicc_install_transaction import (
+    _GENERATED_DROPIN_PREFIXES,
+    SNAPSHOT_PROPERTIES,
+)
 
 LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 UNIT_RE = re.compile(r"voyn-aicc-worker@([A-Za-z0-9][A-Za-z0-9_-]{0,62})\.service")
@@ -1001,6 +1008,102 @@ def verify_unit_configuration(systemd: Systemd, unit: str) -> None:
         raise RolloutError(f"{unit} ExecStart is not the versioned worker command")
 
 
+#: Every directory systemd merges unit drop-ins from, in the order it
+#: resolves a name collision (highest priority first). Ordering BETWEEN
+#: drop-ins is by file name across all of them, which is the property the
+#: preflight below is about.
+DROPIN_SEARCH_ROOTS = (
+    Path("/etc/systemd/system"),
+    Path("/run/systemd/system"),
+    Path("/usr/lib/systemd/system"),
+    Path("/lib/systemd/system"),
+)
+
+
+def _dropin_files(unit: str) -> tuple[Path, ...]:
+    """Every persistent drop-in on disk for `unit`, template family included.
+
+    Read from the filesystem rather than only from `DropInPaths` because the
+    preflight runs BEFORE the install: on a host where the worker units are
+    not loaded yet systemd reports no drop-ins at all, while the stale
+    operator file that will defeat the boundary is already sitting in
+    `/etc/systemd/system/voyn-aicc-worker@.service.d/`.
+    """
+    directories = [f"{unit}.d"]
+    if UNIT_RE.fullmatch(unit):
+        directories.append(f"{WORKER_TEMPLATE.name}.d")
+    found: list[Path] = []
+    for root in DROPIN_SEARCH_ROOTS:
+        for directory in directories:
+            try:
+                entries = sorted((root / directory).iterdir())
+            except OSError:
+                continue
+            found.extend(
+                entry
+                for entry in entries
+                if entry.name.endswith(".conf") and entry.is_file()
+            )
+    return tuple(found)
+
+
+def preflight_dropin_ordering(systemd: Systemd, units: tuple[str, ...]) -> None:
+    """Refuse a host whose drop-in ordering defeats the boundary, before apply.
+
+    `verify_unit_configuration` asserts that the principal-isolation drop-in
+    is the LAST one systemd merges. That is a property of the host, not of
+    this release: an operator drop-in whose name sorts after
+    `20-principal-isolation.conf` defeats it no matter what the install
+    writes. Discovering it only at the rollout -- the first step after
+    `apply()` -- turns a condition nothing in the transaction can fix into a
+    full generation rollback, which is how worker-01 (2026-09-09) ended up
+    rolling back an applied generation over a credential a run had refreshed
+    in the meantime, with `30-github-token-hotfix.conf` last in DropInPaths
+    the whole time and never named until the failure.
+
+    So it is checked here, before the first target is staged, and the refusal
+    names the offending file and what to do about it. Deliberately NOT the
+    whole of `verify_unit_configuration`: every other property that check
+    asserts is one this install is about to establish, and demanding it up
+    front would refuse every first install.
+    """
+    for unit in units:
+        merged = tuple(
+            Path(word)
+            for word in _systemd_words(
+                systemd.property(unit, "DropInPaths"),
+                unit=unit,
+                property_name="DropInPaths",
+            )
+            if not word.startswith(_GENERATED_DROPIN_PREFIXES)
+        )
+        # Sorted by the name systemd actually orders on, so a host with more
+        # than one offending drop-in reports the same one every run.
+        candidates = sorted(
+            {*merged, *_dropin_files(unit)}, key=lambda path: (path.name, str(path))
+        )
+        for path in candidates:
+            if path.name > WORKER_DROPIN.name:
+                raise RolloutError(
+                    f"{unit}: {path} is merged after {WORKER_DROPIN} -- systemd "
+                    f'orders drop-ins by file name and "{path.name}" sorts '
+                    f'after "{WORKER_DROPIN.name}", so it overrides the '
+                    "principal boundary this install asserts and the rollout "
+                    f'would refuse the lane with "{unit} does not inherit the '
+                    'principal boundary". Remove that drop-in, or rename it to '
+                    f"sort before {WORKER_DROPIN.name}, and run the bootstrap "
+                    "again."
+                )
+            if path.name == WORKER_DROPIN.name and path != WORKER_DROPIN:
+                raise RolloutError(
+                    f"{unit}: {path} carries the same file name as "
+                    f"{WORKER_DROPIN} from a different drop-in directory, so "
+                    "the installed principal boundary would be shadowed rather "
+                    "than merged. Remove that drop-in and run the bootstrap "
+                    "again."
+                )
+
+
 def verify_unit(
     systemd: Systemd,
     unit: str,
@@ -1253,6 +1356,7 @@ def main() -> int:
             "snapshot",
             "restore",
             "verify-snapshot-closure",
+            "preflight",
             "rollout",
             "verify",
         ),
@@ -1290,6 +1394,23 @@ def main() -> int:
     units = discover_units(systemd, args.lanes)
     if args.action in {"rollout", "verify"}:
         verify_immutable_release()
+    if args.action == "preflight":
+        # Deliberately outside the `verify_immutable_release()` set above:
+        # this runs before the release this install is staging exists, and
+        # its whole purpose is to report a host precondition BEFORE the
+        # transaction mutates anything. The message is printed rather than
+        # raised so the operator reads the remedy, not a traceback, through
+        # the bootstrap's captured stderr.
+        try:
+            preflight_dropin_ordering(systemd, units)
+        except RolloutError as exc:
+            print(
+                f"AICC_AGENT_PRINCIPAL_ISOLATION_PRECONDITION_FAILED: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        print("AICC_AGENT_PRINCIPAL_ISOLATION_PRECONDITIONS_OK")
+        return 0
     if args.action == "snapshot":
         if args.state is None:
             parser.error("snapshot requires --state")

@@ -2169,3 +2169,158 @@ def test_the_launcher_can_write_the_model_auth_store_it_writes_refreshed_tokens_
     assert "/var/lib/aicc-agent" in paths
     tmpfiles = (Path(__file__).parents[2] / "deploy/tmpfiles.d/aicc-agent.conf").read_text()
     assert "d /var/lib/aicc-agent 0700 root root -" in tmpfiles
+
+
+# --- VOYN-W0-AICC-INSTALL-ROLLBACK-VS-MODEL-AUTH-WRITEBACK -------------------
+
+
+def _run_rollback_trap(tmp_path, **environment):
+    """Execute the installer's rollback trap against stubbed host commands.
+
+    The trap is lifted verbatim out of the installer -- functions and all --
+    so this exercises the shipped code rather than a paraphrase of it. Only
+    the commands that would touch the host are stubbed.
+    """
+    text = _installer_text()
+    block = text[
+        text.index("restore_snapshotted_units() {") : text.index(
+            "\ntrap rollback EXIT HUP INT TERM"
+        )
+    ]
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pending.json").write_text("{}", encoding="utf-8")
+    (state / "attempt-units.json").write_text("{}", encoding="utf-8")
+    log = tmp_path / "log"
+    log.write_text("", encoding="utf-8")
+    harness = f"""
+set -eu
+LOG={log}
+state_dir={state}
+attempt_units="$state_dir/attempt-units.json"
+baseline_units="$state_dir/baseline-units.json"
+baseline_release="$state_dir/baseline-release"
+release_staging=
+pending_release_manifest=
+release_dir=
+install_profile="$INSTALL_PROFILE"
+transaction_active=1
+baseline_created=0
+# The real one is `[ -e "$1" ] || [ -L "$1" ]`; the launcher socket unit is
+# answered from the fixture so the test does not depend on this machine's /etc.
+path_present() {{
+  case "$1" in
+    */aicc-agent-launcher.socket) [ "$SOCKET_UNIT_PRESENT" = 1 ] ;;
+    *) [ -e "$1" ] || [ -L "$1" ] ;;
+  esac
+}}
+run_transaction() {{ printf 'run_transaction %s\\n' "$*" >>"$LOG"; return "$RECOVER_RC"; }}
+run_rollout() {{ printf 'run_rollout %s\\n' "$*" >>"$LOG"; return "$ROLLOUT_RC"; }}
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >>"$LOG"
+  if [ "$1" = is-enabled ]; then printf '%s\\n' "$SOCKET_ENABLED"; fi
+}}
+release_lane_timers() {{ printf 'release_lane_timers\\n' >>"$LOG"; }}
+{block}
+(exit 7) || rollback
+"""
+    result = subprocess.run(
+        ["/bin/sh", "-c", harness],
+        capture_output=True,
+        check=False,
+        text=True,
+        env={
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "INSTALL_PROFILE": "worker",
+            "RECOVER_RC": "1",
+            "ROLLOUT_RC": "0",
+            "SOCKET_UNIT_PRESENT": "1",
+            "SOCKET_ENABLED": "enabled",
+            **environment,
+        },
+    )
+    return result, log.read_text(encoding="utf-8").splitlines(), state
+
+
+def test_failed_rollback_restores_the_units_it_took_down(tmp_path):
+    """The trap disables the launcher socket before calling `recover`, and a
+    `recover` that raises returns without restoring anything: worker-01
+    (2026-09-09) was left with aicc-agent-launcher.socket stopped AND disabled,
+    so every later lane launch failed and each self-deploy tick walked into the
+    same retained WAL. The durable WAL still governs the FILES; the services
+    must not be left down with it."""
+    result, log, state = _run_rollback_trap(tmp_path)
+
+    assert "systemctl disable --now aicc-agent-launcher.socket" in log
+    disable = log.index("systemctl disable --now aicc-agent-launcher.socket")
+    restore = log.index(f"run_rollout restore --state {state}/attempt-units.json")
+    release = log.index("release_lane_timers")
+    assert disable < restore < release
+    # The WAL and the snapshot it will be retried against are both retained.
+    assert (state / "pending.json").exists()
+    assert (state / "attempt-units.json").exists()
+    assert "rollback incomplete" in result.stderr
+    assert result.returncode == 7
+
+
+def test_successful_rollback_does_not_restore_units_twice(tmp_path):
+    """`recover` restores the snapshot itself when it succeeds. The extra
+    restore belongs to the failure path only."""
+    result, log, state = _run_rollback_trap(tmp_path, RECOVER_RC="0")
+
+    assert not [line for line in log if line.startswith("run_rollout restore")]
+    assert result.returncode == 7
+    # A completed rollback consumes the snapshot, as it always did.
+    assert not (state / "attempt-units.json").exists()
+
+
+def test_failed_snapshot_restore_still_puts_the_launcher_socket_back(tmp_path):
+    """Last resort when even the snapshot restore cannot be proven safe: the
+    socket is the only path by which any lane can start at all, so it does not
+    stay disabled because a rollback failed."""
+    result, log, _state = _run_rollback_trap(tmp_path, ROLLOUT_RC="1")
+
+    assert "systemctl enable --now aicc-agent-launcher.socket" in log
+    assert "service snapshot restore failed" in result.stderr
+    assert result.returncode == 7
+
+
+def test_a_control_install_is_not_handed_back_the_agent_socket(tmp_path):
+    """The control profile removes the launcher socket on purpose. A failed
+    rollback must not re-enable the very unit the profile exists to remove."""
+    _result, log, _state = _run_rollback_trap(
+        tmp_path, INSTALL_PROFILE="control", ROLLOUT_RC="1"
+    )
+
+    assert "systemctl enable --now aicc-agent-launcher.socket" not in log
+
+
+def test_an_absent_socket_unit_is_not_enabled_by_the_last_resort(tmp_path):
+    """Nothing is enabled on the strength of a name: if the unit file is not
+    on disk the fallback reports the failure instead of asking systemd to
+    enable a unit that does not exist."""
+    result, log, _state = _run_rollback_trap(
+        tmp_path, ROLLOUT_RC="1", SOCKET_UNIT_PRESENT="0", SOCKET_ENABLED="disabled"
+    )
+
+    assert "systemctl enable --now aicc-agent-launcher.socket" not in log
+    assert "no lane can launch until it is" in result.stderr
+
+
+def test_dropin_ordering_is_preflighted_before_the_generation_is_staged():
+    """The precondition that failed the whole install on worker-01 is a
+    property of the host, not of the release: reported before the first target
+    is staged, and named, instead of surfacing at the rollout after apply()."""
+    text = _installer_text()
+    preflight = text.index(
+        'run_rollout preflight --lanes "$repo_root/deploy/aicc/worker-lanes"'
+    )
+    assert preflight < text.index("run_transaction prepare")
+    assert preflight < text.index("run_transaction apply")
+    assert preflight < text.index("run_rollout rollout --lanes")
+    # Worker profile only: a control install removes the worker units.
+    _assert_command_inside_shell_if(
+        text,
+        'run_rollout preflight --lanes "$repo_root/deploy/aicc/worker-lanes"',
+        'if [ "$install_profile" = worker ]; then',
+    )

@@ -1718,3 +1718,171 @@ def test_hold_skips_timers_that_are_not_installed_on_the_host():
     module.hold_lane_mutating_timers(systemd)
 
     assert [call for call in systemd.calls if call[0] == "stop"] == []
+
+
+# --- VOYN-W0-AICC-INSTALL-ROLLBACK-VS-MODEL-AUTH-WRITEBACK -------------------
+#
+# `verify_unit_configuration` requires the principal-isolation drop-in to be
+# the last one merged. That is a host precondition no release can establish,
+# and it was only ever discovered at the rollout -- the first step AFTER
+# apply() -- so an operator's 30-github-token-hotfix.conf turned into a full
+# generation rollback on worker-01 (2026-09-09) with the offending file never
+# named. The preflight reports it before anything is staged.
+
+
+def _preflight_roots(module, tmp_path, monkeypatch):
+    """Point the on-disk drop-in scan at a fixture instead of this host's /etc."""
+    roots = (tmp_path / "etc/systemd/system", tmp_path / "run/systemd/system")
+    for root in roots:
+        root.mkdir(parents=True)
+    monkeypatch.setattr(module, "DROPIN_SEARCH_ROOTS", roots)
+    return roots
+
+
+def test_preflight_names_the_operator_dropin_that_would_defeat_the_boundary(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    _preflight_roots(module, tmp_path, monkeypatch)
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["voyn-aicc-worker@1.service"]["DropInPaths"] = (
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf "
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/30-github-token-hotfix.conf"
+    )
+
+    with pytest.raises(module.RolloutError) as failure:
+        module.preflight_dropin_ordering(systemd, ("voyn-aicc-worker@1.service",))
+
+    message = str(failure.value)
+    assert "30-github-token-hotfix.conf" in message
+    assert "20-principal-isolation.conf" in message
+    # Actionable, not merely accurate: the remedy is part of the refusal.
+    assert "Remove that drop-in" in message
+    # Nothing was mutated to find this out.
+    assert [call for call in systemd.calls if call[0] != "show"] == []
+
+
+def test_preflight_accepts_a_distro_dropin_that_sorts_before_the_boundary(
+    tmp_path, monkeypatch
+):
+    """Ubuntu ships 10-timeout-abort.conf for every service. It sorts before
+    the boundary drop-in and cannot override it; refusing it would fail every
+    healthy host (the same over-strictness that was fixed in the verify)."""
+    module = _module()
+    _preflight_roots(module, tmp_path, monkeypatch)
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["voyn-aicc-worker@1.service"]["DropInPaths"] = (
+        "/usr/lib/systemd/system/service.d/10-timeout-abort.conf "
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf"
+    )
+
+    module.preflight_dropin_ordering(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_preflight_ignores_the_boot_generated_recovery_dropin(
+    tmp_path, monkeypatch
+):
+    """`aicc-principal-recovery` writes into /run/systemd/generator.early/,
+    whose name sorts after the boundary but which systemd merges from the
+    generator tree, not from configuration. The snapshot comparison already
+    exempts it; this must agree, or every recovering host is refused."""
+    module = _module()
+    _preflight_roots(module, tmp_path, monkeypatch)
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["voyn-aicc-worker@1.service"]["DropInPaths"] = (
+        "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf "
+        "/run/systemd/generator.early/voyn-aicc-worker@1.service.d/"
+        "90-aicc-recovery.conf"
+    )
+
+    module.preflight_dropin_ordering(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_preflight_reads_the_disk_when_the_units_are_not_loaded_yet(
+    tmp_path, monkeypatch
+):
+    """A first install runs before any worker unit exists, so systemd reports
+    no drop-ins at all while the stale operator file is already on disk and
+    will take effect the moment the unit is installed."""
+    module = _module()
+    roots = _preflight_roots(module, tmp_path, monkeypatch)
+    directory = roots[0] / "voyn-aicc-worker@.service.d"
+    directory.mkdir()
+    (directory / "30-github-token-hotfix.conf").write_text(
+        "[Service]\nEnvironment=AICC_AGENT_PRINCIPAL_ISOLATION=off\n",
+        encoding="utf-8",
+    )
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["voyn-aicc-worker@1.service"]["DropInPaths"] = ""
+
+    with pytest.raises(module.RolloutError, match="30-github-token-hotfix.conf"):
+        module.preflight_dropin_ordering(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_preflight_refuses_a_shadowing_copy_of_the_boundary_dropin(
+    tmp_path, monkeypatch
+):
+    """Same file name from another drop-in directory replaces the installed
+    boundary rather than being merged after it -- `verify_unit_configuration`
+    compares the exact path, so this is a precondition failure too."""
+    module = _module()
+    roots = _preflight_roots(module, tmp_path, monkeypatch)
+    directory = roots[0] / "voyn-aicc-worker@1.service.d"
+    directory.mkdir()
+    (directory / module.WORKER_DROPIN.name).write_text("[Service]\n", encoding="utf-8")
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["voyn-aicc-worker@1.service"]["DropInPaths"] = ""
+
+    with pytest.raises(module.RolloutError, match="same file name"):
+        module.preflight_dropin_ordering(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_preflight_action_reports_the_precondition_instead_of_a_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    """The bootstrap captures the installer's stderr and reports it verbatim
+    as its refusal, so the CLI prints the remedy rather than raising."""
+    module = _module()
+    roots = _preflight_roots(module, tmp_path, monkeypatch)
+    directory = roots[0] / "voyn-aicc-worker@.service.d"
+    directory.mkdir()
+    (directory / "30-github-token-hotfix.conf").write_text("[Service]\n", encoding="utf-8")
+    lanes = tmp_path / "worker-lanes"
+    lanes.write_text("1\n", encoding="utf-8")
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["voyn-aicc-worker@1.service"]["DropInPaths"] = ""
+    monkeypatch.setattr(module, "Systemd", lambda: systemd)
+    monkeypatch.setattr(
+        sys, "argv", ["aicc-staged-worker-rollout", "preflight", "--lanes", str(lanes)]
+    )
+    # The release this install is staging does not exist yet: the preflight
+    # must not demand it.
+    monkeypatch.setattr(
+        module,
+        "verify_immutable_release",
+        lambda: (_ for _ in ()).throw(AssertionError("preflight verified a release")),
+    )
+
+    assert module.main() == 1
+
+    captured = capsys.readouterr()
+    assert "AICC_AGENT_PRINCIPAL_ISOLATION_PRECONDITION_FAILED" in captured.err
+    assert "30-github-token-hotfix.conf" in captured.err
+    assert captured.out == ""
+
+
+def test_preflight_action_passes_a_host_with_no_stale_dropin(
+    tmp_path, monkeypatch, capsys
+):
+    module = _module()
+    _preflight_roots(module, tmp_path, monkeypatch)
+    lanes = tmp_path / "worker-lanes"
+    lanes.write_text("1\n", encoding="utf-8")
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    monkeypatch.setattr(module, "Systemd", lambda: systemd)
+    monkeypatch.setattr(
+        sys, "argv", ["aicc-staged-worker-rollout", "preflight", "--lanes", str(lanes)]
+    )
+
+    assert module.main() == 0
+    assert "PRECONDITIONS_OK" in capsys.readouterr().out
