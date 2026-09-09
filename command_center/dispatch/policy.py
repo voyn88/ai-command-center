@@ -26,14 +26,14 @@ The hard guarantees, enforced structurally here:
    guess conservatively, it guesses *zero work in flight*, which raises the
    effective concurrency limit exactly when the runtime store cannot be
    consulted.
-1d. **Budget arithmetic that cannot be performed blocks everything.** A
-   non-finite spend figure or ceiling (NaN/±inf) engages the same
-   `DEFER_COST_DATA_UNAVAILABLE` gate. This is not defensive paranoia about a
-   caller: NaN is the one input that *silently inverts* guarantee 2 below,
-   because every `>` comparison against NaN is False, so a NaN spend total
-   reads as "under every ceiling" for every task. A number that cannot be
-   compared is not a budget, and this engine — the thing that makes the
-   guarantee — is where that has to be caught.
+1d. **Budget arithmetic that cannot be performed blocks everything.** A spend
+   figure or ceiling that is not usable money — non-finite (NaN/±inf) or
+   negative — engages the same `DEFER_COST_DATA_UNAVAILABLE` gate. This is not
+   defensive paranoia about a caller: NaN is the one input that *silently
+   inverts* guarantee 2 below, because every `>` comparison against NaN is
+   False, so a NaN spend total reads as "under every ceiling" for every task.
+   A number that cannot be compared is not a budget, and this engine — the
+   thing that makes the guarantee — is where that has to be caught.
 2. **Budget is never exceeded.** An executor is only assigned when the
    *projected* cumulative spend (the trailing-24h spend already incurred plus
    every assignment made so far in this plan plus this one) stays at or under
@@ -41,7 +41,14 @@ The hard guarantees, enforced structurally here:
    per-project ceilings. The check happens before the assignment is recorded,
    so an over-budget assignment cannot be produced. Because the comparison is
    only meaningful on finite numbers, a non-finite per-task cost blocks the
-   executor it belongs to rather than sailing past every ceiling.
+   executor it belongs to rather than sailing past every ceiling — and the
+   same holds for the *ceilings themselves*: a per-agent or per-project limit
+   that is not usable money blocks what it governs instead of reading as the
+   absent limit it superficially resembles. Both directions matter because
+   both permissive readings are spelled `0.0` here: a zero price is free and a
+   zero ceiling is unset, so corruption that decays to zero disables the
+   guarantee from either end. See `DispatchPolicy` for how such a value is
+   carried (as NaN) rather than normalised away.
 3. **SLA/priority is never bypassed.** Tasks are consumed in a fixed order:
    priority weight (desc), then SLA deadline (earliest first), then age. A
    lower-priority task can never take capacity a higher-priority task in the
@@ -144,8 +151,10 @@ def plan_dispatch(
     # so it takes the gate that already exists for exactly that. Folded in here
     # rather than trusted to the caller because `plan_dispatch` is what promises
     # the ceiling holds; a NaN would not trip any `>` check further down, it
-    # would quietly satisfy all of them.
-    if not math.isfinite(daily_spend_usd) or not math.isfinite(max_daily_spend_usd):
+    # would quietly satisfy all of them. A *negative* figure is refused by the
+    # same rule (`_usable`): a negative ceiling reads as unset via `> 0`, and a
+    # negative trailing spend would hand the plan headroom it never had.
+    if not _usable(daily_spend_usd) or not _usable(max_daily_spend_usd):
         budget_unknown = True
 
     # (1) Kill switch / unreadable guardrail inputs first: no assignment is
@@ -287,10 +296,11 @@ def _budget_block(
     global daily ceiling first (the kill-switch's budget sibling), then the
     per-agent concurrency/spend guardrails, then the per-project ceiling.
     """
-    # A cost that is not a finite number cannot be shown to fit any ceiling —
-    # and would defeat every comparison below rather than fail one — so the
-    # executor carrying it is blocked outright.
-    if not math.isfinite(cost):
+    # A cost that is not usable money cannot be shown to fit any ceiling — a
+    # non-finite one would defeat every comparison below rather than fail one,
+    # and a negative one would *refund* the projected total — so the executor
+    # carrying it is blocked outright.
+    if not _usable(cost):
         return DEFER_DAILY_BUDGET
 
     # Global daily spend ceiling. `<= ceiling` after adding this cost.
@@ -299,21 +309,47 @@ def _budget_block(
 
     limit = policy.per_agent_limits.get(executor.id)
     if limit is not None:
+        # A negative concurrency ceiling is not "unset", it is a ceiling that
+        # cannot be evaluated; `> 0` would silently read it as the former.
+        if limit.max_concurrent < 0:
+            return DEFER_AGENT_CAPACITY
         if limit.max_concurrent > 0:
             running = active_by_executor.get(executor.id, 0)
             planned = agent_assigned.get(executor.id, 0)
             if running + planned >= limit.max_concurrent:
                 return DEFER_AGENT_CAPACITY
+        # Same reasoning one field over, and this is the one a corrupt policy
+        # file actually reaches: an unusable spend ceiling must not fall
+        # through the `> 0` test into "no per-agent budget configured".
+        if not _usable(limit.max_spend_usd):
+            return DEFER_AGENT_BUDGET
         if limit.max_spend_usd > 0:
             spent = agent_spend.get(executor.id, 0.0)
             if (spent + cost) > limit.max_spend_usd:
                 return DEFER_AGENT_BUDGET
 
     if task.project is not None:
+        # A project with no entry gets `0.0` — genuinely unset, and finite, so
+        # it passes the check below and skips the ceiling as intended.
         project_cap = policy.per_project_limits.get(task.project, 0.0)
+        if not _usable(project_cap):
+            return DEFER_PROJECT_BUDGET
         if project_cap > 0:
             spent = project_spend.get(task.project, 0.0)
             if (spent + cost) > project_cap:
                 return DEFER_PROJECT_BUDGET
 
     return None
+
+
+def _usable(amount: float) -> bool:
+    """Whether `amount` is money this engine can compare: finite and not
+    negative.
+
+    The engine re-checks rather than trusting `DispatchPolicy.from_dict` to
+    have normalised, because a `DispatchPolicy` is constructible directly and
+    this function is where the budget guarantee is actually made. Mirrors
+    `dispatch.models._usable_amount`, which is the same rule stated on the
+    config side.
+    """
+    return math.isfinite(amount) and amount >= 0

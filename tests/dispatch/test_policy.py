@@ -532,3 +532,157 @@ def test_plan_is_deterministic_for_identical_input():
     assert [d.as_dict() for d in first.decisions] == [
         d.as_dict() for d in second.decisions
     ]
+
+
+# --------------------------------------------------------------------------
+# A guardrail that cannot be evaluated blocks what it governs. Both permissive
+# readings in this engine are spelled `0.0` — a zero price is *free*, a zero
+# ceiling is *unset* — so corruption that decays to zero disables the budget
+# guarantee from whichever end it lands on.
+# --------------------------------------------------------------------------
+
+
+def test_a_corrupt_price_in_the_policy_cannot_buy_an_unbounded_plan():
+    """The reported defect, reproduced from the policy file rather than from
+    the defaults, and end to end through `cost_for`.
+
+    A NaN price used to be normalised by `max(0.0, value)` into `0.0`, which
+    is not a degraded price but the strongest one available: free. Every
+    ceiling — daily, per-agent, per-project — is satisfied by it forever, so
+    one corrupt cost-matrix entry assigned the entire queue against a ceiling
+    that was configured, non-zero and perfectly readable.
+    """
+    policy = DispatchPolicy.from_dict(
+        {"prefer_local": False, "cost_matrix": {"claude_code": float("nan")}}
+    )
+    executors = [_executor("claude_code", cost=policy.cost_for("claude_code"))]
+    tasks = [_task(f"t{i}", priority="High") for i in range(5)]
+
+    plan = _plan(tasks, executors, policy, max_daily_spend_usd=5.0)
+
+    assert plan.assignments == ()
+    assert all(d.reason == models.DEFER_DAILY_BUDGET for d in plan.decisions)
+
+
+def test_a_corrupt_per_project_ceiling_defers_that_project():
+    """`project_cap > 0` is False for NaN and `spent + cost > inf` is False
+    for `inf`, so an unusable per-project ceiling read as "no ceiling" from
+    either direction."""
+    for bad in (float("nan"), float("inf")):
+        policy = DispatchPolicy(
+            prefer_local=False,
+            cost_matrix={"claude_code": 1.0},
+            per_project_limits={"AICC": bad},
+        )
+        executors = [_executor("claude_code", cost=1.0)]
+        plan = _plan([_task("t1", project="AICC")], executors, policy)
+
+        assert plan.assignments == (), bad
+        assert plan.decisions[0].reason == models.DEFER_PROJECT_BUDGET, bad
+
+
+def test_a_corrupt_per_project_ceiling_does_not_block_other_projects():
+    """The refusal is scoped to what the corrupt ceiling governs — it is a
+    per-project limit, not a whole-plan gate like `budget_unknown`."""
+    policy = DispatchPolicy(
+        prefer_local=False,
+        cost_matrix={"claude_code": 1.0},
+        per_project_limits={"AICC": float("nan")},
+    )
+    executors = [_executor("claude_code", cost=1.0)]
+    plan = _plan(
+        [_task("t1", project="AICC"), _task("t2", project="AIOS")], executors, policy
+    )
+
+    assigned = {d.task_id for d in plan.assignments}
+    assert assigned == {"t2"}
+
+
+def test_a_corrupt_per_agent_spend_ceiling_defers_that_executor():
+    policy = DispatchPolicy(
+        prefer_local=False,
+        cost_matrix={"claude_code": 1.0},
+        per_agent_limits={"claude_code": AgentLimit(max_spend_usd=float("inf"))},
+    )
+    executors = [_executor("claude_code", cost=1.0)]
+    plan = _plan([_task("t1")], executors, policy)
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_AGENT_BUDGET
+
+
+def test_a_negative_per_agent_concurrency_ceiling_is_not_read_as_unset():
+    """`max_concurrent > 0` skips a negative value into "no limit". Reachable
+    only by constructing the policy directly — which in-process callers and
+    every test here do — which is exactly why the engine re-checks instead of
+    trusting `from_dict` to have normalised."""
+    policy = DispatchPolicy(
+        prefer_local=False,
+        cost_matrix={"claude_code": 1.0},
+        per_agent_limits={"claude_code": AgentLimit(max_concurrent=-1)},
+    )
+    executors = [_executor("claude_code", cost=1.0)]
+    plan = _plan([_task("t1")], executors, policy)
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_AGENT_CAPACITY
+
+
+def test_a_negative_price_cannot_refund_the_projected_total():
+    """A negative cost does not merely under-report: it *lowers* the running
+    projection, so each assignment would buy headroom for the next one."""
+    policy = DispatchPolicy(prefer_local=False)
+    executors = [_executor("claude_code", cost=-10.0)]
+    plan = _plan(
+        [_task("t1"), _task("t2")], executors, policy, max_daily_spend_usd=5.0
+    )
+
+    assert plan.assignments == ()
+    assert plan.projected_spend_usd == 0.0
+
+
+def test_well_formed_ceilings_still_admit_and_still_bind():
+    """Control for all of the above: the guards reject only unusable values,
+    they have not turned every configured ceiling into a refusal."""
+    policy = DispatchPolicy(
+        prefer_local=False,
+        cost_matrix={"claude_code": 1.0},
+        per_project_limits={"AICC": 1.5},
+        per_agent_limits={
+            "claude_code": AgentLimit(max_concurrent=5, max_spend_usd=2.0)
+        },
+    )
+    executors = [_executor("claude_code", cost=1.0)]
+    plan = _plan(
+        [_task("t1", project="AICC"), _task("t2", project="AICC")],
+        executors,
+        policy,
+        max_daily_spend_usd=10.0,
+    )
+
+    # The first fits under the $1.50 project cap; the second would take it to
+    # $2.00 and is deferred for that reason, not refused wholesale.
+    assert [d.task_id for d in plan.assignments] == ["t1"]
+    assert plan.decisions[1].reason == models.DEFER_PROJECT_BUDGET
+
+
+def test_a_negative_spend_figure_or_ceiling_engages_the_cost_data_gate():
+    """`max_daily_spend_usd` is only enforced when `> 0`, so a negative
+    ceiling reads as "no cap configured"; a negative trailing spend would
+    instead hand the plan headroom that was never there. Neither is a budget,
+    so both take the gate that already exists for budget data we do not have.
+    """
+    policy = DispatchPolicy(prefer_local=False, cost_matrix={"claude_code": 50.0})
+    executors = [_executor("claude_code", cost=50.0)]
+
+    for spend, ceiling in ((0.0, -1.0), (-5.0, 10.0)):
+        plan = _plan(
+            [_task("t1")],
+            executors,
+            policy,
+            daily_spend_usd=spend,
+            max_daily_spend_usd=ceiling,
+        )
+        assert plan.budget_unknown is True, (spend, ceiling)
+        assert plan.assignments == (), (spend, ceiling)
+        assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE

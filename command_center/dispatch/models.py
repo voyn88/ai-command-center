@@ -146,7 +146,16 @@ class QueuedTask:
 
 @dataclass(frozen=True)
 class AgentLimit:
-    """Per-agent guardrails. `0`/`0.0` means "unset" (no limit)."""
+    """Per-agent guardrails. `0`/`0.0` means "unset" (no limit).
+
+    Which is exactly why a *corrupt* limit must not decay into `0`: "unset"
+    is the most permissive value this type can hold, so silently substituting
+    it turns a guardrail an operator configured into no guardrail at all. A
+    configured-but-unusable spend ceiling is therefore carried as NaN (see
+    :func:`_usable_amount`) and blocks the executor in the engine, and a
+    configured-but-unusable concurrency ceiling falls back to the tightest
+    enforceable limit rather than to none.
+    """
 
     max_concurrent: int = 0
     max_spend_usd: float = 0.0
@@ -154,7 +163,9 @@ class AgentLimit:
     def as_dict(self) -> dict:
         return {
             "max_concurrent": self.max_concurrent,
-            "max_spend_usd": self.max_spend_usd,
+            # `_json_safe` because a NaN ceiling must survive as legal JSON;
+            # `from_dict` reads that `null` back as unusable, not as absent.
+            "max_spend_usd": _json_safe(self.max_spend_usd),
         }
 
     @classmethod
@@ -162,8 +173,8 @@ class AgentLimit:
         if not isinstance(data, dict):
             return cls()
         return cls(
-            max_concurrent=_non_negative_int(data.get("max_concurrent"), 0),
-            max_spend_usd=_non_negative_float(data.get("max_spend_usd"), 0.0),
+            max_concurrent=_concurrency_limit(data, "max_concurrent"),
+            max_spend_usd=_spend_limit(data, "max_spend_usd"),
         )
 
 
@@ -174,6 +185,24 @@ class DispatchPolicy:
     Persisted as `data/dispatch_policy.json`. Everything is fail-closed: an
     unparseable field falls back to the safe default rather than widening a
     budget or disabling a guardrail.
+
+    For the *money* fields that rule needs stating precisely, because their
+    safe default is not their neutral one. A price and a ceiling widen in
+    opposite directions — the permissive price is `0.0` (free) and the
+    permissive ceiling is `0.0` (unset) — so "fall back to zero" would be the
+    fail-**open** answer for both. The single rule applied here instead:
+
+        a configured amount that is not usable money (non-finite, or
+        negative) is preserved as NaN, never replaced by a number,
+
+    so it can never read as free and never as unlimited. NaN is the right
+    carrier because every ordering comparison against it is False, which makes
+    it useless as a budget and therefore impossible to accidentally satisfy;
+    the engine spots it (`math.isfinite`) and blocks whatever the amount
+    governs. `as_dict` degrades it to JSON `null` — bare `NaN` is not legal
+    JSON — and `from_dict` reads `null` back as unusable, so the refusal
+    survives a policy round-trip instead of being quietly cleared the next
+    time an unrelated field is edited.
     """
 
     prefer_local: bool = True
@@ -190,10 +219,27 @@ class DispatchPolicy:
     updated_by: str | None = None
 
     def cost_for(self, executor_id: str) -> float:
-        value = self.cost_matrix.get(executor_id)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return max(0.0, float(value))
-        return self.default_cost_usd
+        """The per-task price of `executor_id`: its cost-matrix entry, or
+        `default_cost_usd` when the matrix names no price for it.
+
+        An entry that *is* named but is not usable money resolves to NaN, not
+        to `0.0`. `max(0.0, value)` used to be the normalisation here and it
+        was the fail-open: `max(0.0, nan)` is `0.0`, so a single corrupt price
+        made its executor read as **free**, and a free executor satisfies the
+        daily, per-agent and per-project ceilings simultaneously no matter how
+        much real money it spends — the same unbounded dispatch this ticket
+        measured, arrived at from the policy file instead of the defaults.
+
+        Re-normalised here and not only in `from_dict` because a
+        `DispatchPolicy` is also constructed directly (in-process callers and
+        every engine test), and the guarantee belongs to the accessor the
+        engine actually calls.
+        """
+        value = self.cost_matrix.get(executor_id, _MISSING)
+        if value is _MISSING:
+            return self.default_cost_usd
+        amount = _configured_amount(value)
+        return self.default_cost_usd if amount is None else amount
 
     def priority_weight(self, priority: str) -> int:
         return self.priority_weights.get(priority, 0)
@@ -204,12 +250,19 @@ class DispatchPolicy:
     def as_dict(self) -> dict:
         return {
             "prefer_local": self.prefer_local,
-            "cost_matrix": dict(self.cost_matrix),
+            # `_json_safe` on both money maps: an unusable amount is carried as
+            # NaN, which `json.dump` would emit as a bare `NaN` token that no
+            # RFC 8259 parser accepts. It degrades to `null`, which `from_dict`
+            # reads back as unusable — so the round-trip preserves the refusal
+            # rather than the unrepresentable number.
+            "cost_matrix": {k: _json_safe(v) for k, v in self.cost_matrix.items()},
             "default_cost_usd": self.default_cost_usd,
             "per_agent_limits": {
                 k: v.as_dict() for k, v in self.per_agent_limits.items()
             },
-            "per_project_limits": dict(self.per_project_limits),
+            "per_project_limits": {
+                k: _json_safe(v) for k, v in self.per_project_limits.items()
+            },
             "priority_weights": dict(self.priority_weights),
             "local_executor_ids": sorted(self.local_executor_ids),
             "updated_at": self.updated_at,
@@ -222,24 +275,24 @@ class DispatchPolicy:
         recognized values yields the safe defaults for that field."""
         if not isinstance(data, dict):
             return cls()
-        cost_matrix = {
-            str(k): max(0.0, float(v))
-            for k, v in _as_dict(data.get("cost_matrix")).items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-        }
+        cost_matrix = _amount_map(data.get("cost_matrix"))
         per_agent = {
             str(k): AgentLimit.from_dict(v)
             for k, v in _as_dict(data.get("per_agent_limits")).items()
         }
-        per_project = {
-            str(k): max(0.0, float(v))
-            for k, v in _as_dict(data.get("per_project_limits")).items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-        }
+        per_project = _amount_map(data.get("per_project_limits"))
+        # The finite guard is what makes this `from_dict` total as documented:
+        # `int(float("nan"))` raises `ValueError` and `int(float("inf"))`
+        # raises `OverflowError`, so a corrupt weight used to take down every
+        # reader of the policy file — including `GET /api/v1/dispatch/policy`.
+        # A weight is an ordering hint, not a guardrail, so an unusable one is
+        # simply dropped.
         weights = {
             str(k): int(v)
             for k, v in _as_dict(data.get("priority_weights")).items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            if isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and math.isfinite(v)
         } or dict(DEFAULT_PRIORITY_WEIGHTS)
         local_ids = data.get("local_executor_ids")
         local_set = (
@@ -371,15 +424,105 @@ def _as_dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def _non_negative_int(value: object, default: int) -> int:
+# A key that is simply absent from the policy, told apart from one that is
+# present and holds `null`. The distinction is the whole point of the money
+# round-trip: absent means "no ceiling configured", `null` is what `as_dict`
+# writes for a ceiling that was configured and is unusable.
+_MISSING = object()
+
+# The fallback for a configured-but-unusable per-agent concurrency ceiling.
+# `0` is unavailable as a fallback here because it means "no limit"; `1` is the
+# tightest limit that is still enforceable, which is the conservative reading
+# of "a limit was configured and we cannot tell what it was".
+_UNUSABLE_CONCURRENCY = 1
+
+
+def _usable_amount(value: float) -> float:
+    """`value` when it is a usable amount of money, NaN otherwise.
+
+    "Usable" is the rule `task_pipeline.daily_spend_usd` already applies to a
+    provider-reported cost: finite and not negative. Everything else — NaN,
+    ±inf, a negative price or ceiling — is money this system cannot compare,
+    and the one thing it must never become is a plausible number.
+    """
+    return value if math.isfinite(value) and value >= 0 else float("nan")
+
+
+def _configured_amount(value: object) -> float | None:
+    """The amount a *present* policy entry configures: the number when it is
+    usable money, NaN when it is present but unusable, and `None` when the
+    entry is too wrongly-typed to be either — a string or a bool, which the
+    caller drops to the field's default exactly as it always has.
+
+    JSON `null` is deliberately not in that last group. It is precisely what
+    `as_dict` writes for a NaN, so reading it back as *unusable* is what makes
+    a refusal survive a policy round-trip instead of being cleared the next
+    time an unrelated field is edited.
+    """
+    if value is None:
+        return float("nan")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return default
-    number = int(value)
-    return number if number >= 0 else default
+        return None
+    return _usable_amount(float(value))
+
+
+def _amount_map(data: object) -> dict[str, float]:
+    """Coerce a policy money map (prices, per-project ceilings).
+
+    Keeps every entry that names an amount — usable or not — because dropping
+    an unusable one falls through to the field's permissive default: the
+    default *price* for a cost matrix (re-pricing an executor whose configured
+    price is corrupt) and "no ceiling" for a limits map.
+    """
+    coerced: dict[str, float] = {}
+    for key, value in _as_dict(data).items():
+        amount = _configured_amount(value)
+        if amount is not None:
+            coerced[str(key)] = amount
+    return coerced
+
+
+def _spend_limit(data: dict, key: str) -> float:
+    """A per-agent spend ceiling: `0.0` (unset) when the key is absent, the
+    amount when it is usable, NaN when it is present but unusable."""
+    value = data.get(key, _MISSING)
+    if value is _MISSING:
+        return 0.0
+    amount = _configured_amount(value)
+    return 0.0 if amount is None else amount
+
+
+def _concurrency_limit(data: dict, key: str) -> int:
+    """A per-agent concurrency ceiling: `0` (unset) when the key is absent.
+
+    Unlike the money fields there is no NaN to carry — the field is an `int` —
+    so an unusable value falls back to `_UNUSABLE_CONCURRENCY` instead. The
+    finite check has to come before `int()`, which raises on NaN and ±inf; that
+    raise is the reason a corrupt policy file could make every reader of it
+    fail rather than fall back.
+    """
+    value = data.get(key, _MISSING)
+    if value is _MISSING:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _UNUSABLE_CONCURRENCY
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return _UNUSABLE_CONCURRENCY
+    return int(number)
 
 
 def _non_negative_float(value: object, default: float) -> float:
+    """A finite, non-negative float, or `default`.
+
+    Used only for `default_cost_usd`, the fallback *price* — where falling back
+    to the documented default is right, because that price is what an executor
+    absent from the cost matrix already gets, and it is a priced fallback
+    rather than a free one.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     number = float(value)
-    return number if number >= 0 else default
+    if not math.isfinite(number) or number < 0:
+        return default
+    return number
