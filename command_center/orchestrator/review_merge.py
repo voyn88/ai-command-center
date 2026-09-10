@@ -3693,17 +3693,28 @@ def _pr_window_labels(pr: dict[str, Any]) -> set[str]:
     }
 
 
+_QUEUE_ACTIVE_LABEL = "queue-active"
+_QUEUE_WAITING_REVIEW_LABEL = "queue-waiting-review"
+
+
+def _pr_is_queue_selected(labels: set[str]) -> bool:
+    return _QUEUE_ACTIVE_LABEL in labels or _QUEUE_WAITING_REVIEW_LABEL in labels
+
+
 def _pr_window_order_key(pr: dict[str, Any], cfg: PrWindowConfig) -> tuple[int, str, int]:
     """Stable processing order for the bounded window.
 
     Sticky-active PRs stay first. Already-blocked PRs move behind unblocked
     candidates so a long tail of stale/conflicted PRs cannot consume the tick
-    before newly-opened work receives an active/waiting label.
+    before newly-opened work receives an active/waiting label. Queue-selected
+    PRs are treated as non-tail even when they still carry an old blocked
+    label; the tick will normalize that stale label away instead of letting
+    it poison the active/waiting queue view.
     """
     labels = _pr_window_labels(pr)
-    if cfg.label_active in labels:
+    if cfg.label_active in labels or _QUEUE_ACTIVE_LABEL in labels:
         bucket = 0
-    elif cfg.label_blocked in labels:
+    elif cfg.label_blocked in labels and not _pr_is_queue_selected(labels):
         bucket = 2
     else:
         bucket = 1
@@ -3806,8 +3817,12 @@ def _reconcile_pr_window(
         number = int(pr.get("number") or 0)
         head = str(pr.get("headRefOid") or "")
         labels = _pr_window_labels(pr)
-        active_now = cfg.label_active in labels
-        blocked_now = cfg.label_blocked in labels and not active_now
+        active_now = cfg.label_active in labels or _QUEUE_ACTIVE_LABEL in labels
+        blocked_now = (
+            cfg.label_blocked in labels
+            and not active_now
+            and not _pr_is_queue_selected(labels)
+        )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
         # A cache hit costs no API call, so it costs no detail budget

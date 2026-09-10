@@ -3911,6 +3911,42 @@ def test_already_correctly_labelled_pr_costs_no_edit_call(monkeypatch):
     assert edits == []
 
 
+def test_queue_selected_prs_shed_stale_blocked_labels(monkeypatch):
+    """Live backlog hygiene: a PR can already be selected by the queue while
+    still carrying an old `review-window:blocked` label. That stale label must
+    be normalized away immediately rather than pushing the PR into the old
+    blocked tail and making downstream ticks scan contradictory state."""
+    active_head = "5" * 40
+    waiting_head = "6" * 40
+    prs = [
+        _win_pr(
+            10,
+            "2026-01-01T00:00:00Z",
+            active_head,
+            labels=["queue-active", "review-window:blocked"],
+        ),
+        _win_pr(
+            11,
+            "2026-01-02T00:00:00Z",
+            waiting_head,
+            labels=["queue-waiting-review", "review-window:blocked"],
+        ),
+    ]
+    fake = _RestGitHub(prs)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert report.active == [(10, active_head)]
+    assert report.waiting == [(11, waiting_head)]
+    assert ("10", "remove", "review-window:blocked") in fake.labels
+    assert ("10", "add", "review-window:active") in fake.labels
+    assert ("11", "remove", "review-window:blocked") in fake.labels
+    assert ("11", "add", "review-window:waiting") in fake.labels
+
+
 def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
     """VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE: live 2026-09-08 the listing
     exceeded GitHub's GraphQL node limit and returned rc=1, and the tick
