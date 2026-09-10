@@ -1090,7 +1090,7 @@ def _build_release(tmp_path, *, final_mode=0o755, bin_mode=0o555):
         if hasattr(os, "lchmod"):
             try:
                 os.lchmod(link, 0o777)
-            except OSError, NotImplementedError:
+            except (OSError, NotImplementedError):
                 pass
 
     current = opt / "current"

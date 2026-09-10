@@ -3483,8 +3483,8 @@ def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):
     repo = Path(__file__).parents[2]
     authority = tmp_path / "authority.env"
     authority.write_text(
-        "AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n", encoding="utf-8"
-    )  # pragma: allowlist secret
+        "AICC_WORKSPACE_ROOTS=./tmp/workspaces\n", encoding="utf-8"
+    )
     specs = module.default_specs(
         repo,
         authority_env=authority,
@@ -5942,8 +5942,8 @@ def test_a_real_control_install_leaves_no_worker_artefact_or_secret_tree(
     state = tmp_path / "state"
     authority = tmp_path / "authority.env"
     authority.write_text(
-        "AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n",
-        encoding="utf-8",  # pragma: allowlist secret
+        "AICC_WORKSPACE_ROOTS=./tmp/workspaces\n",
+        encoding="utf-8",
     )
     for target, payload in (
         (CLAUDE_CREDENTIAL, CLAUDE_BYTES),
