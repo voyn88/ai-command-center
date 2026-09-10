@@ -152,12 +152,20 @@ def test_model_auth_allowlist_is_provider_specific(launcher, monkeypatch, tmp_pa
         launcher._validate_environment_file(env_file, "claude")
 
 
-def test_codex_keeps_inner_workspace_write_sandbox(launcher, tmp_path):
+def test_codex_development_profile_runs_without_its_inner_sandbox_inside_the_unit(launcher, tmp_path):
+    """Owner decision 2026-09-09: the systemd unit is the boundary; Codex's
+    bubblewrap on top mounted .git read-only and no commit could land. The
+    prompt is still terminated with `--` so it cannot pick a sandbox."""
     command = launcher._provider_command(_manifest(tmp_path))
-    assert command[command.index("--sandbox") + 1] == "workspace-write"
-    assert "danger-full-access" not in command
+    assert command[command.index("--sandbox") + 1] == "danger-full-access"
     assert command[-2] == "--"
     assert command[-1] == "make one local commit"
+
+
+def test_codex_read_only_profile_keeps_the_read_only_sandbox(launcher, tmp_path):
+    command = launcher._provider_command(_manifest(tmp_path, profile="read_only"))
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert "danger-full-access" not in command
 
 
 def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
@@ -177,8 +185,11 @@ def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
     ],
 )
 def test_root_launcher_provider_argv_cannot_drift_from_worker_policy(
-    launcher, tmp_path, executor, task_type
+    launcher, tmp_path, executor, task_type, monkeypatch
 ):
+    # The broker only ever runs under principal isolation; the worker's
+    # builder must produce the same argv in that mode.
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
     profile = agent_runner.profile_for_task_type(task_type)
     manifest = _manifest(
         tmp_path,
@@ -292,6 +303,7 @@ def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
         "/run/aicc-agent-workspace-binds",
         "/run/credentials",
         "/run/voyn-aicc-worker",
+        "/run/aicc-worker-lanes",
         "/run/aicc-agent-homes",
         "/srv/aicc-quarantine",
         str(tmp_path.parent),
@@ -414,10 +426,33 @@ def test_workspace_with_renamable_parent_is_refused(launcher, tmp_path):
         launcher._open_pinned_workspace(workspace)
 
 
+def test_workspace_parent_owned_by_the_client_is_rename_proof_unless_group_writable(
+    launcher, tmp_path
+):
+    """VOYN-W0-AICC-LAUNCHER-PARENT-RULE-REJECTS-WORKER-OWNED-WORKSPACES: the
+    worker lane provisions workspaces under directories it owns; those are
+    rename-proof against the agent when no group/other write bit is set.
+    A group-writable parent (the old 2770 root, agents in that group) is
+    still refused, and so is a parent owned by a third uid."""
+    parent = tmp_path / "ai-command-center-worktrees"
+    parent.mkdir(mode=0o700)
+    workspace = parent / "workspace"
+    workspace.mkdir()
+    me = os.getuid()
+    assert launcher._parent_is_rename_proof(workspace, me) is True
+    assert launcher._parent_is_rename_proof(workspace, me + 1) is False
+    descriptor = launcher._open_pinned_workspace(workspace, me)
+    os.close(descriptor)
+    parent.chmod(0o2770)
+    assert launcher._parent_is_rename_proof(workspace, me) is False
+    with pytest.raises(launcher.LaunchRefused, match="renamable"):
+        launcher._open_pinned_workspace(workspace, me)
+
+
 def test_workspace_bind_source_stays_on_pinned_inode_after_path_replacement(
     launcher, monkeypatch, tmp_path
 ):
-    monkeypatch.setattr(launcher, "_parent_is_rename_proof", lambda workspace: True)
+    monkeypatch.setattr(launcher, "_parent_is_rename_proof", lambda workspace, client_uid=0: True)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "identity").write_text("original", encoding="utf-8")
@@ -830,28 +865,31 @@ def test_model_auth_reader_is_nofollow_and_exact_mode(launcher, tmp_path):
         )
 
 
-def test_output_limit_is_incremental_and_triggers_seal(launcher, monkeypatch):
+def test_output_limit_keeps_the_tail_and_lets_the_agent_finish(launcher, monkeypatch):
     monkeypatch.setattr(launcher, "MAX_OUTPUT_BYTES", 1024)
     proc = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            "import os; os.write(1, b'x' * 4096)",
+            "import os; os.write(1, b'x' * 4096 + b'FINAL'); os.write(2, b'e' * 10)",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    sealed: list[bool] = []
+    limited: list[bool] = []
     try:
-        with pytest.raises(launcher.LaunchRefused, match="bounded transport"):
-            launcher._bounded_collect(
-                proc,
-                lambda: (sealed.append(True), proc.kill()),
-            )
+        stdout, stderr = launcher._bounded_collect(proc, lambda: limited.append(True))
     finally:
         proc.kill()
         proc.wait()
-    assert sealed == [True]
+    # Overflow is observed once, the run is not refused, and the retained
+    # stdout is the marked tail (the final report lives at the end).
+    assert limited == [True]
+    assert proc.returncode == 0
+    assert stdout.startswith(launcher.OUTPUT_TRUNCATED_MARKER)
+    body = stdout[len(launcher.OUTPUT_TRUNCATED_MARKER) :]
+    assert len(body) == 1024 and body.endswith(b"FINAL")
+    assert stderr == b"e" * 10
 
 
 def test_sigterm_ignoring_unit_escalates_and_is_proven_inactive(launcher, monkeypatch):
@@ -1049,8 +1087,18 @@ def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
     assert "TimeoutStopSec=3660s" in worker_template
     # 195s adopted from main (PR #382) at the merge of the two templates.
     assert "TimeoutStartSec=195s" in worker_template
-    assert "RuntimeDirectory=voyn-aicc-worker/%i" in worker_template
-    assert "PGPASSFILE=/run/voyn-aicc-worker/%i/pgpass" in worker_template
+    assert "RuntimeDirectory=aicc-worker-lanes/%i" in worker_template
+    assert "PGPASSFILE=/run/aicc-worker-lanes/%i/pgpass" in worker_template
+    assert "/run/aicc-worker-lanes/%i/pgpass" in worker_template.split("ExecStartPre=")[1]
+    # The legacy lane (User=voynadmin) owns /run/voyn-aicc-worker 0750 while the
+    # staged rollout still runs it next to the first isolated lane; nesting the
+    # isolated lane's runtime directory under that root killed it at
+    # ExecStartPre (worker-01, 2026-09-08). Never share the legacy root.
+    directives = "\n".join(
+        line for line in worker_template.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "RuntimeDirectory=voyn-aicc-worker" not in directives
+    assert "/run/voyn-aicc-worker" not in directives
     assert "SocketUser=root" in socket_unit
     assert "SocketGroup=aicc-publisher" in socket_unit
     assert "SocketMode=0660" in socket_unit
@@ -1419,6 +1467,78 @@ def test_worker_to_control_is_one_generation_with_one_rollback_boundary():
     )
 
 
+def test_lane_timers_are_held_before_apply_and_released_after_commit():
+    """Both lane-mutating timers, and the shared rollout lock, must be held
+    for the transaction's full mutating span -- prepare through commit -- not
+    just the `run_rollout rollout` step. `rollback`'s own `run_transaction
+    recover` (armed the moment `transaction_active` becomes 1) mutates the
+    same worker units from a separate, shell-level snapshot on ANY later
+    failure -- including one in `run_transaction apply`, before the rollout
+    step even starts -- so the hold has to begin there too, live worker-01
+    2026-09-08 (VOYN-W0-AICC-ROLLOUT-VS-ROTATE-SELFDEPLOY-TIMERS)."""
+    text = _installer_text()
+    lines = [line.strip() for line in text.splitlines()]
+    active = lines.index("transaction_active=1")
+    hold = lines.index("hold_lane_timers || {")
+    apply_index = lines.index("run_transaction apply")
+    commit = lines.index("run_transaction commit")
+    release_after_commit = lines.index("release_lane_timers", commit)
+
+    assert active < hold < apply_index < commit < release_after_commit
+    # Immediately after commit -- not buried behind
+    # `verify-agent-principal-boundary.sh` or the rollout step, both of which
+    # run before commit and must stay covered by the hold.
+    assert lines[commit + 1] == "transaction_active=0"
+    assert lines[commit + 2] == "release_lane_timers"
+
+
+def test_rollback_always_releases_lane_timers_after_recover():
+    """`rollback`'s release must be unconditional: it has to run whether or
+    not `recover` was even invoked (the guard above it may be false), and
+    whether or not `recover` succeeded -- a rollback that only released the
+    timers on the happy path would leave rotation/self-deploy paused forever
+    on exactly the failure this ticket is about."""
+    text = _installer_text()
+    body_start = text.index("rollback() {\n") + len("rollback() {\n")
+    body_end = text.index("\n}\n", body_start)
+    lines = [line.strip() for line in text[body_start:body_end].splitlines()]
+
+    recover_guard = lines.index(
+        'if [ "$transaction_active" -eq 1 ] && path_present '
+        '"$state_dir/pending.json"; then'
+    )
+    recover_call = lines.index("if ! run_transaction recover; then")
+    guard_fi = next(
+        index
+        for index, line in enumerate(lines)
+        if line == "fi" and index > recover_call
+    )
+    release_index = lines.index("release_lane_timers")
+    baseline_check = lines.index(
+        'if [ "$rollback_complete" -eq 1 ] && [ "$baseline_created" -eq 1 ]; then'
+    )
+
+    assert recover_guard < recover_call < guard_fi < release_index < baseline_check
+    # `release_lane_timers` sits AFTER the guard's closing `fi`, not inside
+    # it: reached even when transaction_active was never 1 (nothing to
+    # recover) or when recover() itself failed.
+    assert lines.count("release_lane_timers") == 1
+
+
+def test_rollout_step_declares_the_transaction_already_holds_the_timers():
+    """The rollout step must tell `rollout()` not to stop/start the timers or
+    touch the lock itself -- the transaction already holds both for a wider
+    span than this one step, and `rollout()`'s own `finally` releasing them
+    early would reopen the gap between a successful rollout and `commit`."""
+    text = _installer_text()
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+    _assert_command_inside_shell_if(
+        text,
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes --assume-timers-held",
+        guard,
+    )
+
+
 def test_worker_to_control_guard_check_rejects_an_intervening_fi():
     """A nearby guard is not proof if it closes before quiesce."""
     guard = 'if [ "$install_profile" = "control" ]; then'
@@ -1494,7 +1614,7 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
 
     for line in (
         "systemctl enable --now aicc-agent-launcher.socket",
-        "run_rollout rollout --lanes /etc/aicc/worker-lanes",
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes --assume-timers-held",
         '"$repo_root/ops/verify-agent-principal-boundary.sh"',
     ):
         # The boundary verifier is also named earlier as `sh -n "..."`, a
@@ -1748,3 +1868,415 @@ def test_control_authority_is_proven_before_prepare():
     validation = installer.index("run_transaction validate-control-authority")
     prepare = installer.index("run_transaction prepare")
     assert sysusers < validation < prepare
+
+
+def test_release_venv_installs_the_accepted_aios_wheels_from_the_root_store():
+    """The worker imports `aios_db`; the CI lock does not carry it (CI fetches
+    the private aios release with a token a root installer must not hold). The
+    first canary start after #823/#858 died with "No module named 'aios_db'"
+    (worker-01, 2026-09-08). The release venv installs both accepted wheels
+    from the root-owned digest store, verified against the release's own lock
+    files, and the import preflight proves them before the release is recorded."""
+    installer = (
+        Path(__file__).parents[2] / "deploy" / "install-agent-principal-isolation.sh"
+    ).read_text()
+    assert "aios_artifact_store=/var/lib/aicc-artifacts" in installer
+    assert 'for lock in aios-sdk.lock.json aios-db.lock.json; do' in installer
+    assert "sha256sum -c --quiet" in installer
+    assert "--no-deps --require-hashes" in installer
+    staging = installer.split("stage_immutable_release() {", 1)[1]
+    lock_install = staging.index('-r "$release_staging/requirements-ci-linux.lock"')
+    aios_install = staging.index('install_aios_wheels "$release_staging"')
+    preflight = staging.index("import aios_db")
+    record = staging.index("run_release release-record")
+    assert lock_install < aios_install < preflight < record
+
+
+def test_boundary_script_masks_the_launcher_trees_and_tolerates_absent_ones():
+    """The boundary canary masks exactly the launcher's sensitive trees, each
+    with the '-' prefix: a tree that does not exist yet (the workspace-bind
+    root before the first launch, the lane runtime root before a lane runs,
+    the quarantine root before the first quarantine) must not make systemd
+    refuse the canary namespace -- that refusal rolled back the whole install
+    as a boundary failure that measured nothing (worker-01, 2026-09-08)."""
+    import re
+
+    script = (Path(__file__).parents[2] / "ops" / "verify-agent-principal-boundary.sh").read_text()
+    match = re.search(r'^principal_inaccessible_paths="([^"]+)"', script, re.MULTILINE)
+    assert match, "inaccessible path list not found"
+    entries = match.group(1).split()
+    assert all(entry.startswith("-/") for entry in entries), entries
+    spec = importlib.util.spec_from_file_location(
+        "aicc_agent_launcher", Path(__file__).parents[2] / "ops" / "aicc_agent_launcher.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert {entry[1:] for entry in entries} == set(module.SENSITIVE_AUTHORITY_TREES)
+
+
+def test_boundary_flag_check_skips_a_retired_legacy_family_unit_but_not_a_lane():
+    """A retired legacy family unit (`not-found`) carries no flag and can start
+    nothing, so the flag check skips it; a REGISTERED lane that is not loaded
+    is still a failure (worker-01 2026-09-08 14:45 UTC rolled back on the
+    retired aicc-worker.service)."""
+    script = (Path(__file__).parents[2] / "ops" / "verify-agent-principal-boundary.sh").read_text()
+    block = script.split("for family_unit in $worker_family_units $lane_family_units; do", 1)[1]
+    block = block.split("done", 1)[0]
+    assert 'family_load=$(systemctl show "$family_unit" --property=LoadState --value)' in block
+    assert '[ "$family_load" = not-found ]' in block
+    assert 'fail "registered worker lane is not loaded: $family_unit"' in block
+    # The flag itself is still required exactly for every loaded unit.
+    assert "isolation flag did not reach $family_unit exactly" in block
+
+
+def test_executor_symlink_is_judged_by_owner_only_and_its_target_by_mode(launcher):
+    """VOYN-W0-AICC-LAUNCHER-PARENT-RULE-REJECTS-WORKER-OWNED-WORKSPACES: a
+    symlink's mode is always 0777 and means nothing; refusing it on `& 0o022`
+    refused every toolchain executor. The target keeps the strict rule."""
+    def info(mode, uid):
+        return os.stat_result((mode, 0, 0, 1, uid, 0, 0, 0, 0, 0))
+
+    link = 0o120777
+    assert launcher._node_is_immutable_root_owned(info(link, 0)) is True
+    assert launcher._node_is_immutable_root_owned(info(link, 1000)) is False
+    assert launcher._node_is_immutable_root_owned(info(0o100755, 0)) is True
+    assert launcher._node_is_immutable_root_owned(info(0o100775, 0)) is False
+    assert launcher._node_is_immutable_root_owned(info(0o100755, 1000)) is False
+
+
+def test_validate_binary_refuses_a_target_that_is_group_writable(launcher, tmp_path, monkeypatch):
+    binary = tmp_path / "bin" / "claude"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o775)
+    link = tmp_path / "claude-link"
+    link.symlink_to(binary)
+    real_stat = os.stat_result
+
+    class RootStat:
+        """Every node reads as root-owned; modes stay real."""
+
+    def fake_stat(self, *, follow_symlinks=True):
+        # Every node reads as root-owned; directories (tmp_path lives under a
+        # 1777 /tmp on Linux runners) read as not group/other-writable so the
+        # path-component rule passes and the TARGET's real mode is judged.
+        result = os.stat(self, follow_symlinks=follow_symlinks)
+        values = list(result)
+        values[4] = 0
+        if stat.S_ISDIR(values[0]):
+            values[0] &= ~0o022
+        return real_stat(values)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(Path, "lstat", lambda self: fake_stat(self, follow_symlinks=False))
+    with pytest.raises(launcher.LaunchRefused, match="executor binary is not immutable root-owned"):
+        launcher._validate_binary(str(link))
+    binary.chmod(0o755)
+    launcher._validate_binary(str(link))
+
+
+def test_the_worker_preflight_names_the_same_executors_the_broker_launches(launcher):
+    """Two authorities for "where is the executor" drift: the worker's
+    preflight pointed at /usr/local/bin (where codex never was) while the
+    broker launches from the toolchain, so codex read as unavailable and
+    every review fell through to the next link (worker-01 2026-09-08)."""
+    from command_center import agent_runner
+
+    # Whole-dictionary equality: a broker-only or worker-only executor is
+    # drift either way (review of 706db212: iterating one side let a
+    # broker-only entry pass). Copilot is absent from BOTH by ADR-0010.
+    assert dict(agent_runner.PRINCIPAL_EXECUTOR_BINARIES) == dict(launcher.EXECUTOR_BINARIES)
+    assert "copilot" not in launcher.EXECUTOR_BINARIES
+
+
+def test_validate_binary_refuses_a_target_that_is_not_a_regular_file(launcher, tmp_path, monkeypatch):
+    """Review of 2a3fa2a3: the owner/mode split left the regular-file
+    requirement unreachable; a root-owned directory or FIFO passed."""
+    real_stat = os.stat_result
+
+    def fake_stat(self, *, follow_symlinks=True):
+        values = list(os.stat(self, follow_symlinks=follow_symlinks))
+        values[4] = 0
+        if stat.S_ISDIR(values[0]):
+            values[0] &= ~0o022
+        return real_stat(values)
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(Path, "lstat", lambda self: fake_stat(self, follow_symlinks=False))
+    directory = tmp_path / "bin" / "claude"
+    directory.mkdir(parents=True)
+    directory.chmod(0o755)
+    with pytest.raises(launcher.LaunchRefused, match="not a regular file"):
+        launcher._validate_binary(str(directory))
+    fifo = tmp_path / "bin" / "codex"
+    os.mkfifo(fifo)
+    fifo.chmod(0o755)
+    with pytest.raises(launcher.LaunchRefused, match="not a regular file"):
+        launcher._validate_binary(str(fifo))
+
+
+def test_the_worker_data_dir_parent_stays_root_owned():
+    """Review of f4ef507c: `install -d -o aicc-worker /var/lib/aicc /var/lib/aicc/data`
+    handed the PARENT to the worker too. Only the leaf is the worker's."""
+    text = (Path(__file__).parents[2] / "deploy/install-agent-principal-isolation.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "install -d -m 0755 -o root -g root /var/lib/aicc\n" in text
+    assert "install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc/data\n" in text
+    # No worker-owned install may name the parent as a target, in any
+    # position or order (review of 39981fc9: the first version only rejected
+    # one ordering).
+    for line in text.splitlines():
+        if "install" in line and "-o aicc-worker" in line:
+            targets = [word for word in line.split() if word.startswith("/")]
+            assert "/var/lib/aicc" not in targets, line
+            assert targets == ["/var/lib/aicc/data"] or "/var/lib/aicc" not in " ".join(targets), line
+
+
+def test_every_launcher_read_write_path_is_created_by_tmpfiles_before_the_first_connection():
+    """VOYN-W0-AICC-LAUNCHER-BIND-ROOT-MUST-EXIST-BEFORE-FIRST-CONNECTION:
+    a ReadWritePaths= entry only the launcher creates refuses every first
+    connection with 226/NAMESPACE. Every entry is declared in tmpfiles, the
+    entries are STRICT (a '-' would only hide the absence: a directory
+    created after the namespace is built is not writable inside it, review
+    of 5736dd6c), and the socket unit re-applies the tmpfiles declaration
+    before it accepts a connection, so a boot where tmpfiles did not run is
+    repaired at the socket, not tolerated at the namespace."""
+    root = Path(__file__).parents[2]
+    unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text(encoding="utf-8")
+    socket_unit = (root / "deploy/systemd/aicc-agent-launcher.socket").read_text(encoding="utf-8")
+    tmpfiles = (root / "deploy/tmpfiles.d/aicc-agent.conf").read_text(encoding="utf-8")
+    # Only d/D CREATE a directory; z/Z merely adjust one that exists (review
+    # of 446856da: counting them let a `d` demoted to `z` pass).
+    created = {
+        line.split()[1]
+        for line in tmpfiles.splitlines()
+        if line and not line.startswith("#") and line.split()[0] in {"d", "D"}
+    }
+    paths = [
+        path
+        for line in unit.splitlines()
+        if line.startswith("ReadWritePaths=")
+        for path in line.split("=", 1)[1].split()
+    ]
+    assert paths, "launcher unit has no ReadWritePaths="
+    for path in paths:
+        assert not path.startswith("-"), f"{path}: '-' hides the absence instead of curing it"
+        assert path in created, f"{path} is not CREATED (d/D) by tmpfiles.d/aicc-agent.conf"
+    assert (
+        "ExecStartPre=/usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/aicc-agent.conf"
+        in socket_unit
+    ), "the socket must re-create the runtime paths before the first connection"
+    assert "/run/aicc-agent-workspace-binds" in created
+
+
+def _auth_store(tmp_path, monkeypatch, launcher, payload: bytes):
+    store = tmp_path / "store" / ".claude" / ".credentials.json"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(payload)
+    store.chmod(0o600)
+    monkeypatch.setitem(launcher.MODEL_AUTH_SOURCES, "claude", store)
+    monkeypatch.setattr(
+        launcher, "_read_exact_protected_file", lambda path, **kwargs: Path(path).read_bytes()
+    )
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    return store, home
+
+
+def test_refreshed_model_auth_is_written_back_to_the_store(tmp_path, monkeypatch, launcher):
+    """VOYN-W0-AICC-AGENT-MODEL-AUTH-REFRESH-IS-LOST-WITH-THE-EPHEMERAL-HOME:
+    a token refresh (same keys, new values) in the ephemeral home reaches
+    the root store atomically; the next run is staged from the new token."""
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1", "expiresAt": 1}}).encode()
+    new = json.dumps({"claudeAiOauth": {"accessToken": "b", "refreshToken": "r2", "expiresAt": 2}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    (home / ".claude" / ".credentials.json").write_bytes(new)
+    assert launcher._write_back_model_auth("claude", home) is True
+    assert store.read_bytes() == new
+    assert stat.S_IMODE(store.stat().st_mode) == 0o600
+    assert not list(store.parent.glob(".*.tmp"))
+
+
+def test_unchanged_or_missing_model_auth_is_not_written_back(tmp_path, monkeypatch, launcher):
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1"}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    assert launcher._write_back_model_auth("claude", home) is False
+    (home / ".claude" / ".credentials.json").write_bytes(old)
+    assert launcher._write_back_model_auth("claude", home) is False
+    assert store.read_bytes() == old
+
+
+def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monkeypatch, launcher):
+    """A refresh changes values, never the key set; anything else the agent
+    left behind is not trusted into the store."""
+    old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1"}}).encode()
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    target = home / ".claude" / ".credentials.json"
+    target.write_bytes(b"not json")
+    with pytest.raises(launcher.LaunchRefused, match="not JSON"):
+        launcher._write_back_model_auth("claude", home)
+    target.write_bytes(json.dumps({"claudeAiOauth": {"accessToken": "a"}, "extra": 1}).encode())
+    with pytest.raises(launcher.LaunchRefused, match="changed shape"):
+        launcher._write_back_model_auth("claude", home)
+    target.unlink()
+    target.symlink_to(store)
+    with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
+        launcher._write_back_model_auth("claude", home)
+    assert store.read_bytes() == old
+
+
+def test_agent_units_keep_proc_subset_pid_for_every_executor(launcher, monkeypatch, tmp_path):
+    """No executor needs /proc/sys: Codex runs without bubblewrap inside the
+    unit (see the danger-full-access test), so the tight subset stays."""
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *args, **kwargs: False)
+    for executor, profile in (("codex", "trusted_development"), ("codex", "read_only"), ("claude", "trusted_development")):
+        command = launcher._systemd_command(
+            _manifest(tmp_path, executor=executor, profile=profile), Path("/run/aicc-agent-homes/t"),
+            "aicc-agent-t.service", "aicc-agent-launcher@t.service", tmp_path.parent, tmp_path,
+        )
+        assert "--property=ProcSubset=pid" in command, (executor, profile)
+
+
+def test_agent_git_trusts_exactly_the_bound_workspace(launcher, monkeypatch, tmp_path):
+    """The workspace is worker-owned (nobody inside the agent's uid view); with
+    system/global git config disabled, only the command-line scope can carry
+    safe.directory, and it names /workspace alone."""
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *args, **kwargs: False)
+    command = launcher._systemd_command(
+        _manifest(tmp_path), Path("/run/aicc-agent-homes/t"), "aicc-agent-t.service",
+        "aicc-agent-launcher@t.service", tmp_path.parent, tmp_path,
+    )
+    assert "--setenv=GIT_CONFIG_NOSYSTEM=1" in command and "--setenv=GIT_CONFIG_GLOBAL=/dev/null" in command
+    assert "--setenv=GIT_CONFIG_COUNT=1" in command
+    assert "--setenv=GIT_CONFIG_KEY_0=safe.directory" in command
+    assert "--setenv=GIT_CONFIG_VALUE_0=/workspace" in command
+    assert not any(v.startswith("--setenv=GIT_CONFIG_VALUE_0=") and v != "--setenv=GIT_CONFIG_VALUE_0=/workspace" for v in command)
+
+
+def test_the_launcher_can_write_the_model_auth_store_it_writes_refreshed_tokens_into():
+    """VOYN-W0-AICC-AGENT-MODEL-AUTH-REFRESH-IS-LOST-WITH-THE-EPHEMERAL-HOME-REM:
+    the write-back at teardown targets /var/lib/aicc-agent; under
+    ProtectSystem=strict that path must be in ReadWritePaths, or the
+    refreshed token is lost with EROFS (worker-01 2026-09-09)."""
+    unit = (Path(__file__).parents[2] / "deploy/systemd/aicc-agent-launcher@.service").read_text()
+    paths = [
+        path
+        for line in unit.splitlines()
+        if line.startswith("ReadWritePaths=")
+        for path in line.split("=", 1)[1].split()
+    ]
+    assert "/var/lib/aicc-agent" in paths
+    tmpfiles = (Path(__file__).parents[2] / "deploy/tmpfiles.d/aicc-agent.conf").read_text()
+    assert "d /var/lib/aicc-agent 0700 root root -" in tmpfiles
+
+
+# ---------------------------------------------------------------------------
+# The control plane's own ticks are deploy-managed, not hand-made.
+#
+# VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL: the PR
+# review-window labeller had exactly one committed unit
+# (deploy/systemd/aicc-backlog-pr-window.{service,timer}) and it names a
+# layout control-01 does not have -- User=aicc-worker, /usr/bin/python,
+# /srv/ai-command-center. Nothing installed it there, control-01 runs
+# hand-made voyn-aicc-{planner,review,merge,reaper,self-deploy} units only,
+# and the window-gated workflows (CI, Acceptance gate, boundary fitness) run
+# on a PR ONLY while it carries a review-window label. So every fleet PR
+# opened with no CI at all -- 24 red-or-checkless PRs and #907 on 2026-09-09 --
+# until an operator installed a unit by hand at 21:15 UTC. A hand-made unit
+# lasts exactly as long as the host does; these tests are what makes the
+# rebuilt host keep it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
+    """The unit is part of the control generation, so a rebuilt control host
+    gets the labeller without an operator remembering it."""
+    tx, control = _specs("control", tmp_path)
+    _tx, worker = _specs("worker", tmp_path)
+
+    assert tx.CONTROL_ONLY_UNITS == (
+        "voyn-aicc-pr-window.service",
+        "voyn-aicc-pr-window.timer",
+    )
+    for unit in tx.CONTROL_ONLY_UNITS:
+        assert f"/etc/systemd/system/{unit}" in control
+    # A control-only unit is exactly that: the worker profile neither installs
+    # it nor is expected to, and the worker-only drop set is unchanged by it.
+    assert control - worker == {
+        f"/etc/systemd/system/{unit}" for unit in tx.CONTROL_ONLY_UNITS
+    }
+    assert worker - control == tx.WORKER_ONLY_TARGETS
+
+
+def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
+    """Why the tick was never deployed, stated as a test.
+
+    The committed aicc-backlog-pr-window units name a layout nothing on the
+    control plane has -- User=aicc-worker, /usr/bin/python, an
+    /srv/ai-command-center clone, an /etc/ai-command-center.env credential --
+    so installing them there was never possible and nobody did. The control
+    spelling depends on exactly two things the control profile itself
+    guarantees: the release tree this same transaction publishes and verifies,
+    and the operator principal every other repo-owned control unit runs as. No
+    clone, no database credential, no required EnvironmentFile, and no home
+    directory: a unit that needs a host layout is a unit that does not get
+    installed."""
+    root = Path(__file__).parents[2]
+    service = (root / "deploy/systemd/voyn-aicc-pr-window.service").read_text()
+    timer = (root / "deploy/systemd/voyn-aicc-pr-window.timer").read_text()
+    reference = (root / "deploy/systemd/voyn-aicc-self-deploy.service").read_text()
+    release = "/opt/aicc/current"
+    directives = [
+        line for line in service.splitlines() if line and not line.startswith("#")
+    ]
+    body = "\n".join(directives)
+
+    assert f"WorkingDirectory={release}" in directives
+    assert (
+        f"ExecStart={release}/.venv/bin/python -m command_center.db "
+        "backlog-pr-window --repo-path ${AICC_FLEET_REPO}" in directives
+    )
+    # The release tree is a `git archive`, not a clone: gh has no remote to
+    # read the repository from, so the unit names it (overridably).
+    assert any(line.startswith("Environment=GH_REPO=") for line in directives)
+    assert "Environment=AICC_FLEET_REPO=/opt/aicc/current" in directives
+    # Optional (`-`) and only an override: a REQUIRED environment file is a
+    # host layout, and requiring one is the mistake this unit exists to undo.
+    for line in directives:
+        if line.startswith("EnvironmentFile="):
+            assert line.startswith("EnvironmentFile=-"), line
+    for borrowed in ("User=voynadmin", "Type=oneshot"):
+        assert borrowed in directives and borrowed in reference
+    # None of the layout that was never on this host, and no home path at all
+    # (this is a public repository; see scripts/ci/prepush/leak_guard.sh).
+    for absent in ("/srv/ai-command-center", "/usr/bin/python", "aicc-worker",
+                   "/home", "/Users"):
+        assert absent not in body
+    # Scheduled from the END of the last tick: the tick's whole runtime is gh
+    # calls, and OnUnitActiveSec would queue a second one behind a slow first.
+    assert "OnUnitInactiveSec=5min" in timer
+    assert "OnUnitActiveSec" not in timer
+    assert "WantedBy=timers.target" in timer
+
+
+def test_the_installer_starts_the_pr_window_timer_after_it_commits(tmp_path):
+    """Installed and enabled, or the file is just a file. Deliberately after
+    `run_transaction commit` AND after the rollback trap is disarmed: this
+    timer is not in the rollback's service snapshot (RESTORABLE_UNIT_RE admits
+    only worker and launcher units), so enabling it inside the transaction
+    would leave an enablement symlink pointing at a unit file the rollback
+    removes."""
+    tx, _control = _specs("control", tmp_path)
+    text = _installer_text()
+    enable = f"systemctl enable --now {tx.CONTROL_ONLY_TIMER}"
+
+    assert tx.CONTROL_ONLY_TIMER in tx.CONTROL_ONLY_UNITS
+    _assert_command_inside_shell_if(
+        text, enable, 'if [ "$install_profile" = "control" ]; then'
+    )
+    assert text.index("run_transaction commit") < text.index(enable)
+    assert text.index("trap - EXIT HUP INT TERM") < text.index(enable)
+    assert text.index(enable) < text.index(
+        "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
+    ), "a failed enable must not be announced as a completed install"

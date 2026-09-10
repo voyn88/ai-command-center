@@ -129,6 +129,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Report the eligible set without dispatching.",
     )
+    plan.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Deploy preflight: run backlog_dispatch_smoke() (0021) -- the read-only "
+        "probe with exactly dispatch's privileges -- and exit non-zero on refusal.",
+    )
     review = sub.add_parser(
         "backlog-review",
         help="One review tick (BO-S3b): enqueue an adversarial review run for "
@@ -158,10 +164,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "backlog-pr-window",
         help="One PR-window tick: label every open PR active/waiting/"
-        "blocked in a bounded rotation (aicc-backlog-pr-window.timer). "
+        "blocked in a bounded rotation (voyn-aicc-pr-window.timer). "
         "Only ever relabels -- never merges, approves, or weakens a gate. "
-        "Needs --repo-path.",
-    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+        "GitHub only: opens no database connection, so it runs on any host "
+        "with a gh identity. Needs --repo-path.",
+    ).add_argument(
+        "--repo-path",
+        default=".",
+        help="Directory to run gh in. A clone, or any directory when GH_REPO "
+        "names the repository (the deploy-managed unit uses the release tree).",
+    )
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -193,6 +205,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--branch",
         default="main",
         help="Remote branch to deploy from (the repository's default branch).",
+    )
+    self_deploy.add_argument(
+        "--rollout-lock",
+        default="/run/aicc-staged-rollout.lock",
+        help="Marker file the staged worker rollout holds for its duration; "
+        "a tick that finds it present refuses rather than racing the "
+        "rollout's own lane mutations.",
     )
 
     # The fleet's single-panel view over enrolled worker-host devices
@@ -267,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                 branch=args.branch,
                 services=tuple(args.restart),
                 migrate=args.migrate,
+                rollout_lock_path=args.rollout_lock,
             ),
         )
         print(f"{deploy_report.outcome.upper():10} {deploy_report.detail}")
@@ -275,6 +295,44 @@ def main(argv: list[str] | None = None) -> int:
         # A refusal or rollback exits non-zero so systemd surfaces the
         # failed tick to the operator; noop/deployed is success.
         return 0 if deploy_report.outcome in ("noop", "deployed") else 1
+
+    if args.command == "backlog-pr-window":
+        # Deliberately BEFORE any database configuration or pool, like
+        # self-deploy above and for a sharper reason: the PR-window
+        # reconciler reads and writes GitHub and nothing else -- it takes no
+        # connection factory and touches no table -- so a database credential
+        # was a requirement that bought the tick nothing and cost it a host.
+        # It is what tied the tick to the one layout that had one
+        # (User=aicc-worker, /etc/ai-command-center.env), which the control
+        # plane does not have, which is why the labeller was never deployed
+        # there at all and every fleet PR opened without CI
+        # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL). The
+        # deploy-managed unit needs no EnvironmentFile, and the tick keeps
+        # labelling while the database is down.
+        from command_center.orchestrator.review_merge import reconcile_pr_window
+
+        window = reconcile_pr_window(args.repo_path)
+        if window.error is not None:
+            print(f"pr-window tick failed: {window.error}", file=sys.stderr)
+            if window.quota is not None:
+                # The quota line is exactly what tells an operator whether a
+                # failed listing was a rate limit, and under whose identity
+                # -- print it on the way out, not only on the happy path.
+                print(window.quota.line())
+            return 1
+        for number, head in window.active:
+            print(f"ACTIVE    #{number} -> {head}")
+        for number, head in window.waiting:
+            print(f"WAITING   #{number} -> {head}")
+        for number, reason in window.blocked:
+            print(f"BLOCKED   #{number}: {reason}")
+        for number, head in window.age_fallback:
+            print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+        for number, head in window.unreadable:
+            print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
+        if window.quota is not None:
+            print(window.quota.line())
+        return 0
 
     try:
         config = load_config()
@@ -455,6 +513,12 @@ def main(argv: list[str] | None = None) -> int:
 
                 from command_center.orchestrator.planner import PlanLimits, plan_once
 
+                if args.smoke:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT backlog_dispatch_smoke()")
+                        (ok,) = cur.fetchone()
+                    print(f"SMOKE     backlog_dispatch_smoke={'ok' if ok else 'refused'}")
+                    return 0 if ok else 1
                 if args.dry_run:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -478,7 +542,18 @@ def main(argv: list[str] | None = None) -> int:
                         "implementation dispatch paused: review backlog at "
                         f"{report.review_window_full} "
                         "(PlanLimits.review_backlog_limit)"
+                        + (
+                            "; lanes idle, dispatching this tick anyway"
+                            if report.idle_trickle
+                            else f"; {report.fenced} functional candidate(s) held"
+                        )
                     )
+                for task_id in report.pipeline_bypass:
+                    print(f"PIPELINE  {task_id}: dispatched past the review fence")
+                for task_id in report.split_dispatched:
+                    print(f"SPLIT     {task_id}: dispatched in decomposition mode")
+                for task_id, failure in report.monitor_tasks:
+                    print(f"MONITOR   {task_id}: task for finding {failure}")
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
@@ -497,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
@@ -506,50 +582,61 @@ def main(argv: list[str] | None = None) -> int:
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
-                # Before selecting anything: a task whose PR exists but was
-                # never recorded is invisible to every gate downstream. This
-                # derives that evidence from the task's own branch, so a pull
-                # request opened outside `publish_run` still reaches review.
-                evidence = reconcile_pr_evidence(
-                    lambda: _nc(conn), args.repo_path, task_id=args.task_id
-                )
-                for evidence_task_id, pr in evidence.recorded:
-                    print(f"PR-FOUND  {evidence_task_id} -> {pr}")
-                for evidence_task_id, reason in evidence.skipped:
-                    print(f"PR-SKIP   {evidence_task_id}: {reason}")
-                report = review_once(
-                    lambda: _nc(conn),
-                    enqueue,
-                    args.repo_path,
-                    task_id=args.task_id,
-                )
-                for task_id, pr in report.reviewed:
-                    print(f"REVIEW    {task_id} -> {pr}")
-                for task_id, reason in report.skipped:
-                    print(f"SKIP      {task_id}: {reason}")
-                retry_report = reconcile_review_once(
-                    lambda: _nc(conn),
-                    enqueue,
-                    args.repo_path,
-                    task_id=args.task_id,
-                )
-                for task_id, retry_key in retry_report.retried:
-                    print(f"RETRY     {task_id} -> {retry_key}")
-                for task_id, reason in retry_report.skipped:
-                    print(f"RETRY-SKIP {task_id}: {reason}")
-                marker_report = publish_review_verdicts(
-                    lambda: _nc(conn), args.repo_path, task_id=args.task_id,
-                    # The same queue writer review_once uses: a REJECT
-                    # enqueues one finding-verification run before it may
-                    # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
-                    enqueue=enqueue,
-                )
-                for task_id, pr in marker_report.reviewed:
-                    print(f"MARKER    {task_id} -> {pr}")
-                for task_id, new_task_id in marker_report.remediated:
-                    print(f"REMEDIATE {task_id} -> {new_task_id}")
-                for task_id, reason in marker_report.skipped:
-                    print(f"SKIP      {task_id}: {reason}")
+                # One quota scope for the WHOLE tick: the four steps below
+                # all call `gh`, so counting them separately would tell an
+                # operator nothing about what the tick as a whole spent --
+                # and the identity is resolved once, here, rather than four
+                # times (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+                with gh_access.tick(args.repo_path) as quota:
+                    # Before selecting anything: a task whose PR exists but
+                    # was never recorded is invisible to every gate
+                    # downstream. This derives that evidence from the task's
+                    # own branch, so a pull request opened outside
+                    # `publish_run` still reaches review.
+                    evidence = reconcile_pr_evidence(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                    )
+                    for evidence_task_id, pr in evidence.recorded:
+                        print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                    for evidence_task_id, reason in evidence.skipped:
+                        print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    report = review_once(
+                        lambda: _nc(conn),
+                        enqueue,
+                        args.repo_path,
+                        task_id=args.task_id,
+                    )
+                    for task_id, pr in report.reviewed:
+                        print(f"REVIEW    {task_id} -> {pr}")
+                    for task_id, reason in report.skipped:
+                        print(f"SKIP      {task_id}: {reason}")
+                    retry_report = reconcile_review_once(
+                        lambda: _nc(conn),
+                        enqueue,
+                        args.repo_path,
+                        task_id=args.task_id,
+                    )
+                    for task_id, retry_key in retry_report.retried:
+                        print(f"RETRY     {task_id} -> {retry_key}")
+                    for task_id, reason in retry_report.skipped:
+                        print(f"RETRY-SKIP {task_id}: {reason}")
+                    marker_report = publish_review_verdicts(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id,
+                        # The same queue writer review_once uses: a REJECT
+                        # enqueues one finding-verification run before it may
+                        # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
+                        enqueue=enqueue,
+                    )
+                    for task_id, pr in marker_report.reviewed:
+                        print(f"MARKER    {task_id} -> {pr}")
+                    for task_id, new_task_id in marker_report.remediated:
+                        print(f"REMEDIATE {task_id} -> {new_task_id}")
+                    for task_id, reason in marker_report.skipped:
+                        print(f"SKIP      {task_id}: {reason}")
+                # Printed AFTER the scope closes: the remaining-budget half
+                # of the line is read on the way out (`gh api rate_limit`,
+                # which does not itself consume quota).
+                print(quota.line())
                 return 0
 
             if args.command == "backlog-merge":
@@ -562,6 +649,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                if report.quota is not None:
+                    print(report.quota.line())
                 return 0
 
             if args.command == "backlog-merge-reconcile":
@@ -584,22 +673,6 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
-
-            if args.command == "backlog-pr-window":
-                from command_center.orchestrator.review_merge import (
-                    reconcile_pr_window,
-                )
-
-                report = reconcile_pr_window(args.repo_path)
-                for number, head in report.active:
-                    print(f"ACTIVE    #{number} -> {head}")
-                for number, head in report.waiting:
-                    print(f"WAITING   #{number} -> {head}")
-                for number, reason in report.blocked:
-                    print(f"BLOCKED   #{number}: {reason}")
-                for number, head in report.age_fallback:
-                    print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
-                return 0
 
             if args.command == "downgrade":
                 if not args.confirmed:

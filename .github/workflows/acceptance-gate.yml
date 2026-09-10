@@ -41,7 +41,8 @@ concurrency:
   # Per pull request or exact synthetic merge-group head, so a burst of review
   # events collapses while independent queue groups never cancel one another.
   # A cancelled run reports as a failure, which is the safe side.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
+  # Label noise (see ci.yml) gets its own group and skips the job below.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}-${{ ((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) && github.run_id || 'head' }}
   cancel-in-progress: true
 
 # Read-only, and only what the API callers need: `contents: read` for the
@@ -53,7 +54,8 @@ permissions:
 
 jobs:
   acceptance-gate:
-    name: Acceptance gate (independent verdict on exact SHA)
+    name: ${{ ((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) && 'Gate not run (label noise or outside review window)' || 'Acceptance gate (independent verdict on exact SHA)' }}
+    if: ${{ !((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

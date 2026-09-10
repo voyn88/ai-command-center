@@ -1203,3 +1203,16 @@ def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
 
     monkeypatch.delenv("AICC_REVIEW_ANTHROPIC_API_KEY")
     assert "ANTHROPIC_API_KEY" not in run("independent_review")
+
+
+def test_codex_development_sandbox_is_danger_full_access_only_under_principal_isolation(monkeypatch):
+    """Owner decision 2026-09-09: inside the isolated unit the boundary is
+    systemd's; Codex's inner bubblewrap mounted .git read-only. Outside
+    isolation the inner sandbox stays; read-only stays read-only either way."""
+    from command_center import agent_runner as ar
+
+    monkeypatch.delenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV, raising=False)
+    assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "workspace-write"
+    monkeypatch.setenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "danger-full-access"
+    assert _sandbox_argument(ar.build_codex_command("p", task_type="review")) == "read-only"

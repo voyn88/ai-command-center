@@ -1870,7 +1870,19 @@ def restore_service_snapshot(
             enabled_matches = enabled != "enabled"
         if not (exists_matches and active_matches and enabled_matches):
             raise RuntimeError(f"service snapshot did not restore exactly: {unit}")
-        if active != "active" and main_pid not in {"", "0"}:
+        # A queued Type=notify start forks its MainPID before it sends
+        # READY=1, so systemd reports it "activating" with a live MainPID for
+        # a window that is entirely normal -- not a leftover from a service
+        # that failed to go inactive. `active_matches` already accepts that
+        # transitional state for a queued start of an expected-active unit;
+        # this must not re-refuse the exact same state (observed live on
+        # worker-01, 2026-09-07/08).
+        activating_start = queued_start and expected_active and active == "activating"
+        if (
+            active != "active"
+            and not activating_start
+            and main_pid not in {"", "0"}
+        ):
             raise RuntimeError(f"inactive restored service retains MainPID: {unit}")
         if version == 3 and state["exists"] and not self_recovery:
             properties = state["properties"]
@@ -4664,6 +4676,16 @@ def _release_entry(
         raise ReleaseRefused(f"release path is not trusted-owned: {relative}")
     if mode & 0o022 and not stat.S_ISLNK(info.st_mode):
         raise ReleaseRefused(f"release path is group/world writable: {relative}")
+    if stat.S_ISDIR(info.st_mode) and mode & 0o055 != 0o055:
+        # The worker lane runs as the unprivileged `aicc-worker` principal with
+        # `WorkingDirectory=/opt/aicc/current`; a directory it cannot traverse
+        # makes the release unstartable (200/CHDIR at ExecStartPre, observed
+        # live on worker-01 2026-09-02 and 2026-09-07: `mktemp -d` staged the
+        # release root as 0700 and `chmod -R a-w` left it 0500). Refuse to
+        # record or accept such a tree rather than publish a dead release.
+        raise ReleaseRefused(
+            f"release directory is not traversable by the worker principal: {relative}"
+        )
     if stat.S_ISLNK(info.st_mode):
         # A symlink is legitimate inside the interpreter venv, but only as the
         # exact link recorded when root built the release. The target is data,
@@ -5139,6 +5161,7 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/aicc-agent-launcher@.service",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
+        "/etc/aicc/gitconfig",
         "/etc/aicc/agent.env",
         "/etc/systemd/system/voyn-aicc-worker@.service",
         "/etc/systemd/system/voyn-aicc-worker@.service.d/20-principal-isolation.conf",
@@ -5180,6 +5203,35 @@ WORKER_ONLY_DIRECTORIES = (
     "/etc/systemd/system/voyn-aicc-worker@.service.d",
     "/etc/systemd/system/aicc-worker.service.d",
 )
+
+#: Unit files only a control-plane host runs, installed by the control
+#: profile in the same generation as everything else.
+#:
+#: The PR review-window tick is the first of the control plane's own ticks to
+#: become repo-owned. It had to be: the only committed spelling of it
+#: (`deploy/systemd/aicc-backlog-pr-window.{service,timer}`) names a layout
+#: control-01 does not have -- User=aicc-worker, /usr/bin/python,
+#: /srv/ai-command-center -- and nothing ever installed it there, so the
+#: labeller that the window-gated workflows (CI, Acceptance gate, boundary
+#: fitness) key off simply never ran on the fleet. Every fleet PR opened
+#: unlabelled and therefore uncheckable until an operator labelled it by
+#: hand: 24 red-or-checkless PRs, and #907 on 2026-09-09, before an operator
+#: installed the unit by hand at 21:15 UTC. A hand-made unit is not deployed
+#: -- it survives exactly as long as the host does -- which is what this
+#: entry fixes: a rebuilt control host gets the tick from the transaction,
+#: atomically with the rest of the generation and rolled back with it.
+#:
+#: Nothing purges these on a worker host. The worker profile is not a
+#: conversion away from a control host (there is one control plane, and it
+#: owns the database), so unlike `WORKER_ONLY_TARGETS` there is no live host
+#: carrying these files that a worker install has to take them away from.
+CONTROL_ONLY_UNITS = (
+    "voyn-aicc-pr-window.service",
+    "voyn-aicc-pr-window.timer",
+)
+#: The timer of `CONTROL_ONLY_UNITS` the installer enables after commit, so
+#: an installed unit is a *running* tick and not just a file on disk.
+CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
 
 
 def _runtime_target(target: str) -> bool:
@@ -5230,10 +5282,12 @@ def default_specs(
     credential files) removed atomically with the control install itself,
     not as a separate step that could commit while the other fails.
 
-    The control-plane's own units (planner, review, merge, reaper, rotation)
-    are not added here: they are still symlinks into the operator's home and
-    become repo-owned under VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. This
-    profile makes that installation possible; it does not pre-empt it.
+    The control-plane's own ticks become repo-owned under VOYN-W0-AICC-
+    CONTROL-PLANE-REPO-OWNED-UNITS, one at a time as each is needed.
+    `CONTROL_ONLY_UNITS` is the set that has arrived: the PR review-window
+    tick, which had never been installed on control-01 at all. The rest
+    (planner, review, merge, reaper, rotation) are still symlinks into the
+    operator's home and still follow.
 
     What the transition does and does not remove, stated exactly, because
     "the agent principal is absent" is a claim this cannot make:
@@ -5368,6 +5422,48 @@ def default_specs(
             root_gid,
         ),
         FileSpec(
+            repo_root / "deploy/aicc/gitconfig",
+            "/etc/aicc/gitconfig",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/aicc/github-app.env",
+            "/etc/aicc/github-app.env",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "ops/aicc_github_app_token.py",
+            "/usr/local/sbin/aicc-github-app-token",
+            0o700,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "ops/aicc_git_credential",
+            "/usr/local/libexec/aicc-git-credential",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-github-token.service",
+            "/etc/systemd/system/voyn-aicc-github-token.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-github-token.timer",
+            "/etc/systemd/system/voyn-aicc-github-token.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
             repo_root / "deploy/aicc/privileged-principals",
             "/etc/aicc/privileged-principals",
             0o644,
@@ -5450,6 +5546,20 @@ def default_specs(
         # predecessor). A host that never carried the worker profile simply
         # removes nothing -- every one of these targets is already absent.
         kept = tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
+        # The control plane's own ticks, this generation's half of
+        # VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. Installed with the
+        # rest of the control generation rather than beside it, so the tick
+        # a rebuilt host runs is the tick this commit describes.
+        control_units = tuple(
+            FileSpec(
+                repo_root / "deploy/systemd" / unit,
+                f"/etc/systemd/system/{unit}",
+                0o644,
+                root_uid,
+                root_gid,
+            )
+            for unit in CONTROL_ONLY_UNITS
+        )
         purge = tuple(
             removal_spec(target, sensitive=target in SENSITIVE_TARGETS)
             for target in sorted(WORKER_ONLY_TARGETS)
@@ -5460,7 +5570,7 @@ def default_specs(
         purge_directories = tuple(
             directory_removal_spec(target) for target in WORKER_ONLY_DIRECTORIES
         )
-        return kept + purge + purge_directories
+        return kept + control_units + purge + purge_directories
     return specs
 
 
