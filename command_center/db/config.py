@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 __all__ = [
     "ConfigError",
@@ -68,7 +68,13 @@ class PostgresConfig:
     port: int
     dbname: str
     user: str
-    password: str
+    # `repr=False` so the dataclass-generated `__repr__`/`__str__` never print
+    # the secret: `str(config)` in a log line or an unhandled exception's
+    # locals dump is exactly how a plain `password: str` field leaks it, no
+    # `conninfo()`/`redacted()` call required (psycopg's own `dsn` property on
+    # a connection strips the password from its printed form for the same
+    # reason).
+    password: str = field(repr=False)
     sslmode: str
     sslrootcert: str | None
     connect_timeout: int
