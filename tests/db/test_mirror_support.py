@@ -9,6 +9,8 @@ no PostgreSQL, so this file runs on a laptop with no server and no Docker.
 
 from __future__ import annotations
 
+import os
+import time as time_module
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -18,6 +20,7 @@ from command_center.db.mirror_support import (
     ColumnCodec,
     divergence,
     render_authority_timestamp,
+    resolve_authority_zone,
     to_instant,
 )
 
@@ -73,6 +76,109 @@ def test_the_render_survives_a_mirror_read_in_another_zone() -> None:
     elsewhere = instant.astimezone(timezone(timedelta(hours=-7)))
 
     assert render_authority_timestamp(elsewhere) == written
+
+
+# --- VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS: an explicit, declared zone -----------
+
+
+def test_an_explicit_zone_is_independent_of_the_calling_processs_own_clock() -> None:
+    """The concrete bug this closes: with no explicit zone, an MSK process and
+    a UTC process each converting the same naive string through their own
+    clock stored instants three hours apart, and each rendered its own instant
+    back to exactly the wall clock it started from — so reconciliation
+    reported both clean, because both conversions used "whichever zone is
+    asking" and there was nothing to compare them against. A declared zone
+    removes the calling process's own clock from the conversion, so two
+    "processes" passing the same declared zone agree.
+    """
+    written = "2026-08-13T12:00:00"
+    declared = timezone(timedelta(hours=3))  # e.g. Europe/Moscow, fixed offset
+
+    from_one_process = to_instant(written, zone=declared)
+    from_another_process = to_instant(written, zone=declared)
+
+    assert from_one_process == from_another_process
+    assert from_one_process.utcoffset() == timedelta(hours=3)
+
+
+def test_render_with_a_declared_zone_ignores_the_reading_processs_own_zone() -> None:
+    """The render-side counterpart: passing `zone` reproduces the original
+    string from the declared zone alone, not from whatever zone the reading
+    process happens to be in."""
+    written = "2026-08-13T12:00:00"
+    declared = timezone(timedelta(hours=3))
+
+    instant = to_instant(written, zone=declared)
+
+    assert render_authority_timestamp(instant, zone=declared) == written
+
+
+def test_a_codec_with_a_declared_zone_still_round_trips_losslessly() -> None:
+    codec = ColumnCodec(timestamps=frozenset({"created_at"}), zone=timezone(timedelta(hours=3)))
+
+    stored = codec.to_column("created_at", "2026-08-13T00:00:00")
+
+    assert stored.utcoffset() == timedelta(hours=3)
+    assert codec.to_authority("created_at", stored) == "2026-08-13T00:00:00"
+
+
+@pytest.fixture
+def _restore_tz():
+    original = os.environ.get("TZ")
+    yield
+    if original is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = original
+    time_module.tzset()
+
+
+def _set_process_tz(name: str) -> None:
+    os.environ["TZ"] = name
+    time_module.tzset()
+
+
+def test_resolve_authority_zone_prefers_the_env_override(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AICC_RUNTIME_TZ", "America/New_York")
+
+    zone, source = resolve_authority_zone(tmp_path / "unused.db")
+
+    assert source == "env"
+    assert zone.key == "America/New_York"
+
+
+def test_resolve_authority_zone_reads_the_zone_the_database_declares(
+    monkeypatch, tmp_path, _restore_tz
+) -> None:
+    """The same mechanism `VOYN-W0-AICC-RETENTION-TZ` built for retention,
+    reused here for reconciliation: the zone comes from the authority
+    database's own ledger, stamped by the process that migrated it, not from
+    whichever process later asks."""
+    monkeypatch.delenv("AICC_RUNTIME_TZ", raising=False)
+    from command_center.runtime import db as runtime_db
+
+    db_path = tmp_path / "runtime.db"
+    _set_process_tz("UTC")
+    runtime_db.migrate(db_path)
+
+    # A later reconciliation run, on a machine in a different zone.
+    _set_process_tz("Europe/Moscow")
+
+    zone, source = resolve_authority_zone(db_path)
+
+    assert source == "database"
+    assert zone.key == "UTC"
+
+
+def test_resolve_authority_zone_falls_back_to_process_local_with_no_declared_zone(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("AICC_RUNTIME_TZ", raising=False)
+
+    zone, source = resolve_authority_zone(tmp_path / "never-migrated.db")
+
+    assert source == "process-local"
+    assert zone is None
 
 
 # --- the per-column codec ---------------------------------------------------
