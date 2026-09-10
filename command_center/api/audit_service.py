@@ -26,6 +26,8 @@ Layering note: the tasks path is reached **only** through
 
 from __future__ import annotations
 
+import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from command_center.api import audit_schemas as a
@@ -50,6 +52,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # Registry seam (module-level so a test can substitute a registry of fake checks).
 _registry = default_registry
+
+#: Default minimum spacing between auto-triggered passes for one project — the
+#: "real-time" cadence :func:`auto_trigger` callers use instead of the
+#: once-daily self-audit campaign or a human remembering to POST
+#: ``/audit/run``. Overridable per host via
+#: ``AICC_AUDIT_AUTO_TRIGGER_INTERVAL_SECONDS``, and per call via
+#: ``AutoTriggerRequest.min_interval_seconds``.
+DEFAULT_AUTO_TRIGGER_INTERVAL_SECONDS = 900
 
 
 class SensitiveProjectRefError(Exception):
@@ -226,6 +236,81 @@ def run_audit(payload: a.AuditRunRequest) -> a.AuditRunResult:
     return a.AuditRunResult(
         run=_run_from_row(finalized),
         findings=finding_models,
+        deduped=result.deduped,
+    )
+
+
+# --------------------------------------------------------------------------
+# Auto-trigger — the early-tracking seam
+# --------------------------------------------------------------------------
+
+
+def _auto_trigger_interval_seconds(override: int | None) -> int:
+    """Resolve the effective auto-trigger interval: the per-call override,
+    else the environment, else the built-in default. Never raises on a
+    malformed environment value — it falls back rather than breaking an
+    unattended caller over a typo."""
+    if override is not None:
+        return override
+    raw = os.environ.get("AICC_AUDIT_AUTO_TRIGGER_INTERVAL_SECONDS")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return DEFAULT_AUTO_TRIGGER_INTERVAL_SECONDS
+
+
+def is_due(
+    last_run_at: str | None, *, now: datetime, min_interval_seconds: int
+) -> bool:
+    """True when a project has never run, or its most recent run is older than
+    ``min_interval_seconds`` relative to ``now``. An unparsable timestamp
+    counts as due — fail open toward *more* tracking, never toward a project
+    that silently stops being audited because one row grew a malformed
+    timestamp."""
+    if not last_run_at:
+        return True
+    try:
+        last = datetime.fromisoformat(last_run_at)
+    except ValueError:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return (now - last) >= timedelta(seconds=min_interval_seconds)
+
+
+def auto_trigger(
+    payload: a.AutoTriggerRequest, *, now: datetime | None = None
+) -> a.AutoTriggerResult:
+    """Fire one audit pass for ``payload.project`` only if it is due.
+
+    Reads the project's most recent run (any status) and decides via
+    :func:`is_due`. When due, the pass runs through the exact same
+    :func:`run_audit` path a manual POST uses — an auto-triggered run persists
+    findings, stamps status/owner and publishes the same events
+    (``AuditFindingCreated``, ``AuditRunCompleted``) as any other run, so it is
+    indistinguishable from a manual one once it lands. A sensitive (BANK/LEGAL)
+    project is skipped, never raised: an unattended caller (a short-interval
+    script, a pre-commit gate, a UI tick) must not crash on a project it
+    cannot audit.
+    """
+    project = payload.project
+    if is_sensitive(project):
+        return a.AutoTriggerResult(project=project, ran=False, reason="sensitive_project")
+    interval = _auto_trigger_interval_seconds(payload.min_interval_seconds)
+    recent = list_runs(project=project, limit=1)
+    last_run_at = recent.runs[0].created_at if recent.runs else None
+    if not is_due(last_run_at, now=now or datetime.now(UTC), min_interval_seconds=interval):
+        return a.AutoTriggerResult(project=project, ran=False, reason="not_due")
+    result = run_audit(a.AuditRunRequest(project=project, checks=payload.checks))
+    return a.AutoTriggerResult(
+        project=project,
+        ran=True,
+        run=result.run,
+        findings=result.findings,
         deduped=result.deduped,
     )
 

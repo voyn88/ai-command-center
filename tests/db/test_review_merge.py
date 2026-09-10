@@ -12,17 +12,28 @@ import pytest
 
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import (
+    PrWindowConfig,
     ReviewConfig,
     merge_once,
     publish_review_verdicts,
     reconcile_merge_evidence,
     reconcile_pr_evidence,
+    reconcile_pr_window,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
     _test_repo_routes,
     rig,
 )
+
+# `rig` provisions cluster-level roles (aicc_migrator, aicc_worker, ...) that
+# every xdist worker's database shares; running these tests under xdist
+# parallelism races that provisioning against every other module that also
+# pulls in `rig`, surfacing PostgreSQL's `tuple concurrently updated` on the
+# shared catalog rows (VOYN-W0-AICC-FLAKE-RIG-ROLE-SETUP-CONCURRENT-UPDATE).
+# `tests/db/test_backlog_planner.py`, `rig`'s home module, already opts out of
+# xdist this way; every other module that borrows `rig` must do the same.
+pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
 
 BASE = "c" * 40
 DIFF = "diff --git a/x b/x\n+hi\n"
@@ -32,6 +43,21 @@ ORIGINAL_PR_SNAPSHOT = review_merge._pr_diff_and_head
 
 def _snapshot(head, diff=DIFF):
     return review_merge._PRSnapshot.create(diff, BASE, head)
+
+
+@pytest.fixture(autouse=True)
+def _control_plane_gh_environment(monkeypatch):
+    """Two facts every tick now depends on, held still for the tests.
+
+    The REST paths need the checkout's `origin` slug, which is read from git
+    (`_origin_owner_repo`) -- these tests hand the ticks a path that is not a
+    clone at all. And the (repo, PR, head) detail cache must not carry state
+    between tests: TTL 0 disables it, so a test that means to exercise it
+    switches it back on explicitly."""
+    monkeypatch.setattr(
+        review_merge, "_origin_owner_repo", lambda repo_path: ("x", "repo-w")
+    )
+    monkeypatch.setenv("AICC_GH_CACHE_TTL_SECONDS", "0")
 
 
 @pytest.fixture(autouse=True)
@@ -132,8 +158,8 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
         f"review:VOYN-W0-R1:7:{head}:{review_merge._REVIEW_POLICY_VERSION}:base:{BASE}:diff:"
     )
     assert task_id == "VOYN-W0-R1"
-    assert [link["executor"] for link in payload["cascade"]] == ["codex", "copilot", "claude"]
-    assert max_attempts == len(payload["cascade"]) == 3
+    assert [link["executor"] for link in payload["cascade"]] == ["codex", "claude"]
+    assert max_attempts == len(payload["cascade"]) == 2
     assert payload["task_type"] == "independent_review"
     assert payload["untrusted"] is True
     assert "pull/7" in payload["prompt"]
@@ -257,13 +283,13 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
@@ -298,7 +324,7 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch): 
             "state": "OPEN", "headRefOid": head,
             "author": {"login": "dimastov-lab"},
             "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": "dimastov-lab"}}],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -327,7 +353,7 @@ def test_merge_skips_a_self_issued_marker_that_only_differs_by_login_case(rig, m
             "state": "OPEN", "headRefOid": head,
             "author": {"login": "Dimastov-Lab"},
             "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": "dimastov-lab"}}],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -362,7 +388,7 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                         "body": f"ACCEPTANCE: ACCEPT {head}",
                         "author": {"login": "voyn88-acceptance-gate[bot]"},
                     }],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
@@ -372,7 +398,7 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                         "body": f"ACCEPTANCE: ACCEPT {head}",
                         "author": {"login": "voyn88-acceptance-gate[bot]"},
                     }],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
@@ -404,7 +430,7 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
                 "author": {"login": "voyn88-acceptance-gate[bot]"},
             }],
             "statusCheckRollup": [
-                {"name": "CI", "conclusion": "SUCCESS"},
+                {"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"},
                 {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "FAILURE"},
             ],
         })
@@ -427,7 +453,7 @@ def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": "b" * 40, "reviews": [],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -507,7 +533,7 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
                 {"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"},
                 {"body": "Actually, hold on -- this needs another look.", "submittedAt": "2026-01-02T00:00:00Z"},
             ],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -540,7 +566,7 @@ def test_merge_skips_a_dismissed_review_even_when_it_is_the_only_one(rig, monkey
                     "author": {"login": "voyn88-acceptance-gate[bot]"},
                 },
             ],
-            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
 
@@ -585,14 +611,14 @@ def test_merge_falls_back_to_an_earlier_live_review_past_a_dismissed_one(rig, mo
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head, "author": {"login": "dimastov-lab"},
                     "reviews": reviews,
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
                     "author": {"login": "dimastov-lab"},
                     "reviews": reviews,
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
@@ -1110,7 +1136,11 @@ def test_mergeability_uses_latest_check_rerun(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    assert review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10") == (True, head)
+    # Rerun/timestamp semantics of the rollup alone; the required-context
+    # presence gate is covered separately.
+    assert review_merge._pr_is_mergeable(
+        "/tmp", "https://github.com/x/y/pull/10", required_checks=()
+    ) == (True, head)
 
 
 def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
@@ -1171,7 +1201,7 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     ready, _ = review_merge._pr_is_mergeable(
-        "/tmp", "https://github.com/x/y/pull/10"
+        "/tmp", "https://github.com/x/y/pull/10", required_checks=()
     )
     assert ready is expected_ready
 
@@ -1519,6 +1549,32 @@ def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_
     assert any(f"AUTO-ACCEPT-AUDIT {head}" in argv[-1] for argv in fake_gh.posted_comments)
 
 
+def test_chunk_review_rows_is_empty_for_a_single_chunk_review(rig, monkeypatch):  # noqa: F811
+    """A single-chunk review is stored under the plain review-cycle key
+    (`review_once` only mints a `:chunk:`-suffixed key when `chunk.count >
+    1`), so `_chunk_review_rows`' prefix match against that suffix must come
+    back empty for it -- never a spurious one-row "chunk" result. That
+    distinction is exactly what routes a single-chunk REJECT through
+    `publish_review_verdicts`' plain-result branch (which itself enqueues
+    verification for ANY REJECT) instead of the chunk-aggregation branch,
+    which is the only branch review_once historically fed eagerly. Nothing
+    here mocks `_chunk_review_rows` itself, unlike `_force_chunk_reject`
+    above -- this exercises the real prefix match a single-chunk review
+    result rows through."""
+    app_factory, _store, worker = rig
+    task_id, pr_url, head = "VOYN-W0-ADJ-CR", "https://github.com/x/repo-d2/pull/29", "8" * 40
+    _ready(_store, app_factory, task_id, pr_url)
+    _complete_review(
+        app_factory, worker, task_id, pr_url, head,
+        f"Some finding.\nVERDICT: REJECT\nHEAD_SHA: {head}\n",
+    )
+    prefix, rows = review_merge._chunk_review_rows(
+        app_factory, task_id, pr_url, _snapshot(head)
+    )
+    assert prefix is not None
+    assert rows == []
+
+
 def test_verification_key_is_scoped_by_head_and_findings():
     snap_a = _snapshot("a" * 40)
     key = review_merge._verification_key("T", "https://github.com/x/y/pull/1", snap_a, "f1")
@@ -1717,7 +1773,7 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
                 "author": {"login": "writer-bot"},
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
                              "author": {"login": "voyn88-acceptance-gate[bot]"}}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "update-branch"]:
@@ -1790,7 +1846,7 @@ def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F8
                 "author": {"login": "writer-bot"},
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
                              "author": {"login": "voyn88-acceptance-gate[bot]"}}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
@@ -1818,7 +1874,7 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
                 "author": {"login": "writer-bot"},
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
                              "author": {"login": "voyn88-acceptance-gate[bot]"}}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "update-branch"]:
@@ -2031,13 +2087,13 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 })
             return sp.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
@@ -2260,7 +2316,7 @@ def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeyp
             body = json.dumps({
                 "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                 "headRefOid": head, "reviews": [],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return sp.CompletedProcess(argv, 0, body, "")
         return sp.CompletedProcess(argv, 1, "", "?")
@@ -2344,6 +2400,77 @@ def test_permanent_skips_do_not_starve_the_publish_window(rig, monkeypatch):  # 
     # All ten eternal skips were scanned AND the real task still acted.
     assert posted == [(pr_url, head)]
     assert len(report.skipped) == 10
+
+
+def test_permanent_skips_do_not_starve_the_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-REVIEW-WINDOW-STARVATION (live 2026-08-27): with
+    `ORDER BY t.task_id LIMIT max_per_tick`, the alphabetically-first
+    READY_TO_REVIEW tasks -- here, ones with no routed repo, a permanent
+    skip that costs no gh call at all -- filled review_once's window every
+    tick, so a task sorting after them (like the real VOYN-W0-AICC-SRV-*
+    cohort behind VOYN-ARCH-*/VOYN-OPS-*/VOYN-PLAT-*) was never even
+    scanned. Examinations are bounded by scan_cap and only a fresh enqueue
+    counts toward max_per_tick, so the real task standing behind any number
+    of eternal skips still gets its review enqueued this tick."""
+    app_factory, store, _ = rig
+    for i in range(10):
+        _ready(
+            store, app_factory, f"VOYN-ARCH-{i:02d}",
+            f"https://github.com/x/unrouted-repo/pull/{i}",
+        )
+    head = "d" * 40
+    real_pr = "https://github.com/x/repo-d2/pull/50"
+    _ready(store, app_factory, "VOYN-W0-ZREAL", real_pr)
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[0] == "api" and "/pulls/50" in argv[1]:
+            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": head}, "changed_files": 1,
+                    "additions": 1, "deletions": 0}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api":
+            return subprocess.CompletedProcess(argv, 0, DIFF, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
+    calls = []
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        "/tmp",
+        ReviewConfig(max_per_tick=2),
+    )
+    # All ten eternal (unrouted) skips were scanned AND the real task still
+    # got its review enqueued -- not starved behind its alphabetically-prior
+    # neighbors.
+    assert ("VOYN-W0-ZREAL", real_pr) in report.reviewed
+    assert len(calls) == 1
+    assert len(report.skipped) == 10
+
+
+def test_review_once_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa: F811, E501
+    """Same GUARANTEE as test_partition_schedule_guarantees_full_coverage,
+    for review_once's own scan window: with N tasks and scan_cap C,
+    cycling through ceil(N/C) ticks examines every task exactly once per
+    cycle, regardless of which alphabetical slice of task_ids the eternal
+    skips occupy."""
+    ids = [f"VOYN-W0-PG{i:02d}" for i in range(15)]
+    app_factory, store, _ = rig
+    for i, tid in enumerate(ids):
+        _ready(store, app_factory, tid, f"https://github.com/x/unrouted-repo/pull/{200 + i}")
+
+    examined: list[str] = []
+    for _tick in range(3):  # cursor advances per invocation: 3 calls cover 15
+        report = review_once(
+            app_factory, lambda *a: None, "/tmp",
+            ReviewConfig(max_per_tick=5, scan_cap=5),
+        )
+        examined += [task_id for task_id, _ in report.skipped]
+    # Every task exactly ONCE per full cycle -- set coverage alone would
+    # hide duplicate examinations.
+    assert sorted(examined) == sorted(ids)
 
 
 def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):  # noqa: F811
@@ -2571,14 +2698,14 @@ def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch)
                     "state": "MERGED", "mergeCommit": {"oid": "ef" * 20},
                     "headRefOid": head,
                     "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 }), "")
             return sp.CompletedProcess(argv, 0, json.dumps({"state": "OPEN"}), "")
         if argv[:2] == ["pr", "view"]:
             return sp.CompletedProcess(argv, 0, json.dumps({
                 "state": "OPEN", "headRefOid": head,
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
                 "mergeStateStatus": "CLEAN",
             }), "")
         if argv[:2] == ["pr", "merge"]:
@@ -3099,11 +3226,21 @@ def _pr_rows(factory, task_id):
 
 
 def _fake_pr_list(entries, *, returncode=0, stdout=None):
+    """The branch lookup is REST now (`gh api repos/{o}/{r}/pulls?...head=`)
+    rather than `gh pr list --head` (GraphQL) --
+    VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS. Entries are still
+    written in the shape the caller reads back ({url, headRefName}); the
+    fake translates them to the REST body GitHub actually returns."""
     import subprocess as sp
 
+    rest = [
+        {"html_url": entry["url"], "head": {"ref": entry["headRefName"]}}
+        for entry in entries
+    ]
+
     def fake_gh(argv, repo):
-        if argv[:2] == ["pr", "list"]:
-            body = json.dumps(entries) if stdout is None else stdout
+        if argv[0] == "api" and "/pulls?" in argv[1]:
+            body = json.dumps(rest) if stdout is None else stdout
             return sp.CompletedProcess(argv, returncode, body, "")
         return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
 
@@ -3250,3 +3387,629 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     reconcile_pr_evidence(app_factory, REPO)
 
     assert seen == [REPO]
+
+
+# -- reconcile_pr_window: no database involved, gh is faked in-process ------
+
+
+def _win_pr(number, created, head, *, author="alice", labels=(), reviews=(),
+            checks=(), commits=None, url=None):
+    return {
+        "number": number,
+        "url": url or f"https://github.com/x/repo-w/pull/{number}",
+        "headRefOid": head,
+        "createdAt": created,
+        "commits": commits if commits is not None else [
+            {"oid": head, "committedDate": created}
+        ],
+        "reviews": list(reviews),
+        "statusCheckRollup": list(checks),
+        "author": {"login": author},
+        "labels": [{"name": name} for name in labels],
+    }
+
+
+class _RestGitHub:
+    """The GitHub REST endpoints the PR-window tick speaks, in process.
+
+    The tick moved off `gh pr list` / `gh pr view` (GraphQL, on whichever
+    human token was ambient) onto `gh api repos/...`
+    (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS), so this fake serves
+    PATHS rather than porcelain: the open-PR listing, one PR's reviews, its
+    head's check-runs and legacy statuses, the head commit's date, and the
+    issue-label writes. Test data stays in the GraphQL vocabulary `_win_pr`
+    already uses -- the translation lives here, exactly as it does in the
+    module under test.
+
+    `details` maps a PR number to a `{reviews, statusCheckRollup, commits}`
+    dict for the tests that keep listing and details apart; without it the
+    listing entry itself carries them."""
+
+    def __init__(
+        self,
+        prs,
+        *,
+        details=None,
+        list_rc=0,
+        list_body=None,
+        detail_rc=0,
+        commit_rc=None,
+        commit_stdout="",
+        edits=None,
+    ):
+        self.prs = [dict(pr) for pr in prs]
+        self.details = {int(n): d for n, d in (details or {}).items()}
+        self.list_rc = list_rc
+        self.list_body = list_body
+        self.detail_rc = detail_rc
+        self.commit_rc = commit_rc
+        self.commit_stdout = commit_stdout
+        self.edits = edits
+        self.calls: list[list[str]] = []
+        #: PR numbers whose details this tick actually fetched.
+        self.viewed: list[int] = []
+        #: (number, "add"|"remove", label) label writes.
+        self.labels: list[tuple[str, str, str]] = []
+        #: Listing pages requested, in order.
+        self.pages: list[int] = []
+
+    # -- translation ------------------------------------------------------
+    def _listed(self, pr):
+        return {
+            "number": pr["number"],
+            "html_url": pr["url"],
+            "head": {"sha": pr.get("headRefOid", "")},
+            "created_at": pr.get("createdAt", ""),
+            "user": {"login": (pr.get("author") or {}).get("login")},
+            "labels": list(pr.get("labels") or []),
+        }
+
+    def _details_for(self, number):
+        if number in self.details:
+            return self.details[number]
+        return next(
+            (pr for pr in self.prs if int(pr["number"]) == number), {}
+        )
+
+    def _reviews(self, number):
+        return [
+            {
+                "state": review.get("state"),
+                "submitted_at": review.get("submittedAt"),
+                "body": review.get("body"),
+                "user": {"login": (review.get("author") or {}).get("login")},
+            }
+            for review in self._details_for(number).get("reviews") or []
+        ]
+
+    def _checks(self, number):
+        runs, statuses = [], []
+        for check in self._details_for(number).get("statusCheckRollup") or []:
+            if "state" in check:
+                statuses.append({
+                    "context": check.get("name"),
+                    "state": check.get("state"),
+                    "created_at": check.get("startedAt"),
+                    "updated_at": check.get("completedAt"),
+                    "target_url": check.get("detailsUrl"),
+                })
+            else:
+                runs.append({
+                    "name": check.get("name"),
+                    "status": check.get("status"),
+                    "conclusion": check.get("conclusion"),
+                    "started_at": check.get("startedAt"),
+                    "completed_at": check.get("completedAt"),
+                    "details_url": check.get("detailsUrl"),
+                })
+        return runs, statuses
+
+    def _committed_date(self, sha):
+        for pr in self.prs:
+            number = int(pr["number"])
+            for commit in self._details_for(number).get("commits") or []:
+                if commit.get("oid") == sha:
+                    return commit.get("committedDate")
+        return None
+
+    # -- the fake `_gh` ---------------------------------------------------
+    def __call__(self, argv, repo_path):
+        import subprocess as sp
+
+        self.calls.append(list(argv))
+        if argv[0] != "api":
+            return sp.CompletedProcess(argv, 1, "", "unexpected gh porcelain call")
+        method = argv[2] if "--method" in argv else "GET"
+        path = argv[3] if "--method" in argv else argv[1]
+        query = dict(
+            pair.split("=", 1)
+            for pair in path.partition("?")[2].split("&")
+            if "=" in pair
+        )
+
+        if "/issues/" in path and "/labels" in path:
+            number = path.split("/issues/")[1].split("/")[0]
+            if method == "POST":
+                label = argv[argv.index("-f") + 1].split("=", 1)[1]
+                self.labels.append((number, "add", label))
+            else:
+                from urllib.parse import unquote
+
+                self.labels.append(
+                    (number, "remove", unquote(path.split("/labels/")[1]))
+                )
+            if self.edits is not None:
+                self.edits.append(list(argv))
+            return sp.CompletedProcess(argv, 0, "", "")
+
+        if "/pulls?" in path:
+            page = int(query.get("page", 1))
+            per_page = int(query.get("per_page", 100))
+            self.pages.append(page)
+            if self.list_rc:
+                return sp.CompletedProcess(argv, self.list_rc, "", "HTTP 403")
+            if self.list_body is not None:
+                return sp.CompletedProcess(argv, 0, self.list_body, "")
+            start = (page - 1) * per_page
+            chunk = [self._listed(pr) for pr in self.prs[start:start + per_page]]
+            return sp.CompletedProcess(argv, 0, json.dumps(chunk), "")
+
+        if "/reviews" in path:
+            if self.detail_rc:
+                return sp.CompletedProcess(argv, self.detail_rc, "", "HTTP 502")
+            number = int(path.split("/pulls/")[1].split("/")[0])
+            self.viewed.append(number)
+            page = int(query.get("page", 1))
+            body = self._reviews(number) if page == 1 else []
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+
+        if "/check-runs" in path:
+            if self.detail_rc:
+                return sp.CompletedProcess(argv, self.detail_rc, "", "HTTP 502")
+            sha = path.split("/commits/")[1].split("/")[0]
+            page = int(query.get("page", 1))
+            runs = self._checks_for_sha(sha)[0] if page == 1 else []
+            return sp.CompletedProcess(argv, 0, json.dumps({"check_runs": runs}), "")
+
+        if path.split("?")[0].endswith("/status"):
+            if self.detail_rc:
+                return sp.CompletedProcess(argv, self.detail_rc, "", "HTTP 502")
+            sha = path.split("/commits/")[1].split("/")[0]
+            statuses = self._checks_for_sha(sha)[1]
+            return sp.CompletedProcess(
+                argv, 0, json.dumps({"state": "success", "statuses": statuses}), ""
+            )
+
+        if "/commits/" in path:
+            # The head commit's own date (`--jq .commit.committer.date`), the
+            # one lookup that was already REST before this change.
+            if self.commit_rc:
+                return sp.CompletedProcess(argv, self.commit_rc, self.commit_stdout, "")
+            if self.commit_stdout:
+                return sp.CompletedProcess(argv, 0, self.commit_stdout, "")
+            date = self._committed_date(path.split("/commits/")[1].split("?")[0])
+            if date is None:
+                return sp.CompletedProcess(argv, 1, "", "HTTP 404")
+            return sp.CompletedProcess(argv, 0, date, "")
+
+        return sp.CompletedProcess(argv, 1, "", "unhandled path")
+
+    def _checks_for_sha(self, sha):
+        for pr in self.prs:
+            if pr.get("headRefOid") == sha:
+                return self._checks(int(pr["number"]))
+        return [], []
+
+
+def _fake_pr_window_gh(prs, *, api_returncode=0, api_stdout="", edits=None):
+    """`prs` are `_win_pr` dicts: the listing is served from them, and so are
+    the details the tick now fetches per PR (reviews, checks, head date).
+
+    The head commit's date comes from each PR's own `commits` -- the same
+    data the listing used to carry inline -- so a test that wants that
+    lookup to FAIL (the age-fallback one) passes `api_returncode=1`."""
+    return _RestGitHub(
+        prs,
+        edits=edits,
+        commit_rc=api_returncode or None,
+        commit_stdout=api_stdout,
+    )
+
+
+def test_pr_list_is_requested_in_ascending_created_order(monkeypatch):
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM-REM: an unsorted listing returns
+    newest-first, so a plain page cap truncated the OLDEST, longest-waiting
+    PRs out of consideration on any repo busier than the scan limit.
+    Requesting ascending order explicitly is the actual FIFO fix -- now as
+    REST query parameters, since the listing left GraphQL entirely
+    (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS)."""
+    fake = _fake_pr_window_gh([])
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    reconcile_pr_window("/repo", PrWindowConfig(scan_limit=10))
+
+    list_call = next(c for c in fake.calls if "/pulls?" in c[-1])
+    assert list_call[0] == "api", "REST, not the GraphQL `gh pr list`"
+    assert "sort=created" in list_call[-1] and "direction=asc" in list_call[-1]
+    assert "per_page=10" in list_call[-1]
+
+
+def test_oldest_eligible_prs_fill_the_window_first(monkeypatch):
+    older = _win_pr(1, "2026-01-01T00:00:00Z", "a" * 40)
+    newer = _win_pr(2, "2026-02-01T00:00:00Z", "b" * 40)
+    edits: list[list[str]] = []
+    # gh already returns them oldest-first (ascending search), as real usage
+    # would; the reconciler's own selection must preserve that order too.
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_pr_window_gh([older, newer], edits=edits)
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert report.active == [(1, "a" * 40)]
+    assert report.waiting == [(2, "b" * 40)]
+    assert any(
+        "/issues/1/labels" in call[-1] or "/issues/1/labels" in " ".join(call)
+        for call in edits
+    )
+
+
+def test_reject_marker_from_the_pr_author_does_not_block(monkeypatch):
+    """Mirrors the accept marker's own author-independence rule: the PR's
+    own author cannot spoof a block by posting the reject marker text on a
+    plain comment-type review."""
+    head = "c" * 40
+    pr = _win_pr(
+        3, "2026-01-01T00:00:00Z", head, author="alice",
+        reviews=[{"state": "COMMENTED", "submittedAt": "2026-01-02T00:00:00Z",
+                  "body": f"ACCEPTANCE: REJECT {head}",
+                  "author": {"login": "alice"}}],
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_window_gh([pr]))
+
+    report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=10**12))
+
+    assert report.blocked == []
+    assert report.active == [(3, head)]
+
+
+def test_reject_marker_from_a_non_author_reviewer_blocks(monkeypatch):
+    head = "d" * 40
+    pr = _win_pr(
+        4, "2026-01-01T00:00:00Z", head, author="alice",
+        reviews=[{"state": "COMMENTED", "submittedAt": "2026-01-02T00:00:00Z",
+                  "body": f"ACCEPTANCE: REJECT {head}",
+                  "author": {"login": "bob"}}],
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_window_gh([pr]))
+
+    report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=10**12))
+
+    assert report.blocked == [(4, "acceptance_rejected")]
+    assert report.active == []
+
+
+def test_a_later_unrelated_review_does_not_erase_an_earlier_valid_reject(monkeypatch):
+    """The latest LIVE review is what's inspected -- a genuine reject from a
+    non-author reviewer, followed by a later drive-by comment, must still be
+    the one that counts once the later review is excluded for having no
+    marker of its own... this asserts the reject marker's own precedence:
+    it must win over a later review that carries no marker text at all only
+    when it truly is the latest; here the drive-by IS later, so the marker
+    review is superseded -- documenting the existing, accept-symmetric
+    behavior rather than asserting a stronger guarantee this reconciler does
+    not make (matching `_accept_marker_on_latest_review`'s own semantics)."""
+    head = "e" * 40
+    pr = _win_pr(
+        5, "2026-01-01T00:00:00Z", head, author="alice",
+        reviews=[
+            {"state": "COMMENTED", "submittedAt": "2026-01-02T00:00:00Z",
+             "body": f"ACCEPTANCE: REJECT {head}", "author": {"login": "bob"}},
+            {"state": "COMMENTED", "submittedAt": "2026-01-03T00:00:00Z",
+             "body": "LGTM", "author": {"login": "carol"}},
+        ],
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_window_gh([pr]))
+
+    report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=10**12))
+
+    # Symmetric with `_accept_marker_on_latest_review`: only the single
+    # latest live review is ever inspected, matching this codebase's
+    # existing, accepted trust model for the accept side of the same
+    # protocol.
+    assert report.blocked == []
+    assert report.active == [(5, head)]
+
+
+def test_age_falls_back_to_created_at_and_is_reported(monkeypatch):
+    """The head commit is absent from the (possibly paginated) `commits`
+    field and the direct per-commit lookup also fails -- the age falls back
+    to `createdAt`, and that fallback must be visible in the report rather
+    than silently indistinguishable from a genuinely stale PR."""
+    head = "f" * 40
+    pr = _win_pr(
+        6, "2020-01-01T00:00:00Z", head, commits=[],
+    )
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_pr_window_gh([pr], api_returncode=1)
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(stale_seconds=60)
+    )
+
+    assert (6, head) in report.age_fallback
+    assert report.blocked == [(6, "stale_exact_head_acceptance")]
+
+
+def test_age_uses_direct_lookup_when_commits_list_is_paginated_out(monkeypatch):
+    """The head commit is missing from `commits` but the direct, unpaginated
+    lookup succeeds -- age must come from that fresh date, not `createdAt`,
+    and must not be recorded as a fallback."""
+    head = "1" * 40
+    pr = _win_pr(6, "2020-01-01T00:00:00Z", head, commits=[])
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _RestGitHub([pr], commit_stdout="2026-01-01T00:00:00Z"),
+    )
+
+    report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=999_999_999))
+
+    assert report.age_fallback == []
+    assert report.blocked == []
+
+
+def test_sticky_active_keeps_its_slot_over_an_older_newly_eligible_pr(monkeypatch):
+    """Deliberate low-churn trade-off: a PR already in the window keeps its
+    slot while still eligible, even against an older PR that only just
+    became eligible -- avoiding restarting review on ordinary rotation."""
+    older_new = _win_pr(7, "2026-01-01T00:00:00Z", "2" * 40)
+    younger_active = _win_pr(
+        8, "2026-02-01T00:00:00Z", "3" * 40,
+        labels=["review-window:active"],
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_window_gh([older_new, younger_active]),
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert report.active == [(8, "3" * 40)]
+    assert report.waiting == [(7, "2" * 40)]
+
+
+def test_already_correctly_labelled_pr_costs_no_edit_call(monkeypatch):
+    pr = _win_pr(9, "2026-01-01T00:00:00Z", "4" * 40, labels=["review-window:active"])
+    edits: list[list[str]] = []
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_pr_window_gh([pr], edits=edits)
+    )
+
+    reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert edits == []
+
+
+def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE: live 2026-09-08 the listing
+    exceeded GitHub's GraphQL node limit and returned rc=1, and the tick
+    printed an empty report for days. A failed listing is an error, and
+    nothing is relabelled on the strength of it -- however it failed."""
+    edits: list[list[str]] = []
+    fake = _RestGitHub([], list_rc=1, edits=edits)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+    report = reconcile_pr_window("/repo", PrWindowConfig())
+    assert report.error is not None and "pr_list_failed" in report.error
+    assert report.active == [] and report.waiting == [] and report.blocked == []
+    assert edits == []
+    # The quota line is what tells an operator WHY a listing failed, so a
+    # failed tick still carries one (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-
+    # EXHAUSTED-BY-TICKS).
+    assert report.quota is not None
+
+
+def test_window_listing_is_light_and_details_come_from_one_view_per_pr_within_the_budget(monkeypatch):
+    """The listing carries no reviews/checks/commits (that is what blew the
+    node budget); a PR's details are fetched exactly once, for every PR the
+    detail budget reaches -- beyond the window too, because the block check
+    needs them (review of 53183850). Bounding is the budget's job
+    (`test_out_of_budget_prs_...`), not this test's claim (review of
+    d16dc0e4: the old name promised laziness the assertions contradicted)."""
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 5)}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": []}
+        for n in range(1, 5)
+    ]
+    views = {
+        n: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[n], "committedDate": f"2026-01-0{n}T00:00:00Z"}]}
+        for n in range(1, 5)
+    }
+    fake = _RestGitHub(light, details=views)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=2, stale_seconds=10**12)
+    )
+    assert report.error is None
+    assert [n for n, _ in report.active] == [1, 2]
+    assert [n for n, _ in report.waiting] == [3, 4]
+    listing = [call for call in fake.calls if "/pulls?" in call[-1]]
+    assert listing and all(
+        "reviews" not in call[-1] and "check-runs" not in call[-1]
+        for call in listing
+    ), "the listing itself stays light"
+    assert sorted(fake.viewed) == [1, 2, 3, 4], (
+        "beyond-window PRs are still examined for block reasons while budget remains"
+    )
+    assert len(fake.viewed) == len(set(fake.viewed)), "exactly one detail fetch per PR"
+    assert ("4", "add", "review-window:waiting") in fake.labels, (
+        "the tail is still labelled waiting"
+    )
+
+
+def _window_fake(monkeypatch, light, views):
+    fake = _RestGitHub(light, details=views)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+    return fake
+
+
+def test_a_genuinely_blocked_pr_beyond_the_window_is_labelled_blocked(monkeypatch):
+    """Adversarial review of 53183850: stamping everything past the window
+    `waiting` without a detail lookup lost the blocked signal for the whole
+    backlog. A stale PR far down the queue must still come out blocked."""
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 4)}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": []}
+        for n in range(1, 4)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {
+        1: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[1], "committedDate": fresh}]},
+        2: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[2], "committedDate": fresh}]},
+        # Beyond the window AND stale: an old head with no accept marker.
+        3: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[3], "committedDate": "2020-01-01T00:00:00Z"}]},
+    }
+    fake = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=3600))
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.waiting] == [2]
+    assert report.blocked == [(3, "stale_exact_head_acceptance")]
+    assert ("3", "add", "review-window:blocked") in fake.labels
+
+
+def test_out_of_budget_prs_keep_their_blocked_label_and_are_reported(monkeypatch):
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 5)}
+    labels = {3: [{"name": "review-window:blocked"}], 4: []}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": labels.get(n, [])}
+        for n in range(1, 5)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {n: {"reviews": [], "statusCheckRollup": [],
+                 "commits": [{"oid": heads[n], "committedDate": fresh}]} for n in range(1, 5)}
+    fake = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=3600, detail_budget=2)
+    )
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.waiting] == [2]
+    assert [n for n, _ in report.unchecked] == [3, 4]
+    assert sorted(fake.viewed) == [1, 2], "the budget bounds the detail fetches"
+    # Neither 3 (blocked) nor 4 (unlabelled) was examined: no label is
+    # written on no evidence.
+    assert not any(number in ("3", "4") for number, _, _ in fake.labels)
+
+
+def test_an_active_pr_beyond_the_detail_budget_is_not_demoted(monkeypatch):
+    """Two sticky-active PRs, budget for one detail lookup: the second stays
+    `active` untouched. The budget-exhausted path used to stamp `waiting`,
+    knocking an active PR out and back in on no real change."""
+    heads = {n: chr(ord("a") + n) * 40 for n in range(1, 4)}
+    labels = {1: [{"name": "review-window:active"}], 2: [{"name": "review-window:active"}]}
+    light = [
+        {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+         "headRefOid": heads[n], "createdAt": f"2026-01-0{n}T00:00:00Z",
+         "author": {"login": "alice"}, "labels": labels.get(n, [])}
+        for n in range(1, 4)
+    ]
+    fresh = "2099-01-01T00:00:00Z"
+    views = {n: {"reviews": [], "statusCheckRollup": [],
+                 "commits": [{"oid": heads[n], "committedDate": fresh}]} for n in range(1, 4)}
+    fake = _window_fake(monkeypatch, light, views)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=2, stale_seconds=3600, detail_budget=1)
+    )
+    assert [n for n, _ in report.active] == [1]
+    assert [n for n, _ in report.unchecked] == [2, 3]
+    assert not any(number in ("2", "3") for number, _, _ in fake.labels), (
+        "no evidence, no label change: 2 keeps active, 3 keeps nothing"
+    )
+
+
+def _light_pr(n: int) -> dict:
+    return {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
+            "headRefOid": format(n, "040x"), "createdAt": f"2026-01-01T00:{n % 60:02d}:{n // 60:02d}Z",
+            "author": {"login": "alice"}, "labels": []}
+
+
+def test_window_lists_every_open_pr_page_by_page_until_a_page_comes_back_short(monkeypatch):
+    """Review of d16dc0e4: a fixed cap silently omitted PR N+1 onward. The
+    listing is exhaustive: REST pages are read until one comes back short,
+    and every PR seen gets a label."""
+    total = 7
+    prs = [_light_pr(n) for n in range(1, total + 1)]
+    views = {n: {"reviews": [], "statusCheckRollup": [], "commits": []} for n in range(1, total + 1)}
+    fake = _RestGitHub(prs, details=views)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, scan_limit=2, detail_budget=100, stale_seconds=10**12)
+    )
+    assert report.error is None
+    assert fake.pages == [1, 2, 3, 4], "pages are read until one comes back short"
+    assert {number for number, _, _ in fake.labels} == {str(n) for n in range(1, total + 1)}, (
+        "every open PR was seen and labelled"
+    )
+
+
+def test_window_refuses_to_pretend_it_saw_everything_past_the_hard_cap(monkeypatch):
+    """A repository whose open PRs never run out: every page comes back
+    full, so the tick hits the hard cap and says so instead of labelling a
+    set it knows is partial."""
+    import subprocess as sp
+
+    edits: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        path = argv[3] if "--method" in argv else argv[1]
+        if "/pulls?" in path:
+            per_page = int(path.split("per_page=")[1].split("&")[0])
+            page = int(path.split("page=")[-1])
+            first = (page - 1) * per_page + 1
+            body = [
+                {"number": n, "html_url": f"https://github.com/x/repo-w/pull/{n}",
+                 "head": {"sha": format(n, "040x")}, "created_at": "2026-01-01T00:00:00Z",
+                 "user": {"login": "alice"}, "labels": []}
+                for n in range(first, first + per_page)
+            ]
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "/labels" in path:
+            edits.append(argv)
+        return sp.CompletedProcess(argv, 0, "{}", "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = reconcile_pr_window("/repo", PrWindowConfig(scan_limit=2, scan_hard_cap=8))
+    assert report.error and report.error.startswith("pr_list_truncated")
+    assert edits == [], "a tick that did not see every PR labels nothing"
+
+
+def test_a_failed_detail_lookup_leaves_the_existing_label_untouched(monkeypatch):
+    """Review of d16dc0e4: a transient detail-lookup failure stamped
+    `waiting`, demoting an active or blocked PR on no evidence. Now the
+    label stays and the PR is reported unreadable."""
+    labels = {1: [{"name": "review-window:active"}], 2: [{"name": "review-window:blocked"}], 3: []}
+    light = [dict(_light_pr(n), labels=labels[n]) for n in (1, 2, 3)]
+    fake = _RestGitHub(light, detail_rc=1)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=2, stale_seconds=3600))
+    assert report.error is None
+    assert [n for n, _ in report.unreadable] == [1, 2, 3]
+    assert report.active == [] and report.waiting == [] and report.blocked == []
+    assert fake.labels == [], "no evidence, no label change"

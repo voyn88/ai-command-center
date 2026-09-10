@@ -64,6 +64,13 @@ class SelfDeployConfig:
     #: Host-local provenance record (sha, outcome, timestamp per line).
     provenance_path: str = "~/.aicc-self-deploy-provenance.jsonl"
     command_timeout: int = 300
+    #: Marker file the staged worker rollout (ops/aicc_staged_worker_rollout.py)
+    #: holds for its entire duration. A restart issued by this tick while the
+    #: rollout is mid-drain is exactly what raced the rollout's own `stop` of
+    #: the canary lane on worker-01 (live 2026-09-08); refusing while the
+    #: marker exists means the next tick (5 minutes later, after the rollout
+    #: has finished and removed it) picks the deploy back up instead.
+    rollout_lock_path: str = "/run/aicc-staged-rollout.lock"
 
 
 @dataclass(slots=True)
@@ -131,6 +138,17 @@ def _import_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess[s
     )
 
 
+def _dispatch_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess[str]:
+    """`backlog_dispatch_smoke()` (0021) through the deployed code and the
+    control plane's own role: a read of `backlog_eligible` and the wave
+    candidate under the same SECURITY DEFINER the planner's dispatch uses."""
+    return _run_bounded(
+        [sys.executable, "-m", "command_center.db", "backlog-plan", "--smoke"],
+        timeout,
+        cwd=repo_path,
+    )
+
+
 def _record_provenance(cfg: SelfDeployConfig, report: SelfDeployReport) -> None:
     try:
         path = Path(cfg.provenance_path).expanduser()
@@ -175,6 +193,9 @@ def self_deploy_once(
         if outcome != "noop":
             _record_provenance(cfg, report)
         return report
+
+    if cfg.rollout_lock_path and Path(cfg.rollout_lock_path).expanduser().exists():
+        return finish("refused", "staged_rollout_in_progress")
 
     fetched = _git(repo_path, ["fetch", cfg.remote, cfg.branch], timeout)
     if fetched.returncode != 0:
@@ -273,6 +294,19 @@ def self_deploy_once(
         # rolled back, which is true whether or not anything actually
         # changed.
         report.steps.append("database_upgrade_ran_not_rolled_back")
+        # A migration can leave the schema importable yet unusable by the
+        # control plane (0019 recreated a view under the wrong owner; every
+        # planner tick died for 18 minutes while import-smoke was green).
+        # Exercise exactly the privileges dispatch needs before any service
+        # restarts; a refusal rolls the checkout and services back.
+        dispatch_smoke = _dispatch_smoke(repo_path, timeout)
+        if dispatch_smoke.returncode != 0:
+            return rollback(
+                "dispatch_smoke_failed_after_migration: "
+                f"{(dispatch_smoke.stderr or dispatch_smoke.stdout).strip()[:150]}",
+                services_touched=False,
+            )
+        report.steps.append("dispatch_smoke_passed")
 
     # A completed `db upgrade` is deliberately NOT rolled back on a later
     # restart failure: this codebase's migration policy is expand-contract

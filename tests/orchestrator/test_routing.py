@@ -52,10 +52,23 @@ def test_cascade_for_returns_copies_not_the_matrix():
     assert ROUTING_MATRIX["review"][0]["executor"] == "codex"
 
 
-def test_review_uses_copilot_then_claude_once_each():
+def test_review_uses_codex_then_claude_once_each():
     cascade = cascade_for("review")
-    assert [link["executor"] for link in cascade] == ["codex", "copilot", "claude"]
+    assert [link["executor"] for link in cascade] == ["codex", "claude"]
     assert all(link["task_type"] == "review" for link in cascade)
+
+
+def test_every_link_is_an_executor_the_isolated_worker_will_launch():
+    """ADR-0010: the fleet runs under principal isolation and the broker
+    launches only `PRINCIPAL_EXECUTOR_BINARIES`. A link outside that set is a
+    phantom link -- the worker refuses it at preflight and the attempt is
+    burned (live 2026-09-08: copilot ate the last attempt of every task whose
+    first two failed). This test is the gate that keeps such a link out."""
+    for task_class, cascade in ROUTING_MATRIX.items():
+        for link in cascade:
+            assert link["executor"] in agent_runner.PRINCIPAL_EXECUTOR_BINARIES, (
+                task_class, link, "not launchable under principal isolation"
+            )
 
 
 def test_unknown_task_class_falls_back_to_implementation():

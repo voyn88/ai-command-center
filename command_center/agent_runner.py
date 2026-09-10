@@ -130,9 +130,17 @@ COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
 PRINCIPAL_ISOLATION_LAUNCHER = "/usr/libexec/aicc-agent-launcher"
 PRINCIPAL_ISOLATION_REQUIRED_ENV = "AICC_AGENT_PRINCIPAL_ISOLATION"
 PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
+# The ONE place the isolated executors live: the root-owned toolchain the
+# broker validates and launches (`ops/aicc_agent_launcher.py`,
+# `EXECUTOR_BINARIES`). This map used to name /usr/local/bin, a path the
+# toolchain does not populate: on worker-01 codex was absent there, the
+# worker's preflight declared it unavailable, and every review fell through
+# the cascade to claude (2026-09-08). Two authorities for "where is the
+# executor" is exactly the drift that hid it; keep this in step with the
+# launcher's TOOLCHAIN_BIN.
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
-    "claude": "/usr/local/bin/claude",
-    "codex": "/usr/local/bin/codex",
+    "claude": "/opt/aicc/toolchains/current/bin/claude",
+    "codex": "/opt/aicc/toolchains/current/bin/codex",
     # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
     # principal isolation because its login credential carries GitHub /
     # repository authority -- staging it would hand untrusted model code the
@@ -877,9 +885,11 @@ def build_codex_command(
       enforcement, exactly as `--tools` is for Claude: a read-only sandbox
       cannot write the tree no matter what the model decides to attempt.
     * `PROFILE_TRUSTED_DEVELOPMENT` -> `--sandbox workspace-write`, which
-      confines writes to the working root `--cd` names. `danger-full-
-      access` is never used: it removes the boundary this profile exists
-      to draw.
+      confines writes to the working root `--cd` names -- OUTSIDE principal
+      isolation. Under isolation (`principal_isolation_required()`) the
+      systemd unit is the boundary and Codex runs `danger-full-access`
+      inside it: its inner bubblewrap mounted .git read-only and no commit
+      could land (owner decision 2026-09-09).
 
     `--skip-git-repo-check` is NOT passed: every dispatch runs inside a
     real git worktree (`workspace_provisioning`), so the check is a free
@@ -892,7 +902,19 @@ def build_codex_command(
     executor, so nothing downstream has to learn a second format.
     """
     profile = profile_for_task_type(task_type)
-    sandbox = "read-only" if profile == PROFILE_READ_ONLY else "workspace-write"
+    if profile == PROFILE_READ_ONLY:
+        sandbox = "read-only"
+    elif principal_isolation_required():
+        # Under principal isolation the systemd unit the broker builds is the
+        # boundary (dynamic uid, only /workspace writable, ProtectSystem=
+        # strict, no capabilities); Codex's own bubblewrap on top mounted
+        # .git read-only, so the commit the fleet contract requires could
+        # never land (worker-01 2026-09-09). Owner decision 2026-09-09: no
+        # inner sandbox INSIDE the unit. The launcher builds the same argv
+        # (a test pins both against each other).
+        sandbox = "danger-full-access"
+    else:
+        sandbox = "workspace-write"
     command = [
         CODEX_BINARY,
         "exec",

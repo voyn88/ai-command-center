@@ -572,6 +572,33 @@ def test_worker_can_call_backlog_resume_deferred_without_grants(
 
 
 # ---------------------------------------------------------------------------
+# Same shape, for the READY_TO_REVIEW recovery path (0018): a worker must
+# not be able to unstick its own evidence-free READY_TO_REVIEW row either.
+# ---------------------------------------------------------------------------
+
+
+def test_worker_cannot_call_backlog_recover_stuck_ready_to_review_when_grants_are_applied(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """With grants applied, the worker role must not reach
+    ``backlog_recover_stuck_ready_to_review``: it is declared to ``aicc_app``
+    only (``roles._APP_BACKLOG_FUNCTIONS``), the same posture as
+    ``backlog_resume_deferred``. A worker has no legitimate reason to move
+    its own stuck READY_TO_REVIEW task back to OPEN."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with psycopg.connect(
+        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(Exception, match="permission denied"):
+                cur.execute(
+                    "SELECT public.backlog_recover_stuck_ready_to_review('nonexistent_task')"
+                )
+
+
+# ---------------------------------------------------------------------------
 # A new migration adding an object outside the policy must fail the check
 # ---------------------------------------------------------------------------
 

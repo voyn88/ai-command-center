@@ -158,6 +158,20 @@ def test_the_migration_scan_ignores_add_column_inside_prose() -> None:
     assert _ADD_COLUMN.findall(prose) == []
 
 
+def test_a_subclass_without_spec_is_rejected_at_import_not_at_first_use() -> None:
+    """`PostgresTableMirror.spec` is a bare annotation, not a value: forgetting
+    it in a subclass used to surface as `AttributeError: 'X' object has no
+    attribute 'spec'` on the first mirrored write — late, swallowed by the
+    dual-write hook, and naming the subclass rather than the mistake. The
+    class body executes at import time, so `__init_subclass__` can and must
+    raise there instead, with a message naming what was left undeclared.
+    """
+    with pytest.raises(TypeError, match=r"Forgot.*\bspec\b"):
+
+        class Forgot(PostgresTableMirror):
+            pass
+
+
 def _value_for(table: str, column: str, spec: MirroredTable, row_id: str) -> object:
     declared = _declared_columns(table)[column]
     if column == "id":
