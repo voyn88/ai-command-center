@@ -11,6 +11,16 @@ key is the opt-in switch for publishing at all and the credential only on
 the SSH fallback. ``gh`` also opens the PR carrying the ``HEAD_SHA:`` trailer
 that result-ingest already parses.
 
+A worker can die mid-publish -- e.g. killed by a systemd service restart
+during a deploy -- after acquiring the lease but before the ``finally`` that
+releases it ever runs (observed live 2026-08-21). The lease then sits held
+under its ``(host, session_id, branch)`` key, and every subsequent publish
+attempt for that same task/branch is correctly refused with
+``lease_unavailable`` until ``PublishConfig.ttl`` (default 600s) lapses. This
+is the TTL doing exactly what a release that never ran needs: no manual
+action is required, the backlog task's next retry succeeds once the lease
+expires. A suspected stuck lease can be inspected with ``voyn-lease list``.
+
 That lease has an on-disk shadow, which is why every ``acquire`` here is
 followed by ``install-hooks`` under the identity it just acquired (#351).
 The hook presents repository/owner/session/task/pid/process-start read from
