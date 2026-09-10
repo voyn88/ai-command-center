@@ -1164,6 +1164,44 @@ def test_a_writable_directory_far_above_the_interpreter_is_refused(tmp_path, mon
         module.verify_immutable_release()
 
 
+def test_ancestor_directory_that_is_itself_a_symlink_is_followed_to_its_real_target(
+    tmp_path, monkeypatch
+):
+    """A merged-`/usr` host reaches `/usr/bin` through `/usr -> real-usr`. The
+    link's own mode is meaningless (every symlink is `lrwxrwxrwx`); what
+    matters is whether the directory it actually points at is writable. A walk
+    that stops at the link itself, without resolving it, would never see the
+    writable real directory sitting behind it."""
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    real_usr = tmp_path / "real-usr"
+    (tmp_path / "usr").rename(real_usr)
+    (tmp_path / "usr").symlink_to("real-usr")
+    real_usr.chmod(0o777)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
+def test_ancestor_symlink_chain_is_fully_resolved_not_just_one_hop(tmp_path, monkeypatch):
+    """The writable real directory can sit two hops behind the ancestor:
+    `usr -> usr-link -> real-usr`. A fix that resolves only the first hop --
+    itself still a symlink -- and stops there never reaches `real-usr`, so the
+    directory that actually holds the interpreter's ancestry stays unverified
+    (review on `c44cd40` caught exactly this: a fix that followed one ancestor
+    symlink hop but not a chain of them)."""
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    real_usr = tmp_path / "real-usr"
+    (tmp_path / "usr").rename(real_usr)
+    (tmp_path / "usr-link").symlink_to("real-usr")
+    (tmp_path / "usr").symlink_to("usr-link")
+    real_usr.chmod(0o777)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
 # ---------------------------------------------------------------------------
 # A rollout must not retire the old fleet and then discover the new one cannot
 # start. worker-01, 2026-08-31: every configuration check passed, the legacy

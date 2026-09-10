@@ -146,24 +146,56 @@ def _verify_immutable_object(path: Path) -> os.stat_result:
     return info
 
 
-def _ancestors_of(path: Path) -> tuple[Path, ...]:
+def _consume_hop(path: Path, hops: list[int]) -> None:
+    """Spend one symlink follow from the shared budget, or refuse.
+
+    `hops` is a single-element list shared by every caller in this module's
+    resolution walk, so a cycle spread across ancestor symlinks *and*
+    resolution hops is bounded once, not once per branch -- a chain that
+    ping-pongs between an ancestor symlink and an interpreter symlink cannot
+    outlast the budget by alternating which side it spends.
+    """
+    if hops[0] <= 0:
+        raise RolloutError(f"AICC release interpreter symlink chain is too deep: {path}")
+    hops[0] -= 1
+
+
+def _readlink(current: Path, target_text: str) -> Path:
+    return Path(target_text) if os.path.isabs(target_text) else current.parent / target_text
+
+
+def _ancestors_of(path: Path, hops: list[int]) -> tuple[Path, ...]:
     """Every directory between `path` and `_TRUSTED_ROOT`, inclusive.
 
-    Terminates at the trusted root, and also when a parent stops changing, so
-    a path outside the trusted root still ends rather than looping at `/`.
+    An ancestor that is itself a symlink -- a merged-`/usr` layout, or `/opt`
+    mounted through a compatibility link -- is followed to its real target,
+    and that target's own *full* resolution chain is verified too, not just
+    the target path itself: the target can be another symlink, and stopping
+    there leaves it unverified (review on `c44cd40` caught a fix that
+    resolved exactly one such hop and stopped, so a two-hop ancestor-symlink
+    chain ending in a writable real directory was still invisible). Terminates
+    at the trusted root, and also when a parent stops changing, so a path
+    outside the trusted root still ends rather than looping at `/`.
     """
     ancestors: list[Path] = []
     current = path.parent
     while True:
         ancestors.append(current)
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise RolloutError(f"AICC release path is unavailable: {current}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            _consume_hop(current, hops)
+            ancestors.extend(_resolution_chain(_readlink(current, os.readlink(current)), hops))
         if current == _TRUSTED_ROOT or current == current.parent:
             return tuple(ancestors)
         current = current.parent
 
 
-def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
-    """Every path the kernel touches to reach the real interpreter, plus the
-    directory each one lives in.
+def _resolution_chain(path: Path, hops: list[int]) -> tuple[Path, ...]:
+    """Every path the kernel touches to reach `path`'s real, non-symlink form,
+    plus the full (recursively resolved) ancestor chain of each hop.
 
     A virtualenv interpreter is a symlink chain that leaves the release:
     `.venv/bin/python -> python3 -> /usr/bin/python3 -> python3.12`. Verifying
@@ -179,19 +211,18 @@ def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
     exactly that: only the hop and its immediate parent were checked).
     """
     chain: list[Path] = []
-    current = executable
-    for _ in range(_MAX_SYMLINK_HOPS + 1):
+    current = path
+    while True:
         chain.append(current)
-        chain.extend(_ancestors_of(current))
+        chain.extend(_ancestors_of(current, hops))
         try:
             info = current.lstat()
         except OSError as exc:
             raise RolloutError(f"AICC release path is unavailable: {current}") from exc
         if not stat.S_ISLNK(info.st_mode):
             return tuple(chain)
-        target = os.readlink(current)
-        current = Path(target) if os.path.isabs(target) else current.parent / target
-    raise RolloutError(f"AICC release interpreter symlink chain is too deep: {executable}")
+        _consume_hop(current, hops)
+        current = _readlink(current, os.readlink(current))
 
 
 def verify_immutable_release() -> None:
@@ -224,7 +255,8 @@ def verify_immutable_release() -> None:
         target / ".venv/bin",
     )
     seen: set[Path] = set()
-    for path in ancestors + _interpreter_resolution_chain(executable):
+    hops = [_MAX_SYMLINK_HOPS]
+    for path in ancestors + _resolution_chain(executable, hops):
         if path in seen:
             continue
         seen.add(path)
