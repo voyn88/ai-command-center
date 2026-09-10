@@ -8,6 +8,33 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
+- `command_center/orchestrator/gh_access.py`: every `gh` call the review,
+  merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
+  installation token (`/var/lib/aicc/github/gh`, minted by
+  `voyn-aicc-github-token.timer` and readable by the `aicc-worker` principal
+  the ticks run as) instead of whatever human credential is ambient on
+  control-01. On 2026-09-09 21:15-22:10 UTC that human's shared GraphQL quota
+  was exhausted (`API rate limit already exceeded for user ID 297853521`) and
+  all three ticks failed for an hour. A host without the store falls back to
+  the ambient credential and says so; a refusal from the App falls back per
+  call so a scope it was never granted cannot break a tick.
+- The PR-window tick -- the only loop that touches every open pull request --
+  moved from `gh pr list`/`gh pr view`/`gh pr edit` (GraphQL) to the REST
+  endpoints (`gh api repos/...`), with per-`(repo, PR, head sha)` caching of
+  the details, so an unchanged head costs no API call at all. Its timer went
+  from 5 to 15 minutes; labelling is advisory and no gate reads it.
+- Each tick reports a `QUOTA` line: identity, REST/GraphQL call counts, cache
+  hits, ambient fallbacks, rate-limited calls, and the identity's remaining
+  core/GraphQL budget (read with `gh api rate_limit`, which is exempt from
+  rate limiting).
+- `ops/aicc_github_app_token.py` requests the ticks' additional read scopes
+  (`checks`, `statuses`, `actions`) on top of the lanes' git set, and falls
+  back to the lane set alone if the installation was never granted them --
+  GitHub refuses the whole token otherwise, which would leave the fleet with
+  no credential at all.
+
+
 ### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
 - `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`
   (`clients/aicc-native/apple/Sources/AICCNativeCore/AICCNativeCore.swift`):

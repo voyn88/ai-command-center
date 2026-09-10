@@ -46,6 +46,21 @@ def _snapshot(head, diff=DIFF):
 
 
 @pytest.fixture(autouse=True)
+def _control_plane_gh_environment(monkeypatch):
+    """Two facts every tick now depends on, held still for the tests.
+
+    The REST paths need the checkout's `origin` slug, which is read from git
+    (`_origin_owner_repo`) -- these tests hand the ticks a path that is not a
+    clone at all. And the (repo, PR, head) detail cache must not carry state
+    between tests: TTL 0 disables it, so a test that means to exercise it
+    switches it back on explicitly."""
+    monkeypatch.setattr(
+        review_merge, "_origin_owner_repo", lambda repo_path: ("x", "repo-w")
+    )
+    monkeypatch.setenv("AICC_GH_CACHE_TTL_SECONDS", "0")
+
+
+@pytest.fixture(autouse=True)
 def _snapshots(monkeypatch):
     SNAPSHOTS.clear()
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda _repo, pr: SNAPSHOTS.get(pr))
@@ -3211,11 +3226,21 @@ def _pr_rows(factory, task_id):
 
 
 def _fake_pr_list(entries, *, returncode=0, stdout=None):
+    """The branch lookup is REST now (`gh api repos/{o}/{r}/pulls?...head=`)
+    rather than `gh pr list --head` (GraphQL) --
+    VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS. Entries are still
+    written in the shape the caller reads back ({url, headRefName}); the
+    fake translates them to the REST body GitHub actually returns."""
     import subprocess as sp
 
+    rest = [
+        {"html_url": entry["url"], "head": {"ref": entry["headRefName"]}}
+        for entry in entries
+    ]
+
     def fake_gh(argv, repo):
-        if argv[:2] == ["pr", "list"]:
-            body = json.dumps(entries) if stdout is None else stdout
+        if argv[0] == "api" and "/pulls?" in argv[1]:
+            body = json.dumps(rest) if stdout is None else stdout
             return sp.CompletedProcess(argv, returncode, body, "")
         return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
 
@@ -3384,45 +3409,229 @@ def _win_pr(number, created, head, *, author="alice", labels=(), reviews=(),
     }
 
 
-def _fake_pr_window_gh(prs, *, api_returncode=1, api_stdout="", edits=None):
-    """Fakes `pr list` (returns `prs`) and `pr edit` (records into `edits`,
-    a list the caller can inspect); `api` calls (the direct head-commit
-    lookup) return `api_returncode`/`api_stdout`."""
-    import subprocess as sp
+class _RestGitHub:
+    """The GitHub REST endpoints the PR-window tick speaks, in process.
 
-    calls: list[list[str]] = []
+    The tick moved off `gh pr list` / `gh pr view` (GraphQL, on whichever
+    human token was ambient) onto `gh api repos/...`
+    (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS), so this fake serves
+    PATHS rather than porcelain: the open-PR listing, one PR's reviews, its
+    head's check-runs and legacy statuses, the head commit's date, and the
+    issue-label writes. Test data stays in the GraphQL vocabulary `_win_pr`
+    already uses -- the translation lives here, exactly as it does in the
+    module under test.
 
-    def fake_gh(argv, repo_path):
-        calls.append(list(argv))
-        if argv[0] == "pr" and argv[1] == "list":
-            return sp.CompletedProcess(argv, 0, json.dumps(prs), "")
-        if argv[0] == "pr" and argv[1] == "edit":
-            if edits is not None:
-                edits.append(list(argv))
+    `details` maps a PR number to a `{reviews, statusCheckRollup, commits}`
+    dict for the tests that keep listing and details apart; without it the
+    listing entry itself carries them."""
+
+    def __init__(
+        self,
+        prs,
+        *,
+        details=None,
+        list_rc=0,
+        list_body=None,
+        detail_rc=0,
+        commit_rc=None,
+        commit_stdout="",
+        edits=None,
+    ):
+        self.prs = [dict(pr) for pr in prs]
+        self.details = {int(n): d for n, d in (details or {}).items()}
+        self.list_rc = list_rc
+        self.list_body = list_body
+        self.detail_rc = detail_rc
+        self.commit_rc = commit_rc
+        self.commit_stdout = commit_stdout
+        self.edits = edits
+        self.calls: list[list[str]] = []
+        #: PR numbers whose details this tick actually fetched.
+        self.viewed: list[int] = []
+        #: (number, "add"|"remove", label) label writes.
+        self.labels: list[tuple[str, str, str]] = []
+        #: Listing pages requested, in order.
+        self.pages: list[int] = []
+
+    # -- translation ------------------------------------------------------
+    def _listed(self, pr):
+        return {
+            "number": pr["number"],
+            "html_url": pr["url"],
+            "head": {"sha": pr.get("headRefOid", "")},
+            "created_at": pr.get("createdAt", ""),
+            "user": {"login": (pr.get("author") or {}).get("login")},
+            "labels": list(pr.get("labels") or []),
+        }
+
+    def _details_for(self, number):
+        if number in self.details:
+            return self.details[number]
+        return next(
+            (pr for pr in self.prs if int(pr["number"]) == number), {}
+        )
+
+    def _reviews(self, number):
+        return [
+            {
+                "state": review.get("state"),
+                "submitted_at": review.get("submittedAt"),
+                "body": review.get("body"),
+                "user": {"login": (review.get("author") or {}).get("login")},
+            }
+            for review in self._details_for(number).get("reviews") or []
+        ]
+
+    def _checks(self, number):
+        runs, statuses = [], []
+        for check in self._details_for(number).get("statusCheckRollup") or []:
+            if "state" in check:
+                statuses.append({
+                    "context": check.get("name"),
+                    "state": check.get("state"),
+                    "created_at": check.get("startedAt"),
+                    "updated_at": check.get("completedAt"),
+                    "target_url": check.get("detailsUrl"),
+                })
+            else:
+                runs.append({
+                    "name": check.get("name"),
+                    "status": check.get("status"),
+                    "conclusion": check.get("conclusion"),
+                    "started_at": check.get("startedAt"),
+                    "completed_at": check.get("completedAt"),
+                    "details_url": check.get("detailsUrl"),
+                })
+        return runs, statuses
+
+    def _committed_date(self, sha):
+        for pr in self.prs:
+            number = int(pr["number"])
+            for commit in self._details_for(number).get("commits") or []:
+                if commit.get("oid") == sha:
+                    return commit.get("committedDate")
+        return None
+
+    # -- the fake `_gh` ---------------------------------------------------
+    def __call__(self, argv, repo_path):
+        import subprocess as sp
+
+        self.calls.append(list(argv))
+        if argv[0] != "api":
+            return sp.CompletedProcess(argv, 1, "", "unexpected gh porcelain call")
+        method = argv[2] if "--method" in argv else "GET"
+        path = argv[3] if "--method" in argv else argv[1]
+        query = dict(
+            pair.split("=", 1)
+            for pair in path.partition("?")[2].split("&")
+            if "=" in pair
+        )
+
+        if "/issues/" in path and "/labels" in path:
+            number = path.split("/issues/")[1].split("/")[0]
+            if method == "POST":
+                label = argv[argv.index("-f") + 1].split("=", 1)[1]
+                self.labels.append((number, "add", label))
+            else:
+                from urllib.parse import unquote
+
+                self.labels.append(
+                    (number, "remove", unquote(path.split("/labels/")[1]))
+                )
+            if self.edits is not None:
+                self.edits.append(list(argv))
             return sp.CompletedProcess(argv, 0, "", "")
-        if argv[0] == "api":
-            return sp.CompletedProcess(argv, api_returncode, api_stdout, "")
-        return sp.CompletedProcess(argv, 1, "", "unhandled")
 
-    fake_gh.calls = calls
-    return fake_gh
+        if "/pulls?" in path:
+            page = int(query.get("page", 1))
+            per_page = int(query.get("per_page", 100))
+            self.pages.append(page)
+            if self.list_rc:
+                return sp.CompletedProcess(argv, self.list_rc, "", "HTTP 403")
+            if self.list_body is not None:
+                return sp.CompletedProcess(argv, 0, self.list_body, "")
+            start = (page - 1) * per_page
+            chunk = [self._listed(pr) for pr in self.prs[start:start + per_page]]
+            return sp.CompletedProcess(argv, 0, json.dumps(chunk), "")
+
+        if "/reviews" in path:
+            if self.detail_rc:
+                return sp.CompletedProcess(argv, self.detail_rc, "", "HTTP 502")
+            number = int(path.split("/pulls/")[1].split("/")[0])
+            self.viewed.append(number)
+            page = int(query.get("page", 1))
+            body = self._reviews(number) if page == 1 else []
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+
+        if "/check-runs" in path:
+            if self.detail_rc:
+                return sp.CompletedProcess(argv, self.detail_rc, "", "HTTP 502")
+            sha = path.split("/commits/")[1].split("/")[0]
+            page = int(query.get("page", 1))
+            runs = self._checks_for_sha(sha)[0] if page == 1 else []
+            return sp.CompletedProcess(argv, 0, json.dumps({"check_runs": runs}), "")
+
+        if path.split("?")[0].endswith("/status"):
+            if self.detail_rc:
+                return sp.CompletedProcess(argv, self.detail_rc, "", "HTTP 502")
+            sha = path.split("/commits/")[1].split("/")[0]
+            statuses = self._checks_for_sha(sha)[1]
+            return sp.CompletedProcess(
+                argv, 0, json.dumps({"state": "success", "statuses": statuses}), ""
+            )
+
+        if "/commits/" in path:
+            # The head commit's own date (`--jq .commit.committer.date`), the
+            # one lookup that was already REST before this change.
+            if self.commit_rc:
+                return sp.CompletedProcess(argv, self.commit_rc, self.commit_stdout, "")
+            if self.commit_stdout:
+                return sp.CompletedProcess(argv, 0, self.commit_stdout, "")
+            date = self._committed_date(path.split("/commits/")[1].split("?")[0])
+            if date is None:
+                return sp.CompletedProcess(argv, 1, "", "HTTP 404")
+            return sp.CompletedProcess(argv, 0, date, "")
+
+        return sp.CompletedProcess(argv, 1, "", "unhandled path")
+
+    def _checks_for_sha(self, sha):
+        for pr in self.prs:
+            if pr.get("headRefOid") == sha:
+                return self._checks(int(pr["number"]))
+        return [], []
+
+
+def _fake_pr_window_gh(prs, *, api_returncode=0, api_stdout="", edits=None):
+    """`prs` are `_win_pr` dicts: the listing is served from them, and so are
+    the details the tick now fetches per PR (reviews, checks, head date).
+
+    The head commit's date comes from each PR's own `commits` -- the same
+    data the listing used to carry inline -- so a test that wants that
+    lookup to FAIL (the age-fallback one) passes `api_returncode=1`."""
+    return _RestGitHub(
+        prs,
+        edits=edits,
+        commit_rc=api_returncode or None,
+        commit_stdout=api_stdout,
+    )
 
 
 def test_pr_list_is_requested_in_ascending_created_order(monkeypatch):
-    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM-REM: `gh pr list` with no sort
-    returns newest-first, so a plain `--limit` truncated the OLDEST, longest-
-    waiting PRs out of consideration on any repo busier than the scan limit.
-    Requesting ascending order explicitly is the actual FIFO fix."""
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-REM-REM: an unsorted listing returns
+    newest-first, so a plain page cap truncated the OLDEST, longest-waiting
+    PRs out of consideration on any repo busier than the scan limit.
+    Requesting ascending order explicitly is the actual FIFO fix -- now as
+    REST query parameters, since the listing left GraphQL entirely
+    (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS)."""
     fake = _fake_pr_window_gh([])
     monkeypatch.setattr(review_merge, "_gh", fake)
 
     reconcile_pr_window("/repo", PrWindowConfig(scan_limit=10))
 
-    list_call = next(c for c in fake.calls if c[:2] == ["pr", "list"])
-    assert "--search" in list_call
-    assert list_call[list_call.index("--search") + 1] == "sort:created-asc"
-    assert "--limit" in list_call
-    assert list_call[list_call.index("--limit") + 1] == "10"
+    list_call = next(c for c in fake.calls if "/pulls?" in c[-1])
+    assert list_call[0] == "api", "REST, not the GraphQL `gh pr list`"
+    assert "sort=created" in list_call[-1] and "direction=asc" in list_call[-1]
+    assert "per_page=10" in list_call[-1]
 
 
 def test_oldest_eligible_prs_fill_the_window_first(monkeypatch):
@@ -3441,7 +3650,10 @@ def test_oldest_eligible_prs_fill_the_window_first(monkeypatch):
 
     assert report.active == [(1, "a" * 40)]
     assert report.waiting == [(2, "b" * 40)]
-    assert any(e[2] == "1" and "--add-label" in e for e in edits)
+    assert any(
+        "/issues/1/labels" in call[-1] or "/issues/1/labels" in " ".join(call)
+        for call in edits
+    )
 
 
 def test_reject_marker_from_the_pr_author_does_not_block(monkeypatch):
@@ -3538,18 +3750,11 @@ def test_age_uses_direct_lookup_when_commits_list_is_paginated_out(monkeypatch):
     and must not be recorded as a fallback."""
     head = "1" * 40
     pr = _win_pr(6, "2020-01-01T00:00:00Z", head, commits=[])
-    import subprocess as sp
-
-    now_iso = "2026-01-01T00:00:00Z"
-
-    def fake_gh(argv, repo_path):
-        if argv[0] == "pr" and argv[1] == "list":
-            return sp.CompletedProcess(argv, 0, json.dumps([pr]), "")
-        if argv[0] == "api":
-            return sp.CompletedProcess(argv, 0, now_iso, "")
-        return sp.CompletedProcess(argv, 0, "", "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _RestGitHub([pr], commit_stdout="2026-01-01T00:00:00Z"),
+    )
 
     report = reconcile_pr_window("/repo", PrWindowConfig(stale_seconds=999_999_999))
 
@@ -3596,35 +3801,29 @@ def test_already_correctly_labelled_pr_costs_no_edit_call(monkeypatch):
 
 def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
     """VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE: live 2026-09-08 the listing
-    exceeded GitHub's GraphQL node limit, `gh pr list` returned rc=1 and the
-    tick printed an empty report for days. A failed listing is an error,
-    and nothing is relabelled on the strength of it."""
-    import subprocess as sp
-
+    exceeded GitHub's GraphQL node limit and returned rc=1, and the tick
+    printed an empty report for days. A failed listing is an error, and
+    nothing is relabelled on the strength of it -- however it failed."""
     edits: list[list[str]] = []
-
-    def fake_gh(argv, repo_path):
-        if argv[:2] == ["pr", "list"]:
-            return sp.CompletedProcess(argv, 1, "", "GraphQL: exceeds the maximum limit")
-        edits.append(list(argv))
-        return sp.CompletedProcess(argv, 0, "", "")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    fake = _RestGitHub([], list_rc=1, edits=edits)
+    monkeypatch.setattr(review_merge, "_gh", fake)
     report = reconcile_pr_window("/repo", PrWindowConfig())
     assert report.error is not None and "pr_list_failed" in report.error
     assert report.active == [] and report.waiting == [] and report.blocked == []
     assert edits == []
+    # The quota line is what tells an operator WHY a listing failed, so a
+    # failed tick still carries one (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-
+    # EXHAUSTED-BY-TICKS).
+    assert report.quota is not None
 
 
 def test_window_listing_is_light_and_details_come_from_one_view_per_pr_within_the_budget(monkeypatch):
-    """The listing asks for no reviews/checks/commits (that is what blew the
-    node budget); a PR's details come from exactly one `pr view`, for every
-    PR the detail budget reaches -- beyond the window too, because the block
-    check needs them (review of 53183850). Bounding is the budget's job
+    """The listing carries no reviews/checks/commits (that is what blew the
+    node budget); a PR's details are fetched exactly once, for every PR the
+    detail budget reaches -- beyond the window too, because the block check
+    needs them (review of 53183850). Bounding is the budget's job
     (`test_out_of_budget_prs_...`), not this test's claim (review of
     d16dc0e4: the old name promised laziness the assertions contradicted)."""
-    import subprocess as sp
-
     heads = {n: chr(ord("a") + n) * 40 for n in range(1, 5)}
     light = [
         {"number": n, "url": f"https://github.com/x/repo-w/pull/{n}",
@@ -3632,59 +3831,37 @@ def test_window_listing_is_light_and_details_come_from_one_view_per_pr_within_th
          "author": {"login": "alice"}, "labels": []}
         for n in range(1, 5)
     ]
-    calls: list[list[str]] = []
-
-    def fake_gh(argv, repo_path):
-        calls.append(list(argv))
-        if argv[:2] == ["pr", "list"]:
-            fields = argv[argv.index("--json") + 1]
-            assert "reviews" not in fields and "statusCheckRollup" not in fields
-            assert "commits" not in fields
-            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
-        if argv[:2] == ["pr", "view"]:
-            n = int(argv[2])
-            return sp.CompletedProcess(argv, 0, json.dumps({
-                "reviews": [], "statusCheckRollup": [],
-                "commits": [{"oid": heads[n], "committedDate": f"2026-01-0{n}T00:00:00Z"}],
-            }), "")
-        if argv[:2] == ["pr", "edit"]:
-            return sp.CompletedProcess(argv, 0, "", "")
-        return sp.CompletedProcess(argv, 1, "", "unhandled")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    views = {
+        n: {"reviews": [], "statusCheckRollup": [],
+            "commits": [{"oid": heads[n], "committedDate": f"2026-01-0{n}T00:00:00Z"}]}
+        for n in range(1, 5)
+    }
+    fake = _RestGitHub(light, details=views)
+    monkeypatch.setattr(review_merge, "_gh", fake)
     report = reconcile_pr_window(
         "/repo", PrWindowConfig(max_active=2, stale_seconds=10**12)
     )
     assert report.error is None
     assert [n for n, _ in report.active] == [1, 2]
     assert [n for n, _ in report.waiting] == [3, 4]
-    viewed = [int(c[2]) for c in calls if c[:2] == ["pr", "view"]]
-    assert sorted(viewed) == [1, 2, 3, 4], (
+    listing = [call for call in fake.calls if "/pulls?" in call[-1]]
+    assert listing and all(
+        "reviews" not in call[-1] and "check-runs" not in call[-1]
+        for call in listing
+    ), "the listing itself stays light"
+    assert sorted(fake.viewed) == [1, 2, 3, 4], (
         "beyond-window PRs are still examined for block reasons while budget remains"
     )
-    assert len(viewed) == len(set(viewed)), "exactly one detail lookup per PR"
-    assert any(c[:2] == ["pr", "edit"] and c[2] == "4" for c in calls), (
+    assert len(fake.viewed) == len(set(fake.viewed)), "exactly one detail fetch per PR"
+    assert ("4", "add", "review-window:waiting") in fake.labels, (
         "the tail is still labelled waiting"
     )
 
 
 def _window_fake(monkeypatch, light, views):
-    import subprocess as sp
-
-    calls: list[list[str]] = []
-
-    def fake_gh(argv, repo_path):
-        calls.append(list(argv))
-        if argv[:2] == ["pr", "list"]:
-            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
-        if argv[:2] == ["pr", "view"]:
-            return sp.CompletedProcess(argv, 0, json.dumps(views[int(argv[2])]), "")
-        if argv[:2] == ["pr", "edit"]:
-            return sp.CompletedProcess(argv, 0, "", "")
-        return sp.CompletedProcess(argv, 1, "", "unhandled")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
-    return calls
+    fake = _RestGitHub(light, details=views)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+    return fake
 
 
 def test_a_genuinely_blocked_pr_beyond_the_window_is_labelled_blocked(monkeypatch):
@@ -3708,12 +3885,12 @@ def test_a_genuinely_blocked_pr_beyond_the_window_is_labelled_blocked(monkeypatc
         3: {"reviews": [], "statusCheckRollup": [],
             "commits": [{"oid": heads[3], "committedDate": "2020-01-01T00:00:00Z"}]},
     }
-    calls = _window_fake(monkeypatch, light, views)
+    fake = _window_fake(monkeypatch, light, views)
     report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=3600))
     assert [n for n, _ in report.active] == [1]
     assert [n for n, _ in report.waiting] == [2]
     assert report.blocked == [(3, "stale_exact_head_acceptance")]
-    assert ["pr", "edit", "3", "--add-label", "review-window:blocked"] in calls
+    assert ("3", "add", "review-window:blocked") in fake.labels
 
 
 def test_out_of_budget_prs_keep_their_blocked_label_and_are_reported(monkeypatch):
@@ -3728,18 +3905,17 @@ def test_out_of_budget_prs_keep_their_blocked_label_and_are_reported(monkeypatch
     fresh = "2099-01-01T00:00:00Z"
     views = {n: {"reviews": [], "statusCheckRollup": [],
                  "commits": [{"oid": heads[n], "committedDate": fresh}]} for n in range(1, 5)}
-    calls = _window_fake(monkeypatch, light, views)
+    fake = _window_fake(monkeypatch, light, views)
     report = reconcile_pr_window(
         "/repo", PrWindowConfig(max_active=1, stale_seconds=3600, detail_budget=2)
     )
     assert [n for n, _ in report.active] == [1]
     assert [n for n, _ in report.waiting] == [2]
     assert [n for n, _ in report.unchecked] == [3, 4]
-    viewed = sorted(int(c[2]) for c in calls if c[:2] == ["pr", "view"])
-    assert viewed == [1, 2], "the budget bounds the detail lookups"
+    assert sorted(fake.viewed) == [1, 2], "the budget bounds the detail fetches"
     # Neither 3 (blocked) nor 4 (unlabelled) was examined: no label is
     # written on no evidence.
-    assert not any(c[:2] == ["pr", "edit"] and c[2] in ("3", "4") for c in calls)
+    assert not any(number in ("3", "4") for number, _, _ in fake.labels)
 
 
 def test_an_active_pr_beyond_the_detail_budget_is_not_demoted(monkeypatch):
@@ -3757,13 +3933,13 @@ def test_an_active_pr_beyond_the_detail_budget_is_not_demoted(monkeypatch):
     fresh = "2099-01-01T00:00:00Z"
     views = {n: {"reviews": [], "statusCheckRollup": [],
                  "commits": [{"oid": heads[n], "committedDate": fresh}]} for n in range(1, 4)}
-    calls = _window_fake(monkeypatch, light, views)
+    fake = _window_fake(monkeypatch, light, views)
     report = reconcile_pr_window(
         "/repo", PrWindowConfig(max_active=2, stale_seconds=3600, detail_budget=1)
     )
     assert [n for n, _ in report.active] == [1]
     assert [n for n, _ in report.unchecked] == [2, 3]
-    assert not any(c[:2] == ["pr", "edit"] and c[2] in ("2", "3") for c in calls), (
+    assert not any(number in ("2", "3") for number, _, _ in fake.labels), (
         "no evidence, no label change: 2 keeps active, 3 keeps nothing"
     )
 
@@ -3774,48 +3950,47 @@ def _light_pr(n: int) -> dict:
             "author": {"login": "alice"}, "labels": []}
 
 
-def test_window_lists_every_open_pr_by_growing_the_page_until_it_comes_back_short(monkeypatch):
-    """Review of d16dc0e4: a fixed --limit 300 still silently omitted PR 301+.
-    The listing is exhaustive: a full page is retried at twice the size
-    until a page is short, and every PR seen gets a label."""
-    import subprocess as sp
-
+def test_window_lists_every_open_pr_page_by_page_until_a_page_comes_back_short(monkeypatch):
+    """Review of d16dc0e4: a fixed cap silently omitted PR N+1 onward. The
+    listing is exhaustive: REST pages are read until one comes back short,
+    and every PR seen gets a label."""
     total = 7
-    limits: list[int] = []
-    edited: set[str] = set()
-
-    def fake_gh(argv, repo_path):
-        if argv[:2] == ["pr", "list"]:
-            limit = int(argv[argv.index("--limit") + 1])
-            limits.append(limit)
-            page = [_light_pr(n) for n in range(1, min(total, limit) + 1)]
-            return sp.CompletedProcess(argv, 0, json.dumps(page), "")
-        if argv[:2] == ["pr", "view"]:
-            return sp.CompletedProcess(argv, 0, json.dumps({"reviews": [], "statusCheckRollup": [], "commits": []}), "")
-        if argv[:2] == ["pr", "edit"]:
-            edited.add(argv[2])
-            return sp.CompletedProcess(argv, 0, "", "")
-        return sp.CompletedProcess(argv, 1, "", "unhandled")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    prs = [_light_pr(n) for n in range(1, total + 1)]
+    views = {n: {"reviews": [], "statusCheckRollup": [], "commits": []} for n in range(1, total + 1)}
+    fake = _RestGitHub(prs, details=views)
+    monkeypatch.setattr(review_merge, "_gh", fake)
     report = reconcile_pr_window(
         "/repo", PrWindowConfig(max_active=1, scan_limit=2, detail_budget=100, stale_seconds=10**12)
     )
     assert report.error is None
-    assert limits == [2, 4, 8], "page size doubles until a page comes back short"
-    assert edited == {str(n) for n in range(1, total + 1)}, "every open PR was seen and labelled"
+    assert fake.pages == [1, 2, 3, 4], "pages are read until one comes back short"
+    assert {number for number, _, _ in fake.labels} == {str(n) for n in range(1, total + 1)}, (
+        "every open PR was seen and labelled"
+    )
 
 
 def test_window_refuses_to_pretend_it_saw_everything_past_the_hard_cap(monkeypatch):
+    """A repository whose open PRs never run out: every page comes back
+    full, so the tick hits the hard cap and says so instead of labelling a
+    set it knows is partial."""
     import subprocess as sp
 
     edits: list[list[str]] = []
 
     def fake_gh(argv, repo_path):
-        if argv[:2] == ["pr", "list"]:
-            limit = int(argv[argv.index("--limit") + 1])
-            return sp.CompletedProcess(argv, 0, json.dumps([_light_pr(n) for n in range(1, limit + 1)]), "")
-        if argv[:2] == ["pr", "edit"]:
+        path = argv[3] if "--method" in argv else argv[1]
+        if "/pulls?" in path:
+            per_page = int(path.split("per_page=")[1].split("&")[0])
+            page = int(path.split("page=")[-1])
+            first = (page - 1) * per_page + 1
+            body = [
+                {"number": n, "html_url": f"https://github.com/x/repo-w/pull/{n}",
+                 "head": {"sha": format(n, "040x")}, "created_at": "2026-01-01T00:00:00Z",
+                 "user": {"login": "alice"}, "labels": []}
+                for n in range(first, first + per_page)
+            ]
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "/labels" in path:
             edits.append(argv)
         return sp.CompletedProcess(argv, 0, "{}", "")
 
@@ -3826,28 +4001,15 @@ def test_window_refuses_to_pretend_it_saw_everything_past_the_hard_cap(monkeypat
 
 
 def test_a_failed_detail_lookup_leaves_the_existing_label_untouched(monkeypatch):
-    """Review of d16dc0e4: a transient `gh pr view` failure stamped `waiting`,
-    demoting an active or blocked PR on no evidence. Now the label stays and
-    the PR is reported unreadable."""
-    import subprocess as sp
-
+    """Review of d16dc0e4: a transient detail-lookup failure stamped
+    `waiting`, demoting an active or blocked PR on no evidence. Now the
+    label stays and the PR is reported unreadable."""
     labels = {1: [{"name": "review-window:active"}], 2: [{"name": "review-window:blocked"}], 3: []}
     light = [dict(_light_pr(n), labels=labels[n]) for n in (1, 2, 3)]
-    calls: list[list[str]] = []
-
-    def fake_gh(argv, repo_path):
-        calls.append(list(argv))
-        if argv[:2] == ["pr", "list"]:
-            return sp.CompletedProcess(argv, 0, json.dumps(light), "")
-        if argv[:2] == ["pr", "view"]:
-            return sp.CompletedProcess(argv, 1, "", "HTTP 502")
-        if argv[:2] == ["pr", "edit"]:
-            return sp.CompletedProcess(argv, 0, "", "")
-        return sp.CompletedProcess(argv, 1, "", "unhandled")
-
-    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    fake = _RestGitHub(light, detail_rc=1)
+    monkeypatch.setattr(review_merge, "_gh", fake)
     report = reconcile_pr_window("/repo", PrWindowConfig(max_active=2, stale_seconds=3600))
     assert report.error is None
     assert [n for n, _ in report.unreadable] == [1, 2, 3]
     assert report.active == [] and report.waiting == [] and report.blocked == []
-    assert not any(c[:2] == ["pr", "edit"] for c in calls), "no evidence, no label change"
+    assert fake.labels == [], "no evidence, no label change"

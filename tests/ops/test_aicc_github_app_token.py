@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import stat
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,93 @@ def test_mint_narrows_the_token_to_the_fleet_repositories_and_permissions(tmp_pa
     assert seen["url"].endswith("/app/installations/160309192/access_tokens")
     assert seen["body"] == {"permissions": {"contents": "write"}, "repositories": ["ai-command-center", "aios"]}
     assert seen["auth"].startswith("Bearer ")
+
+
+def test_the_control_ticks_scopes_are_requested_on_top_of_the_lane_set(tmp_path, monkeypatch):
+    """VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS: the ticks read a
+    head's check rollup and commit statuses and rerun a cancelled required
+    check, so the token asks for those scopes as well as the lanes' git
+    ones."""
+    module = _module()
+    monkeypatch.setattr(module, "_openssl_sign", lambda pem, payload: b"s")
+    seen = {}
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def opener(request, timeout):
+        seen["body"] = json.loads(request.data)
+        return _Response(json.dumps({"token": "ghs_abc", "expires_at": "x"}).encode())
+
+    module.mint(
+        "1", "2", tmp_path / "k.pem", repositories=("aios",),
+        permissions=module.CONTROL_PERMISSIONS, opener=opener,
+    )
+    assert seen["body"]["permissions"] == {
+        "contents": "write", "pull_requests": "write", "metadata": "read",
+        "checks": "read", "statuses": "read", "actions": "write",
+    }
+    assert module.DEFAULT_PERMISSIONS.items() <= module.CONTROL_PERMISSIONS.items(), (
+        "the control scopes are additive; the lanes' git access is unchanged"
+    )
+
+
+def test_an_ungranted_extra_permission_falls_back_to_the_lane_set(tmp_path, monkeypatch):
+    """GitHub refuses the WHOLE token (422) when it is asked for a permission
+    the installation was never granted. Without a fallback that would leave
+    the fleet with no token at all -- no git fetch, no publish, no ticks --
+    the moment this asked for a scope the owner has not approved yet."""
+    module = _module()
+    monkeypatch.setattr(module, "_openssl_sign", lambda pem, payload: b"s")
+    requested = []
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def opener(request, timeout):
+        body = json.loads(request.data)
+        requested.append(body["permissions"])
+        if "checks" in body["permissions"]:
+            raise urllib.error.HTTPError(
+                request.full_url, 422, "Unprocessable Entity", {}, None
+            )
+        return _Response(json.dumps({"token": "ghs_ok", "expires_at": "x"}).encode())
+
+    document = module.mint(
+        "1", "2", tmp_path / "k.pem", repositories=("aios",),
+        permissions=module.CONTROL_PERMISSIONS,
+        fallback_permissions=module.DEFAULT_PERMISSIONS,
+        opener=opener,
+    )
+    assert document["token"] == "ghs_ok"
+    assert requested == [module.CONTROL_PERMISSIONS, module.DEFAULT_PERMISSIONS]
+
+
+def test_a_refusal_that_is_not_about_permissions_is_not_retried(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "_openssl_sign", lambda pem, payload: b"s")
+    attempts = []
+
+    def opener(request, timeout):
+        attempts.append(1)
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    with pytest.raises(urllib.error.HTTPError):
+        module.mint(
+            "1", "2", tmp_path / "k.pem", repositories=("aios",),
+            permissions=module.CONTROL_PERMISSIONS,
+            fallback_permissions=module.DEFAULT_PERMISSIONS,
+            opener=opener,
+        )
+    assert len(attempts) == 1, "a bad JWT is not fixed by asking for less"
 
 
 def test_store_writes_token_expiry_and_gh_hosts_lane_readable_and_atomic(tmp_path):
@@ -130,3 +218,17 @@ def test_the_lane_contract_is_wired_end_to_end():
         assert target in transaction, target
     agent_runner = (root / "command_center/agent_runner.py").read_text()
     assert '"GH_CONFIG_DIR": "/nonexistent/aicc-agent-gh"' in agent_runner
+
+
+def test_the_control_ticks_read_the_same_store_for_their_own_quota():
+    """VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS: the ticks run as
+    `aicc-worker`, which is exactly the group the token store is readable
+    by, so the control plane's GitHub identity is this same minted token --
+    no second credential, no second store."""
+    root = Path(__file__).parents[2]
+    gh_access = (root / "command_center/orchestrator/gh_access.py").read_text()
+    assert 'DEFAULT_FLEET_CONFIG_DIR = "/var/lib/aicc/github/gh"' in gh_access
+    for unit in ("review", "merge", "pr-window"):
+        text = (root / f"deploy/systemd/aicc-backlog-{unit}.service").read_text()
+        assert "User=aicc-worker" in text, unit
+        assert "CacheDirectory=aicc-gh" in text, unit

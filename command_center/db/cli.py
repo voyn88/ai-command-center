@@ -314,6 +314,11 @@ def main(argv: list[str] | None = None) -> int:
         window = reconcile_pr_window(args.repo_path)
         if window.error is not None:
             print(f"pr-window tick failed: {window.error}", file=sys.stderr)
+            if window.quota is not None:
+                # The quota line is exactly what tells an operator whether a
+                # failed listing was a rate limit, and under whose identity
+                # -- print it on the way out, not only on the happy path.
+                print(window.quota.line())
             return 1
         for number, head in window.active:
             print(f"ACTIVE    #{number} -> {head}")
@@ -325,6 +330,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
         for number, head in window.unreadable:
             print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
+        if window.quota is not None:
+            print(window.quota.line())
         return 0
 
     try:
@@ -565,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
@@ -574,50 +582,61 @@ def main(argv: list[str] | None = None) -> int:
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
-                # Before selecting anything: a task whose PR exists but was
-                # never recorded is invisible to every gate downstream. This
-                # derives that evidence from the task's own branch, so a pull
-                # request opened outside `publish_run` still reaches review.
-                evidence = reconcile_pr_evidence(
-                    lambda: _nc(conn), args.repo_path, task_id=args.task_id
-                )
-                for evidence_task_id, pr in evidence.recorded:
-                    print(f"PR-FOUND  {evidence_task_id} -> {pr}")
-                for evidence_task_id, reason in evidence.skipped:
-                    print(f"PR-SKIP   {evidence_task_id}: {reason}")
-                report = review_once(
-                    lambda: _nc(conn),
-                    enqueue,
-                    args.repo_path,
-                    task_id=args.task_id,
-                )
-                for task_id, pr in report.reviewed:
-                    print(f"REVIEW    {task_id} -> {pr}")
-                for task_id, reason in report.skipped:
-                    print(f"SKIP      {task_id}: {reason}")
-                retry_report = reconcile_review_once(
-                    lambda: _nc(conn),
-                    enqueue,
-                    args.repo_path,
-                    task_id=args.task_id,
-                )
-                for task_id, retry_key in retry_report.retried:
-                    print(f"RETRY     {task_id} -> {retry_key}")
-                for task_id, reason in retry_report.skipped:
-                    print(f"RETRY-SKIP {task_id}: {reason}")
-                marker_report = publish_review_verdicts(
-                    lambda: _nc(conn), args.repo_path, task_id=args.task_id,
-                    # The same queue writer review_once uses: a REJECT
-                    # enqueues one finding-verification run before it may
-                    # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
-                    enqueue=enqueue,
-                )
-                for task_id, pr in marker_report.reviewed:
-                    print(f"MARKER    {task_id} -> {pr}")
-                for task_id, new_task_id in marker_report.remediated:
-                    print(f"REMEDIATE {task_id} -> {new_task_id}")
-                for task_id, reason in marker_report.skipped:
-                    print(f"SKIP      {task_id}: {reason}")
+                # One quota scope for the WHOLE tick: the four steps below
+                # all call `gh`, so counting them separately would tell an
+                # operator nothing about what the tick as a whole spent --
+                # and the identity is resolved once, here, rather than four
+                # times (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+                with gh_access.tick(args.repo_path) as quota:
+                    # Before selecting anything: a task whose PR exists but
+                    # was never recorded is invisible to every gate
+                    # downstream. This derives that evidence from the task's
+                    # own branch, so a pull request opened outside
+                    # `publish_run` still reaches review.
+                    evidence = reconcile_pr_evidence(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                    )
+                    for evidence_task_id, pr in evidence.recorded:
+                        print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                    for evidence_task_id, reason in evidence.skipped:
+                        print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    report = review_once(
+                        lambda: _nc(conn),
+                        enqueue,
+                        args.repo_path,
+                        task_id=args.task_id,
+                    )
+                    for task_id, pr in report.reviewed:
+                        print(f"REVIEW    {task_id} -> {pr}")
+                    for task_id, reason in report.skipped:
+                        print(f"SKIP      {task_id}: {reason}")
+                    retry_report = reconcile_review_once(
+                        lambda: _nc(conn),
+                        enqueue,
+                        args.repo_path,
+                        task_id=args.task_id,
+                    )
+                    for task_id, retry_key in retry_report.retried:
+                        print(f"RETRY     {task_id} -> {retry_key}")
+                    for task_id, reason in retry_report.skipped:
+                        print(f"RETRY-SKIP {task_id}: {reason}")
+                    marker_report = publish_review_verdicts(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id,
+                        # The same queue writer review_once uses: a REJECT
+                        # enqueues one finding-verification run before it may
+                        # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
+                        enqueue=enqueue,
+                    )
+                    for task_id, pr in marker_report.reviewed:
+                        print(f"MARKER    {task_id} -> {pr}")
+                    for task_id, new_task_id in marker_report.remediated:
+                        print(f"REMEDIATE {task_id} -> {new_task_id}")
+                    for task_id, reason in marker_report.skipped:
+                        print(f"SKIP      {task_id}: {reason}")
+                # Printed AFTER the scope closes: the remaining-budget half
+                # of the line is read on the way out (`gh api rate_limit`,
+                # which does not itself consume quota).
+                print(quota.line())
                 return 0
 
             if args.command == "backlog-merge":
@@ -630,6 +649,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                if report.quota is not None:
+                    print(report.quota.line())
                 return 0
 
             if args.command == "backlog-merge-reconcile":
