@@ -66,13 +66,14 @@ elif "/labels" in path:
     print("[]")
 elif "/pulls?" in path:
     page = int(path.split("page=")[-1])
+    labels = [{"name": name} for name in os.environ.get("FAKE_GH_PR_LABELS", "").split(",") if name]
     body = [] if page > 1 else [{
         "number": 42,
         "html_url": "https://github.com/OWNER_REPO/pull/42",
         "head": {"sha": head},
         "created_at": "2026-09-09T12:00:00Z",
         "user": {"login": "voyn-aicc-fleet[bot]"},
-        "labels": [],
+        "labels": labels,
     }]
     print(json.dumps(body))
 elif "/reviews" in path:
@@ -241,6 +242,32 @@ def test_the_window_tick_works_while_the_human_graphql_quota_is_exhausted(
     assert any(
         call["argv"][:3] == ["api", "--method", "POST"] for call in _calls(fake_gh)
     ), "the label write is REST too, so a spent GraphQL budget cannot block it"
+
+
+def test_queue_active_pr_sheds_stale_blocked_label(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """Backlog hygiene: queue selection is mutually exclusive with a stale
+    `review-window:blocked` label, so the tick normalizes the contradiction
+    instead of leaving downstream review/merge scans to read both."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:blocked")
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(stale_seconds=10**12))
+
+    assert report.error is None
+    assert report.active == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
+        for argv in calls
+    )
+    assert any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:active"
+        for argv in calls
+    )
 
 
 def test_without_the_fleet_store_the_same_tick_reports_the_rate_limit(
