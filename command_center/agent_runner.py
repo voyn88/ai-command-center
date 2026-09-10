@@ -97,7 +97,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from command_center import models, openai_exec, project_config, storage
@@ -176,6 +176,85 @@ _COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
     "getaddrinfo",
     "econnreset",
 )
+
+# Quota-EXHAUSTION signatures, deliberately narrower and more specific than
+# `_COPILOT_RETRYABLE_FAILURE_SIGNATURES` above. That table answers "is this
+# attempt worth retrying against a healthy alternative right now" -- a
+# same-attempt decision, scoped to the one attempt already in flight, where a
+# false positive costs one wasted retry. This table answers a much
+# higher-consequence question: "should the WHOLE executor stop being offered
+# to every OTHER task on this host for a while" (see
+# `record_executor_exhausted`/`EXECUTOR_QUOTA_COOLDOWN_SECONDS` below). A read
+# that licenses that action has to be narrower on every axis the same-attempt
+# check does not need to be -- see `RunResult.executor_quota_signature`'s
+# docstring for the full read-scope reasoning. Claude is deliberately absent
+# here: its quota/session-limit refusal is detected structurally, from the
+# CLI's own `api_error_status` field, never from free text.
+_EXECUTOR_QUOTA_EXHAUSTION_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "copilot": ("exceeded your monthly quota",),
+    "codex": ("usage limit reached",),
+}
+
+# How much of the failed process's OWN stderr `executor_quota_signature`
+# considers, from the end. Bounds how much unrelated earlier output (a long
+# tool trace, a prior warning) could coincidentally contain a match, the same
+# way `worker.handlers._tail` bounds what travels into a stored result.
+_QUOTA_SIGNATURE_TAIL_CHARS = 4000
+
+# How long a worker-local executor-quota circuit stays open once
+# `record_executor_exhausted` opens it. 30 minutes: short enough that a
+# genuinely healthy executor is not withheld for long past the incident, long
+# enough that the next several dispatch cycles do not re-probe (and re-fail
+# against) an account that is almost certainly still exhausted. None of the
+# three CLIs expose a structured reset time, so this is a fixed, conservative
+# estimate, not a promise the quota is actually clear by then -- the next
+# attempt against this executor after the window simply gets to try again.
+EXECUTOR_QUOTA_COOLDOWN_SECONDS = 1800
+
+_executor_exhaustion_lock = threading.Lock()
+# executor -> (exhausted_until ISO 8601, the signature that opened the circuit)
+_executor_exhausted_until: dict[str, tuple[str, str]] = {}
+
+
+def record_executor_exhausted(executor: str, signature: str) -> str:
+    """Open the worker-local quota circuit for `executor`; returns the ISO
+    8601 deadline it now expires at.
+
+    Called only after `RunResult.executor_quota_signature` has positively
+    identified a quota-exhaustion refusal for THIS attempt -- see that
+    method for the deliberately narrow detection surface. `worker.handlers.
+    _executor_preflight` checks `executor_exhausted_until` before selecting
+    `executor` for any later dispatch, cascade candidate or fresh delivery
+    alike, so the circuit opened here is what makes the cascade SKIP an
+    exhausted link -- rather than dispatch to it and burn another attempt
+    finding out it is still exhausted.
+    """
+    deadline = (
+        datetime.now(UTC) + timedelta(seconds=EXECUTOR_QUOTA_COOLDOWN_SECONDS)
+    ).isoformat()
+    with _executor_exhaustion_lock:
+        _executor_exhausted_until[executor] = (deadline, signature)
+    return deadline
+
+
+def executor_exhausted_until(executor: str) -> str | None:
+    """The still-active exhaustion deadline for `executor`, or `None`.
+
+    Self-clearing: once `now()` passes the recorded deadline the entry is
+    dropped rather than left stale, so a healthy executor is never withheld a
+    moment past the cooldown `record_executor_exhausted` opened it for.
+    """
+    with _executor_exhaustion_lock:
+        entry = _executor_exhausted_until.get(executor)
+        if entry is None:
+            return None
+        deadline, _signature = entry
+        if datetime.fromisoformat(deadline) <= datetime.now(UTC):
+            del _executor_exhausted_until[executor]
+            return None
+        return deadline
+
+
 _CODEX_PREFLIGHT_PROMPT = (
     "This is a disposable sandbox capability probe. In the current repository, "
     "create a file named aicc-codex-commit-probe.txt containing exactly "
@@ -1212,6 +1291,60 @@ class RunResult:
             signature in diagnostic
             for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
         )
+
+    def executor_quota_signature(self, executor: str) -> str | None:
+        """The exact quota-EXHAUSTION signal this run matched, if any -- what
+        `worker.handlers` calls `record_executor_exhausted` with to open a
+        worker-wide, time-bound circuit for `executor`.
+
+        Deliberately narrower than `is_executor_provider_error` above, which
+        licenses only a same-attempt failover: a false positive there costs
+        one wasted retry against the one attempt already in flight. Opening
+        the exhaustion circuit is a much larger-blast-radius action -- it
+        silently withholds the WHOLE executor from every OTHER task on this
+        host for `EXECUTOR_QUOTA_COOLDOWN_SECONDS` -- so the read that
+        licenses it is narrower on every axis the same-attempt check does
+        not need to be:
+
+        - Claude: read from the CLI's own structured `api_error_status`
+          field (already parsed by `_parse_cli_result_payload`), never from
+          free text. `is_executor_api_error` already proves the CLI
+          positively reported an API-level failure rather than a completed
+          task whose own report merely discusses one (see that property's
+          docstring); gating further on `api_error_status == 429` -- the
+          status the Claude CLI uses for both a rate limit and a
+          session/quota limit -- is a second, independent, structured
+          signal, never a substring match over model output.
+        - Copilot/Codex: neither CLI emits a structured error payload, so
+          the read falls back to text -- but only the CLI's OWN diagnostic
+          channel (`stderr`, never `stdout`, which carries model-generated
+          content that a genuine task attempt can legitimately quote or
+          discuss -- this module's own quota-scenario test fixtures print
+          their quota refusal to stderr for exactly this reason), only the
+          last `_QUOTA_SIGNATURE_TAIL_CHARS` of it, and only against
+          `_EXECUTOR_QUOTA_EXHAUSTION_SIGNATURES`' narrow,
+          exhaustion-specific phrases -- disjoint from the broader
+          `_COPILOT_RETRYABLE_FAILURE_SIGNATURES` the same-attempt check
+          above already uses.
+
+        `None` whenever `status != "failed"` or `exit_code` is falsy, exactly
+        like `is_executor_provider_error`: a successful run cannot be a quota
+        refusal regardless of what its output contains.
+        """
+        if self.status != "failed" or not self.exit_code:
+            return None
+        if executor == "claude":
+            if self.is_executor_api_error and self.api_error_status == 429:
+                return "api_error_status:429"
+            return None
+        signatures = _EXECUTOR_QUOTA_EXHAUSTION_SIGNATURES.get(executor)
+        if not signatures:
+            return None
+        diagnostic = self.stderr[-_QUOTA_SIGNATURE_TAIL_CHARS:].lower()
+        for signature in signatures:
+            if signature in diagnostic:
+                return signature
+        return None
 
     @property
     def is_executor_sandbox_error(self) -> bool:

@@ -59,6 +59,20 @@ def clear_provider_probe_cache():
 
 
 @pytest.fixture(autouse=True)
+def clear_executor_quota_circuit(monkeypatch):
+    """`agent_runner.record_executor_exhausted` opens a worker-local,
+    time-bound circuit in a module-level dict so it survives across tasks
+    dispatched by the same worker process — exactly the persistence that
+    makes it useful in production, and exactly what would leak a quota
+    circuit opened by one test's fake CLI failure into an unrelated later
+    test's "claude/copilot/codex is available" assumption within the same
+    pytest process. Reset (not merely cleared once) around every test."""
+    from command_center import agent_runner
+
+    monkeypatch.setattr(agent_runner, "_executor_exhausted_until", {})
+
+
+@pytest.fixture(autouse=True)
 def _immediate_reconcile(monkeypatch):
     """reconcile()'s cross-process debounce (audit P0) waits a grace window before
     terminalizing a run that only *looks* gone. Tests want deterministic,

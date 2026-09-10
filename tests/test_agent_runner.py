@@ -1,3 +1,4 @@
+import json
 import os
 import signal
 import subprocess
@@ -802,6 +803,152 @@ def test_runtime_bwrap_failure_opens_codex_workspace_write_circuit(monkeypatch):
     assert ok is False
     assert "sandbox unavailable" in reason
     assert "loopback" in reason
+
+
+# --------------------------------------------------------------------------
+# Executor quota-exhaustion signature recognition
+# (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING-REM) -- the narrow, per-executor
+# read that licenses `record_executor_exhausted`'s worker-wide, time-bound
+# circuit. Deliberately exercised separately from `is_executor_provider_error`
+# above: that check licenses only a same-attempt failover, this one licenses
+# withholding the whole executor from every OTHER task on the host, so its
+# detection surface must be proven narrower on every axis.
+# --------------------------------------------------------------------------
+
+
+def _run(
+    *,
+    status: str = "failed",
+    exit_code: int | None = 1,
+    stdout: str = "",
+    stderr: str = "",
+) -> agent_runner.RunResult:
+    return agent_runner.RunResult(
+        status=status,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=0.1,
+        started_at="2026-09-08T00:00:00+00:00",
+        completed_at="2026-09-08T00:00:01+00:00",
+    )
+
+
+def test_copilot_quota_signature_is_recognized_from_stderr():
+    run = _run(stderr="exceeded your monthly quota")
+    assert run.executor_quota_signature("copilot") == "exceeded your monthly quota"
+
+
+def test_codex_quota_signature_is_recognized_from_stderr():
+    run = _run(stderr="usage limit reached; check your quota")
+    assert run.executor_quota_signature("codex") == "usage limit reached"
+
+
+def test_claude_quota_signature_is_read_from_structured_api_error_status():
+    payload = json.dumps(
+        {
+            "is_error": True,
+            "api_error_status": 429,
+            "terminal_reason": "api_error",
+            "result": "You've hit your session limit · resets 4:10pm (UTC)",
+        }
+    )
+    run = _run(stdout=payload)
+    assert run.executor_quota_signature("claude") == "api_error_status:429"
+
+
+def test_claude_non_quota_api_error_is_not_a_quota_signature():
+    """A structured API failure that is NOT a 429 (an overload, a 500) is a
+    same-attempt provider error (`is_executor_provider_error`), never a
+    quota-exhaustion signal -- it must not open the cross-task circuit."""
+    payload = json.dumps(
+        {"is_error": True, "api_error_status": 529, "terminal_reason": "api_error"}
+    )
+    run = _run(stdout=payload)
+    assert run.is_executor_api_error is True
+    assert run.executor_quota_signature("claude") is None
+
+
+def test_quota_signature_never_reads_stdout_for_copilot_or_codex():
+    """The defect an adversarial review rejected this feature over: matching
+    quota phrases anywhere in stdout+stderr let a task attempt's own
+    (legitimate) output echo the phrase -- e.g. quoting this very test
+    fixture, or a diff/docstring that happens to contain the words -- and
+    misclassify a genuine task failure as a quota refusal, opening a
+    30-minute circuit for no real quota event. Only the CLI's own stderr
+    channel is read; stdout is never considered, no matter what it contains."""
+    for executor, phrase in (
+        ("copilot", "exceeded your monthly quota"),
+        ("codex", "usage limit reached"),
+    ):
+        run = _run(stdout=phrase, stderr="")
+        assert run.executor_quota_signature(executor) is None
+
+
+def test_quota_signature_stdout_echo_in_a_successful_run_is_not_a_refusal():
+    """A COMPLETED run that merely discusses a quota phrase in its own result
+    (the realistic shape of the false positive: an agent quoting/echoing
+    this feature's own vocabulary) must never be classified as a quota
+    exhaustion -- status alone already gates this, but pinned explicitly."""
+    run = _run(
+        status="completed",
+        exit_code=0,
+        stdout="Investigated: the earlier failure said 'exceeded your monthly quota'.",
+    )
+    assert run.executor_quota_signature("copilot") is None
+
+
+def test_quota_signature_is_bounded_to_the_tail_of_stderr():
+    """A quota phrase far outside the bounded tail (buried under unrelated
+    earlier diagnostic noise) must not match -- the same read-scope
+    narrowing `worker.handlers._tail` already applies to what travels into
+    a stored result, applied here to what can trigger the circuit."""
+    padding = "x" * (agent_runner._QUOTA_SIGNATURE_TAIL_CHARS + 100)
+    run = _run(stderr=f"exceeded your monthly quota\n{padding}")
+    assert run.executor_quota_signature("copilot") is None
+    # Sanity check: the same phrase within the tail still matches.
+    run_within_tail = _run(stderr=f"{padding}\nexceeded your monthly quota")
+    assert (
+        run_within_tail.executor_quota_signature("copilot")
+        == "exceeded your monthly quota"
+    )
+
+
+def test_quota_signature_requires_a_failed_nonzero_exit():
+    run = _run(status="completed", exit_code=0, stderr="exceeded your monthly quota")
+    assert run.executor_quota_signature("copilot") is None
+
+
+def test_quota_signature_unrecognized_executor_returns_none():
+    run = _run(stderr="exceeded your monthly quota")
+    assert run.executor_quota_signature("openai_http") is None
+
+
+def test_generic_copilot_retry_signature_is_not_a_quota_exhaustion_signature():
+    """`_COPILOT_RETRYABLE_FAILURE_SIGNATURES` (same-attempt failover only)
+    and `_EXECUTOR_QUOTA_EXHAUSTION_SIGNATURES` (cross-task circuit) are
+    deliberately disjoint: a transient "AI credit usage limit reached" must
+    still fail over within the attempt but must NOT open the worker-wide
+    circuit -- only the more specific monthly-quota refusal does."""
+    run = _run(stderr="AI credit usage limit reached")
+    assert run.is_executor_provider_error("copilot") is True
+    assert run.executor_quota_signature("copilot") is None
+
+
+def test_record_executor_exhausted_opens_a_time_bound_circuit(monkeypatch):
+    monkeypatch.setattr(agent_runner, "_executor_exhausted_until", {})
+    deadline = agent_runner.record_executor_exhausted("copilot", "exceeded your monthly quota")
+    assert agent_runner.executor_exhausted_until("copilot") == deadline
+    assert agent_runner.executor_exhausted_until("claude") is None
+
+
+def test_executor_exhaustion_circuit_self_clears_after_the_cooldown(monkeypatch):
+    monkeypatch.setattr(agent_runner, "_executor_exhausted_until", {})
+    monkeypatch.setattr(agent_runner, "EXECUTOR_QUOTA_COOLDOWN_SECONDS", -1)
+    agent_runner.record_executor_exhausted("codex", "usage limit reached")
+    assert agent_runner.executor_exhausted_until("codex") is None
+    # Self-clearing removes the stale entry rather than leaving it behind.
+    assert "codex" not in agent_runner._executor_exhausted_until
 
 
 def test_claude_cli_preflight_names_the_missing_binary_and_how_to_fix_it():
