@@ -192,6 +192,53 @@ def test_immutable_release_is_staged_and_selected(pair, calls, tmp_path):
     assert "release_selected:" + new in report.steps
 
 
+def test_already_current_checkout_still_selects_missing_immutable_release(
+    pair, calls, tmp_path
+):
+    _origin, clone, current = pair
+    release_root = tmp_path / "opt-aicc"
+    release_root.mkdir()
+    (release_root / "current").symlink_to(clone)
+    runtime_venv = tmp_path / "runtime-venv"
+    runtime_venv.mkdir()
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            migrate=True,
+            release_root=str(release_root),
+            release_venv=str(runtime_venv),
+        ),
+    )
+
+    release = release_root / "releases" / current
+    assert (report.outcome, report.detail) == ("deployed", current)
+    assert release.is_dir()
+    assert (release_root / "current").readlink() == Path(f"releases/{current}")
+    assert calls["smoke_cwd"] == str(release)
+    assert calls["migrate_cwd"] == str(release)
+    assert "checkout_already_current:" + current in report.steps
+    assert "release_selected:" + current in report.steps
+
+
+def test_noop_when_checkout_and_immutable_release_are_current(pair, calls, tmp_path):
+    _origin, clone, current = pair
+    release_root = tmp_path / "opt-aicc"
+    release = release_root / "releases" / current
+    release.mkdir(parents=True)
+    (release_root / "current").symlink_to(f"releases/{current}")
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(tmp_path, migrate=True, release_root=str(release_root)),
+    )
+
+    assert (report.outcome, report.detail) == ("noop", current)
+    assert calls["migrate"] == 0
+    assert "smoke_cwd" not in calls
+
+
 def test_failed_restart_restores_previous_release_selector(pair, calls, tmp_path):
     origin, clone, first = pair
     release_root = tmp_path / "opt-aicc"
@@ -225,6 +272,12 @@ def test_committed_control_unit_deploys_an_immutable_release():
     assert "--release-root /opt/aicc" in service
     assert "--release-venv ${AICC_RUNTIME_VENV}" in service
     assert "--repo-path ${AICC_SOURCE_REPO}" in service
+    assert "Environment=AICC_PREPROD_ROOT=/home/voynadmin/aicc-preprod" in service  # pragma: allowlist secret
+    assert "Environment=AICC_SOURCE_REPO=/home/voynadmin/aicc-preprod/repo" in service  # pragma: allowlist secret
+    assert (
+        "Environment=AICC_RUNTIME_VENV=/home/voynadmin/aicc-preprod/repo/.venv"
+        in service
+    )
     assert "exec /opt/aicc/current/.venv/bin/python" in service
 
 
