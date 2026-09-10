@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -652,6 +653,223 @@ def test_workspace_permission_normalization_preserves_tracked_executable_bit(
         text=True,
     ).stdout
     assert after == before
+
+
+def _walk_fixture(launcher, monkeypatch, tmp_path: Path) -> Path:
+    """A reusable task workspace shaped like one a previous run left behind.
+
+    A uv/pip-built `.venv` (site-packages included, one wheel HARD-LINKED
+    from the cache outside the workspace, exactly as `uv` installs), plus
+    ordinary tracked sources the walk must still normalize.
+    """
+    workspace = tmp_path / "workspace"
+    site = workspace / ".venv" / "lib" / "python3.12" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "vanishing.py").write_text("stale\n", encoding="utf-8")
+    (site / "swapped.py").write_text("stale\n", encoding="utf-8")
+    linked = site / "wheel_hardlinked.py"
+    linked.write_text("from uv cache\n", encoding="utf-8")
+    linked.chmod(0o600)
+    os.link(linked, tmp_path / "uv-cache-copy")
+    source = workspace / "src"
+    source.mkdir()
+    (source / "app.py").write_text("real work\n", encoding="utf-8")
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher, "_tracked_executables", lambda path: frozenset())
+    return workspace
+
+
+def _race_at_open(launcher, monkeypatch, effects: dict[str, object]) -> list[str]:
+    """Fire a concurrent writer's effect between the walk's lstat and its open.
+
+    That is the exact window the live failure hit: `scandir` + `lstat` said
+    the entry was a regular file, and a package manager replaced or removed
+    it before the broker's `open`.
+    """
+    real_open = launcher.os.open
+    fired: list[str] = []
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        effect = effects.get(path) if isinstance(path, str) else None
+        if effect is not None:
+            fired.append(path)
+            effect()
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(launcher.os, "open", racing_open)
+    return fired
+
+
+def test_workspace_walk_survives_writes_under_venv_during_the_walk(
+    launcher, monkeypatch, tmp_path
+):
+    """VOYN-W0-AICC-LAUNCHER-WORKSPACE-WALK-RACES-VENV-WRITES, live
+    2026-09-09: `workspace entry changed while opening:
+    .venv/lib/python3.12/site-packages/...` refused the run outright, spent
+    the whole cascade reproducing itself, and parked a task whose PR was
+    already published. A virtualenv is regenerable and carries no authority,
+    so a write racing the walk must cost that entry its group grant -- never
+    the run."""
+    workspace = _walk_fixture(launcher, monkeypatch, tmp_path)
+    site = workspace / ".venv" / "lib" / "python3.12" / "site-packages"
+    vanishing = site / "vanishing.py"
+    swapped = site / "swapped.py"
+
+    def unlink_it() -> None:
+        vanishing.unlink()
+
+    def swap_it() -> None:
+        # Exactly how an installer replaces a file: write a temporary and
+        # rename it over the name. The new inode is allocated while the old
+        # one still exists, so the identity check has a real change to catch
+        # (unlink-then-create would very often be handed the same inode back).
+        replacement = site / ".swapped.py.tmp"
+        replacement.write_text("reinstalled\n", encoding="utf-8")
+        os.replace(replacement, swapped)
+
+    fired = _race_at_open(
+        launcher,
+        monkeypatch,
+        {"vanishing.py": unlink_it, "swapped.py": swap_it},
+    )
+
+    launcher._prepare_workspace_permissions(workspace)
+
+    assert sorted(fired) == ["swapped.py", "vanishing.py"], "the race never fired"
+    # The run is admitted and the rest of the tree is normalized: the walk
+    # continued past the raced entries instead of aborting at the first one.
+    assert stat.S_IMODE(workspace.stat().st_mode) == 0o2770
+    assert stat.S_IMODE((workspace / "src").stat().st_mode) == 0o2770
+    assert stat.S_IMODE((workspace / "src" / "app.py").stat().st_mode) == 0o660
+    assert stat.S_IMODE(site.stat().st_mode) == 0o2770
+    # Skipping only ever WITHHOLDS the grant -- root never chowns/chmods an
+    # inode whose identity moved, nor one a second link reaches from outside
+    # the workspace (`uv`'s hard-linked wheel).
+    assert stat.S_IMODE(swapped.stat().st_mode) == 0o644
+    assert stat.S_IMODE((site / "wheel_hardlinked.py").stat().st_mode) == 0o600
+    assert not vanishing.exists()
+
+
+def test_workspace_walk_still_fails_closed_on_a_race_outside_the_venv(
+    launcher, monkeypatch, tmp_path
+):
+    """The tolerance is scoped to regenerable subtrees, not to the tree. An
+    entry that moves under the walk anywhere else still refuses the run, so
+    the guarantee this walk exists for -- never widen the mode of an inode
+    whose identity changed -- is untouched."""
+    workspace = _walk_fixture(launcher, monkeypatch, tmp_path)
+    target = workspace / "src" / "app.py"
+    _race_at_open(launcher, monkeypatch, {"app.py": target.unlink})
+
+    assert issubclass(launcher.TransientLaunchRefused, launcher.LaunchRefused)
+    with pytest.raises(
+        launcher.LaunchRefused,
+        match="workspace entry changed while opening: src/app.py",
+    ) as refusal:
+        launcher._prepare_workspace_permissions(workspace)
+    # Still a refusal, but one the worker can tell apart from a permanent
+    # launcher fault: it is contention, so the attempt is refunded rather
+    # than spent (see the classification test below).
+    assert isinstance(refusal.value, launcher.TransientLaunchRefused)
+
+
+def test_workspace_walk_survives_a_venv_entry_deleted_before_its_own_lstat(
+    launcher, monkeypatch, tmp_path
+):
+    """The same race one syscall earlier: `scandir` listed the name and the
+    writer removed it before `DirEntry.stat`. That arm used to escape the
+    walk as a bare `OSError`, reported as an unclassified errno string."""
+    workspace = _walk_fixture(launcher, monkeypatch, tmp_path)
+    site = workspace / ".venv" / "lib" / "python3.12" / "site-packages"
+    doomed = site / "vanishing.py"
+    real_scandir = launcher.os.scandir
+
+    class _Snapshot:
+        def __init__(self, entries):
+            self._entries = entries
+
+        def __enter__(self):
+            return self._entries
+
+        def __exit__(self, *exc_info):
+            return False
+
+    def racing_scandir(fd):
+        with real_scandir(fd) as entries:
+            snapshot = list(entries)
+        if any(entry.name == doomed.name for entry in snapshot):
+            doomed.unlink()
+        return _Snapshot(snapshot)
+
+    monkeypatch.setattr(launcher.os, "scandir", racing_scandir)
+
+    launcher._prepare_workspace_permissions(workspace)
+
+    assert not doomed.exists()
+    assert stat.S_IMODE((workspace / "src" / "app.py").stat().st_mode) == 0o660
+
+
+def test_a_transient_launch_refusal_is_marked_on_the_fixed_failure_envelope(
+    launcher,
+):
+    """The broker and the worker must agree on the marker, and the marker
+    must ride the same envelope the worker already trusts (exit 125, empty
+    stdout, marker-prefixed stderr line) -- never transcript content."""
+    assert launcher.FAILURE == agent_runner._PRINCIPAL_ISOLATION_FAILURE
+    assert (
+        f"{launcher.FAILURE}: {launcher.TRANSIENT_FAILURE_PREFIX}"
+        == agent_runner._PRINCIPAL_ISOLATION_TRANSIENT_PREFIX
+    )
+
+    def _run(response) -> agent_runner.RunResult:
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=int(response["exit_code"]),
+            stdout=base64.b64decode(response["stdout_b64"]).decode(),
+            stderr=base64.b64decode(response["stderr_b64"]).decode(),
+            duration_seconds=0.1,
+            started_at="2026-09-09T20:00:00+00:00",
+            completed_at="2026-09-09T20:00:00+00:00",
+        )
+
+    race = _run(
+        launcher._failure_response(
+            launcher.TransientLaunchRefused(
+                "workspace entry changed while opening: "
+                ".venv/lib/python3.12/site-packages/pkg/__init__.py"
+            )
+        )
+    )
+    assert race.is_principal_isolation_error
+    assert race.is_transient_principal_isolation_error
+
+    # A permanent launcher fault stays attempt-consuming: it has to reach the
+    # dead-letter queue instead of retrying off the lease-wait budget.
+    permanent = _run(
+        launcher._failure_response(
+            launcher.LaunchRefused("aicc-workspace group does not exist")
+        )
+    )
+    assert permanent.is_principal_isolation_error
+    assert not permanent.is_transient_principal_isolation_error
+
+    # An agent cannot forge the marker into a REPORTED outcome: the envelope
+    # is the authority, and a completed run has output and exit 0.
+    quoted = agent_runner.RunResult(
+        status="completed",
+        exit_code=0,
+        stdout=json.dumps({"result": "the diff adds 'transient: ' to the marker"}),
+        stderr=f"{agent_runner._PRINCIPAL_ISOLATION_TRANSIENT_PREFIX}quoted",
+        duration_seconds=0.1,
+        started_at="2026-09-09T20:00:00+00:00",
+        completed_at="2026-09-09T20:00:00+00:00",
+    )
+    assert not quoted.is_principal_isolation_error
+    assert not quoted.is_transient_principal_isolation_error
 
 
 def test_workspace_index_parser_never_executes_malicious_git_fsmonitor(

@@ -150,6 +150,12 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # cascade to the next link rather than respinning forever.
 }
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
+# The broker's sub-marker for a refusal caused by concurrent, self-clearing
+# state rather than by anything about the work -- a workspace write racing its
+# pre-bind walk, a Git index rewritten under its read. Must stay in step with
+# `ops/aicc_agent_launcher.py`'s FAILURE + TRANSIENT_FAILURE_PREFIX; the
+# agreement is pinned by tests/ops/test_agent_principal_isolation.py.
+_PRINCIPAL_ISOLATION_TRANSIENT_PREFIX = f"{_PRINCIPAL_ISOLATION_FAILURE}: transient: "
 
 # Codex 0.149.0 on worker-01 can exit zero after its vendor bwrap fails to
 # create loopback inside the network namespace. This exact, two-part signature
@@ -1238,6 +1244,34 @@ class RunResult:
                 line.startswith(f"{_PRINCIPAL_ISOLATION_FAILURE}:")
                 for line in self.stderr.splitlines()
             )
+        )
+
+    @property
+    def is_transient_principal_isolation_error(self) -> bool:
+        """The launcher's refusal names concurrent state, not this work.
+
+        The broker validates a REUSED task workspace entry by entry before
+        binding it. A writer it does not synchronise with -- a package
+        manager populating `.venv`, a tail process from the previous run --
+        can change an entry between the walk's own two syscalls, and failing
+        closed there is correct. But it is not evidence the task, the payload
+        or the tree is bad: the very next delivery succeeds. Live 2026-09-09,
+        `.venv/lib/python3.12/site-packages/...` refused every remaining
+        cascade attempt of a task whose PR was already published and parked it
+        into DEFER_TO_USER
+        (VOYN-W0-AICC-LAUNCHER-WORKSPACE-WALK-RACES-VENV-WRITES).
+
+        Read off the SAME fixed transport envelope
+        `is_principal_isolation_error` requires (exit 125, empty stdout,
+        marker-prefixed stderr line) -- never off transcript content, for the
+        reason documented there -- with the broker's transient sub-marker on
+        the marker line. The caller (`worker.handlers`) turns it into an
+        attempt REFUND, so an unmarked refusal must stay attempt-consuming:
+        a permanent launcher fault has to reach the dead-letter queue.
+        """
+        return self.is_principal_isolation_error and any(
+            line.startswith(_PRINCIPAL_ISOLATION_TRANSIENT_PREFIX)
+            for line in self.stderr.splitlines()
         )
 
 

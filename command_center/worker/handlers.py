@@ -1142,6 +1142,20 @@ def _run_agent(
             # task as completed and never fall back to direct same-UID
             # execution. A later delivery may land after socket/systemd
             # recovery and safely inspect/reuse the workspace.
+            #
+            # A refusal the broker marked TRANSIENT additionally names no
+            # fault in this work at all: its pre-bind walk lost a race with a
+            # writer it does not synchronise with (a package manager filling
+            # `.venv`, a tail from the previous run), and the next delivery
+            # simply succeeds. Routing it through the ordinary retryable path
+            # spent this item's `max_attempts` on that race -- live
+            # 2026-09-09 it exhausted the cascade of a task whose PR was
+            # already published and parked it into DEFER_TO_USER. So it takes
+            # the same refund-and-bound exit writer-lease contention takes
+            # (`lease_wait` -> `queue_fail_lease_wait`), while an UNMARKED
+            # launcher failure keeps spending the attempt budget: a
+            # permanently broken launcher must still reach the DLQ
+            # (VOYN-W0-AICC-LAUNCHER-WORKSPACE-WALK-RACES-VENV-WRITES).
             return HandlerOutcome(
                 ok=False,
                 reason=(
@@ -1149,6 +1163,7 @@ def _run_agent(
                     f"isolation): {_tail(run.stderr or result_text)}"
                 ),
                 retryable=True,
+                lease_wait=run.is_transient_principal_isolation_error,
             )
         non_mutating_copilot_failure = (
             executor == "copilot"

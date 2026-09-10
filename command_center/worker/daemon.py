@@ -71,6 +71,15 @@ class HandlerOutcome:
     # this delivery and counts the wait against its own bounded budget
     # instead. Meaningless when `ok` is True and implies `retryable` --
     # there is no such thing as a non-retryable lease wait.
+    #
+    # The name is the DB exit it routes to (`lease_wait_count`), and the
+    # class it admits is "wait, do not spend an attempt": the second member
+    # is a launch refused by a concurrent write racing the broker's pre-bind
+    # workspace walk (VOYN-W0-AICC-LAUNCHER-WORKSPACE-WALK-RACES-VENV-WRITES,
+    # `agent_runner.RunResult.is_transient_principal_isolation_error`). Both
+    # are contention with another writer, neither is evidence about the work,
+    # and both stay bounded by the same lease-wait budget so pathological
+    # recurrence still dead-letters instead of retrying forever.
     lease_wait: bool = False
 
 
