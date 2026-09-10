@@ -12,8 +12,8 @@ After=network-online.target
 Type=oneshot
 User=voynadmin
 Environment=AICC_PREPROD_ROOT=/home/voynadmin/aicc-preprod
-Environment=AICC_SOURCE_REPO=/home/voynadmin/aicc-preprod/repo
-Environment=AICC_RUNTIME_VENV=/home/voynadmin/aicc-preprod/repo/.venv
-WorkingDirectory=/opt/aicc/current
+Environment=AICC_SOURCE_REPO=/opt/aicc/source
+Environment=AICC_RUNTIME_VENV=/opt/aicc/runtime-venv
+WorkingDirectory=/opt/aicc/source
 ExecCondition=/usr/bin/test ! -e /run/aicc-staged-rollout.lock
-ExecStart=/bin/bash -lc "set -a && source ${AICC_PREPROD_ROOT}/worker.env && set +a && exec /opt/aicc/current/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --restart voyn-aicc-worker@1.service --restart voyn-aicc-worker@2.service --restart voyn-aicc-worker@3.service --restart voyn-aicc-worker@4.service"
+ExecStart=/bin/bash -lc "set -a && source ${AICC_PREPROD_ROOT}/worker.env && set +a && exec ${AICC_SOURCE_REPO}/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --restart voyn-aicc-worker@1.service --restart voyn-aicc-worker@2.service --restart voyn-aicc-worker@3.service --restart voyn-aicc-worker@4.service"
