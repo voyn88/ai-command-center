@@ -686,6 +686,47 @@ def test_fleet_readiness_wait_does_not_scale_its_overrun_with_lane_count(
     assert clock[0] - start <= usable + call_cost
 
 
+def test_fleet_readiness_diagnostic_drops_recovered_probe_error(
+    tmp_path: Path,
+) -> None:
+    """The timeout must describe the last observation, not a transient helper
+    error that a later successful (but not-ready) state probe superseded."""
+
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    controller.config = replace(
+        controller.config,
+        worker_units=(LANE_1,),
+        prerequisite_timeout=2.0,
+        poll_initial=1.0,
+        poll_max=1.0,
+    )
+    clock = [0.0]
+    attempts = [0]
+
+    def state(unit: str) -> UnitState:
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise RotationError("transient helper failure")
+        return UnitState("activating", "start", "starting", 100)
+
+    systemd.state = state  # type: ignore[method-assign]
+    controller.monotonic = lambda: clock[0]
+    controller.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    controller._controller_deadline = 100.0
+    controller._set_credential_deadline(
+        authority.current_expires_at,
+        SELF_CREDENTIAL_TTL_SECONDS,
+        "test credential",
+    )
+
+    with pytest.raises(RotationError) as raised:
+        controller._wait_workers_healthy()
+
+    assert attempts[0] == 2
+    assert str(raised.value) == f"worker readiness failed: {LANE_1}: not ready"
+
+
 def test_retry_lifetime_covers_every_failed_attempt_and_all_delays(
     tmp_path: Path,
 ) -> None:

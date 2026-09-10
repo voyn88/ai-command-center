@@ -1132,9 +1132,15 @@ class RotationController:
                 if self.monotonic() >= deadline:
                     break
                 try:
-                    if self._healthy(self.systemd.state(unit)):
+                    state = self.systemd.state(unit)
+                    # A successful probe supersedes an older transport/helper
+                    # error even when the unit is not ready yet. Retaining the
+                    # stale exception would make the final diagnostic describe
+                    # an already-recovered failure instead of the last observed
+                    # (reachable but unhealthy) state.
+                    last_errors.pop(unit, None)
+                    if self._healthy(state):
                         pending.remove(unit)
-                        last_errors.pop(unit, None)
                 except Exception as error:  # noqa: BLE001 - final diagnosis below
                     last_errors[unit] = str(error)
             if pending:
