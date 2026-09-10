@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
+from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
@@ -168,6 +169,21 @@ _PERMANENT_CLONE_FAILURES = (
 )
 
 
+def _refresh_read_only_source(
+    repository: Path, *, pr_number: str | None = None
+) -> tuple[bool, str | None]:
+    """Bring the bound source clone current before a read-only checkout uses it.
+
+    The isolated reviewer clones from this source, not from GitHub.  A stale
+    source therefore means every review runs against yesterday's tree until an
+    operator manually fetches it.  The source is read-only to agents, but the
+    worker owns the clone and may update it before handing a detached copy to
+    the privileged launcher.
+    """
+    result = refresh_source_clone(repository, pr_number=pr_number)
+    return result.ok, result.error
+
+
 def _read_only_isolated_checkout(
     repository: Path, pin_sha: str | None = None
 ) -> tuple[Path | None, str | None, bool]:
@@ -191,7 +207,8 @@ def _read_only_isolated_checkout(
 
     Order: rev-parse the source HEAD first, clone ``--no-checkout`` (the
     upload-pack child needs the lane's system gitconfig for the source's
-    safe.directory trust), ``checkout --detach <sha>`` -- so a source that
+    safe.directory trust), fetch source-held PR refs into the throwaway clone
+    when a pin needs them, ``checkout --detach <sha>`` -- so a source that
     moves mid-clone or sits on a detached HEAD cannot produce a spurious
     mismatch -- then drop ``origin``: it named the hidden /home path, and a
     ``git fetch`` the agent attempted would have resurrected the very ENOENT
@@ -214,15 +231,31 @@ def _read_only_isolated_checkout(
     except (OSError, agent_runner.RunnerError) as exc:
         return None, f"isolated workspace root is unavailable: {exc}", False
     if not repository.is_dir():
-        return None, f"read-only isolated checkout source is absent: {repository}", False
+        return (
+            None,
+            f"read-only isolated checkout source is absent: {repository}",
+            False,
+        )
     source_head = agent_runner._run_git(["rev-parse", "HEAD"], repository)
-    if source_head is None or source_head.returncode != 0 or not source_head.stdout.strip():
-        detail = source_head.stderr.strip() if source_head is not None else "git unavailable"
+    if (
+        source_head is None
+        or source_head.returncode != 0
+        or not source_head.stdout.strip()
+    ):
+        detail = (
+            source_head.stderr.strip() if source_head is not None else "git unavailable"
+        )
         permanent = any(marker in detail for marker in _PERMANENT_CLONE_FAILURES)
-        return None, f"read-only isolated checkout source is unreadable: {detail[-300:]}", not permanent
+        return (
+            None,
+            f"read-only isolated checkout source is unreadable: {detail[-300:]}",
+            not permanent,
+        )
     sha = source_head.stdout.strip()
     if pin_sha is not None:
-        present = agent_runner._run_git(["cat-file", "-e", f"{pin_sha}^{{commit}}"], repository)
+        present = agent_runner._run_git(
+            ["cat-file", "-e", f"{pin_sha}^{{commit}}"], repository
+        )
         if present is None or present.returncode != 0:
             return (
                 None,
@@ -232,10 +265,36 @@ def _read_only_isolated_checkout(
             )
         sha = pin_sha
     target = root / f"ro-{repository.name}-{uuid.uuid4().hex[:12]}"
-    steps = (
-        (["clone", "--no-local", "--no-checkout", "--quiet", str(repository), str(target)], root),
-        (["checkout", "--quiet", "--detach", sha], target),
-        (["remote", "remove", "origin"], target),
+    steps = [
+        (
+            [
+                "clone",
+                "--no-local",
+                "--no-checkout",
+                "--quiet",
+                str(repository),
+                str(target),
+            ],
+            root,
+        ),
+    ]
+    if pin_sha is not None:
+        steps.append(
+            (
+                [
+                    "fetch",
+                    "--quiet",
+                    "origin",
+                    "+refs/remotes/origin/pr/*:refs/remotes/source-pr/*",
+                ],
+                target,
+            )
+        )
+    steps.extend(
+        [
+            (["checkout", "--quiet", "--detach", sha], target),
+            (["remote", "remove", "origin"], target),
+        ]
     )
     for argv, cwd in steps:
         result = agent_runner._run_git(argv, cwd, timeout=600)
@@ -392,9 +451,9 @@ def _cascade_link(request, attempt_no: int) -> dict[str, Any] | None:
 
 def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> bool:
     """A route switch may change providers, never the workspace safety model."""
-    return (
-        current_task_type in agent_runner.MUTATING_TASK_TYPES
-    ) == (candidate_task_type in agent_runner.MUTATING_TASK_TYPES)
+    return (current_task_type in agent_runner.MUTATING_TASK_TYPES) == (
+        candidate_task_type in agent_runner.MUTATING_TASK_TYPES
+    )
 
 
 def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
@@ -585,13 +644,22 @@ def _run_agent(
                 # clone a plain read-only run gets, detached at the exact PR
                 # head instead of the source HEAD: a `git worktree add` would
                 # write into the read-only bound clone and a fetch has no
-                # credential (VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-
-                # WORKSPACE-REM-REM).
+                # credential.  The worker refreshes the bound source first,
+                # while it still has the deployment-managed Git authority.
+                ok, failure = _refresh_read_only_source(
+                    repository, pr_number=request.review_head_pr_number
+                )
+                if not ok:
+                    return HandlerOutcome(
+                        ok=False, reason=failure or "?", retryable=True
+                    )
                 checkout, failure, retryable = _read_only_isolated_checkout(
                     repository, pin_sha=request.review_head_sha
                 )
                 if checkout is None:
-                    return HandlerOutcome(ok=False, reason=failure or "?", retryable=retryable)
+                    return HandlerOutcome(
+                        ok=False, reason=failure or "?", retryable=retryable
+                    )
                 stack.callback(_remove_read_only_isolated_checkout, checkout)
                 run_repository = checkout
             else:
@@ -615,9 +683,14 @@ def _run_agent(
             # read-only run under isolation gets its own detached clone
             # inside the principal root -- see the helper for why the
             # shared clone cannot be handed to the launcher.
+            ok, failure = _refresh_read_only_source(repository)
+            if not ok:
+                return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
             checkout, failure, retryable = _read_only_isolated_checkout(repository)
             if checkout is None:
-                return HandlerOutcome(ok=False, reason=failure or "?", retryable=retryable)
+                return HandlerOutcome(
+                    ok=False, reason=failure or "?", retryable=retryable
+                )
             stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
@@ -821,17 +894,19 @@ def _run_agent(
                     and not safe_to_fail_over
                     and isolated_workspace is not None
                 ):
-                    safe_to_fail_over = workspace_provisioning.task_workspace_is_unchanged(
-                        run_repository,
-                        expected_branch=evidence.expected_branch,
-                        remote_url=evidence.remote_url,
-                        start_sha=evidence.start_sha,
-                        trusted_base_sha=evidence.base_sha,
-                        expected_remote_sha=evidence.remote_task_sha,
-                        expected_inode=(
-                            evidence.workspace_device,
-                            evidence.workspace_inode,
-                        ),
+                    safe_to_fail_over = (
+                        workspace_provisioning.task_workspace_is_unchanged(
+                            run_repository,
+                            expected_branch=evidence.expected_branch,
+                            remote_url=evidence.remote_url,
+                            start_sha=evidence.start_sha,
+                            trusted_base_sha=evidence.base_sha,
+                            expected_remote_sha=evidence.remote_task_sha,
+                            expected_inode=(
+                                evidence.workspace_device,
+                                evidence.workspace_inode,
+                            ),
+                        )
                     )
                 fallback_selected = False
                 if (
@@ -1180,13 +1255,15 @@ def _run_agent(
                 # The checkpoint helper reads HEAD without invoking Git against
                 # agent-owned metadata.  Read it once more immediately before
                 # validation so a late writer cannot substitute the candidate.
-                observed_candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
-                    run_repository,
-                    expected_branch=evidence.expected_branch,
-                    expected_inode=(
-                        evidence.workspace_device,
-                        evidence.workspace_inode,
-                    ),
+                observed_candidate_sha = (
+                    workspace_provisioning.task_workspace_candidate_sha(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                    )
                 )
                 if observed_candidate_sha != candidate_sha:
                     raise workspace_provisioning.WorkspaceVerificationError(

@@ -600,6 +600,7 @@ systemctl daemon-reload
 # asserts an agent/publisher separation a control host has no parties for.
 if [ "$install_profile" = "worker" ]; then
   systemctl enable --now aicc-agent-launcher.socket
+  systemctl enable --now voyn-aicc-source-clone-refresh.timer
 fi
 
 # The orchestrator discovers configured plus already-instantiated lanes, then

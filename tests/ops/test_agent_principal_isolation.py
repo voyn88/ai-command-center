@@ -1089,7 +1089,12 @@ def test_deployment_definitions_pin_separate_non_login_identity(monkeypatch):
     assert "TimeoutStartSec=195s" in worker_template
     assert "RuntimeDirectory=aicc-worker-lanes/%i" in worker_template
     assert "PGPASSFILE=/run/aicc-worker-lanes/%i/pgpass" in worker_template
-    assert "/run/aicc-worker-lanes/%i/pgpass" in worker_template.split("ExecStartPre=")[1]
+    start_pre = worker_template.split("ExecStartPre=")[1]
+    assert start_pre.startswith("+/bin/sh -c ")
+    assert "${CREDENTIALS_DIRECTORY:-}/voyn_lease_pgpass" in start_pre
+    assert "/etc/voyn/secrets/voyn_lease_pgpass" in start_pre
+    assert "-o aicc-worker -g aicc-worker -m 0600" in start_pre
+    assert "/run/aicc-worker-lanes/%i/pgpass" in start_pre
     # The legacy lane (User=voynadmin) owns /run/voyn-aicc-worker 0750 while the
     # staged rollout still runs it next to the first isolated lane; nesting the
     # isolated lane's runtime directory under that root killed it at

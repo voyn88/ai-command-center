@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+_PROMETHEUS_ERRORS = (OSError, ValueError, http.client.HTTPException)
+
 
 @dataclass(frozen=True, slots=True)
 class QueueSnapshot:
@@ -64,6 +66,24 @@ class PrWindowSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceCloneSnapshot:
+    """Whether the source clone used by isolated reviews tracks origin.
+
+    Read-only review lanes clone from the local bound source, so a local clone
+    that stopped advancing is a silent review-quality outage even when workers
+    and queues look healthy.  This probe compares the local checkout's HEAD to
+    the remote default HEAD without updating refs, so it is safe for the
+    fail-closed monitor's read-only systemd envelope.
+    """
+
+    path: str
+    local_head: str | None
+    remote_head: str | None
+    stale: bool
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class MonitorReport:
     ok: bool
     active_workers: int
@@ -72,6 +92,7 @@ class MonitorReport:
     prometheus_ready: bool
     failures: tuple[str, ...]
     pr_window: PrWindowSnapshot | None = None
+    source_clone: SourceCloneSnapshot | None = None
 
 
 def parse_worker_units(output: str) -> dict[str, str]:
@@ -289,7 +310,9 @@ def _open_prs(repo_path: str, scan_limit: int) -> list[dict[str, Any]]:
         timeout=60,
     )
     if completed.returncode != 0:
-        raise RuntimeError(f"gh pr list failed: {(completed.stderr or '').strip()[:120]}")
+        raise RuntimeError(
+            f"gh pr list failed: {(completed.stderr or '').strip()[:120]}"
+        )
     listed = json.loads(completed.stdout or "[]")
     if not isinstance(listed, list):
         raise RuntimeError("gh pr list returned no array")
@@ -338,7 +361,9 @@ def read_pr_window_snapshot(
             error=f"{type(exc).__name__}: {exc}"[:200],
         )
     listed = [pr for pr in prs if isinstance(pr, dict)]
-    fleet = [pr for pr in listed if (pr_identity(pr.get("url") or "") or "") in evidence]
+    fleet = [
+        pr for pr in listed if (pr_identity(pr.get("url") or "") or "") in evidence
+    ]
     return PrWindowSnapshot(
         unlabelled=unlabelled_evidence_prs(
             listed,
@@ -351,6 +376,47 @@ def read_pr_window_snapshot(
         evidence_prs=len(fleet),
         grace_seconds=grace_seconds,
     )
+
+
+def _git_stdout(repo_path: str, args: list[str], *, timeout: int = 30) -> str:
+    completed = subprocess.run(
+        ["git", "-C", repo_path, *args],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            (completed.stderr or completed.stdout or "git failed").strip()[:160]
+        )
+    return completed.stdout.strip()
+
+
+def read_source_clone_snapshot(repo_path: str) -> SourceCloneSnapshot:
+    """Measure source-clone freshness, never raising."""
+    try:
+        local_head = _git_stdout(repo_path, ["rev-parse", "HEAD"])
+        remote_output = _git_stdout(
+            repo_path, ["ls-remote", "origin", "HEAD"], timeout=60
+        )
+        remote_head = remote_output.split(None, 1)[0] if remote_output else ""
+        if not remote_head:
+            raise RuntimeError("origin HEAD was empty")
+        return SourceCloneSnapshot(
+            path=repo_path,
+            local_head=local_head,
+            remote_head=remote_head,
+            stale=local_head != remote_head,
+        )
+    except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
+        return SourceCloneSnapshot(
+            path=repo_path,
+            local_head=None,
+            remote_head=None,
+            stale=True,
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
 
 
 def prometheus_is_ready(url: str) -> bool:
@@ -377,7 +443,7 @@ def prometheus_is_ready(url: str) -> bool:
         response = connection.getresponse()
         body = response.read(256).decode("utf-8", errors="replace")
         return response.status == 200 and "ready" in body.lower()
-    except (OSError, ValueError, http.client.HTTPException):
+    except _PROMETHEUS_ERRORS:
         return False
     finally:
         if connection is not None:
@@ -393,6 +459,7 @@ def evaluate(
     prometheus_ready: bool,
     max_recent_dead: int = 0,
     pr_window: PrWindowSnapshot | None = None,
+    source_clone: SourceCloneSnapshot | None = None,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
     failures: list[str] = []
@@ -412,9 +479,7 @@ def evaluate(
         if queue.ready + queue.claimed > 0 and pending_is_stale:
             failures.append("queue_stalled")
         if queue.recent_dead > max_recent_dead:
-            failures.append(
-                f"dead_letter_growth:{queue.recent_dead}>{max_recent_dead}"
-            )
+            failures.append(f"dead_letter_growth:{queue.recent_dead}>{max_recent_dead}")
         # Executor quota/spend/rate refusals are a capacity fact the fleet
         # cannot retry through; surface them as their own class so routing
         # (quota-aware cascade) and budgets get a task, not a guess.
@@ -446,6 +511,14 @@ def evaluate(
                 f"_oldest_{oldest}s>{int(pr_window.grace_seconds)}s:{numbers}"
             )
 
+    if source_clone is not None:
+        if source_clone.error is not None:
+            failures.append(f"source_clone_probe_failed:{source_clone.error}")
+        elif source_clone.stale:
+            local = (source_clone.local_head or "unknown")[:12]
+            remote = (source_clone.remote_head or "unknown")[:12]
+            failures.append(f"source_clone_stale:{local}!={remote}")
+
     return MonitorReport(
         ok=not failures,
         active_workers=active_workers,
@@ -454,6 +527,7 @@ def evaluate(
         prometheus_ready=prometheus_ready,
         failures=tuple(failures),
         pr_window=pr_window,
+        source_clone=source_clone,
     )
 
 
@@ -507,6 +581,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Open PRs the single `gh pr list` asks for, oldest-created first.",
     )
     parser.add_argument(
+        "--source-clone-repo",
+        default=os.environ.get("AICC_SOURCE_CLONE_REPO", ""),
+        metavar="PATH",
+        help=(
+            "Local source clone used by isolated read-only reviews. When set, "
+            "the monitor compares its HEAD to origin/HEAD via git ls-remote "
+            "and fails if the clone is stale or cannot be measured."
+        ),
+    )
+    parser.add_argument(
         "--record-findings",
         metavar="SOURCE",
         default="",
@@ -525,7 +609,9 @@ def finding_key(failure: str) -> str:
     return failure.split(":", 1)[0].strip()[:200] or failure[:200]
 
 
-def record_findings(source: str, failures: tuple[str, ...], detail: dict[str, Any]) -> None:
+def record_findings(
+    source: str, failures: tuple[str, ...], detail: dict[str, Any]
+) -> None:
     """Write the measurement to the database through the SECURITY DEFINER
     functions of migration 0021 (granted to aicc_app and aicc_worker). A red
     monitor becomes a task the fleet fixes; a healthy one clears its rows.
@@ -581,6 +667,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.pr_window_repo
             else None
         )
+        source_clone = (
+            read_source_clone_snapshot(args.source_clone_repo)
+            if args.source_clone_repo
+            else None
+        )
         report = evaluate(
             workers,
             queue,
@@ -589,6 +680,7 @@ def main(argv: list[str] | None = None) -> int:
             prometheus_ready=metrics_ready,
             max_recent_dead=args.max_recent_dead,
             pr_window=pr_window,
+            source_clone=source_clone,
         )
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))

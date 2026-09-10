@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the AICC source clone for isolated read-only reviews
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+Persistent=true
+Unit=voyn-aicc-source-clone-refresh.service
+
+[Install]
+WantedBy=timers.target
