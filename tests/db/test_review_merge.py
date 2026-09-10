@@ -3393,7 +3393,7 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
 
 
 def _win_pr(number, created, head, *, author="alice", labels=(), reviews=(),
-            checks=(), commits=None, url=None):
+            checks=(), commits=None, merge_state="CLEAN", url=None):
     return {
         "number": number,
         "url": url or f"https://github.com/x/repo-w/pull/{number}",
@@ -3404,6 +3404,7 @@ def _win_pr(number, created, head, *, author="alice", labels=(), reviews=(),
         ],
         "reviews": list(reviews),
         "statusCheckRollup": list(checks),
+        "mergeStateStatus": merge_state,
         "author": {"login": author},
         "labels": [{"name": name} for name in labels],
     }
@@ -3554,6 +3555,22 @@ class _RestGitHub:
             chunk = [self._listed(pr) for pr in self.prs[start:start + per_page]]
             return sp.CompletedProcess(argv, 0, json.dumps(chunk), "")
 
+        if "/pulls/" in path and "/reviews" not in path:
+            number = int(path.split("/pulls/")[1].split("?")[0])
+            detail = self._details_for(number)
+            return sp.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    {
+                        "mergeable_state": str(
+                            detail.get("mergeStateStatus") or "CLEAN"
+                        ).lower()
+                    }
+                ),
+                "",
+            )
+
         if "/reviews" in path:
             if self.detail_rc:
                 return sp.CompletedProcess(argv, self.detail_rc, "", "HTTP 502")
@@ -3654,6 +3671,29 @@ def test_oldest_eligible_prs_fill_the_window_first(monkeypatch):
         "/issues/1/labels" in call[-1] or "/issues/1/labels" in " ".join(call)
         for call in edits
     )
+
+
+def test_conflicted_active_pr_does_not_hold_the_window(monkeypatch):
+    conflicted = _win_pr(
+        1,
+        "2026-01-01T00:00:00Z",
+        "a" * 40,
+        labels=("review-window:active",),
+        merge_state="DIRTY",
+    )
+    clean = _win_pr(2, "2026-01-02T00:00:00Z", "b" * 40)
+    fake = _fake_pr_window_gh([conflicted, clean])
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert report.blocked == [(1, "merge_conflict")]
+    assert report.active == [(2, "b" * 40)]
+    assert ("1", "remove", "review-window:active") in fake.labels
+    assert ("1", "add", "review-window:blocked") in fake.labels
+    assert ("2", "add", "review-window:active") in fake.labels
 
 
 def test_reject_marker_from_the_pr_author_does_not_block(monkeypatch):

@@ -83,6 +83,8 @@ elif "/reviews" in path:
         "body": "ACCEPTANCE: ACCEPT " + head,
         "user": {"login": "voyn88-acceptance-gate[bot]"},
     }]))
+elif path.endswith("/pulls/42"):
+    print(json.dumps({"mergeable_state": "clean"}))
 elif "/check-runs" in path:
     page = int(path.split("page=")[-1])
     print(json.dumps({"check_runs": [] if page > 1 else [{
