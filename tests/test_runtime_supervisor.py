@@ -1736,6 +1736,148 @@ def test_concurrent_start_raw_against_same_workspace_exactly_one_wins(git_repo, 
 
 
 # --------------------------------------------------------------------------
+# Self-heal: a workspace/task lock conflict raised by `db.create_run` is not
+# always a genuinely live peer — it may be a stale row a crashed Supervisor
+# left behind. `start_raw` polls `reconcile()` to tell the two apart instead
+# of failing immediately.
+# --------------------------------------------------------------------------
+
+
+def _make_stale_prepared_row(db_path, *, project, repository_path):
+    """A `PREPARED` row with no `pid` recorded — exactly what a Supervisor
+    process crashing between `create_run` and `Popen` leaves behind (see
+    `reconcile()`'s docstring). Bypasses `enforce_workspace_lock` (default
+    `False`) since this is direct setup, not a real concurrent launch.
+
+    Carries a finalization owner identity that is provably dead (an
+    unreachable pid), matching `test_runtime_reconciliation.py`'s
+    `_make_running_row` fixture pattern — `reconcile()` only ever
+    terminalizes a row past the grace window through
+    `_acquire_recovery_finalization_claim`, which fails closed for a
+    pre-v25 row with no fenced owner at all."""
+    task = db.create_task(db_path, project=project, title="t", task_type="implementation")
+    session = db.create_session(db_path, task_id=task["id"], project=project, repository_path=repository_path)
+    return db.create_run(
+        db_path, session_id=session["id"], task_id=task["id"], project=project, task_type="implementation",
+        repository_path=repository_path, prompt="p", is_resume=False,
+        finalization_owner_token="dead-supervisor",
+        finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
+    )
+
+
+def test_start_raw_self_heals_a_stale_workspace_lock_left_by_a_crashed_peer(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """Regression test for the PR #471 review finding: `reconcile()`'s
+    cross-process debounce (`_reconcile_absence_grace`) only terminalizes a
+    stale row once its absence has persisted across *two* reconcile passes
+    spaced at least the grace window apart in real wall-clock time — a
+    single reconcile-and-immediate-retry can never observe that in
+    production. `start_raw` must poll (bounded), not just retry once."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    sup._reconcile_absence_grace = 0.3
+    monkeypatch.setattr(supervisor, "_SELF_HEAL_GRACE_MARGIN_SECONDS", 0.3)
+    monkeypatch.setattr(supervisor, "_SELF_HEAL_POLL_INTERVAL_SECONDS", 0.05)
+
+    stale = _make_stale_prepared_row(sup.db_path, project="AIOS", repository_path=str(git_repo))
+
+    started_at = time.monotonic()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p2", confirmed=True,
+    )
+    elapsed = time.monotonic() - started_at
+    try:
+        assert run["state"] == "RUNNING"
+        # A single immediate retry after one reconcile() call could not have
+        # succeeded here — the debounce requires the absence to persist past
+        # the grace window, so genuine self-healing must take at least that
+        # long (with slack for scheduling jitter).
+        assert elapsed >= 0.2
+        assert db.get_run(sup.db_path, stale["id"])["state"] == "INTERRUPTED"
+    finally:
+        sup.cancel(run["id"], confirmed=True, grace_seconds=2)
+
+
+def test_start_raw_self_heal_fails_fast_against_a_new_live_conflict(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """Regression test for the PR #756 review finding: the self-heal
+    candidacy check must be recomputed from the *current* conflicting run on
+    every retry iteration, not cached from the first one. Simulates a stale
+    row that `reconcile()` clears mid-poll while a second, genuinely live run
+    wins the same workspace slot before the next retry — the fix must fail
+    on that live conflict immediately, rather than treating it as still
+    self-healable because an earlier, different conflict once was."""
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    sup._reconcile_absence_grace = 5.0
+    monkeypatch.setattr(supervisor, "_SELF_HEAL_GRACE_MARGIN_SECONDS", 5.0)
+    monkeypatch.setattr(supervisor, "_SELF_HEAL_POLL_INTERVAL_SECONDS", 0.05)
+
+    stale = _make_stale_prepared_row(sup.db_path, project="AIOS", repository_path=str(git_repo))
+
+    live_proc = subprocess.Popen(["sleep", "5"])
+    try:
+        original_reconcile = sup.reconcile
+        call_count = {"n": 0}
+
+        def fake_reconcile():
+            call_count["n"] += 1
+            outcomes = original_reconcile()
+            if call_count["n"] == 1:
+                # Between this reconcile() call and start_raw's next retry,
+                # the stale row clears and a second, genuinely live process
+                # wins the same workspace before we ever get there.
+                current = db.get_run(sup.db_path, stale["id"])
+                db.update_run_state(
+                    sup.db_path, stale["id"], expected_version=current["version"], new_state="INTERRUPTED",
+                )
+                live_task = db.create_task(sup.db_path, project="AIOS", title="t2", task_type="implementation")
+                live_session = db.create_session(
+                    sup.db_path, task_id=live_task["id"], project="AIOS", repository_path=str(git_repo),
+                )
+                live_run = db.create_run(
+                    sup.db_path, session_id=live_session["id"], task_id=live_task["id"], project="AIOS",
+                    task_type="implementation", repository_path=str(git_repo), prompt="p", is_resume=False,
+                )
+                live_run = db.update_run_state(
+                    sup.db_path, live_run["id"], expected_version=live_run["version"], new_state="QUEUED",
+                )
+                db.update_run_state(
+                    sup.db_path, live_run["id"], expected_version=live_run["version"], new_state="RUNNING",
+                    fields={
+                        "pid": live_proc.pid,
+                        "process_start_identity": identity.capture_identity(live_proc.pid).as_string(),
+                        "started_at": "2026-01-01T00:00:00",
+                    },
+                )
+            return outcomes
+
+        monkeypatch.setattr(sup, "reconcile", fake_reconcile)
+
+        started_at = time.monotonic()
+        with pytest.raises(supervisor.WorkspaceLockedError) as excinfo:
+            sup.start_raw(
+                project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p2",
+                confirmed=True,
+            )
+        elapsed = time.monotonic() - started_at
+    finally:
+        live_proc.terminate()
+        live_proc.wait()
+
+    assert db.get_run(sup.db_path, stale["id"])["state"] == "INTERRUPTED"
+    assert excinfo.value.conflicting_run["id"] != stale["id"]
+    # The fix: fails fast against the live conflict. The bug this regresses
+    # against would instead keep polling on the stale candidacy flag from the
+    # first (already-resolved) conflict, burning the whole ~10s self-heal
+    # budget before finally raising.
+    assert elapsed < 2.0
+
+
+# --------------------------------------------------------------------------
 # Crash recovery: `self._launching` protects an in-flight (QUEUED, not yet
 # `Popen`'d) run of *this* instance from a concurrent `reconcile()` call —
 # see tests/test_runtime_reconciliation.py for reconcile()'s own widened
