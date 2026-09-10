@@ -153,7 +153,9 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, bytes]:
         url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+        with urllib.request.urlopen(  # noqa: S310  # nosec B310 - scheme validated by platform_base_url()
+            request, timeout=timeout
+        ) as response:
             return int(response.status), response.read()
     except urllib.error.HTTPError as exc:
         return int(exc.code), exc.read()

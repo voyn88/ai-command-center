@@ -111,7 +111,7 @@ def get_run_provenance_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, 
     placeholders = ", ".join("?" for _ in run_ids)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM run_provenance WHERE run_id IN ({placeholders})",
+            f"SELECT * FROM run_provenance WHERE run_id IN ({placeholders})",  # nosec B608 - placeholders are `?`-per-count only (from len(run_ids)); actual ids bound via tuple(run_ids) params
             tuple(run_ids),
         ).fetchall()
     return {row["run_id"]: dict(row) for row in rows}
@@ -152,7 +152,7 @@ def update_run_provenance(db_path: Path, run_id: str, *, fields: dict) -> dict:
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             cursor = conn.execute(
-                f"UPDATE run_provenance SET {set_clause} WHERE run_id = :run_id", values
+                f"UPDATE run_provenance SET {set_clause} WHERE run_id = :run_id", values  # nosec B608 - set_clause keys are `values`, which is `fields` already checked against the `allowed` fixed set (unknown keys raise) plus the hardcoded "updated_at"; values bound via params dict
             )
             if cursor.rowcount != 1:
                 raise KeyError(f"No provenance for run: {run_id!r}")
@@ -224,7 +224,7 @@ def set_run_provenance_once(
             values["run_id"] = run_id
             set_clause = ", ".join(f"{key} = :{key}" for key in values if key != "run_id")
             conn.execute(
-                f"UPDATE run_provenance SET {set_clause} WHERE run_id = :run_id", values
+                f"UPDATE run_provenance SET {set_clause} WHERE run_id = :run_id", values  # nosec B608 - set_clause keys are `values`, which is `fields` already checked against the immutable-field `allowed` fixed set (unknown keys raise) plus the hardcoded "updated_at"/"run_id"; values bound via params dict
             )
             updated = conn.execute(
                 "SELECT * FROM run_provenance WHERE run_id = ?", (run_id,)
@@ -327,7 +327,7 @@ def get_provenance_evidence_for_runs(
                        reported_sha, observed_at
                 FROM provenance_evidence
                 WHERE run_id IN ({placeholders})
-                ORDER BY run_id, observed_at, integrity_id""",
+                ORDER BY run_id, observed_at, integrity_id""",  # nosec B608 - placeholders are `?`-per-count only (from len(run_ids)); actual ids bound via tuple(run_ids) params
             tuple(run_ids),
         ).fetchall()
     result: dict[str, list[dict]] = {run_id: [] for run_id in run_ids}
@@ -379,7 +379,7 @@ def get_provider_routes_for_runs(db_path: Path, run_ids: list[str]) -> dict[str,
     placeholders = ", ".join("?" for _ in run_ids)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM run_provider_route WHERE run_id IN ({placeholders})",
+            f"SELECT * FROM run_provider_route WHERE run_id IN ({placeholders})",  # nosec B608 - placeholders are `?`-per-count only (from len(run_ids)); actual ids bound via tuple(run_ids) params
             tuple(run_ids),
         ).fetchall()
     result: dict[str, dict] = {}
@@ -522,7 +522,7 @@ def get_provider_attempts_for_runs(
         rows = conn.execute(
             f"""SELECT * FROM provider_attempt
                 WHERE run_id IN ({placeholders})
-                ORDER BY run_id, attempt_number""",
+                ORDER BY run_id, attempt_number""",  # nosec B608 - placeholders are `?`-per-count only (from len(run_ids)); actual ids bound via tuple(run_ids) params
             tuple(run_ids),
         ).fetchall()
     result: dict[str, list[dict]] = {run_id: [] for run_id in run_ids}

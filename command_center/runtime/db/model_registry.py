@@ -167,7 +167,7 @@ def create_model_entry(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO model_entry ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO model_entry ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders are built only from the hardcoded _MODEL_ENTRY_COLUMNS tuple; all values are bound via the record dict
                 record,
             )
             event = _append_model_event(
@@ -250,7 +250,7 @@ def list_model_entries(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM model_entry{where} "
+            f"SELECT * FROM model_entry{where} "  # nosec B608 - `where` is assembled only from the hardcoded "kind = ?"/"status = ?" literals; the actual kind/status/limit/offset values are all bound via params
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -307,7 +307,7 @@ def set_model_status(
             params["model_id"] = model_id
             params["expected_version"] = expected_version
             cur = conn.execute(
-                f"UPDATE model_entry SET {set_clause}, version = version + 1 "
+                f"UPDATE model_entry SET {set_clause}, version = version + 1 "  # nosec B608 - set_clause's keys come only from the `fields` dict built in this function with fixed literal keys ("status"/"updated_at"/"download_progress"); values are bound via the params dict
                 "WHERE id = :model_id AND version = :expected_version",
                 params,
             )

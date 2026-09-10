@@ -152,7 +152,7 @@ def create_audit_run(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO audit_run ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO audit_run ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built from the hardcoded _AUDIT_RUN_COLUMNS tuple; values bound via params dict
                 record,
             )
     # `record`, not the decoded row: `_decode_run_row` pops `checks_json`.
@@ -234,7 +234,7 @@ def list_audit_runs(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM audit_run{where} "
+            f"SELECT * FROM audit_run{where} "  # nosec B608 - `where` assembled only from hardcoded clause literals + `_exclude_projects_clause` fragments; all values go through `params`
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -284,7 +284,7 @@ def set_audit_run_status(
             params["run_id"] = run_id
             params["expected_version"] = expected_version
             cur = conn.execute(
-                f"UPDATE audit_run SET {set_clause}, version = version + 1 "
+                f"UPDATE audit_run SET {set_clause}, version = version + 1 "  # nosec B608 - `fields` keys are the hardcoded literals "status"/"updated_at"/"finding_count"/"completed_at" set in this function, not caller input; values bound via params dict
                 "WHERE id = :run_id AND version = :expected_version",
                 params,
             )
@@ -383,7 +383,7 @@ def create_audit_finding(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO audit_finding ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO audit_finding ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built from the hardcoded _AUDIT_FINDING_COLUMNS tuple; values bound via params dict
                 record,
             )
     _mirror_audit_finding(record)
@@ -438,7 +438,7 @@ def list_audit_findings(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM audit_finding{where} "
+            f"SELECT * FROM audit_finding{where} "  # nosec B608 - `where` assembled only from hardcoded clause literals + `_exclude_projects_clause` fragments; all values go through `params`
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -485,7 +485,7 @@ def _audit_finding_transition(
     params["finding_id"] = finding_id
     params["expected_version"] = expected_version
     cur = conn.execute(
-        f"UPDATE audit_finding SET {set_clause}, version = version + 1 "
+        f"UPDATE audit_finding SET {set_clause}, version = version + 1 "  # nosec B608 - `fields` keys come only from the hardcoded "status"/"updated_at" plus `extra_fields` literals passed by the two in-module call sites (never caller-supplied dict keys); values bound via params dict
         "WHERE id = :finding_id AND version = :expected_version",
         params,
     )

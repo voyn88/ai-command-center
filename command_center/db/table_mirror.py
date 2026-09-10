@@ -158,7 +158,7 @@ class PostgresTableMirror:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"INSERT INTO {spec.table} ({', '.join(spec.columns)}) "
+                    f"INSERT INTO {spec.table} ({', '.join(spec.columns)}) "  # nosec B608 - spec.table/columns/keys/assignments come only from hardcoded MirroredTable(...) declarations in this package; row values are bound via `values`.
                     f"{overriding}VALUES ({placeholders}) "
                     f"ON CONFLICT ({', '.join(keys)}) DO UPDATE SET {assignments}",
                     values,
@@ -181,7 +181,7 @@ class PostgresTableMirror:
             raise ValueError(f"{self.spec.table} has no column {column!r}")
         with self._connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(f"DELETE FROM {self.spec.table} WHERE {column} = %s", (value,))
+                cur.execute(f"DELETE FROM {self.spec.table} WHERE {column} = %s", (value,))  # nosec B608 - self.spec.table is a hardcoded MirroredTable declaration; `column` is validated above against spec.columns (membership check) before use, and `value` is bound as a parameter.
 
     def resync_identity(self) -> int:
         """Advance the identity sequence past the largest mirrored id.
@@ -213,7 +213,7 @@ class PostgresTableMirror:
                 # 6's acceptance raised it; the behaviour is pinned by
                 # `test_resync_identity_is_a_no_op_on_an_empty_table`.
                 cur.execute(
-                    f"SELECT setval(%s, (SELECT COALESCE(MAX(id), 1) FROM {spec.table}),"
+                    f"SELECT setval(%s, (SELECT COALESCE(MAX(id), 1) FROM {spec.table}),"  # nosec B608 - spec.table is a hardcoded MirroredTable declaration, not caller-supplied; `sequence` is bound as a parameter.
                     f" (SELECT COUNT(*) > 0 FROM {spec.table}))",
                     (sequence,),
                 )
@@ -227,7 +227,7 @@ class PostgresTableMirror:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT {', '.join(spec.columns)} FROM {spec.table} "
+                    f"SELECT {', '.join(spec.columns)} FROM {spec.table} "  # nosec B608 - spec.columns/table/key_columns come only from hardcoded MirroredTable(...) declarations in this package; no caller input reaches this string.
                     f"ORDER BY {', '.join(spec.key_columns)}"
                 )
                 rows = cur.fetchall()

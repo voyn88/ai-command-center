@@ -589,7 +589,7 @@ def _post_marker_as_bot(
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15):
+        with urllib.request.urlopen(req, timeout=15):  # nosec B310 - request URL is an f-string over a hardcoded https literal
             pass
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
         return False, f"marker_post_failed: {exc}"
@@ -1547,7 +1547,7 @@ def reconcile_review_once(
     )
     tasks = _rows(
         factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
+        "SELECT t.task_id, e.value FROM backlog_task t "  # nosec B608 - `where` is one of two hardcoded literal fragments ("" or " AND t.task_id = %s") chosen by a boolean check; the actual task_id value is bound via `params` and a %s placeholder
         "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
         "WHERE t.status = 'READY_TO_REVIEW'" + where + " ORDER BY t.task_id LIMIT %s",
         params,
