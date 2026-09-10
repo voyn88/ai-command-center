@@ -271,7 +271,7 @@ def test_committed_control_unit_deploys_an_immutable_release():
     assert "WorkingDirectory=/opt/aicc/current" in service
     assert "--release-root /opt/aicc" in service
     assert "--release-venv ${AICC_RUNTIME_VENV}" in service
-    assert "--repo-path ${AICC_SOURCE_REPO}" in service
+    assert "--repo-path ${AICC_SOURCE_REPO}" in service  # pragma: allowlist secret
     assert "Environment=AICC_PREPROD_ROOT=/home/voynadmin/aicc-preprod" in service  # pragma: allowlist secret
     assert "Environment=AICC_SOURCE_REPO=/home/voynadmin/aicc-preprod/repo" in service  # pragma: allowlist secret
     assert (
@@ -287,7 +287,7 @@ def test_committed_worker_unit_deploys_an_immutable_release_without_migrations()
         root / "deploy/systemd/voyn-aicc-self-deploy-worker.service"
     ).read_text()
 
-    assert "WorkingDirectory=/opt/aicc/current" in service
+    assert "WorkingDirectory=/opt/aicc/source" in service
     assert "--release-root /opt/aicc" in service
     assert "--release-venv ${AICC_RUNTIME_VENV}" in service
     assert "--repo-path ${AICC_SOURCE_REPO}" in service
@@ -295,7 +295,9 @@ def test_committed_worker_unit_deploys_an_immutable_release_without_migrations()
     assert "--restart voyn-aicc-worker@1.service" in service
     assert "--restart voyn-aicc-worker@4.service" in service
     assert "source ${AICC_PREPROD_ROOT}/worker.env" in service
-    assert "exec /opt/aicc/current/.venv/bin/python" in service
+    assert "Environment=AICC_SOURCE_REPO=/opt/aicc/source" in service  # pragma: allowlist secret
+    assert "Environment=AICC_RUNTIME_VENV=/opt/aicc/runtime-venv" in service  # pragma: allowlist secret
+    assert "exec ${AICC_SOURCE_REPO}/.venv/bin/python" in service  # pragma: allowlist secret
 
 
 def test_noop_looking_migration_still_records_unrolled_back_write(

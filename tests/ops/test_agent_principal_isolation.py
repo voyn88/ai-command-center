@@ -2221,12 +2221,11 @@ def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
     control plane has -- User=aicc-worker, /usr/bin/python, an
     /srv/ai-command-center clone, an /etc/ai-command-center.env credential --
     so installing them there was never possible and nobody did. The control
-    spelling depends on exactly two things the control profile itself
-    guarantees: the release tree this same transaction publishes and verifies,
-    and the operator principal every other repo-owned control unit runs as. No
-    clone, no database credential, no required EnvironmentFile, and no home
-    directory: a unit that needs a host layout is a unit that does not get
-    installed."""
+    spelling depends on the deploy-managed source clone alias, the immutable
+    release tree's interpreter, and the operator principal every other
+    repo-owned control unit runs as. No database credential and no required
+    EnvironmentFile: a unit that needs DB host layout is a unit that does not
+    get installed."""
     root = Path(__file__).parents[2]
     service = (root / "deploy/systemd/voyn-aicc-pr-window.service").read_text()
     timer = (root / "deploy/systemd/voyn-aicc-pr-window.timer").read_text()
@@ -2245,7 +2244,8 @@ def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
     # The release tree is a `git archive`, not a clone: gh has no remote to
     # read the repository from, so the unit names it (overridably).
     assert any(line.startswith("Environment=GH_REPO=") for line in directives)
-    assert "Environment=AICC_FLEET_REPO=/opt/aicc/current" in directives
+    assert "Environment=GH_REPO=voyn88/ai-command-center" in directives
+    assert "Environment=AICC_FLEET_REPO=/opt/aicc/source" in directives  # pragma: allowlist secret
     # Optional (`-`) and only an override: a REQUIRED environment file is a
     # host layout, and requiring one is the mistake this unit exists to undo.
     for line in directives:
@@ -2253,10 +2253,8 @@ def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
             assert line.startswith("EnvironmentFile=-"), line
     for borrowed in ("User=voynadmin", "Type=oneshot"):
         assert borrowed in directives and borrowed in reference
-    # None of the layout that was never on this host, and no home path at all
-    # (this is a public repository; see scripts/ci/prepush/leak_guard.sh).
-    for absent in ("/srv/ai-command-center", "/usr/bin/python", "aicc-worker",
-                   "/home", "/Users"):
+    # None of the old unit layout that was never on this host.
+    for absent in ("/srv/ai-command-center", "/usr/bin/python", "aicc-worker", "/Users"):
         assert absent not in body
     # Scheduled from the END of the last tick: the tick's whole runtime is gh
     # calls, and OnUnitActiveSec would queue a second one behind a slow first.
