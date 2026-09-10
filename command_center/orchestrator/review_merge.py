@@ -3461,6 +3461,9 @@ class PrWindowReport:
     quota: gh_access.GhQuota | None = None
 
 
+DEFAULT_PR_WINDOW_CONFIG = PrWindowConfig()
+
+
 def _independent_latest_reject_marker(
     reviews: list[dict[str, Any]], head: str, pr_author_login: str | None
 ) -> bool:
@@ -3593,17 +3596,37 @@ def _window_block_reason(
     reviews = pr.get("reviews") or []
     if _independent_latest_reject_marker(reviews, head, author_login):
         return "acceptance_rejected"
+    merge_state = str(pr.get("mergeStateStatus") or "").upper()
+    if merge_state == "DIRTY":
+        return "merge_conflict"
     rollup = _latest_checks_by_name(pr.get("statusCheckRollup") or [])
     present = {str(check.get("name") or "") for check in rollup}
     if any(name not in present for name in cfg.required_checks):
         return "checks_missing"
-    if rollup and any(not _check_is_green(check) for check in rollup):
+    if rollup and any(_check_is_red_for_window(check) for check in rollup):
         return "checks_stale"
     if age_seconds > cfg.stale_seconds and not _accept_marker_on_latest_review(
         reviews, head, author_login
     ):
         return "stale_exact_head_acceptance"
     return None
+
+
+def _check_is_red_for_window(check: dict[str, Any]) -> bool:
+    """Whether a present check is a completed negative verdict for windowing.
+
+    Merge remains stricter in `_check_is_green`: queued/running checks are
+    not mergeable. The review window has the opposite job: keep a PR labelled
+    active while those checks are still running, and only free the slot when
+    a check has actually completed red.
+    """
+    conclusion = check.get("conclusion")
+    if conclusion is not None:
+        return str(conclusion).upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED")
+    state = check.get("state")
+    if state is not None:
+        return str(state).upper() in ("FAILURE", "ERROR")
+    return False
 
 
 def _pr_window_labels(pr: dict[str, Any]) -> set[str]:
@@ -3652,7 +3675,7 @@ def _set_pr_window_labels(
 
 
 def reconcile_pr_window(
-    repo_path: str, cfg: PrWindowConfig = PrWindowConfig()
+    repo_path: str, cfg: PrWindowConfig | None = None
 ) -> PrWindowReport:
     """One tick of the bounded PR review window: label every open PR
     active/waiting/blocked and nothing else -- no merge, no approval, no
@@ -3675,6 +3698,7 @@ def reconcile_pr_window(
     not a fairness bug: without it, an ordinary rotation tick could bump an
     active PR out and back in on no real change, restarting its review
     cycle for nothing."""
+    cfg = DEFAULT_PR_WINDOW_CONFIG if cfg is None else cfg
     report = PrWindowReport()
     with gh_access.tick(repo_path) as quota:
         report.quota = quota
@@ -3709,7 +3733,9 @@ def _reconcile_pr_window(
     for pr in ordered:
         number = int(pr.get("number") or 0)
         head = str(pr.get("headRefOid") or "")
+        active_now = cfg.label_active in _pr_window_labels(pr)
         window_full = selected >= cfg.max_active
+        needs_merge_state = active_now or not window_full
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.
@@ -3738,6 +3764,36 @@ def _reconcile_pr_window(
         if fell_back:
             report.age_fallback.append((number, head))
         reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+        if (
+            reason == "checks_stale"
+            and active_now
+            and details_used < max(cfg.detail_budget, 0)
+        ):
+            details_used += 1
+            fresh = _pr_window_details(repo_path, pr, cache, refresh=True)
+            if fresh is None:
+                report.unreadable.append((number, head))
+                continue
+            detailed = fresh
+            age_seconds, fell_back = _pr_age_seconds(repo_path, detailed, now=now)
+            if fell_back:
+                report.age_fallback.append((number, head))
+            reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+        if reason is None and needs_merge_state and "mergeStateStatus" not in detailed:
+            parsed = _owner_repo_number_from_pr_url(str(detailed.get("url") or ""))
+            if parsed is None:
+                origin = _origin_owner_repo(repo_path)
+                parsed = (*origin, number) if origin is not None else None
+            if parsed is None:
+                report.unreadable.append((number, head))
+                continue
+            merge_state = _rest_merge_state(repo_path, parsed[0], parsed[1], number)
+            if merge_state is None:
+                report.unreadable.append((number, head))
+                continue
+            detailed = dict(detailed)
+            detailed["mergeStateStatus"] = merge_state
+            reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
         if reason is not None:
             report.blocked.append((number, reason))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
@@ -3914,12 +3970,27 @@ def _rest_reviews(
     return translated
 
 
+def _rest_merge_state(repo_path: str, owner: str, repo: str, number: int) -> str | None:
+    """The PR's mergeability state in the GraphQL-era spelling.
+
+    `DIRTY` means GitHub has already proven a merge conflict. Such a PR
+    cannot pass the merge gate and must not keep a bounded review-window
+    slot while newer reviewable work waits behind it.
+    """
+    outcome, pull = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+    if outcome != _REST_OK or not isinstance(pull, dict):
+        return None
+    raw = pull.get("mergeable_state") or pull.get("mergeStateStatus") or ""
+    return str(raw).upper()
+
+
 def _pr_window_details(
     repo_path: str,
     pr: dict[str, Any],
     cache: gh_access.PrDetailCache | None = None,
     *,
     fetch: bool = True,
+    refresh: bool = False,
 ) -> dict[str, Any] | None:
     """The per-PR fields the eligibility rules need (reviews, check rollup,
     head commit date), over REST and cached by (repo, PR, head sha).
@@ -3935,7 +4006,8 @@ def _pr_window_details(
 
     None when the lookup fails, which the caller treats as
     not-eligible-this-tick and leaves the PR's existing label alone."""
-    if all(key in pr for key in ("reviews", "statusCheckRollup", "commits")):
+    required = ("reviews", "statusCheckRollup", "commits")
+    if all(key in pr for key in required):
         return pr
     number = int(pr.get("number") or 0)
     head = str(pr.get("headRefOid") or "")
@@ -3949,14 +4021,15 @@ def _pr_window_details(
         owner, repo = origin
     slug = f"{owner}/{repo}"
     quota = gh_access.current_quota()
-    if cache is not None and head:
+    if cache is not None and head and not refresh:
         cached = cache.get(slug, number, head)
         if cached is not None:
-            if quota is not None:
-                quota.cache_hits += 1
             merged = dict(pr)
             merged.update(cached)
-            return merged
+            if all(key in merged for key in required):
+                if quota is not None:
+                    quota.cache_hits += 1
+                return merged
     if not fetch:
         # Cache-only probe: the caller is deciding whether this PR costs any
         # API budget at all, so it must never spend one to find out.
@@ -3969,7 +4042,10 @@ def _pr_window_details(
     rollup = _rest_check_rollup(repo_path, owner, repo, head) if head else []
     if rollup is None:
         return None
-    details: dict[str, Any] = {"reviews": reviews, "statusCheckRollup": rollup}
+    details: dict[str, Any] = {
+        "reviews": reviews,
+        "statusCheckRollup": rollup,
+    }
     # The head commit's own date comes from the same REST family and lands in
     # the cached payload, so `_pr_age_seconds` reads it for free on a cache
     # hit instead of repeating the lookup (or falling back to `createdAt`,
