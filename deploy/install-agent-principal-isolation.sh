@@ -640,6 +640,6 @@ trap - EXIT HUP INT TERM
 # review-window labeller instead of "someone typed it once on 2026-09-09"
 # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
 if [ "$install_profile" = "control" ]; then
-  systemctl enable --now voyn-aicc-pr-window.timer
+  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-pr-window.timer
 fi
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"
