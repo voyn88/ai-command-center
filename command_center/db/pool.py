@@ -23,6 +23,24 @@ deliberately via `conn.transaction()` at the call site; an implicit transaction
 per checkout is how a long-lived pooled connection ends up holding an idle
 transaction open and blocking VACUUM. Autocommit is also what the migration
 runner and the advisory-lock primitives require.
+
+`_build_pool()` also proves, once per pool, that PostgreSQL will hand this
+process back `session_user`. That check exists because the whole claim/audit
+model shipped by `0002_queue_claim` and `0003_worker_enrollment` treats
+`session_user` as a provable identity: a trigger stamps it into
+`claimed_by_role`, a grant makes it the only route to a write, and no
+argument ever carries an actor. That is sound against PostgreSQL itself, but
+it is a promise about the network path, not the protocol: a transaction-mode
+connection pooler placed in front of this database can terminate the client's
+authentication and open its own backend connections under a single shared
+role, in which case `session_user` on every statement is the pooler's role,
+identical for every caller behind it. Nothing about that setup looks broken —
+queries run, claims succeed, audit rows get written — it just makes every one
+of them unattributable, and unattributable is not something a `SELECT` later
+notices. This is a deployment constraint on where the pool may point, not a
+defect in the protocol, so the check that enforces it lives here rather than
+in the schema: it fails pool startup loudly instead of leaving the identity
+model quietly meaningless in production.
 """
 
 from __future__ import annotations
@@ -36,6 +54,7 @@ from typing import Any
 from command_center.db.config import PostgresConfig, load_config
 
 __all__ = [
+    "PoolIdentityError",
     "PoolNotOpenError",
     "close_pool",
     "PoolReplacedError",
@@ -72,6 +91,14 @@ class PoolReplacedError(RuntimeError):
     caller observed (review note on 3a845a3)."""
 
 
+class PoolIdentityError(RuntimeError):
+    """Raised when PostgreSQL hands this process back a `session_user` other
+    than the role it authenticated as -- see the module docstring for why
+    that is the observable signature of a transaction-mode pooler sitting
+    between here and PostgreSQL, and why it breaks the claim/audit model
+    rather than merely surprising it."""
+
+
 def open_pool(config: PostgresConfig | None = None):
     """Open the process-wide pool and verify connectivity. Idempotent."""
     global _pool, _config
@@ -94,7 +121,7 @@ def _build_pool(config: PostgresConfig):
     # `aios_db.open_pool` waits for the first connections and closes the
     # half-built pool if they fail, so a bad DSN, an unreachable host or a
     # rejected certificate surfaces before it can replace the working pool.
-    return adapter.open_pool(
+    built = adapter.open_pool(
         config.conninfo(),
         min_size=config.pool_min_size,
         max_size=config.pool_max_size,
@@ -103,6 +130,41 @@ def _build_pool(config: PostgresConfig):
         autocommit=True,
         name="aicc",
     )
+    try:
+        _verify_session_user(built, config)
+    except Exception:
+        built.close()
+        raise
+    return built
+
+
+def _verify_session_user(built, config: PostgresConfig) -> None:
+    """Fail loudly if PostgreSQL will not hand this pool back `config.user`.
+
+    `config.user` is the role libpq authenticated as (see `conninfo()`). If a
+    transaction-mode pooler sits in front of PostgreSQL and terminates that
+    authentication itself, every backend it opens runs under whatever role
+    *it* was configured with, and `session_user` on this pool's connections
+    is that shared role for every caller behind it -- not the identity this
+    process just proved. See the module docstring for why that silently
+    breaks the claim/audit model instead of merely surprising it.
+    """
+    with built.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT session_user")
+            (observed,) = cur.fetchone()
+    if observed != config.user:
+        raise PoolIdentityError(
+            f"authenticated as {config.user!r} but PostgreSQL reports "
+            f"session_user {observed!r}. This pool is not connecting "
+            "directly to PostgreSQL as the role it authenticated with -- "
+            "the signature of a transaction-mode connection pooler sharing "
+            "one backend role across every caller. That breaks the "
+            "session_user-is-the-claimant identity model the queue-claim "
+            "and worker-enrollment protocols depend on (see this module's "
+            "docstring). Point AICC_PG_HOST directly at PostgreSQL, or at a "
+            "pooler running in session mode, not transaction mode."
+        )
 
 
 def replace_pool(config: PostgresConfig):
