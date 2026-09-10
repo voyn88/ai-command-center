@@ -632,6 +632,67 @@ def test_terminate_process_group_escalates_to_sigkill_when_sigterm_is_ignored(
             unpatched_wait(timeout=10)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="os.killpg and process groups are POSIX-specific"
+)
+def test_terminate_process_group_still_sweeps_escaped_descendants_when_group_is_extinct(
+    monkeypatch, tmp_path
+):
+    """VOYN-W0-AICC-SETSID-ORPHAN-REM: the case adversarial review flagged as
+    the one that matters most — the entire launch-time pgid is already gone
+    (`os.killpg` raises `ProcessLookupError` for the *group*, not merely "the
+    leader is gone") because the only thing left alive is a descendant that
+    escaped via `os.setsid()` into its own, different pgid. The pre-captured
+    `descendants` snapshot must still be swept in this branch; an early
+    `return` inside the `except ProcessLookupError` block would discard it
+    and leave the escaped descendant unsignaled, exactly the regression the
+    prior PR was rejected for.
+    """
+    proc = subprocess.Popen(
+        _fake_command("import time; time.sleep(60)"),
+        **agent_runner._popen_new_process_group_kwargs(),
+    )
+    escaped_pid = proc.pid + 12345  # arbitrary pid distinct from the group's
+    unpatched_killpg = os.killpg
+    unpatched_wait = proc.wait
+    try:
+        monkeypatch.setattr(
+            agent_runner,
+            "_live_process_tree",
+            lambda root_pid: [(escaped_pid, escaped_pid)],
+        )
+
+        def raising_killpg(pgid, sig):
+            raise ProcessLookupError("no such process group")
+
+        monkeypatch.setattr(agent_runner.os, "killpg", raising_killpg)
+
+        signaled: list[tuple[int, int]] = []
+
+        def recording_kill(pid, sig):
+            signaled.append((pid, sig))
+
+        monkeypatch.setattr(agent_runner.os, "kill", recording_kill)
+
+        agent_runner._terminate_process_group(proc, grace_seconds=5)
+
+        assert (escaped_pid, signal.SIGTERM) in signaled, (
+            "the escaped descendant was not signaled when the group's own "
+            "killpg raised ProcessLookupError — the pre-captured snapshot "
+            "was discarded by an early return instead of being swept"
+        )
+    finally:
+        # `os.killpg`/`proc.wait` are still the patched versions here (the
+        # `monkeypatch` fixture only undoes them after this function
+        # returns), so real cleanup must go through the captured originals.
+        if proc.poll() is None:
+            try:
+                unpatched_killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            unpatched_wait(timeout=10)
+
+
 def test_run_claude_code_cancel_event_reports_cancelled_and_never_hangs(
     monkeypatch, tmp_path
 ):
@@ -724,6 +785,63 @@ def test_run_claude_code_cancellation_kills_the_whole_process_group(
     assert _wait_until(lambda: not _pid_alive(grandchild_pid), timeout=5.0), (
         f"grandchild pid {grandchild_pid} survived process-group cancellation "
         "— only the direct child was killed, not the whole group"
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="process-group semantics are POSIX-specific"
+)
+def test_run_claude_code_cancellation_kills_a_grandchild_that_escaped_via_setsid(
+    monkeypatch, tmp_path, tmp_path_factory
+):
+    """VOYN-W0-AICC-SETSID-ORPHAN: `os.killpg` only reaches processes still in
+    the launch-time pgid. A grandchild that calls `os.setsid()` on itself —
+    what a sandbox wrapper started deeper in the tree can do internally —
+    leaves that pgid and would survive a plain `os.killpg` untouched. This
+    spawns a real grandchild that immediately escapes into its own session,
+    cancels the run, and asserts the grandchild is still dead — proof that
+    termination also reaches descendants `killpg` alone cannot see."""
+    pid_file = tmp_path_factory.mktemp("pidfile") / "child.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        f"pid_file = {str(pid_file)!r}\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import os, time; os.setsid(); time.sleep(60)']\n"
+        ")\n"
+        "open(pid_file, 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: [
+            sys.executable,
+            "-c",
+            script,
+        ],
+    )
+    cancel_event = threading.Event()
+
+    def _trigger_cancel_once_child_exists() -> None:
+        _wait_until(pid_file.exists, timeout=5.0)
+        cancel_event.set()
+
+    threading.Thread(target=_trigger_cancel_once_child_exists, daemon=True).start()
+
+    result = agent_runner.run_claude_code(
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=300,
+        cancel_event=cancel_event,
+        termination_grace_seconds=10,
+    )
+    assert result.status == "cancelled"
+    assert pid_file.exists()
+    grandchild_pid = int(pid_file.read_text().strip())
+    assert _wait_until(lambda: not _pid_alive(grandchild_pid), timeout=5.0), (
+        f"grandchild pid {grandchild_pid} escaped its own session via "
+        "os.setsid() and survived process-group cancellation"
     )
 
 
