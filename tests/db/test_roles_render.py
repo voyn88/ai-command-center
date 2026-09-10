@@ -1,6 +1,6 @@
 """The rendered grant matrix, checked without a database.
 
-`test_role_privileges.py` proves the database enforces this matrix. These tests
+`test_grant_compliance.py` proves the database enforces this matrix. These tests
 prove the matrix says what it is supposed to say — cheap, and they run on every
 machine, including ones with no PostgreSQL available.
 """
