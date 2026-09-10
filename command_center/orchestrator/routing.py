@@ -1,12 +1,24 @@
 """The executor routing matrix (BO-S2a, executor-cascade).
 
 Route order is the recorded decision chain quality -> risk -> privacy ->
-latency -> cost. The first slice is deliberately STATIC and deliberately
-HONEST: it names only executors that actually exist on the worker hosts
-today. A cascade naming an absent executor would not fail loudly — the
-worker's unavailability path *retries to the next link*, so a phantom link
-silently burns one attempt of every task's budget. That is why codex is a
-COMMENT, not an entry, until its CLI is proven on worker-01.
+latency -> cost, and THAT ORDER is static — a table any operator can read
+top to bottom and predict. Which link actually gets to run is not: a link
+naming an executor absent from the worker's proven set is skipped exactly
+like one this host currently knows is quota-exhausted (VOYN-W0-AICC-
+EXECUTOR-QUOTA-AWARE-ROUTING — `agent_runner.executor_exhausted_until`,
+checked in `worker.handlers._executor_preflight`), both without spending an
+attempt. An earlier slice of this module was static in the stronger sense of
+withholding codex entirely (as a comment, not an entry) until its CLI was
+proven on worker-01; both codex and copilot are proven entries now, and the
+routing decision that matters live is no longer "is this executor listed"
+but "is this executor's account, right now, still spendable" — a fact only
+runtime observation (a session-limit refusal, a monthly-quota refusal)
+can supply, never a table fixed before execution. A cascade naming an
+absent executor would still not fail loudly on its own — the worker's
+unavailability path *retries to the next link*, so a phantom link would
+otherwise silently burn one attempt of every task's budget — which is why
+every executor named here must still be proven (see
+`tests.orchestrator.test_routing.PROVEN_EXECUTORS`).
 
 Cascade mechanics live where the state already is: the planner writes the
 cascade into the payload, ``max_attempts`` = its length (the attempt budget

@@ -59,6 +59,23 @@ def clear_provider_probe_cache():
 
 
 @pytest.fixture(autouse=True)
+def clear_executor_quota_circuit():
+    """`agent_runner.record_executor_exhausted` opens a same-process,
+    in-memory circuit keyed only by executor name (VOYN-W0-AICC-EXECUTOR-
+    QUOTA-AWARE-ROUTING) -- the same worker-local shape as the pre-existing
+    Codex workspace-write circuit, and the same cross-test pollution hazard
+    `clear_provider_probe_cache` above already guards against: a quota mark
+    left open by one test's fake `codex`/`claude`/`copilot` refusal would
+    silently make an unrelated later test's SAME executor name look
+    exhausted."""
+    from command_center import agent_runner
+
+    agent_runner._executor_exhausted_until.clear()
+    yield
+    agent_runner._executor_exhausted_until.clear()
+
+
+@pytest.fixture(autouse=True)
 def _immediate_reconcile(monkeypatch):
     """reconcile()'s cross-process debounce (audit P0) waits a grace window before
     terminalizing a run that only *looks* gone. Tests want deterministic,

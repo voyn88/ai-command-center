@@ -176,6 +176,28 @@ _COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
     "getaddrinfo",
     "econnreset",
 )
+# Executor quota-exhaustion signatures (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-
+# ROUTING): a narrower, NAMED subset of what `is_executor_provider_error`
+# already treats as "provider/auth/quota" broadly. That check answers "does
+# THIS attempt fail over to the next cascade link" -- true for a quota
+# refusal among other causes, and unchanged by this. `RunResult.
+# executor_quota_signature` answers a different question -- "is the cause
+# specifically an account-level QUOTA" -- which is the fact
+# `record_executor_exhausted` needs before opening a same-host circuit that
+# skips the executor on a LATER dispatch (this task's redelivery, or another
+# task's) without spending a model call to re-learn what this host already
+# learned seconds ago. Phrasing is verbatim from each CLI's own refusal text:
+# claude's is the live incident capture in `is_executor_api_error`'s
+# docstring ("You've hit your session limit"); copilot's is its monthly-quota
+# refusal ("You've exceeded your monthly quota"); codex's is the OpenAI-style
+# usage-limit refusal already established elsewhere in this codebase (the
+# `fake_codex` test fixture's "usage limit reached", and the same "usage
+# limit" token `runtime.providers` already classifies as `quota_limit`).
+_EXECUTOR_QUOTA_SIGNATURES: dict[str, tuple[str, ...]] = {
+    "claude": ("hit your session limit",),
+    "copilot": ("exceeded your monthly quota",),
+    "codex": ("usage limit reached",),
+}
 _CODEX_PREFLIGHT_PROMPT = (
     "This is a disposable sandbox capability probe. In the current repository, "
     "create a file named aicc-codex-commit-probe.txt containing exactly "
@@ -196,6 +218,66 @@ def disable_codex_workspace_write(detail: str = "") -> None:
         reason = f"{reason}: {detail[-400:]}"
     with _codex_workspace_write_preflight_lock:
         _codex_workspace_write_preflight_result = (False, reason)
+
+
+# Quota-exhaustion circuit (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING): the
+# same worker-local, in-memory shape as the Codex workspace-write circuit
+# just above, for the same reason -- only the process that heard the refusal
+# needs to stop re-spending a whole model call proving the same account is
+# still exhausted. Unlike that circuit, this one self-clears after a cooldown
+# rather than staying open until the process restarts: a provider's own
+# quota resets (Claude's rolling session window, Copilot's/Codex's usage
+# cycle) are a real event this host should notice, not a fact only a restart
+# can undo. `EXECUTOR_QUOTA_COOLDOWN_SECONDS` is deliberately one bounded
+# default rather than a per-provider guess at each one's real reset moment
+# (parsing "resets 4:10pm (UTC)" out of free text is exactly the kind of
+# locale/timezone-fragile heuristic that misfires quietly) -- too short and
+# a still-exhausted account is simply reprobed and re-marked; too long (or
+# unbounded) and a host that outlives the real reset stays wrongly blind to
+# an executor that has recovered.
+EXECUTOR_QUOTA_COOLDOWN_SECONDS = 1800.0
+
+_executor_exhausted_until: dict[str, tuple[float, str, str]] = {}
+_executor_exhausted_lock = threading.Lock()
+
+
+def record_executor_exhausted(
+    executor: str, *, signature: str, now: float | None = None
+) -> str:
+    """Open this worker's quota circuit for `executor`, matched by `signature`
+    (the recognized phrase from `RunResult.executor_quota_signature`).
+
+    Returns the ISO-8601 ``exhausted_until`` the caller attaches to this
+    refusal's telemetry (``worker.handlers``' ``route_failovers``/result
+    detail) -- the same value a later ``executor_exhausted_until`` call for
+    this executor will return until the cooldown elapses.
+    """
+    started = now if now is not None else time.time()
+    until_epoch = started + EXECUTOR_QUOTA_COOLDOWN_SECONDS
+    until_iso = datetime.fromtimestamp(until_epoch, tz=UTC).isoformat()
+    with _executor_exhausted_lock:
+        _executor_exhausted_until[executor] = (until_epoch, until_iso, signature)
+    return until_iso
+
+
+def executor_exhausted_until(executor: str, *, now: float | None = None) -> str | None:
+    """The still-open ``exhausted_until`` for ``executor``, or ``None``.
+
+    ``None`` covers both "never marked" and "marked, but the cooldown has
+    since elapsed" -- the latter is dropped from the table here rather than
+    requiring a separate sweep, so a stale mark can never permanently strand
+    an executor whose quota already reset.
+    """
+    current = now if now is not None else time.time()
+    with _executor_exhausted_lock:
+        entry = _executor_exhausted_until.get(executor)
+        if entry is None:
+            return None
+        until_epoch, until_iso, _signature = entry
+        if current >= until_epoch:
+            del _executor_exhausted_until[executor]
+            return None
+        return until_iso
 
 
 # --------------------------------------------------------------------------
@@ -1212,6 +1294,27 @@ class RunResult:
             signature in diagnostic
             for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
         )
+
+    def executor_quota_signature(self, executor: str) -> str | None:
+        """The exact recognized phrase if this run's diagnostic text confirms
+        `executor` refused for QUOTA exhaustion specifically -- an
+        account-level cap, not merely "some" provider/auth/infra failure.
+
+        `None` for a run that never matched this executor's known phrasing, a
+        successful run (whatever its own report happens to say), or an
+        executor with no known signature. Gated on `status == "failed"` and a
+        non-zero exit code -- the same gate `is_executor_provider_error`'s
+        free-text branch uses -- so a completed task whose own result merely
+        discusses a quota cannot open the circuit `record_executor_exhausted`
+        guards.
+        """
+        if self.status != "failed" or not self.exit_code:
+            return None
+        diagnostic = f"{self.stdout}\n{self.stderr}".lower()
+        for signature in _EXECUTOR_QUOTA_SIGNATURES.get(executor, ()):
+            if signature in diagnostic:
+                return signature
+        return None
 
     @property
     def is_executor_sandbox_error(self) -> bool:

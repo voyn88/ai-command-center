@@ -585,6 +585,130 @@ def test_copilot_provider_failure_switches_inside_the_same_attempt(
     ]
 
 
+# -- quota-aware routing (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING) ---------
+
+
+def test_quota_refusal_switches_inside_the_same_attempt_without_burning_it(
+    handler, monkeypatch
+):
+    """A QUOTA-specific refusal (claude's "session limit" signature, not
+    merely a generic provider/auth error) fails over to the next cascade
+    link inside this SAME delivery, exactly like the pre-existing generic
+    provider-failure failover above — the queue never sees a second attempt
+    spent proving an already-exhausted account still refuses."""
+    run_agent, runs = handler
+
+    def session_limit_then_success(**kwargs):
+        if kwargs["executor"] == "claude":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=1,
+                stdout=json.dumps(
+                    {
+                        "is_error": True,
+                        "api_error_status": 429,
+                        "result": "You've hit your session limit · resets 4:10pm (UTC)",
+                    }
+                ),
+                stderr="",
+                duration_seconds=0.1,
+                started_at="2026-09-06T12:00:00+00:00",
+                completed_at="2026-09-06T12:00:01+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-06T12:00:01+00:00",
+            completed_at="2026-09-06T12:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", session_limit_then_success)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "review"},
+        {"executor": "codex", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert runs[-1]["executor"] == "codex"
+    assert outcome.result["cascade_step"] == 2
+    [failover] = outcome.result["route_failovers"]
+    assert failover["executor"] == "claude"
+    assert failover["reason"] == "provider_auth_or_quota"
+    assert failover["exhausted_until"] == agent_runner.executor_exhausted_until("claude")
+    [quota] = outcome.result["quota_exhausted"]
+    assert quota["executor"] == "claude"
+    assert quota["signature"] == "hit your session limit"
+    assert quota["exhausted_until"] == failover["exhausted_until"]
+
+
+def test_quota_exhausted_executor_is_skipped_before_the_run_starts(
+    handler, monkeypatch
+):
+    """A circuit already opened by an earlier delivery (this task's own
+    redelivery, or another task's dispatch on the same host) is honoured at
+    preflight — the exhausted link never runs at all, so no attempt is spent
+    re-learning what this host already knows."""
+    run_agent, runs = handler
+    agent_runner.record_executor_exhausted("claude", signature="hit your session limit")
+
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "review"},
+        {"executor": "codex", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert len(runs) == 1
+    assert runs[0]["executor"] == "codex"
+
+
+def test_quota_refusal_opens_the_circuit_even_with_no_fallback_link(
+    handler, monkeypatch
+):
+    """Terminal case: no cascade at all, so the attempt still fails — but the
+    account is genuinely exhausted either way, and the circuit this opens
+    must still be visible to a later dispatch, and in this attempt's own
+    telemetry since `result` is otherwise unreachable on a failing outcome."""
+    run_agent, _runs = handler
+
+    def session_limit(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=json.dumps(
+                {
+                    "is_error": True,
+                    "api_error_status": 429,
+                    "result": "You've hit your session limit · resets 4:10pm (UTC)",
+                }
+            ),
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-06T12:00:00+00:00",
+            completed_at="2026-09-06T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", session_limit)
+    assert agent_runner.executor_exhausted_until("claude") is None
+
+    outcome = run_agent(_payload(), _event(), 1)
+
+    assert not outcome.ok and outcome.retryable
+    assert "exhausted_until=" in outcome.reason
+    exhausted_until = agent_runner.executor_exhausted_until("claude")
+    assert exhausted_until is not None
+    [quota] = outcome.result["quota_exhausted"]
+    assert quota["exhausted_until"] == exhausted_until
+
+
 @pytest.mark.parametrize("workspace_unchanged", [True, False])
 def test_mutating_provider_failover_requires_unchanged_workspace(
     handler, monkeypatch, workspace_unchanged
