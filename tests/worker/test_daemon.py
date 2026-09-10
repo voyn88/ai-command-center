@@ -64,6 +64,10 @@ class ScriptedStore:
         self.calls.append(("fail_lease_wait", work.attempt_id, reason))
         return True
 
+    def fail_infra_wait(self, work, *, reason):
+        self.calls.append(("fail_infra_wait", work.attempt_id, reason))
+        return True
+
 
 def _run_until_idle(daemon: WorkerDaemon, store: ScriptedStore) -> None:
     """Run the loop until the script is exhausted, then stop it via the
@@ -123,6 +127,27 @@ def test_a_lease_wait_failure_routes_to_the_lease_wait_store_method() -> None:
     assert ("fail_lease_wait", "wat-1", "publish failed: lease_unavailable: held by x") in (
         store.calls
     )
+    assert not any(c[0] == "fail" for c in store.calls)
+
+
+def test_an_infra_wait_failure_routes_to_the_infra_wait_store_method() -> None:
+    store = ScriptedStore([_work({"kind": "infra"})])
+
+    def infra(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="executor infrastructure failure (agent principal isolation): socket inactive",
+            infra_wait=True,
+        )
+
+    daemon = WorkerDaemon(store, {"infra": infra}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert (
+        "fail_infra_wait",
+        "wat-1",
+        "executor infrastructure failure (agent principal isolation): socket inactive",
+    ) in store.calls
     assert not any(c[0] == "fail" for c in store.calls)
 
 

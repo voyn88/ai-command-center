@@ -1017,9 +1017,10 @@ def test_completion_without_a_result_is_refused_by_the_signature_itself(
             "WHERE n.nspname = 'public' AND p.proname LIKE 'queue\\_%%' "
             "AND p.proname NOT IN "
             "('queue_enqueue','queue_claim','queue_heartbeat','queue_complete',"
-            "'queue_fail','queue_fail_lease_wait','queue_reap','queue_redrive')"
+            "'queue_fail','queue_fail_lease_wait','queue_fail_infra_wait',"
+            "'queue_reap','queue_redrive')"
         )
-        assert cur.fetchone()[0] == 0, "a ninth queue entry point appeared"
+        assert cur.fetchone()[0] == 0, "an unexpected queue entry point appeared"
 
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         token, token_hash = _token()
@@ -1120,6 +1121,36 @@ def test_a_non_retryable_failure_dead_letters_without_spending_the_budget(
     state = _item(admin_conn, item_id)
     assert state[0] == "dead" and state[1] == 1 and state[2] == 5
     assert state[5] == "non_retryable: malformed payload"
+
+
+def test_infra_wait_failure_refunds_attempt_count_and_uses_its_own_budget(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "infra", max_attempts=1, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0] and verdict[4] == 1
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 2)",
+                (verdict[3], token, "executor infrastructure failure: launcher socket inactive"),
+            ) == (True, "infra_wait_requeued")
+
+    state = _item(admin_conn, item_id)
+    assert state[0] == "ready"
+    assert state[1] == 0, "infrastructure failures refund the claimed attempt"
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT infra_wait_count FROM work_item WHERE work_item_id = %s",
+            (item_id,),
+        )
+        assert cur.fetchone()[0] == 1
 
 
 def test_the_dead_letter_view_preserves_the_cause_and_the_history(

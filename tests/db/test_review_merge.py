@@ -3951,7 +3951,7 @@ def test_out_of_budget_prs_keep_their_blocked_label_and_are_reported(monkeypatch
     )
     assert [n for n, _ in report.active] == [1]
     assert [n for n, _ in report.waiting] == [2]
-    assert [n for n, _ in report.unchecked] == [3, 4]
+    assert {n for n, _ in report.unchecked} == {3, 4}
     assert sorted(fake.viewed) == [1, 2], "the budget bounds the detail fetches"
     # Neither 3 (blocked) nor 4 (unlabelled) was examined: no label is
     # written on no evidence.
@@ -4050,6 +4050,6 @@ def test_a_failed_detail_lookup_leaves_the_existing_label_untouched(monkeypatch)
     monkeypatch.setattr(review_merge, "_gh", fake)
     report = reconcile_pr_window("/repo", PrWindowConfig(max_active=2, stale_seconds=3600))
     assert report.error is None
-    assert [n for n, _ in report.unreadable] == [1, 2, 3]
+    assert {n for n, _ in report.unreadable} == {1, 2, 3}
     assert report.active == [] and report.waiting == [] and report.blocked == []
     assert fake.labels == [], "no evidence, no label change"

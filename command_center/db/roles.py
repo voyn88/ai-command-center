@@ -541,6 +541,10 @@ _WORKER_FUNCTIONS = (
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
     "queue_fail_lease_wait(text, text, text, integer)",
+    # A sibling refund path for host/launcher/provider infrastructure
+    # failures. These are not task attempts, but must still be bounded under
+    # their own wait budget.
+    "queue_fail_infra_wait(text, text, text, integer)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a

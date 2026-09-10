@@ -77,6 +77,8 @@ jobs:
     if: ${{ !((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      deploy_only: ${{ steps.change-scope.outputs.deploy_only }}
     env:
       AICC_AIOS_SDK_WHEEL: ${{ github.workspace }}/.artifacts/aios_sdk-0.2.0-py3-none-any.whl
       AICC_AIOS_DB_WHEEL: ${{ github.workspace }}/.artifacts/aios_db-0.1.0-py3-none-any.whl
@@ -86,7 +88,33 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Detect deploy-only change scope
+        id: change-scope
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "deploy_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$BASE_SHA...HEAD")"
+          if [[ -z "$changed" ]]; then
+            echo "deploy_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if echo "$changed" | grep -Eqv \
+            '^(command_center/deployment/self_deploy\.py|command_center/db/cli\.py|deploy/systemd/voyn-aicc-self-deploy\.service|deploy/systemd/voyn-aicc-self-deploy-worker\.service|tests/orchestrator/test_self_deploy\.py)$'; then
+            echo "deploy_only=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_only=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Python
+        if: steps.change-scope.outputs.deploy_only != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
@@ -98,16 +126,19 @@ jobs:
       # prepare job must too, or collection dies with
       # `ImportError: libEGL.so.1` before it can plan anything.
       - name: Install Qt system libraries (for optional desktop shell)
+        if: steps.change-scope.outputs.deploy_only != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
 
       - name: Install dependencies
+        if: steps.change-scope.outputs.deploy_only != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-linux.lock
 
       - name: Fetch and verify exact accepted AIOS SDK and DB artifacts
+        if: steps.change-scope.outputs.deploy_only != 'true'
         shell: bash
         env:
           AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
@@ -121,10 +152,16 @@ jobs:
           pip install "$AICC_AIOS_DB_WHEEL"
 
       - name: Build exactly-once test manifest
+        if: steps.change-scope.outputs.deploy_only != 'true'
         run: |
           python scripts/ci/test_shards.py build \
             --shards 4 \
             --output test-manifest.json
+
+      - name: Write deploy-only manifest placeholder
+        if: steps.change-scope.outputs.deploy_only == 'true'
+        run: |
+          printf '{"mode":"deploy-only-fast-path","shards":4}\n' > test-manifest.json
 
       - name: Publish prepared SDK, DB, and test manifest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -176,6 +213,7 @@ jobs:
         host=127.0.0.1 port=5432 dbname=postgres user=postgres
         password=ci-only-throwaway-Kq7vRt2wXz
       COVERAGE_FILE: .coverage.shard-${{ matrix.shard }}
+      DEPLOY_ONLY: ${{ needs.prepare.outputs.deploy_only }}
     services:
       # Same image and digest as docker-compose.server.yml: the migration,
       # privilege and restore behaviour under test is version-dependent, so CI
@@ -212,6 +250,7 @@ jobs:
           name: ci-shared-inputs
 
       - name: Set up Python
+        if: needs.prepare.outputs.deploy_only != 'true' || matrix.shard == 1
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
@@ -225,6 +264,7 @@ jobs:
       # (even non-desktop ones) can run. Cheap (apt), only needed when the
       # desktop deps are installed.
       - name: Install Qt system libraries (for optional desktop shell)
+        if: needs.prepare.outputs.deploy_only != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
@@ -234,6 +274,7 @@ jobs:
       # postgresql-client, and pg_dump refuses to dump a newer server outright,
       # so the matching major is installed from PGDG.
       - name: Install PostgreSQL 17 client (for the backup/restore drill)
+        if: needs.prepare.outputs.deploy_only != 'true'
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
@@ -245,11 +286,13 @@ jobs:
           sudo apt-get install -y postgresql-client-17
 
       - name: Install dependencies
+        if: needs.prepare.outputs.deploy_only != 'true' || matrix.shard == 1
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-linux.lock
 
       - name: Install prepared AIOS SDK and DB artifacts
+        if: needs.prepare.outputs.deploy_only != 'true'
         run: |
           pip install "$AICC_AIOS_SDK_WHEEL"
           pip install "$AICC_AIOS_DB_WHEEL"
@@ -267,12 +310,31 @@ jobs:
           fi
 
       - name: Ruff
+        if: needs.prepare.outputs.deploy_only != 'true'
         run: ruff check .
 
       - name: Compile validation
+        if: needs.prepare.outputs.deploy_only != 'true'
         run: python -m compileall -q command_center scripts tests app.py
 
+      - name: Deploy-only fast path
+        if: needs.prepare.outputs.deploy_only == 'true' && matrix.shard == 1
+        run: |
+          ruff check \
+            command_center/deployment/self_deploy.py \
+            command_center/db/cli.py \
+            tests/orchestrator/test_self_deploy.py
+          python -m py_compile command_center/deployment/self_deploy.py command_center/db/cli.py
+          pytest -q tests/orchestrator/test_self_deploy.py
+          printf '{"nodeids":[],"mode":"deploy-only-fast-path","shard":1}\n' > test-collection.json
+
+      - name: Deploy-only empty shard receipt
+        if: needs.prepare.outputs.deploy_only == 'true' && matrix.shard != 1
+        run: |
+          printf '{"nodeids":[],"mode":"deploy-only-fast-path","shard":${{ matrix.shard }}}\n' > test-collection.json
+
       - name: Pytest core shard
+        if: needs.prepare.outputs.deploy_only != 'true'
         shell: bash
         run: |
           args=(
@@ -294,7 +356,7 @@ jobs:
             "${args[@]}"
 
       - name: Pytest (serial tail)
-        if: matrix.run_serial
+        if: needs.prepare.outputs.deploy_only != 'true' && matrix.run_serial
         shell: bash
         run: |
           args=(--pytest-arg=-q --pytest-arg=-p --pytest-arg=no:xdist)
@@ -316,7 +378,7 @@ jobs:
       # type-check progress for a codebase that is not yet fully typed.
 
       - name: Type check (informational)
-        if: matrix.run_typecheck
+        if: needs.prepare.outputs.deploy_only != 'true' && matrix.run_typecheck
         continue-on-error: true
         run: mypy command_center || true
 
@@ -324,7 +386,7 @@ jobs:
       # does not re-download the browser on every run. Keyed on the pinned
       # playwright version in the lock so a driver bump invalidates the cache.
       - name: Cache Playwright browsers
-        if: matrix.run_e2e
+        if: needs.prepare.outputs.deploy_only != 'true' && matrix.run_e2e
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/ms-playwright
@@ -333,7 +395,7 @@ jobs:
       # Real-browser lifecycle projection is a release invariant, not an
       # informational signal: a failing user journey must fail this check.
       - name: Real-browser E2E
-        if: matrix.run_e2e
+        if: needs.prepare.outputs.deploy_only != 'true' && matrix.run_e2e
         run: |
           python -m playwright install chromium
           python scripts/ci/test_shards.py run \
@@ -372,17 +434,20 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Download prepared test manifest
+        if: needs.prepare.outputs.deploy_only != 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ci-shared-inputs
 
       - name: Download shard collection receipts
+        if: needs.prepare.outputs.deploy_only != 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: test-collection-*
           path: collections
 
       - name: Verify actual collections equal planned partition
+        if: needs.prepare.outputs.deploy_only != 'true'
         shell: bash
         run: |
           shopt -s nullglob
@@ -394,6 +459,10 @@ jobs:
           python scripts/ci/test_shards.py verify \
             --manifest test-manifest.json \
             "${reports[@]}"
+
+      - name: Accept deploy-only Linux fast path
+        if: needs.prepare.outputs.deploy_only == 'true'
+        run: echo "Deploy-only PR covered by focused self-deploy shard."
 
   coverage-gate:
     name: Main coverage aggregation

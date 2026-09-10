@@ -72,6 +72,11 @@ class HandlerOutcome:
     # instead. Meaningless when `ok` is True and implies `retryable` --
     # there is no such thing as a non-retryable lease wait.
     lease_wait: bool = False
+    # Same refund semantics for failures in the host/launcher/provider
+    # substrate. These are not task attempts: a missing systemd socket, a
+    # broken sandbox, or a provider outage says the work did not get a fair
+    # execution slot.
+    infra_wait: bool = False
 
 
 class Handler(Protocol):
@@ -313,6 +318,8 @@ class WorkerDaemon:
                 accepted = self._store.complete(work, outcome.result)
             elif outcome.lease_wait:
                 accepted = self._store.fail_lease_wait(work, reason=outcome.reason)
+            elif outcome.infra_wait:
+                accepted = self._store.fail_infra_wait(work, reason=outcome.reason)
             else:
                 accepted = self._store.fail(
                     work, reason=outcome.reason, retryable=outcome.retryable

@@ -281,6 +281,23 @@ def test_committed_control_unit_deploys_an_immutable_release():
     assert "exec /opt/aicc/current/.venv/bin/python" in service
 
 
+def test_committed_worker_unit_deploys_an_immutable_release_without_migrations():
+    root = Path(__file__).parents[2]
+    service = (
+        root / "deploy/systemd/voyn-aicc-self-deploy-worker.service"
+    ).read_text()
+
+    assert "WorkingDirectory=/opt/aicc/current" in service
+    assert "--release-root /opt/aicc" in service
+    assert "--release-venv ${AICC_RUNTIME_VENV}" in service
+    assert "--repo-path ${AICC_SOURCE_REPO}" in service
+    assert "--migrate" not in service
+    assert "--restart voyn-aicc-worker@1.service" in service
+    assert "--restart voyn-aicc-worker@4.service" in service
+    assert "source ${AICC_PREPROD_ROOT}/worker.env" in service
+    assert "exec /opt/aicc/current/.venv/bin/python" in service
+
+
 def test_noop_looking_migration_still_records_unrolled_back_write(
     pair, calls, tmp_path, monkeypatch
 ):

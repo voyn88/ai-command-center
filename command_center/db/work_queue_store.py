@@ -148,6 +148,21 @@ class WorkQueueStore:
         )
         return bool(row["ok"])
 
+    def fail_infra_wait(
+        self, work: ClaimedWork, *, reason: str, max_infra_waits: int = 20
+    ) -> bool:
+        """Report a host/launcher/provider infrastructure failure.
+
+        Like ``fail_lease_wait``, this refunds the attempt spent by
+        ``queue_claim`` and uses a separate bounded wait counter so broken
+        infrastructure retries without consuming the task's own attempts.
+        """
+        row = self._call(
+            "SELECT * FROM queue_fail_infra_wait(%s, %s, %s, %s)",
+            (work.attempt_id, work.claim_token, reason, max_infra_waits),
+        )
+        return bool(row["ok"])
+
     # -- enqueue (control plane, app role) ------------------------------------
 
     def enqueue(
