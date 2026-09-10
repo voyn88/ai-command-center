@@ -6,6 +6,7 @@ from pathlib import Path
 from command_center.ops import infra_monitor
 from command_center.ops.infra_monitor import (
     QueueSnapshot,
+    SourceCloneSnapshot,
     evaluate,
     parse_worker_units,
     prometheus_is_ready,
@@ -226,11 +227,21 @@ def test_prometheus_probe_rejects_non_http_urls() -> None:
 def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
     worker_unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
     queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
+    refresh_unit = Path(
+        "deploy/systemd/voyn-aicc-source-clone-refresh.service"
+    ).read_text()
+    refresh_timer = Path(
+        "deploy/systemd/voyn-aicc-source-clone-refresh.timer"
+    ).read_text()
 
     assert "--skip-queue" in worker_unit
+    assert "Environment=AICC_SOURCE_CLONE_REPO=." in worker_unit
     assert "EnvironmentFile=" not in worker_unit
     assert "--skip-workers" in queue_unit
     assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" in queue_unit
+    assert "command_center.ops.source_clone_refresh" in refresh_unit
+    assert "ReadWritePaths=/home/voynadmin/aicc-preprod/repo" in refresh_unit
+    assert "Unit=voyn-aicc-source-clone-refresh.service" in refresh_timer
 
 
 def test_evaluate_can_skip_queue_without_hiding_worker_failures() -> None:
@@ -312,8 +323,15 @@ def test_main_skip_workers_reads_queue_without_inspecting_systemd(
 def _queue(**kw):
     from command_center.ops.infra_monitor import QueueSnapshot
 
-    base = dict(ready=3, claimed=2, succeeded=100, dead=0, success_age_seconds=200.0,
-                pending_age_seconds=60.0, recent_dead=0)
+    base = dict(
+        ready=3,
+        claimed=2,
+        succeeded=100,
+        dead=0,
+        success_age_seconds=200.0,
+        pending_age_seconds=60.0,
+        recent_dead=0,
+    )
     base.update(kw)
     return QueueSnapshot(**base)
 
@@ -321,9 +339,14 @@ def _queue(**kw):
 def test_executor_quota_refusals_are_their_own_failure_class() -> None:
     from command_center.ops.infra_monitor import evaluate
 
-    report = evaluate({"voyn-aicc-worker@1.service": "active"}, _queue(recent_dead=2, recent_quota_dead=2),
-                      minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True,
-                      max_recent_dead=5)
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_dead=2, recent_quota_dead=2),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=5,
+    )
     assert "executor_quota_exhausted:2" in report.failures
     assert not any(f.startswith("dead_letter_growth") for f in report.failures)
 
@@ -333,40 +356,70 @@ def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> N
 
     # Pending age keeps resetting (items re-claimed), so queue_stalled does
     # not fire -- but nothing succeeded for an hour while work is waiting.
-    report = evaluate({"voyn-aicc-worker@1.service": "active"}, _queue(recent_succeeded=0),
-                      minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True)
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_succeeded=0),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
     assert report.failures == ("throughput_stalled:0_succeeded_in_1h",)
-    healthy = evaluate({"voyn-aicc-worker@1.service": "active"}, _queue(recent_succeeded=4),
-                       minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True)
+    healthy = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_succeeded=4),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
     assert healthy.ok
 
 
-def test_findings_are_recorded_and_cleared_through_the_definer_functions(monkeypatch) -> None:
+def test_findings_are_recorded_and_cleared_through_the_definer_functions(
+    monkeypatch,
+) -> None:
     from command_center.ops import infra_monitor
 
     calls: list[tuple] = []
 
     class _Cur:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def execute(self, sql, params=None): calls.append((sql.strip(), params))
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            calls.append((sql.strip(), params))
 
     class _Conn:
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def cursor(self): return _Cur()
-        def commit(self): calls.append(("commit", None))
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+        def commit(self):
+            calls.append(("commit", None))
 
     class _Pool:
         @staticmethod
-        def open_pool(cfg): calls.append(("open", None))
+        def open_pool(cfg):
+            calls.append(("open", None))
+
         @staticmethod
-        def connection(): return _Conn()
+        def connection():
+            return _Conn()
+
         @staticmethod
-        def close_pool(): calls.append(("close", None))
+        def close_pool():
+            calls.append(("close", None))
 
     import sys
     import types
+
     fake_db = types.ModuleType("command_center.db")
     fake_db.pool = _Pool
     fake_cfg = types.ModuleType("command_center.db.config")
@@ -380,17 +433,25 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(monkeyp
     # same red probe measured 2<4 then 1<4 is ONE finding, not two tasks.
     assert recorded[0][1][:2] == ("worker-01:infra", "active_workers")
     assert json.loads(recorded[0][1][2]) == {"x": 1, "failure": "active_workers:2<4"}
-    assert infra_monitor.finding_key("dead_letter_growth:53>0") == infra_monitor.finding_key("dead_letter_growth:54>0") == "dead_letter_growth"
+    assert (
+        infra_monitor.finding_key("dead_letter_growth:53>0")
+        == infra_monitor.finding_key("dead_letter_growth:54>0")
+        == "dead_letter_growth"
+    )
     calls.clear()
     infra_monitor.record_findings("worker-01:infra", (), {})
     assert any("monitor_clear_finding" in c[0] for c in calls)
 
 
-def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(monkeypatch, capsys) -> None:
+def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(
+    monkeypatch, capsys
+) -> None:
     """Review of fc167cf7: a healthy measurement whose persistence failed
     exited 0, so a broken finding store passed unnoticed. Fail closed."""
     monkeypatch.setattr(
-        infra_monitor, "discover_worker_units", lambda: {"voyn-aicc-worker@1.service": "active"}
+        infra_monitor,
+        "discover_worker_units",
+        lambda: {"voyn-aicc-worker@1.service": "active"},
     )
     monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
     monkeypatch.setattr(
@@ -399,8 +460,15 @@ def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(mo
         lambda source, failures, detail: (_ for _ in ()).throw(RuntimeError("db down")),
     )
     result = infra_monitor.main(
-        ["--minimum-active-workers", "1", "--skip-queue", "--prometheus-url", "http://m/ready",
-         "--record-findings", "worker-01:infra"]
+        [
+            "--minimum-active-workers",
+            "1",
+            "--skip-queue",
+            "--prometheus-url",
+            "http://m/ready",
+            "--record-findings",
+            "worker-01:infra",
+        ]
     )
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True and out["findings_recorded"] is False
@@ -499,7 +567,9 @@ def test_a_probe_that_could_not_measure_is_its_own_failure_class(monkeypatch) ->
     monkeypatch.setattr(
         infra_monitor,
         "_open_prs",
-        lambda repo, limit: (_ for _ in ()).throw(RuntimeError("gh pr list failed: 403")),
+        lambda repo, limit: (_ for _ in ()).throw(
+            RuntimeError("gh pr list failed: 403")
+        ),
     )
     monkeypatch.setattr(infra_monitor, "read_pr_evidence", frozenset)
 
@@ -562,18 +632,26 @@ def test_the_probe_costs_one_github_request_and_is_off_by_default(monkeypatch) -
     assert "sort:created-asc" in calls[0]
     assert "--limit" in calls[0] and "200" in calls[0]
     assert "statusCheckRollup" not in " ".join(calls[0])
-    assert infra_monitor.build_parser().parse_args(
-        ["--prometheus-url", "http://m/ready"]
-    ).pr_window_repo == ""
+    assert (
+        infra_monitor.build_parser()
+        .parse_args(["--prometheus-url", "http://m/ready"])
+        .pr_window_repo
+        == ""
+    )
     # The control unit turns it on by environment, because its ExecStart names
     # an absolute home path this public repository cannot restate.
     monkeypatch.setenv("AICC_PR_WINDOW_REPO", "/clone")
-    assert infra_monitor.build_parser().parse_args(
-        ["--prometheus-url", "http://m/ready"]
-    ).pr_window_repo == "/clone"
+    assert (
+        infra_monitor.build_parser()
+        .parse_args(["--prometheus-url", "http://m/ready"])
+        .pr_window_repo
+        == "/clone"
+    )
 
 
-def test_main_skips_the_pr_window_probe_unless_a_repo_is_given(monkeypatch, capsys) -> None:
+def test_main_skips_the_pr_window_probe_unless_a_repo_is_given(
+    monkeypatch, capsys
+) -> None:
     monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
     monkeypatch.setattr(
         infra_monitor,
@@ -582,15 +660,23 @@ def test_main_skips_the_pr_window_probe_unless_a_repo_is_given(monkeypatch, caps
     )
 
     result = infra_monitor.main(
-        ["--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
-         "--prometheus-url", "http://m/ready"]
+        [
+            "--skip-workers",
+            "--skip-queue",
+            "--minimum-active-workers",
+            "0",
+            "--prometheus-url",
+            "http://m/ready",
+        ]
     )
 
     assert json.loads(capsys.readouterr().out)["pr_window"] is None
     assert result == 0
 
 
-def test_main_reports_the_pr_window_probe_when_a_repo_is_given(monkeypatch, capsys) -> None:
+def test_main_reports_the_pr_window_probe_when_a_repo_is_given(
+    monkeypatch, capsys
+) -> None:
     monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
     monkeypatch.setattr(
         infra_monitor,
@@ -604,8 +690,16 @@ def test_main_reports_the_pr_window_probe_when_a_repo_is_given(monkeypatch, caps
     )
 
     result = infra_monitor.main(
-        ["--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
-         "--prometheus-url", "http://m/ready", "--pr-window-repo", "/repo"]
+        [
+            "--skip-workers",
+            "--skip-queue",
+            "--minimum-active-workers",
+            "0",
+            "--prometheus-url",
+            "http://m/ready",
+            "--pr-window-repo",
+            "/repo",
+        ]
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -629,3 +723,119 @@ def test_the_control_probe_watches_the_pr_window_and_records_its_findings() -> N
     assert "Environment=AICC_PR_WINDOW_REPO=." in queue_unit
     assert "--record-findings" not in worker_unit
     assert "AICC_PR_WINDOW_REPO" not in worker_unit
+
+
+# ---------------------------------------------------------------------------
+# The source clone that isolated read-only review lanes clone from.
+#
+# VOYN-W0-AICC-BOUND-SOURCE-CLONE-NEVER-REFRESHED: review lanes used a local
+# bound clone whose HEAD could sit behind origin indefinitely, so every
+# detached read-only checkout was faithfully cloned from stale source.
+# ---------------------------------------------------------------------------
+
+
+def test_source_clone_staleness_is_its_own_failure_class() -> None:
+    snapshot = SourceCloneSnapshot(
+        path="/repo",
+        local_head="a" * 40,
+        remote_head="b" * 40,
+        stale=True,
+    )
+
+    report = evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        source_clone=snapshot,
+    )
+
+    assert report.failures == ("source_clone_stale:aaaaaaaaaaaa!=bbbbbbbbbbbb",)
+    assert infra_monitor.finding_key(report.failures[0]) == "source_clone_stale"
+
+
+def test_source_clone_probe_failure_fails_closed() -> None:
+    snapshot = SourceCloneSnapshot(
+        path="/repo",
+        local_head=None,
+        remote_head=None,
+        stale=True,
+        error="RuntimeError: origin unreachable",
+    )
+
+    report = evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        source_clone=snapshot,
+    )
+
+    assert report.failures == (
+        "source_clone_probe_failed:RuntimeError: origin unreachable",
+    )
+    assert infra_monitor.finding_key(report.failures[0]) == "source_clone_probe_failed"
+
+
+def test_source_clone_snapshot_uses_git_and_never_raises(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_git(repo, args, **kwargs):
+        calls.append(args)
+        if args == ["rev-parse", "HEAD"]:
+            return "a" * 40
+        if args == ["ls-remote", "origin", "HEAD"]:
+            return f"{'b' * 40}\tHEAD"
+        raise AssertionError(args)
+
+    monkeypatch.setattr(infra_monitor, "_git_stdout", fake_git)
+    stale = infra_monitor.read_source_clone_snapshot("/repo")
+    assert (
+        stale.stale and stale.local_head == "a" * 40 and stale.remote_head == "b" * 40
+    )
+    assert calls == [["rev-parse", "HEAD"], ["ls-remote", "origin", "HEAD"]]
+
+    monkeypatch.setattr(
+        infra_monitor,
+        "_git_stdout",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("git broken")),
+    )
+    failed = infra_monitor.read_source_clone_snapshot("/repo")
+    assert failed.stale and "git broken" in (failed.error or "")
+
+
+def test_main_reports_the_source_clone_probe_when_a_repo_is_given(
+    monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor,
+        "read_source_clone_snapshot",
+        lambda repo: SourceCloneSnapshot(
+            path=repo,
+            local_head="a" * 40,
+            remote_head="b" * 40,
+            stale=True,
+        ),
+    )
+
+    result = infra_monitor.main(
+        [
+            "--skip-workers",
+            "--skip-queue",
+            "--minimum-active-workers",
+            "0",
+            "--prometheus-url",
+            "http://m/ready",
+            "--source-clone-repo",
+            "/repo",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source_clone"]["path"] == "/repo"
+    assert payload["source_clone"]["stale"] is True
+    assert any(f.startswith("source_clone_stale:") for f in payload["failures"])
+    assert result == 1

@@ -79,6 +79,7 @@ RELEASE_ROOT = Path("/opt/aicc/releases")
 LANE_MUTATING_TIMERS = (
     "voyn-aicc-credential-rotation.timer",
     "voyn-aicc-self-deploy.timer",
+    "voyn-aicc-source-clone-refresh.timer",
 )
 
 # Shared with DEFAULT_ROLLOUT_LOCK_PATH in command_center/ops/
@@ -191,7 +192,9 @@ def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
             return tuple(chain)
         target = os.readlink(current)
         current = Path(target) if os.path.isabs(target) else current.parent / target
-    raise RolloutError(f"AICC release interpreter symlink chain is too deep: {executable}")
+    raise RolloutError(
+        f"AICC release interpreter symlink chain is too deep: {executable}"
+    )
 
 
 def verify_immutable_release() -> None:
@@ -252,9 +255,7 @@ class Systemd:
     def run(self, *args: str, check: bool = True) -> str:
         returncode, stdout, stderr = self.probe(*args)
         if check and returncode:
-            raise RolloutError(
-                stderr or f"systemctl {' '.join(args)} failed"
-            )
+            raise RolloutError(stderr or f"systemctl {' '.join(args)} failed")
         return stdout
 
     def property(self, unit: str, name: str) -> str:
@@ -390,12 +391,8 @@ def _listed_instances(
             # status stays fail-closed, and `list-units` below never gets
             # this tolerance.
             returncode, stdout, stderr = systemd.probe(*command)
-            if returncode and not (
-                returncode == 1 and not stdout and not stderr
-            ):
-                raise RolloutError(
-                    stderr or f"systemctl {' '.join(command)} failed"
-                )
+            if returncode and not (returncode == 1 and not stdout and not stderr):
+                raise RolloutError(stderr or f"systemctl {' '.join(command)} failed")
             output = stdout
         else:
             output = systemd.run(*command, check=check)
@@ -460,9 +457,7 @@ def verify_snapshot_closure(systemd: Systemd, state: dict[str, object]) -> None:
     )
     extras = sorted(discovered - expected)
     if extras:
-        raise RolloutError(
-            f"template units exist outside service snapshot: {extras}"
-        )
+        raise RolloutError(f"template units exist outside service snapshot: {extras}")
 
 
 def hold_lane_mutating_timers(systemd: Systemd) -> None:
@@ -513,9 +508,7 @@ def write_rollout_lock() -> None:
     observes a partially written file.
     """
     ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    temporary = ROLLOUT_LOCK_PATH.with_name(
-        f".{ROLLOUT_LOCK_PATH.name}.{os.getpid()}"
-    )
+    temporary = ROLLOUT_LOCK_PATH.with_name(f".{ROLLOUT_LOCK_PATH.name}.{os.getpid()}")
     temporary.write_text(f"{os.getpid()}\n", encoding="utf-8")
     temporary.chmod(0o644)
     os.replace(temporary, ROLLOUT_LOCK_PATH)
@@ -607,17 +600,13 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
                 "show", unit, "--property=LoadState", "--value"
             )
             if load_returncode or not load_before:
-                raise RolloutError(
-                    f"cannot prove absent service load state: {unit}"
-                )
+                raise RolloutError(f"cannot prove absent service load state: {unit}")
             initially_not_found = load_before == "not-found"
             if not initially_not_found:
                 systemd.run("stop", unit, check=False)
                 systemd.run("disable", unit, check=False)
             active_rc, active, _active_stderr = systemd.probe("is-active", unit)
-            enabled_rc, enabled, _enabled_stderr = systemd.probe(
-                "is-enabled", unit
-            )
+            enabled_rc, enabled, _enabled_stderr = systemd.probe("is-enabled", unit)
             load_rc, load_state, _post_load_stderr = systemd.probe(
                 "show", unit, "--property=LoadState", "--value"
             )
@@ -644,9 +633,7 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
             )
             enablement_absent = enabled in {"disabled", "not-found"}
             runtime_absent = (
-                active == "inactive"
-                and load_state == "not-found"
-                and main_pid == "0"
+                active == "inactive" and load_state == "not-found" and main_pid == "0"
             )
             # The generator may be executing inside its own recovery service,
             # so it cannot prove that service inactive/unloaded until it exits.
@@ -691,7 +678,11 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
             load_state in {"", "not-found"}
             or ((active == "active") is not expected_active and not activating_start)
             or ((enabled == "enabled") is not (raw.get("enabled") is True))
-            or (active != "active" and not activating_start and main_pid not in {"", "0"})
+            or (
+                active != "active"
+                and not activating_start
+                and main_pid not in {"", "0"}
+            )
         ):
             raise RolloutError(f"service snapshot did not restore exactly: {unit}")
         if version == 3:
@@ -888,9 +879,8 @@ def _lane_inputs_visible(
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip().splitlines()
-            return (
-                f"{path} is not usable inside the lane namespace as uid {uid}"
-                + (f": {detail[0][:160]}" if detail else "")
+            return f"{path} is not usable inside the lane namespace as uid {uid}" + (
+                f": {detail[0][:160]}" if detail else ""
             )
     return None
 
@@ -1051,7 +1041,9 @@ def verify_unit(
         if value.startswith(DATA_DIR_ENVIRONMENT_KEY + "=")
     )
     if len(data_dirs) != 1 or not data_dirs[0].startswith("/"):
-        raise RolloutError(f"{unit} MainPID has no single absolute {DATA_DIR_ENVIRONMENT_KEY}")
+        raise RolloutError(
+            f"{unit} MainPID has no single absolute {DATA_DIR_ENVIRONMENT_KEY}"
+        )
     failure = lane_inputs_visible(int(raw_pid), unit_uid, data_dirs[0], environment)
     if failure is not None:
         raise RolloutError(f"{unit} cannot read its task inputs: {failure}")
@@ -1097,7 +1089,9 @@ def verify_all(
 _environment_file_exists = os.path.exists
 
 
-def verify_required_environment_files(systemd: "Systemd", units: tuple[str, ...]) -> None:
+def verify_required_environment_files(
+    systemd: "Systemd", units: tuple[str, ...]
+) -> None:
     """Refuse before the first mutation if a required environment file is
     absent from the host.
 
@@ -1181,9 +1175,7 @@ def rollout(
     try:
         try:
             agent_uid = uid_for_user(agent_user)
-            privileged_uids = frozenset(
-                uid_for_user(user) for user in privileged_users
-            )
+            privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
             # verify_all() has always refused an aliased agent/privileged UID,
             # but a caller invoking this mutating rollout directly (bypassing
             # the separate shell verifier) was not protected by that check:
@@ -1206,9 +1198,7 @@ def rollout(
                 if systemd.property(unit, "ActiveState") != "inactive":
                     raise RolloutError(f"{unit} did not drain to inactive")
                 if systemd.property(unit, "MainPID") != "0":
-                    raise RolloutError(
-                        f"{unit} retained a stale MainPID after drain"
-                    )
+                    raise RolloutError(f"{unit} retained a stale MainPID after drain")
                 # A daemon-reload or drop-in replacement may race the drain.
                 # The final pre-start check makes that race fail closed too.
                 verify_unit_configuration(systemd, unit)
@@ -1299,9 +1289,7 @@ def main() -> int:
         payload = json.dumps(
             snapshot(
                 systemd,
-                tuple(
-                    sorted({*units, *included, *discover_launcher_units(systemd)})
-                ),
+                tuple(sorted({*units, *included, *discover_launcher_units(systemd)})),
             ),
             sort_keys=True,
         ).encode()

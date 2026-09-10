@@ -58,7 +58,10 @@ UnsetEnvironment=ANTHROPIC_API_KEY
 # ADR-0010 invariant: the worker neither receives sudo nor selects a
 # privileged command (review finding on 6218a21).
 NoNewPrivileges=yes
-ExecStartPre=/usr/bin/install -m 0600 %d/voyn_lease_pgpass /run/aicc-worker-lanes/%i/pgpass
+# Prefer systemd's credential directory. Some privileged CI containers do not
+# materialise LoadCredential= under %d; in that harness shape only, copy from
+# the same root-only source path the credential loader would have used.
+ExecStartPre=+/bin/sh -c 'src="${CREDENTIALS_DIRECTORY:-}/voyn_lease_pgpass"; [ -r "$src" ] || src=/etc/voyn/secrets/voyn_lease_pgpass; exec /usr/bin/install -o aicc-worker -g aicc-worker -m 0600 "$src" /run/aicc-worker-lanes/%i/pgpass'
 # This final argv assignment cannot be overridden by EnvironmentFile values.
 ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.worker
 ExecReload=/bin/kill -HUP $MAINPID

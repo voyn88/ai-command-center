@@ -109,6 +109,8 @@ for _ in $(seq 1 30); do [ "$(systemctl show voyn-aicc-worker@2 -p StatusText --
 [ "$(stat -c %U /run/voyn-aicc-worker)" = voynadmin ] || fail "legacy runtime root is not owned by voynadmin (test shape)"
 
 log "immutable release at /opt/aicc/releases/<sha> the installer would stage"
+git config --global --add safe.directory "$REPO"
+git config --global --add safe.directory "$REPO/.git"
 sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo 0000000000000000000000000000000000000000)
 release=/opt/aicc/releases/$sha
 install -d -m 0755 /opt/aicc/releases
@@ -138,7 +140,20 @@ install -m 0644 "$REPO/deploy/aicc/worker-lanes" /etc/aicc/worker-lanes
 install -m 0644 "$REPO/deploy/aicc/privileged-principals" /etc/aicc/privileged-principals
 install -m 0644 "$REPO/deploy/aicc/agent-workspace-roots" /etc/aicc/agent-workspace-roots
 install -m 0640 -g aicc-agent "$REPO/deploy/aicc/agent.env" /etc/aicc/agent.env
-mkdir -p /home/voynadmin/Projects/ai-command-center
+install -m 0644 "$REPO/deploy/aicc/gitconfig" /etc/aicc/gitconfig
+mkdir -p /home/voynadmin/Projects
+git init --quiet /home/voynadmin/Projects/ai-command-center
+chown -R voynadmin:voynadmin /home/voynadmin/Projects/ai-command-center
+install -d -m 0750 -o aicc-worker -g aicc-worker /var/lib/aicc/data
+cat > /var/lib/aicc/data/project_config.json <<'JSON'
+{
+  "AICC": {
+    "repository_path": "/home/voynadmin/Projects/ai-command-center"
+  }
+}
+JSON
+chown aicc-worker:aicc-worker /var/lib/aicc/data/project_config.json
+chmod 0640 /var/lib/aicc/data/project_config.json
 
 log "install the isolated template + drop-in over the legacy template (lane 2 keeps running)"
 install -m 0644 "$REPO/deploy/systemd/voyn-aicc-worker@.service" /etc/systemd/system/voyn-aicc-worker@.service
@@ -175,8 +190,8 @@ log "assertions on the isolated lane"
 [ "$(systemctl show voyn-aicc-worker@1 -p User --value)" = aicc-worker ] || fail "lane 1 is not User=aicc-worker"
 [ "$(systemctl show voyn-aicc-worker@1 -p StatusText --value)" = aicc-ready ] || fail "lane 1 is not READY"
 pid=$(systemctl show voyn-aicc-worker@1 -p MainPID --value)
-[ "$(stat -c %U /proc/$pid)" = aicc-worker ] || fail "lane 1 MainPID does not run as aicc-worker"
-tr '\0' '\n' < /proc/$pid/environ | grep -qx 'AICC_AGENT_PRINCIPAL_ISOLATION=required' || fail "isolation flag absent from the live process environment"
+[ "$(stat -c %U /proc/"$pid")" = aicc-worker ] || fail "lane 1 MainPID does not run as aicc-worker"
+tr '\0' '\n' < /proc/"$pid"/environ | grep -qx 'AICC_AGENT_PRINCIPAL_ISOLATION=required' || fail "isolation flag absent from the live process environment"
 [ -f /run/aicc-worker-lanes/1/pgpass ] || fail "credential was not installed under the lane's own runtime root (#858 shape)"
 [ ! -e /run/voyn-aicc-worker/1 ] || fail "isolated lane nested under the legacy runtime root"
 systemctl reload voyn-aicc-worker@1 || fail "lane 1 does not support reload (rotation needs it)"

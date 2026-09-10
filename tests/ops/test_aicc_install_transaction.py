@@ -393,9 +393,7 @@ def test_recovery_generator_rejects_selector_before_install_is_applied(
 @pytest.mark.parametrize(
     "journal_name", ["pending.json", "pending-release", "uninstall.json"]
 )
-def test_recovery_generator_rejects_dangling_journal_symlink(
-    tmp_path, journal_name
-):
+def test_recovery_generator_rejects_dangling_journal_symlink(tmp_path, journal_name):
     generator = _generator_module()
     state = tmp_path / "state"
     state.mkdir()
@@ -613,13 +611,9 @@ def test_transaction_host_lock_contends_and_adopts_the_inherited_inode(tmp_path)
     lock = tmp_path / "state" / "install-recovery.lock"
     lock.parent.mkdir(mode=0o700)
     uid, gid = os.geteuid(), os.getegid()
-    first = module._install_lock_fd(
-        lock, trusted_uid=uid, trusted_gid=gid
-    )
+    first = module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
     try:
-        adopted = module._install_lock_fd(
-            lock, first, trusted_uid=uid, trusted_gid=gid
-        )
+        adopted = module._install_lock_fd(lock, first, trusted_uid=uid, trusted_gid=gid)
         try:
             assert os.fstat(adopted).st_ino == os.fstat(first).st_ino
         finally:
@@ -701,9 +695,7 @@ def test_uninstall_wal_blocks_install_and_resumes_after_registry_removal(tmp_pat
         )
         == "INTENT"
     )
-    snapshot.write_text(
-        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
-    )
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
     snapshot.chmod(0o600)
     module.arm_uninstall(state, snapshot)
     lanes.unlink()
@@ -778,9 +770,7 @@ def test_uninstall_wal_refuses_registry_or_snapshot_drift(tmp_path):
             lane_registry=lanes,
         )
     lanes.write_text("blue\n", encoding="utf-8")
-    snapshot.write_text(
-        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
-    )
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
     snapshot.chmod(0o600)
     module.arm_uninstall(state, snapshot)
     snapshot.write_text("{}", encoding="utf-8")
@@ -818,9 +808,7 @@ def test_boot_recovery_aborts_unarmed_uninstall_intent_with_wal_last(tmp_path):
     assert not capsule.exists()
 
 
-def test_boot_recovery_completes_armed_uninstall_from_capsule(
-    monkeypatch, tmp_path
-):
+def test_boot_recovery_completes_armed_uninstall_from_capsule(monkeypatch, tmp_path):
     module = _module()
     root = tmp_path / "root"
     state = tmp_path / "state"
@@ -840,9 +828,7 @@ def test_boot_recovery_completes_armed_uninstall_from_capsule(
         json.dumps({"version": 2, "units": {}}), encoding="utf-8"
     )
     snapshot = state / "uninstall-units.json"
-    snapshot.write_text(
-        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
-    )
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
     snapshot.chmod(0o600)
     module.begin_uninstall(
         state,
@@ -862,9 +848,7 @@ def test_boot_recovery_completes_armed_uninstall_from_capsule(
     monkeypatch.setattr(
         module,
         "restore_service_snapshot",
-        lambda path, *, defer_starts=False: restored.append(
-            (path, defer_starts)
-        ),
+        lambda path, *, defer_starts=False: restored.append((path, defer_starts)),
     )
 
     module.recover_uninstall(state, root=root, boot=True)
@@ -959,9 +943,7 @@ def test_armed_uninstall_recovery_refuses_late_lane_before_mutation(
 def test_snapshot_closure_fails_closed_when_systemd_inventory_fails(tmp_path):
     module = _module()
     snapshot = tmp_path / "uninstall-units.json"
-    snapshot.write_text(
-        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
-    )
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
 
     def run(argv, **kwargs):
         return SimpleNamespace(returncode=1, stdout="", stderr="inventory failed")
@@ -983,9 +965,7 @@ def test_install_recovery_rechecks_closure_after_quiesce_before_mutation(
     transaction.prepare((_spec(module, source, "/etc/new"),))
     transaction.apply()
     snapshot = state / "attempt-units.json"
-    snapshot.write_text(
-        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
-    )
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
     checks = 0
 
     def closure(path, *, preserve_unsnapshotted_launchers=False):
@@ -1121,9 +1101,7 @@ def test_uninstall_completion_keeps_wal_until_all_adjuncts_are_durable(
         current_selector=current,
         lane_registry=lanes,
     )
-    snapshot.write_text(
-        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
-    )
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
     snapshot.chmod(0o600)
     module.arm_uninstall(state, snapshot)
     for name in ("baseline-units.json", "baseline-release", "attempt-units.json"):
@@ -1261,8 +1239,19 @@ def test_same_boot_barrier_is_active_before_first_wal_or_claimer_start():
     )
     prepare = commands.index("run_transaction prepare")
     launcher = commands.index("systemctl enable --now aicc-agent-launcher.socket")
+    source_refresh = commands.index(
+        "systemctl enable --now voyn-aicc-source-clone-refresh.timer"
+    )
 
-    assert anchor < inline_recover < reload_units < activate < prepare < launcher
+    assert (
+        anchor
+        < inline_recover
+        < reload_units
+        < activate
+        < prepare
+        < launcher
+        < source_refresh
+    )
     assert "systemctl enable aicc-principal-recovery.service" not in installer
 
 
@@ -1599,9 +1588,7 @@ def test_boot_restore_never_synchronously_stops_its_own_recovery_service(
         if "--property=LoadState" in argv:
             return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
         if "--property=MainPID" in argv:
-            return SimpleNamespace(
-                returncode=0, stdout=f"{os.getpid()}\n", stderr=""
-            )
+            return SimpleNamespace(returncode=0, stdout=f"{os.getpid()}\n", stderr="")
         if argv[1] == "is-active":
             return SimpleNamespace(returncode=0, stdout="active\n", stderr="")
         if argv[1] == "is-enabled":
@@ -1642,9 +1629,7 @@ def test_boot_restore_existing_inactive_recovery_defers_self_stop(tmp_path):
         if "--property=LoadState" in argv:
             return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
         if "--property=MainPID" in argv:
-            return SimpleNamespace(
-                returncode=0, stdout=f"{os.getpid()}\n", stderr=""
-            )
+            return SimpleNamespace(returncode=0, stdout=f"{os.getpid()}\n", stderr="")
         if argv[1] == "is-active":
             return SimpleNamespace(returncode=0, stdout="active\n", stderr="")
         if argv[1] == "is-enabled":
@@ -1654,8 +1639,7 @@ def test_boot_restore_existing_inactive_recovery_defers_self_stop(tmp_path):
     module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
 
     assert not any(
-        argv[1] in {"start", "stop"}
-        and argv[-1] == "aicc-principal-recovery.service"
+        argv[1] in {"start", "stop"} and argv[-1] == "aicc-principal-recovery.service"
         for argv in calls
     )
 
@@ -1765,9 +1749,7 @@ def test_commit_crash_after_pending_release_unlink_cannot_restore_old_selector(
     transaction = module.FileTransaction(root, state)
     transaction.prepare((_spec(module, source, "/etc/payload"),))
     transaction.apply()
-    transaction.pending_release.write_text(
-        f"releases/{'a' * 40}\n", encoding="ascii"
-    )
+    transaction.pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
     transaction.pending_release.chmod(0o600)
     real_unlink = module.Path.unlink
 
@@ -1803,9 +1785,7 @@ def test_committing_recovery_can_crash_after_selector_retirement_and_retry(
     transaction = module.FileTransaction(root, state)
     transaction.prepare((_spec(module, source, "/etc/payload"),))
     transaction.apply()
-    transaction.pending_release.write_text(
-        f"releases/{'a' * 40}\n", encoding="ascii"
-    )
+    transaction.pending_release.write_text(f"releases/{'a' * 40}\n", encoding="ascii")
     transaction.pending_release.chmod(0o600)
     real_unlink = module.Path.unlink
 
@@ -1913,9 +1893,7 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
         recording_selector_restore,
     )
     monkeypatch.setattr(module, "quiesce_service_snapshot", recording_quiesce)
-    monkeypatch.setattr(
-        module, "verify_service_snapshot_closure", recording_closure
-    )
+    monkeypatch.setattr(module, "verify_service_snapshot_closure", recording_closure)
     monkeypatch.setattr(module, "restore_service_snapshot", recording_service_restore)
 
     transaction.recover()
@@ -2316,11 +2294,13 @@ def test_the_retired_legacy_set_matches_the_rollout_and_the_installer():
         encoding="utf-8"
     )
     block = rollout_src.split("LEGACY_WORKER_UNITS = (", 1)[1].split(")", 1)[0]
-    rollout_units = {line.strip().strip('",') for line in block.splitlines() if line.strip()}
+    rollout_units = {
+        line.strip().strip('",') for line in block.splitlines() if line.strip()
+    }
 
-    installer = (
-        root / "deploy" / "install-agent-principal-isolation.sh"
-    ).read_text(encoding="utf-8")
+    installer = (root / "deploy" / "install-agent-principal-isolation.sh").read_text(
+        encoding="utf-8"
+    )
     included = {
         line.split("--include-unit", 1)[1].strip().rstrip("\\").strip()
         for line in installer.splitlines()
@@ -2339,7 +2319,9 @@ def test_a_boot_generated_dropin_is_not_required_to_match():
     restore on a host where nothing was wrong (worker-01, 2026-08-31).
     """
     module = _module()
-    snapshotted = "/run/systemd/generator.early/voyn-aicc-worker.service.d/10-aicc-recovery.conf"
+    snapshotted = (
+        "/run/systemd/generator.early/voyn-aicc-worker.service.d/10-aicc-recovery.conf"
+    )
 
     assert module._properties_match("DropInPaths", "", snapshotted)
 
@@ -2348,7 +2330,9 @@ def test_an_administrator_dropin_must_still_match():
     """The check exists because a silently added drop-in can weaken the
     isolation the snapshot preserves. Only the generated ones are exempt."""
     module = _module()
-    expected = "/etc/systemd/system/voyn-aicc-worker.service.d/20-principal-isolation.conf"
+    expected = (
+        "/etc/systemd/system/voyn-aicc-worker.service.d/20-principal-isolation.conf"
+    )
 
     assert not module._properties_match("DropInPaths", "", expected)
     assert module._properties_match("DropInPaths", expected, expected)
@@ -2633,9 +2617,7 @@ def test_a_failure_after_the_purge_rolls_the_purge_back_too(monkeypatch, tmp_pat
     assert not list(state.glob("generation-*"))
 
 
-def test_immediate_rollback_refuses_a_refilled_removed_directory(
-    monkeypatch, tmp_path
-):
+def test_immediate_rollback_refuses_a_refilled_removed_directory(monkeypatch, tmp_path):
     """An external writer can recreate a purged directory before synchronous
     rollback begins. Matching mode/owner is not enough: accepting an unknown
     entry would silently preserve state the generation never snapshotted."""
@@ -2748,7 +2730,9 @@ def test_removal_spec_restores_a_legacy_symlink_it_replaced(monkeypatch, tmp_pat
     (target_dir / "aicc-worker.service").symlink_to(elsewhere)
 
     transaction = module.FileTransaction(root, state)
-    transaction.prepare((module.removal_spec("/etc/systemd/system/aicc-worker.service"),))
+    transaction.prepare(
+        (module.removal_spec("/etc/systemd/system/aicc-worker.service"),)
+    )
     transaction.apply()
 
     installed = target_dir / "aicc-worker.service"
@@ -2930,7 +2914,8 @@ def test_quiesce_worker_only_units_refuses_when_stopping_a_loaded_unit_fails(
 ):
     module = _module()
     run = _purge_runner(
-        loaded={"aicc-agent-launcher.socket"}, disable_fails={"aicc-agent-launcher.socket"}
+        loaded={"aicc-agent-launcher.socket"},
+        disable_fails={"aicc-agent-launcher.socket"},
     )
 
     with pytest.raises(RuntimeError, match="cannot stop worker-only unit"):
@@ -3061,10 +3046,7 @@ def test_an_accepted_session_can_outlive_the_short_client_drain(tmp_path):
     slept = []
     launcher = "aicc-agent-launcher@long-running.service"
     budget = math.ceil(
-        (
-            module.MAX_ACCEPTED_LAUNCHER_SECONDS
-            + module.LAUNCHER_DRAIN_GRACE_SECONDS
-        )
+        (module.MAX_ACCEPTED_LAUNCHER_SECONDS + module.LAUNCHER_DRAIN_GRACE_SECONDS)
         / module.DRAIN_INTERVAL_SECONDS
     )
     run = _purge_runner(
@@ -3129,9 +3111,7 @@ def test_each_inactive_socket_residue_independently_prevents_drain(
             ),
         )
 
-    drained, why = module._unit_drained(
-        "aicc-agent-launcher.socket", run=run
-    )
+    drained, why = module._unit_drained("aicc-agent-launcher.socket", run=run)
 
     assert not drained
     assert reason in why
@@ -3147,9 +3127,7 @@ def test_a_session_that_never_drains_closes_admission_for_outer_recovery(tmp_pat
     run = _purge_runner(
         launchers=("aicc-agent-launcher@7.service",),
         loaded={"aicc-agent-launcher.socket", "aicc-agent-launcher@7.service"},
-        busy={
-            "aicc-agent-launcher@7.service": module.LAUNCHER_DRAIN_ATTEMPTS
-        },
+        busy={"aicc-agent-launcher@7.service": module.LAUNCHER_DRAIN_ATTEMPTS},
         calls=calls,
     )
 
@@ -3482,6 +3460,14 @@ def test_the_control_purge_covers_every_retired_worker_unit():
 
     assert module.RETIRED_LEGACY_UNITS < module.CONTROL_PURGE_UNITS
     assert "aicc-agent-launcher.socket" in module.CONTROL_PURGE_UNITS
+    assert (
+        "/etc/systemd/system/voyn-aicc-source-clone-refresh.service"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer"
+        in module.WORKER_ONLY_TARGETS
+    )
     # The boot recovery capsule is the one agent-adjacent unit that must keep
     # running: it is what retries an interrupted rollback.
     assert "aicc-principal-recovery.service" not in module.CONTROL_PURGE_UNITS
@@ -3496,7 +3482,9 @@ def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):
     module = _module()
     repo = Path(__file__).parents[2]
     authority = tmp_path / "authority.env"
-    authority.write_text("AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n", encoding="utf-8")  # pragma: allowlist secret
+    authority.write_text(
+        "AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n", encoding="utf-8"
+    )  # pragma: allowlist secret
     specs = module.default_specs(
         repo,
         authority_env=authority,
@@ -3512,9 +3500,9 @@ def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):
     assert {
         spec.target for spec in specs if spec.remove and not spec.directory
     } == module.WORKER_ONLY_TARGETS
-    assert [
-        spec.target for spec in specs if spec.remove and spec.directory
-    ] == list(module.WORKER_ONLY_DIRECTORIES)
+    assert [spec.target for spec in specs if spec.remove and spec.directory] == list(
+        module.WORKER_ONLY_DIRECTORIES
+    )
     assert not (tmp_path / "absent-claude.json").exists()
 
 
@@ -3807,9 +3795,7 @@ def test_a_committed_control_generation_retains_no_credential_byte(tmp_path):
     assert len(list(state.glob("generation-*"))) == 2
 
 
-def test_a_failure_before_commit_still_restores_both_credentials(
-    monkeypatch, tmp_path
-):
+def test_a_failure_before_commit_still_restores_both_credentials(monkeypatch, tmp_path):
     """The retirement is armed inside commit(), so everything before commit
     keeps the ordinary rollback guarantee: a control transition that purges
     the credentials and then fails puts them back byte-for-byte."""
@@ -3905,21 +3891,13 @@ def test_auxiliary_only_retirement_refuses_targets_not_bound_by_its_manifest(
     payload["targets"].append("/etc/ordinary")
     journal.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
     journal.chmod(0o600)
-    before = {
-        path: path.read_bytes()
-        for path in state.rglob("*")
-        if path.is_file()
-    }
+    before = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
     monkeypatch.undo()
 
     with pytest.raises(RuntimeError, match="sensitive retirement targets drifted"):
         module.FileTransaction(root, state).recover()
 
-    after = {
-        path: path.read_bytes()
-        for path in state.rglob("*")
-        if path.is_file()
-    }
+    after = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
     assert after == before
     assert (root / "etc/ordinary").read_bytes() == b"ordinary-rollback-material"
 
@@ -4037,7 +4015,9 @@ def test_uninstall_preflights_the_whole_chain_before_unwinding_a_newer_generatio
     assert later.read_bytes() == b"later-generation"
     assert recreated.read_bytes() == b"new-untracked-credential"
     assert transaction.current.read_bytes() == current_before
-    assert sorted(path.name for path in state.glob("generation-*")) == generations_before
+    assert (
+        sorted(path.name for path in state.glob("generation-*")) == generations_before
+    )
 
 
 def test_the_retirement_intent_is_armed_while_the_wal_still_says_applied(
@@ -4071,9 +4051,7 @@ def test_the_retirement_intent_is_armed_while_the_wal_still_says_applied(
     assert observed["armed"], "COMMITTING was written before the intent was durable"
 
 
-def test_a_failure_arming_the_retirement_is_an_ordinary_rollback(
-    monkeypatch, tmp_path
-):
+def test_a_failure_arming_the_retirement_is_an_ordinary_rollback(monkeypatch, tmp_path):
     """The exact dynamic injection: the arming write itself fails. Nothing
     has been published, the WAL is still APPLIED, and the trap's recover()
     puts both credentials back byte-for-byte -- including the backups the
@@ -4113,9 +4091,7 @@ def test_a_failure_arming_the_retirement_is_an_ordinary_rollback(
     assert not (root / "etc/control-file").exists()
 
 
-def test_an_armed_intent_dies_with_the_generation_that_armed_it(
-    monkeypatch, tmp_path
-):
+def test_an_armed_intent_dies_with_the_generation_that_armed_it(monkeypatch, tmp_path):
     """Arming before COMMITTING means an intent can outlive a generation that
     never committed. For that one the credentials are back on the host and
     the backups are what put them there, so the rollback discards the intent
@@ -4466,9 +4442,7 @@ def test_a_membership_journal_is_refused_against_another_generation(tmp_path):
         lambda: module.restore_legacy_authority_membership(
             state, manifest=other, run=run, getgrnam=getgrnam
         ),
-        lambda: module.finalize_authority_membership(
-            state, other, getgrnam=getgrnam
-        ),
+        lambda: module.finalize_authority_membership(state, other, getgrnam=getgrnam),
     ):
         with pytest.raises(RuntimeError, match="bound to another generation"):
             call()
@@ -4577,9 +4551,7 @@ def test_the_membership_is_back_before_any_worker_is_started(monkeypatch, tmp_pa
     worker_only.write_bytes(b"agent-secret")
     worker_only.chmod(0o640)
     snapshot = state / "attempt-units.json"
-    snapshot.write_text(
-        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
-    )
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
     snapshot.chmod(0o600)
     order = []
     transaction = module.FileTransaction(root, state)
@@ -4589,9 +4561,7 @@ def test_the_membership_is_back_before_any_worker_is_started(monkeypatch, tmp_pa
     )
     real_restore = module.restore_legacy_authority_membership
     monkeypatch.setattr(module, "quiesce_service_snapshot", lambda *a, **k: None)
-    monkeypatch.setattr(
-        module, "verify_service_snapshot_closure", lambda *a, **k: None
-    )
+    monkeypatch.setattr(module, "verify_service_snapshot_closure", lambda *a, **k: None)
     monkeypatch.setattr(
         module,
         "restore_service_snapshot",
@@ -4824,9 +4794,7 @@ def _listing_runner(*, workers=(), launchers=(), loaded=()):
             return SimpleNamespace(returncode=1, stderr="", stdout="")
         if command[1] == "list-units":
             names = (
-                launchers
-                if command[2] == "aicc-agent-launcher@*.service"
-                else workers
+                launchers if command[2] == "aicc-agent-launcher@*.service" else workers
             )
             return SimpleNamespace(
                 returncode=0,
@@ -4871,9 +4839,7 @@ def test_the_control_purge_waits_for_every_live_broker_instance(tmp_path):
         "aicc-agent-launcher@9.service",
     ):
         assert any(
-            call[1] == "show"
-            and call[2] == unit
-            and "--property=ControlGroup" in call
+            call[1] == "show" and call[2] == unit and "--property=ControlGroup" in call
             for call in calls
         )
 
@@ -4941,9 +4907,7 @@ def test_normal_install_recovery_still_refuses_a_late_worker_lane(tmp_path):
     preserve-only launcher exception must never weaken their closure."""
     module = _module()
     snapshot = tmp_path / "attempt-units.json"
-    snapshot.write_text(
-        json.dumps({"version": 2, "units": {}}), encoding="utf-8"
-    )
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="outside service snapshot"):
         module.verify_service_snapshot_closure(
@@ -5138,8 +5102,7 @@ def _older_reader(fields):
             unexpected = sorted(set(value) - set(fields))
             if unexpected:
                 raise TypeError(
-                    "__init__() got an unexpected keyword argument "
-                    f"{unexpected[0]!r}"
+                    f"__init__() got an unexpected keyword argument {unexpected[0]!r}"
                 )
             loaded.append({name: value[name] for name in fields if name in value})
         return loaded
@@ -5722,7 +5685,10 @@ def test_control_generation_authority_check_is_intrinsic_to_apply(
         transaction.apply()
 
     assert calls == [(state, manifest)]
-    assert json.loads(transaction.pending.read_text(encoding="utf-8"))["phase"] == "PREPARED"
+    assert (
+        json.loads(transaction.pending.read_text(encoding="utf-8"))["phase"]
+        == "PREPARED"
+    )
 
 
 def test_control_authority_group_refuses_a_live_numeric_gid(tmp_path):
@@ -5790,9 +5756,7 @@ def test_failed_control_quiesce_recovery_restores_socket_not_accepted_session(
             stdout = "active\n"
         elif action == "is-enabled":
             stdout = (
-                "disabled\n"
-                if unit == "aicc-agent-launcher@7.service"
-                else "enabled\n"
+                "disabled\n" if unit == "aicc-agent-launcher@7.service" else "enabled\n"
             )
         elif action == "show":
             stdout = (
@@ -5978,7 +5942,8 @@ def test_a_real_control_install_leaves_no_worker_artefact_or_secret_tree(
     state = tmp_path / "state"
     authority = tmp_path / "authority.env"
     authority.write_text(
-        "AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n", encoding="utf-8"  # pragma: allowlist secret
+        "AICC_WORKSPACE_ROOTS=/srv/aicc-workspaces\n",
+        encoding="utf-8",  # pragma: allowlist secret
     )
     for target, payload in (
         (CLAUDE_CREDENTIAL, CLAUDE_BYTES),
@@ -6192,7 +6157,9 @@ def test_a_failed_apply_resolves_the_membership_journal_it_orphans(
     with pytest.raises(RuntimeError, match="injected apply failure"):
         transaction.apply()
 
-    assert live == {"aicc-worker", "voynadmin"}, "membership came back with the rollback"
+    assert live == {"aicc-worker", "voynadmin"}, (
+        "membership came back with the rollback"
+    )
     assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
     assert not transaction.pending.exists()
     assert worker_only.read_bytes() == b"agent-secret"
@@ -6218,9 +6185,7 @@ def test_recover_resolves_a_journal_bound_to_a_rolled_back_generation(
     source.write_bytes(b"committed")
     transaction.install((_spec(module, source, "/etc/committed-file"),))
     dead = state / "generation-00000000deadbeef" / "manifest.json"
-    module.revoke_legacy_authority_membership(
-        state, dead, run=run, getgrnam=getgrnam
-    )
+    module.revoke_legacy_authority_membership(state, dead, run=run, getgrnam=getgrnam)
     assert live == set()
     _restoring_recover(module, monkeypatch, run, getgrnam)
 

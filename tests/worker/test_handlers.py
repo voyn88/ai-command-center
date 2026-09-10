@@ -638,9 +638,7 @@ def test_mutating_provider_failover_requires_unchanged_workspace(
         assert "provider/auth/quota" in outcome.reason
 
 
-def test_unknown_copilot_failure_switches_for_read_only_review(
-    handler, monkeypatch
-):
+def test_unknown_copilot_failure_switches_for_read_only_review(handler, monkeypatch):
     run_agent, runs = handler
 
     def failed_copilot(**kwargs):
@@ -1714,7 +1712,10 @@ def test_review_head_checkout_is_removed_on_failure_paths_too(
 
     def failed_run(**kwargs):
         return agent_runner.RunResult(
-            status="failed", exit_code=1, stdout="", stderr="agent died",
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr="agent died",
             duration_seconds=0.1,
             started_at="2026-08-26T12:00:00+00:00",
             completed_at="2026-08-26T12:00:01+00:00",
@@ -1789,16 +1790,38 @@ def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
     def git(cwd, *args):
         return subprocess.run(
             ["git", "-C", str(cwd), *args],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout.strip()
 
     origin = tmp_path / "origin"
     origin.mkdir()
     git(tmp_path, "init", "-q", str(origin))
-    git(origin, "-c", "user.email=t@t", "-c", "user.name=t",
-        "commit", "--allow-empty", "-q", "-m", "base")
-    git(origin, "-c", "user.email=t@t", "-c", "user.name=t",
-        "commit", "--allow-empty", "-q", "-m", "pr head")
+    git(
+        origin,
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "base",
+    )
+    git(
+        origin,
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "pr head",
+    )
     head_sha = git(origin, "rev-parse", "HEAD")
     git(origin, "update-ref", "refs/pull/7/head", head_sha)
     git(origin, "reset", "-q", "--hard", "HEAD~1")
@@ -1806,7 +1829,9 @@ def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
     clone = tmp_path / "clone"
     subprocess.run(
         ["git", "clone", "-q", str(origin), str(clone)],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     assert git(clone, "rev-parse", "HEAD") != head_sha
 
@@ -1836,7 +1861,12 @@ def test_read_only_run_under_isolation_uses_a_detached_clone_in_the_principal_ro
 
     run_agent, runs = handler
     monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
-    monkeypatch.setattr(agent_runner, "principal_executor_preflight", lambda executor: (True, "ok"))
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        handlers_module, "_refresh_read_only_source", lambda *a, **kw: (True, None)
+    )
     clone = tmp_path / "root" / "ro-repo-abc"
     removed: list[Path] = []
     asked: list[Path] = []
@@ -1847,7 +1877,9 @@ def test_read_only_run_under_isolation_uses_a_detached_clone_in_the_principal_ro
 
     monkeypatch.setattr(handlers_module, "_read_only_isolated_checkout", fake_checkout)
     monkeypatch.setattr(
-        handlers_module, "_remove_read_only_isolated_checkout", lambda target: removed.append(target)
+        handlers_module,
+        "_remove_read_only_isolated_checkout",
+        lambda target: removed.append(target),
     )
     outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
     assert outcome.ok, outcome.reason
@@ -1856,7 +1888,9 @@ def test_read_only_run_under_isolation_uses_a_detached_clone_in_the_principal_ro
     assert removed == [clone]
 
 
-def test_read_only_run_outside_isolation_keeps_the_shared_clone(handler, monkeypatch, tmp_path) -> None:
+def test_read_only_run_outside_isolation_keeps_the_shared_clone(
+    handler, monkeypatch, tmp_path
+) -> None:
     from command_center import agent_runner
     from command_center.worker import handlers as handlers_module
 
@@ -1865,7 +1899,9 @@ def test_read_only_run_outside_isolation_keeps_the_shared_clone(handler, monkeyp
     monkeypatch.setattr(
         handlers_module,
         "_read_only_isolated_checkout",
-        lambda repository: (_ for _ in ()).throw(AssertionError("must not clone outside isolation")),
+        lambda repository: (_ for _ in ()).throw(
+            AssertionError("must not clone outside isolation")
+        ),
     )
     outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
     assert outcome.ok, outcome.reason
@@ -1878,11 +1914,20 @@ def test_read_only_isolated_checkout_failure_is_retryable(handler, monkeypatch) 
 
     run_agent, runs = handler
     monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
-    monkeypatch.setattr(agent_runner, "principal_executor_preflight", lambda executor: (True, "ok"))
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        handlers_module, "_refresh_read_only_source", lambda *a, **kw: (True, None)
+    )
     monkeypatch.setattr(
         handlers_module,
         "_read_only_isolated_checkout",
-        lambda repository: (None, "read-only isolated checkout clone failed: boom", True),
+        lambda repository: (
+            None,
+            "read-only isolated checkout clone failed: boom",
+            True,
+        ),
     )
     outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
     assert not outcome.ok and outcome.retryable
@@ -1891,19 +1936,75 @@ def test_read_only_isolated_checkout_failure_is_retryable(handler, monkeypatch) 
     monkeypatch.setattr(
         handlers_module,
         "_read_only_isolated_checkout",
-        lambda repository: (None, "isolated workspace root is unavailable: gone", False),
+        lambda repository: (
+            None,
+            "isolated workspace root is unavailable: gone",
+            False,
+        ),
     )
     outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
-    assert not outcome.ok and not outcome.retryable, "a permanent cause must not spin the cascade"
+    assert not outcome.ok and not outcome.retryable, (
+        "a permanent cause must not spin the cascade"
+    )
+
+
+def test_read_only_source_refresh_failure_is_retryable_before_attempt(
+    handler, monkeypatch
+) -> None:
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_refresh_read_only_source",
+        lambda *a, **kw: (False, "source clone fetch failed: network"),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("must not clone stale source")
+        ),
+    )
+
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+
+    assert not outcome.ok and outcome.retryable
+    assert "source clone fetch failed" in outcome.reason
+    assert runs == []
 
 
 def _git_repo_with_one_commit(path: Path) -> str:
     path.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
-    subprocess.run(["git", "-C", str(path), "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "--allow-empty", "-q", "-m", "one"], check=True)
-    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
-                          capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "one",
+        ],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
 
 
 def _git(*argv: str) -> subprocess.CompletedProcess[str]:
@@ -1928,14 +2029,21 @@ def test_read_only_isolated_checkout_is_a_detached_clone_without_origin_at_the_s
     assert (failure, retryable) == (None, False) and target is not None
     assert target.parent == root and target.name.startswith("ro-source-")
     assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == head
-    assert _git("-C", str(target), "symbolic-ref", "-q", "HEAD").returncode != 0, "HEAD must be detached"
+    assert _git("-C", str(target), "symbolic-ref", "-q", "HEAD").returncode != 0, (
+        "HEAD must be detached"
+    )
     assert "origin" not in _git("-C", str(target), "remote").stdout.split()
-    assert str(target) not in _git("-C", str(source), "worktree", "list", "--porcelain").stdout
+    assert (
+        str(target)
+        not in _git("-C", str(source), "worktree", "list", "--porcelain").stdout
+    )
     handlers_module._remove_read_only_isolated_checkout(target)
     assert not target.exists()
 
 
-def test_read_only_isolated_checkout_works_from_a_source_on_a_detached_head(tmp_path, monkeypatch):
+def test_read_only_isolated_checkout_works_from_a_source_on_a_detached_head(
+    tmp_path, monkeypatch
+):
     from command_center import agent_runner
     from command_center.worker import handlers as handlers_module
 
@@ -1968,7 +2076,8 @@ def test_read_only_isolated_checkout_source_git_refuses_is_permanent_and_leaves_
     assert target is None and failure and retryable is False
     assert list(root.iterdir()) == []
     monkeypatch.setattr(
-        agent_runner, "principal_workspace_root",
+        agent_runner,
+        "principal_workspace_root",
         lambda: (_ for _ in ()).throw(agent_runner.RunnerError("no root")),
     )
     target, failure, retryable = handlers_module._read_only_isolated_checkout(tmp_path)
@@ -1985,14 +2094,17 @@ def test_remove_read_only_isolated_checkout_reports_a_leak_instead_of_hiding_it(
     target = tmp_path / "ro-x"
     target.mkdir()
     (target / "f").write_text("x", encoding="utf-8")
+
     def failing_rmtree(path, onerror=None, **kwargs):
         onerror(os.unlink, str(target / "f"), (OSError, OSError("busy"), None))
 
     monkeypatch.setattr(handlers_module, "_rmtree", failing_rmtree)
     with caplog.at_level(logging.ERROR, logger="command_center.worker.handlers"):
         handlers_module._remove_read_only_isolated_checkout(target)
-    assert any("was not fully removed" in record.message and "busy" in record.message
-               for record in caplog.records)
+    assert any(
+        "was not fully removed" in record.message and "busy" in record.message
+        for record in caplog.records
+    )
 
 
 def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
@@ -2006,24 +2118,41 @@ def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
 
     run_agent, runs = handler
     monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
-    monkeypatch.setattr(agent_runner, "principal_executor_preflight", lambda executor: (True, "ok"))
     monkeypatch.setattr(
-        handlers_module, "_review_head_checkout",
-        lambda *a: (_ for _ in ()).throw(AssertionError("must not touch the bound clone")),
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        handlers_module, "_refresh_read_only_source", lambda *a, **kw: (True, None)
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda *a: (_ for _ in ()).throw(
+            AssertionError("must not touch the bound clone")
+        ),
     )
     clone = tmp_path / "root" / "ro-pinned"
     asked: list[tuple] = []
     removed: list[Path] = []
     monkeypatch.setattr(
-        handlers_module, "_read_only_isolated_checkout",
-        lambda repository, pin_sha=None: (asked.append((repository, pin_sha)), (clone, None, False))[1],
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda repository, pin_sha=None: (
+            asked.append((repository, pin_sha)),
+            (clone, None, False),
+        )[1],
     )
     monkeypatch.setattr(
-        handlers_module, "_remove_read_only_isolated_checkout", lambda target: removed.append(target)
+        handlers_module,
+        "_remove_read_only_isolated_checkout",
+        lambda target: removed.append(target),
     )
     outcome = run_agent(
-        _payload(task_type="verification_review", untrusted=True,
-                 review_head={"pr_number": "42", "head_sha": "b" * 40}),
+        _payload(
+            task_type="verification_review",
+            untrusted=True,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
         _event(),
     )
     assert outcome.ok, outcome.reason
@@ -2032,7 +2161,9 @@ def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
     assert removed == [clone]
 
 
-def test_read_only_isolated_checkout_pins_to_the_requested_sha_or_waits_for_it(tmp_path, monkeypatch):
+def test_read_only_isolated_checkout_pins_to_the_requested_sha_or_waits_for_it(
+    tmp_path, monkeypatch
+):
     """Real git: a pin to an older commit detaches there; a pin the bound
     clone does not hold yet is a retryable wait, never a permanent refusal."""
     from command_center import agent_runner
@@ -2040,19 +2171,129 @@ def test_read_only_isolated_checkout_pins_to_the_requested_sha_or_waits_for_it(t
 
     source = tmp_path / "source"
     first = _git_repo_with_one_commit(source)
-    assert _git("-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
-                "commit", "--allow-empty", "-q", "-m", "two").returncode == 0
+    assert (
+        _git(
+            "-C",
+            str(source),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "two",
+        ).returncode
+        == 0
+    )
     head = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
     assert head != first
     root = tmp_path / "root"
     root.mkdir()
     monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
-    target, failure, _ = handlers_module._read_only_isolated_checkout(source, pin_sha=first)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=first
+    )
     assert failure is None and target is not None
     assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == first
     assert _git("-C", str(target), "symbolic-ref", "-q", "HEAD").returncode != 0
     handlers_module._remove_read_only_isolated_checkout(target)
     missing = "c" * 40
-    target, failure, retryable = handlers_module._read_only_isolated_checkout(source, pin_sha=missing)
-    assert target is None and retryable is True and "not in the bound clone yet" in failure
+    target, failure, retryable = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=missing
+    )
+    assert (
+        target is None and retryable is True and "not in the bound clone yet" in failure
+    )
     assert list(root.iterdir()) == []
+
+
+def test_read_only_source_refresh_fast_forwards_the_bound_clone(tmp_path) -> None:
+    """Real git: a stale source clone advances before an isolated review
+    clones from it. Fetch-only would leave HEAD on the old commit."""
+    from command_center.worker import handlers as handlers_module
+
+    origin = tmp_path / "origin"
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(origin)
+    assert _git("clone", "-q", str(origin), str(source)).returncode == 0
+    old_head = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git(
+            "-C",
+            str(origin),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "two",
+        ).returncode
+        == 0
+    )
+    new_head = _git("-C", str(origin), "rev-parse", "HEAD").stdout.strip()
+    assert old_head != new_head
+
+    ok, failure = handlers_module._refresh_read_only_source(source)
+
+    assert (ok, failure) == (True, None)
+    assert _git("-C", str(source), "rev-parse", "HEAD").stdout.strip() == new_head
+
+
+def test_review_head_refresh_fetches_the_pull_ref_before_isolated_pin(
+    tmp_path, monkeypatch
+) -> None:
+    """A pinned isolated review cannot fetch from inside the agent boundary,
+    so the worker source refresh must make refs/pull/<n>/head reachable
+    before `_read_only_isolated_checkout(..., pin_sha=...)` checks it."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    origin = tmp_path / "origin"
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(origin)
+    assert _git("clone", "-q", str(origin), str(source)).returncode == 0
+    assert (
+        _git(
+            "-C",
+            str(origin),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "pr head",
+        ).returncode
+        == 0
+    )
+    pin = _git("-C", str(origin), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git("-C", str(origin), "update-ref", "refs/pull/7/head", pin).returncode == 0
+    )
+    assert _git("-C", str(origin), "reset", "-q", "--hard", "HEAD~1").returncode == 0
+    assert (
+        _git("-C", str(source), "cat-file", "-e", f"{pin}^{{commit}}").returncode != 0
+    )
+
+    ok, failure = handlers_module._refresh_read_only_source(source, pr_number="7")
+
+    assert (ok, failure) == (True, None)
+    assert (
+        _git("-C", str(source), "cat-file", "-e", f"{pin}^{{commit}}").returncode == 0
+    )
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, retryable = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=pin
+    )
+    assert (failure, retryable) == (None, False) and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pin
+    handlers_module._remove_read_only_isolated_checkout(target)
