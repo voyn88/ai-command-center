@@ -9,8 +9,18 @@ installed client rejects the snapshot wholesale.
 from __future__ import annotations
 
 import json
+import logging
 
-from native_gateway.redaction import REDACTED, find_violation, sanitize_tree
+from native_gateway.redaction import (
+    PATH_REDACTED,
+    REDACTED,
+    REPO_ROOT,
+    PathRedactingFilter,
+    find_violation,
+    install_path_redaction,
+    relativize_filepaths,
+    sanitize_tree,
+)
 
 from .conftest import auth_headers, fresh_sample
 
@@ -97,3 +107,126 @@ def test_clean_content_is_not_redacted(client, device_token):
     body = response.json()
     assert body["tasks"][0]["title"] == "Example delivery"
     assert body["events"][0]["summary"] == "PR #42 opened"
+
+
+# --------------------------------------------------------------------------
+# Log-path redaction: PathRedactingFilter / relativize_filepaths.
+#
+# The prior version of this filter only matched paths beginning with a fixed
+# allowlist of root directory names (Users/home/var/etc/opt/srv/root/private/
+# tmp). That silently no-ops for any deployment rooted elsewhere — Docker's
+# `WORKDIR /app`, `/usr/src/app`, `/workspace`, `/code`, `/nix/store`, etc.
+# These tests specifically exercise roots *outside* that old fixed list to
+# guard against regressing back to an allowlist-by-root-name approach.
+# --------------------------------------------------------------------------
+
+
+def test_in_repo_path_is_relativized_not_redacted():
+    in_repo = REPO_ROOT / "native_gateway" / "redaction.py"
+    out = relativize_filepaths(str(in_repo))
+    assert out == "native_gateway/redaction.py"
+    assert PATH_REDACTED not in out
+
+
+def test_docker_workdir_app_path_is_redacted_not_leaked():
+    # /app is a conventional Docker WORKDIR, not in the old fixed root list.
+    text = 'File "/app/native_gateway/foo.py", line 42, in handler'
+    out = relativize_filepaths(text)
+    assert "/app/" not in out
+    assert PATH_REDACTED in out
+
+
+def test_usr_src_app_path_is_redacted_not_leaked():
+    text = "loaded config from /usr/src/app/config/settings.yaml"
+    out = relativize_filepaths(text)
+    assert "/usr/src/app" not in out
+    assert PATH_REDACTED in out
+
+
+def test_workspace_path_is_redacted_not_leaked():
+    text = "resolved module at /workspace/native_gateway/app.py"
+    out = relativize_filepaths(text)
+    assert "/workspace" not in out
+    assert PATH_REDACTED in out
+
+
+def test_legacy_allowlisted_roots_still_redacted_when_outside_repo():
+    # /home/someone/... is outside this repo checkout, so even though it
+    # matches the *old* fixed-root list, it must still be fully redacted
+    # (not merely left alone) because it isn't inside REPO_ROOT.
+    text = "loaded venv from /home/someone/.venv/lib/python3.11/site-packages"
+    out = relativize_filepaths(text)
+    assert "/home/someone" not in out
+    assert PATH_REDACTED in out
+
+
+def test_windows_path_is_redacted():
+    text = r"cache dir: C:\Users\owner\AppData\Local\aicc"
+    out = relativize_filepaths(text)
+    assert "C:\\Users" not in out
+    assert PATH_REDACTED in out
+
+
+def test_non_path_slash_text_is_left_alone():
+    text = "throughput improved and/or latency dropped 24/7"
+    assert relativize_filepaths(text) == text
+
+
+def test_path_redacting_filter_scrubs_pathname_message_and_exc_text():
+    logger = logging.getLogger("test.path.redaction")
+    logger.filters = []
+    path_filter = install_path_redaction(logger)
+    try:
+        record = logger.makeRecord(
+            logger.name,
+            logging.ERROR,
+            "/usr/src/app/native_gateway/foo.py",
+            10,
+            "boom near /app/secrets/config.yaml",
+            (),
+            None,
+        )
+        assert path_filter.filter(record) is True
+        assert "/usr/src/app" not in record.pathname
+        assert record.pathname == PATH_REDACTED
+        assert "/app/secrets" not in record.getMessage()
+    finally:
+        logger.filters = []
+
+
+def test_path_redacting_filter_scrubs_exception_traceback():
+    logger = logging.getLogger("test.path.redaction.exc")
+    logger.filters = []
+    path_filter = install_path_redaction(logger)
+    try:
+        try:
+            raise RuntimeError("nope")
+        except RuntimeError:
+            import sys
+
+            exc_info = sys.exc_info()
+        record = logger.makeRecord(
+            logger.name,
+            logging.ERROR,
+            "/usr/src/app/native_gateway/foo.py",
+            10,
+            "unhandled",
+            (),
+            exc_info,
+        )
+        assert path_filter.filter(record) is True
+        assert record.exc_text is not None
+        assert "/usr/src/app" not in record.exc_text
+    finally:
+        logger.filters = []
+
+
+def test_install_path_redaction_is_idempotent():
+    logger = logging.getLogger("test.path.redaction.idempotent")
+    logger.filters = []
+    first = install_path_redaction(logger)
+    second = install_path_redaction(logger)
+    assert first is second
+    assert sum(isinstance(f, PathRedactingFilter) for f in logger.filters) == 1
+    logger.filters = []
+
