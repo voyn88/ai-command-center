@@ -20,9 +20,9 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=voynadmin
-Environment=AICC_PREPROD_ROOT=%h/aicc-preprod
-Environment=AICC_SOURCE_REPO=%h/aicc-preprod/repo
-Environment=AICC_RUNTIME_VENV=%h/aicc-preprod/repo/.venv
+Environment=AICC_PREPROD_ROOT=/home/voynadmin/aicc-preprod
+Environment=AICC_SOURCE_REPO=/home/voynadmin/aicc-preprod/repo
+Environment=AICC_RUNTIME_VENV=/home/voynadmin/aicc-preprod/repo/.venv
 WorkingDirectory=/opt/aicc/current
 # Belt-and-suspenders alongside --rollout-lock (which self_deploy_once()
 # checks and refuses on): a tick already queued when the staged rollout

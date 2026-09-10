@@ -180,12 +180,18 @@ def _current_selector(current_link: Path) -> str:
         raise RuntimeError("release selector is not a symlink")
     selector = os.readlink(current_link)
     if not re.fullmatch(r"releases/[0-9a-f]{40}", selector):
+        if os.path.isabs(selector):
+            return selector
         raise RuntimeError("release selector is invalid")
     return selector
 
 
 def _point_current_at(current_link: Path, selector: str) -> None:
-    if selector != "ABSENT" and not re.fullmatch(r"releases/[0-9a-f]{40}", selector):
+    if (
+        selector != "ABSENT"
+        and not os.path.isabs(selector)
+        and not re.fullmatch(r"releases/[0-9a-f]{40}", selector)
+    ):
         raise RuntimeError("release selector is invalid")
     tmp = current_link.with_name(f".{current_link.name}.next")
     try:
@@ -303,16 +309,30 @@ def self_deploy_once(
         return finish("failed", "rev_parse_failed")
     report.previous_sha = current.stdout.strip()
     report.target_sha = target.stdout.strip()
-    if report.previous_sha == report.target_sha:
+    same_sha = report.previous_sha == report.target_sha
+    if same_sha and cfg.release_root is None:
         return finish("noop", report.target_sha)
 
-    ff = _git(
-        repo_path,
-        ["merge-base", "--is-ancestor", "HEAD", report.target_sha],
-        timeout,
-    )
-    if ff.returncode != 0:
-        return finish("refused", "non_fast_forward_checkout_diverged")
+    if same_sha and cfg.release_root is not None:
+        release_root = Path(cfg.release_root)
+        try:
+            current_selector = _current_selector(release_root / "current")
+        except (OSError, RuntimeError) as exc:
+            return finish("failed", f"release_selector_read_failed: {exc}")
+        release_selector = _selector_for_sha(report.target_sha)
+        if (
+            current_selector == release_selector
+            and (release_root / release_selector).is_dir()
+        ):
+            return finish("noop", report.target_sha)
+    if not same_sha:
+        ff = _git(
+            repo_path,
+            ["merge-base", "--is-ancestor", "HEAD", report.target_sha],
+            timeout,
+        )
+        if ff.returncode != 0:
+            return finish("refused", "non_fast_forward_checkout_diverged")
     dirty = _git(repo_path, ["status", "--porcelain"], timeout)
     if dirty.returncode != 0 or dirty.stdout.strip():
         return finish("refused", "checkout_dirty")
@@ -332,10 +352,13 @@ def self_deploy_once(
             "refused", f"dependency_change_requires_manual_deploy: {manifests[:3]}"
         )
 
-    moved = _git(repo_path, ["reset", "--hard", report.target_sha], timeout)
-    if moved.returncode != 0:
-        return finish("failed", f"reset_failed: {moved.stderr.strip()[:100]}")
-    report.steps.append(f"checkout_moved:{report.target_sha}")
+    if not same_sha:
+        moved = _git(repo_path, ["reset", "--hard", report.target_sha], timeout)
+        if moved.returncode != 0:
+            return finish("failed", f"reset_failed: {moved.stderr.strip()[:100]}")
+        report.steps.append(f"checkout_moved:{report.target_sha}")
+    else:
+        report.steps.append(f"checkout_already_current:{report.target_sha}")
 
     try:
         runtime_path, previous_selector = _stage_immutable_release(
