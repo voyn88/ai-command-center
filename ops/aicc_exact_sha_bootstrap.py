@@ -67,6 +67,17 @@ GIT_CONFIG_FREE = (
     "filter.lfs.process=",
     "-c",
     "uploadpack.packObjectsHook=",
+    # Observed on voyn-worker-01, 2026-09-02 (GIT_TRACE_CURL): anonymous
+    # `git-upload-pack` POSTs from this datacenter's egress IPs came back 401
+    # ("Basic realm=...") over HTTP/2 while `info/refs` on the same clone
+    # succeeded, and the identical POST succeeded outright over HTTP/1.1. Stage
+    # 0 has no deploy key or PAT to fall back to (org policy refuses the
+    # former, install rules the latter), so pinning the protocol on the
+    # command line -- config-free, per GIT_CONFIG_FREE's own contract above --
+    # is the only lever available. Harmless on the local, non-HTTP git calls
+    # this list also gates.
+    "-c",
+    "http.version=HTTP/1.1",
 )
 
 

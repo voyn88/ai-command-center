@@ -4540,6 +4540,14 @@ GIT_CONFIG_FREE = (
     "filter.lfs.process=",
     "-c",
     "uploadpack.packObjectsHook=",
+    # See the matching comment on GIT_CONFIG_FREE in
+    # ops/aicc_exact_sha_bootstrap.py: an anonymous `git-upload-pack` POST from
+    # this datacenter's egress IPs was observed 401ing over HTTP/2 while the
+    # same POST over HTTP/1.1 succeeded (voyn-worker-01, 2026-09-02). Kept in
+    # this list, not a one-off flag, precisely so the drift test below
+    # (test_the_two_git_hardening_lists_cannot_drift) keeps enforcing it here.
+    "-c",
+    "http.version=HTTP/1.1",
 )
 
 
