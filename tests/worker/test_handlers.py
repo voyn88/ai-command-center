@@ -426,6 +426,7 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(
     outcome = run_agent(_payload(), _event(), 1)
     assert not outcome.ok
     assert outcome.retryable
+    assert outcome.infra_wait
     assert "executor infrastructure failure" in outcome.reason
     assert "session limit" in outcome.reason
 
@@ -1162,6 +1163,7 @@ def test_lease_unavailable_publish_failure_is_a_lease_wait_not_a_spent_attempt(
     outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert not outcome.ok and outcome.retryable is True
     assert outcome.lease_wait is True
+    assert outcome.infra_wait is False
     assert "lease_unavailable" in outcome.reason
 
 
@@ -1183,6 +1185,7 @@ def test_other_publish_failures_are_not_lease_waits(handler, monkeypatch) -> Non
     outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert not outcome.ok and outcome.retryable is True
     assert outcome.lease_wait is False
+    assert outcome.infra_wait is False
 
 
 def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:

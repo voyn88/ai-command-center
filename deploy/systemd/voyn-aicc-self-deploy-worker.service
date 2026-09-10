@@ -1,0 +1,19 @@
+# Worker-host self-deploy tick.
+#
+# Installed as /etc/systemd/system/voyn-aicc-self-deploy.service on worker
+# hosts. Unlike the control host variant, this never runs migrations: the
+# worker role has no DDL authority. It stages/selects /opt/aicc/releases/<sha>
+# and then restarts worker lanes so the new code is picked up after drain.
+[Unit]
+Description=AICC worker self-deploy tick (merged -> immutable worker release)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=voynadmin
+Environment=AICC_PREPROD_ROOT=/home/voynadmin/aicc-preprod
+Environment=AICC_SOURCE_REPO=/home/voynadmin/aicc-preprod/repo
+Environment=AICC_RUNTIME_VENV=/home/voynadmin/aicc-preprod/repo/.venv
+WorkingDirectory=/opt/aicc/current
+ExecCondition=/usr/bin/test ! -e /run/aicc-staged-rollout.lock
+ExecStart=/bin/bash -lc "set -a && source ${AICC_PREPROD_ROOT}/worker.env && set +a && exec /opt/aicc/current/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --restart voyn-aicc-worker@1.service --restart voyn-aicc-worker@2.service --restart voyn-aicc-worker@3.service --restart voyn-aicc-worker@4.service"

@@ -3417,6 +3417,12 @@ class PrWindowConfig:
     #: did not reach keeps the label it has: `blocked` is never downgraded
     #: to `waiting` on no evidence (adversarial review of 53183850).
     detail_budget: int = 80
+    #: Already-blocked PRs are rechecked, but they no longer get to spend the
+    #: whole per-tick detail budget before fresh candidates reach the window.
+    #: A push changes the cache key through `headRefOid`, so a recovered PR is
+    #: still eligible for a later tick; this cap only bounds unchanged stale
+    #: tails whose old checks would otherwise be refreshed every run.
+    blocked_refresh_budget: int = 5
     #: A PR whose head commit is older than this (seconds) with no green
     #: acceptance path yet is blocked from the window rather than occupying
     #: a slot indefinitely. Default 48h.
@@ -3637,6 +3643,23 @@ def _pr_window_labels(pr: dict[str, Any]) -> set[str]:
     }
 
 
+def _pr_window_order_key(pr: dict[str, Any], cfg: PrWindowConfig) -> tuple[int, str, int]:
+    """Stable processing order for the bounded window.
+
+    Sticky-active PRs stay first. Already-blocked PRs move behind unblocked
+    candidates so a long tail of stale/conflicted PRs cannot consume the tick
+    before newly-opened work receives an active/waiting label.
+    """
+    labels = _pr_window_labels(pr)
+    if cfg.label_active in labels:
+        bucket = 0
+    elif cfg.label_blocked in labels:
+        bucket = 2
+    else:
+        bucket = 1
+    return (bucket, str(pr.get("createdAt") or ""), int(pr.get("number") or 0))
+
+
 def _set_pr_window_labels(
     repo_path: str, pr: dict[str, Any], cfg: PrWindowConfig, desired: str
 ) -> bool:
@@ -3720,20 +3743,21 @@ def _reconcile_pr_window(
         return
     now = time.time()
     listed_prs = list(prs)
-    listed_prs.sort(
-        key=lambda pr: (str(pr.get("createdAt") or ""), int(pr.get("number") or 0))
-    )
-    # Sticky for the currently active set: they are examined first and keep
-    # their slot while still eligible; the age-sorted rest fills what is left.
-    ordered = [pr for pr in listed_prs if cfg.label_active in _pr_window_labels(pr)]
-    ordered += [pr for pr in listed_prs if cfg.label_active not in _pr_window_labels(pr)]
+    # Sticky active first, then ordinary candidates, then the old blocked
+    # tail. This keeps FIFO order inside each bucket without letting stale
+    # blocked PRs starve fresh work out of the window.
+    listed_prs.sort(key=lambda pr: _pr_window_order_key(pr, cfg))
 
     selected = 0
     details_used = 0
-    for pr in ordered:
+    blocked_refreshes_used = 0
+    blocked_refresh_budget = max(cfg.blocked_refresh_budget, 0)
+    for pr in listed_prs:
         number = int(pr.get("number") or 0)
         head = str(pr.get("headRefOid") or "")
-        active_now = cfg.label_active in _pr_window_labels(pr)
+        labels = _pr_window_labels(pr)
+        active_now = cfg.label_active in labels
+        blocked_now = cfg.label_blocked in labels and not active_now
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
         # A cache hit costs no API call, so it costs no detail budget
@@ -3742,6 +3766,13 @@ def _reconcile_pr_window(
         detailed = _pr_window_details(
             repo_path, pr, cache, fetch=False, include_reviews=False
         )
+        if (
+            blocked_now
+            and detailed is None
+            and blocked_refreshes_used >= blocked_refresh_budget
+        ):
+            report.unchecked.append((number, head))
+            continue
         if detailed is None and details_used >= max(cfg.detail_budget, 0):
             # Out of detail budget: no evidence either way this tick, so no
             # label write at all -- whatever the PR carried (active, waiting,
@@ -3751,6 +3782,8 @@ def _reconcile_pr_window(
             report.unchecked.append((number, head))
             continue
         if detailed is None:
+            if blocked_now:
+                blocked_refreshes_used += 1
             details_used += 1
             detailed = _pr_window_details(repo_path, pr, cache, include_reviews=False)
         if detailed is None:
@@ -3777,6 +3810,15 @@ def _reconcile_pr_window(
             reason == "checks_stale"
             and details_used < max(cfg.detail_budget, 0)
         ):
+            if (
+                blocked_now
+                and blocked_refreshes_used >= blocked_refresh_budget
+            ):
+                report.blocked.append((number, reason))
+                _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
+                continue
+            if blocked_now:
+                blocked_refreshes_used += 1
             details_used += 1
             fresh = _pr_window_details(
                 repo_path, pr, cache, refresh=True, include_reviews=False

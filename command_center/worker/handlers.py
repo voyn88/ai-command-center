@@ -1131,6 +1131,7 @@ def _run_agent(
                 ok=False,
                 reason=_tail(run.stderr) or "runner failed to start",
                 retryable=True,
+                infra_wait=True,
             )
         if run.is_principal_isolation_error:
             # The separate-UID launcher failed before it could return a
@@ -1149,6 +1150,7 @@ def _run_agent(
                     f"isolation): {_tail(run.stderr or result_text)}"
                 ),
                 retryable=True,
+                infra_wait=True,
             )
         non_mutating_copilot_failure = (
             executor == "copilot"
@@ -1175,6 +1177,7 @@ def _run_agent(
                     f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
                 ),
                 retryable=True,
+                infra_wait=True,
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.
@@ -1192,6 +1195,7 @@ def _run_agent(
                     f"sandbox): {_tail(run.stderr or result_text)}"
                 ),
                 retryable=True,
+                infra_wait=True,
             )
         # BO-S3b: a successful mutating run publishes its commits as a PR so
         # the autonomous loop closes without a human. Opt-in by env
