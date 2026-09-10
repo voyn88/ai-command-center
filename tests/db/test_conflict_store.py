@@ -11,7 +11,9 @@ that column again. It cannot — `resolved` is terminal — and the test offered
 evidence upserted two hand-built dicts, which is the "proved against data the
 writer cannot emit" defect this migration has now produced twice. The claim is
 pinned as a fact by `test_a_resolved_conflict_is_terminal` instead of being
-asserted in prose.
+asserted in prose. VOYN-W0-AICC-CONFLICT-REOPEN-DECISION settled the product
+question behind that technical finding: `resolved` stays terminal for good, so
+this pin is permanent rather than a placeholder for a future edge.
 """
 
 from __future__ import annotations
@@ -172,13 +174,16 @@ def test_a_resolved_conflict_is_terminal(tmp_path) -> None:
     """The fact the first version of this slice got wrong, now pinned.
 
     Its acceptance story said `resolved_at` returns to `NULL` when a conflict
-    reopens — read off the clearing branch in `_conflict_transition` without
-    reading the allowlist above it, which makes that branch unreachable.
-    Independent review disproved it by running the real writer.
+    reopens — read off a (since-removed) clearing branch in
+    `_conflict_transition` without reading the allowlist above it, which made
+    that branch unreachable. Independent review disproved it by running the
+    real writer.
 
-    Pinned here rather than fixed in a docstring, because the next person to
-    open `resolved -> open` needs this test to fail: whole-row upserts, the
-    mirror's `resolved_at` handling and this assertion all move together.
+    VOYN-W0-AICC-CONFLICT-REOPEN-DECISION turned that technical finding into a
+    product decision: `resolved` is terminal, permanently — there is no future
+    `resolved -> open` edge to plan for. Pinned here rather than left as prose
+    so any later attempt to reopen this decision has to fail a test, not just
+    read a comment, to get past it.
     """
     db_path = tmp_path / "runtime.db"
     conflict_db.db.migrate(db_path)
