@@ -32,14 +32,12 @@ do for the other table-family modules.
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
-_LOG = logging.getLogger(__name__)
+from command_center.db.mirror_support import record_mirror_failure
 
 #: The conflict kinds (mirrors ``api.models.ConflictKind``). Validated at the
 #: persistence boundary so a malformed kind can never reach a stored row.
@@ -185,16 +183,19 @@ def _mirror_conflict(record: dict) -> None:
     two fields plus `updated_at` and `version`, and the
     mirror has no other source for the rest.
 
-    The mirror's health is reported by `conflict_store.divergence`, not by
-    exceptions raised here. Imported lazily so the desktop and CLI entry points
-    keep working on a machine with no PostgreSQL client library.
+    Silent does not mean invisible: a rejected write still counts and logs
+    through `record_mirror_failure` (`VOYN-W0-AICC-MIRROR-SILENT-DROP`) so a
+    dropped row is observable without running `conflict_store.divergence` by
+    hand — divergence remains the only check that names which *columns*
+    disagree. Imported lazily so the desktop and CLI entry points keep working
+    on a machine with no PostgreSQL client library.
     """
     try:
         from command_center.db.conflict_store import PostgresConflictMirror
 
         PostgresConflictMirror().upsert(record)
-    except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        _LOG.debug("Could not mirror conflict into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — the mirror must never break the real write
+        record_mirror_failure("conflict", record, exc)
 
 
 def get_conflict(db_path: Path, conflict_id: str) -> dict | None:

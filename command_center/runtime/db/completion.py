@@ -12,14 +12,12 @@ they did against the single module.
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from typing import Any, Iterable
 
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
-_LOG = logging.getLogger(__name__)
+from command_center.db.mirror_support import record_mirror_failure
 
 # --------------------------------------------------------------------------
 # Completion pipeline (AICC-AUTONOMY-001)
@@ -189,8 +187,8 @@ def _mirror(mirror_name: str, record: dict, table: str) -> None:
         from command_center.db import completion_store
 
         getattr(completion_store, mirror_name)().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror %s into PostgreSQL", table, exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure(table, record, exc)
 
 
 def get_completion(db_path: Path, run_id: str) -> dict | None:
