@@ -13,6 +13,7 @@ repairs a dropped earlier one and a final-state check would report clean.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from command_center.db.completion_store import (
@@ -27,6 +28,11 @@ from command_center.db.execution_store import PostgresSessionMirror, PostgresTas
 from command_center.db.run_store import PostgresRunMirror
 from command_center.runtime.db import completion as completion_db
 from command_center.runtime.db import execution as exec_db
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 SAMPLE_AT = "2026-08-14T00:00:00"
 
@@ -84,9 +90,9 @@ def test_the_completion_family_reconciles_after_every_write(
     reconciles both runs' children against the complete table rather than one
     run's slice of it."""
     _patch(monkeypatch, pg_connection_factory)
-    completions = PostgresCompletionMirror(connection_factory=pg_connection_factory)
-    events = PostgresCompletionEventMirror(connection_factory=pg_connection_factory)
-    validations = PostgresCompletionValidationMirror(connection_factory=pg_connection_factory)
+    completions = PostgresCompletionMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    events = PostgresCompletionEventMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    validations = PostgresCompletionValidationMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)

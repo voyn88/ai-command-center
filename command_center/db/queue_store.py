@@ -26,7 +26,7 @@ table would reorder the queue silently, and silently is the problem.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import Any
 
 from command_center.db.mirror_support import ColumnCodec, render_authority_timestamp
@@ -55,10 +55,14 @@ class PostgresQueueMirror:
 
     name = "postgres"
 
-    def __init__(self, connection_factory: Any = None) -> None:
+    def __init__(self, connection_factory: Any = None, *, zone: tzinfo | None = None) -> None:
         # Injectable so tests can supply a connection without a process-wide
         # pool, and so this module never reaches for global state of its own.
         self._factory = connection_factory
+        # Only `list_entries` needs this; see it and
+        # `mirror_support.render_authority_timestamp`
+        # (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+        self._zone = zone
 
     def _connection(self) -> Any:
         """The pool is resolved on use, never at import.
@@ -98,6 +102,20 @@ class PostgresQueueMirror:
                         )
 
     def list_entries(self) -> list[dict]:
+        """Every mirrored entry, shaped like the JSON queue's own.
+
+        Needs the zone this table's naive timestamps are declared on, supplied
+        at construction (`zone=`) — see `mirror_support.render_authority_timestamp`
+        for why the reconciling process's own zone cannot be trusted
+        (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+        """
+        if self._zone is None:
+            raise ValueError(
+                f"{type(self).__name__}.list_entries() needs the authority's "
+                "declared zone: construct with zone=<the writer's zone>, e.g. "
+                "from command_center.runtime.db.resolve_timestamp_zone(db_path) "
+                "— see mirror_support.render_authority_timestamp."
+            )
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -107,7 +125,7 @@ class PostgresQueueMirror:
                 rows = cur.fetchall()
         return [
             {
-                column: _as_json_value(value)
+                column: _as_json_value(value, self._zone)
                 for column, value in zip(QUEUE_ENTRY_COLUMNS, row, strict=True)
             }
             for row in rows
@@ -127,7 +145,7 @@ class PostgresQueueMirror:
 _CODEC = ColumnCodec(timestamps=frozenset({"added_at", "evaluated_at", "launched_at"}))
 
 
-def _as_json_value(value: Any) -> Any:
+def _as_json_value(value: Any, zone: tzinfo) -> Any:
     """Render a column back into the shape the JSON queue holds.
 
     Column-name-independent, unlike the row stores': every `datetime` this
@@ -135,7 +153,11 @@ def _as_json_value(value: Any) -> Any:
     JSON queue holds them as the naive local strings `models.iso_now()` writes.
     So the renderer is called directly rather than through the codec, which
     would need a column name this function has no reason to know.
+
+    `zone` is the authority's declared zone, threaded down from
+    `PostgresQueueMirror.list_entries` — not this process's own
+    (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
     """
     if isinstance(value, datetime):
-        return render_authority_timestamp(value)
+        return render_authority_timestamp(value, zone=zone)
     return value

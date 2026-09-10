@@ -18,6 +18,7 @@ rewrites the row `start_provider_attempt` wrote.
 
 from __future__ import annotations
 
+from datetime import datetime
 import sqlite3
 from pathlib import Path
 
@@ -35,6 +36,11 @@ from command_center.db.provenance_store import (
 from command_center.db.run_store import PostgresRunMirror
 from command_center.runtime.db import execution as exec_db
 from command_center.runtime.db import provenance as prov_db
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 SAMPLE_OBSERVED_AT = "2026-08-14T00:00:00"
 
@@ -99,11 +105,11 @@ def test_the_provenance_family_reconciles_after_every_write(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
     _patch(monkeypatch, pg_connection_factory)
-    provenance = PostgresRunProvenanceMirror(connection_factory=pg_connection_factory)
-    evidence = PostgresProvenanceEvidenceMirror(connection_factory=pg_connection_factory)
-    attempts = PostgresProviderAttemptMirror(connection_factory=pg_connection_factory)
+    provenance = PostgresRunProvenanceMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    evidence = PostgresProvenanceEvidenceMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    attempts = PostgresProviderAttemptMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
-    routes = PostgresRunProviderRouteMirror(connection_factory=pg_connection_factory)
+    routes = PostgresRunProviderRouteMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
@@ -303,7 +309,7 @@ def test_the_backfill_mirrors_the_rows_it_creates(
     below cannot pass by comparing nothing with nothing.
     """
     _patch(monkeypatch, pg_connection_factory)
-    provenance = PostgresRunProvenanceMirror(connection_factory=pg_connection_factory)
+    provenance = PostgresRunProvenanceMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)

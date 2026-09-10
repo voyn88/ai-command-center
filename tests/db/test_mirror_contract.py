@@ -29,6 +29,7 @@ import ast
 import functools
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,13 @@ _ADD_COLUMN = re.compile(
 
 #: What `models.iso_now()` emits: naive local, second precision, no offset.
 SAMPLE_TIMESTAMP = "2026-08-14T00:00:00"
+
+#: The zone every sample row in this file is implicitly written in: this test
+#: process's own, matching what `to_instant` attaches with no explicit zone
+#: (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS). Every mirror instance here that calls
+#: `list_records` must be constructed with this zone — a bare
+#: `mirror(connection_factory=...)` now raises rather than guessing it.
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 
 
@@ -247,6 +255,21 @@ def test_the_mirror_satisfies_the_row_oriented_contract(table: str, mirror) -> N
     instance = mirror(connection_factory=lambda: None)
     assert isinstance(instance, record_mirror.RecordMirror)
     assert mirror.name == "postgres"
+
+
+@pytest.mark.parametrize(("table", "mirror"), MIRRORS, ids=IDS)
+def test_list_records_refuses_to_guess_a_zone(table: str, mirror) -> None:
+    """Every mirrored table shares this: `list_records` renders `timestamptz`
+    columns back to naive local text, and doing that in *this* process's own
+    zone is the defect `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS` closed — see
+    `mirror_support.render_authority_timestamp`. A mirror built with no `zone`
+    now raises before it ever opens a connection, rather than reconciling
+    against a guess; needs no database, because the refusal happens before
+    the query does.
+    """
+    instance = mirror(connection_factory=lambda: None)
+    with pytest.raises(ValueError, match="zone"):
+        instance.list_records()
 
 
 @pytest.mark.parametrize(("table", "mirror"), MIRRORS, ids=IDS)
@@ -458,7 +481,7 @@ def test_a_row_round_trips_and_reconciles(table: str, mirror, pg_connection_fact
     `divergence` compares the stored row against the rendered one.
     """
     _ensure_parents(mirror.spec, pg_connection_factory)
-    instance = mirror(connection_factory=pg_connection_factory)
+    instance = mirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
     row = sample_row(mirror.spec)
 
     instance.upsert(row)
@@ -498,7 +521,7 @@ def test_timestamps_round_trip_to_what_the_application_writes(
     assert "+" not in written and not written.endswith("Z")  # guard the premise
 
     _ensure_parents(mirror.spec, pg_connection_factory)
-    instance = mirror(connection_factory=pg_connection_factory)
+    instance = mirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
     row = sample_row(mirror.spec)
     for column in mirror.spec.codec.timestamps:
         row[column] = written
@@ -522,7 +545,7 @@ def test_json_columns_reconcile_by_value_not_by_bytes(
     different. Checked per table, because a table declaring a JSON column and
     forgetting to say so is exactly the omission this contract exists for."""
     _ensure_parents(mirror.spec, pg_connection_factory)
-    instance = mirror(connection_factory=pg_connection_factory)
+    instance = mirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
     row = sample_row(mirror.spec)
     instance.upsert(row)
 
@@ -544,7 +567,7 @@ def test_identity_tables_keep_the_authoritys_id_and_can_resync(
     reconcile nothing. And the sequence is left behind by those inserts, which
     only bites on the first native write after a cutover."""
     _ensure_parents(mirror.spec, pg_connection_factory)
-    instance = mirror(connection_factory=pg_connection_factory)
+    instance = mirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
     row = sample_row(mirror.spec)
     row["id"] = 41
     instance.upsert(row)
