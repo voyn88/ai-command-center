@@ -213,6 +213,19 @@ def build_parser() -> argparse.ArgumentParser:
         "a tick that finds it present refuses rather than racing the "
         "rollout's own lane mutations.",
     )
+    self_deploy.add_argument(
+        "--release-root",
+        default=None,
+        help="Optional immutable release root. When set, stage tracked source "
+        "under RELEASE_ROOT/releases/<sha> and atomically update "
+        "RELEASE_ROOT/current.",
+    )
+    self_deploy.add_argument(
+        "--release-venv",
+        default=None,
+        help="Runtime venv to expose as .venv inside each immutable release "
+        "(defaults to REPO_PATH/.venv when --release-root is set).",
+    )
 
     # The fleet's single-panel view over enrolled worker-host devices
     # (VOYN-MIN-FARM: "10 devices managed by one operational panel"). Reads
@@ -287,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
                 services=tuple(args.restart),
                 migrate=args.migrate,
                 rollout_lock_path=args.rollout_lock,
+                release_root=args.release_root,
+                release_venv=args.release_venv,
             ),
         )
         print(f"{deploy_report.outcome.upper():10} {deploy_report.detail}")

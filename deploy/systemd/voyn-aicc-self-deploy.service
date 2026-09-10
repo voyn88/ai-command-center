@@ -2,12 +2,12 @@
 #
 # Two install variants -- the difference is ONLY the ExecStart flags, and the
 # committed default is the CONTROL host (database owner: migrations run,
-# no restarts -- its ticks are oneshot units that re-exec from the checkout
+# no restarts -- its ticks are oneshot units that re-exec from /opt/aicc/current
 # on their next firing). A WORKER host replaces ExecStart with the variant
 # below: no --migrate (the worker role holds no DDL privilege) and its own
 # --restart list (SIGTERM is a graceful drain for the daemons):
 #
-#   ExecStart=/bin/bash -lc "exec /home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.db self-deploy --repo-path /home/voynadmin/aicc-preprod/repo --restart voyn-aicc-worker.service --restart voyn-aicc-worker-2.service --restart voyn-aicc-worker@3.service --restart voyn-aicc-worker@4.service"
+#   ExecStart=/bin/bash -lc "exec /opt/aicc/current/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --restart voyn-aicc-worker.service --restart voyn-aicc-worker-2.service --restart voyn-aicc-worker@3.service --restart voyn-aicc-worker@4.service"
 #
 # The command is fail-closed (diverged/dirty checkout, dependency-manifest
 # change) and rolls back checkout + services on migration/smoke/restart
@@ -20,7 +20,10 @@ After=network-online.target
 [Service]
 Type=oneshot
 User=voynadmin
-WorkingDirectory=/home/voynadmin/aicc-preprod/repo
+Environment=AICC_PREPROD_ROOT=%h/aicc-preprod
+Environment=AICC_SOURCE_REPO=%h/aicc-preprod/repo
+Environment=AICC_RUNTIME_VENV=%h/aicc-preprod/repo/.venv
+WorkingDirectory=/opt/aicc/current
 # Belt-and-suspenders alongside --rollout-lock (which self_deploy_once()
 # checks and refuses on): a tick already queued when the staged rollout
 # stops this unit's timer would otherwise still run to completion and race
@@ -28,4 +31,4 @@ WorkingDirectory=/home/voynadmin/aicc-preprod/repo
 # VOYN-W0-AICC-ROLLOUT-VS-ROTATE-SELFDEPLOY-TIMERS). A skipped
 # ExecCondition is not a failure.
 ExecCondition=/usr/bin/test ! -e /run/aicc-staged-rollout.lock
-ExecStart=/bin/bash -lc "set -a && source /home/voynadmin/aicc-preprod/.env && set +a && exec /home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.db self-deploy --repo-path /home/voynadmin/aicc-preprod/repo --migrate"
+ExecStart=/bin/bash -lc "set -a && source ${AICC_PREPROD_ROOT}/.env && set +a && exec /opt/aicc/current/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --migrate"
