@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import os
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from command_center import (
     agent_runner,
     artifacts,
     chat_service,
+    console_identity,
     dashboard_truth,
     execution_queue,
     executors,
@@ -65,6 +67,30 @@ from command_center.ui import (
     task_dependencies,
     tokens,
 )
+
+# --------------------------------------------------------------------------
+# Identity boundary (ADR-0011)
+# --------------------------------------------------------------------------
+
+# This console performs privileged git/gh and subprocess operations and has no
+# authentication of its own. Every launch path defaults to loopback, and every
+# one of them also documents its override, so this is the only seam that sees
+# an explicit `--server.address` after it has actually taken effect —
+# `command_center/console_identity.py` decides whether that reach is accounted
+# for. The check stands before any data load or page render, and Streamlit
+# re-runs this script top to bottom on every interaction, so a refusal is not a
+# banner over a live console: no widget that could launch an agent, cancel a
+# run or touch a repository is ever created.
+try:
+    console_identity.check(st.get_option("server.address"))
+except console_identity.ConsoleBoundaryError as _boundary_refusal:
+    # Both surfaces, because they have different audiences: the operator who
+    # widened the bind is watching the terminal, and whoever opens the browser
+    # needs to see why the console is empty rather than assume it is broken.
+    print(f"[console] FATAL: {_boundary_refusal}", file=sys.stderr)
+    st.error(str(_boundary_refusal))
+    st.stop()
+
 
 ROOT = Path(__file__).resolve().parent
 PROJECTS_DIR = ROOT / "projects"

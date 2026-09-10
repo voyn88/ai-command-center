@@ -30,6 +30,16 @@ if [[ -z "${STREAMLIT_SERVER_ADDRESS:-}" ]]; then
     exit 78  # EX_CONFIG
 fi
 
+# ADR-0011, enforced rather than documented: the address above says where the
+# process listens, which inside a private namespace is not where it can be
+# reached. AICC_CONSOLE_PUBLISH_ADDRESS carries the host interface the port is
+# published on (docker-compose.aml.yml sets it from the same AML_BIND_HOST it
+# publishes), and this gate refuses an off-loopback reach that names no
+# identity-aware proxy. It runs before the seeding below so a refused
+# deployment touches no data, and it exits 78 for the same reason the check
+# above does.
+python -m command_center.console_identity "${STREAMLIT_SERVER_ADDRESS}" || exit $?
+
 DATA_DIR="${AICC_DATA_DIR:-/data}"
 RULES_DB="${DATA_DIR}/aml_rules.db"
 
