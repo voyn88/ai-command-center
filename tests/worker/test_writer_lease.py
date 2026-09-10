@@ -21,7 +21,10 @@ from command_center.worker.writer_lease import (
 
 
 def _cfg(
-    tool: str, ttl: int = 600, repository: str = "ai-command-center"
+    tool: str,
+    ttl: int = 600,
+    repository: str = "ai-command-center",
+    acquire_wait_seconds: float = 0.0,
 ) -> WriterLeaseConfig:
     return WriterLeaseConfig(
         lease_tool=tool,
@@ -30,6 +33,7 @@ def _cfg(
         session="s1",
         task="VOYN-W0-TEST",
         ttl=ttl,
+        acquire_wait_seconds=acquire_wait_seconds,
     )
 
 
@@ -77,6 +81,8 @@ def test_hold_never_touches_the_clone_wide_hook_identity_file(tmp_path):
 
 
 def test_hold_raises_when_initial_acquire_fails(tmp_path):
+    """`acquire_wait_seconds=0` (the `_cfg` default) pins the no-retry-budget
+    case: a single failed acquire must raise immediately, with no retry."""
     tool = _install_lease_tool(
         tmp_path, "echo 'lease held by another writer' >&2\nexit 1\n"
     )
@@ -87,6 +93,58 @@ def test_hold_raises_when_initial_acquire_fails(tmp_path):
 
     # A failed initial acquire must not itself trip forced cancellation --
     # nothing was ever held, so there is nothing to cancel.
+    assert not lease_lost.is_set()
+
+
+def test_hold_retries_the_initial_acquire_and_succeeds_within_budget(
+    tmp_path, monkeypatch
+):
+    """VOYN-W0-AICC-DEAD-QUEUE-THREE-WRITER-CONTENTION-CLASSES class 3 (161 of
+    712 dead `work_item`s): `writer lease unavailable: acquire_failed`. This
+    lease is task-scoped, so a refused acquire is routinely the SAME task's
+    own still-running previous attempt releasing shortly, not a permanent
+    conflict -- and the queue's redelivery backoff (2s/4s for a short
+    cascade) is far shorter than a run that can hold the lease for minutes.
+    A lease that clears within `acquire_wait_seconds` must succeed rather
+    than raise, so the delivery does not burn one of the few attempts on
+    ordinary overlap."""
+    import command_center.worker.writer_lease as writer_lease_module
+
+    monkeypatch.setattr(writer_lease_module, "_ACQUIRE_RETRY_INTERVAL_SECONDS", 0.01)
+    calls = tmp_path / "calls.log"
+    tool = _install_lease_tool(
+        tmp_path,
+        f'echo "$*" >> {calls}\n'
+        f"n=$(grep -c . {calls} 2>/dev/null || echo 0)\n"
+        'if [ "$n" -lt 3 ]; then echo "lease held by prior attempt" >&2; exit 1; fi\n'
+        "exit 0\n",
+    )
+    lease_lost = threading.Event()
+
+    with hold(tmp_path, _cfg(str(tool), acquire_wait_seconds=5.0), lease_lost):
+        pass
+
+    assert calls.read_text().count(" acquire ") >= 3, "expected retries before success"
+    assert not lease_lost.is_set()
+
+
+def test_hold_gives_up_once_the_acquire_wait_budget_elapses(tmp_path, monkeypatch):
+    """A lease that never clears must still fail once the retry budget is
+    spent -- the retry absorbs ordinary transient overlap, it does not turn
+    a genuinely stuck or refused lease into an infinite wait."""
+    import command_center.worker.writer_lease as writer_lease_module
+
+    monkeypatch.setattr(writer_lease_module, "_ACQUIRE_RETRY_INTERVAL_SECONDS", 0.01)
+    calls = tmp_path / "calls.log"
+    tool = _install_lease_tool(
+        tmp_path, f'echo "$*" >> {calls}\necho "still held" >&2\nexit 1\n'
+    )
+    lease_lost = threading.Event()
+
+    with pytest.raises(WriterLeaseUnavailable, match="acquire_failed"):
+        hold(tmp_path, _cfg(str(tool), acquire_wait_seconds=0.3), lease_lost)
+
+    assert calls.read_text().count(" acquire ") >= 2, "expected more than one try"
     assert not lease_lost.is_set()
 
 

@@ -951,6 +951,61 @@ def test_provider_error_after_commit_is_checkpointed_for_retry(agent, monkeypatc
     assert workspace.is_dir()
 
 
+def test_marker_behind_head_after_interrupted_sign_is_recovered_not_bricked(
+    agent, monkeypatch
+):
+    """VOYN-W0-AICC-DEAD-QUEUE-THREE-WRITER-CONTENTION-CLASSES class 1 (254 of
+    712 dead `work_item`s): `task_workspace_checkpoint failed: saved HEAD
+    <A> differs from signed checkpoint <B>`. The agent's commit durably
+    advances the branch ref; the signed marker only catches up in a
+    SEPARATE follow-up `checkpoint_task_workspace` call. If that follow-up
+    never completes (process restart, an exception on this exact line), HEAD
+    is left ahead of the marker with no writer left to finish signing it.
+    Before this fix, every later attempt's `_verify_task_local_workspace`
+    read that mismatch as untrusted and failed closed forever -- the clone
+    could never re-validate itself. It must instead prove the new HEAD is a
+    clean, fsck-valid descendant of the last signed checkpoint (the same
+    disposable trusted clone this function already builds) and re-sign the
+    marker to match, so a retry recovers instead of dying."""
+    run_agent, repo = agent
+    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run())
+    original_checkpoint = workspace_provisioning.checkpoint_task_workspace
+    calls = {"n": 0}
+
+    def die_on_first_sign(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise workspace_provisioning.WorkspaceVerificationError(
+                failed_step="simulated_crash_before_sign",
+                remediation="n/a",
+                expected_workspace=None,
+                detail="process died before the marker could be signed",
+            )
+        return original_checkpoint(*args, **kwargs)
+
+    monkeypatch.setattr(
+        workspace_provisioning, "checkpoint_task_workspace", die_on_first_sign
+    )
+    first = run_agent(_payload(), _event(), 1)
+    assert not first.ok and first.retryable
+    assert "simulated_crash_before_sign" in first.reason
+    workspace = _workspace(repo)
+    assert workspace.is_dir() and (workspace / "change.txt").exists()
+    head_after_first_attempt = _git(workspace, "rev-parse", "HEAD").stdout.strip()
+
+    monkeypatch.setattr(workspace_provisioning, "checkpoint_task_workspace", original_checkpoint)
+    monkeypatch.setattr(agent_runner, "run_claude_code", _fake_run(commit=False))
+    recovered = run_agent(_payload(), _event(), 2)
+
+    assert recovered.ok, recovered.reason
+    assert workspace.is_dir()
+    assert _git(workspace, "rev-parse", "HEAD").stdout.strip() == head_after_first_attempt
+    marker = next((workspace.parent / ".aicc-task-metadata").glob("*.json"))
+    import json as _json
+
+    assert _json.loads(marker.read_text())["start_sha"] == head_after_first_attempt
+
+
 def test_candidate_change_after_validation_is_never_checkpointed_or_published(
     agent_with_publish, monkeypatch
 ):
