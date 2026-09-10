@@ -1164,6 +1164,31 @@ def test_a_writable_directory_far_above_the_interpreter_is_refused(tmp_path, mon
         module.verify_immutable_release()
 
 
+def test_ancestor_directory_that_is_itself_a_symlink_is_followed_to_its_real_target(
+    tmp_path, monkeypatch
+):
+    """Not just the interpreter can be a symlink -- an ancestor directory can be
+    one too (a merged-`/usr` layout where `/usr/bin` is a symlink, or `/opt`
+    mounted from elsewhere). Checking only the symlink's own ownership and
+    never where it points would let whoever can write to the REAL directory
+    replace the interpreter inside it, while every path the lexical ancestor
+    walk names -- all root-owned symlinks -- reports clean.
+    """
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    system_bin = tmp_path / "usr" / "bin"
+    real = system_bin / "python3.12"
+    altbin = tmp_path / "altbin"
+    altbin.mkdir()
+    real.rename(altbin / "python3.12")
+    system_bin.rmdir()
+    system_bin.symlink_to(altbin, target_is_directory=True)
+    altbin.chmod(0o777)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
 # ---------------------------------------------------------------------------
 # A rollout must not retire the old fleet and then discover the new one cannot
 # start. worker-01, 2026-08-31: every configuration check passed, the legacy
