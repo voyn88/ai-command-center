@@ -92,6 +92,75 @@ def build_parser() -> argparse.ArgumentParser:
         help="Additional attempts to grant beyond those already burned (default 1).",
     )
 
+    # VOYN-W0-AICC-DLQ-REDRIVE-AUTOMATION: the historical uncommitted_changes
+    # pool, redriven strictly one at a time (queue-redrive itself stays the
+    # single-item primitive above; this is the eligibility-checked loop over
+    # it -- see command_center.db.dlq_redrive_automation).
+    redrive_batch = sub.add_parser(
+        "queue-dlq-redrive-batch",
+        help="Eligibility-checked, one-at-a-time redrive of the "
+        "uncommitted_changes dead-letter pool. Defaults to a dry-run listing.",
+    )
+    redrive_batch.add_argument("--queue", default=None, help="Restrict to one queue name.")
+    redrive_batch.add_argument(
+        "--limit", type=int, default=500, help="Dead letters to scan (default 500)."
+    )
+    redrive_batch.add_argument(
+        "--extra-attempts",
+        type=int,
+        default=1,
+        help="Additional attempts granted per redrive (default 1).",
+    )
+    redrive_batch.add_argument(
+        "--repo-path", default=".", help="Local clone for gh/ls-remote calls."
+    )
+    redrive_batch.add_argument(
+        "--clones-root",
+        required=True,
+        help="Directory containing the per-task standalone clones "
+        "(backlog-<TASK_ID>-<hash>), e.g. the task-clones root.",
+    )
+    redrive_batch.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually redrive eligible items. Without this, only lists "
+        "each candidate's eligibility and changes nothing.",
+    )
+    redrive_batch.add_argument(
+        "--poll-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between polls while waiting for a redriven item to "
+        "resolve before considering the next candidate (default 5).",
+    )
+    redrive_batch.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=1800.0,
+        help="Max seconds to wait for a redriven item to resolve before "
+        "giving up on the rest of the batch (default 1800).",
+    )
+
+    classify = sub.add_parser(
+        "queue-dlq-classify",
+        help="Classify dead letters outside the uncommitted_changes pool "
+        "(superseded/unrecoverable/needs_review) and append the disposition "
+        "to a report. Never mutates or deletes a work_dlq row.",
+    )
+    classify.add_argument("--queue", default=None, help="Restrict to one queue name.")
+    classify.add_argument(
+        "--limit", type=int, default=1000, help="Dead letters to scan (default 1000)."
+    )
+    classify.add_argument(
+        "--repo-path", default=".", help="Local clone for gh calls."
+    )
+    classify.add_argument(
+        "--output",
+        default="reports/dlq/disposition.jsonl",
+        help="Append-only JSON-lines disposition report "
+        "(default reports/dlq/disposition.jsonl).",
+    )
+
     # The structured backlog store (VOYN-W0-BACKLOG-ORCHESTRATOR BO-S1).
     imp = sub.add_parser(
         "backlog-import",
@@ -421,6 +490,129 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
+
+            if args.command == "queue-dlq-redrive-batch":
+                from pathlib import Path as _Path
+
+                from command_center.db.dlq_redrive_automation import (
+                    build_default_clone_locator,
+                    build_default_duplicate_checker,
+                    build_default_pr_or_branch_checker,
+                    check_eligibility,
+                    find_uncommitted_changes_pool,
+                    poll_until_resolved,
+                    redrive_pool_one_at_a_time,
+                )
+                from command_center.db.work_queue_admin import WorkQueueAdmin
+
+                admin = WorkQueueAdmin(lambda: nullcontext(conn))
+                candidates = find_uncommitted_changes_pool(
+                    admin, queue=args.queue, limit=args.limit
+                )
+                if not candidates:
+                    print("uncommitted_changes pool is empty")
+                    return 0
+                has_live_duplicate = build_default_duplicate_checker(conn)
+                has_open_pr_or_branch = build_default_pr_or_branch_checker(
+                    _Path(args.repo_path)
+                )
+                locate_clone = build_default_clone_locator(_Path(args.clones_root))
+
+                if not args.apply:
+                    for candidate in candidates:
+                        result = check_eligibility(
+                            candidate,
+                            has_live_duplicate=has_live_duplicate,
+                            has_open_pr_or_branch=has_open_pr_or_branch,
+                            locate_clone=locate_clone,
+                        )
+                        verdict = "eligible" if result.eligible else "ineligible"
+                        print(
+                            f"{candidate.work_item_id}  task={candidate.task_id}  "
+                            f"{verdict}: {result.reason}"
+                        )
+                    return 0
+
+                def _state_of(work_item_id: str) -> str | None:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT state FROM work_item WHERE work_item_id = %s",
+                            (work_item_id,),
+                        )
+                        row = cur.fetchone()
+                        return row[0] if row else None
+
+                def _wait(work_item_id: str) -> str | None:
+                    return poll_until_resolved(
+                        _state_of,
+                        work_item_id,
+                        poll_interval=args.poll_interval,
+                        timeout=args.wait_timeout,
+                    )
+
+                outcomes = redrive_pool_one_at_a_time(
+                    admin,
+                    candidates,
+                    has_live_duplicate=has_live_duplicate,
+                    has_open_pr_or_branch=has_open_pr_or_branch,
+                    locate_clone=locate_clone,
+                    wait_for_resolution=_wait,
+                    extra_attempts=args.extra_attempts,
+                )
+                redriven = 0
+                for outcome in outcomes:
+                    if not outcome.eligibility.eligible:
+                        print(
+                            f"{outcome.work_item_id}  task={outcome.task_id}  "
+                            f"skipped: {outcome.eligibility.reason}"
+                        )
+                        continue
+                    if outcome.redriven:
+                        redriven += 1
+                        print(
+                            f"{outcome.work_item_id}  task={outcome.task_id}  "
+                            f"redriven, resolved={outcome.resolved_state}"
+                        )
+                    else:
+                        print(
+                            f"{outcome.work_item_id}  task={outcome.task_id}  "
+                            "redrive refused server-side"
+                        )
+                print(f"redriven {redriven}/{len(candidates)} candidate(s)")
+                return 0
+
+            if args.command == "queue-dlq-classify":
+                from datetime import UTC, datetime
+                from pathlib import Path as _Path
+
+                from command_center.db.dlq_redrive_automation import (
+                    build_default_superseded_checker,
+                    classify_remaining,
+                    write_disposition_report,
+                )
+                from command_center.db.work_queue_admin import WorkQueueAdmin
+
+                admin = WorkQueueAdmin(lambda: nullcontext(conn))
+                letters = admin.dead_letters(args.queue, limit=args.limit)
+                superseded_check = build_default_superseded_checker(
+                    _Path(args.repo_path)
+                )
+                dispositions = classify_remaining(
+                    letters, superseded_check=superseded_check
+                )
+                written = write_disposition_report(
+                    _Path(args.output),
+                    dispositions,
+                    generated_at=datetime.now(UTC).isoformat(),
+                )
+                counts: dict[str, int] = {}
+                for disposition in dispositions:
+                    counts[disposition.disposition] = (
+                        counts.get(disposition.disposition, 0) + 1
+                    )
+                print(f"classified {written} dead-lettered item(s): {counts}")
+                print(f"disposition report appended: {args.output}")
+                return 0
 
             if args.command == "fleet-status":
                 from command_center.db.fleet_admin import FleetAdmin

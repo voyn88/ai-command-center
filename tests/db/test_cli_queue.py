@@ -52,6 +52,49 @@ def test_queue_redrive_requires_the_item_id() -> None:
         build_parser().parse_args(["queue-redrive"])
 
 
+def test_queue_dlq_redrive_batch_requires_clones_root_and_defaults_to_dry_run() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["queue-dlq-redrive-batch"])
+    args = build_parser().parse_args(
+        ["queue-dlq-redrive-batch", "--clones-root", "/srv/clones"]
+    )
+    assert args.command == "queue-dlq-redrive-batch"
+    assert args.clones_root == "/srv/clones"
+    assert args.apply is False
+    assert args.repo_path == "."
+    assert args.limit == 500
+    assert args.extra_attempts == 1
+    assert args.poll_interval == 5.0
+    assert args.wait_timeout == 1800.0
+    applied = build_parser().parse_args(
+        [
+            "queue-dlq-redrive-batch",
+            "--clones-root",
+            "/srv/clones",
+            "--apply",
+            "--queue",
+            "execution",
+            "--limit",
+            "10",
+        ]
+    )
+    assert applied.apply is True
+    assert applied.queue == "execution"
+    assert applied.limit == 10
+
+
+def test_queue_dlq_classify_defaults_output_path() -> None:
+    args = build_parser().parse_args(["queue-dlq-classify"])
+    assert args.command == "queue-dlq-classify"
+    assert args.output == "reports/dlq/disposition.jsonl"
+    assert args.limit == 1000
+    scoped = build_parser().parse_args(
+        ["queue-dlq-classify", "--output", "/tmp/out.jsonl", "--limit", "5"]
+    )
+    assert scoped.output == "/tmp/out.jsonl"
+    assert scoped.limit == 5
+
+
 def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
     args = build_parser().parse_args(["backlog-merge-reconcile"])
     assert args.command == "backlog-merge-reconcile"
