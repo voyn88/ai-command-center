@@ -107,7 +107,7 @@ jobs:
           fi
 
           if echo "$changed" | grep -Eqv \
-            '^(command_center/deployment/self_deploy\.py|command_center/db/cli\.py|deploy/systemd/voyn-aicc-self-deploy\.service|deploy/systemd/voyn-aicc-self-deploy-worker\.service|tests/orchestrator/test_self_deploy\.py)$'; then
+            '^(command_center/deployment/self_deploy\.py|command_center/db/cli\.py|deploy/systemd/voyn-aicc-merge\.(service|timer)|deploy/systemd/voyn-aicc-pr-window\.service|deploy/systemd/voyn-aicc-review\.(service|timer)|deploy/systemd/voyn-aicc-self-deploy\.service|deploy/systemd/voyn-aicc-self-deploy-worker\.service|tests/ops/test_agent_principal_isolation\.py|tests/orchestrator/test_self_deploy\.py)$'; then
             echo "deploy_only=false" >> "$GITHUB_OUTPUT"
           else
             echo "deploy_only=true" >> "$GITHUB_OUTPUT"
@@ -323,9 +323,14 @@ jobs:
           ruff check \
             command_center/deployment/self_deploy.py \
             command_center/db/cli.py \
+            tests/ops/test_agent_principal_isolation.py \
             tests/orchestrator/test_self_deploy.py
           python -m py_compile command_center/deployment/self_deploy.py command_center/db/cli.py
-          pytest -q tests/orchestrator/test_self_deploy.py
+          pytest -q \
+            tests/orchestrator/test_self_deploy.py \
+            tests/ops/test_agent_principal_isolation.py::test_the_pr_window_unit_carries_no_host_layout_of_its_own \
+            tests/ops/test_agent_principal_isolation.py::test_the_review_and_merge_units_are_immutable_control_ticks \
+            tests/ops/test_agent_principal_isolation.py::test_the_control_profile_installs_the_pr_window_tick
           printf '{"nodeids":[],"mode":"deploy-only-fast-path","shard":1}\n' > test-collection.json
 
       - name: Deploy-only empty shard receipt

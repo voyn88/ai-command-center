@@ -1407,14 +1407,9 @@ def _assert_command_inside_shell_if(text: str, command: str, guard: str) -> None
     assert guards, f"{command} has no preceding {guard}"
     assert not any(
         line == "fi"
-        or line.startswith("fi ")
-        or line.startswith("fi;")
         or line == "else"
-        or line.startswith("else ")
-        or line.startswith("else;")
         or line == "elif"
-        or line.startswith("elif ")
-        or line.startswith("elif;")
+        or line.startswith(("fi ", "fi;", "else ", "else;", "elif ", "elif;"))
         for line in lines[guards[-1] + 1 : command_index]
     ), (
         f"{command} escaped {guard}"
@@ -2201,6 +2196,10 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
     _tx, worker = _specs("worker", tmp_path)
 
     assert tx.CONTROL_ONLY_UNITS == (
+        "voyn-aicc-review.service",
+        "voyn-aicc-review.timer",
+        "voyn-aicc-merge.service",
+        "voyn-aicc-merge.timer",
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
     )
@@ -2212,6 +2211,42 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         f"/etc/systemd/system/{unit}" for unit in tx.CONTROL_ONLY_UNITS
     }
     assert worker - control == tx.WORKER_ONLY_TARGETS
+
+
+def test_the_review_and_merge_units_are_immutable_control_ticks(tmp_path):
+    """The acceptance publisher cannot depend on a hand-made home symlink.
+
+    The immutable units run from /opt/aicc/current, read the control DB env
+    before starting Python, and import the fleet GitHub App config so
+    acceptance markers can be posted under the App identity.
+    """
+    root = Path(__file__).parents[2]
+    for unit, command in (
+        ("review", "backlog-review"),
+        ("merge", "backlog-merge"),
+    ):
+        service = (
+            root / f"deploy/systemd/voyn-aicc-{unit}.service"
+        ).read_text()
+        timer = (root / f"deploy/systemd/voyn-aicc-{unit}.timer").read_text()
+        directives = [
+            line for line in service.splitlines() if line and not line.startswith("#")
+        ]
+        body = "\n".join(directives)
+
+        assert "User=voynadmin" in directives
+        assert "WorkingDirectory=/opt/aicc/current" in directives
+        assert "Environment=AICC_FLEET_REPO=/opt/aicc/source" in directives  # pragma: allowlist secret
+        assert "EnvironmentFile=/etc/aicc/github-app.env" in directives
+        assert "EnvironmentFile=-/etc/aicc/review-merge.env" in directives
+        assert "source ${AICC_PREPROD_ROOT}/.env" in body
+        assert (
+            "/opt/aicc/current/.venv/bin/python -m command_center.db "
+            f"{command} --repo-path ${{AICC_FLEET_REPO}}" in body
+        )
+        assert "/home/voynadmin/aicc-preprod/repo/.venv" not in body
+        assert "OnUnitInactiveSec=5min" in timer
+        assert f"Unit=voyn-aicc-{unit}.service" in timer
 
 
 def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
@@ -2263,7 +2298,7 @@ def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
     assert "WantedBy=timers.target" in timer
 
 
-def test_the_installer_starts_the_pr_window_timer_after_it_commits(tmp_path):
+def test_the_installer_starts_the_control_timers_after_it_commits(tmp_path):
     """Installed and enabled, or the file is just a file. Deliberately after
     `run_transaction commit` AND after the rollback trap is disarmed: this
     timer is not in the rollback's service snapshot (RESTORABLE_UNIT_RE admits
@@ -2272,9 +2307,9 @@ def test_the_installer_starts_the_pr_window_timer_after_it_commits(tmp_path):
     removes."""
     tx, _control = _specs("control", tmp_path)
     text = _installer_text()
-    enable = f"systemctl enable --now {tx.CONTROL_ONLY_TIMER}"
+    enable = "systemctl enable --now " + " ".join(tx.CONTROL_ONLY_TIMERS)
 
-    assert tx.CONTROL_ONLY_TIMER in tx.CONTROL_ONLY_UNITS
+    assert set(tx.CONTROL_ONLY_TIMERS) <= set(tx.CONTROL_ONLY_UNITS)
     _assert_command_inside_shell_if(
         text, enable, 'if [ "$install_profile" = "control" ]; then'
     )

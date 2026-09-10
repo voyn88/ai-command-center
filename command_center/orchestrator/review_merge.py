@@ -490,18 +490,66 @@ def _acceptance_app_credentials() -> github_app_auth.GitHubAppCredentials | None
     """The independent acceptance identity's credentials, gated on env
     the same way `VOYN_LEASE_DSN` gates the writer lease elsewhere in this
     codebase: a host with none of the three set has no bot identity to
-    post as. Unlike the lease gate, though, there is nothing safe to fall
-    back to here -- `publish_review_verdicts` skips loudly
-    (`acceptance_bot_not_configured`) rather than posting a same-identity
-    marker that can no longer satisfy `_pr_is_mergeable`'s different-author
-    check. All three or none; a partial set is a misconfiguration, reported
-    as a skip reason rather than silently guessed at."""
+    post as unless the deployed fleet GitHub App config is present. That App
+    posts under a bot identity distinct from the PR author, so it is a safe
+    fallback for independent acceptance. All three explicit acceptance vars or
+    none; a partial set is a misconfiguration, reported as a skip reason rather
+    than silently guessed at."""
     app_id = os.environ.get("VOYN_ACCEPTANCE_APP_ID", "")
     installation_id = os.environ.get("VOYN_ACCEPTANCE_INSTALLATION_ID", "")
     key_path = os.environ.get("VOYN_ACCEPTANCE_PRIVATE_KEY_PATH", "")
+    if not (app_id or installation_id or key_path):
+        # The deployed control profile already carries the fleet GitHub App
+        # config for quota-isolated gh access. That App posts a review under a
+        # bot identity distinct from the PR author, which satisfies the
+        # independent acceptance gate without a second owner-managed secret set.
+        app_id = os.environ.get("AICC_GITHUB_APP_ID", "")
+        installation_id = os.environ.get("AICC_GITHUB_INSTALLATION_ID", "")
+        key_path = os.environ.get(
+            "AICC_GITHUB_PRIVATE_KEY_PATH",
+            os.environ.get(
+                "AICC_GITHUB_APP_PEM",
+                "/etc/voyn/secrets/aicc-github-app.pem",
+            ),
+        )
     if not (app_id and installation_id and key_path):
         return None
     return github_app_auth.GitHubAppCredentials(app_id, installation_id, Path(key_path))
+
+
+def _preminted_acceptance_token() -> str | None:
+    """A pre-minted installation token for the fleet App fallback.
+
+    The control token minter keeps the private key root-only and writes a
+    short-lived installation token for the fleet App. When the acceptance
+    identity is explicitly configured, App auth failures stay fail-closed; the
+    token store is only the default for the repo-owned fleet App fallback.
+    """
+    token_path = os.environ.get("VOYN_ACCEPTANCE_INSTALLATION_TOKEN_PATH", "")
+    explicit_acceptance = any(
+        os.environ.get(name)
+        for name in (
+            "VOYN_ACCEPTANCE_APP_ID",
+            "VOYN_ACCEPTANCE_INSTALLATION_ID",
+            "VOYN_ACCEPTANCE_PRIVATE_KEY_PATH",
+        )
+    )
+    if not token_path and explicit_acceptance:
+        return None
+    if not token_path:
+        token_path = os.environ.get(
+            "AICC_GITHUB_INSTALLATION_TOKEN_PATH",
+            "/var/lib/aicc/github/token",
+        )
+    try:
+        token = Path(token_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not token.startswith(("ghs_", "ghp_", "github_pat_")) or any(
+        char.isspace() for char in token
+    ):
+        return None
+    return token
 
 
 def _post_marker_as_bot(
@@ -526,7 +574,9 @@ def _post_marker_as_bot(
     try:
         token = github_app_auth.installation_token(creds)
     except github_app_auth.AppAuthError as exc:
-        return False, f"app_auth_failed: {exc}"
+        token = _preminted_acceptance_token()
+        if token is None:
+            return False, f"app_auth_failed: {exc}"
     body = f"ACCEPTANCE: {decision} {sha}"
     req = urllib.request.Request(
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews",

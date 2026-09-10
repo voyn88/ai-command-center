@@ -45,6 +45,78 @@ def _snapshot(head, diff=DIFF):
     return review_merge._PRSnapshot.create(diff, BASE, head)
 
 
+def _clear_acceptance_env(monkeypatch):
+    for name in (
+        "VOYN_ACCEPTANCE_APP_ID",
+        "VOYN_ACCEPTANCE_INSTALLATION_ID",
+        "VOYN_ACCEPTANCE_PRIVATE_KEY_PATH",
+        "AICC_GITHUB_APP_ID",
+        "AICC_GITHUB_INSTALLATION_ID",
+        "AICC_GITHUB_PRIVATE_KEY_PATH",
+        "AICC_GITHUB_APP_PEM",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_acceptance_app_credentials_prefers_the_explicit_acceptance_identity(monkeypatch):
+    _clear_acceptance_env(monkeypatch)
+    monkeypatch.setenv("VOYN_ACCEPTANCE_APP_ID", "acceptance-app")
+    monkeypatch.setenv("VOYN_ACCEPTANCE_INSTALLATION_ID", "acceptance-installation")
+    monkeypatch.setenv("VOYN_ACCEPTANCE_PRIVATE_KEY_PATH", "/tmp/acceptance.pem")
+    monkeypatch.setenv("AICC_GITHUB_APP_ID", "fleet-app")
+    monkeypatch.setenv("AICC_GITHUB_INSTALLATION_ID", "fleet-installation")
+
+    creds = review_merge._acceptance_app_credentials()
+
+    assert creds is not None
+    assert creds.app_id == "acceptance-app"
+    assert creds.installation_id == "acceptance-installation"
+    assert str(creds.private_key_path) == "/tmp/acceptance.pem"
+
+
+def test_acceptance_app_credentials_falls_back_to_the_fleet_github_app(monkeypatch):
+    _clear_acceptance_env(monkeypatch)
+    monkeypatch.setenv("AICC_GITHUB_APP_ID", "fleet-app")
+    monkeypatch.setenv("AICC_GITHUB_INSTALLATION_ID", "fleet-installation")
+
+    creds = review_merge._acceptance_app_credentials()
+
+    assert creds is not None
+    assert creds.app_id == "fleet-app"
+    assert creds.installation_id == "fleet-installation"
+    assert str(creds.private_key_path) == "/etc/voyn/secrets/aicc-github-app.pem"
+
+
+def test_acceptance_app_credentials_keeps_partial_explicit_config_fail_closed(monkeypatch):
+    _clear_acceptance_env(monkeypatch)
+    monkeypatch.setenv("VOYN_ACCEPTANCE_APP_ID", "acceptance-app")
+    monkeypatch.setenv("AICC_GITHUB_APP_ID", "fleet-app")
+    monkeypatch.setenv("AICC_GITHUB_INSTALLATION_ID", "fleet-installation")
+
+    assert review_merge._acceptance_app_credentials() is None
+
+
+def test_preminted_acceptance_token_reads_the_fleet_token_store(monkeypatch, tmp_path):
+    _clear_acceptance_env(monkeypatch)
+    token = tmp_path / "token"
+    token.write_text("ghs_fleet_token\n", encoding="utf-8")
+    monkeypatch.setenv("AICC_GITHUB_INSTALLATION_TOKEN_PATH", str(token))
+
+    assert review_merge._preminted_acceptance_token() == "ghs_fleet_token"
+
+
+def test_preminted_acceptance_token_does_not_mask_explicit_acceptance_config(
+    monkeypatch, tmp_path
+):
+    _clear_acceptance_env(monkeypatch)
+    token = tmp_path / "token"
+    token.write_text("ghs_fleet_token\n", encoding="utf-8")
+    monkeypatch.setenv("AICC_GITHUB_INSTALLATION_TOKEN_PATH", str(token))
+    monkeypatch.setenv("VOYN_ACCEPTANCE_APP_ID", "acceptance-app")
+
+    assert review_merge._preminted_acceptance_token() is None
+
+
 @pytest.fixture(autouse=True)
 def _control_plane_gh_environment(monkeypatch):
     """Two facts every tick now depends on, held still for the tests.

@@ -244,7 +244,7 @@ def _record_document(record: BackupRecord) -> dict[str, object]:
 
 def _record_from_document(value: object) -> BackupRecord:
     if not isinstance(value, dict):
-        raise RuntimeError("generation manifest record is malformed")
+        raise TypeError("generation manifest record is malformed")
     unsupported = sorted(set(value) - _BACKUP_RECORD_FIELDS)
     if unsupported:
         raise RuntimeError(
@@ -256,13 +256,13 @@ def _record_from_document(value: object) -> BackupRecord:
 def _generation_records(payload: object) -> list[BackupRecord]:
     """Every record of one generation, or a refusal before any mutation."""
     if not isinstance(payload, dict):
-        raise RuntimeError("generation manifest is malformed")
+        raise TypeError("generation manifest is malformed")
     version = payload.get("version")
     if version not in SUPPORTED_MANIFEST_VERSIONS:
         raise RuntimeError(f"unsupported generation manifest version: {version!r}")
     records = payload.get("records")
     if not isinstance(records, list):
-        raise RuntimeError("generation manifest has no records")
+        raise TypeError("generation manifest has no records")
     return [_record_from_document(value) for value in records]
 
 
@@ -1194,7 +1194,7 @@ def _assert_fresh_control_authority_group(
                 continue
             held: set[int] = set()
             for line in status.splitlines():
-                if line.startswith("Gid:") or line.startswith("Groups:"):
+                if line.startswith(("Gid:", "Groups:")):
                     held.update(
                         int(value) for value in line.split()[1:] if value.isdigit()
                     )
@@ -1540,7 +1540,7 @@ def _redact_sensitive_records(manifest: Path, retired: frozenset[str]) -> bool:
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     records = payload.get("records")
     if not isinstance(records, list):
-        raise RuntimeError(f"generation manifest has no records: {manifest}")
+        raise TypeError(f"generation manifest has no records: {manifest}")
     changed = False
     for index, record in enumerate(records):
         if not isinstance(record, dict) or record.get("target") not in retired:
@@ -1634,7 +1634,7 @@ def _preflight_sensitive_records(
             if Path(value) != expected:
                 raise RuntimeError(f"sensitive {field} escaped its generation: {value}")
             if not isinstance(digest, str):
-                raise RuntimeError(f"sensitive {field} has no bound digest: {manifest}")
+                raise TypeError(f"sensitive {field} has no bound digest: {manifest}")
             if not _validate_sensitive_blob(
                 generation, directory, expected.name, digest
             ):
@@ -5168,11 +5168,20 @@ WORKER_ONLY_DIRECTORIES = (
 #: owns the database), so unlike `WORKER_ONLY_TARGETS` there is no live host
 #: carrying these files that a worker install has to take them away from.
 CONTROL_ONLY_UNITS = (
+    "voyn-aicc-review.service",
+    "voyn-aicc-review.timer",
+    "voyn-aicc-merge.service",
+    "voyn-aicc-merge.timer",
     "voyn-aicc-pr-window.service",
     "voyn-aicc-pr-window.timer",
 )
-#: The timer of `CONTROL_ONLY_UNITS` the installer enables after commit, so
-#: an installed unit is a *running* tick and not just a file on disk.
+#: The timers of `CONTROL_ONLY_UNITS` the installer enables after commit, so
+#: installed units are *running* ticks and not just files on disk.
+CONTROL_ONLY_TIMERS = (
+    "voyn-aicc-review.timer",
+    "voyn-aicc-merge.timer",
+    "voyn-aicc-pr-window.timer",
+)
 CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
 
 
