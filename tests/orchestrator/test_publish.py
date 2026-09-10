@@ -8,7 +8,15 @@ import subprocess
 
 import pytest
 
-from command_center.orchestrator.publish import PublishConfig, publish_run
+from command_center.orchestrator.publish import (
+    PublishConfig,
+    _classify_push_failure,
+    _diff_touches_github_workflows,
+    _gh_auth_host,
+    _gh_oauth_workflow_scope_missing,
+    _workflow_scope_gate,
+    publish_run,
+)
 
 
 def _git(cwd, *args):
@@ -807,3 +815,365 @@ def test_candidate_leak_guard_copy_is_never_executed(repo, monkeypatch):
 
     assert r.ok, r.reason
     assert not marker.exists(), "candidate leak_guard executed in publisher"
+
+
+# --- VOYN-W0-AICC-PUBLISH-WORKFLOW-SCOPE-REM-REM ---------------------------
+# A failed `git push` used to collapse a missing `workflow` OAuth scope, a
+# stale lease and a real network outage into one opaque `push_failed`
+# reason. These buckets are operator/automation actionable, so they must
+# be distinguishable in the reported reason.
+
+
+def test_classify_push_failure_flags_workflow_scope_rejection():
+    stderr = (
+        "remote: Permission to voyn88/ai-command-center.git denied to "
+        "worker-bot.\n"
+        "! [remote rejected] backlog/x -> backlog/x (refusing to allow an "
+        "OAuth App to create or update workflow "
+        "`.github/workflows/ci.yml` without `workflow` scope)\n"
+    )
+    assert _classify_push_failure(stderr).startswith(
+        "push_rejected_workflow_scope:"
+    )
+
+
+def test_classify_push_failure_prioritizes_auth_over_generic_network_marker():
+    """Rejected on PR #773: `could not read from remote repository` is
+    git's generic SSH transport-failure fatal, and in practice follows
+    `Permission denied (publickey)` -- an auth/permission failure, not a
+    network outage. A retry cannot fix a bad key; it must not be told to."""
+    stderr = (
+        "Permission denied (publickey).\n"
+        "fatal: Could not read from remote repository.\n"
+    )
+    reason = _classify_push_failure(stderr)
+    assert reason.startswith("push_auth_failure:"), reason
+    assert not reason.startswith("push_network_failure:")
+
+
+def test_classify_push_failure_flags_genuine_network_failure():
+    stderr = (
+        "ssh: connect to host github.com port 22: Connection timed out\n"
+        "fatal: Could not read from remote repository.\n"
+    )
+    assert _classify_push_failure(stderr).startswith("push_network_failure:")
+
+
+def test_classify_push_failure_flags_stale_lease():
+    stderr = (
+        "! [rejected] backlog/x -> backlog/x (stale info)\n"
+        "error: failed to push some refs\n"
+    )
+    assert _classify_push_failure(stderr).startswith("push_rejected_stale_lease:")
+
+
+def test_classify_push_failure_falls_back_to_generic_bucket():
+    assert _classify_push_failure("error: something unrecognized\n").startswith(
+        "push_failed:"
+    )
+
+
+def test_gh_auth_host_parses_bare_host():
+    assert (
+        _gh_auth_host("https://github.com/voyn88/ai-command-center.git")
+        == "github.com"
+    )
+
+
+def test_gh_auth_host_fails_open_on_non_https():
+    assert _gh_auth_host("git@github.com:voyn88/ai-command-center.git") is None
+
+
+def test_diff_touches_github_workflows_true_for_a_workflow_edit(tmp_path):
+    work = tmp_path / "w"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(work)], check=True, capture_output=True
+    )
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    (work / "a.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    wf_dir = work / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    assert _diff_touches_github_workflows(work, base, head) is True
+
+
+def test_diff_touches_github_workflows_false_for_unrelated_change(tmp_path):
+    work = tmp_path / "w"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(work)], check=True, capture_output=True
+    )
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    (work / "a.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / "a.txt").write_text("y\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "unrelated")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    assert _diff_touches_github_workflows(work, base, head) is False
+
+
+def test_diff_touches_github_workflows_detects_rename_out_of_workflows(tmp_path):
+    """Secondary observation on PR #773: with git's default rename
+    detection, a workflow file renamed *out* of `.github/workflows/` can be
+    reported only under its new path -- `--no-renames` keeps both the old
+    and new path visible as a delete+add so the touch is never hidden."""
+    work = tmp_path / "w"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(work)], check=True, capture_output=True
+    )
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    wf_dir = work / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    long_body = "\n".join(f"line{i}: value" for i in range(50))
+    (wf_dir / "ci.yml").write_text(f"name: ci\n{long_body}\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    _git(work, "mv", str(wf_dir / "ci.yml"), str(work / "ci.yml.disabled"))
+    _git(work, "commit", "-m", "disable workflow via rename")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    assert _diff_touches_github_workflows(work, base, head) is True
+
+
+def _fake_gh_auth_status(bin_, script_body):
+    gh = bin_ / "gh"
+    gh.write_text(f"#!/bin/sh\n{script_body}\n")
+    gh.chmod(0o755)
+
+
+def test_gh_oauth_workflow_scope_missing_reads_active_account_not_first_match(
+    tmp_path, monkeypatch
+):
+    """Two accounts on the same host: the FIRST one lacks `workflow`, but
+    it is not the active one `gh`/git's credential helper would actually
+    use for the push. Reading the first match anywhere would misattribute
+    the missing scope onto a push that would have succeeded (PR #689)."""
+    import os
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    _fake_gh_auth_status(
+        bin_,
+        "cat <<'EOF'\n"
+        "github.com\n"
+        "  \u2713 Logged in to github.com account first-account (keyring)\n"
+        "  - Active account: false\n"
+        "  - Token scopes: 'gist', 'read:org', 'repo'\n"
+        "\n"
+        "  \u2713 Logged in to github.com account second-account (keyring)\n"
+        "  - Active account: true\n"
+        "  - Token scopes: 'gist', 'read:org', 'repo', 'workflow'\n"
+        "EOF\n",
+    )
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+    assert _gh_oauth_workflow_scope_missing(tmp_path, "github.com") is False
+
+
+def test_gh_oauth_workflow_scope_missing_true_when_active_account_lacks_scope(
+    tmp_path, monkeypatch
+):
+    import os
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    _fake_gh_auth_status(
+        bin_,
+        "cat <<'EOF'\n"
+        "github.com\n"
+        "  \u2713 Logged in to github.com account worker-bot (keyring)\n"
+        "  - Active account: true\n"
+        "  - Token scopes: 'gist', 'read:org', 'repo'\n"
+        "EOF\n",
+    )
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+    assert _gh_oauth_workflow_scope_missing(tmp_path, "github.com") is True
+
+
+def test_gh_oauth_workflow_scope_missing_fails_open_on_no_active_account(
+    tmp_path, monkeypatch
+):
+    import os
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    _fake_gh_auth_status(
+        bin_,
+        "cat <<'EOF'\n"
+        "github.com\n"
+        "  \u2713 Logged in to github.com account worker-bot (keyring)\n"
+        "  - Active account: false\n"
+        "  - Token scopes: 'repo'\n"
+        "EOF\n",
+    )
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+    assert _gh_oauth_workflow_scope_missing(tmp_path, "github.com") is None
+
+
+def test_gh_oauth_workflow_scope_missing_fails_open_on_nonzero_exit(
+    tmp_path, monkeypatch
+):
+    import os
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    _fake_gh_auth_status(bin_, "exit 1")
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+    assert _gh_oauth_workflow_scope_missing(tmp_path, "github.com") is None
+
+
+def test_workflow_scope_gate_blocks_workflow_diff_with_missing_scope(
+    tmp_path, monkeypatch
+):
+    import os
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    _fake_gh_auth_status(
+        bin_,
+        "cat <<'EOF'\n"
+        "github.com\n"
+        "  \u2713 Logged in to github.com account worker-bot (keyring)\n"
+        "  - Active account: true\n"
+        "  - Token scopes: 'gist', 'read:org', 'repo'\n"
+        "EOF\n",
+    )
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+    work = tmp_path / "w"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(work)], check=True, capture_output=True
+    )
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    (work / "a.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    wf_dir = work / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    result = _workflow_scope_gate(
+        work, "https://github.com/voyn88/ai-command-center.git", base, head
+    )
+
+    assert result is not None
+    assert not result.ok
+    assert result.reason.startswith("workflow_scope_missing:")
+
+
+def test_workflow_scope_gate_defers_when_diff_does_not_touch_workflows(
+    tmp_path, monkeypatch
+):
+    import os
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    _fake_gh_auth_status(
+        bin_,
+        "cat <<'EOF'\n"
+        "github.com\n"
+        "  \u2713 Logged in to github.com account worker-bot (keyring)\n"
+        "  - Active account: true\n"
+        "  - Token scopes: 'gist', 'read:org', 'repo'\n"
+        "EOF\n",
+    )
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+
+    work = tmp_path / "w"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(work)], check=True, capture_output=True
+    )
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    (work / "a.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    base = _git(work, "rev-parse", "HEAD").stdout.strip()
+    (work / "a.txt").write_text("y\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "unrelated")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+
+    assert (
+        _workflow_scope_gate(
+            work, "https://github.com/voyn88/ai-command-center.git", base, head
+        )
+        is None
+    )
+
+
+def test_workflow_scope_gate_is_a_noop_off_the_https_oauth_path():
+    """No `_https_push_target` means the SSH deploy-key fallback -- not an
+    OAuth App, never subject to this GitHub restriction."""
+    from pathlib import Path
+
+    assert _workflow_scope_gate(Path("/does/not/matter"), None, "a", "b") is None
+
+
+def test_publish_refuses_a_workflow_diff_without_the_workflow_scope(repo, monkeypatch):
+    """End-to-end: a candidate whose diff touches `.github/workflows/` is
+    refused, with a distinct machine-readable reason, before it ever
+    reaches `git push` -- the live 2026-08-30 PR #502 failure mode, caught
+    pre-flight instead of surfacing as an opaque `push_failed`."""
+    work, bin_, calls = repo
+    _git(
+        work,
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/voyn88/ai-command-center.git",
+    )
+    gh = bin_ / "gh"
+    gh.write_text(
+        f'#!/bin/sh\necho "gh $*" >> {calls}\n'
+        'if [ "$1" = "auth" ]; then\n'
+        "  cat <<'EOF'\n"
+        "github.com\n"
+        "  \u2713 Logged in to github.com account worker-bot (keyring)\n"
+        "  - Active account: true\n"
+        "  - Token scopes: 'gist', 'read:org', 'repo'\n"
+        "EOF\n"
+        "  exit 0\n"
+        "fi\n"
+        'case "$2" in\n'
+        "  view) exit 1 ;;\n"
+        "  create) echo 'https://github.com/x/y/pull/1'; exit 0 ;;\n"
+        "esac\n"
+    )
+    gh.chmod(0o755)
+    _with_path(bin_, monkeypatch)
+    wf_dir = work / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok
+    assert r.reason.startswith("workflow_scope_missing:")
+    log = calls.read_text() if calls.exists() else ""
+    assert not any(line.startswith("git push") for line in log.splitlines())
+    assert not any(line.startswith("lease ") for line in log.splitlines())
