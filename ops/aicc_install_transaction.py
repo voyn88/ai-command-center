@@ -242,6 +242,29 @@ def _record_document(record: BackupRecord) -> dict[str, object]:
     return document
 
 
+def _manifest_version_for(records: list[BackupRecord]) -> int:
+    """The lowest manifest version that losslessly holds every record.
+
+    `_record_document` already omits a version-3 field a record does not use;
+    this is the same trigger applied to the top-level stamp `_generation_records`
+    gates on. An already-deployed reader that predates version 3 -- or version
+    2 -- refuses on that stamp before it ever inspects a record, so a
+    generation that never exercises a newer field must not claim a newer
+    version than it needs, or the compatibility every per-record default
+    exists for never actually reaches an older reader.
+    """
+    if any(
+        record.directory or record.sensitive or record.sensitive_retired
+        for record in records
+    ):
+        return 3
+    if any(
+        record.original_symlink is not None or record.remove for record in records
+    ):
+        return 2
+    return 1
+
+
 def _record_from_document(value: object) -> BackupRecord:
     if not isinstance(value, dict):
         raise TypeError("generation manifest record is malformed")
@@ -1324,34 +1347,34 @@ def _authority_membership_bound(
 def _authority_membership_state(
     payload: dict[str, object], *, getgrnam=grp.getgrnam, getpwall=pwd.getpwall
 ) -> str:
-    """Where the group is now: exactly `before`, exactly `after`, or refused.
+    """Where the two revoked principals are now: exactly `before`, exactly
+    `after`, or refused.
 
-    Both directions are idempotent, so both have to tolerate finding the
-    group already in the state they were going to produce. What neither may
-    tolerate is a THIRD state -- a member this transaction never recorded,
-    or one it recorded and something else has since taken out. Either way the
-    group is no longer described by this journal, and both `gpasswd -a` and
-    `gpasswd -d` would be acting on a membership list nobody in this
-    transaction has seen (review on 0a205a0). Refuse before mutating, with
-    the journal retained.
+    This journal manages exactly two principals' membership in the publisher
+    group, so that is all either direction may judge the group by. Comparing
+    the entire member (or primary-member) list would make an unrelated
+    membership change elsewhere on the host -- something this transaction
+    never touched and does not own -- block restoring, finalizing or
+    retrying the revocation forever (independent review). Both directions
+    are idempotent, so both have to tolerate finding the two principals
+    already in the state they were going to produce; a caller that needs a
+    specific terminal state -- `finalize_authority_membership` wants
+    "after", `restore_legacy_authority_membership` wants "before" -- refuses
+    on its own when this returns anything else, `gpasswd` untouched, journal
+    retained.
     """
     gid, current, primary = _group_snapshot(
         AUTHORITY_GROUP, getgrnam=getgrnam, getpwall=getpwall
     )
     if gid != payload["group_gid"]:
         raise RuntimeError("authority group numeric gid changed during transaction")
-    if primary != frozenset(payload["primary_members"]):
-        raise RuntimeError("authority group primary membership drifted")
-    before = frozenset(payload["members_before"])
-    after = frozenset(payload["members_after"])
     revoked = frozenset(payload["revoked"])
-    if current - revoked != after:
-        raise RuntimeError(
-            f"authority group drifted outside this transaction: {sorted(current)}"
-        )
-    if current == after:
+    if primary & revoked:
+        raise RuntimeError("authority group primary membership drifted")
+    present = current & revoked
+    if not present:
         return "after"
-    if current == before:
+    if present == revoked:
         return "before"
     return "partial"
 
@@ -2368,6 +2391,20 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
             raise RuntimeError(f"cannot prove worker-only unit load state: {unit}")
         load_state = load.stdout.strip()
         if load_state == "not-found":
+            # `LoadState=not-found` names the unit file, not the manager's
+            # runtime state: systemd can retain a unit it has already
+            # started active in memory after that file is deleted or made
+            # unavailable, and only reports not-found for one that is
+            # neither running nor referenced. Trust the same drain proof
+            # `wait_drained` requires everywhere else -- ActiveState,
+            # MainPID, ControlGroup, TasksCurrent -- rather than the load
+            # state alone before skipping it.
+            is_drained, reason = _unit_drained(unit, run=run)
+            if not is_drained:
+                raise RuntimeError(
+                    "worker-only unit reports no load state but is not "
+                    f"proven inactive before control purge: {reason}"
+                )
             return False
         if load_state not in {
             "loaded",
@@ -2831,7 +2868,7 @@ class FileTransaction:
                 manifest,
                 json.dumps(
                     {
-                        "version": MANIFEST_VERSION,
+                        "version": _manifest_version_for(records),
                         "generation": transaction.name,
                         "records": [_record_document(record) for record in records],
                         "previous_current": previous_current,
