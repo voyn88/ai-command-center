@@ -3739,7 +3739,9 @@ def _reconcile_pr_window(
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.
-        detailed = _pr_window_details(repo_path, pr, cache, fetch=False)
+        detailed = _pr_window_details(
+            repo_path, pr, cache, fetch=False, include_reviews=False
+        )
         if detailed is None and details_used >= max(cfg.detail_budget, 0):
             # Out of detail budget: no evidence either way this tick, so no
             # label write at all -- whatever the PR carried (active, waiting,
@@ -3750,7 +3752,7 @@ def _reconcile_pr_window(
             continue
         if detailed is None:
             details_used += 1
-            detailed = _pr_window_details(repo_path, pr, cache)
+            detailed = _pr_window_details(repo_path, pr, cache, include_reviews=False)
         if detailed is None:
             # Unknown is not evidence: a failed detail lookup says nothing
             # about eligibility, so the PR's existing label (active,
@@ -3764,13 +3766,21 @@ def _reconcile_pr_window(
         if fell_back:
             report.age_fallback.append((number, head))
         reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+        if reason in (None, "stale_exact_head_acceptance"):
+            detailed_with_reviews = _pr_window_with_reviews(repo_path, detailed, cache)
+            if detailed_with_reviews is None:
+                report.unreadable.append((number, head))
+                continue
+            detailed = detailed_with_reviews
+            reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
         if (
             reason == "checks_stale"
-            and active_now
             and details_used < max(cfg.detail_budget, 0)
         ):
             details_used += 1
-            fresh = _pr_window_details(repo_path, pr, cache, refresh=True)
+            fresh = _pr_window_details(
+                repo_path, pr, cache, refresh=True, include_reviews=False
+            )
             if fresh is None:
                 report.unreadable.append((number, head))
                 continue
@@ -3779,6 +3789,13 @@ def _reconcile_pr_window(
             if fell_back:
                 report.age_fallback.append((number, head))
             reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+            if reason in (None, "stale_exact_head_acceptance"):
+                detailed_with_reviews = _pr_window_with_reviews(repo_path, detailed, cache)
+                if detailed_with_reviews is None:
+                    report.unreadable.append((number, head))
+                    continue
+                detailed = detailed_with_reviews
+                reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
         if reason is None and needs_merge_state and "mergeStateStatus" not in detailed:
             parsed = _owner_repo_number_from_pr_url(str(detailed.get("url") or ""))
             if parsed is None:
@@ -3984,6 +4001,34 @@ def _rest_merge_state(repo_path: str, owner: str, repo: str, number: int) -> str
     return str(raw).upper()
 
 
+def _pr_window_with_reviews(
+    repo_path: str,
+    pr: dict[str, Any],
+    cache: gh_access.PrDetailCache | None = None,
+) -> dict[str, Any] | None:
+    """Add reviews without replacing fresher check/head details already loaded."""
+    if "reviews" in pr:
+        return pr
+    number = int(pr.get("number") or 0)
+    head = str(pr.get("headRefOid") or "")
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    if parsed is not None:
+        owner, repo = parsed[0], parsed[1]
+    else:
+        origin = _origin_owner_repo(repo_path)
+        if origin is None:
+            return None
+        owner, repo = origin
+    reviews = _rest_reviews(repo_path, owner, repo, number)
+    if reviews is None:
+        return None
+    detailed = dict(pr)
+    detailed["reviews"] = reviews
+    if cache is not None and head:
+        cache.put(f"{owner}/{repo}", number, head, detailed)
+    return detailed
+
+
 def _pr_window_details(
     repo_path: str,
     pr: dict[str, Any],
@@ -3991,6 +4036,7 @@ def _pr_window_details(
     *,
     fetch: bool = True,
     refresh: bool = False,
+    include_reviews: bool = True,
 ) -> dict[str, Any] | None:
     """The per-PR fields the eligibility rules need (reviews, check rollup,
     head commit date), over REST and cached by (repo, PR, head sha).
@@ -4006,7 +4052,9 @@ def _pr_window_details(
 
     None when the lookup fails, which the caller treats as
     not-eligible-this-tick and leaves the PR's existing label alone."""
-    required = ("reviews", "statusCheckRollup", "commits")
+    required = ("statusCheckRollup", "commits")
+    if include_reviews:
+        required = ("reviews", *required)
     if all(key in pr for key in required):
         return pr
     number = int(pr.get("number") or 0)
@@ -4036,16 +4084,17 @@ def _pr_window_details(
         return None
     if cache is not None and head and quota is not None:
         quota.cache_misses += 1
-    reviews = _rest_reviews(repo_path, owner, repo, number)
-    if reviews is None:
-        return None
     rollup = _rest_check_rollup(repo_path, owner, repo, head) if head else []
     if rollup is None:
         return None
     details: dict[str, Any] = {
-        "reviews": reviews,
         "statusCheckRollup": rollup,
     }
+    if include_reviews:
+        reviews = _rest_reviews(repo_path, owner, repo, number)
+        if reviews is None:
+            return None
+        details["reviews"] = reviews
     # The head commit's own date comes from the same REST family and lands in
     # the cached payload, so `_pr_age_seconds` reads it for free on a cache
     # hit instead of repeating the lookup (or falling back to `createdAt`,

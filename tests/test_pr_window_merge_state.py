@@ -146,6 +146,88 @@ def test_active_pr_refreshes_cached_stale_checks_before_demoting(monkeypatch):
     assert cache.writes[-1]["statusCheckRollup"][0]["conclusion"] == "SUCCESS"
 
 
+def test_blocked_pr_refreshes_cached_stale_checks_before_staying_blocked(monkeypatch):
+    head = "b" * 40
+    light_pr = {
+        "number": 2,
+        "url": "https://github.com/x/repo/pull/2",
+        "headRefOid": head,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "author": {"login": "alice"},
+        "labels": [{"name": "review-window:blocked"}],
+    }
+    labels: list[tuple[int, str]] = []
+    cache_payload = {
+        "reviews": [],
+        "statusCheckRollup": [
+            {
+                "name": "Acceptance gate (independent verdict on exact SHA)",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+            }
+        ],
+        "commits": [{"oid": head, "committedDate": "2099-01-01T00:00:00Z"}],
+    }
+
+    class Cache:
+        enabled = True
+
+        def get(self, _repo: str, _number: int, _head: str) -> dict:
+            return cache_payload
+
+        def put(self, _repo: str, _number: int, _head: str, payload: dict) -> None:
+            cache_payload.update(payload)
+
+        def prune(self) -> int:
+            return 0
+
+    monkeypatch.setattr(
+        review_merge, "_list_open_pulls", lambda _repo_path, _cfg: ([light_pr], None)
+    )
+    monkeypatch.setattr(review_merge.gh_access, "detail_cache", Cache)
+    monkeypatch.setattr(
+        review_merge, "_rest_reviews", lambda _repo_path, _owner, _repo, _number: []
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_rest_check_rollup",
+        lambda _repo_path, _owner, _repo, _head: [
+            {
+                "name": "Acceptance gate (independent verdict on exact SHA)",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_head_commit_committed_date",
+        lambda _repo_path, _pr: "2099-01-01T00:00:00Z",
+    )
+    monkeypatch.setattr(
+        review_merge, "_rest_merge_state", lambda _repo_path, _owner, _repo, _number: "CLEAN"
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_set_pr_window_labels",
+        lambda _repo_path, pr, _cfg, desired: labels.append((pr["number"], desired))
+        or True,
+    )
+
+    report = reconcile_pr_window(
+        "/repo",
+        PrWindowConfig(
+            max_active=1,
+            stale_seconds=10**12,
+            required_checks=("Acceptance gate (independent verdict on exact SHA)",),
+        ),
+    )
+
+    assert report.active == [(2, head)]
+    assert report.blocked == []
+    assert labels == [(2, "review-window:active")]
+
+
 def test_in_progress_checks_keep_the_active_window_label(monkeypatch):
     head = "a" * 40
     pr = _pr(1, head, label="review-window:active")

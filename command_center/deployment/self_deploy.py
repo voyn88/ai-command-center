@@ -37,7 +37,10 @@ from __future__ import annotations
 
 import datetime as _datetime
 import json
+import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -71,6 +74,16 @@ class SelfDeployConfig:
     #: marker exists means the next tick (5 minutes later, after the rollout
     #: has finished and removed it) picks the deploy back up instead.
     rollout_lock_path: str = "/run/aicc-staged-rollout.lock"
+    #: Optional immutable release root. When set, self-deploy stages tracked
+    #: files into `<release_root>/releases/<sha>` and atomically points
+    #: `<release_root>/current` at that release instead of asking systemd units
+    #: to execute directly from the mutable source clone.
+    release_root: str | None = None
+    #: Runtime venv to expose inside each immutable release. The venv itself is
+    #: still provisioned by the installer; release staging only binds it into
+    #: the immutable source tree so units can keep using
+    #: `/opt/aicc/current/.venv/bin/python`.
+    release_venv: str | None = None
 
 
 @dataclass(slots=True)
@@ -128,10 +141,13 @@ def _import_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess[s
     modules every tick and worker imports must import from the NEW tree."""
     return _run_bounded(
         [
-            sys.executable, "-c",
-            "import command_center.orchestrator.review_merge, "
-            "command_center.orchestrator.planner, "
-            "command_center.worker.handlers",
+            sys.executable,
+            "-c",
+            (
+                "import command_center.orchestrator.review_merge, "
+                "command_center.orchestrator.planner, "
+                "command_center.worker.handlers"
+            ),
         ],
         timeout,
         cwd=repo_path,
@@ -147,6 +163,87 @@ def _dispatch_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess
         timeout,
         cwd=repo_path,
     )
+
+
+def _selector_for_sha(sha: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise RuntimeError("release sha is invalid")
+    return f"releases/{sha}"
+
+
+def _current_selector(current_link: Path) -> str:
+    try:
+        info = current_link.lstat()
+    except FileNotFoundError:
+        return "ABSENT"
+    if not stat.S_ISLNK(info.st_mode):
+        raise RuntimeError("release selector is not a symlink")
+    selector = os.readlink(current_link)
+    if not re.fullmatch(r"releases/[0-9a-f]{40}", selector):
+        raise RuntimeError("release selector is invalid")
+    return selector
+
+
+def _point_current_at(current_link: Path, selector: str) -> None:
+    if selector != "ABSENT" and not re.fullmatch(r"releases/[0-9a-f]{40}", selector):
+        raise RuntimeError("release selector is invalid")
+    tmp = current_link.with_name(f".{current_link.name}.next")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    if selector == "ABSENT":
+        try:
+            current_link.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    tmp.symlink_to(selector)
+    os.replace(tmp, current_link)
+
+
+def _tracked_files(repo_path: str, timeout: int) -> list[str]:
+    listed = _git(repo_path, ["ls-files", "-z"], timeout)
+    if listed.returncode != 0:
+        raise RuntimeError("release file listing failed")
+    return [name for name in listed.stdout.split("\0") if name]
+
+
+def _stage_immutable_release(
+    repo_path: str, cfg: SelfDeployConfig, sha: str
+) -> tuple[Path, str]:
+    if cfg.release_root is None:
+        return Path(repo_path), "ABSENT"
+    release_root = Path(cfg.release_root)
+    selector = _selector_for_sha(sha)
+    release_dir = release_root / selector
+    current_link = release_root / "current"
+    previous_selector = _current_selector(current_link)
+    if release_dir.exists():
+        return release_dir, previous_selector
+
+    staging = release_root / "releases" / f".{sha}.staging-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, mode=0o755)
+    try:
+        for name in _tracked_files(repo_path, cfg.command_timeout):
+            source = Path(repo_path) / name
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target, follow_symlinks=False)
+        if cfg.release_venv is not None:
+            venv = Path(cfg.release_venv)
+        else:
+            venv = Path(repo_path) / ".venv"
+        if venv.exists():
+            (staging / ".venv").symlink_to(venv)
+        (staging / ".aicc-release-sha").write_text(sha + "\n", encoding="ascii")
+        os.rename(staging, release_dir)
+    except (OSError, RuntimeError, shutil.Error):
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return release_dir, previous_selector
 
 
 def _record_provenance(cfg: SelfDeployConfig, report: SelfDeployReport) -> None:
@@ -240,6 +337,17 @@ def self_deploy_once(
         return finish("failed", f"reset_failed: {moved.stderr.strip()[:100]}")
     report.steps.append(f"checkout_moved:{report.target_sha}")
 
+    try:
+        runtime_path, previous_selector = _stage_immutable_release(
+            repo_path, cfg, report.target_sha
+        )
+    except (OSError, RuntimeError, shutil.Error) as exc:
+        _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
+        return finish("failed", f"release_stage_failed: {exc}")
+    selector_flipped = False
+    if cfg.release_root is not None:
+        report.steps.append(f"release_staged:{runtime_path}")
+
     def rollback(reason: str, *, services_touched: bool) -> SelfDeployReport:
         """VERIFIED restoration (review of 8d1f967: an unchecked
         `reset --hard` could itself fail or time out, leaving the host on
@@ -252,6 +360,14 @@ def self_deploy_once(
         at = _git(repo_path, ["rev-parse", "HEAD"], timeout)
         if at.returncode != 0 or at.stdout.strip() != report.previous_sha:
             return finish("failed", f"rollback_incomplete_checkout: after {reason}")
+        if selector_flipped and cfg.release_root is not None:
+            try:
+                _point_current_at(Path(cfg.release_root) / "current", previous_selector)
+            except (OSError, RuntimeError) as exc:
+                return finish(
+                    "failed",
+                    f"rollback_incomplete_release_selector: {exc}; after {reason}",
+                )
         if services_touched:
             restore_failure = _restart_services(cfg, report)
             if restore_failure is not None:
@@ -264,7 +380,7 @@ def self_deploy_once(
     # Smoke BEFORE migrations (review of cff672a): a broken tree must be
     # discovered while the database is still untouched -- the cheapest
     # failure order is the one with nothing to unwind.
-    smoke = _import_smoke(repo_path, timeout)
+    smoke = _import_smoke(str(runtime_path), timeout)
     if smoke.returncode != 0:
         return rollback(
             f"import_smoke_failed: {smoke.stderr.strip()[:150]}",
@@ -273,7 +389,7 @@ def self_deploy_once(
     report.steps.append("import_smoke_passed")
 
     if cfg.migrate:
-        migrated = _run_migrations(repo_path, timeout)
+        migrated = _run_migrations(str(runtime_path), timeout)
         if migrated.returncode != 0:
             # The checkout is restored, but earlier PENDING migrations may
             # have committed before the failing one (each migration is its
@@ -299,7 +415,7 @@ def self_deploy_once(
         # planner tick died for 18 minutes while import-smoke was green).
         # Exercise exactly the privileges dispatch needs before any service
         # restarts; a refusal rolls the checkout and services back.
-        dispatch_smoke = _dispatch_smoke(repo_path, timeout)
+        dispatch_smoke = _dispatch_smoke(str(runtime_path), timeout)
         if dispatch_smoke.returncode != 0:
             return rollback(
                 "dispatch_smoke_failed_after_migration: "
@@ -307,6 +423,16 @@ def self_deploy_once(
                 services_touched=False,
             )
         report.steps.append("dispatch_smoke_passed")
+
+    if cfg.release_root is not None:
+        try:
+            _point_current_at(
+                Path(cfg.release_root) / "current", _selector_for_sha(report.target_sha)
+            )
+        except (OSError, RuntimeError) as exc:
+            return rollback(f"release_selector_failed: {exc}", services_touched=False)
+        selector_flipped = True
+        report.steps.append(f"release_selected:{report.target_sha}")
 
     # A completed `db upgrade` is deliberately NOT rolled back on a later
     # restart failure: this codebase's migration policy is expand-contract
