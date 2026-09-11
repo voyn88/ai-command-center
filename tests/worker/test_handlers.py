@@ -586,6 +586,86 @@ def test_copilot_provider_failure_switches_inside_the_same_attempt(
     ]
 
 
+def test_codex_usage_limit_switches_inside_the_same_attempt(handler, monkeypatch):
+    """Live 2026-09-11: Codex quota used to complete the review as succeeded
+    with an empty result. It must failover like Copilot, not publish."""
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        if kwargs["executor"] == "codex":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    "ERROR: You've hit your usage limit. Visit "
+                    "https://chatgpt.com/codex/settings/usage to purchase more "
+                    "credits or try again at Sep 15th, 2026 1:24 AM."
+                ),
+                duration_seconds=0.1,
+                started_at="2026-09-11T12:00:00+00:00",
+                completed_at="2026-09-11T12:00:03+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-11T12:00:03+00:00",
+            completed_at="2026-09-11T12:00:04+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert runs[-1]["executor"] == "claude"
+    assert outcome.result["cascade_step"] == 2
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "reason": "provider_auth_or_quota",
+        }
+    ]
+
+
+def test_codex_usage_limit_on_the_last_link_is_infra_not_success(handler, monkeypatch):
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr=(
+                "ERROR: You've hit your usage limit. Visit "
+                "https://chatgpt.com/codex/settings/usage to purchase more "
+                "credits or try again at Sep 15th, 2026 1:24 AM."
+            ),
+            duration_seconds=0.1,
+            started_at="2026-09-11T12:00:00+00:00",
+            completed_at="2026-09-11T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert [run["executor"] for run in runs] == ["codex"]
+    assert "provider/auth/quota" in outcome.reason
+
+
 @pytest.mark.parametrize("workspace_unchanged", [True, False])
 def test_mutating_provider_failover_requires_unchanged_workspace(
     handler, monkeypatch, workspace_unchanged
