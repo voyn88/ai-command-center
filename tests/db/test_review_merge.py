@@ -207,6 +207,11 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
                     "head": {"sha": head}, "changed_files": 1,
                     "additions": 1, "deletions": 0}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api" and "-H" not in argv:
+            # The merge-base probe (no diff media-type header): the stable
+            # ancestor commit, not the mutable base-ref tip.
+            body = {"merge_base_commit": {"sha": BASE}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
         if argv[0] == "api":
             return subprocess.CompletedProcess(argv, 0, DIFF, "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
@@ -306,6 +311,9 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
             body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
                     "head": {"sha": head}, "changed_files": 1,
                     "additions": 1, "deletions": 0}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api" and "-H" not in argv:
+            body = {"merge_base_commit": {"sha": BASE}}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
         if argv[0] == "api":
             return subprocess.CompletedProcess(argv, 0, huge_diff, "")
@@ -1324,6 +1332,54 @@ def test_repo_from_pr_url():
     assert review_merge._repo_from_pr_url("https://github.com/voyn88/aios") is None
 
 
+def test_pr_diff_and_head_keys_off_the_stable_merge_base_not_the_moving_base_tip(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Live 2026-09-06/07 on PR 649 (VOYN-W0-AICC-VERDICT-AGGREGATION-
+    STALLS): `pulls/{n}.base.sha` is the CURRENT TIP of the target branch,
+    which advances every time something else merges into it -- completely
+    unrelated to this PR. Keying the review-cycle identity off that value
+    meant an unrelated merge into main silently orphaned this PR's already-
+    succeeded chunk reviews under a stale key on the very next tick, and
+    `review_once` enqueued a brand-new chunk set from scratch that could
+    never outrun the next drift -- an invisible retry storm that starved
+    aggregation forever. Two fetches of the SAME PR with its own branch
+    completely untouched, but with the target branch having advanced in
+    between (simulated here by a different `base.sha` on the second `pulls`
+    response), must resolve to the exact same review-cycle key."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/repo-d2/pull/649"
+    _ready(store, app_factory, "VOYN-W0-P649", pr_url)
+    head = "9" * 40
+    moving_base_tip = iter([BASE, "d" * 40, "e" * 40])
+
+    def fake_gh(argv, repo):
+        if argv[0] == "api" and "/pulls/649" in argv[1]:
+            body = {"base": {"sha": next(moving_base_tip),
+                              "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": head}, "changed_files": 1,
+                    "additions": 1, "deletions": 0}
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api" and "-H" not in argv:
+            # The stable merge-base commit never moves: it is the same
+            # regardless of which (moving) base-ref tip was passed in.
+            body = {"merge_base_commit": {"sha": BASE}}
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api":
+            return sp.CompletedProcess(argv, 0, DIFF, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
+    snapshot_1 = review_merge._pr_diff_and_head("/tmp", pr_url)
+    snapshot_2 = review_merge._pr_diff_and_head("/tmp", pr_url)
+    assert snapshot_1 is not None and snapshot_2 is not None
+    assert snapshot_1.base == snapshot_2.base == BASE
+    key_1 = review_merge._review_key("VOYN-W0-P649", pr_url, snapshot_1)
+    key_2 = review_merge._review_key("VOYN-W0-P649", pr_url, snapshot_2)
+    assert key_1 == key_2
+
+
 def test_review_key_scopes_by_pr_number_head_sha_and_policy_version():
     base = "https://github.com/voyn88/aios/pull/273"
     sha_a = "a" * 40
@@ -1351,6 +1407,9 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
             body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
                     "head": {"sha": next(current_head)}, "changed_files": 1,
                     "additions": 1, "deletions": 0}
+            return sp.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[0] == "api" and "-H" not in argv:
+            body = {"merge_base_commit": {"sha": BASE}}
             return sp.CompletedProcess(argv, 0, json.dumps(body), "")
         if argv[0] == "api":
             return sp.CompletedProcess(argv, 0, DIFF, "")

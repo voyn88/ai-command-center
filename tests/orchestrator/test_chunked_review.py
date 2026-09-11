@@ -86,6 +86,32 @@ def test_chunk_completeness_failure_and_reject_are_fail_closed(monkeypatch):
     assert not posted and remediated and report.remediated
 
 
+def test_chunk_stuck_at_retry_ceiling_reports_named_exhaustion_not_generic_wait(monkeypatch):  # noqa: E501
+    """VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS (live 2026-09-06/07 on PR
+    649): every chunk review run had SUCCEEDED, yet `publish_review_verdicts`
+    kept reporting the exact same skip forever with nothing to distinguish
+    a permanently-stuck chunk from an ordinary in-flight one. A chunk whose
+    latest attempt succeeded but never produced a valid verdict/head-sha
+    pair, and which has already reached `_next_retry_key`'s bounded retry
+    ceiling (so reconcile_review_once will never enqueue another attempt for
+    it), must surface as its own named terminal reason -- not the same
+    generic `review_chunk_verdict_missing`/`review_chunk_head_sha_mismatch`
+    skip repeated tick after tick."""
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    stuck = rows(snapshot)
+    key, state, payload, _output = stuck[0]
+    retry_key = f"{key}:retry:{review_merge._MAX_RESULT_RETRY_ATTEMPTS}"
+    stuck[0] = (retry_key, state, payload, {"result_text": "tool transcript only, no verdict"})
+
+    report, posted, remediated = publish(monkeypatch, snapshot, stuck)
+
+    assert not posted and not remediated
+    assert len(report.skipped) == 1
+    reason = report.skipped[0][1]
+    assert reason.startswith("review_chunk_retries_exhausted:")
+    assert "verdict_missing" in reason
+
+
 def test_malformed_result_gets_fresh_bounded_retry_key(monkeypatch):
     key = "review:identity:chunk:0001:abc"
     monkeypatch.setattr(
@@ -371,6 +397,9 @@ def test_pr_snapshot_uses_only_atomic_pr_and_immutable_compare(monkeypatch):
                 "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
                 "changed_files": 1, "additions": 0, "deletions": 0}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "-H" not in argv:
+            body = {"merge_base_commit": {"sha": BASE}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
         assert f"compare/{BASE}...{HEAD}" in argv[1]
         return subprocess.CompletedProcess(argv, 0, diff, "")
 
@@ -401,8 +430,13 @@ def test_pr_snapshot_rejects_truncated_or_file_count_mismatch(monkeypatch, stats
         "changed_files": stats[0], "additions": stats[1], "deletions": stats[2]}
 
     def gh(argv, _repo):
-        text = json.dumps(body) if "/pulls/" in argv[1] else "diff --git a/x b/x\n"
-        return subprocess.CompletedProcess(argv, 0, text, "")
+        if "/pulls/" in argv[1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "-H" not in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"merge_base_commit": {"sha": BASE}}), ""
+            )
+        return subprocess.CompletedProcess(argv, 0, "diff --git a/x b/x\n", "")
 
     monkeypatch.setattr(review_merge, "_gh", gh)
     assert review_merge._pr_diff_and_head("/repo", PR) is None
@@ -412,9 +446,18 @@ def test_pr_snapshot_rejects_oversize(monkeypatch):
     body = {"base": {"sha": BASE, "repo": {
         "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
         "changed_files": 1, "additions": 0, "deletions": 0}
+
+    def gh(argv, _repo):
+        if "/pulls/" in argv[1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "-H" not in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"merge_base_commit": {"sha": BASE}}), ""
+            )
+        return subprocess.CompletedProcess(argv, 0, "diff --git a/x b/x\n", "")
+
     monkeypatch.setattr(review_merge, "_MAX_REVIEW_DIFF_BYTES", 1)
-    monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
-        argv, 0, json.dumps(body) if "/pulls/" in argv[1] else "diff --git a/x b/x\n", ""))
+    monkeypatch.setattr(review_merge, "_gh", gh)
     assert review_merge._pr_diff_and_head("/repo", PR) is None
 
 
@@ -423,6 +466,15 @@ def test_pr_snapshot_rejects_binary_diff_even_when_stats_match(monkeypatch):
         "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
         "changed_files": 1, "additions": 0, "deletions": 0}
     binary = "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
-    monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
-        argv, 0, json.dumps(body) if "/pulls/" in argv[1] else binary, ""))
+
+    def gh(argv, _repo):
+        if "/pulls/" in argv[1]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if "-H" not in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"merge_base_commit": {"sha": BASE}}), ""
+            )
+        return subprocess.CompletedProcess(argv, 0, binary, "")
+
+    monkeypatch.setattr(review_merge, "_gh", gh)
     assert review_merge._pr_diff_and_head("/repo", PR) is None

@@ -1236,14 +1236,47 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     try:
         data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
         base, head = data["base"], data["head"]
-        base_sha, head_sha = base["sha"], head["sha"]
+        base_ref_sha, head_sha = base["sha"], head["sha"]
         same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
         stats = tuple(data[name] for name in ("changed_files", "additions", "deletions"))
     except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
         return None
-    if (not same_repo or not re.fullmatch(r"[0-9a-f]{40}", base_sha)
+    if (not same_repo or not re.fullmatch(r"[0-9a-f]{40}", base_ref_sha)
             or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
             or not all(type(value) is int and value >= 0 for value in stats)):
+        return None
+    # `pulls/{number}.base.sha` is the CURRENT TIP of the target branch, not
+    # the commit this PR's topic branch actually diverged from -- GitHub
+    # advances it every time something else merges into the target branch,
+    # completely unrelated to this PR (live 2026-09-06/07 on PR 649,
+    # VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS: with many Wave-0 tasks
+    # merging concurrently, `base.sha` drifted on nearly every tick). The
+    # review-cycle key embeds this value (`_review_key`'s `base:...`
+    # segment), so every drift silently orphaned this PR's already-
+    # succeeded chunk reviews under a stale key -- `_chunk_review_rows`
+    # found nothing under the new prefix, aggregation fell through to the
+    # single-result path and reported "no_review_result_yet" forever, and
+    # review_once kept enqueuing a brand-new chunk set each tick that could
+    # never outrun the next drift. The merge-base commit both refs share is
+    # the stable ancestor: it does not move when unrelated commits land on
+    # the target branch, so re-fetching this exact same PR twice with its
+    # own branch untouched always resolves to the same key. `compare` also
+    # computes its three-dot diff against this same merge-base internally,
+    # so substituting it changes only the KEY's stability, never the diff
+    # content.
+    merge_base_probe = _gh(
+        ["api", f"repos/{owner}/{repo}/compare/{base_ref_sha}...{head_sha}"],
+        repo_path,
+    )
+    try:
+        compare_data = (
+            json.loads(merge_base_probe.stdout or "{}")
+            if merge_base_probe.returncode == 0 else {}
+        )
+        base_sha = compare_data["merge_base_commit"]["sha"]
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", base_sha):
         return None
     diff = _gh(["api", f"repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
                 "-H", "Accept: application/vnd.github.v3.diff"], repo_path)
@@ -1711,16 +1744,25 @@ def _chunk_review_rows(
     first_valid: dict[str, tuple[int, tuple[Any, ...]]] = {}
     for row in rows:
         base_key, attempt = _retry_attempt(row[0])
-        current = newest.get(base_key)
-        if current is None or attempt > current[0]:
-            newest[base_key] = (attempt, (base_key, *row[1:]))
+        # The attempt number rides along as a trailing element so callers
+        # (namely `_aggregate_chunk_verdict`) can tell "still in flight" and
+        # "malformed but retries remain" apart from "malformed AND
+        # `_next_retry_key`'s bounded ceiling was already reached" -- the
+        # latter is permanently stuck and must surface as its own named
+        # terminal reason rather than repeating the same generic WAIT skip
+        # forever (VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS).
+        if current := newest.get(base_key):
+            if attempt > current[0]:
+                newest[base_key] = (attempt, (base_key, *row[1:], attempt))
+        else:
+            newest[base_key] = (attempt, (base_key, *row[1:], attempt))
         result = _json_object(row[3])
         parsed = _parse_verdict((result or {}).get("result_text") or "")
         valid = first_valid.get(base_key)
         if parsed is not None and parsed[1] == snapshot.head and (
             valid is None or attempt < valid[0]
         ):
-            first_valid[base_key] = (attempt, (base_key, *row[1:]))
+            first_valid[base_key] = (attempt, (base_key, *row[1:], attempt))
     selected = {
         base_key: first_valid.get(base_key, newest[base_key])
         for base_key in newest
@@ -1731,10 +1773,10 @@ def _chunk_review_rows(
 def _aggregate_chunk_verdict(
     rows: list[tuple[Any, ...]], snapshot: _PRSnapshot, prefix: str
 ) -> tuple[str, str]:
-    indexed: dict[int, tuple[str, str, dict[str, Any] | None, str]] = {}
+    indexed: dict[int, tuple[str, str, dict[str, Any] | None, str, int]] = {}
     expected_count: int | None = None
     expected_manifest: str | None = None
-    for key, state, payload_value, result_value in rows:
+    for key, state, payload_value, result_value, attempt in rows:
         payload = _json_object(payload_value)
         metadata = payload.get("review_chunk") if payload else None
         if not isinstance(metadata, dict) or metadata.get("version") != 3:
@@ -1774,7 +1816,9 @@ def _aggregate_chunk_verdict(
         content = envelope.get("content") if envelope else None
         if not isinstance(content, dict) or not isinstance(content.get("text"), str):
             return "WAIT", "review_chunk_manifest_invalid"
-        indexed[index] = (str(state), content_hash, _json_object(result_value), content["text"])
+        indexed[index] = (
+            str(state), content_hash, _json_object(result_value), content["text"], attempt,
+        )
 
     if expected_count is None:
         return "WAIT", "review_chunks_missing"
@@ -1789,22 +1833,43 @@ def _aggregate_chunk_verdict(
 
     rejections: list[str] = []
     waiting_reason = ""
+    exhausted_reason = ""
     for index in sorted(indexed):
-        state, _content_hash, result, _text = indexed[index]
+        state, _content_hash, result, _text, attempt = indexed[index]
         if state != "succeeded" or result is None:
             waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
             continue
         text = result.get("result_text") or ""
         parsed = _parse_verdict(text)
+        # A succeeded chunk run that never produced a valid verdict/head-sha
+        # pair, at `_next_retry_key`'s bounded retry ceiling, will never be
+        # retried again -- reconcile_review_once has permanently given up on
+        # it. Distinguishing that from ordinary "still waiting" (which DOES
+        # resolve on a later tick once the retry lands) is exactly the
+        # single-chunk `review_result_retries_exhausted` treatment, applied
+        # per-chunk here: a stuck chunk must surface as its own named,
+        # terminal reason instead of repeating the same generic WAIT skip
+        # forever (VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS, live on PR 649
+        # where every chunk had succeeded yet aggregation never advanced).
         if parsed is None:
+            if attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+                exhausted_reason = exhausted_reason or (
+                    f"review_chunk_retries_exhausted:{index}:verdict_missing"
+                )
             waiting_reason = waiting_reason or f"review_chunk_verdict_missing:{index}"
             continue
         verdict, sha = parsed
         if sha != snapshot.head:
+            if attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+                exhausted_reason = exhausted_reason or (
+                    f"review_chunk_retries_exhausted:{index}:head_sha_mismatch"
+                )
             waiting_reason = waiting_reason or f"review_chunk_head_sha_mismatch:{index}"
             continue
         if verdict == "REJECT":
             rejections.append(f"Chunk {index + 1}/{expected_count}:\n{text}")
+    if exhausted_reason:
+        return "WAIT", exhausted_reason
     if rejections:
         return "REJECT", "\n\n".join(rejections)
     if not complete:
@@ -2492,7 +2557,25 @@ def publish_review_verdicts(
         else:
             result = _latest_review_result(factory, task_id, key)
             if result is None:
-                report.skipped.append((task_id, "no_review_result_yet"))
+                # A malformed terminal result exhausted its bounded retries
+                # (`_next_retry_key`'s `_MAX_RESULT_RETRY_ATTEMPTS` ceiling)
+                # without ever producing a valid verdict/head-sha pair for
+                # this exact head: reconcile_review_once has permanently
+                # stopped retrying it, so re-checking every tick would only
+                # repeat the same generic "still waiting" skip forever with
+                # nothing distinguishing it from an ordinary in-flight
+                # review (VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS -- a stuck
+                # task must surface as its own named, terminal state, not a
+                # silent, indefinite re-enqueue loop).
+                latest = _latest_attempt(factory, task_id, key)
+                if (
+                    latest is not None
+                    and latest[1] == "succeeded"
+                    and latest[0] >= _MAX_RESULT_RETRY_ATTEMPTS
+                ):
+                    report.skipped.append((task_id, "review_result_retries_exhausted"))
+                else:
+                    report.skipped.append((task_id, "no_review_result_yet"))
                 continue
             text = result.get("result_text") or ""
             parsed = _parse_verdict(text)
