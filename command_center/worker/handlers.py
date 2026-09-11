@@ -175,10 +175,11 @@ def _refresh_read_only_source(
     """Bring the bound source clone current before a read-only checkout uses it.
 
     The isolated reviewer clones from this source, not from GitHub.  A stale
-    source therefore means every review runs against yesterday's tree until an
-    operator manually fetches it.  The source is read-only to agents, but the
-    worker owns the clone and may update it before handing a detached copy to
-    the privileged launcher.
+    source therefore means every review runs against yesterday's tree.  The
+    worker namespace binds the Projects clone read-only, so this must not
+    write FETCH_HEAD: host `voyn-aicc-source-clone-refresh` is the writer,
+    and a read-only fetch is skipped (VOYN-W0-AICC-ISOLATED-WORKER-FETCHES-
+    READONLY-SOURCE-CLONE).
     """
     result = refresh_source_clone(repository, pr_number=pr_number)
     return result.ok, result.error
