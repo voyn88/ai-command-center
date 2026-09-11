@@ -35,6 +35,7 @@ from command_center.runtime import db as runtime_db
 from command_center.runtime import runs_read, scheduler, session_view
 from command_center.ui import (
     agent_launcher,
+    agent_tuning_panel,
     alert_panel,
     aml_panel,
     board_view,
@@ -209,6 +210,7 @@ NAV: dict[str, tuple[str, str]] = {
     "task_deps": ("Зависимости задач", ":material/account_tree:"),
     "waves": ("Волны", ":material/waves:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
+    "agent_policies": ("Политики агентов", ":material/tune:"),
     "execution_center": ("Live Execution Center", ":material/bolt:"),
     "daily_audit": ("Ежедневный аудит", ":material/fact_check:"),
     "runs": ("Журнал запусков", ":material/history:"),
@@ -2301,6 +2303,15 @@ elif page_key == "agents":
                     tasks=tasks,
                     default_task_type=task_type,
                 )
+
+
+# --------------------------------------------------------------------------
+# Agent Tuning Policies (VOYN-MIN-AGT-TUNING) — weight/fallback/SLA
+# policy constructor, no code deploy required to add a new policy.
+# --------------------------------------------------------------------------
+
+elif page_key == "agent_policies":
+    agent_tuning_panel.render()
 
 
 # --------------------------------------------------------------------------
