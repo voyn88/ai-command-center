@@ -1534,29 +1534,45 @@ def reconcile_review_once(
     the current PR snapshot again and enqueues an identical payload under a
     fresh `:retry:N` key when the latest attempt succeeded but lacks a valid
     verdict for that same head SHA.
+
+    Untargeted ticks use the same rotating scan window as ``review_once``
+    / ``publish_review_verdicts``. A ``LIMIT max_per_tick ORDER BY task_id``
+    page was permanently filled by the alphabetically first READY_TO_REVIEW
+    rows (usually already ``marker_already_posted``), so later tasks sat on
+    ``review_chunk_verdict_missing`` with no retry forever (live 2026-09-11).
     """
     from command_center.orchestrator.planner import repo_route
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (
-        (task_id, cfg.max_per_tick)
-        if task_id is not None
-        else (cfg.max_per_tick,)
-    )
-    tasks = _rows(
-        factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where + " ORDER BY t.task_id LIMIT %s",
-        params,
-    )
+    if task_id is not None:
+        tasks, scan_token = _rows(
+            factory,
+            "SELECT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "ORDER BY e.value LIMIT %s",
+            (task_id, cfg.max_per_tick),
+        ), None
+    else:
+        tasks, scan_token = _scan_tasks(
+            factory,
+            "scan:reconcile_review_once",
+            "SELECT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' "
+            "AND (t.task_id, e.value) > (%s, %s) "
+            "ORDER BY t.task_id, e.value LIMIT %s",
+            (),
+            cfg.scan_cap,
+        )
     cascade = _model_only_review_cascade()
     actions = 0
+    last_processed = None
     for current_task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
+        last_processed = (current_task_id, pr_url)
         if not cascade:
             report.skipped.append((current_task_id, "no_review_executor_route"))
             continue
@@ -1629,6 +1645,8 @@ def reconcile_review_once(
             report.skipped.append(
                 (current_task_id, "no_malformed_review_result_eligible_for_retry")
             )
+    if scan_token is not None:
+        _scan_commit(factory, "scan:reconcile_review_once", scan_token, last_processed)
     return report
 
 
