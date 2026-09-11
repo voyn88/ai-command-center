@@ -456,6 +456,85 @@ def count_votes(db_path: Path, motion_id: str) -> int:
         return int(row["n"]) if row is not None else 0
 
 
+def get_vote(db_path: Path, vote_id: str) -> dict | None:
+    """One vote by its id, or ``None``."""
+    with db.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM council_vote WHERE id = ?", (vote_id,)
+        ).fetchone()
+        return db._row_to_dict(row)
+
+
+def list_votes_with_outcomes(
+    db_path: Path,
+    *,
+    voter_id: str | None = None,
+    exclude_projects: Iterable[str] | None = None,
+) -> list[dict]:
+    """Every vote joined to its motion's decision, oldest first — the read path
+    behind :mod:`command_center.council.reputation`.
+
+    Each row carries every ``council_vote`` column plus ``decision_outcome``
+    (``NULL`` while the motion is still open) and ``decision_tally`` (the
+    decoded ``{yes, no, abstain}`` dict, or ``None``). ``exclude_projects`` drops
+    votes whose motion is attributed to a redacted project — the same
+    exclude-in-SQL redaction pattern :func:`list_motions` uses, applied here to
+    the joined motion's ``project_ref`` (un-attributed motions are always kept)."""
+    clauses: list[str] = []
+    params: list[Any] = []
+    if voter_id is not None:
+        clauses.append("cv.voter_id = ?")
+        params.append(voter_id)
+    excluded = [p for p in (exclude_projects or []) if p]
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(f"(m.project_ref IS NULL OR m.project_ref NOT IN ({placeholders}))")
+        params.extend(excluded)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT cv.*, cd.outcome AS decision_outcome, "
+            "cd.tally_json AS decision_tally_json "
+            "FROM council_vote cv "
+            "JOIN motion m ON m.id = cv.motion_id "
+            "LEFT JOIN council_decision cd ON cd.motion_id = cv.motion_id"
+            f"{where} "
+            "ORDER BY cv.created_at ASC, cv.id ASC",
+            params,
+        ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            tally_raw = item.pop("decision_tally_json", None)
+            item["decision_tally"] = json.loads(tally_raw) if tally_raw else None
+            out.append(item)
+        return out
+
+
+def list_voter_ids(
+    db_path: Path, *, exclude_projects: Iterable[str] | None = None
+) -> list[str]:
+    """Every distinct ``voter_id`` that has cast at least one non-redacted vote,
+    alphabetically — the roster :func:`command_center.council.service` iterates
+    for the reputation listing."""
+    excluded = [p for p in (exclude_projects or []) if p]
+    clauses: list[str] = []
+    params: list[Any] = []
+    if excluded:
+        placeholders = ", ".join("?" for _ in excluded)
+        clauses.append(f"(m.project_ref IS NULL OR m.project_ref NOT IN ({placeholders}))")
+        params.extend(excluded)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    with db.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT cv.voter_id AS voter_id FROM council_vote cv "
+            f"JOIN motion m ON m.id = cv.motion_id{where} "
+            "ORDER BY cv.voter_id ASC",
+            params,
+        ).fetchall()
+        return [row["voter_id"] for row in rows]
+
+
 # --------------------------------------------------------------------------
 # council_decision  (immutable — written once, no update path)
 # --------------------------------------------------------------------------
