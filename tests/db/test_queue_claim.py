@@ -400,6 +400,51 @@ def test_the_attempt_number_is_unique_per_item(
     assert "idx_work_attempt_item_no" in str(raised.value)
 
 
+def test_claim_follows_attempt_history_when_the_counter_lags(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """A lagged `attempt_count` must not UniqueViolation-crash the worker.
+
+    Live 2026-09-11: `work_item.attempt_count` was 7 while `work_attempt`
+    already had `attempt_no=8`. `queue_claim` inserted 8 again, raised, and
+    every `voyn-aicc-worker@` lane crash-looped until the host credential
+    expired. The attempt rows are the authority; the next number is
+    greatest(counter, max(history)) + 1.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    with psycopg.connect(
+        _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE]), autocommit=True
+    ) as app:
+        item_id = _enqueue(app, "lagged-counter", max_attempts=5)
+
+    migrator_dsn = _as_role(
+        test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]
+    )
+    with psycopg.connect(migrator_dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO work_attempt (attempt_id, work_item_id, attempt_no, "
+                "claimed_by_role, claim_token_hash, visibility_seconds, visible_until, "
+                "state, created_at, updated_at) VALUES "
+                "(%s, %s, 1, session_user, %s, 60, now() + interval '1 min', "
+                "'failed', now(), now())",
+                ("wat_orphan", item_id, "0" * 64),
+            )
+            cur.execute(
+                "SELECT attempt_count FROM work_item WHERE work_item_id = %s",
+                (item_id,),
+            )
+            assert cur.fetchone()[0] == 0
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            verdict = _claim(worker, _token()[1])
+    assert verdict[0] is True, verdict
+    assert verdict[4] == 2
+    state = _item(admin_conn, item_id)
+    assert state[0] == "claimed" and state[1] == 2
+
+
 def test_one_claim_call_consumes_exactly_one_attempt(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
