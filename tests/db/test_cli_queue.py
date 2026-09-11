@@ -52,6 +52,30 @@ def test_queue_redrive_requires_the_item_id() -> None:
         build_parser().parse_args(["queue-redrive"])
 
 
+def test_enroll_mint_defaults_purpose_to_enroll() -> None:
+    args = build_parser().parse_args(["enroll-mint", "worker:srv-a", "srv-a.local"])
+    assert args.principal_id == "worker:srv-a"
+    assert args.host == "srv-a.local"
+    assert args.purpose == "enroll" and args.ttl is None and args.cidr is None
+    reenroll = build_parser().parse_args(
+        ["enroll-mint", "worker:srv-a", "srv-a.local", "--purpose", "re_enroll"]
+    )
+    assert reenroll.purpose == "re_enroll"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["enroll-mint", "worker:srv-a"])
+
+
+def test_enroll_redeem_ticket_is_optional_for_stdin_input() -> None:
+    args = build_parser().parse_args(["enroll-redeem"])
+    assert args.ticket is None and args.out is None
+    scoped = build_parser().parse_args(
+        ["enroll-redeem", "abc123", "--hostname", "srv-a.local", "--out", "/tmp/w.env"]
+    )
+    assert scoped.ticket == "abc123"
+    assert scoped.hostname == "srv-a.local"
+    assert str(scoped.out) == "/tmp/w.env"
+
+
 def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
     args = build_parser().parse_args(["backlog-merge-reconcile"])
     assert args.command == "backlog-merge-reconcile"
