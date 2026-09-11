@@ -107,6 +107,56 @@ def test_refresh_stores_pr_head_as_a_reachable_local_ref(tmp_path) -> None:
     )
 
 
+def test_refresh_skips_fetch_when_the_clone_is_read_only(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    head = _repo(source)
+    real_git = source_clone_refresh._git
+
+    def fake_git(repo, args, *, timeout=120):
+        if args[:1] == ["fetch"]:
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                1,
+                stdout="",
+                stderr="error: cannot open '.git/FETCH_HEAD': Read-only file system\n",
+            )
+        return real_git(repo, args, timeout=timeout)
+
+    monkeypatch.setattr(source_clone_refresh, "_git", fake_git)
+
+    result = source_clone_refresh.refresh_source_clone(source)
+
+    assert result.ok
+    assert result.head == head
+    assert result.error is None
+
+
+def test_read_only_refresh_fails_closed_when_the_pr_ref_is_absent(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    _repo(source)
+    real_git = source_clone_refresh._git
+
+    def fake_git(repo, args, *, timeout=120):
+        if args[:1] == ["fetch"]:
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                1,
+                stdout="",
+                stderr="error: cannot open '.git/FETCH_HEAD': Read-only file system\n",
+            )
+        return real_git(repo, args, timeout=timeout)
+
+    monkeypatch.setattr(source_clone_refresh, "_git", fake_git)
+
+    result = source_clone_refresh.refresh_source_clone(source, pr_number="17")
+
+    assert not result.ok
+    assert result.error is not None
+    assert "read-only and PR ref is absent" in result.error
+
+
 def test_cli_reports_json_and_nonzero_on_failure(tmp_path, capsys) -> None:
     missing = tmp_path / "missing"
 

@@ -241,6 +241,9 @@ def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
     assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" in queue_unit
     assert "command_center.ops.source_clone_refresh" in refresh_unit
     assert "ReadWritePaths=/home/voynadmin/aicc-preprod/repo" in refresh_unit
+    assert "ReadWritePaths=/home/voynadmin/Projects/ai-command-center" in refresh_unit
+    assert "ReadWritePaths=-/home/voynadmin/Projects/aios" in refresh_unit
+    assert "--repo /home/voynadmin/Projects/ai-command-center" in refresh_unit
     assert "Unit=voyn-aicc-source-clone-refresh.service" in refresh_timer
 
 
