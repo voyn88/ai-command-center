@@ -12,6 +12,8 @@ started rather than found inside it:
 from __future__ import annotations
 
 import json
+import sqlite3
+import types
 from pathlib import Path
 
 import pytest
@@ -369,6 +371,113 @@ def test_reconciling_against_a_decoded_reader_is_not_clean(
     reported = divergence(decoded, mirror)
 
     assert [entry["fields"] for entry in reported] == [["refs_json"]]
+
+
+def test_list_digest_items_stored_streams_rather_than_materialises(tmp_path) -> None:
+    """The property `mirror_support.divergence` was written to rely on:
+    `list_digest_items_stored` is the first real reconciliation input, and a
+    `list`-returning implementation would put the whole table in one
+    process's memory to feed a check written specifically to avoid that.
+    """
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+    wave1.create_digest_item(db_path, title="only", day="2026-08-14", position=1)
+
+    result = wave1.list_digest_items_stored(db_path)
+
+    assert isinstance(result, types.GeneratorType)
+    assert [row["title"] for row in result] == ["only"]
+
+
+def test_list_digest_items_stored_never_calls_fetchall(tmp_path, monkeypatch) -> None:
+    """Pins the row-by-row path against a table too large for a single
+    `fetchall()` — 5,000 rows here standing in for "bigger than a reasonable
+    buffer" — using a cursor whose `fetchall`/`fetchmany` raise if reached.
+
+    Patches the *module-level* `sqlite3.connect` that `runtime.db.core` calls
+    directly (`import sqlite3; sqlite3.connect(...)`, not a bound `from
+    sqlite3 import connect`), which is what makes the patch actually intercept
+    the connection `list_digest_items_stored` opens. The rows are inserted
+    through the *unpatched* connect beforehand and read back through the
+    patched one, so a pooled/cached connection reused across both calls would
+    not silently defeat this guard either — there is only ever one connection
+    per `db.connect()` call (see `runtime/db/core.py`), and this proves it
+    stays that way for the read path too.
+    """
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+    row_count = 5000
+    for i in range(row_count):
+        wave1.create_digest_item(db_path, title=f"item {i}", day="2026-08-14", position=i)
+
+    class _NoFetchAllCursor(sqlite3.Cursor):
+        def fetchall(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("materialised the whole table via fetchall")
+
+        def fetchmany(self, *args: object, **kwargs: object) -> object:
+            raise AssertionError("materialised the whole table via fetchmany")
+
+    class _Connection(sqlite3.Connection):
+        def cursor(self, factory: object = None) -> sqlite3.Cursor:
+            return super().cursor(_NoFetchAllCursor)
+
+    real_connect = sqlite3.connect
+
+    def _patched_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs.setdefault("factory", _Connection)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", _patched_connect)
+
+    result = wave1.list_digest_items_stored(db_path)
+    assert isinstance(result, types.GeneratorType)
+    assert sum(1 for _ in result) == row_count
+
+
+def test_list_digest_items_stored_closes_the_connection_when_execute_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression pin for the defect independent review found in the first
+    streaming rewrite (PR #789): because the reader is a generator,
+    `db.connect(db_path)` is not entered until the caller starts iterating, so
+    a naive rewrite that opened the connection *before* constructing the
+    generator (e.g. via `ExitStack`) closed it only on failures reached during
+    iteration — a failure raised by `execute()` itself, before any row was
+    ever yielded, leaked the connection.
+
+    Here `execute()` is made to fail on the very statement
+    `list_digest_items_stored` issues, and the connection's `close()` is
+    watched to confirm the `with db.connect(...)` block that wraps `execute()`
+    (not a `try`/`finally` bolted on around it) is what closes it — the same
+    guarantee the old `fetchall()`-based code had, kept rather than narrowed.
+    """
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+
+    closed: list[sqlite3.Connection] = []
+
+    class _Connection(sqlite3.Connection):
+        def close(self) -> None:
+            closed.append(self)
+            super().close()
+
+        def execute(self, sql: str, *args: object, **kwargs: object) -> sqlite3.Cursor:
+            if sql.startswith("SELECT * FROM digest_item"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return super().execute(sql, *args, **kwargs)
+
+    real_connect = sqlite3.connect
+
+    def _patched_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs.setdefault("factory", _Connection)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", _patched_connect)
+
+    with pytest.raises(sqlite3.OperationalError):
+        next(wave1.list_digest_items_stored(db_path))
+
+    assert closed, "the connection opened for the failed query was never closed"
 
 
 def test_sqlite_remains_the_authority_for_digest_items() -> None:
