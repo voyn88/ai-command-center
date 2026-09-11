@@ -865,9 +865,9 @@ def test_review_backlog_fence_pauses_dispatch_but_not_resume_reconcile(rig) -> N
     )
     _park_technically(app_factory, store, worker, "VOYN-W0-BL3")
     assert store.upsert_task(_task("VOYN-W0-BL4", repo="repo-d2"))[0]  # OPEN
-    # A lane is busy, so the fence is real backpressure here (with every lane
-    # idle the tick would dispatch anyway -- see
-    # test_idle_lanes_dispatch_through_the_review_backlog_fence).
+    # A lane is busy, so this is the ordinary backpressure case. Idle lanes
+    # no longer punch a hole in the fence either -- see
+    # test_idle_lanes_do_not_dispatch_through_the_review_backlog_fence.
     assert store.upsert_task(_task("VOYN-W0-TT", repo="repo-tt"))[0]
     assert _dispatch(app_factory, "VOYN-W0-TT")[0]
 
@@ -1128,10 +1128,10 @@ def test_pipeline_class_tasks_pass_the_review_backlog_fence(rig, admin_conn) -> 
     assert report.fenced == 1
 
 
-def test_idle_lanes_dispatch_through_the_review_backlog_fence(rig) -> None:
-    """The fence is backpressure for busy lanes, not a reason to idle the
-    fleet: with no execution work item ready or claimed, the tick dispatches
-    its ordinary bounded batch even though the backlog is at the limit."""
+def test_idle_lanes_do_not_dispatch_through_the_review_backlog_fence(rig) -> None:
+    """VOYN-W0-AICC-STOP-IDLE-TRICKLE-THROUGH-REVIEW-FENCE: idle execution
+    lanes are not a reason to grow the READY_TO_REVIEW window. Functional
+    work stays fenced until that window drains; pipeline still bypasses."""
     app_factory, store, _worker = rig
     assert store.upsert_task(_task("VOYN-W0-RV", status="READY_TO_REVIEW", repo="repo-rv"))[0]
     _mark_ready_to_review_with_pr(app_factory, "VOYN-W0-RV")
@@ -1140,9 +1140,37 @@ def test_idle_lanes_dispatch_through_the_review_backlog_fence(rig) -> None:
     limits = PlanLimits(planner="planner-idle", review_backlog_limit=1)
     report = plan_once(app_factory, limits)
     assert report.review_window_full == 1
-    assert report.idle_trickle is True
-    assert [t for t, _ in report.dispatched] == ["VOYN-W0-P1"]
-    assert report.fenced == 0
+    assert report.idle_trickle is False
+    assert report.dispatched == []
+    assert report.fenced == 1
+    assert store.get_task("VOYN-W0-P1")["status"] == "OPEN"
+
+
+def test_pipeline_still_bypasses_when_lanes_are_idle_and_fence_active(
+    rig, admin_conn
+) -> None:
+    """Pipeline work that drains the review window still dispatches when
+    every execution lane is idle; only functional work is held."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RV", status="READY_TO_REVIEW", repo="repo-rv"))[0]
+    _mark_ready_to_review_with_pr(app_factory, "VOYN-W0-RV")
+    assert store.upsert_task(_task("VOYN-W0-P1", repo="repo-p1"))[0]
+    assert store.upsert_task(_task("VOYN-W0-P3", repo="repo-p3"))[0]
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_task SET task_class = 'pipeline' WHERE task_id = %s",
+            ("VOYN-W0-P3",),
+        )
+        admin_conn.commit()
+
+    limits = PlanLimits(planner="planner-idle-pipe", review_backlog_limit=1)
+    report = plan_once(app_factory, limits)
+    assert report.review_window_full == 1
+    assert report.idle_trickle is False
+    assert [t for t, _ in report.dispatched] == ["VOYN-W0-P3"]
+    assert report.pipeline_bypass == ["VOYN-W0-P3"]
+    assert report.fenced == 1
+    assert store.get_task("VOYN-W0-P1")["status"] == "OPEN"
 
 
 def _set_pipeline(app_factory, task_id: str) -> None:
