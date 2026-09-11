@@ -45,7 +45,7 @@ def test_finding_explicit_dedup_key_wins() -> None:
 
 
 def test_default_owner_for_never_empty() -> None:
-    for category in ("security", "coverage", "code-quality", "deps", "lint"):
+    for category in ("security", "coverage", "code-quality", "deps", "lint", "gaming"):
         assert default_owner_for(category)
     assert default_owner_for("unmapped-category") == "engineering"
 
@@ -165,9 +165,9 @@ def test_lint_check_flags_unused_import(tmp_path: Path) -> None:
 # --- registry -------------------------------------------------------------
 
 
-def test_default_registry_has_all_five_checks() -> None:
+def test_default_registry_has_all_six_checks() -> None:
     names = set(default_registry().names())
-    assert names == {"security", "lint", "code-quality", "deps", "coverage"}
+    assert names == {"security", "lint", "code-quality", "deps", "coverage", "gaming"}
 
 
 def test_registry_refuses_duplicate_without_replace() -> None:
