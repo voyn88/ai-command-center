@@ -45,6 +45,15 @@ class VoteCreate(BaseModel):
     rationale: str | None = None
 
 
+class MotionClose(BaseModel):
+    """Optional POST body for closing a motion. ``impact``, when given, is
+    recorded on the resulting decision as its estimated financial/time impact
+    (the Decision P&L pillar of the proof package, VOYN-MIN-WOW-1) — free-form
+    and optional, since most decisions never carry one."""
+
+    impact: dict | None = None
+
+
 class JournalEntry(BaseModel):
     """One entry in a motion's append-only journal (audit trail)."""
 

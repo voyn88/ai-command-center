@@ -42,6 +42,7 @@ INITIAL_MIGRATION = REPO_ROOT / "command_center" / "db" / "sql" / "0001_initial.
 CORRESPONDING_MIGRATIONS = (
     REPO_ROOT / "command_center" / "db" / "sql" / "0004_run_finalized_at.up.sql",
     REPO_ROOT / "command_center" / "db" / "sql" / "0016_run_finalization_claim.up.sql",
+    REPO_ROOT / "command_center" / "db" / "sql" / "0017_council_decision_impact.up.sql",
 )
 
 #: The bookkeeping table; not a domain table on either side.
