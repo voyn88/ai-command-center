@@ -1,6 +1,6 @@
 """Server-side redaction boundary — the last line before bytes leave AIOS.
 
-Two complementary mechanisms, both fail-closed:
+Three complementary mechanisms, all fail-closed:
 
 1. **Allowlist projection** — the mappers in `native_gateway.source` copy only
    named fields into pydantic DTOs with ``extra="forbid"``; anything the
@@ -9,6 +9,12 @@ Two complementary mechanisms, both fail-closed:
    secret-shaped content and replaced with ``[REDACTED]`` if it matches; the
    fully serialized response body is then scanned once more, and any residual
    hit aborts the response with a safe 500 instead of leaking.
+3. **Log path redaction** — `PathRedactingFilter` rewrites the absolute
+   local-filesystem paths that `logging`'s own machinery injects (the call
+   site's `pathname`, and `exc_info=True` tracebacks, which print each
+   frame's absolute source file) to repo-relative form before a handler can
+   emit them. This is the log-side counterpart to (2): the HTTP scan never
+   sees log output, so it cannot cover this leak on its own.
 
 The pattern list is a strict superset of the native client's own
 `SnapshotDecoder` guard ("authorization", "bearer ", "password", "ssh-rsa",
@@ -19,9 +25,13 @@ also a liveness requirement, not only a security one.
 
 from __future__ import annotations
 
+import logging
 import re
+import traceback
+from pathlib import Path
 
 REDACTED = "[REDACTED]"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Case-insensitive substring/regex patterns for content that must never leave
 # the gateway: credentials, key material, DSNs, SSH data, absolute host paths,
@@ -101,3 +111,56 @@ def assert_body_safe(body: str) -> None:
     violation = find_violation(body)
     if violation is not None:
         raise RedactionViolation(violation)
+
+
+# Absolute path spans (POSIX system roots and Windows drives) — the same
+# roots `_PROHIBITED` flags above, but captured whole so the match can be
+# rewritten in place rather than nuking the entire log line.
+_ABS_PATH = re.compile(
+    r"/(?:Users|home|var|etc|opt|srv|root|private|tmp)(?:/[^\s\"'()]*)?"
+    r"|[A-Za-z]:\\[^\s\"'()]*"
+)
+
+
+def relativize_filepaths(text: str) -> str:
+    """Rewrite absolute local filesystem paths to repo-relative form.
+
+    A path under this checkout becomes a relative POSIX path — it names a
+    file in version control, not a developer machine's or host's directory
+    layout, so it is safe to keep for debugging. A path outside the checkout
+    (interpreter, virtualenv, OS temp dir, another user's home) carries no
+    diagnostic value worth the leak and is redacted outright.
+    """
+
+    def _sub(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        try:
+            rel = Path(raw).resolve().relative_to(REPO_ROOT)
+        except (OSError, ValueError):
+            return REDACTED
+        return rel.as_posix()
+
+    return _ABS_PATH.sub(_sub, text)
+
+
+class PathRedactingFilter(logging.Filter):
+    """Strips absolute local filesystem paths out of every emitted record.
+
+    Covers the three places `logging` can leak a machine's directory layout
+    on its own, independent of what the caller passed as the log message:
+    the call site's `record.pathname`, any absolute path interpolated into
+    the message text, and — the sharpest edge, because it fires even when
+    the caller never mentions a path — every frame of an `exc_info=True`
+    traceback, which `logging` renders as ``File "<absolute path>", ...``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.pathname = relativize_filepaths(record.pathname)
+        record.msg = relativize_filepaths(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            exc_text = record.exc_text or "".join(
+                traceback.format_exception(*record.exc_info)
+            )
+            record.exc_text = relativize_filepaths(exc_text)
+        return True
