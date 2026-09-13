@@ -3827,6 +3827,15 @@ def _reconcile_pr_window(
         )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
+        if queue_active_now:
+            selected += 1
+            report.active.append((number, head))
+            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_active)
+            continue
+        if queue_waiting_now:
+            report.waiting.append((number, head))
+            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
+            continue
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.
@@ -3920,15 +3929,6 @@ def _reconcile_pr_window(
             detailed = dict(detailed)
             detailed["mergeStateStatus"] = merge_state
             reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
-        if queue_active_now:
-            selected += 1
-            report.active.append((number, head))
-            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
-            continue
-        if queue_waiting_now:
-            report.waiting.append((number, head))
-            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
-            continue
         if reason is not None:
             report.blocked.append((number, reason))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
