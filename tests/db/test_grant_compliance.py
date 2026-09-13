@@ -60,6 +60,27 @@ def _provision(admin_conn, psycopg, test_dsn, role_passwords) -> None:
         roles.apply_table_grants(conn)
 
 
+def _migrate_files_directly(admin_conn, psycopg, test_dsn, role_passwords):
+    """Bootstrap, then apply the migration *files* without `migrations.upgrade()`.
+
+    Stands in for a lightweight rebuild of the schema (a throwaway stand, a
+    schema-correspondence fixture) that runs the `.up.sql` files straight
+    through, the way `tests/db/test_schema_correspondence.py` already does.
+    That path never calls the runner, so it never calls `ensure_ledger()`
+    either: `schema_migration` is `aios_db`'s table, not any migration's, and a
+    database built this way genuinely does not have it. Returns the open
+    migrator connection so the caller can act on it.
+    """
+    roles.apply_bootstrap(admin_conn)
+    conn = psycopg.connect(
+        _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords),
+        autocommit=True,
+    )
+    for migration in migrations.discover():
+        conn.execute(migration.up_sql)
+    return conn
+
+
 def _actual_table_grants(admin_conn) -> dict[str, dict[str, set[str]]]:
     """Return {role: {table: {privilege, …}}} from the catalog.
 
@@ -325,6 +346,44 @@ def test_compliance_passes_when_grants_are_applied(
     """A database with migrations AND grants applied must have zero violations."""
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     violations = _check_compliance(admin_conn)
+    assert violations == [], "\n".join(violations)
+
+
+def test_apply_table_grants_creates_the_ledger_a_migrations_only_build_lacks(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """render_table_grants-needs-a-table-no-migration-creates (VOYN-W0-AICC).
+
+    `schema_migration` is declared in `roles.ALL_TABLES` but created by
+    `aios_db`'s `ensure_ledger()`, not by `0001` or `0002`. A database built by
+    applying the migration files directly -- skipping `migrations.upgrade()`
+    entirely, the way a lightweight stand or `test_schema_correspondence.py`'s
+    fixture does -- therefore reaches `apply_table_grants()` without that table
+    existing. Before the fix, the catalog probe inside `apply_table_grants()`
+    would simply not find it and silently skip its grant; the surface symptom
+    is `aicc_app`/`aicc_worker` permission-denied on `schema_migration`, which
+    is exactly what makes `/readyz`'s schema-version check degrade.
+    """
+    conn = _migrate_files_directly(admin_conn, psycopg, test_dsn, role_passwords)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_class WHERE relname = 'schema_migration'")
+            assert cur.fetchone() is None, (
+                "test setup invariant broken: the ledger must not exist yet"
+            )
+
+        roles.apply_table_grants(conn)
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_class WHERE relname = 'schema_migration'")
+            assert cur.fetchone() is not None, (
+                "apply_table_grants() must ensure the ledger exists, not just "
+                "grant on what it happens to find"
+            )
+    finally:
+        conn.close()
+
+    violations = [v for v in _check_compliance(admin_conn) if "schema_migration" in v]
     assert violations == [], "\n".join(violations)
 
 
