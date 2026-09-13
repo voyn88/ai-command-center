@@ -2,7 +2,7 @@
 
 This module is the single source of truth for who may touch what. The same
 `PRIVILEGES` mapping renders the `GRANT` statements that provision a database
-and drives `tests/db/test_role_privileges.py`, which connects *as each role*
+and drives `tests/db/test_grant_compliance.py`, which connects *as each role*
 and asserts both halves of the matrix — what the role can do and what it must
 not. That coupling is deliberate: the defect behind `VOYN-W0-SEC-AUDIT-PG-CRED`
 was a grant that no test exercised, so a grant added here without a matching
