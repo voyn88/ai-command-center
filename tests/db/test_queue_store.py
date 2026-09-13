@@ -7,6 +7,7 @@ promoted a mirror would look exactly like a passing test suite.
 
 from __future__ import annotations
 
+from datetime import datetime
 import inspect
 from pathlib import Path
 
@@ -14,6 +15,11 @@ import pytest
 
 from command_center import execution_queue, queue_store
 from command_center.db.queue_store import QUEUE_ENTRY_COLUMNS, PostgresQueueMirror
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -97,7 +103,7 @@ def test_the_read_path_reads_the_authority_and_no_mirror() -> None:
 
 @pytest.fixture
 def mirror(pg_connection_factory) -> PostgresQueueMirror:
-    return PostgresQueueMirror(connection_factory=pg_connection_factory)
+    return PostgresQueueMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
 
 def test_replace_is_idempotent(mirror: PostgresQueueMirror) -> None:

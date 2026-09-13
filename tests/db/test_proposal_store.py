@@ -18,6 +18,7 @@ is repaired by a later one and a final-state check reports clean.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from command_center.db.proposal_store import (
@@ -29,6 +30,11 @@ from command_center.db.proposal_store import (
     proposal_evidence_divergence,
 )
 from command_center.runtime.db import proposal as proposal_db
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 SAMPLE_AT = "2026-08-14T00:00:00"
 
@@ -74,9 +80,9 @@ def test_the_proposal_family_reconciles_after_every_write(
     stage reconciles both proposals' children against the complete table
     rather than one proposal's slice of it."""
     _patch(monkeypatch, pg_connection_factory)
-    proposals = PostgresProposalMirror(connection_factory=pg_connection_factory)
-    events = PostgresProposalEventMirror(connection_factory=pg_connection_factory)
-    evidence = PostgresProposalEvidenceMirror(connection_factory=pg_connection_factory)
+    proposals = PostgresProposalMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    events = PostgresProposalEventMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    evidence = PostgresProposalEvidenceMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     proposal_db.db.migrate(db_path)
@@ -173,9 +179,9 @@ def test_the_atomic_path_mirrors_the_parent_before_its_children(
     that visible: they can only be there if the parent went first.
     """
     _patch(monkeypatch, pg_connection_factory)
-    proposals = PostgresProposalMirror(connection_factory=pg_connection_factory)
-    events = PostgresProposalEventMirror(connection_factory=pg_connection_factory)
-    evidence = PostgresProposalEvidenceMirror(connection_factory=pg_connection_factory)
+    proposals = PostgresProposalMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    events = PostgresProposalEventMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    evidence = PostgresProposalEvidenceMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     proposal_db.db.migrate(db_path)

@@ -47,6 +47,13 @@ def test_an_already_aware_timestamp_keeps_its_own_offset() -> None:
     assert to_instant(aware).utcoffset() == timedelta(hours=5)
 
 
+#: The zone `to_instant` attaches when it has no explicit zone to work from —
+#: this process's own, exactly as `datetime.astimezone()` with no argument
+#: resolves it. Naming it here is what lets these tests pass the *same* zone
+#: to `render_authority_timestamp` deliberately rather than by accident.
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
+
+
 def test_the_render_reproduces_exactly_what_the_application_writes() -> None:
     """The regression test for the defect that reached `main`.
 
@@ -60,19 +67,55 @@ def test_the_render_reproduces_exactly_what_the_application_writes() -> None:
     written = models.iso_now()
     assert "+" not in written and not written.endswith("Z")  # guard the premise
 
-    assert render_authority_timestamp(to_instant(written)) == written
+    assert render_authority_timestamp(to_instant(written), zone=AMBIENT_ZONE) == written
 
 
 def test_the_render_survives_a_mirror_read_in_another_zone() -> None:
     """`timestamptz` comes back in the session's zone, not the writer's. The
-    render converts to local first, so the same instant renders identically
-    however the server chose to present it."""
+    render converts to the *given* zone first, so the same instant renders
+    identically however the server chose to present it."""
     written = "2026-08-13T12:00:00"
     instant = to_instant(written)
 
     elsewhere = instant.astimezone(timezone(timedelta(hours=-7)))
 
-    assert render_authority_timestamp(elsewhere) == written
+    assert render_authority_timestamp(elsewhere, zone=AMBIENT_ZONE) == written
+
+
+def test_rendering_against_the_wrong_zone_no_longer_reconciles_clean() -> None:
+    """The counterexample independent review found, reproduced and closed.
+
+    The same row mirrored from an MSK-zoned and a UTC-zoned process stored
+    instants three hours apart and both reconciled clean, because each
+    process's render used `.astimezone()` — its own ambient zone — which is
+    the same (wrong, for the other process) zone its own `to_instant` had
+    used going in. Nothing compared that zone to the one the row was actually
+    written on, so two different instants both round-tripped to the same
+    string.
+
+    `zone` is required now, so a caller has to say which zone the naive string
+    is on. Naming the *wrong* one is now visible in the rendered string rather
+    than silently reproducing the original wall clock — and naming the right
+    one (what `command_center.runtime.db.resolve_timestamp_zone` returns, not
+    whatever zone the reconciling process happens to be in) is what makes this
+    an independent check instead of a coincidence (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+    """
+    msk = timezone(timedelta(hours=3))
+    utc = timezone.utc
+    written = "2026-08-13T12:00:00"
+
+    # What an MSK-zoned writer process actually stored: `to_instant` in that
+    # process would have attached its own (MSK) ambient zone.
+    stored_by_msk_writer = datetime.fromisoformat(written).replace(tzinfo=msk)
+
+    # A UTC-zoned reconciler that (correctly, now) states its assumption finds
+    # it does not reproduce the authority's string — the divergence the old
+    # code could never see.
+    assert render_authority_timestamp(stored_by_msk_writer, zone=utc) != written
+
+    # The zone that actually wrote the row is the one that reproduces it,
+    # independent of which zone the reconciling process itself is in.
+    assert render_authority_timestamp(stored_by_msk_writer, zone=msk) == written
 
 
 # --- the per-column codec ---------------------------------------------------
@@ -83,11 +126,11 @@ CODEC = ColumnCodec(timestamps=frozenset({"created_at"}), flags=frozenset({"done
 
 def test_flags_and_timestamps_round_trip_through_their_column_types() -> None:
     assert CODEC.to_column("done", 1) is True
-    assert CODEC.to_authority("done", True) == 1
-    assert isinstance(CODEC.to_authority("done", True), int)
+    assert CODEC.to_authority("done", True, zone=AMBIENT_ZONE) == 1
+    assert isinstance(CODEC.to_authority("done", True, zone=AMBIENT_ZONE), int)
 
     stored = CODEC.to_column("created_at", "2026-08-13T00:00:00")
-    assert CODEC.to_authority("created_at", stored) == "2026-08-13T00:00:00"
+    assert CODEC.to_authority("created_at", stored, zone=AMBIENT_ZONE) == "2026-08-13T00:00:00"
 
 
 def test_a_null_stays_null_in_both_directions() -> None:
@@ -96,7 +139,7 @@ def test_a_null_stays_null_in_both_directions() -> None:
     "no"."""
     for name in ("done", "created_at"):
         assert CODEC.to_column(name, None) is None
-        assert CODEC.to_authority(name, None) is None
+        assert CODEC.to_authority(name, None, zone=AMBIENT_ZONE) is None
 
 
 def test_columns_the_table_did_not_name_pass_through_untouched() -> None:
@@ -104,7 +147,7 @@ def test_columns_the_table_did_not_name_pass_through_untouched() -> None:
     sides — free user input, not dates. A codec that guessed from the column
     name would convert them and lose whatever the user typed."""
     assert CODEC.to_column("due", "someday") == "someday"
-    assert CODEC.to_authority("due", "someday") == "someday"
+    assert CODEC.to_authority("due", "someday", zone=AMBIENT_ZONE) == "someday"
     assert CODEC.to_column("version", 3) == 3
 
 

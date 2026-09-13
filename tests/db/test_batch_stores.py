@@ -30,6 +30,7 @@ What still gets per-table attention, because it is per-table by nature:
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
 
@@ -67,6 +68,11 @@ from command_center.runtime.db import audit as audit_db
 from command_center.runtime.db import marketplace as market_db
 from command_center.runtime.db import networking as net_db
 from command_center.runtime.db import wave1
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -172,7 +178,7 @@ def test_audit_runs_have_a_reconciliation_entry_point(
         "PostgresAuditRunMirror",
         lambda: PostgresAuditRunMirror(connection_factory=pg_connection_factory),
     )
-    runs = PostgresAuditRunMirror(connection_factory=pg_connection_factory)
+    runs = PostgresAuditRunMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     audit_db.db.migrate(db_path)
@@ -203,8 +209,8 @@ def test_the_audit_family_reconciles_after_every_write(
         "PostgresAuditFindingMirror",
         lambda: PostgresAuditFindingMirror(connection_factory=pg_connection_factory),
     )
-    runs = PostgresAuditRunMirror(connection_factory=pg_connection_factory)
-    findings = PostgresAuditFindingMirror(connection_factory=pg_connection_factory)
+    runs = PostgresAuditRunMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    findings = PostgresAuditFindingMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     audit_db.db.migrate(db_path)
@@ -232,7 +238,7 @@ def test_the_audit_family_reconciles_after_every_write(
 
 
 def test_a_finding_needs_its_run_in_the_mirror_first(pg_connection_factory) -> None:
-    findings = PostgresAuditFindingMirror(connection_factory=pg_connection_factory)
+    findings = PostgresAuditFindingMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
     with pytest.raises(Exception) as refused:
         findings.upsert(
             {
@@ -273,8 +279,8 @@ def test_the_marketplace_family_reconciles_after_every_write(
         "PostgresInstallLogMirror",
         lambda: PostgresInstallLogMirror(connection_factory=pg_connection_factory),
     )
-    items = PostgresMarketItemMirror(connection_factory=pg_connection_factory)
-    logs = PostgresInstallLogMirror(connection_factory=pg_connection_factory)
+    items = PostgresMarketItemMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    logs = PostgresInstallLogMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     market_db.db.migrate(db_path)
@@ -303,8 +309,8 @@ def test_install_metadata_round_trips_through_jsonb(pg_connection_factory, tmp_p
     text comparison survive here and nowhere else. The declaration compares
     parsed values anyway, so the reconciliation does not depend on one caller
     keeping that flag."""
-    items = PostgresMarketItemMirror(connection_factory=pg_connection_factory)
-    logs = PostgresInstallLogMirror(connection_factory=pg_connection_factory)
+    items = PostgresMarketItemMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    logs = PostgresInstallLogMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     items.upsert(
         {
@@ -365,7 +371,7 @@ def test_invitations_reconcile_after_every_write(
         "PostgresInvitationMirror",
         lambda: PostgresInvitationMirror(connection_factory=pg_connection_factory),
     )
-    invitations = PostgresInvitationMirror(connection_factory=pg_connection_factory)
+    invitations = PostgresInvitationMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     net_db.db.migrate(db_path)
@@ -398,7 +404,7 @@ def test_advisor_proposals_reconcile_after_every_write(
         "PostgresAdvisorProposalMirror",
         lambda: PostgresAdvisorProposalMirror(connection_factory=pg_connection_factory),
     )
-    proposals = PostgresAdvisorProposalMirror(connection_factory=pg_connection_factory)
+    proposals = PostgresAdvisorProposalMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     wave1.db.migrate(db_path)
