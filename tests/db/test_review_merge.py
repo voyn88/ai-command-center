@@ -294,6 +294,49 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
     )
 
 
+def test_review_skips_prs_outside_the_active_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: F811,E501
+    """The review tick must honor the cheap PR-window triage before fetching
+    diffs for the backlog tail."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-RW", "https://github.com/x/repo-d2/pull/112")
+    gh_calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+
+        gh_calls.append(argv)
+        if argv[0] == "api" and argv[1] == "repos/x/repo-d2/pulls/112":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "open",
+                    "merged_at": None,
+                    "labels": [{"name": "review-window:waiting"}],
+                    "base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": "a" * 40},
+                    "changed_files": 1,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    enqueued = []
+
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: enqueued.append((q, k, p, tid, attempts)),
+        "/tmp",
+    )
+
+    assert ("VOYN-W0-RW", "review_window_inactive") in report.skipped
+    assert enqueued == []
+    assert gh_calls == [["api", "repos/x/repo-d2/pulls/112"]]
+
+
 def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13")
@@ -1162,7 +1205,7 @@ def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P4", "marker_already_posted") in report.skipped
-    assert not posted
+    assert posted == [["api", "repos/x/y/pulls/14"]]
 
 
 def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig, monkeypatch):  # noqa: F811
@@ -1201,7 +1244,7 @@ def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig,
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P5", "no_review_result_yet") in report.skipped
-    assert not posted
+    assert posted == [["api", "repos/x/y/pulls/15"]]
 
 
 def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811

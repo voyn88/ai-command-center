@@ -82,6 +82,7 @@ module for the incident that forced it
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -171,6 +172,13 @@ class LoopReport:
     #: `gh_access.GhQuota`. None when the report was built outside a tick
     #: scope (a unit test constructing one by hand).
     quota: gh_access.GhQuota | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PrWindowReadDecision:
+    allowed: bool
+    reason: str
+    pull: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1216,7 +1224,9 @@ def _failover_cascade(
     return preferred + deprioritized
 
 
-def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
+def _pr_diff_and_head(
+    repo_path: str, pr_url: str, pull: dict[str, Any] | None = None
+) -> _PRSnapshot | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
     prompt (rather than granting the agent its own `gh`/Bash access to fetch
@@ -1232,9 +1242,12 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     if parsed is None:
         return None
     owner, repo, number = parsed
-    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
     try:
-        data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
+        if pull is None:
+            view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+            data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
+        else:
+            data = pull
         base, head = data["base"], data["head"]
         base_sha, head_sha = base["sha"], head["sha"]
         same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
@@ -1263,6 +1276,29 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
         sum(line.startswith("-") and not line.startswith("--- ") for line in lines),
     )
     return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
+
+
+def _pr_diff_and_head_with_pull(
+    repo_path: str, pr_url: str, pull: dict[str, Any] | None
+) -> _PRSnapshot | None:
+    """Fetch a PR snapshot, reusing a window-gate pull body when available."""
+    if pull is None:
+        return _pr_diff_and_head(repo_path, pr_url)
+    try:
+        signature = inspect.signature(_pr_diff_and_head)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        parameters = list(signature.parameters.values())
+        accepts_varargs = any(p.kind == p.VAR_POSITIONAL for p in parameters)
+        positional = [
+            p
+            for p in parameters
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        if not accepts_varargs and len(positional) < 3:
+            return _pr_diff_and_head(repo_path, pr_url)
+    return _pr_diff_and_head(repo_path, pr_url, pull)
 
 
 _SCAN_KEY_SEP = "\x1f"
@@ -1450,7 +1486,13 @@ def _review_once(
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
-        fetched = _pr_diff_and_head(repo_path, pr_url)
+        window = _pr_window_expensive_read_decision(
+            repo_path, pr_url, prefix="review_window"
+        )
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
+            continue
+        fetched = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if fetched is None:
             report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
             continue
@@ -1565,11 +1607,22 @@ def reconcile_review_once(
         if route is None:
             report.skipped.append((current_task_id, "no_repo_route"))
             continue
-        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        window = _pr_window_expensive_read_decision(
+            repo_path, pr_url, prefix="review_window"
+        )
+        if not window.allowed:
+            report.skipped.append((current_task_id, window.reason))
+            continue
+        snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if snapshot is None:
             report.skipped.append((current_task_id, "pr_diff_fetch_failed"))
             continue
-        marker, marker_head = _has_accept_marker(repo_path, pr_url)
+        marker, marker_head = _has_accept_marker_with_pull(
+            repo_path,
+            pr_url,
+            window.pull,
+            rest_allowed=window.reason != "review_window_lookup_failed",
+        )
         if marker and marker_head == snapshot.head:
             report.skipped.append((current_task_id, "marker_already_posted"))
             continue
@@ -1896,22 +1949,54 @@ def _accept_marker_on_latest_review(
     live = [review for review in reviews if review.get("state") != "DISMISSED"]
     if not live:
         return False
-    latest = max(live, key=lambda r: r.get("submittedAt") or "")
+    latest = max(live, key=lambda r: r.get("submittedAt") or r.get("submitted_at") or "")
     if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
         return False
     if pr_author_login is None:
         return True
-    reviewer_login = (latest.get("author") or {}).get("login")
+    reviewer_login = (
+        (latest.get("author") or {}).get("login")
+        or (latest.get("user") or {}).get("login")
+    )
     return (
         reviewer_login is not None
         and reviewer_login.casefold() != pr_author_login.casefold()
     )
 
 
-def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
+def _has_accept_marker(
+    repo_path: str,
+    pr_url: str,
+    pull: dict[str, Any] | None = None,
+    *,
+    rest_allowed: bool = True,
+) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
     job). Returns (has_marker, head_sha)."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is not None:
+        owner, repo, number = parsed
+        if pull is None and rest_allowed:
+            outcome, loaded = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+            pull = loaded if outcome == _REST_OK and isinstance(loaded, dict) else None
+        if pull is not None:
+            head = str(((pull.get("head") or {}).get("sha")) or "")
+            author_login = (pull.get("user") or {}).get("login")
+            ok, reviews = _rest_pages(
+                repo_path,
+                f"repos/{owner}/{repo}/pulls/{number}/reviews",
+                max_pages=5,
+            )
+            if (
+                ok
+                and re.fullmatch(r"[0-9a-f]{40}", head)
+                and isinstance(reviews, list)
+            ):
+                return (
+                    _accept_marker_on_latest_review(reviews, head, author_login),
+                    head,
+                )
     view = _gh(
         ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
     )
@@ -1922,6 +2007,37 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     author_login = (data.get("author") or {}).get("login")
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     return accept, head
+
+
+def _has_accept_marker_with_pull(
+    repo_path: str,
+    pr_url: str,
+    pull: dict[str, Any] | None,
+    *,
+    rest_allowed: bool,
+) -> tuple[bool, str]:
+    try:
+        signature = inspect.signature(_has_accept_marker)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is None:
+        return _has_accept_marker(
+            repo_path, pr_url, pull, rest_allowed=rest_allowed
+        )
+    parameters = list(signature.parameters.values())
+    if any(p.kind == p.VAR_KEYWORD for p in parameters) or "rest_allowed" in signature.parameters:
+        return _has_accept_marker(
+            repo_path, pr_url, pull, rest_allowed=rest_allowed
+        )
+    accepts_varargs = any(p.kind == p.VAR_POSITIONAL for p in parameters)
+    positional = [
+        p
+        for p in parameters
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    if accepts_varargs or len(positional) >= 3:
+        return _has_accept_marker(repo_path, pr_url, pull)
+    return _has_accept_marker(repo_path, pr_url)
 
 
 #: How many remediation links may stand above a task before the chain stops
@@ -2463,14 +2579,25 @@ def publish_review_verdicts(
             break
         prev_processed = last_processed
         last_processed = (task_id, pr_url)
-        already, current_head = _has_accept_marker(repo_path, pr_url)
+        window = _pr_window_expensive_read_decision(
+            repo_path, pr_url, prefix="review_window"
+        )
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
+            continue
+        already, current_head = _has_accept_marker_with_pull(
+            repo_path,
+            pr_url,
+            window.pull,
+            rest_allowed=window.reason != "review_window_lookup_failed",
+        )
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
             continue
         if not current_head:
             report.skipped.append((task_id, "pr_view_failed"))
             continue
-        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if snapshot is None or snapshot.head != current_head:
             report.skipped.append((task_id, "pr_diff_snapshot_failed"))
             continue
@@ -2784,35 +2911,47 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     return str(data.get("mergeStateStatus") or "")
 
 
-def _merge_window_allows_expensive_read(repo_path: str, pr_url: str) -> tuple[bool, str]:
-    """Whether merge_once should spend GraphQL detail reads on this PR.
+def _pr_window_expensive_read_decision(
+    repo_path: str, pr_url: str, *, prefix: str
+) -> _PrWindowReadDecision:
+    """Whether a hot loop should spend expensive PR detail reads.
 
     The PR-window reconciler is the cheap, REST-backed backlog triage pass.
-    The merge tick should honor that triage and spend its heavier GraphQL
-    reads only on the active merge/review window. If the lightweight lookup
-    fails, fail open: stranding a READY_TO_REVIEW task because labels could
-    not be read would be worse than one conservative expensive read.
+    Review and merge ticks should honor that triage and spend heavier PR
+    detail reads only on the active merge/review window. If the lightweight
+    lookup fails, fail open: stranding a READY_TO_REVIEW task because labels
+    could not be read would be worse than one conservative expensive read.
     """
     parsed = _owner_repo_number_from_pr_url(pr_url)
     if parsed is None:
-        return True, "pr_url_unparseable"
+        return _PrWindowReadDecision(True, "pr_url_unparseable")
+    if not Path(repo_path).exists():
+        return _PrWindowReadDecision(True, f"{prefix}_lookup_failed")
     owner, repo, number = parsed
     outcome, pull = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
     if outcome != _REST_OK or not isinstance(pull, dict):
-        return True, "merge_window_lookup_failed"
+        return _PrWindowReadDecision(True, f"{prefix}_lookup_failed")
     if str(pull.get("state") or "").lower() != "open" or pull.get("merged_at"):
-        return True, "pr_not_open"
+        return _PrWindowReadDecision(True, "pr_not_open", pull)
     raw_labels = pull.get("labels")
     if not isinstance(raw_labels, list):
-        return True, "merge_window_labels_missing"
+        return _PrWindowReadDecision(True, f"{prefix}_labels_missing", pull)
     labels = {
         str(label.get("name") or "")
         for label in raw_labels
         if isinstance(label, dict)
     }
     if _QUEUE_ACTIVE_LABEL in labels or DEFAULT_PR_WINDOW_CONFIG.label_active in labels:
-        return True, "merge_window_active"
-    return False, "merge_window_inactive"
+        return _PrWindowReadDecision(True, f"{prefix}_active", pull)
+    return _PrWindowReadDecision(False, f"{prefix}_inactive", pull)
+
+
+def _merge_window_allows_expensive_read(repo_path: str, pr_url: str) -> tuple[bool, str]:
+    """Whether merge_once should spend GraphQL detail reads on this PR."""
+    decision = _pr_window_expensive_read_decision(
+        repo_path, pr_url, prefix="merge_window"
+    )
+    return decision.allowed, decision.reason
 
 
 def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
@@ -3237,13 +3376,18 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         # otherwise strand the task in READY_TO_REVIEW forever. A merged PR
         # WITHOUT acceptance evidence (external/bypass merge) is an incident
         # for the operator, never a silent DONE.
-        in_window, window_detail = _merge_window_allows_expensive_read(
-            repo_path, pr_url
+        window = _pr_window_expensive_read_decision(
+            repo_path, pr_url, prefix="merge_window"
         )
-        if not in_window:
-            report.skipped.append((task_id, window_detail))
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
             continue
-        merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
+        window_state = str((window.pull or {}).get("state") or "").lower()
+        window_merged = bool((window.pull or {}).get("merged_at"))
+        if window_state == "open" and not window_merged:
+            merge_sha, merge_reason = None, "not_merged"
+        else:
+            merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
         if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
             report.skipped.append((task_id, merge_reason))
             continue

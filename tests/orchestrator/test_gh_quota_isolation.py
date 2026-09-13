@@ -90,7 +90,14 @@ elif "/reviews" in path:
         }]))
 elif path.endswith("/pulls/42"):
     labels = [{"name": name} for name in os.environ.get("FAKE_GH_PR_LABELS", "").split(",") if name]
-    print(json.dumps({"state": "open", "merged_at": None, "mergeable_state": "clean", "labels": labels}))
+    print(json.dumps({
+        "state": "open",
+        "merged_at": None,
+        "mergeable_state": "clean",
+        "labels": labels,
+        "head": {"sha": head},
+        "user": {"login": "voyn-aicc-fleet[bot]"},
+    }))
 elif "/check-runs" in path:
     page = int(path.split("page=")[-1])
     print(json.dumps({"check_runs": [] if page > 1 else [{
@@ -281,6 +288,109 @@ def test_merge_window_gate_fails_open_when_labels_are_missing(monkeypatch):
     )
 
     assert (allowed, reason) == (True, "merge_window_labels_missing")
+
+
+def test_accept_marker_lookup_uses_rest_when_pull_snapshot_is_available(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """The review tick can publish/skip markers without `gh pr view`; REST
+    pull+reviews data is enough for the current-head marker question."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "review-window:active")
+
+    has_marker, head = review_merge._has_accept_marker(
+        str(checkout), "https://github.com/voyn88/ai-command-center/pull/42"
+    )
+
+    assert (has_marker, head) == (True, HEAD)
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert calls
+    assert all(argv[0] == "api" for argv in calls)
+    assert any(argv[1].endswith("/pulls/42") for argv in calls)
+    assert any("/pulls/42/reviews" in argv[1] for argv in calls)
+
+
+def test_accept_marker_lookup_can_skip_a_redundant_rest_pull(monkeypatch):
+    """After the window gate already failed to load the PR over REST, the
+    marker lookup should fail open through the legacy view path without
+    immediately repeating the same REST pull."""
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        import subprocess
+
+        calls.append(argv)
+        if argv[:2] == ["pr", "view"]:
+            body = {
+                "headRefOid": HEAD,
+                "author": {"login": "writer"},
+                "reviews": [
+                    {
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                        "body": f"ACCEPTANCE: ACCEPT {HEAD}",
+                    }
+                ],
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    has_marker, head = review_merge._has_accept_marker(
+        "/tmp",
+        "https://github.com/voyn88/ai-command-center/pull/42",
+        rest_allowed=False,
+    )
+
+    assert (has_marker, head) == (True, HEAD)
+    assert calls == [
+        [
+            "pr",
+            "view",
+            "https://github.com/voyn88/ai-command-center/pull/42",
+            "--json",
+            "reviews,headRefOid,author",
+        ]
+    ]
+
+
+def test_merge_open_active_pr_skips_the_merged_target_detail_read(monkeypatch):
+    """The REST window lookup already proves an active PR is still open, so
+    merge_once should not spend a pre-read checking whether it is merged."""
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        review_merge,
+        "_scan_tasks",
+        lambda factory, cursor_name, query, params, limit: (
+            [("VOYN-W0-MG", "https://github.com/voyn88/ai-command-center/pull/42")],
+            "tok",
+        ),
+    )
+    monkeypatch.setattr(review_merge, "_scan_commit", lambda *args: None)
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_window_expensive_read_decision",
+        lambda repo_path, pr_url, prefix: review_merge._PrWindowReadDecision(
+            True,
+            "merge_window_active",
+            {"state": "open", "merged_at": None},
+        ),
+    )
+
+    def fail_if_called(repo_path, pr_url):
+        raise AssertionError("_merged_target_sha should not run for an open PR")
+
+    def not_ready(repo_path, pr_url, required_checks):
+        calls.append("readiness")
+        return False, "no_accept_marker_on_head"
+
+    monkeypatch.setattr(review_merge, "_merged_target_sha", fail_if_called)
+    monkeypatch.setattr(review_merge, "_pr_is_mergeable", not_ready)
+
+    report = review_merge._merge_once(lambda: None, "/repo")
+
+    assert calls == ["readiness"]
+    assert ("VOYN-W0-MG", "no_accept_marker_on_head") in report.skipped
 
 
 def test_queue_active_pr_sheds_stale_blocked_label(
