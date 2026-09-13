@@ -105,6 +105,69 @@ def test_a_newer_success_after_a_cancelled_run_needs_no_rerun(monkeypatch):
     assert not [c for c in calls if c[:2] == ["run", "rerun"]]
 
 
+def test_stale_failed_duplicate_check_is_rerun_after_newer_success(monkeypatch):
+    """A newer success is the code verdict, but GitHub can keep the commit
+    rollup red while an older duplicate failure remains on the same SHA."""
+    rollup = [
+        {"name": "Final merge gate", "conclusion": "FAILURE",
+         "startedAt": "2026-09-08T01:00:00Z", "detailsUrl": URL.format(run=11, job=1)},
+        {"name": "Final merge gate", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-08T01:10:00Z", "detailsUrl": URL.format(run=13, job=1)},
+        {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-08T01:12:00Z", "detailsUrl": URL.format(run=14, job=1)},
+    ]
+    fake, calls = _fake_gh(rollup, {"11": 1})
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    ok, reason = review_merge._pr_is_mergeable("/repo", PR)
+
+    assert ok is False
+    assert reason == "stale_duplicate_checks_rerun_requested: ['11']"
+    assert [c for c in calls if c[:2] == ["run", "rerun"]] == [
+        ["run", "rerun", "11", "--failed"]
+    ]
+
+
+def test_stale_cancelled_duplicate_check_gets_full_rerun(monkeypatch):
+    rollup = [
+        {"name": "Final merge gate", "conclusion": "CANCELLED",
+         "startedAt": "2026-09-08T01:00:00Z", "detailsUrl": URL.format(run=11, job=1)},
+        {"name": "Final merge gate", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-08T01:10:00Z", "detailsUrl": URL.format(run=13, job=1)},
+        {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-08T01:12:00Z", "detailsUrl": URL.format(run=14, job=1)},
+    ]
+    fake, calls = _fake_gh(rollup, {"11": 1})
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    ok, reason = review_merge._pr_is_mergeable("/repo", PR)
+
+    assert ok is False
+    assert reason == "stale_duplicate_checks_rerun_requested: ['11']"
+    assert [c for c in calls if c[:2] == ["run", "rerun"]] == [
+        ["run", "rerun", "11"]
+    ]
+
+
+def test_stale_duplicate_rerun_respects_attempt_cap(monkeypatch):
+    rollup = [
+        {"name": "Final merge gate", "conclusion": "FAILURE",
+         "startedAt": "2026-09-08T01:00:00Z", "detailsUrl": URL.format(run=11, job=1)},
+        {"name": "Final merge gate", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-08T01:10:00Z", "detailsUrl": URL.format(run=13, job=1)},
+        {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-08T01:12:00Z", "detailsUrl": URL.format(run=14, job=1)},
+    ]
+    fake, calls = _fake_gh(rollup, {"11": 3})
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    ok, reason = review_merge._pr_is_mergeable("/repo", PR)
+
+    assert ok is False
+    assert reason == "stale_duplicate_checks_unresolved"
+    assert not [c for c in calls if c[:2] == ["run", "rerun"]]
+
+
 def test_a_head_whose_required_gates_never_ran_is_not_mergeable(monkeypatch):
     """Absence of information is not a verdict: an all-green rollup that lacks
     the required contexts (gates skipped or never triggered) must not merge."""
