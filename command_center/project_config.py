@@ -84,6 +84,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "ECOSYSTEM": "Ecosystem",
     "ESF": "ESF Корпоративная платформа",
     "AML": "AML Платформа управления рисками",
+    "CRM": "VOYN Logistics CRM",
     "BANK": "Bank Strategy",
     "LEGAL": "Legal",
     "BUSINESS": "Business",
@@ -109,6 +110,7 @@ PROJECT_STATUS_FILES: dict[str, str] = {
     "ECOSYSTEM": "projects/ECOSYSTEM.md",
     "ESF": "projects/ESF.md",
     "AML": "projects/AML.md",
+    "CRM": "projects/CRM.md",
     "BANK": "projects/BANK_STRATEGY.md",
     "LEGAL": "projects/LEGAL.md",
     "BUSINESS": "projects/BUSINESS.md",
@@ -192,6 +194,7 @@ def discover_candidate_repository_path(project_id: str) -> str | None:
     """
     candidates: dict[str, Path] = {
         "AIOS": Path.home() / "Projects" / "aios",
+        "CRM": Path.home() / "Projects" / "voyn-logistics-crm",
     }
     candidate = candidates.get(project_id)
     if candidate is None:

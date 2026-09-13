@@ -1,0 +1,225 @@
+{
+  "schema_version": "1",
+  "package_id": "voyn-crm-autonomy-lane-p0",
+  "generated_from": {
+    "source_backlog": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels/docs/VOYN_CRM_CANONICAL_BACKLOG.md",
+    "source_repo": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+    "target_repo": "voyn-logistics-crm"
+  },
+  "tasks": [
+    {
+      "id": "VOYN-CRM-AUTO-LANE",
+      "title": "Configure autonomous CRM lane",
+      "goal": "Make CRM work schedulable as an isolated autonomous lane beside AICC work.",
+      "prompt": "Configure the CRM backlog lane so the supervisor can select CRM work independently from AICC work, with repo-specific budget, review, merge, smoke, and stop controls.\n\nDefinition of Done: CRM rows import with repo `voyn-logistics-crm`; the supervisor can dispatch at most one bounded CRM slice per window; AICC and CRM queues do not block each other except through global safety budgets; stop reasons name the affected repo and task.\n\nForbidden scope: No shared dirty worktree, no direct production deployment without CRM-specific smoke and rollback gates, no bypass of existing acceptance evidence.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-autonomous-lane",
+      "branch": "crm/autonomous-lane"
+    },
+    {
+      "id": "VOYN-CRM-P0-SHELL",
+      "title": "Build CRM app shell and role navigation",
+      "goal": "Build the CRM app shell around the canonical workflow and role boundaries.",
+      "prompt": "Build the CRM app shell and role navigation around the canonical workflow: dashboard, role menu, breadcrumbs, global search, saved filters, and return-to-list behavior.\n\nDefinition of Done: Each role sees only allowed sections; direct URL access is server-gated; dashboard counters drill into filtered registries; desktop and mobile acceptance covers navigation, search, filters, and no dead-end routes.\n\nSource item: P0.1 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-AUTO-LANE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-role-shell-navigation",
+      "branch": "crm/role-shell-navigation"
+    },
+    {
+      "id": "VOYN-CRM-P0-CARD-DIRECTORIES",
+      "title": "Build canonical shipment card and directories",
+      "goal": "Implement the canonical request card and required operational directories.",
+      "prompt": "Implement the canonical shipment/request card and core directories: customer, carrier, vehicle, driver, cargo, addresses, contract, rate, VAT, and time windows.\n\nDefinition of Done: A request cannot be confirmed without required canonical fields; unavailable or non-compliant transport cannot be assigned; changes are audited; browser acceptance covers create, edit, validation, and role visibility.\n\nSource item: P0.2 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-AUTO-LANE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-shipment-card-directories",
+      "branch": "crm/shipment-card-directories"
+    },
+    {
+      "id": "VOYN-CRM-P0-DISPATCH-LIFECYCLE",
+      "title": "Build CRM dispatch board and lifecycle",
+      "goal": "Implement dispatch board, shipment lifecycle, multimodal legs, plan/fact, ETA, delays, and personal queues.",
+      "prompt": "Build the dispatch board and full shipment lifecycle: table, kanban/calendar views, statuses, multimodal legs, plan/fact timestamps, ETA, delays, and personal queues.\n\nDefinition of Done: A dispatcher can find unassigned work, late shipments, and their own queue in two clicks; status transitions are validated; multimodal legs remain linked to the parent request; acceptance covers desktop and mobile.\n\nSource item: P0.3 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-P0-SHELL",
+        "VOYN-CRM-P0-CARD-DIRECTORIES"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-dispatch-lifecycle",
+      "branch": "crm/dispatch-lifecycle"
+    },
+    {
+      "id": "VOYN-CRM-P0-DOCUMENTS",
+      "title": "Build CRM document completeness",
+      "goal": "Implement document registry, completeness rules, versions, deadlines, request/send flows, and close blockers.",
+      "prompt": "Build the document registry and completeness rules: required document types, deadlines, versions, request/send flows, and close blockers.\n\nDefinition of Done: Missing UPD/TN/TTN/act documents create tasks; configurable close rules block only when intended; document download/export respects server-side permissions; acceptance covers document lifecycle and role access.\n\nSource item: P0.4 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-P0-CARD-DIRECTORIES",
+        "VOYN-CRM-P0-DISPATCH-LIFECYCLE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-document-completeness",
+      "branch": "crm/document-completeness"
+    },
+    {
+      "id": "VOYN-CRM-P0-FINANCE-CARD",
+      "title": "Build CRM shipment finance card",
+      "goal": "Implement shipment finance card with primary financial rows and role-gated sensitive views.",
+      "prompt": "Build the shipment finance card: multiple revenue and cost lines, VAT components, currency, corrections, plan/fact values, cost of money, and object-linked primary rows.\n\nDefinition of Done: P&L by shipment, customer, lane, and carrier is reproducible from primary financial rows; every financial fact has `legal_entity_id`; sensitive finance views are role-gated; CSV totals match screen totals.\n\nSource item: P0.5 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-P0-CARD-DIRECTORIES",
+        "VOYN-CRM-P0-DISPATCH-LIFECYCLE"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-finance-card",
+      "branch": "crm/finance-card"
+    },
+    {
+      "id": "VOYN-CRM-P0-EXCEPTIONS-SLA",
+      "title": "Build CRM exceptions and SLA queues",
+      "goal": "Implement exceptions, SLA queues, auditability, and Dmitry's private read-only expense-deviation queue.",
+      "prompt": "Build exceptions and SLA queues with owner, deadline, severity, cause, resolution, traceability, and Dmitry's private read-only expense-deviation queue.\n\nDefinition of Done: Every exception has audit history and an owner; SLA breaches are visible from operations; Dmitry's private queue is isolated by server checks and has no approve/reject actions; acceptance covers direct URL leakage attempts.\n\nSource item: P0.6 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-P0-SHELL",
+        "VOYN-CRM-P0-DISPATCH-LIFECYCLE",
+        "VOYN-CRM-P0-FINANCE-CARD"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-exceptions-sla",
+      "branch": "crm/exceptions-sla"
+    },
+    {
+      "id": "VOYN-CRM-P0-HISTORICAL-IMPORT",
+      "title": "Build CRM historical import staging",
+      "goal": "Implement historical import through preview, mapping, staging, approved run, idempotency, error report, and rollback plan.",
+      "prompt": "Build historical import through preview, mapping, staging, approved run, idempotency, error report, and rollback plan.\n\nDefinition of Done: Files never write directly to production tables; repeated imports do not create duplicates; validation errors are reviewable before commit; rollback plan is recorded with each accepted import batch.\n\nSource item: P0.7 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-P0-CARD-DIRECTORIES",
+        "VOYN-CRM-P0-FINANCE-CARD"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-historical-import-staging",
+      "branch": "crm/historical-import-staging"
+    },
+    {
+      "id": "VOYN-CRM-P1-FINANCE-INTEGRATIONS",
+      "title": "Build CRM finance integrations",
+      "goal": "Implement payment calendar, AR/AP ageing, bank reconciliation, integration platform, and adapter layer.",
+      "prompt": "Implement the next finance and integration layer: payment calendar, AR/AP ageing, bank import reconciliation, integration platform, and 1C/EDO/GPS/fuel/mail adapters.\n\nDefinition of Done: Payment totals match screen and CSV by legal entity; bank uploads are immutable and idempotent; ambiguous reconciliation never mutates cashflow; adapters have sandbox proof, least-privilege credentials, monitoring, and disabled-by-default behavior without configuration.\n\nSource items: P1.8 through P1.11 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-P0-FINANCE-CARD",
+        "VOYN-CRM-P0-HISTORICAL-IMPORT"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-finance-integrations",
+      "branch": "crm/finance-integrations"
+    },
+    {
+      "id": "VOYN-CRM-P1-TENDERS",
+      "title": "Build CRM tender workspace",
+      "goal": "Implement tender assumptions, pricing, taxes, documents, approvals, and manual submission flow.",
+      "prompt": "Build the tender workspace with assumptions, price, taxes, cost of money, document package, approvals, and manual submission flow.\n\nDefinition of Done: Tender decisions are reproducible from saved assumptions; external submission only exists behind an explicitly configured adapter; acceptance covers create, calculate, approve, package, and manual submit workflows.\n\nSource item: P1.12 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "High",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-P0-CARD-DIRECTORIES",
+        "VOYN-CRM-P0-FINANCE-CARD"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-tender-workspace",
+      "branch": "crm/tender-workspace"
+    },
+    {
+      "id": "VOYN-CRM-P2-PRODUCTION-MATURITY",
+      "title": "Complete CRM production maturity",
+      "goal": "Complete approvals, ratings, claims, BI, production operations, security, backup, restore, and smoke evidence.",
+      "prompt": "Complete CRM production maturity: approvals, carrier ratings, claims, BI reports, PostgreSQL migrations, object storage, SSO/MFA, CSRF, backups, restore drill, SLO alerts, load tests, and security tests.\n\nDefinition of Done: Production readiness is proven by current migration, security, accessibility, browser, backup/restore, and operational-smoke evidence; BI reports drill down to source rows and export consistently.\n\nSource items: P2.13 through P2.15 from the canonical CRM backlog.",
+      "status": "Backlog",
+      "priority": "Medium",
+      "task_type": "implementation",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-P0-SHELL",
+        "VOYN-CRM-P0-CARD-DIRECTORIES",
+        "VOYN-CRM-P0-DISPATCH-LIFECYCLE",
+        "VOYN-CRM-P0-DOCUMENTS",
+        "VOYN-CRM-P0-FINANCE-CARD",
+        "VOYN-CRM-P0-EXCEPTIONS-SLA",
+        "VOYN-CRM-P0-HISTORICAL-IMPORT"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-production-maturity",
+      "branch": "crm/production-maturity"
+    },
+    {
+      "id": "VOYN-CRM-FINAL-DEEP-ACCEPTANCE",
+      "title": "Run deep CRM acceptance and remediate findings",
+      "goal": "After the 11 CRM lane tasks are implemented, run deep acceptance across product, architecture, code, UX, security, performance, and resilience, then repeat remediation and acceptance until no findings remain.",
+      "prompt": "After the 11 CRM lane tasks are implemented, run a maximally deep product acceptance across architecture, code, interface, speed, usability, security, fault tolerance, and multi-user role workflows, then loop acceptance and remediation until no findings remain.\n\nAcceptance scope: emulate several users across every role; verify role isolation, direct URL/API access control, end-to-end operational flows, finance/document correctness, desktop and mobile UX, accessibility, performance, security, resilience, backup/restore, and failure handling.\n\nDefinition of Done: produce a prioritized remediation plan; fix every confirmed blocker/major/minor finding; repeat the full relevant acceptance loop after each remediation pass; close only when the latest pass has zero open findings or an explicit founder-approved deferral with owner, reason, and acceptance impact; final evidence is tied to the exact accepted commit.\n\nForbidden scope: No superficial checklist-only acceptance; no closing while confirmed findings remain untriaged or unremediated; no claiming production readiness without current evidence tied to the exact accepted commit; no stopping after a single audit if remediation changed behavior.",
+      "status": "Backlog",
+      "priority": "Critical",
+      "task_type": "final_gate",
+      "project": "CRM",
+      "depends_on": [
+        "VOYN-CRM-AUTO-LANE",
+        "VOYN-CRM-P0-SHELL",
+        "VOYN-CRM-P0-CARD-DIRECTORIES",
+        "VOYN-CRM-P0-DISPATCH-LIFECYCLE",
+        "VOYN-CRM-P0-DOCUMENTS",
+        "VOYN-CRM-P0-FINANCE-CARD",
+        "VOYN-CRM-P0-EXCEPTIONS-SLA",
+        "VOYN-CRM-P0-HISTORICAL-IMPORT",
+        "VOYN-CRM-P1-FINANCE-INTEGRATIONS",
+        "VOYN-CRM-P1-TENDERS",
+        "VOYN-CRM-P2-PRODUCTION-MATURITY"
+      ],
+      "repository_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-ux-u4-audit-filter-labels",
+      "workspace_path": "/Users/dmitrijcernikov/Documents/Codex/2026-09-13/voyn-logistics-crm-worktrees/crm-final-deep-acceptance-remediation",
+      "branch": "crm/final-deep-acceptance-remediation"
+    }
+  ]
+}
