@@ -280,9 +280,9 @@ def execute_agent_launch(
     task/prompt requires capabilities the configured profile would not grant.
     This is the v1 analogue of `runtime.supervisor.Supervisor.start_raw`.
     """
-    from command_center import capabilities
+    from command_center import emergency_mode
 
-    decision = capabilities.decide(task_type, prompt, capability_override)
+    decision = emergency_mode.decide(task_type, prompt, capability_override)
     if not decision.ok:
         raise CapabilityMismatchError(decision)
     return agent_runner.run_claude_code(
