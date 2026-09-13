@@ -75,6 +75,33 @@ def test_the_render_survives_a_mirror_read_in_another_zone() -> None:
     assert render_authority_timestamp(elsewhere) == written
 
 
+def test_the_render_does_not_reproduce_an_aware_utc_writer() -> None:
+    """Pinned demonstration of the blocker tracked as
+    `VOYN-W0-AICC-MIRROR-RENDER-SHARED`.
+
+    `render_authority_timestamp` is naive-local, second-precision — correct for
+    every column mirrored today because every one of them is written by
+    `models.iso_now()`. Eight stores queued for later waves (`customer_store`,
+    `evidence_store`, `risk_store`, `case_store`, `compliance_store`,
+    `rule_engine`, `sar_store`, `alert_store`) write
+    `datetime.now(UTC).isoformat()` instead — aware UTC, microsecond precision
+    — and reusing today's renderer for one of their columns would silently
+    fail to round-trip: the offset and the microseconds the writer emitted are
+    gone from what comes back.
+
+    Asserted rather than described, so the day one of those eight tables gets
+    a mirror this stops passing instead of quietly agreeing that the shared
+    renderer is still correct for it. Not fixed here: building the general
+    renderer against a second format that has no mirrored caller yet is the
+    same premature abstraction that put the wrong conversion into slice 1.
+    """
+    written = "2026-08-13T12:00:00.784317+00:00"  # shape of datetime.now(UTC).isoformat()
+
+    rendered = render_authority_timestamp(to_instant(written))
+
+    assert rendered != written
+
+
 # --- the per-column codec ---------------------------------------------------
 
 
