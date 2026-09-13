@@ -84,7 +84,7 @@ DISPLAY_NAMES: dict[str, str] = {
     "ECOSYSTEM": "Ecosystem",
     "ESF": "ESF Корпоративная платформа",
     "AML": "AML Платформа управления рисками",
-    "CRM": "VOYN Logistics CRM",
+    "CRM": "CRM VOYN",
     "BANK": "Bank Strategy",
     "LEGAL": "Legal",
     "BUSINESS": "Business",
