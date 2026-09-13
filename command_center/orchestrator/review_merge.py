@@ -3241,7 +3241,26 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     continue
                 branch_updates += 1
                 actions += 1
-                updated = _gh(["pr", "update-branch", pr_url], repo_path)
+                # `gh pr update-branch` is a subcommand of the `gh` CLI itself,
+                # not the REST API -- a host running a `gh` build that predates
+                # it (control-01, live 2026-08-26) rejects it with "unknown
+                # command", burning an attempt without ever updating anything.
+                # The REST endpoint it wraps (`PUT .../update-branch`) is
+                # reachable through `gh api` on every `gh` version, since `gh
+                # api` is just a thin HTTP client -- so drive it directly and
+                # this loop stops depending on the CLI's release cadence.
+                parsed = _owner_repo_number_from_pr_url(pr_url)
+                if parsed is None:
+                    report.skipped.append(
+                        (task_id, f"branch_update_failed: no_repo_route: {pr_url!r}")
+                    )
+                    continue
+                owner, repo, number = parsed
+                updated = _gh(
+                    ["api", "-X", "PUT",
+                     f"repos/{owner}/{repo}/pulls/{number}/update-branch"],
+                    repo_path,
+                )
                 if updated.returncode == 0:
                     # The new head is a fresh, unmarked commit even though
                     # the PR's own diff may not have changed at all -- see
