@@ -2825,7 +2825,8 @@ def _pr_is_mergeable(
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     if not accept:
         return False, "no_accept_marker_on_head"
-    rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
+    raw_rollup = data.get("statusCheckRollup") or []
+    rollup = _latest_checks_by_name(raw_rollup)
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
         rerun = _rerun_cancelled_latest_runs(repo_path, rollup)
@@ -2836,6 +2837,13 @@ def _pr_is_mergeable(
     missing = [name for name in required_checks if name not in present]
     if missing:
         return False, f"checks_missing: {missing[:3]}"
+    rerun, stale_duplicate = _rerun_stale_duplicate_red_runs(
+        repo_path, raw_rollup, required_checks
+    )
+    if rerun:
+        return False, f"stale_duplicate_checks_rerun_requested: {rerun[:3]}"
+    if stale_duplicate:
+        return False, "stale_duplicate_checks_unresolved"
     return True, head
 
 
@@ -2886,6 +2894,81 @@ def _rerun_cancelled_latest_runs(
         if rerun.returncode == 0:
             requested.append(run_id)
     return requested
+
+
+def _check_run_time(check: dict[str, Any]) -> str:
+    return str(check.get("startedAt") or check.get("completedAt") or "")
+
+
+def _rerun_stale_duplicate_red_runs(
+    repo_path: str,
+    rollup: list[dict[str, Any]],
+    required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS,
+) -> tuple[list[str], bool]:
+    """Rerun older red duplicate workflow runs once a newer duplicate is green.
+
+    GitHub may keep old failed/cancelled check-runs on the same commit after a
+    label-churn or concurrency cancellation. `_latest_checks_by_name` correctly
+    treats the PR's latest check verdict as green, but GitHub's overall rollup
+    can still remain FAILURE until the old run is retried. Clean that stale
+    tail automatically, bounded by the same per-run attempt cap used for latest
+    cancelled checks.
+    """
+    required = set(required_checks)
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for check in rollup:
+        name = str(check.get("name") or "")
+        if name in required:
+            by_name.setdefault(name, []).append(check)
+
+    run_ids: list[tuple[str, str]] = []
+    for checks in by_name.values():
+        if len(checks) < 2:
+            continue
+        timed = [(check, _check_run_time(check)) for check in checks]
+        if any(not stamp for _check, stamp in timed):
+            continue
+        latest, latest_at = max(timed, key=lambda item: item[1])
+        if not _check_is_green(latest):
+            continue
+        latest_run = _RUN_ID_IN_DETAILS_URL.search(str(latest.get("detailsUrl") or ""))
+        latest_run_id = latest_run.group(1) if latest_run is not None else ""
+        for check, stamp in timed:
+            if stamp >= latest_at or _check_is_green(check):
+                continue
+            conclusion = str(check.get("conclusion") or "").upper()
+            if conclusion not in {"FAILURE", "CANCELLED", "TIMED_OUT"}:
+                continue
+            match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
+            if match is None:
+                continue
+            run_id = match.group(1)
+            if run_id == latest_run_id:
+                continue
+            mode = "--failed" if conclusion == "FAILURE" else ""
+            if (run_id, mode) not in run_ids:
+                run_ids.append((run_id, mode))
+
+    requested: list[str] = []
+    for run_id, mode in run_ids:
+        if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
+            break
+        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
+        if view.returncode != 0:
+            continue
+        try:
+            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
+            continue
+        argv = ["run", "rerun", run_id]
+        if mode:
+            argv.append(mode)
+        rerun = _gh(argv, repo_path)
+        if rerun.returncode == 0:
+            requested.append(run_id)
+    return requested, bool(run_ids)
 
 
 def _merge_state(repo_path: str, pr_url: str) -> str:
