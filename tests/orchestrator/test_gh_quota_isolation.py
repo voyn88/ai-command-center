@@ -621,6 +621,32 @@ def test_a_permission_the_app_lacks_falls_back_to_the_ambient_credential(
     assert quota.degraded is False, "a resource refusal is not a credential failure"
 
 
+def test_a_tick_can_disable_ambient_fallback_for_fleet_refusals(
+    tmp_path, monkeypatch, fleet_store
+):
+    """Merge automation is allowed to fail visibly on missing App permissions;
+    it must not silently spend the operator's ambient credential."""
+    binary = tmp_path / "bin" / "gh"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "if 'fleet' in os.environ.get('GH_CONFIG_DIR', ''):\n"
+        "    sys.stderr.write('HTTP 403: Resource not accessible by integration\\n')\n"
+        "    sys.exit(1)\n"
+        "print('{\"attempt\": 1}')\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary.parent}:{Path('/usr/bin')}")
+
+    with gh_access.tick(allow_ambient_fallback=False) as quota:
+        proc = gh_access.run(["run", "view", "7", "--json", "attempt"], str(tmp_path))
+
+    assert proc.returncode == 1
+    assert quota.ambient_fallbacks == 0
+    assert quota.degraded is False
+
+
 def test_a_credential_failure_demotes_the_whole_tick_once_not_per_call(
     tmp_path, monkeypatch, fleet_store
 ):
