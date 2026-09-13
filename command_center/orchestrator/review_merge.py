@@ -3037,6 +3037,25 @@ def _merge_window_allows_expensive_read(repo_path: str, pr_url: str) -> tuple[bo
     return decision.allowed, decision.reason
 
 
+def _merge_window_open_pr_snapshot(
+    repo_path: str,
+) -> tuple[dict[int, dict[str, Any]] | None, str | None]:
+    """Lightweight open-PR labels for one merge tick.
+
+    This is a cache, not an authority. If the listing fails, or a READY task
+    points at a PR not present in the open list, merge_once falls back to the
+    precise per-PR lookup so already-merged PRs can still be completed.
+    """
+    prs, failure = _list_open_pulls(repo_path, DEFAULT_PR_WINDOW_CONFIG)
+    if prs is None:
+        return None, failure
+    return {
+        int(pr["number"]): pr
+        for pr in prs
+        if isinstance(pr.get("number"), int)
+    }, None
+
+
 def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     """The PR's actual merge commit on the target branch, or None until
     GitHub reports the PR MERGED.
@@ -3441,6 +3460,8 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
     last_processed = None
     branch_updates = 0
     actions = 0
+    open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
+    origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
@@ -3461,9 +3482,36 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         # otherwise strand the task in READY_TO_REVIEW forever. A merged PR
         # WITHOUT acceptance evidence (external/bypass merge) is an incident
         # for the operator, never a silent DONE.
-        window = _pr_window_expensive_read_decision(
-            repo_path, pr_url, prefix="merge_window"
-        )
+        window = None
+        parsed = _owner_repo_number_from_pr_url(pr_url)
+        if open_pr_snapshot is not None and origin is not None and parsed is not None:
+            owner, repo, raw_number = parsed
+            try:
+                number = int(raw_number)
+            except ValueError:
+                number = 0
+            if (owner, repo) == origin and number in open_pr_snapshot:
+                snapshot_pr = open_pr_snapshot[number]
+                labels = _pr_window_labels(snapshot_pr)
+                if (
+                    _QUEUE_ACTIVE_LABEL in labels
+                    or DEFAULT_PR_WINDOW_CONFIG.label_active in labels
+                ):
+                    window = _PrWindowReadDecision(
+                        True,
+                        "merge_window_active",
+                        {"state": "open", "merged_at": None},
+                    )
+                else:
+                    window = _PrWindowReadDecision(
+                        False,
+                        "merge_window_inactive",
+                        {"state": "open", "merged_at": None},
+                    )
+        if window is None:
+            window = _pr_window_expensive_read_decision(
+                repo_path, pr_url, prefix="merge_window"
+            )
         if not window.allowed:
             report.skipped.append((task_id, window.reason))
             continue

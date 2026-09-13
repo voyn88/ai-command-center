@@ -393,6 +393,65 @@ def test_merge_open_active_pr_skips_the_merged_target_detail_read(monkeypatch):
     assert ("VOYN-W0-MG", "no_accept_marker_on_head") in report.skipped
 
 
+def test_merge_tick_reuses_one_window_listing_for_inactive_tail(monkeypatch):
+    """One light open-PR listing is enough to reject inactive READY tail rows.
+
+    The per-PR fallback still exists for closed/merged or lookup-failed PRs,
+    but ordinary open inactive PRs should not each spend their own REST pull
+    read before the heavier mergeability path is even considered.
+    """
+    monkeypatch.setattr(
+        review_merge,
+        "_scan_tasks",
+        lambda factory, cursor_name, query, params, limit: (
+            [
+                ("VOYN-W0-MG-1", "https://github.com/voyn88/ai-command-center/pull/41"),
+                ("VOYN-W0-MG-2", "https://github.com/voyn88/ai-command-center/pull/42"),
+                ("VOYN-W0-MG-3", "https://github.com/voyn88/ai-command-center/pull/43"),
+            ],
+            "tok",
+        ),
+    )
+    monkeypatch.setattr(review_merge, "_scan_commit", lambda *args: None)
+    monkeypatch.setattr(
+        review_merge,
+        "_origin_owner_repo",
+        lambda repo_path: ("voyn88", "ai-command-center"),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_merge_window_open_pr_snapshot",
+        lambda repo_path: (
+            {
+                number: {
+                    "number": number,
+                    "labels": [{"name": "review-window:waiting"}],
+                }
+                for number in (41, 42, 43)
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_window_expensive_read_decision",
+        lambda *args, **kwargs: pytest.fail("per-PR window lookup should not run"),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_is_mergeable",
+        lambda *args, **kwargs: pytest.fail("inactive PRs must not reach mergeability"),
+    )
+
+    report = review_merge._merge_once(lambda: None, "/repo")
+
+    assert report.skipped == [
+        ("VOYN-W0-MG-1", "merge_window_inactive"),
+        ("VOYN-W0-MG-2", "merge_window_inactive"),
+        ("VOYN-W0-MG-3", "merge_window_inactive"),
+    ]
+
+
 def test_queue_active_pr_sheds_stale_blocked_label(
     fake_gh, checkout, fleet_store, monkeypatch
 ):
