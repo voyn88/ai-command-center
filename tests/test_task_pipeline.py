@@ -944,6 +944,26 @@ def test_a_transiently_deferred_task_is_not_reported_as_stuck(tmp_path, git_repo
     assert _stuck([task], [decision], db_path=api.db_path) == ()
 
 
+def test_a_task_deferred_on_unknown_retry_timing_is_reported_as_stuck(tmp_path, git_repo, api):
+    """`retry_timing_unknown` is a DEFER in *action* only: the prior run's
+    completion time can never be computed, so the task defers forever exactly
+    like a structural block, and must not hide behind the transient-DEFER
+    exclusion above (VOYN-W0-AICC-LAUNCH-STATUS-MISLABEL)."""
+    task = _task(id="a", workspace_path=str(git_repo))
+    from command_center.runtime import scheduler as sched
+
+    decision = task_pipeline.EntryDecision(
+        entry_id="q1",
+        task_id="a",
+        action=sched.ACTION_DEFER,
+        reason_code=sched.REASON_RETRY_TIMING_UNKNOWN,
+        explanation="completion time unknown",
+    )
+    reported = _stuck([task], [decision], db_path=api.db_path)
+    assert [(s.task_id, s.kind) for s in reported] == [("a", task_pipeline.STUCK_KIND_NOT_STARTING)]
+    assert reported[0].remediation
+
+
 def test_a_running_task_is_never_reported_as_stuck(tmp_path, git_repo, api):
     _failed_validation(api, git_repo)
     task = _task(id="a", workspace_path=str(git_repo))
