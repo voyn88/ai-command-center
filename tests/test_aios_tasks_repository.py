@@ -322,3 +322,28 @@ def test_delete_already_cancelled_task_is_idempotent_false():
     result = repo.delete("aicc-1")
     assert result is False
     assert all(r.method == "GET" for r in requests)
+
+
+# ---------------------------------------------------------------------------
+# AIOSTasksRepository.upsert / upsert_all — mirrors tasks_repository.save_tasks's
+# structural drop of master-projection records (VOYN-W0-AICC-READONLY-LAUNCH-
+# SURFACES): the local JSON store refuses these on write, and every other
+# backend this repository facade can front must refuse them the same way.
+# ---------------------------------------------------------------------------
+
+def test_upsert_refuses_master_projection_task():
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("gateway must not be called for a master-projection record")
+
+    repo, _ = _make_repo(handler)
+    repo.upsert({"id": "master-1", "source": "master", "read_only": True, "status": "Backlog"})
+
+
+def test_upsert_all_refuses_master_projection_tasks():
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("gateway must not be called for a master-projection record")
+
+    repo, _ = _make_repo(handler)
+    repo.upsert_all(
+        [{"id": "master-1", "source": "master", "read_only": True, "status": "Backlog"}]
+    )
