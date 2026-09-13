@@ -26,14 +26,52 @@ _ENV = {
 }
 
 
-def _run(script: Path, *args: str) -> subprocess.CompletedProcess:
+def _run(script: Path, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(script), *args],
-        env={**os.environ, **_ENV},
+        env={**os.environ, **_ENV, **(extra_env or {})},
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def _fake_bin_dir(tmp_path: Path, *, client_version: str, server_version_num: str) -> Path:
+    """A directory of stand-in `pg_dump`/`psql` binaries for the version guard.
+
+    Fakes rather than real binaries so the version comparison is exercised
+    without needing two PostgreSQL installations (or a live server) side by
+    side — the exact drill setup (Homebrew pg_dump 15 against a pg 17 server)
+    is what this guard exists for, and it is not something CI can install.
+    """
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+
+    pg_dump = bin_dir / "pg_dump"
+    pg_dump.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "--version" ]]; then\n'
+        f'    echo "pg_dump (PostgreSQL) {client_version}"\n'
+        "    exit 0\n"
+        "fi\n"
+        "for arg in \"$@\"; do\n"
+        '    case "$arg" in\n'
+        '        --file=*) echo "fake archive" > "${arg#--file=}" ;;\n'
+        "    esac\n"
+        "done\n"
+        "exit 0\n"
+    )
+    pg_dump.chmod(0o755)
+
+    psql = bin_dir / "psql"
+    psql.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "{server_version_num}"\n'
+        "exit 0\n"
+    )
+    psql.chmod(0o755)
+
+    return bin_dir
 
 
 # An empty `--keep ""` is rejected earlier, by the argument parser's `${2:?...}`
@@ -55,8 +93,47 @@ def test_backup_leaves_an_existing_directory_permissions_alone(tmp_path) -> None
     existing = tmp_path / "backups"
     existing.mkdir(mode=0o755)
     before = existing.stat().st_mode
-    _run(BACKUP, "--out-dir", str(existing))  # fails later, at pg_dump
+    _run(BACKUP, "--out-dir", str(existing))  # fails later, at the version check or pg_dump
     assert existing.stat().st_mode == before
+
+
+def test_backup_rejects_a_pg_dump_client_older_than_the_server(tmp_path) -> None:
+    """The version check runs — and fails loudly — before pg_dump ever connects.
+
+    This is the drill scenario the task was filed from: a Homebrew pg_dump
+    15.18 against a pg 17.6 server. Left unchecked, pg_dump discovers the
+    mismatch on its own, but only after it has already connected and started
+    reading — on an unattended nightly run that reads as a silently failed
+    backup, not a clear error. Fake `pg_dump`/`psql` stand in for a second
+    PostgreSQL install so the comparison is exercised without one.
+    """
+    fake_bin = _fake_bin_dir(tmp_path, client_version="15.18", server_version_num="170006")
+    out_dir = tmp_path / "backups"
+    result = _run(
+        BACKUP,
+        "--out-dir",
+        str(out_dir),
+        extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    assert result.returncode == 3
+    assert "15.18" in result.stderr
+    assert "17" in result.stderr
+    # The guard fires before the output directory — or any archive — is created.
+    assert not out_dir.exists()
+
+
+def test_backup_proceeds_when_the_client_is_not_older_than_the_server(tmp_path) -> None:
+    """A client at or ahead of the server's major version clears the guard."""
+    fake_bin = _fake_bin_dir(tmp_path, client_version="17.2", server_version_num="170004")
+    out_dir = tmp_path / "backups"
+    result = _run(
+        BACKUP,
+        "--out-dir",
+        str(out_dir),
+        extra_env={"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(out_dir.glob("aicc-aicc_live-*.dump"))
 
 
 def test_restore_refuses_the_live_database_without_the_flag(tmp_path) -> None:

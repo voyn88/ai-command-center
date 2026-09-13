@@ -14,6 +14,13 @@
 # Credentials come from the environment (AICC_PG_*) and are handed to libpq via
 # PGPASSWORD, which is never echoed. Nothing here writes a password to disk.
 #
+# Before anything else, the local pg_dump's major version is compared against
+# the server's: pg_dump cannot reliably dump a server newer than itself, but it
+# only discovers that after connecting and starting to read. Catching the
+# mismatch up front turns a backup that fails partway through — silently, on a
+# host nobody is watching overnight — into one clear error before any work
+# starts.
+#
 # Usage:
 #   scripts/aicc_pg_backup.sh --out-dir /var/backups/aicc [--verify] [--keep 14]
 
@@ -24,7 +31,7 @@ KEEP=""
 VERIFY=0
 
 usage() {
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -55,6 +62,39 @@ fi
 PGPORT_VALUE="${AICC_PG_PORT:-5432}"
 
 command -v pg_dump >/dev/null || { echo "pg_dump not found in PATH" >&2; exit 127; }
+command -v psql >/dev/null    || { echo "psql not found in PATH" >&2; exit 127; }
+
+# pg_dump can read from an older server, but not a newer one — a client behind
+# the server's major version is exactly the drill failure this guards against
+# (Homebrew pg_dump 15 against a pg 17 server), and left unchecked it is
+# discovered mid-dump instead of before anything has started.
+CLIENT_VERSION_LINE="$(pg_dump --version)"
+if [[ ! "$CLIENT_VERSION_LINE" =~ ([0-9]+)\.([0-9]+) ]]; then
+    echo "could not parse a version from 'pg_dump --version': '${CLIENT_VERSION_LINE}'" >&2
+    exit 1
+fi
+CLIENT_MAJOR="${BASH_REMATCH[1]}"
+CLIENT_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+
+if ! SERVER_VERSION_NUM="$(PGPASSWORD="$AICC_PG_PASSWORD" psql \
+        --host="$AICC_PG_HOST" --port="$PGPORT_VALUE" --username="$AICC_PG_USER" \
+        --dbname="$AICC_PG_DB" --tuples-only --no-align --no-psqlrc \
+        --command="SHOW server_version_num;")"; then
+    echo "could not connect to ${AICC_PG_HOST}:${PGPORT_VALUE}/${AICC_PG_DB} to check the server version" >&2
+    exit 1
+fi
+SERVER_VERSION_NUM="$(tr -d '[:space:]' <<<"$SERVER_VERSION_NUM")"
+if [[ ! "$SERVER_VERSION_NUM" =~ ^[0-9]+$ ]]; then
+    echo "could not parse a server version from 'SHOW server_version_num': '${SERVER_VERSION_NUM}'" >&2
+    exit 1
+fi
+SERVER_MAJOR="$((SERVER_VERSION_NUM / 10000))"
+
+if [[ "$CLIENT_MAJOR" -lt "$SERVER_MAJOR" ]]; then
+    echo "pg_dump client is version ${CLIENT_VERSION} (major ${CLIENT_MAJOR}), but the server at ${AICC_PG_HOST}:${PGPORT_VALUE} is major version ${SERVER_MAJOR}." >&2
+    echo "pg_dump cannot reliably back up a server newer than itself; upgrade the pg_dump client before running this backup." >&2
+    exit 3
+fi
 
 # Backups routinely contain every row in the system, so a directory this script
 # creates is owner-only. An existing directory is left alone: it may be an
