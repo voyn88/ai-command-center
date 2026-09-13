@@ -300,6 +300,61 @@ def test_queue_active_pr_sheds_blocked_label_even_with_block_reason(
     )
 
 
+def test_queue_active_pr_sheds_blocked_label_before_detail_budget(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """Backlog hygiene cannot depend on the per-PR detail budget. Queue state
+    is already present in the listing, so contradictory window labels are
+    normalized before any detail lookup is attempted."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:blocked")
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
+
+    assert report.error is None
+    assert report.active == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert not any("/reviews" in argv[-1] for argv in calls)
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
+        for argv in calls
+    )
+    assert any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:active"
+        for argv in calls
+    )
+
+
+def test_queue_waiting_pr_sheds_blocked_label_before_detail_budget(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """The same early normalization applies to queue-waiting PRs, which make
+    up most of the old backlog tail."""
+    monkeypatch.setenv(
+        "FAKE_GH_PR_LABELS", "queue-waiting-review,review-window:blocked"
+    )
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
+
+    assert report.error is None
+    assert report.waiting == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert not any("/reviews" in argv[-1] for argv in calls)
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
+        for argv in calls
+    )
+    assert any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:waiting"
+        for argv in calls
+    )
+
+
 def test_without_the_fleet_store_the_same_tick_reports_the_rate_limit(
     fake_gh, checkout, monkeypatch, tmp_path
 ):
