@@ -2784,6 +2784,37 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     return str(data.get("mergeStateStatus") or "")
 
 
+def _merge_window_allows_expensive_read(repo_path: str, pr_url: str) -> tuple[bool, str]:
+    """Whether merge_once should spend GraphQL detail reads on this PR.
+
+    The PR-window reconciler is the cheap, REST-backed backlog triage pass.
+    The merge tick should honor that triage and spend its heavier GraphQL
+    reads only on the active merge/review window. If the lightweight lookup
+    fails, fail open: stranding a READY_TO_REVIEW task because labels could
+    not be read would be worse than one conservative expensive read.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return True, "pr_url_unparseable"
+    owner, repo, number = parsed
+    outcome, pull = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+    if outcome != _REST_OK or not isinstance(pull, dict):
+        return True, "merge_window_lookup_failed"
+    if str(pull.get("state") or "").lower() != "open" or pull.get("merged_at"):
+        return True, "pr_not_open"
+    raw_labels = pull.get("labels")
+    if not isinstance(raw_labels, list):
+        return True, "merge_window_labels_missing"
+    labels = {
+        str(label.get("name") or "")
+        for label in raw_labels
+        if isinstance(label, dict)
+    }
+    if _QUEUE_ACTIVE_LABEL in labels or DEFAULT_PR_WINDOW_CONFIG.label_active in labels:
+        return True, "merge_window_active"
+    return False, "merge_window_inactive"
+
+
 def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     """The PR's actual merge commit on the target branch, or None until
     GitHub reports the PR MERGED.
@@ -3206,6 +3237,12 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         # otherwise strand the task in READY_TO_REVIEW forever. A merged PR
         # WITHOUT acceptance evidence (external/bypass merge) is an incident
         # for the operator, never a silent DONE.
+        in_window, window_detail = _merge_window_allows_expensive_read(
+            repo_path, pr_url
+        )
+        if not in_window:
+            report.skipped.append((task_id, window_detail))
+            continue
         merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
         if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
             report.skipped.append((task_id, merge_reason))

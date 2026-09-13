@@ -381,6 +381,40 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
         assert cur.fetchone()[0] == merge_oid
 
 
+def test_merge_skips_prs_outside_the_active_review_window(rig, monkeypatch):  # noqa: F811,E501
+    """The merge tick must honor the cheap PR-window triage before spending
+    GraphQL detail reads on a READY_TO_REVIEW backlog tail."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/208"
+    _ready(store, app_factory, "VOYN-W0-MW", pr_url)
+    porcelain_calls = []
+
+    def fake_rest_json(repo_path, path):
+        assert path == "repos/x/y/pulls/208"
+        return review_merge._REST_OK, {
+            "state": "open",
+            "merged_at": None,
+            "labels": [{"name": "review-window:waiting"}],
+        }
+
+    def fake_gh(argv, repo):
+        porcelain_calls.append(argv)
+        return sp.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
+
+    monkeypatch.setattr(review_merge, "_rest_json", fake_rest_json)
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    report = merge_once(app_factory, "/tmp")
+
+    assert ("VOYN-W0-MW", "merge_window_inactive") in report.skipped
+    assert porcelain_calls == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MW",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
 def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):  # noqa: F811
     """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: a marker whose reviewer
     login is the SAME as the PR's own author must not authorize merge --
