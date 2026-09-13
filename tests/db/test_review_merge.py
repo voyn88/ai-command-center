@@ -3947,6 +3947,46 @@ def test_queue_selected_prs_shed_stale_blocked_labels(monkeypatch):
     assert ("11", "add", "review-window:waiting") in fake.labels
 
 
+def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypatch):
+    """Queue ownership is a stronger window signal than stale window evidence.
+
+    A queue-selected PR may still be old, missing an accept marker, or waiting
+    on stale checks. Those are still merge-gate concerns, but the PR-window
+    reconciler must not keep or re-add `review-window:blocked` next to
+    `queue-active`/`queue-waiting-review`; that contradictory label pair is
+    exactly what made review/merge ticks rescan the dirty tail."""
+    active_head = "7" * 40
+    waiting_head = "8" * 40
+    prs = [
+        _win_pr(
+            12,
+            "2020-01-01T00:00:00Z",
+            active_head,
+            labels=["queue-active", "review-window:blocked"],
+        ),
+        _win_pr(
+            13,
+            "2020-01-02T00:00:00Z",
+            waiting_head,
+            labels=["queue-waiting-review", "review-window:blocked"],
+        ),
+    ]
+    fake = _RestGitHub(prs)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=1)
+    )
+
+    assert report.blocked == []
+    assert report.active == [(12, active_head)]
+    assert report.waiting == [(13, waiting_head)]
+    assert ("12", "remove", "review-window:blocked") in fake.labels
+    assert ("12", "add", "review-window:active") in fake.labels
+    assert ("13", "remove", "review-window:blocked") in fake.labels
+    assert ("13", "add", "review-window:waiting") in fake.labels
+
+
 def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
     """VOYN-W0-AICC-PR-WINDOW-RECONCILER-SCALE: live 2026-09-08 the listing
     exceeded GitHub's GraphQL node limit and returned rc=1, and the tick

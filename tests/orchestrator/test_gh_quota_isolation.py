@@ -78,12 +78,15 @@ elif "/pulls?" in path:
     print(json.dumps(body))
 elif "/reviews" in path:
     page = int(path.split("page=")[-1])
-    print(json.dumps([] if page > 1 else [{
+    if os.environ.get("FAKE_GH_NO_REVIEWS"):
+        print(json.dumps([]))
+    else:
+        print(json.dumps([] if page > 1 else [{
         "state": "COMMENTED",
         "submitted_at": "2026-09-09T13:00:00Z",
         "body": "ACCEPTANCE: ACCEPT " + head,
         "user": {"login": "voyn88-acceptance-gate[bot]"},
-    }]))
+        }]))
 elif path.endswith("/pulls/42"):
     print(json.dumps({"mergeable_state": "clean"}))
 elif "/check-runs" in path:
@@ -266,6 +269,33 @@ def test_queue_active_pr_sheds_stale_blocked_label(
         argv[:3] == ["api", "--method", "POST"]
         and argv[3].endswith("/issues/42/labels")
         and argv[-1] == "labels[]=review-window:active"
+        for argv in calls
+    )
+
+
+def test_queue_active_pr_sheds_blocked_label_even_with_block_reason(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """Queue-selected PRs may still have stale window evidence. That must not
+    recreate the contradictory `queue-active` + `review-window:blocked` pair."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:blocked")
+    monkeypatch.setenv("FAKE_GH_NO_REVIEWS", "1")
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(stale_seconds=1))
+
+    assert report.error is None
+    assert report.blocked == []
+    assert report.active == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
+        for argv in calls
+    )
+    assert not any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:blocked"
         for argv in calls
     )
 
