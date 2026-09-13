@@ -394,8 +394,8 @@ def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     already exceeded for user ID 297853521`) and all three ticks failed at
     once for an hour. `gh_access.run` sends the identical argv under the
     fleet App's installation token -- its own, separate quota -- whenever
-    the host has one, falls back to the ambient credential when it does
-    not, and counts the call either way."""
+    the host has one, falls back to the ambient credential when the enclosing
+    tick allows it, and counts the call either way."""
     return gh_access.run(argv, repo_path)
 
 
@@ -3316,9 +3316,11 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     one `pr view` answers state, reviews, rollup and `mergeStateStatus`
     together -- rewriting it in REST would cost MORE requests for the same
     decision. What it needed was a quota nobody else spends, and that is what
-    the fleet App's identity gives it
+    the fleet App's identity gives it. Merge additionally disables ambient
+    fallback for its tick, so missing App permissions surface as merge skips
+    instead of spending a human identity.
     (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS)."""
-    with gh_access.tick(repo_path) as quota:
+    with gh_access.tick(repo_path, allow_ambient_fallback=False) as quota:
         report = _merge_once(factory, repo_path, cfg)
         report.quota = quota
     return report
