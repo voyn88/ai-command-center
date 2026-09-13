@@ -3818,10 +3818,12 @@ def _reconcile_pr_window(
         head = str(pr.get("headRefOid") or "")
         labels = _pr_window_labels(pr)
         active_now = cfg.label_active in labels or _QUEUE_ACTIVE_LABEL in labels
+        queue_active_now = _QUEUE_ACTIVE_LABEL in labels
+        queue_waiting_now = _QUEUE_WAITING_REVIEW_LABEL in labels
         blocked_now = (
             cfg.label_blocked in labels
             and not active_now
-            and not _pr_is_queue_selected(labels)
+            and not (queue_active_now or queue_waiting_now)
         )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
@@ -3918,6 +3920,15 @@ def _reconcile_pr_window(
             detailed = dict(detailed)
             detailed["mergeStateStatus"] = merge_state
             reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+        if queue_active_now:
+            selected += 1
+            report.active.append((number, head))
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
+            continue
+        if queue_waiting_now:
+            report.waiting.append((number, head))
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
+            continue
         if reason is not None:
             report.blocked.append((number, reason))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
