@@ -14,6 +14,7 @@ from typing import Callable
 
 from command_center.audit.checks.base import Check
 from command_center.audit.checks.code_quality import CodeQualityCheck
+from command_center.audit.checks.composite_call import CompositeCallCheck
 from command_center.audit.checks.coverage import CoverageCheck
 from command_center.audit.checks.deps import DepsCheck
 from command_center.audit.checks.lint import LintCheck
@@ -70,6 +71,7 @@ def default_registry() -> CheckRegistry:
     registry = CheckRegistry()
     registry.register(SecurityCheck.name, SecurityCheck)
     registry.register(LintCheck.name, LintCheck)
+    registry.register(CompositeCallCheck.name, CompositeCallCheck)
     registry.register(CodeQualityCheck.name, CodeQualityCheck)
     registry.register(DepsCheck.name, DepsCheck)
     registry.register(CoverageCheck.name, CoverageCheck)
