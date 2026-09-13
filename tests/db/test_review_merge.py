@@ -4019,9 +4019,9 @@ def test_queue_selected_prs_shed_stale_blocked_labels(monkeypatch):
     assert report.active == [(10, active_head)]
     assert report.waiting == [(11, waiting_head)]
     assert ("10", "remove", "review-window:blocked") in fake.labels
-    assert ("10", "add", "review-window:active") in fake.labels
+    assert ("10", "add", "review-window:active") not in fake.labels
     assert ("11", "remove", "review-window:blocked") in fake.labels
-    assert ("11", "add", "review-window:waiting") in fake.labels
+    assert ("11", "add", "review-window:waiting") not in fake.labels
 
 
 def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypatch):
@@ -4059,9 +4059,9 @@ def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypat
     assert report.active == [(12, active_head)]
     assert report.waiting == [(13, waiting_head)]
     assert ("12", "remove", "review-window:blocked") in fake.labels
-    assert ("12", "add", "review-window:active") in fake.labels
+    assert ("12", "add", "review-window:active") not in fake.labels
     assert ("13", "remove", "review-window:blocked") in fake.labels
-    assert ("13", "add", "review-window:waiting") in fake.labels
+    assert ("13", "add", "review-window:waiting") not in fake.labels
 
 
 def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
