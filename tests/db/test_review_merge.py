@@ -446,6 +446,11 @@ def test_merge_skips_prs_outside_the_active_review_window(rig, monkeypatch):  # 
         porcelain_calls.append(argv)
         return sp.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
 
+    monkeypatch.setattr(
+        review_merge,
+        "_merge_window_open_pr_snapshot",
+        lambda repo_path: (None, "pr_list_failed"),
+    )
     monkeypatch.setattr(review_merge, "_rest_json", fake_rest_json)
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
 
