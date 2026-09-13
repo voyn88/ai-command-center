@@ -23,9 +23,10 @@ from pathlib import Path
 
 import pytest
 
-from command_center.orchestrator import gh_access
+from command_center.orchestrator import gh_access, review_merge
 from command_center.orchestrator.review_merge import (
     PrWindowConfig,
+    _merge_window_allows_expensive_read,
     reconcile_pr_window,
 )
 
@@ -88,7 +89,8 @@ elif "/reviews" in path:
         "user": {"login": "voyn88-acceptance-gate[bot]"},
         }]))
 elif path.endswith("/pulls/42"):
-    print(json.dumps({"mergeable_state": "clean"}))
+    labels = [{"name": name} for name in os.environ.get("FAKE_GH_PR_LABELS", "").split(",") if name]
+    print(json.dumps({"state": "open", "merged_at": None, "mergeable_state": "clean", "labels": labels}))
 elif "/check-runs" in path:
     page = int(path.split("page=")[-1])
     print(json.dumps({"check_runs": [] if page > 1 else [{
@@ -245,6 +247,40 @@ def test_the_window_tick_works_while_the_human_graphql_quota_is_exhausted(
     assert any(
         call["argv"][:3] == ["api", "--method", "POST"] for call in _calls(fake_gh)
     ), "the label write is REST too, so a spent GraphQL budget cannot block it"
+
+
+def test_merge_window_gate_skips_inactive_pr_without_graphql(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """The merge tick's cheap window gate is REST-only: inactive backlog-tail
+    PRs must be rejected before any `gh pr view` GraphQL porcelain can run."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "review-window:waiting")
+
+    allowed, reason = _merge_window_allows_expensive_read(
+        str(checkout), "https://github.com/voyn88/ai-command-center/pull/42"
+    )
+
+    assert (allowed, reason) == (False, "merge_window_inactive")
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert calls
+    assert all(argv[0] == "api" for argv in calls)
+    assert any(argv[1].endswith("/pulls/42") for argv in calls)
+
+
+def test_merge_window_gate_fails_open_when_labels_are_missing(monkeypatch):
+    """Old or partial PR payloads are inconclusive, not evidence that a PR is
+    outside the active window."""
+    monkeypatch.setattr(
+        review_merge,
+        "_rest_json",
+        lambda repo_path, path: (review_merge._REST_OK, {"state": "open"}),
+    )
+
+    allowed, reason = _merge_window_allows_expensive_read(
+        "/tmp", "https://github.com/voyn88/ai-command-center/pull/42"
+    )
+
+    assert (allowed, reason) == (True, "merge_window_labels_missing")
 
 
 def test_queue_active_pr_sheds_stale_blocked_label(
