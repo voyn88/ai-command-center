@@ -36,13 +36,11 @@ do for the other table-family modules.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
-_LOG = logging.getLogger(__name__)
+from command_center.db.mirror_support import record_mirror_failure
 
 #: A message's direction relative to the operator.
 MESSAGE_DIRECTIONS: frozenset[str] = frozenset({"inbound", "outbound"})
@@ -165,8 +163,8 @@ def _mirror_contact(record: dict) -> None:
         from command_center.db.networking_store import PostgresContactMirror
 
         PostgresContactMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror contact into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("contact", record, exc)
 
 
 def _mirror_message(record: dict) -> None:
@@ -182,8 +180,8 @@ def _mirror_message(record: dict) -> None:
         from command_center.db.networking_store import PostgresMessageMirror
 
         PostgresMessageMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror message into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("message", record, exc)
 
 
 def get_contact(db_path: Path, contact_id: str) -> dict | None:
@@ -443,8 +441,8 @@ def _mirror_invitation(record: dict) -> None:
         from command_center.db.networking_store import PostgresInvitationMirror
 
         PostgresInvitationMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror networking_invitation into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("networking_invitation", record, exc)
 
 
 

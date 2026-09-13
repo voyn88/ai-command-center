@@ -48,16 +48,14 @@ do for the other table-family modules.
 from __future__ import annotations
 
 import json
-import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+from command_center.db.mirror_support import record_mirror_failure
 
 from command_center.runtime.db.wave1 import _exclude_projects_clause
-
-_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Allowlists (mirror ``api.models`` Literals; validated at the boundary)
@@ -211,8 +209,8 @@ def _mirror_motion(record: dict) -> None:
         from command_center.db.council_store import PostgresMotionMirror
 
         PostgresMotionMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror motion into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("motion", record, exc)
 
 
 def _mirror_vote(record: dict) -> None:
@@ -221,8 +219,8 @@ def _mirror_vote(record: dict) -> None:
         from command_center.db.council_store import PostgresCouncilVoteMirror
 
         PostgresCouncilVoteMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror council_vote into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("council_vote", record, exc)
 
 
 def _mirror_decision(record: dict) -> None:
@@ -236,8 +234,8 @@ def _mirror_decision(record: dict) -> None:
         from command_center.db.council_store import PostgresCouncilDecisionMirror
 
         PostgresCouncilDecisionMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror council_decision into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("council_decision", record, exc)
 
 
 def _mirror_council_event(record: dict) -> None:
@@ -251,8 +249,8 @@ def _mirror_council_event(record: dict) -> None:
         from command_center.db.council_store import PostgresCouncilEventMirror
 
         PostgresCouncilEventMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror council_event into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("council_event", record, exc)
 
 
 
