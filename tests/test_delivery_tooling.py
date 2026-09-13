@@ -35,6 +35,41 @@ def _write_suite(directory: Path, *, green: bool) -> Path:
     return path
 
 
+def _without_the_driver(tmp_path: Path) -> dict[str, str]:
+    """An environment overlay under which `import psycopg` fails, on any host.
+
+    A directory holding a `psycopg.py` that raises, prepended to `PYTHONPATH`.
+    Prepended rather than replacing: dropping an inherited `PYTHONPATH` would
+    change more than the one import under test.
+
+    Both forms of the driver probe honour it, which is what lets the driverless
+    configuration be produced on a machine that has the driver. The fallback
+    form is a plain `sys.executable -c`, so `PYTHONPATH` applies directly; the
+    `uv run` form builds a virtualenv with `psycopg` in it and *still* honours
+    it, because `uv run` passes the environment through and `PYTHONPATH`
+    precedes site-packages on `sys.path`. Measured both ways rather than
+    assumed — `uv run --with 'psycopg[binary]…' python -c 'import psycopg'`
+    exits 0 without this overlay and raises `ImportError: blocked` from
+    `psycopg.py` with it.
+
+    Forcing matters because nothing else reaches that state. Every CI job
+    installs from `requirements-ci-*.lock`, which pins `psycopg`, so a test
+    that inherits the host's driver only ever runs the reachable branch on the
+    machine that decides the merge.
+
+    Under `tmp_path`, not a directory beside this file. The first version of
+    this wrote a module *named `psycopg.py`* into `tests/fixtures/` and never
+    removed it, so every run left an untracked file in the source tree — in a
+    PR whose own body explains that `git add -A` swept a stray file in three
+    times.
+    """
+    blocker = tmp_path / "block_psycopg"
+    blocker.mkdir(exist_ok=True)
+    (blocker / "psycopg.py").write_text('raise ImportError("blocked")\n', encoding="utf-8")
+    existing = os.environ.get("PYTHONPATH")
+    return {"PYTHONPATH": os.pathsep.join([str(blocker), *([existing] if existing else [])])}
+
+
 def _run(script: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
     """Run a tool and keep its stderr with its stdout in the failure message.
 
@@ -188,30 +223,57 @@ def test_the_line_records_which_configuration_measured_it(tmp_path) -> None:
     message, so the two lines were indistinguishable in the place they are
     read. The configuration now travels with the numbers.
 
-    Both configurations are set explicitly rather than inherited. The first
-    version asserted `serverless` and inherited whatever the developer had
-    exported — so it passed on a laptop with no database and failed on one with
-    it, which is the very ambiguity the feature exists to remove.
+    Every configuration is set explicitly rather than inherited, and twice that
+    was got wrong the same way. The first version asserted `serverless` and
+    inherited whatever the developer had exported — so it passed on a laptop
+    with no database and failed on one with it, which is the very ambiguity the
+    feature exists to remove. The second set the DSN but inherited the
+    *driver*: which of the two requested states came back was decided by
+    whether `psycopg` happened to be importable, so when the marker gained its
+    third state — `PostgreSQL requested, **driver missing**` — the exact
+    substring this compared against stopped matching on any machine without it.
+
+    The repair at the time was to compare *less*: `(PostgreSQL requested`
+    without its closing paren, which matches both states that exist and every
+    suffix that does not exist yet. That made the test pass everywhere by
+    removing what it asserted — the objection
+    `test_the_marker_names_a_missing_driver_...` already records against
+    substring assertions on this line. Measured on the pre-change tree:
+    respelling the suffix `**driver missing**` → `**driver absent**` left this
+    test green.
+
+    Nor could the gate see any of it. Every CI job installs from
+    `requirements-ci-*.lock`, which pins `psycopg==3.3.4`, so `_driver_reachable()`
+    has only ever returned True there and one of the marker's three states was
+    reachable exclusively on a developer's machine.
+
+    So the driver is forced instead of inherited, through `PYTHONPATH` rather
+    than a monkeypatch because the tool under test is a subprocess. Both
+    configurations are now produced on every host, the gate included, and each
+    line is compared whole.
     """
     suite = _write_suite(tmp_path / "green", green=True)
 
     serverless = {k: v for k, v in os.environ.items() if k != "AICC_TEST_PG_ADMIN_DSN"}
     measured = _run(EVIDENCE, "measure", str(suite), env=serverless)
-    assert "(serverless)" in measured.stdout, measured.stdout
+    assert measured.stdout.strip().endswith("(serverless)."), measured.stdout
 
-    with_database = {**os.environ, "AICC_TEST_PG_ADMIN_DSN": "host=127.0.0.1 dbname=irrelevant"}
+    with_database = {
+        **os.environ,
+        "AICC_TEST_PG_ADMIN_DSN": "host=127.0.0.1 dbname=irrelevant",
+        **_without_the_driver(tmp_path),
+    }
     measured = _run(EVIDENCE, "measure", str(suite), env=with_database)
-    # `(PostgreSQL requested` without its closing paren, deliberately. The
-    # marker gained a third state — `PostgreSQL requested, **driver missing**`
-    # — and the exact-substring form made this test host-dependent again on any
-    # machine without `psycopg`: the same defect its own docstring above
-    # condemns, reintroduced by the commit that added the state. What this test
-    # is about is that a requested database is distinguishable from a
-    # serverless run; which of the two requested states appears is
-    # `test_the_marker_names_a_missing_driver_...`'s subject, where it is set
-    # explicitly rather than inherited.
-    assert "(PostgreSQL requested" in measured.stdout, measured.stdout
-    assert "(serverless)" not in measured.stdout, measured.stdout
+    # Whole, not a prefix — and this is the state worth pinning end to end: a
+    # DSN with no driver is the shape that used to pose as a PostgreSQL run
+    # over 260 silent skips. That the *reachable* spelling is exact is
+    # `test_the_marker_names_a_missing_driver_...`'s subject, which forces
+    # `_driver_reachable` both ways in-process; what this adds is that the
+    # forcing survives the trip out through `evidence.py`'s own argv and
+    # stdout, which an in-process monkeypatch cannot show.
+    assert measured.stdout.strip().endswith(
+        "(PostgreSQL requested, **driver missing**)."
+    ), measured.stdout
 
 
 def test_a_missing_ruff_is_never_reported_as_a_dirty_tree() -> None:
@@ -306,7 +368,12 @@ def test_the_marker_names_a_missing_driver_instead_of_reading_as_a_postgres_run(
 
     monkeypatch.setattr(module, "_driver_reachable", lambda: False)
     unreachable = module._evidence_line(["tests/db"], counts, "clean")
-    assert "driver missing" in unreachable
+    # Exact, not a substring, for the same reason `reachable` is checked whole
+    # below: `"driver missing" in unreachable` also matches
+    # `PostgreSQL requested, **driver missing, but maybe not**` or any other
+    # text appended around the phrase, so a fourth state could grow out of the
+    # third with this assertion still green.
+    assert unreachable.endswith("(PostgreSQL requested, **driver missing**).")
 
     monkeypatch.setattr(module, "_driver_reachable", lambda: True)
     reachable = module._evidence_line(["tests/db"], counts, "clean")
@@ -370,15 +437,11 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     assert "import psycopg" in module._driver_probe_command()
 
     # And the behaviour, not only the spelling: blocked at import, the probe
-    # must say so; unblocked, it must not.
-    #
-    # `tmp_path`, not a directory beside this file. The first version wrote a
-    # module *named `psycopg.py`* into `tests/fixtures/` and never removed it,
-    # so every run left an untracked file in the source tree — in a PR whose
-    # own body explains that `git add -A` swept a stray file in three times.
-    blocker = tmp_path / "block_psycopg"
-    blocker.mkdir()
-    (blocker / "psycopg.py").write_text('raise ImportError("blocked")\n', encoding="utf-8")
+    # must say so; unblocked, it must not. The blocking is `_without_the_driver`
+    # — the same overlay `..._records_which_configuration_measured_it` forces
+    # the driverless marker with, so the two tests cannot disagree about what
+    # "no driver" means. The blocker was inline here first; the reasons it is
+    # built under `tmp_path` moved into that helper's docstring with it.
     # The behavioural half runs the *fallback* form — `sys.executable -c` —
     # deliberately, and this is a limit worth stating rather than hiding. The
     # first version ran `_driver_probe_command()` itself, which on a runner with
@@ -405,17 +468,11 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
     # the behavioural half to the fallback form does not apply here.
     assert uv_probe == ["uv", "run", *module._DB_EXTRAS, "python", "-c", "import psycopg"]
     assert probe == fallback
-    existing = os.environ.get("PYTHONPATH")
     blocked = subprocess.run(
         fallback,
         cwd=ROOT,
         capture_output=True,
-        env={
-            **os.environ,
-            # Prepended, not replacing: dropping an inherited PYTHONPATH would
-            # change more than the one import under test.
-            "PYTHONPATH": os.pathsep.join([str(blocker), *([existing] if existing else [])]),
-        },
+        env={**os.environ, **_without_the_driver(tmp_path)},
     )
     assert blocked.returncode != 0, "the probe reported a driver that cannot be imported"
 
