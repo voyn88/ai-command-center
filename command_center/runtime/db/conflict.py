@@ -344,9 +344,8 @@ def _conflict_transition(
 
     Checks the caller's ``version`` first (a stale writer always loses as a stale
     writer), then refuses an illegal status edge, stamps ``resolved_at`` when the
-    move is into ``resolved`` (the clearing branch below is unreachable while
-    ``resolved`` is terminal — see the comment on it), bumps ``version`` and
-    sets ``updated_at``. Returns the updated row dict."""
+    move is into ``resolved``, bumps ``version`` and sets ``updated_at``. Returns
+    the updated row dict."""
     row = conn.execute(
         "SELECT status, version FROM conflict WHERE id = ?", (conflict_id,)
     ).fetchone()
@@ -367,16 +366,6 @@ def _conflict_transition(
     fields: dict[str, Any] = {"status": new_status, "updated_at": now}
     if new_status == "resolved":
         fields["resolved_at"] = now
-    elif row["status"] == "resolved":
-        # Unreachable while `resolved` is terminal: the allowlist check above
-        # rejects every edge out of it, so no call reaches here with a resolved
-        # row. Left in place as the correct behaviour if `resolved -> open` is
-        # ever opened, and labelled because reading it as live behaviour is
-        # exactly the mistake SRV-01B slice 3 made — its acceptance story was
-        # built on this branch, and independent review had to disprove it.
-        # Whoever opens that edge owns `test_a_resolved_conflict_is_terminal`
-        # and the PostgreSQL mirror's assumptions along with it.
-        fields["resolved_at"] = None
     set_clause = ", ".join(f"{key} = :{key}" for key in fields)
     params = dict(fields)
     params["conflict_id"] = conflict_id
