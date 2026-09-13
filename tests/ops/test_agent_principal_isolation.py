@@ -2200,6 +2200,8 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-review.timer",
         "voyn-aicc-merge.service",
         "voyn-aicc-merge.timer",
+        "voyn-aicc-remediate.service",
+        "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
     )
@@ -2224,6 +2226,7 @@ def test_the_review_and_merge_units_are_immutable_control_ticks(tmp_path):
     for unit, command in (
         ("review", "backlog-review"),
         ("merge", "backlog-merge"),
+        ("remediate", "backlog-remediate"),
     ):
         service = (
             root / f"deploy/systemd/voyn-aicc-{unit}.service"

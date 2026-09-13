@@ -106,6 +106,7 @@ __all__ = [
     "PrWindowReport",
     "ReconcileReport",
     "ReviewConfig",
+    "autonomy_remediate_once",
     "merge_once",
     "publish_review_verdicts",
     "reconcile_merge_evidence",
@@ -171,6 +172,24 @@ class LoopReport:
     #: What this tick spent at GitHub and under which identity -- see
     #: `gh_access.GhQuota`. None when the report was built outside a tick
     #: scope (a unit test constructing one by hand).
+    quota: gh_access.GhQuota | None = None
+
+
+@dataclass
+class AutonomyRemediationReport:
+    """What the hands-off remediation tick did to blocked review PRs."""
+
+    #: (task_id, pr_url) whose current head was sent back through exact-head
+    #: review because the old acceptance evidence was stale or missing.
+    refreshed: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) whose failed/cancelled checks were rerun.
+    rerun: list[tuple[str, str]] = field(default_factory=list)
+    #: (blocked_task_id, new_remediation_task_id) whose accepted PR needed a
+    #: real follow-up implementation attempt (red checks after bounded rerun,
+    #: merge conflict, or another non-transient merge blocker).
+    remediated: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) deliberately left alone this tick.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
     quota: gh_access.GhQuota | None = None
 
 
@@ -3400,6 +3419,275 @@ def _carry_over_marker_if_patch_id_stable(
 
     ok, _err = _post_marker_as_bot(creds, pr_url, "ACCEPT", head)
     return ok
+
+
+def _pull_for_pr_url(repo_path: str, pr_url: str) -> dict[str, Any] | None:
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return None
+    owner, repo, number = parsed
+    outcome, pull = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+    return pull if outcome == _REST_OK and isinstance(pull, dict) else None
+
+
+def _enqueue_review_refresh(
+    enqueue: Any,
+    repo_path: str,
+    task_id: str,
+    pr_url: str,
+    pull: dict[str, Any] | None,
+    cfg: ReviewConfig,
+) -> str | None:
+    """Enqueue exact-head review even when the PR-window label is blocked.
+
+    This is the hands-off equivalent of an operator saying "the old ACCEPT is
+    stale; review the current head again". It deliberately reuses the normal
+    review payload, review key, chunking, model-only cascade and repo routing,
+    but skips the active-window gate because stale blocked tails are exactly
+    what this remediation tick exists to drain.
+    """
+    if enqueue is None:
+        return "review_enqueue_unavailable"
+    cascade = _model_only_review_cascade()
+    if not cascade:
+        return "no_review_executor_route"
+    from command_center.orchestrator.planner import repo_route
+
+    repo = _repo_from_pr_url(pr_url)
+    route = repo_route(repo) if repo else None
+    if route is None:
+        return f"no_repo_route: {pr_url!r}"
+    snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, pull)
+    if snapshot is None:
+        return "pr_diff_fetch_failed"
+    key = _review_key(task_id, pr_url, snapshot)
+    if key is None:
+        return "review_key_invalid"
+    try:
+        chunks = _review_chunks(snapshot, task_id, pr_url)
+    except (RuntimeError, ValueError) as exc:
+        return f"review_prompt_budget_invalid: {exc}"
+    project_id, repository_path = route
+    for chunk in chunks:
+        prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
+        payload = {
+            "kind": "agent_run",
+            "v": 1,
+            "project_id": project_id,
+            "repository_path": repository_path,
+            "task_type": "independent_review",
+            "prompt": prompt,
+            "timeout_seconds": cfg.review_timeout,
+            "untrusted": True,
+            "cascade": cascade,
+        }
+        review_key = key
+        if chunk.count != 1:
+            chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
+            if chunk_key is None:
+                return "review_key_invalid"
+            review_key = chunk_key
+            payload["review_chunk"] = {
+                "version": 3,
+                "index": chunk.index,
+                "count": chunk.count,
+                "content_bytes": len(chunk.text.encode("utf-8")),
+                "content_hash": chunk.content_hash,
+                "manifest_hash": chunk.manifest_hash,
+                "base_sha": snapshot.base,
+                "head_sha": snapshot.head,
+                "diff_hash": snapshot.digest,
+            }
+        enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
+    return None
+
+
+def _remediate_merge_blocker(
+    factory: Any,
+    task_id: str,
+    pr_url: str,
+    head: str,
+    reason: str,
+) -> str | None:
+    body = (
+        "Automatic merge remediation requested.\n\n"
+        f"PR: {pr_url}\n"
+        f"HEAD_SHA: {head}\n"
+        f"BLOCKER: {reason}\n\n"
+        "Fix the blocker on a follow-up branch and open a new pull request. "
+        "The original accepted PR is left as evidence and superseded by this "
+        "remediation task; the normal review, acceptance and merge gates still "
+        "apply to the follow-up."
+    )
+    return _remediate_rejection(factory, task_id, pr_url, head, body)
+
+
+def _autonomy_window_config(cfg: ReviewConfig) -> PrWindowConfig:
+    base = DEFAULT_PR_WINDOW_CONFIG
+    return PrWindowConfig(
+        label_active=base.label_active,
+        label_waiting=base.label_waiting,
+        label_blocked=base.label_blocked,
+        max_active=base.max_active,
+        scan_limit=base.scan_limit,
+        scan_hard_cap=base.scan_hard_cap,
+        detail_budget=base.detail_budget,
+        blocked_refresh_budget=base.blocked_refresh_budget,
+        stale_seconds=base.stale_seconds,
+        required_checks=cfg.required_checks,
+    )
+
+
+def autonomy_remediate_once(
+    factory: Any,
+    enqueue: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
+) -> AutonomyRemediationReport:
+    """Drain blocked review PRs without weakening merge gates.
+
+    The ordinary PR-window tick labels blocked tails, review ticks only process
+    active PRs, and merge ticks intentionally refuse red/conflicted accepted
+    PRs. This tick is the bounded hygiene loop between them:
+
+    * stale/missing exact-head acceptance -> enqueue a normal review for the
+      current head, bypassing only the active-window label;
+    * accepted red/cancelled checks -> ask GitHub for one bounded rerun;
+    * accepted red checks after the bounded rerun, or merge conflicts -> spawn
+      the existing capped remediation task chain.
+
+    It never posts an ACCEPT marker directly and never merges a PR.
+    """
+    cfg = cfg or ReviewConfig()
+    report = AutonomyRemediationReport()
+    with gh_access.tick(repo_path, allow_ambient_fallback=False) as quota:
+        report.quota = quota
+        if task_id is not None:
+            tasks, scan_token = _rows(
+                factory,
+                "SELECT t.task_id, e.value FROM backlog_task t "
+                "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+                "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+                "ORDER BY e.value LIMIT %s",
+                (task_id, cfg.max_per_tick),
+            ), None
+        else:
+            tasks, scan_token = _scan_tasks(
+                factory,
+                "scan:autonomy_remediate_once",
+                "SELECT t.task_id, e.value FROM backlog_task t "
+                "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+                "WHERE t.status = 'READY_TO_REVIEW' "
+                "AND (t.task_id, e.value) > (%s, %s) "
+                "ORDER BY t.task_id, e.value LIMIT %s",
+                (),
+                cfg.scan_cap,
+            )
+        window_cfg = _autonomy_window_config(cfg)
+        cache = gh_access.detail_cache()
+        actions = 0
+        last_processed = None
+        for current_task_id, pr_url in tasks:
+            if actions >= cfg.max_per_tick:
+                break
+            last_processed = (current_task_id, pr_url)
+            pull = _pull_for_pr_url(repo_path, pr_url)
+            light = _light_pr_from_rest(pull)
+            if pull is None or light is None:
+                report.skipped.append((current_task_id, "pr_lookup_failed"))
+                continue
+            detailed = _pr_window_details(
+                repo_path, light, cache, refresh=True, include_reviews=True
+            )
+            if detailed is None:
+                report.skipped.append((current_task_id, "pr_detail_lookup_failed"))
+                continue
+            parsed = _owner_repo_number_from_pr_url(pr_url)
+            if parsed is not None:
+                merge_state = _rest_merge_state(
+                    repo_path, parsed[0], parsed[1], int(parsed[2])
+                )
+                if merge_state:
+                    detailed["mergeStateStatus"] = merge_state
+            age_seconds, _fell_back = _pr_age_seconds(repo_path, detailed, now=time.time())
+            window_reason = _window_block_reason(
+                detailed, window_cfg, age_seconds=age_seconds
+            )
+            accepted, head = _has_accept_marker_with_pull(
+                repo_path, pr_url, pull, rest_allowed=True
+            )
+            if not head:
+                head = str(detailed.get("headRefOid") or "")
+            if not accepted:
+                if window_reason in (
+                    "stale_exact_head_acceptance",
+                    "checks_stale",
+                    "checks_missing",
+                    None,
+                ):
+                    reason = _enqueue_review_refresh(
+                        enqueue, repo_path, current_task_id, pr_url, pull, cfg
+                    )
+                    if reason is None:
+                        report.refreshed.append((current_task_id, pr_url))
+                        actions += 1
+                    else:
+                        report.skipped.append((current_task_id, reason))
+                    continue
+                report.skipped.append((current_task_id, window_reason or "not_blocked"))
+                continue
+            ready, merge_detail = _pr_is_mergeable(
+                repo_path, pr_url, cfg.required_checks
+            )
+            if ready:
+                report.skipped.append((current_task_id, "merge_ready"))
+                continue
+            if merge_detail.startswith(("checks_not_green", "checks_cancelled")):
+                rerun = _rerun_failed_ci_once(repo_path, pr_url)
+                if rerun:
+                    report.rerun.append((current_task_id, rerun))
+                    actions += 1
+                    continue
+                if head:
+                    new_task_id = _remediate_merge_blocker(
+                        factory, current_task_id, pr_url, head, merge_detail
+                    )
+                    if new_task_id:
+                        report.remediated.append((current_task_id, new_task_id))
+                        actions += 1
+                    else:
+                        report.skipped.append(
+                            (current_task_id, "merge_blocker_remediation_already_dispatched")
+                        )
+                    continue
+            if (
+                head
+                and (
+                    window_reason == "merge_conflict"
+                    or merge_detail == "branch_dirty_needs_rebase"
+                )
+            ):
+                new_task_id = _remediate_merge_blocker(
+                    factory,
+                    current_task_id,
+                    pr_url,
+                    head,
+                    window_reason or merge_detail,
+                )
+                if new_task_id:
+                    report.remediated.append((current_task_id, new_task_id))
+                    actions += 1
+                else:
+                    report.skipped.append(
+                        (current_task_id, "merge_conflict_remediation_already_dispatched")
+                    )
+                continue
+            report.skipped.append((current_task_id, merge_detail))
+        if scan_token is not None:
+            _scan_commit(factory, "scan:autonomy_remediate_once", scan_token, last_processed)
+    return report
 
 
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
