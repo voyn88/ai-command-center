@@ -3941,6 +3941,35 @@ def _set_pr_window_labels(
     return ok
 
 
+def _remove_pr_window_labels(
+    repo_path: str, pr: dict[str, Any], cfg: PrWindowConfig, remove: set[str]
+) -> bool:
+    """Remove only contradictory PR-window labels.
+
+    Queue-owned labels (`queue-active`, `queue-waiting-review`) are a stronger
+    state signal than the review-window labels and already drive the expensive
+    read gates. For those PRs the reconciler should clean stale contradictions
+    without adding another window label and creating an avoidable label event.
+    """
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked}
+    current = _pr_window_labels(pr) & window_labels & remove
+    if not current:
+        return True
+    issues = f"repos/{owner}/{repo}/issues/{number}/labels"
+    ok = True
+    for name in sorted(current):
+        removed = _gh(
+            ["api", "--method", "DELETE", f"{issues}/{urllib.parse.quote(name)}"],
+            repo_path,
+        )
+        ok = ok and removed.returncode == 0
+    return ok
+
+
 def reconcile_pr_window(
     repo_path: str, cfg: PrWindowConfig | None = None
 ) -> PrWindowReport:
@@ -4013,11 +4042,15 @@ def _reconcile_pr_window(
         if queue_active_now:
             selected += 1
             report.active.append((number, head))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_active)
+            _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
+            )
             continue
         if queue_waiting_now:
             report.waiting.append((number, head))
-            _set_pr_window_labels(repo_path, pr, cfg, cfg.label_waiting)
+            _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked}
+            )
             continue
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
