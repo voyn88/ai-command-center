@@ -170,6 +170,15 @@ CREATE TYPE backlog_lease_verdict AS (
 -- mutation goes through backlog_transition. Idempotence is measurable: an
 -- upsert that changes nothing reports changed=false and does not touch
 -- revision or updated_at, so "second run = 0 changes" is a query, not a hope.
+--
+-- Graduation criterion (VOYN-W0-AICC-DOCUMENT-IMPORT-EXEMPTION-GRADUATION):
+-- this direct-status-write exemption must be removed or narrowed once (1)
+-- every NEW task_id is created via backlog_dispatch, not first appearing
+-- through import_markdown, and (2) import_markdown never needs to change
+-- p_status for a task_id that already exists in backlog_task — i.e. the
+-- Markdown file no longer decides status for anything the queue already
+-- tracks. See command_center/db/backlog_store.py module docstring for the
+-- full rationale.
 CREATE FUNCTION backlog_upsert_task(
     p_task_id text, p_wave text, p_priority text, p_status text,
     p_kind text, p_title text, p_body text, p_repo text
