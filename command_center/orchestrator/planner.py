@@ -111,8 +111,10 @@ class PlanReport:
 _DEFAULT_REPO_ROUTES: dict[str, tuple[str, str]] = {
     "ai-command-center": ("AICC", "/home/voynadmin/Projects/ai-command-center"),
     "aios": ("AIOS", "/home/voynadmin/Projects/aios"),
+    "voyn-logistics-crm": ("CRM", "/home/voynadmin/Projects/voyn-logistics-crm"),
     "~/Projects/aios": ("AIOS", "/home/voynadmin/Projects/aios"),
     "~/Projects/ai-command-center": ("AICC", "/home/voynadmin/Projects/ai-command-center"),
+    "~/Projects/voyn-logistics-crm": ("CRM", "/home/voynadmin/Projects/voyn-logistics-crm"),
 }
 
 

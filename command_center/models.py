@@ -15,7 +15,7 @@ from datetime import datetime
 # Projects
 # --------------------------------------------------------------------------
 
-PROJECT_IDS: list[str] = ["AICC", "AIOS", "AICOS", "PRODUCT", "ECOSYSTEM", "ESF", "AML", "BANK", "LEGAL", "BUSINESS", "PERSONAL"]
+PROJECT_IDS: list[str] = ["AICC", "AIOS", "AICOS", "PRODUCT", "ECOSYSTEM", "ESF", "AML", "CRM", "BANK", "LEGAL", "BUSINESS", "PERSONAL"]
 SENSITIVE_PROJECT_IDS: set[str] = {"BANK", "LEGAL"}
 
 # Non-canonical project labels that historically reached data/tasks.json from
