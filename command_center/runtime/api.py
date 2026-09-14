@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from command_center import project_config, provider_route, workspace_provisioning
+from command_center import agent_policy, project_config, provider_route, workspace_provisioning
 from command_center import run_lineage as provenance
 from command_center.runtime import autonomy, autonomy_service, context_service, db, scheduler, supervisor
 
@@ -372,11 +372,19 @@ class ExecutionCenterAPI:
         from this API's own `runtime.db`. Pure decision only — this returns a
         `SchedulingPlan` and launches nothing. Acting on an `ASSIGN` decision
         is a separate, explicit `start_run` call by the caller, so the launch
-        confirmation / sensitive-content boundary is never bypassed here."""
+        confirmation / sensitive-content boundary is never bypassed here.
+
+        When the caller does not pin an explicit `registry`, the default one
+        has the operator's live agent-tuning policies (weight/fallback —
+        see `command_center.agent_policy`) applied on top of it. Policies are
+        read fresh on every call, which is what makes "add one policy, no
+        redeploy" true: a policy created a moment ago via the UI governs this
+        very tick without the process restarting."""
         load = scheduler.build_load_snapshot(self.db_path)
+        effective_registry = registry or agent_policy.tuned_registry(scheduler.default_registry())
         return scheduler.plan(
             work_items,
-            registry=registry or scheduler.default_registry(),
+            registry=effective_registry,
             load=load,
             config=config,
             policy=policy,

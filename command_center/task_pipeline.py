@@ -73,6 +73,7 @@ from pathlib import Path
 
 from command_center import (
     activity_log,
+    agent_policy,
     execution_queue,
     git_info,
     launch_service,
@@ -760,14 +761,22 @@ def adapt_ready_entries(
         workspace = prep.resolved_workspace or launch_service.resolved_workspace_path(prep.selection.path)
         attempts_made, last_state, last_failure_reason, last_completed_at = _run_history(db_path, task_id)
         allowed_agents, preferred_agent = _agent_constraints(task, canonical)
+        task_type = task.get("task_type") or "implementation"
+        priority = task.get("priority") or "Medium"
+        # Reads the operator's live agent-tuning policy store (see
+        # `command_center.agent_policy`) on every wave adaptation, so a new or
+        # edited SLA policy takes effect on the next tick with no code change
+        # or redeploy. ``None`` (no matching policy) reproduces the
+        # pre-policy-engine behaviour exactly: an unset SLA on the WorkItem.
+        sla_seconds = agent_policy.sla_seconds_for(
+            agent_policy.resolve_db_path(), task_type=task_type, priority=priority
+        )
         adapted.append(
             scheduler.WorkItem(
                 task_id=task_id,
                 workspace=workspace,
-                required_capabilities=scheduler.capabilities_for_task_type(
-                    task.get("task_type") or "implementation"
-                ),
-                priority=task.get("priority") or "Medium",
+                required_capabilities=scheduler.capabilities_for_task_type(task_type),
+                priority=priority,
                 # Authorization is a set, not a pin. The scheduler can spread
                 # work across every permitted compatible provider while a
                 # forbidden provider can never be proposed.
@@ -784,6 +793,7 @@ def adapt_ready_entries(
                 last_failure_reason=last_failure_reason,
                 last_completed_at=last_completed_at,
                 enqueued_at=entry.get("added_at"),
+                sla_seconds=sla_seconds,
             )
         )
         entry_by_task[task_id] = entry.get("id")
