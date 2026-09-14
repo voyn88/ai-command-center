@@ -43,7 +43,9 @@ class ProviderCapabilityPort(Protocol):
 
 def _probe_ollama_models() -> tuple[str, ...] | None:
     try:
-        with urlopen("http://127.0.0.1:11434/api/tags", timeout=0.5) as response:
+        with urlopen(  # nosec B310 - literal loopback URL, not derived from input
+            "http://127.0.0.1:11434/api/tags", timeout=0.5
+        ) as response:
             payload = json.loads(response.read(65_537))
     except (OSError, TimeoutError, URLError, ValueError, json.JSONDecodeError):
         return None

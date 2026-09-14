@@ -175,7 +175,7 @@ def list_evidence(
     where = " AND ".join(clauses)
     with _db(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM evidence WHERE {where} ORDER BY submitted_at DESC", params
+            f"SELECT * FROM evidence WHERE {where} ORDER BY submitted_at DESC", params  # nosec B608 - `where` is joined only from hardcoded clause literals ("entity_type = ?", "entity_id = ?", "evidence_type = ?"); all actual values are bound via `params` and `?` placeholders
         ).fetchall()
     return [dict(r) for r in rows]
 
