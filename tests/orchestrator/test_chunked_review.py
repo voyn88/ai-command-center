@@ -46,7 +46,7 @@ def publish(monkeypatch, snapshot, review_rows):
     posted, remediated = [], []
     monkeypatch.setattr(review_merge, "_rows", fake_rows)
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
-    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (review_merge._MARKER_ABSENT, HEAD))
     monkeypatch.setattr(review_merge, "_acceptance_app_credentials", object)
     monkeypatch.setattr(
         review_merge, "_post_marker_as_bot",
@@ -133,7 +133,7 @@ def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
     )
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
-    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (review_merge._MARKER_ABSENT, HEAD))
     monkeypatch.setattr(
         review_merge,
         "_next_retry_key",
@@ -165,7 +165,7 @@ def test_reconcile_ignores_stale_marker_and_binds_empty_task_id(monkeypatch):
     monkeypatch.setattr(review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}])
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
-    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (True, "a" * 40))
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (review_merge._MARKER_ACCEPTED, "a" * 40))
     monkeypatch.setattr(review_merge, "_next_retry_key", lambda *_: None)
 
     report = review_merge.reconcile_review_once(

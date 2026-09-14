@@ -19,7 +19,10 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   on this deployment today, but the check asks for the merger explicitly
   rather than assuming that from the author, since it is a deployment
   choice pending VOYN-W0-AICC-MERGE-GATEWAY's own separate merge identity,
-  not a guarantee this module may rely on.
+  not a guarantee this module may rely on. All three logins must actually
+  be readable: independence is a positive claim, so an unattributable
+  marker (``_MARKER_IDENTITY_UNKNOWN``) waits for a tick that can attribute
+  it instead of merging on a comparison that never happened.
 
   This function's original implementation (VOYN-W0-AICC-MISSING-MARKER-
   PUBLISHER, 2026-08-21) posted that same marker under the pipeline's own
@@ -340,10 +343,9 @@ def _post_marker_as_bot(
     approval from the PR's own author, but the App reviewing is not
     self-review in the first place -- it never opens or authors anything,
     only ever posts this one marker. First line only, matching
-    `assert_independent_acceptance.py`'s own stricter parse (this
-    module's own `_accept_marker_on_latest_review` is more permissive for
-    the local fast-path check, but the marker itself is written to satisfy
-    the strict contract, not the loose one)."""
+    `assert_independent_acceptance.py`'s own stricter parse, which
+    `_accept_marker_standing` now applies locally too -- the marker is
+    written once to satisfy one contract, not two that can drift."""
     parsed = _owner_repo_number_from_pr_url(pr_url)
     if parsed is None:
         return False, f"no_repo_route: {pr_url!r}"
@@ -1264,7 +1266,11 @@ def reconcile_review_once(
             report.skipped.append((current_task_id, "pr_diff_fetch_failed"))
             continue
         marker, marker_head = _has_accept_marker(repo_path, pr_url)
-        if marker and marker_head == snapshot.head:
+        # Only an ACCEPTED standing means this head is already settled. A
+        # marker whose reviewer is the author or the merger authorizes
+        # nothing, so the head still needs a real review; an inconclusive
+        # identity read costs a re-review at worst, never a wrong merge.
+        if marker == _MARKER_ACCEPTED and marker_head == snapshot.head:
             report.skipped.append((current_task_id, "marker_already_posted"))
             continue
         key = _review_key(current_task_id, pr_url, snapshot)
@@ -1575,13 +1581,14 @@ def _merger_login(repo_path: str) -> str | None:
     place (see this module's docstring above on the marker publisher's
     history), a deliberate interim choice pending VOYN-W0-AICC-MERGE-
     GATEWAY's real separate merge identity, not an architectural
-    guarantee. `_accept_marker_on_latest_review`'s
+    guarantee. `_accept_marker_standing`'s
     author-independence check must not silently rely on that coincidence
     holding forever, so the merger is asked for directly. Returns None on
     any lookup failure or malformed response (network hiccup, no `gh`
-    auth, unparseable stdout) -- treated the same as an unfetched PR
-    author: this half of the independence check is skipped rather than
-    refusing an otherwise-valid marker on an inconclusive read."""
+    auth, unparseable stdout) -- which leaves independence UNPROVEN, not
+    half-proven: the caller reports `_MARKER_IDENTITY_UNKNOWN` and refuses
+    the merge until a later tick reads an identity, rather than accepting
+    a marker nobody could attribute."""
     result = _gh(["api", "user", "--jq", ".login"], repo_path)
     if result.returncode != 0:
         return None
@@ -1589,27 +1596,47 @@ def _merger_login(repo_path: str) -> str | None:
     return login if login and _GH_LOGIN.fullmatch(login) else None
 
 
-def _accept_marker_on_latest_review(
+#: What the PR's head actually carries, as far as the marker check can
+#: establish. Every value other than `_MARKER_ACCEPTED` refuses merge; they
+#: are distinguished because the two questions this module asks of the same
+#: head -- "may this merge?" and "has the marker already been posted?" --
+#: fail closed in OPPOSITE directions, and a bare boolean cannot serve both.
+#: `_MARKER_ABSENT` means no standing marker for this head (post one).
+#: `_MARKER_NOT_INDEPENDENT` means one stands but its reviewer is the PR's
+#: own author or the merger, so it authorizes nothing and the acceptance bot
+#: should still publish a real one. `_MARKER_IDENTITY_UNKNOWN` means a
+#: matching marker stands but at least one of the three logins the
+#: independence comparison needs could not be read -- neither "may merge"
+#: nor "post another", just an inconclusive read to retry next tick.
+_MARKER_ACCEPTED = "accepted"
+_MARKER_ABSENT = "absent"
+_MARKER_NOT_INDEPENDENT = "not_independent"
+_MARKER_IDENTITY_UNKNOWN = "identity_unknown"
+
+
+def _accept_marker_standing(
     reviews: list[dict[str, Any]],
     head: str,
     pr_author_login: str | None,
-    merger_login: str | None = None,
-) -> bool:
-    """Whether the marker stands on the MOST RECENT review, not merely
-    somewhere in the array. A superseded/earlier review carrying the marker
-    text must not count once a later review exists -- otherwise a stale
-    ACCEPT from before a rejected re-review (or before a dismissed review)
-    would still authorize merge. `submittedAt` is ISO 8601, so lexical max
-    is chronological max; a missing timestamp sorts first (never wins).
-    That latest review must also be a standing one: a DISMISSED or PENDING
-    state (`_NON_STANDING_REVIEW_STATES`) never counts, even with a
-    matching body, because dismissing (or never submitting) a review
-    withdraws it as a verdict. And the marker line must be the body's
-    FIRST line exactly -- not text appearing anywhere in a longer comment
-    -- so prose that merely quotes, discusses, or recommends the marker
-    format cannot forge an accept (matching `scripts/
-    assert_independent_acceptance.py`'s own `fullmatch`-on-first-line
-    parse, not a bare substring search).
+    merger_login: str | None,
+) -> str:
+    """Whether an independent ACCEPT marker stands on `head`, as one of the
+    `_MARKER_*` values above.
+
+    The marker must be on the MOST RECENT review, not merely somewhere in
+    the array. A superseded/earlier review carrying the marker text must not
+    count once a later review exists -- otherwise a stale ACCEPT from before
+    a rejected re-review (or before a dismissed review) would still
+    authorize merge. `submittedAt` is ISO 8601, so lexical max is
+    chronological max; a missing timestamp sorts first (never wins). That
+    latest review must also be a standing one: a DISMISSED or PENDING state
+    (`_NON_STANDING_REVIEW_STATES`) never counts, even with a matching body,
+    because dismissing (or never submitting) a review withdraws it as a
+    verdict. And the marker line must be the body's FIRST line exactly --
+    not text appearing anywhere in a longer comment -- so prose that merely
+    quotes, discusses, or recommends the marker format cannot forge an
+    accept (matching `scripts/assert_independent_acceptance.py`'s own
+    `fullmatch`-on-first-line parse, not a bare substring search).
 
     `pr_author_login` closes VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE
     (found live 2026-08-22: PRs #354/#355 both merged by the same account
@@ -1618,7 +1645,11 @@ def _accept_marker_on_latest_review(
     `scripts/assert_independent_acceptance.py`'s own comparison exactly
     (login against the pull request's author login, not text alone --
     that script's docstring explains why `authorAssociation` is the wrong
-    field).
+    field). Logins are compared case-INSENSITIVELY, like that script's, for
+    the same reason it does: GitHub treats `DimaStov-Lab` and
+    `dimastov-lab` as one account, so an exact `==` would read a marker the
+    author issued to themselves as independent purely on the casing the API
+    happened to return.
 
     `merger_login` (`_merger_login`, above) closes the other half of the
     same gap: a marker whose review author is the SAME login as the
@@ -1627,46 +1658,77 @@ def _accept_marker_on_latest_review(
     it must not, since the two are only the same account by today's
     deployment choice, not by anything this check can assume.
 
-    None (author or merger unknown/unfetched) skips that half of the
-    check rather than refusing everything -- callers that cannot supply
-    one keep prior behavior for it; `_pr_is_mergeable`, `_has_accept_
-    marker`, and `_merged_target_sha` below always can and always do
-    supply both."""
+    Independence is a POSITIVE claim, so an unreadable identity is
+    `_MARKER_IDENTITY_UNKNOWN`, never an accept: a missing reviewer login, a
+    PR whose author GitHub did not report, or a `_merger_login` lookup that
+    failed each leave "this marker came from someone other than the two
+    accounts that must not issue it" unproven, and this module refuses
+    everything it cannot establish (`_check_is_green`, `_merged_target_sha`)
+    rather than reading absence of information as favourable. The earlier
+    form of this check returned True when BOTH the author and the merger
+    were unknown -- exactly the state a `gh` hiccup produces -- which made
+    the whole independence rule conditional on a lookup nobody verified."""
+    # Acceptance is per COMMIT, so a head that is not a commit id accepts
+    # nothing: an unreadable `headRefOid` arrives here as "", and the body
+    # comparison below would then match the literal `ACCEPTANCE: ACCEPT `
+    # -- a marker naming no commit at all -- instead of refusing.
+    if not re.fullmatch(r"[0-9a-f]{40}", head or ""):
+        return _MARKER_ABSENT
     if not reviews:
-        return False
+        return _MARKER_ABSENT
     latest = max(reviews, key=lambda r: r.get("submittedAt") or "")
     if latest.get("state") in _NON_STANDING_REVIEW_STATES:
-        return False
+        return _MARKER_ABSENT
     body = (latest.get("body") or "").replace("\r\n", "\n")
-    first_line = body.split("\n", 1)[0]
-    if first_line != f"ACCEPTANCE: ACCEPT {head}":
-        return False
-    if pr_author_login is None and merger_login is None:
-        return True
+    if body.split("\n", 1)[0] != f"ACCEPTANCE: ACCEPT {head}":
+        return _MARKER_ABSENT
     reviewer_login = (latest.get("author") or {}).get("login")
-    if reviewer_login is None:
-        return False
-    if pr_author_login is not None and reviewer_login == pr_author_login:
-        return False
-    return not (merger_login is not None and reviewer_login == merger_login)
+    if not reviewer_login or not pr_author_login or not merger_login:
+        return _MARKER_IDENTITY_UNKNOWN
+    reviewer = reviewer_login.casefold()
+    if reviewer in (pr_author_login.casefold(), merger_login.casefold()):
+        return _MARKER_NOT_INDEPENDENT
+    return _MARKER_ACCEPTED
 
 
-def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
-    """Whether an ACCEPT marker already stands on the PR's current head --
-    read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
-    job). Returns (has_marker, head_sha)."""
+def _marker_standing_from_view(data: dict[str, Any], repo_path: str) -> str:
+    """`_accept_marker_standing` for one parsed `gh pr view` payload, with
+    the two identities it compares against read from the same place every
+    caller reads them: the PR's own `author` field, and the ambient
+    credential `_merger_login` resolves. Shared so the merge gate, the
+    post-merge re-validation and the already-posted check cannot drift into
+    asking three subtly different questions of the same head."""
+    return _accept_marker_standing(
+        data.get("reviews", []),
+        data.get("headRefOid", ""),
+        (data.get("author") or {}).get("login"),
+        _merger_login(repo_path),
+    )
+
+
+def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[str, str]:
+    """What the PR's current head carries, as a `_MARKER_*` value, plus the
+    head sha -- read-only, no gh pr merge/checks concern (that's
+    _pr_is_mergeable's job). `("", "")` when the PR cannot be read at all.
+
+    Callers use this to decide whether to PUBLISH a marker, which is why it
+    returns the standing rather than a bool: `_MARKER_NOT_INDEPENDENT` means
+    a worthless marker stands and the acceptance bot should still post a
+    real one, while `_MARKER_IDENTITY_UNKNOWN` means the read was
+    inconclusive and posting again would duplicate a marker that may
+    already be there. Only `_MARKER_ABSENT` is an invitation to write."""
     view = _gh(
         ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
     )
     if view.returncode != 0:
-        return False, ""
-    data = json.loads(view.stdout or "{}")
-    head = data.get("headRefOid", "")
-    author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(
-        data.get("reviews", []), head, author_login, _merger_login(repo_path)
-    )
-    return accept, head
+        return "", ""
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    return _marker_standing_from_view(data, repo_path), data.get("headRefOid", "")
 
 
 #: How many remediation links may stand above a task before the chain stops
@@ -2179,8 +2241,17 @@ def publish_review_verdicts(
         prev_processed = last_processed
         last_processed = (task_id, pr_url)
         already, current_head = _has_accept_marker(repo_path, pr_url)
-        if already:
+        if already == _MARKER_ACCEPTED:
             report.skipped.append((task_id, "marker_already_posted"))
+            continue
+        if already == _MARKER_IDENTITY_UNKNOWN:
+            # A marker for this head is already there; what could not be
+            # read is WHOSE it is. Posting on that is a duplicate marker on
+            # the PR and a spent write budget unit, so wait for a tick whose
+            # identity lookup answers -- the opposite fail-closed direction
+            # from `_pr_is_mergeable`, which refuses the merge on the very
+            # same standing (see `_has_accept_marker`).
+            report.skipped.append((task_id, "marker_identity_unresolved"))
             continue
         if not current_head:
             report.skipped.append((task_id, "pr_view_failed"))
@@ -2262,7 +2333,7 @@ def publish_review_verdicts(
         if creds is None:
             # No acceptance-bot credentials configured on this host.
             # VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE (2026-08-22)
-            # tightened `_accept_marker_on_latest_review` to require the
+            # tightened `_accept_marker_standing` to require the
             # marker's reviewer login differ from the PR's own author login
             # -- so a same-identity marker posted under the old ambient
             # `gh` credential can no longer satisfy `_pr_is_mergeable`
@@ -2379,8 +2450,10 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     """A PR is ready to merge iff its required checks are green and an ACCEPT
-    marker -- from a reviewer login that is NOT the PR's own author -- stands
-    on the head. `gh pr view` gives all of it in one call.
+    marker stands on the head under a reviewer login that is neither the
+    PR's own author nor the identity this pipeline merges under
+    (`_accept_marker_standing`, which also refuses when any of those three
+    logins cannot be read). `gh pr view` gives all of it in one call.
 
     The GitHub Actions "Acceptance gate" check (`.github/workflows/
     acceptance-gate.yml`) used to be excluded here by a `"cceptance" not in
@@ -2405,11 +2478,7 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     if data.get("state") != "OPEN":
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
-    author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(
-        data.get("reviews", []), head, author_login, _merger_login(repo_path)
-    )
-    if not accept:
+    if _marker_standing_from_view(data, repo_path) != _MARKER_ACCEPTED:
         return False, "no_accept_marker_on_head"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
@@ -2476,11 +2545,7 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     oid = str((data.get("mergeCommit") or {}).get("oid") or "")
     if not re.fullmatch(r"[0-9a-f]{40}", oid):
         return None, "merge_commit_missing"
-    head = data.get("headRefOid", "")
-    author_login = (data.get("author") or {}).get("login")
-    if not _accept_marker_on_latest_review(
-        data.get("reviews", []), head, author_login, _merger_login(repo_path)
-    ):
+    if _marker_standing_from_view(data, repo_path) != _MARKER_ACCEPTED:
         return None, "merged_without_acceptance_evidence"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     # An EMPTY rollup is inconclusive, not green (review of eabe0d3: `any()`

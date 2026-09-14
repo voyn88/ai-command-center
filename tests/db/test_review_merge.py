@@ -40,6 +40,39 @@ def _snapshots(monkeypatch):
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda _repo, pr: SNAPSHOTS.get(pr))
 
 
+#: The three logins `_accept_marker_standing` compares. They are distinct
+#: accounts here on purpose: on this deployment the author and the merger
+#: happen to be the same ambient `gh` credential, and a fixture that made
+#: them the same could not tell a check that compares against BOTH apart
+#: from one that only ever compares against the author.
+AUTHOR = "dimastov-lab"
+REVIEWER = "voyn88-acceptance-gate[bot]"
+MERGER = "merger-bot"
+
+
+def _accept_review(head, login=REVIEWER, **extra):
+    """One standing ACCEPT review published by an identity that is neither
+    the PR's AUTHOR nor the MERGER -- the only shape `_accept_marker_
+    standing` accepts. Written as a helper because "who reviewed" is now
+    load-bearing in every fixture, including the ones whose subject is
+    something else entirely: a review dict without an author leaves
+    independence unprovable and refuses the merge, which would read as the
+    check under test failing rather than as a fixture missing a field."""
+    return {"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": login}, **extra}
+
+
+@pytest.fixture(autouse=True)
+def _merger_identity(monkeypatch):
+    """`_merger_login` shells out to `gh api user` on every marker check.
+    Resolve it centrally so each test's `_gh` fake only has to model the
+    calls its own subject makes -- a fake that answered `api user` with a
+    PR payload used to leave the merger unknown, which (before this
+    module's independence check refused an unattributable marker outright)
+    silently skipped half the check in tests that were not about identity
+    at all. Tests that ARE about an unresolvable merger override this."""
+    monkeypatch.setattr(review_merge, "_merger_login", lambda _repo: MERGER)
+
+
 def _complete_review(app_factory, worker, task_id, pr_url, head_sha, result_text):
     SNAPSHOTS[pr_url] = _snapshot(head_sha)
     """Enqueue + claim + complete a review-class work item exactly the way
@@ -256,13 +289,15 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
                 body = json.dumps({
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "author": {"login": AUTHOR},
+                    "reviews": [_accept_review(head)],
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "author": {"login": AUTHOR},
+                    "reviews": [_accept_review(head)],
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -296,8 +331,8 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch): 
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "author": {"login": "dimastov-lab"},
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "author": {"login": "dimastov-lab"}}],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head, login=AUTHOR)],
             "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -328,21 +363,15 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
                 body = json.dumps({
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head,
-                    "author": {"login": "dimastov-lab"},
-                    "reviews": [{
-                        "body": f"ACCEPTANCE: ACCEPT {head}",
-                        "author": {"login": "voyn88-acceptance-gate[bot]"},
-                    }],
+                    "author": {"login": AUTHOR},
+                    "reviews": [_accept_review(head)],
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
-                    "author": {"login": "dimastov-lab"},
-                    "reviews": [{
-                        "body": f"ACCEPTANCE: ACCEPT {head}",
-                        "author": {"login": "voyn88-acceptance-gate[bot]"},
-                    }],
+                    "author": {"login": AUTHOR},
+                    "reviews": [_accept_review(head)],
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -369,11 +398,8 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "author": {"login": "dimastov-lab"},
-            "reviews": [{
-                "body": f"ACCEPTANCE: ACCEPT {head}",
-                "author": {"login": "voyn88-acceptance-gate[bot]"},
-            }],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head)],
             "statusCheckRollup": [
                 {"name": "CI", "conclusion": "SUCCESS"},
                 {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "FAILURE"},
@@ -424,7 +450,8 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, mon
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"}],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head, submittedAt="2026-01-01T00:00:00Z")],
             "statusCheckRollup": [
                 {"name": "CI", "status": "IN_PROGRESS", "conclusion": None},
             ],
@@ -451,7 +478,8 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # n
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"}],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head, submittedAt="2026-01-01T00:00:00Z")],
             "statusCheckRollup": [{"name": "legacy-ci", "state": "PENDING"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -474,8 +502,9 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
+            "author": {"login": AUTHOR},
             "reviews": [
-                {"body": f"ACCEPTANCE: ACCEPT {head}", "submittedAt": "2026-01-01T00:00:00Z"},
+                _accept_review(head, submittedAt="2026-01-01T00:00:00Z"),
                 {"body": "Actually, hold on -- this needs another look.", "submittedAt": "2026-01-02T00:00:00Z"},
             ],
             "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
@@ -504,15 +533,10 @@ def test_merge_skips_a_marker_whose_reviewer_login_matches_the_merger_identity(r
 
     def fake_gh(argv, repo):
         import subprocess
-        if argv[:2] == ["api", "user"]:
-            return subprocess.CompletedProcess(argv, 0, "merger-bot\n", "")
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "author": {"login": "dimastov-lab"},
-            "reviews": [{
-                "body": f"ACCEPTANCE: ACCEPT {head}",
-                "author": {"login": "merger-bot"},
-            }],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head, login=MERGER)],
             "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -537,13 +561,10 @@ def test_merge_skips_a_dismissed_accept_marker(rig, monkeypatch):  # noqa: F811
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "author": {"login": "dimastov-lab"},
-            "reviews": [{
-                "body": f"ACCEPTANCE: ACCEPT {head}",
-                "author": {"login": "voyn88-acceptance-gate[bot]"},
-                "state": "DISMISSED",
-                "submittedAt": "2026-01-01T00:00:00Z",
-            }],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(
+                head, state="DISMISSED", submittedAt="2026-01-01T00:00:00Z",
+            )],
             "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -569,10 +590,10 @@ def test_merge_ignores_a_marker_that_is_not_the_first_line(rig, monkeypatch):  #
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "author": {"login": "dimastov-lab"},
+            "author": {"login": AUTHOR},
             "reviews": [{
                 "body": f"Note: an earlier run said\nACCEPTANCE: ACCEPT {head}\nbut that was a mistake.",
-                "author": {"login": "voyn88-acceptance-gate[bot]"},
+                "author": {"login": REVIEWER},
             }],
             "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
         })
@@ -581,6 +602,165 @@ def test_merge_ignores_a_marker_that_is_not_the_first_line(rig, monkeypatch):  #
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-M1G", "no_accept_marker_on_head") in report.skipped
+
+
+def test_merge_skips_a_marker_whose_reviewer_login_differs_only_in_case(rig, monkeypatch):  # noqa: F811, E501
+    """GitHub logins are case-insensitive -- `DimaStov-Lab` and
+    `dimastov-lab` are one account -- so an exact `==` comparison read a
+    marker the PR's own author issued to themselves as independent purely
+    on whichever casing the API happened to return. The comparison
+    casefolds, exactly like `scripts/assert_independent_acceptance.py`'s."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1H", "https://github.com/x/y/pull/29")
+    head = "8" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head, login=AUTHOR.upper())],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1H", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1H",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_refuses_a_marker_when_the_merger_identity_cannot_be_read(rig, monkeypatch):  # noqa: F811, E501
+    """Independence is a POSITIVE claim. When `gh api user` cannot say who
+    this pipeline merges as, "the marker came from neither the author nor
+    the merger" is unproven -- and the earlier check answered True on
+    exactly that state whenever the PR author was also unreadable. An
+    inconclusive identity read is a wait (the merge is retried next tick),
+    never an accept."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1I", "https://github.com/x/y/pull/31")
+    head = "a" * 40
+
+    monkeypatch.setattr(review_merge, "_merger_login", lambda _repo: None)
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head)],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1I", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1I",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+@pytest.mark.parametrize(
+    ("task_id", "number", "pr_fields", "review"),
+    [
+        ("VOYN-W0-M1J", 32, {}, {"body": "ACCEPTANCE: ACCEPT {head}", "author": {"login": REVIEWER}}),
+        ("VOYN-W0-M1K", 33, {"author": {"login": AUTHOR}}, {"body": "ACCEPTANCE: ACCEPT {head}"}),
+    ],
+    ids=["pr author unreadable", "reviewer unattributable"],
+)
+def test_merge_refuses_a_marker_no_one_can_be_attributed_to(
+    rig, monkeypatch, task_id, number, pr_fields, review,  # noqa: F811
+):
+    """The other two logins the comparison needs, each missing in turn: a
+    PR whose `author` GitHub did not report, and a review carrying no
+    author of its own. Either leaves the marker unattributable, and an
+    unattributable marker is indistinguishable from a forged one."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, task_id, f"https://github.com/x/y/pull/{number}")
+    head = "b" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN", "headRefOid": head,
+            **pr_fields,
+            "reviews": [{**review, "body": review["body"].format(head=head)}],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert (task_id, "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merge_refuses_a_marker_that_names_no_commit_at_all(rig, monkeypatch):  # noqa: F811
+    """Acceptance is per commit, so a head that is not a commit id accepts
+    nothing. An unreadable `headRefOid` arrives as "", and the body
+    comparison is built from it -- without the sha shape check a review
+    whose first line is the literal `ACCEPTANCE: ACCEPT ` would match it."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-M1L", "https://github.com/x/y/pull/37")
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "OPEN",
+            "author": {"login": AUTHOR},
+            "reviews": [{
+                "body": "ACCEPTANCE: ACCEPT ",
+                "author": {"login": REVIEWER},
+            }],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1L", "no_accept_marker_on_head") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1L",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_an_externally_merged_pr_whose_marker_cannot_be_attributed_never_goes_done(rig, monkeypatch):  # noqa: F811, E501
+    """The post-merge re-validation asks the same question as the merge
+    gate and fails closed the same way: a PR that reached MERGED outside
+    this loop, carrying a marker whose reviewer cannot be compared against
+    the author and the merger, is missing acceptance evidence -- not
+    holding some. It skips loudly for an operator rather than recording a
+    DONE nobody can justify."""
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/34"
+    _ready(store, app_factory, "VOYN-W0-M1M", pr_url)
+    head, merge_oid = "c" * 40, "d" * 40
+
+    monkeypatch.setattr(review_merge, "_merger_login", lambda _repo: None)
+
+    def fake_gh(argv, repo):
+        import subprocess
+        body = json.dumps({
+            "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+            "headRefOid": head,
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head)],
+            "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-M1M", "merged_without_acceptance_evidence") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M1M",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
 def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811, E501
@@ -623,6 +803,93 @@ def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig,
     assert ("VOYN-W0-P1", "https://github.com/x/y/pull/11") in report.reviewed
     assert posted == [("https://github.com/x/y/pull/11", "ACCEPT", head)]
 
+
+def test_publish_verdict_waits_rather_than_duplicating_an_unattributable_marker(rig, monkeypatch):  # noqa: F811, E501
+    """The same standing that refuses the merge fails closed the OTHER way
+    here. A marker for this head is already on the PR; what could not be
+    read is whose it is. `_pr_is_mergeable` refuses to merge on that, but
+    publishing would post a SECOND marker over one that may already be the
+    bot's own -- and spend a write-budget unit doing it. The honest answer
+    to an inconclusive read is to wait for a tick that can attribute it."""
+    app_factory, store, worker = rig
+    head = "7" * 40
+    pr_url = "https://github.com/x/y/pull/35"
+    _ready(store, app_factory, "VOYN-W0-P1C", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-P1C", pr_url, head,
+        f"Looks fine.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+    monkeypatch.setattr(review_merge, "_merger_login", lambda _repo: None)
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "headRefOid": head,
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head)],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    posted = []
+
+    def fake_post(creds, pr_url_arg, decision, sha):
+        posted.append((pr_url_arg, decision, sha))
+        return True, ""
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot", fake_post)
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-P1C", "marker_identity_unresolved") in report.skipped
+    assert not posted
+
+
+def test_publish_verdict_still_posts_over_a_marker_that_authorizes_nothing(rig, monkeypatch):  # noqa: F811, E501
+    """A marker whose reviewer IS the PR's own author is exactly the
+    self-approval this task closed, so it authorizes no merge -- and a
+    "marker already posted" skip on it would deadlock the PR forever,
+    never merging and never getting a real verdict. A standing marker only
+    settles a head when it is one the merge gate would actually accept."""
+    app_factory, store, worker = rig
+    head = "9" * 40
+    pr_url = "https://github.com/x/y/pull/36"
+    _ready(store, app_factory, "VOYN-W0-P1D", pr_url)
+    _complete_review(
+        app_factory, worker, "VOYN-W0-P1D", pr_url, head,
+        f"Looks fine.\nVERDICT: ACCEPT\nHEAD_SHA: {head}\n",
+    )
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "headRefOid": head,
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head, login=AUTHOR)],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    posted = []
+
+    def fake_post(creds, pr_url_arg, decision, sha):
+        posted.append((pr_url_arg, decision, sha))
+        return True, ""
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(
+        review_merge, "_acceptance_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials("1", "2", "/dev/null"),
+    )
+    monkeypatch.setattr(review_merge, "_post_marker_as_bot", fake_post)
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert ("VOYN-W0-P1D", pr_url) in report.reviewed
+    assert posted == [(pr_url, "ACCEPT", head)]
 
 def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: F811, E501
     """A host with no acceptance-bot credentials must not fall back to the
@@ -999,7 +1266,8 @@ def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head)],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
         posted.append(argv)
@@ -1060,7 +1328,8 @@ def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
         import subprocess
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head)],
             "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -1078,7 +1347,8 @@ def test_mergeability_uses_latest_check_rerun(monkeypatch):
     def fake_gh(argv, repo):
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head)],
             "statusCheckRollup": [
                 {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T04:29:29Z"},
                 {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T05:25:43Z"},
@@ -1099,7 +1369,8 @@ def test_mergeability_rejects_latest_failed_check_rerun(monkeypatch):
     def fake_gh(argv, repo):
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head)],
             "statusCheckRollup": [
                 {"name": "Acceptance gate", "conclusion": "SUCCESS", "startedAt": "2026-08-23T04:29:29Z"},
                 {"name": "Acceptance gate", "conclusion": "FAILURE", "startedAt": "2026-08-23T05:25:43Z"},
@@ -1131,7 +1402,8 @@ def test_mergeability_uses_timestamps_not_rollup_array_order(
         body = json.dumps({
             "state": "OPEN",
             "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head)],
             "statusCheckRollup": [
                 {
                     "name": "Acceptance gate",
@@ -1176,7 +1448,8 @@ def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, ch
         body = json.dumps({
             "state": "OPEN",
             "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "author": {"login": AUTHOR},
+            "reviews": [_accept_review(head)],
             "statusCheckRollup": checks,
         })
         return subprocess.CompletedProcess(argv, 0, body, "")
@@ -1692,9 +1965,8 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
-                "author": {"login": "writer-bot"},
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
-                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head)],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -1725,7 +1997,7 @@ def test_merge_train_does_not_update_an_unaccepted_behind_pr(rig, monkeypatch): 
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
-                "author": {"login": "writer-bot"},
+                "author": {"login": AUTHOR},
                 "reviews": [], "statusCheckRollup": [],  # not accepted
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -1765,9 +2037,8 @@ def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F8
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "DIRTY",
-                "author": {"login": "writer-bot"},
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
-                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head)],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -1793,9 +2064,8 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
-                "author": {"login": "writer-bot"},
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
-                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head)],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
@@ -1938,13 +2208,15 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
                 body = json.dumps({
                     "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                     "headRefOid": head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "author": {"login": AUTHOR},
+                    "reviews": [_accept_review(head)],
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             else:
                 body = json.dumps({
                     "state": "OPEN", "headRefOid": head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "author": {"login": AUTHOR},
+                    "reviews": [_accept_review(head)],
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 })
             return sp.CompletedProcess(argv, 0, body, "")
@@ -1996,7 +2268,8 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head)],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
             })
             return sp.CompletedProcess(argv, 0, body, "")
@@ -2198,7 +2471,8 @@ def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):
             body = json.dumps({
                 "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                 "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head)],
                 "statusCheckRollup": [],
             })
             return sp.CompletedProcess(argv, 0, body, "")
@@ -2478,14 +2752,16 @@ def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch)
                 return sp.CompletedProcess(argv, 0, json.dumps({
                     "state": "MERGED", "mergeCommit": {"oid": "ef" * 20},
                     "headRefOid": head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                    "author": {"login": AUTHOR},
+                    "reviews": [_accept_review(head)],
                     "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 }), "")
             return sp.CompletedProcess(argv, 0, json.dumps({"state": "OPEN"}), "")
         if argv[:2] == ["pr", "view"]:
             return sp.CompletedProcess(argv, 0, json.dumps({
                 "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "author": {"login": AUTHOR},
+                "reviews": [_accept_review(head)],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
                 "mergeStateStatus": "CLEAN",
             }), "")
