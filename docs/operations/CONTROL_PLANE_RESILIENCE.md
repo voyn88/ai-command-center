@@ -53,13 +53,23 @@ deliberately separate entry points, not one function with a flag — see its
 module docstring for the full design. In one sentence each:
 
 - `reconcile_once` (control-01, `aicc_app`, `aicc-control-reconciler.timer`
-  every 2 minutes): re-asserts every unit in `DECLARED_TIMERS` is active
-  (bounded backoff, circuit breaker after 3 consecutive failures, escalate
-  once rather than retry forever), quarantines
+  every 2 minutes): re-asserts every unit in `DECLARED_TIMERS` is both
+  **enabled and active** (bounded backoff, circuit breaker after 3
+  consecutive failures, escalate once rather than retry forever), quarantines
   `DEFAULT_QUARANTINE_UNITS` (stop + disable), and — for every timer whose
   tick is heartbeat-instrumented — restarts the SERVICE if its heartbeat
   has gone stale despite the timer reporting active. This is the check that
   would have caught 2026-08-29 directly.
+
+  Enablement is checked independently of activity, and it is not
+  redundant: `systemctl disable` on a running timer changes nothing
+  observable — it keeps firing, `is-active` keeps answering `active`, every
+  downstream signal stays green — right up until the host reboots and the
+  timer never comes back. That is the same stall with a delay fuse on it,
+  and an `is-active`-only reconciler hands it straight through. The two
+  recoveries carry separate circuit-breaker keys (`<unit>` for the restart,
+  `<unit>#enabled` for the re-enable) so a timer whose `enable` keeps
+  failing still gets started and running.
 - `check_heartbeats_once` (worker-01, `aicc_worker`,
   `aicc-control-watchdog.timer` every 3 minutes): read-only, touches no
   systemd unit, and runs on a **different host** so a reconciler that
@@ -88,10 +98,34 @@ reconciler":
    same-host restart policy cannot observe.
 
 Both `OnFailure=aicc-control-plane-alert@%n.service`, the owner-visible
-alert path: a `daemon.err` log line naming the failing unit, fired whenever
-either tick's exit code is non-zero (which the CLI returns exactly when
-something escalated — see `command_center/db/cli.py`'s `control-reconcile`/
-`control-watchdog` handlers).
+alert path: a `daemon.err` log line naming the failing unit.
+
+`Restart=` and `OnFailure=` need care together, because a unit that is
+restarting is not in the `failed` state `OnFailure=` keys on — so layer 1
+can silently swallow the alert layer 2 depends on being reachable. Two
+settings keep both working, and they are load-bearing, not decoration:
+
+- The CLI returns `ESCALATION_EXIT_CODE` (**75**, not 1) when — and only
+  when — bounded automatic recovery is exhausted, and
+  `aicc-control-reconciler.service` pins that same number in
+  `RestartPreventExitStatus=`. An escalation is a decision, not a crash:
+  re-running the tick 30s later would only re-read the circuit it just
+  opened. Preventing the restart sends the unit straight to `failed`, which
+  is what actually fires the alert. An unhandled crash still exits 1 and
+  still gets `Restart=on-failure`'s retry — systemd can only tell the two
+  apart by exit code, which is why they must not share one.
+- `StartLimitIntervalSec=90s` / `StartLimitBurst=3` (in `[Unit]`) bound the
+  crash-restart loop, so a reconciler that keeps dying also reaches
+  `failed` and alerts instead of respawning every 30s unnoticed. 90s is
+  deliberately shorter than the timer's own 2-minute cadence so ordinary
+  successful timer-driven starts never accumulate toward the limit.
+
+A tick that is mid-retry — a recovery attempt failed but the circuit has
+not tripped yet — exits **0** on purpose (that is what retrying before
+crying wolf means) but still prints a `RETRY` line. Not-yet-escalated must
+never mean not-reported: a control-plane problem that prints nothing is a
+problem nobody sees, which is the whole failure class this document is
+about.
 
 ## Install
 
@@ -129,6 +163,11 @@ mkdir -p -m 700 ~/.ssh/control
 - **A transient network drop**: both ticks are idempotent oneshots (the
   reaper's pattern used everywhere else in this codebase); a missed tick
   delays recovery, it never corrupts state.
+- **A timer disabled but still running**: `systemctl disable
+  aicc-backlog-planner.timer` without stopping it — `is-active` still says
+  `active` and nothing downstream changes, but the next reconciler tick
+  re-enables it and prints `REENABLED aicc-backlog-planner.timer#enabled`.
+  Without this the loss is invisible until the next reboot.
 - **A sabotaging unit**: re-enable `voyn-aicc-rotate.timer` — the next
   reconciler tick stops and disables it.
 - **A silent stall** (the 2026-08-29 case, timer active but its tick not
@@ -140,3 +179,9 @@ mkdir -p -m 700 ~/.ssh/control
   without touching anything else — `aicc-control-watchdog.timer` on
   worker-01 reports `control-reconcile` stale within 3 minutes and the
   `OnFailure=` alert fires, independent of control-01's own state.
+- **The alert path itself**: `systemd-run --unit=t --property=Type=oneshot
+  --property=OnFailure=aicc-control-plane-alert@t.service /bin/false`, then
+  `journalctl -t aicc-control-plane` — the alert unit is only as real as
+  the last time someone watched it fire. Worth re-running after any edit to
+  the `Restart=`/`RestartPreventExitStatus=`/`StartLimit*` settings above,
+  since those are exactly what decides whether `failed` is ever reached.

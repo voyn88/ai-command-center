@@ -23,12 +23,31 @@
 # backoff/circuit-breaker for individual UNIT recovery lives inside the tick
 # itself (control_plane_reconciler.ReconcileConfig), not here, because a
 # systemd-level restart loop cannot know which units already have an open
-# circuit. `OnFailure=` fires the alert unit whenever a tick's own exit code
-# is non-zero -- which the CLI returns exactly when something escalated,
-# never merely because it dispatched restarts. This is the FIRST of the task's
-# two required supervision paths; worker-01's aicc-control-watchdog.timer,
-# which does not depend on this host being alive at all, is the second --
-# a reconciler that dies the same way the planner did is no reconciler.
+# circuit. This is the FIRST of the task's two required supervision paths;
+# worker-01's aicc-control-watchdog.timer, which does not depend on this host
+# being alive at all, is the second -- a reconciler that dies the same way the
+# planner did is no reconciler.
+#
+# `Restart=` and `OnFailure=` need care together, because a restarting unit
+# does not sit in the `failed` state that `OnFailure=` keys on -- so a naive
+# `Restart=on-failure` can swallow the alert this task requires (or, if the
+# loop is unbounded, alert forever; voyn-aicc-credential-rotation.service hit
+# the same edge and pinned `RestartPreventExitStatus=78` for it). Two settings
+# keep both behaviours:
+#
+#   * `RestartPreventExitStatus=75` -- control_plane_reconciler's
+#     ESCALATION_EXIT_CODE, returned when and only when bounded automatic
+#     recovery is exhausted. That is a decision, not a crash: retrying the
+#     same tick 30s later would only re-read the open circuit it just wrote.
+#     Preventing the restart sends the unit straight to `failed`, which is
+#     what actually fires the alert.
+#   * `StartLimitIntervalSec=`/`StartLimitBurst=` (in [Unit], where systemd
+#     reads them) -- bound the CRASH restart loop so a reconciler that keeps
+#     dying also reaches `failed` and alerts, instead of respawning every 30s
+#     unnoticed. Burst 3 over 90s tolerates two retries and then escalates,
+#     and 90s is deliberately shorter than the timer's own 2-minute cadence
+#     so ordinary successful timer-driven starts never accumulate toward the
+#     limit.
 #
 # `NoNewPrivileges` is deliberately OMITTED (unlike the reaper/planner units):
 # this tick's ExecStart shells out to `sudo -n systemctl ...`
@@ -41,10 +60,13 @@ Description=AI Command Center control-plane reconciler (timer/unit resilience ti
 After=network-online.target
 Wants=network-online.target
 OnFailure=aicc-control-plane-alert@%n.service
+StartLimitIntervalSec=90s
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
 Restart=on-failure
+RestartPreventExitStatus=75
 RestartSec=30s
 User=aicc-app
 Group=aicc-app

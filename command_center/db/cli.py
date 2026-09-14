@@ -506,6 +506,7 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.orchestrator.control_plane_reconciler import (
+                    ESCALATION_EXIT_CODE,
                     ReconcileConfig,
                     SubprocessSystemctl,
                     reconcile_once,
@@ -526,21 +527,33 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"OK         {name}")
                 for name in report.restarted:
                     print(f"RESTARTED  {name}")
+                for name in report.reenabled:
+                    print(f"REENABLED  {name}")
                 for name in report.quarantined:
                     print(f"QUARANTINE {name}")
+                # A bounded retry still in flight exits 0 on purpose -- it is
+                # not yet an escalation -- but it must not be SILENT, which
+                # is the whole failure class this task exists to close.
+                for name in report.retrying:
+                    print(f"RETRY      {name}")
                 for name in report.circuit_open_skipped:
                     print(f"COOLDOWN   {name}")
                 for name, reason in report.escalated:
                     print(f"ESCALATE   {name}: {reason}")
-                # Non-zero drives `OnFailure=` on the systemd unit -- an
-                # escalation is exactly the "not a silent stall" acceptance,
-                # surfaced to an operator instead of swallowed as exit 0.
-                return 0 if report.healthy else 1
+                # ESCALATION_EXIT_CODE, not 1: the unit pins this exact code
+                # in `RestartPreventExitStatus=` so a designed escalation
+                # goes straight to `failed` and fires `OnFailure=` (the
+                # owner-visible alert), while an unhandled crash -- which
+                # Python exits 1 for -- still gets `Restart=on-failure`'s
+                # bounded retry. Both are "non-zero"; only the exit code
+                # tells systemd which one happened.
+                return 0 if report.healthy else ESCALATION_EXIT_CODE
 
             if args.command == "control-watchdog":
                 from contextlib import nullcontext as _nc
 
                 from command_center.orchestrator.control_plane_reconciler import (
+                    ESCALATION_EXIT_CODE,
                     check_heartbeats_once,
                 )
 
@@ -550,7 +563,11 @@ def main(argv: list[str] | None = None) -> int:
                 for name, age in report.stale:
                     age_desc = "never recorded" if age == float("inf") else f"{age:.0f}s old"
                     print(f"STALE {name}: {age_desc}")
-                return 0 if report.healthy else 1
+                # Same code as control-reconcile for the same reason, even
+                # though aicc-control-watchdog.service sets no `Restart=`:
+                # one escalation code across both ticks means an operator
+                # (or a log shipper) reads one number, not two.
+                return 0 if report.healthy else ESCALATION_EXIT_CODE
 
             if args.command == "downgrade":
                 if not args.confirmed:

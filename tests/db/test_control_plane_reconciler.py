@@ -28,14 +28,32 @@ from command_center.orchestrator.control_plane_reconciler import (
 
 class FakeSystemctl:
     """Records every call; `active`/`enabled` are the fake host's state,
-    `start_ok` overrides whether `start()` succeeds per unit (default: yes,
-    and succeeding flips the unit active -- the same effect a real
-    `systemctl start` on a real timer/service has)."""
+    `start_ok`/`enable_ok` override whether `start()`/`enable()` succeed per
+    unit (default: yes, and succeeding flips the unit active/enabled -- the
+    same effect a real `systemctl start`/`enable` has).
 
-    def __init__(self, *, active=None, enabled=None, start_ok=None):
+    `enabled_default=True` models the ordinary host: a declared timer is
+    enabled unless a test says otherwise, so only the tests that care about
+    the enablement path have to mention it. Quarantine units are found by
+    `is_active OR is_enabled`, and every quarantine test below sets the
+    sabotaging unit active explicitly, so this default does not silently
+    turn them into always-quarantined names.
+    """
+
+    def __init__(
+        self,
+        *,
+        active=None,
+        enabled=None,
+        start_ok=None,
+        enable_ok=None,
+        enabled_default=True,
+    ):
         self.active = dict(active or {})
         self.enabled = dict(enabled or {})
         self.start_ok = dict(start_ok or {})
+        self.enable_ok = dict(enable_ok or {})
+        self.enabled_default = enabled_default
         self.calls: list[tuple[str, str]] = []
 
     def is_active(self, unit: str) -> bool:
@@ -44,7 +62,14 @@ class FakeSystemctl:
 
     def is_enabled(self, unit: str) -> bool:
         self.calls.append(("is-enabled", unit))
-        return self.enabled.get(unit, False)
+        return self.enabled.get(unit, self.enabled_default)
+
+    def enable(self, unit: str) -> bool:
+        self.calls.append(("enable", unit))
+        ok = self.enable_ok.get(unit, True)
+        if ok:
+            self.enabled[unit] = True
+        return ok
 
     def start(self, unit: str) -> bool:
         self.calls.append(("start", unit))
@@ -92,6 +117,90 @@ def test_reconcile_leaves_an_active_timer_with_no_tick_alone(pg_connection_facto
     assert report.ok == ["fake-b.timer"]
     assert report.restarted == []
     assert ("start", "fake-b.service") not in fake.calls
+
+
+def test_reconcile_reenables_an_active_but_disabled_timer(pg_connection_factory):
+    """`systemctl disable` on a running timer changes NOTHING observable:
+    it keeps firing, `is-active` keeps saying "active", every downstream
+    signal stays green -- until the host reboots and the timer never comes
+    back. That is the 2026-08-29 stall with a delay fuse on it, and an
+    `is-active`-only reconciler hands it straight through."""
+    fake = FakeSystemctl(
+        active={"fake-en.timer": True}, enabled={"fake-en.timer": False}
+    )
+    timer = DeclaredTimer("fake-en.timer", "fake-en.service", None, 60)
+
+    report = reconcile_once(
+        fake, pg_connection_factory, declared=(timer,), quarantine=()
+    )
+
+    # Bucketed under the circuit-breaker key, not the bare unit name --
+    # the same convention the stale-heartbeat path already uses for
+    # "fake-d.timer#heartbeat" below. What gets printed is then exactly what
+    # `control_plane_unit_state.unit_name` / `control_plane_event.unit_name`
+    # hold, so an operator can grep one string across the tick's output and
+    # the ledger it wrote.
+    assert report.reenabled == ["fake-en.timer#enabled"]
+    assert fake.enabled["fake-en.timer"] is True
+    assert ("enable", "fake-en.timer") in fake.calls
+    # It was already active -- re-enabling must not also bounce it.
+    assert ("start", "fake-en.timer") not in fake.calls
+    assert report.ok == ["fake-en.timer"]
+    assert report.healthy
+
+
+def test_reconcile_reports_a_bounded_retry_instead_of_staying_silent(
+    pg_connection_factory,
+):
+    """A failed FIRST recovery attempt is correctly not an escalation yet --
+    the circuit breaker is supposed to retry before crying wolf. But it must
+    not be invisible either: the timer is down RIGHT NOW, and a tick that
+    prints nothing and exits 0 about a down timer is precisely the silence
+    this task exists to remove."""
+    fake = FakeSystemctl(
+        active={"fake-r.timer": False}, start_ok={"fake-r.timer": False}
+    )
+    timer = DeclaredTimer("fake-r.timer", "fake-r.service", None, 60)
+    config = ReconcileConfig(circuit_failure_threshold=3)
+
+    report = reconcile_once(
+        fake,
+        pg_connection_factory,
+        declared=(timer,),
+        quarantine=(),
+        config=config,
+    )
+
+    assert report.retrying == ["fake-r.timer"]
+    assert report.escalated == []
+    assert report.healthy  # not yet an escalation ...
+    assert report.restarted == []
+    assert report.ok == []  # ... but emphatically not reported as fine
+
+
+def test_a_failing_enable_does_not_open_the_restart_circuit_for_the_same_timer(
+    pg_connection_factory,
+):
+    """Enablement and activity are recovered under SEPARATE circuit-breaker
+    keys. A timer whose `enable` keeps failing (read-only /etc, a clobbered
+    symlink) must still get started and running -- letting the enable
+    failures open one shared circuit would leave the timer dead for the
+    cooldown over a problem that had nothing to do with starting it."""
+    fake = FakeSystemctl(
+        active={"fake-s.timer": False},
+        enabled={"fake-s.timer": False},
+        enable_ok={"fake-s.timer": False},
+    )
+    timer = DeclaredTimer("fake-s.timer", "fake-s.service", None, 60)
+
+    report = reconcile_once(
+        fake, pg_connection_factory, declared=(timer,), quarantine=()
+    )
+
+    assert report.restarted == ["fake-s.timer"]
+    assert fake.active["fake-s.timer"] is True
+    assert report.retrying == ["fake-s.timer#enabled"]
+    assert report.reenabled == []
 
 
 def test_reconcile_opens_circuit_after_repeated_failures_and_escalates_once(

@@ -48,6 +48,7 @@ from typing import Any, Protocol
 __all__ = [
     "DEFAULT_QUARANTINE_UNITS",
     "DECLARED_TIMERS",
+    "ESCALATION_EXIT_CODE",
     "DeclaredTimer",
     "ReconcileConfig",
     "ReconcileReport",
@@ -59,6 +60,21 @@ __all__ = [
     "reconcile_once",
     "record_heartbeat",
 ]
+
+
+#: Exit code both CLI ticks return when -- and only when -- something
+#: escalated, i.e. bounded automatic recovery is exhausted and an owner
+#: needs to look. It is deliberately NOT 1: `Restart=on-failure` on
+#: aicc-control-reconciler.service must keep covering a genuine crash (an
+#: unhandled traceback exits 1) while NOT restart-looping on a designed
+#: escalation, and systemd can only tell those two apart by exit code.
+#: The unit pins the same number in `RestartPreventExitStatus=`, so an
+#: escalation goes straight to `failed` and fires `OnFailure=` -- the
+#: owner-visible alert this task requires -- instead of being swallowed by
+#: a restart loop that never reaches the failed state. 75 is EX_TEMPFAIL,
+#: matching the repo's existing use of sysexits codes for the same purpose
+#: (voyn-aicc-credential-rotation.service's `RestartPreventExitStatus=78`).
+ESCALATION_EXIT_CODE = 75
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,10 +181,22 @@ class ReconcileConfig:
 class ReconcileReport:
     ok: list[str] = field(default_factory=list)
     restarted: list[str] = field(default_factory=list)
+    #: Timers found `disabled` and re-enabled -- see `reconcile_once`. A
+    #: timer here was NOT necessarily inactive: "active but disabled" is a
+    #: unit that works perfectly until the next reboot and then silently
+    #: never comes back.
+    reenabled: list[str] = field(default_factory=list)
+    #: Units whose recovery attempt failed but whose circuit has NOT yet
+    #: tripped -- a bounded retry is still pending. Deliberately does not
+    #: make the report unhealthy (that is the entire point of retrying
+    #: before escalating), but it MUST still be visible: this task exists
+    #: because a control-plane problem that prints nothing is a problem
+    #: nobody sees.
+    retrying: list[str] = field(default_factory=list)
     circuit_open_skipped: list[str] = field(default_factory=list)
     quarantined: list[str] = field(default_factory=list)
-    #: (unit_or_tick, reason) -- surfaced non-zero from the CLI so
-    #: `OnFailure=` fires the owner-visible alert unit.
+    #: (unit_or_tick, reason) -- surfaced as `ESCALATION_EXIT_CODE` from the
+    #: CLI so `OnFailure=` fires the owner-visible alert unit.
     escalated: list[tuple[str, str]] = field(default_factory=list)
 
     @property
@@ -181,6 +209,7 @@ class Systemctl(Protocol):
     def is_enabled(self, unit: str) -> bool: ...
     def start(self, unit: str) -> bool: ...
     def stop(self, unit: str) -> bool: ...
+    def enable(self, unit: str) -> bool: ...
     def disable(self, unit: str) -> bool: ...
 
 
@@ -220,6 +249,9 @@ class SubprocessSystemctl:
 
     def stop(self, unit: str) -> bool:
         return self._run("stop", unit).returncode == 0
+
+    def enable(self, unit: str) -> bool:
+        return self._run("enable", unit).returncode == 0
 
     def disable(self, unit: str) -> bool:
         return self._run("disable", unit).returncode == 0
@@ -441,9 +473,36 @@ def reconcile_once(
                     report.escalated.append((unit, "quarantine_failed_still_active"))
 
         for timer in declared:
+            # Enablement is checked independently of activity, and first.
+            # "active but disabled" is the quietest failure in this whole
+            # class: the timer fires normally, every signal stays green,
+            # and then the host reboots and it never comes back -- the
+            # 2026-08-29 planner stall with a delay fuse on it. The DESIGN
+            # asks for the declared set "enabled+active"; `is-active` alone
+            # only ever answered half of that.
+            #
+            # Keyed "#enabled" so this recovery's circuit-breaker state is
+            # separate from the timer's restart state: a unit whose
+            # `enable` keeps failing (read-only /etc, a broken symlink)
+            # must not open the circuit that would otherwise have gotten it
+            # restarted and running again.
+            if not systemctl.is_enabled(timer.name):
+                _recover_unit(
+                    systemctl,
+                    conn,
+                    unit_name=f"{timer.name}#enabled",
+                    action="enable_timer",
+                    do_recover=lambda t=timer: systemctl.enable(t.name)
+                    and systemctl.is_enabled(t.name),
+                    cfg=config,
+                    now=moment,
+                    report=report,
+                    ok_bucket=report.reenabled,
+                    retry_bucket=report.retrying,
+                )
+
             active = systemctl.is_active(timer.name)
             if not active:
-                _retry_bucket: list[str] = []
                 _recover_unit(
                     systemctl,
                     conn,
@@ -455,7 +514,7 @@ def reconcile_once(
                     now=moment,
                     report=report,
                     ok_bucket=report.restarted,
-                    retry_bucket=_retry_bucket,
+                    retry_bucket=report.retrying,
                 )
                 continue
 
@@ -483,7 +542,6 @@ def reconcile_once(
             # `is-active` check alone cannot see. One bounded restart of the
             # SERVICE (not the timer, which is already active) before this
             # escalates through the same circuit breaker.
-            _retry_bucket = []
             _recover_unit(
                 systemctl,
                 conn,
@@ -494,7 +552,7 @@ def reconcile_once(
                 now=moment,
                 report=report,
                 ok_bucket=report.restarted,
-                retry_bucket=_retry_bucket,
+                retry_bucket=report.retrying,
             )
 
         # The reconciler's own liveness signal: completing this pass IS what
@@ -505,6 +563,8 @@ def reconcile_once(
             conn,
             "control-reconcile",
             f"restarted={len(report.restarted)} "
+            f"reenabled={len(report.reenabled)} "
+            f"retrying={len(report.retrying)} "
             f"quarantined={len(report.quarantined)} "
             f"escalated={len(report.escalated)}",
             moment,
