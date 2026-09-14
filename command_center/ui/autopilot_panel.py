@@ -352,6 +352,20 @@ def render_autopilot_wave(result=None, *, live_running: int | None = None) -> No
 
     if result.launch_status == task_pipeline.LAUNCH_DISABLED and result.ran:
         st.caption("Автозапуск выключен — волна показана, но ничего не запускалось.")
+    elif result.launch_status == task_pipeline.LAUNCH_BUDGET_EXHAUSTED:
+        st.warning(
+            "Дневной лимит расходов исчерпан — новые запуски остановлены "
+            "(работающие задачи продолжаются).",
+            icon=":material/payments:",
+        )
+    elif result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN:
+        # Not "лимит исчерпан": nobody measured the spend, so claiming the
+        # ceiling was reached would report a verdict that was never taken.
+        st.warning(
+            "Расход за 24 часа не удалось установить — запуски остановлены "
+            "до выяснения (лимит НЕ проверен). См. ошибки тика.",
+            icon=":material/help:",
+        )
     elif result.launch_status.startswith(task_pipeline.LAUNCH_BATCH_FAILED):
         st.error(f"Пакет запуска не выполнен: {result.launch_status}", icon=":material/error:")
 
