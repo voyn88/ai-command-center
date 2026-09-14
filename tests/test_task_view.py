@@ -92,6 +92,51 @@ def test_dependency_graph_dot_includes_parent_child_edge():
     assert '"p" -> "c"' in dot
 
 
+def test_dependency_narrative_returns_empty_when_no_relations():
+    task = {"id": "a"}
+    assert task_view.dependency_narrative(task, {"a": task}) == []
+
+
+def test_dependency_narrative_names_unmet_dependency_as_a_wait():
+    parent = {"id": "a", "title": "Ship the API", "status": "Doing"}
+    child = {"id": "b", "title": "Write docs", "depends_on": ["a"]}
+    lines = task_view.dependency_narrative(child, {"a": parent, "b": child})
+    assert lines == ["Эта задача ждёт «Ship the API»: пока та не будет готова, эта не начнётся."]
+
+
+def test_dependency_narrative_names_met_dependency_as_cleared():
+    parent = {"id": "a", "title": "Ship the API", "status": "Done"}
+    child = {"id": "b", "title": "Write docs", "depends_on": ["a"]}
+    lines = task_view.dependency_narrative(child, {"a": parent, "b": child})
+    assert lines == ["«Ship the API» уже готово — эта задача может продолжаться."]
+
+
+def test_dependency_narrative_names_blocked_task_as_downstream_impact():
+    task = {"id": "a", "title": "Ship the API"}
+    blocked = {"id": "b", "title": "Write docs", "depends_on": ["a"]}
+    lines = task_view.dependency_narrative(task, {"a": task, "b": blocked})
+    assert lines == ["Пока эта задача не будет готова, не сможет начаться «Write docs»."]
+
+
+def test_dependency_narrative_names_parent_and_children():
+    parent = {"id": "p", "title": "Parent goal"}
+    child = {"id": "c", "title": "Sub-step", "parent_task_id": "p"}
+    parent_lines = task_view.dependency_narrative(parent, {"p": parent, "c": child})
+    assert parent_lines == [
+        "У этой задачи есть подзадача «Sub-step» — её ход тоже влияет на общий результат."
+    ]
+    child_lines = task_view.dependency_narrative(child, {"p": parent, "c": child})
+    assert child_lines == [
+        "Это часть более крупной задачи «Parent goal» — от этого шага зависит, когда та будет готова."
+    ]
+
+
+def test_dependency_narrative_labels_deleted_dependency_by_id():
+    task = {"id": "a", "title": "Write docs", "depends_on": ["missing"]}
+    lines = task_view.dependency_narrative(task, {"a": task})
+    assert lines == ["Эта задача ждёт «(задача missing удалена)»: пока та не будет готова, эта не начнётся."]
+
+
 # --- Kanban priority filter regression tests -------------------------------
 # Regression guard for AICC-CI-001: a task whose priority is outside the
 # canonical `models.TASK_PRIORITIES` (here `"P0"`) used to be silently dropped

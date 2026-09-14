@@ -20,6 +20,7 @@ if [[ -z "$PROJECT" ]]; then
   echo "  ECOSYSTEM"
   echo "  ESF"
   echo "  AML"
+  echo "  CRM"
   echo "  BANK"
   echo "  LEGAL"
   echo "  BUSINESS"
@@ -31,7 +32,7 @@ PROJECT_UPPER="$(printf '%s' "$PROJECT" | tr '[:lower:]' '[:upper:]')"
 TASK_TYPE_LOWER="$(printf '%s' "$TASK_TYPE" | tr '[:upper:]' '[:lower:]')"
 
 case "$PROJECT_UPPER" in
-  AICC|AICOS|PRODUCT|ECOSYSTEM|ESF|AML|BUSINESS|PERSONAL)
+  AICC|AICOS|PRODUCT|ECOSYSTEM|ESF|AML|CRM|BUSINESS|PERSONAL)
     CONTEXT_FILE="$ROOT_DIR/CURRENT_STATE.md"
     PROJECT_FILE="$ROOT_DIR/projects/${PROJECT_UPPER}.md"
     ;;
@@ -50,7 +51,7 @@ case "$PROJECT_UPPER" in
     ;;
   *)
     echo "Unknown project: $PROJECT"
-    echo "Supported projects: AICC, AIOS, AICOS, PRODUCT, ECOSYSTEM, ESF, AML, BANK, LEGAL, BUSINESS, PERSONAL"
+    echo "Supported projects: AICC, AIOS, AICOS, PRODUCT, ECOSYSTEM, ESF, AML, CRM, BANK, LEGAL, BUSINESS, PERSONAL"
     exit 1
     ;;
 esac

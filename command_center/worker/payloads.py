@@ -21,16 +21,26 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from command_center.agent_runner import MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS
+
 __all__ = ["AgentRunRequest", "PayloadError", "parse_agent_run"]
 
 AGENT_RUN_SCHEMA_VERSION = 1
 
-# Bounds are refusals, not clamps: a payload asking for more than the queue's
-# own visibility ceiling (3600s, clamped server-side in queue_claim) would
-# outlive any lease its worker can hold, so it is refused at parse time where
-# the operator can see why, instead of timing out opaquely mid-run.
-_MAX_TIMEOUT_SECONDS = 3600
-_MIN_TIMEOUT_SECONDS = 30
+# Bounds are refusals, not clamps, and they are `agent_runner.MIN_TIMEOUT_
+# SECONDS` / `MAX_TIMEOUT_SECONDS` themselves -- imported, not re-typed --
+# the existing hard cap on how long a single agent run may take. They are NOT
+# the queue's own visibility window: that lease (`work_queue_store.claim`'s
+# `visibility_seconds`, default 300s) is renewed, not lengthened, by a
+# heartbeat thread that runs beside the handler for the whole of a run
+# (`worker.daemon.WorkerDaemon._heartbeat_loop`), so a run far longer than
+# one visibility window survives on live heartbeats alone and nothing here is
+# "outlived" by it. A payload requesting a timeout `resolve_timeout`/
+# `agent_runner` would clamp anyway is refused here instead, at parse time
+# where the operator can see why, rather than silently narrowed and timing
+# out opaquely mid-run.
+_MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_SECONDS
+_MIN_TIMEOUT_SECONDS = MIN_TIMEOUT_SECONDS
 # Dot-runs are excluded by construction (separators carry exactly one
 # non-alphanumeric), so no separate ".." check is needed.
 _BACKLOG_TASK_ID = re.compile(r"^VOYN-[A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)*$")
@@ -120,7 +130,7 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         return PayloadError(
             reason=(
                 f"timeout_seconds {timeout} outside [{_MIN_TIMEOUT_SECONDS}, "
-                f"{_MAX_TIMEOUT_SECONDS}] (the queue's own visibility ceiling)"
+                f"{_MAX_TIMEOUT_SECONDS}] (agent_runner's own run-length ceiling)"
             )
         )
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=AICC source clone refresh for isolated read-only reviews
+After=network-online.target voyn-aicc-github-token.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=voynadmin
+WorkingDirectory=/home/voynadmin/aicc-preprod/repo
+ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.source_clone_refresh --repo /home/voynadmin/aicc-preprod/repo
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/home/voynadmin/aicc-preprod/repo
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

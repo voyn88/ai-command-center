@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from command_center import agent_runner, execution_queue, git_info, models, project_config, report_parser, storage, task_view, workspace_home
+from command_center import agent_runner, backlog_client, execution_queue, git_info, models, project_config, report_parser, storage, task_view, workspace_home
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
 from command_center.runtime import supervisor as runtime_supervisor
@@ -106,6 +106,21 @@ def _at_on_page(page_key: str, **extra_session_state) -> AppTest:
         at.session_state[key] = value
     at.run()
     return at
+
+
+def test_real_app_routes_initial_tasks_through_board_fallback(monkeypatch):
+    calls = []
+    real_board_tasks = backlog_client.board_tasks
+
+    def observed_board_tasks(local_tasks, path=None):
+        calls.append(local_tasks)
+        return real_board_tasks(local_tasks, path)
+
+    monkeypatch.setattr(backlog_client, "board_tasks", observed_board_tasks)
+    at = _at_on_page("dashboard")
+
+    assert not at.exception
+    assert len(calls) == 1
 
 
 def _seed_task(**overrides) -> dict:

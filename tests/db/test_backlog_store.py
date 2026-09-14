@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from command_center.db import roles
-from command_center.db.backlog_parser import ParsedTask
+from command_center.db.backlog_parser import ParsedTask, parse_backlog
 from command_center.db.backlog_store import BacklogStore
 
 pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
@@ -208,6 +208,36 @@ def test_import_is_idempotent_and_loses_nothing(store) -> None:
     assert counts.get("OPEN", 0) >= 3
     assert store.get_task("VOYN-W0-S3")["status"] == "IN_PROGRESS"
     assert store.get_task("VOYN-W0-G1")["kind"] == "gate"
+
+
+def test_import_stamps_provenance_on_first_migration_only(store) -> None:
+    """VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE's "existing records migrated
+    with provenance" proof: a row created by the importer must carry a
+    durable, queryable trace of the Markdown line it came from, and that
+    trace is stamped once -- at migration -- not on every later reconciling
+    import of the same, now-unchanged, text."""
+    text = FIXTURE.read_text(encoding="utf-8")
+    line_no = next(t.line_no for t in parse_backlog(text).tasks if t.task_id == "VOYN-W0-S1")
+
+    first = store.import_markdown(text)
+    assert first.inserted > 0
+
+    provenance = [e for e in store.list_events("VOYN-W0-S1") if e["event"] == "provenance"]
+    assert len(provenance) == 1
+    assert provenance[0]["outcome"] == "granted"
+    assert provenance[0]["reason"] == "markdown_import"
+    assert provenance[0]["detail"] == {"line_no": line_no}
+
+    second = store.import_markdown(text)
+    assert second.changed == 0, "unchanged text must not re-migrate the row"
+    provenance_after = [
+        e for e in store.list_events("VOYN-W0-S1") if e["event"] == "provenance"
+    ]
+    assert len(provenance_after) == 1, "a stable row is stamped once, not per import run"
+
+
+def test_record_provenance_refuses_an_unknown_task(store) -> None:
+    assert store.record_provenance("VOYN-W0-GHOST", "markdown_import") is False
 
 
 def test_import_reports_a_record_the_schema_refuses(store) -> None:

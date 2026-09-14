@@ -60,6 +60,14 @@ class ScriptedStore:
         self.calls.append(("fail", work.attempt_id, reason, retryable))
         return True
 
+    def fail_lease_wait(self, work, *, reason):
+        self.calls.append(("fail_lease_wait", work.attempt_id, reason))
+        return True
+
+    def fail_infra_wait(self, work, *, reason):
+        self.calls.append(("fail_infra_wait", work.attempt_id, reason))
+        return True
+
 
 def _run_until_idle(daemon: WorkerDaemon, store: ScriptedStore) -> None:
     """Run the loop until the script is exhausted, then stop it via the
@@ -96,6 +104,51 @@ def test_a_failing_handler_reports_fail_not_complete() -> None:
 
     assert ("fail", "wat-1", "did not work", True) in store.calls
     assert not any(c[0] == "complete" for c in store.calls)
+
+
+def test_a_lease_wait_failure_routes_to_the_lease_wait_store_method() -> None:
+    """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a publish that
+    lost the writer-lease race to a sibling lane names no fault in this
+    item's own work. Reporting it through the ordinary `fail(retryable=True)`
+    path would still count it against `max_attempts` (the queue already
+    advanced `attempt_count` at claim), which is exactly what dead-lettered
+    finished work live on 2026-09-06. `lease_wait=True` must route to the
+    store's separate refund-and-bound path instead."""
+    store = ScriptedStore([_work({"kind": "publish"})])
+
+    def contended(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="publish failed: lease_unavailable: held by x", lease_wait=True
+        )
+
+    daemon = WorkerDaemon(store, {"publish": contended}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert ("fail_lease_wait", "wat-1", "publish failed: lease_unavailable: held by x") in (
+        store.calls
+    )
+    assert not any(c[0] == "fail" for c in store.calls)
+
+
+def test_an_infra_wait_failure_routes_to_the_infra_wait_store_method() -> None:
+    store = ScriptedStore([_work({"kind": "infra"})])
+
+    def infra(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="executor infrastructure failure (agent principal isolation): socket inactive",
+            infra_wait=True,
+        )
+
+    daemon = WorkerDaemon(store, {"infra": infra}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert (
+        "fail_infra_wait",
+        "wat-1",
+        "executor infrastructure failure (agent principal isolation): socket inactive",
+    ) in store.calls
+    assert not any(c[0] == "fail" for c in store.calls)
 
 
 def test_a_raising_handler_is_a_retryable_failure() -> None:
@@ -448,6 +501,43 @@ def test_a_refused_report_is_logged_not_swallowed(caplog) -> None:
     with caplog.at_level(logging.WARNING):
         _run_until_idle(daemon, store)
     assert any("report refused as stale owner" in r.message for r in caplog.records)
+
+
+def test_a_raising_report_write_does_not_kill_the_daemon(caplog) -> None:
+    """The handler admitted a real outcome (`HandlerOutcome(ok=True, ...)`),
+    but persisting it raised -- a dropped connection, a driver that cannot
+    encode the result, any DB hiccup mid-write. That must not propagate out
+    of `run_forever` and kill the whole daemon over the one attempt it was
+    reporting: every other item still waiting in the queue would die with it.
+    The lease is left to lapse on its own; the next claim proves the daemon
+    survived and kept working."""
+    import logging
+
+    store = ScriptedStore(
+        [
+            _work({"kind": "echo"}, attempt_id="wat-1"),
+            _work({"kind": "echo"}, attempt_id="wat-2"),
+        ]
+    )
+
+    def raising_complete(work, result):
+        store.calls.append(("complete", work.attempt_id, result))
+        if work.attempt_id == "wat-1":
+            raise RuntimeError("connection reset")
+        return True
+
+    store.complete = raising_complete  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        store,
+        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
+        WorkerConfig(visibility_seconds=3),
+    )
+    with caplog.at_level(logging.ERROR):
+        _run_until_idle(daemon, store)  # must return normally, not raise
+
+    completes = [c for c in store.calls if c[0] == "complete"]
+    assert [c[1] for c in completes] == ["wat-1", "wat-2"]
+    assert any("writing the outcome raised" in r.message for r in caplog.records)
 
 
 def test_a_non_object_payload_dead_letters_instead_of_killing_the_daemon() -> None:
