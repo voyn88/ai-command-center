@@ -10,12 +10,11 @@ fell back to `repository_path`.
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import os
 import shutil
 import stat
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -51,6 +50,23 @@ def test_workspace_authority_accepts_explicit_32_byte_key(monkeypatch):
     monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", "hex:" + "ab" * 32)
 
     assert wp._workspace_authority_key() == bytes.fromhex("ab" * 32)
+
+
+def test_workspace_authority_short_read_cannot_hide_trailing_assignment(
+    tmp_path, monkeypatch
+):
+    authority = tmp_path / "authority.env"
+    valid = f"AICC_WORKSPACE_AUTHORITY_KEY=hex:{'ab' * 32}\n"
+    authority.write_text(valid + "UNEXPECTED=value\n", encoding="ascii")
+    real_read = wp.os.read
+
+    def short_read(descriptor: int, count: int) -> bytes:
+        return real_read(descriptor, min(count, len(valid)))
+
+    monkeypatch.setattr(wp.os, "read", short_read)
+
+    with pytest.raises(ValueError, match="exactly one authority key"):
+        load_workspace_authority_environment(authority, require_root_owned=False)
 
 
 def test_workspace_authority_runtime_and_installer_decoder_accept_same_base64():
@@ -192,6 +208,28 @@ def test_standalone_clone_under_canonical_worker_root_is_exact_and_reusable(
     wrong = replace(spec, workspace_path=str(canonical_root / "attacker"))
     with pytest.raises(wp.WorkspaceVerificationError, match="trusted path"):
         wp.verify_workspace(wrong)
+
+
+def test_github_https_and_ssh_remotes_have_one_repository_identity():
+    https = "https://github.com/voyn88/aios.git"
+
+    assert wp._repository_remote_identity(https) == wp._repository_remote_identity(
+        "git@github.com:voyn88/aios.git"
+    )
+    assert wp._repository_remote_identity(https) == wp._repository_remote_identity(
+        "ssh://git@github.com/voyn88/aios.git"
+    )
+
+
+def test_repository_identity_never_collapses_different_github_repositories():
+    expected = wp._repository_remote_identity("https://github.com/voyn88/aios.git")
+
+    assert expected != wp._repository_remote_identity(
+        "git@github.com:voyn88/ai-command-center.git"
+    )
+    assert ("literal", "https://example.com/voyn88/aios.git") == (
+        wp._repository_remote_identity("https://example.com/voyn88/aios.git")
+    )
 
 
 def test_branch_is_created_from_base_branch(tmp_path):
@@ -641,6 +679,50 @@ def test_prune_repository_refuses_a_missing_path(tmp_path):
     assert wp.prune_repository(tmp_path / "does-not-exist") == "not_a_repository"
 
 
+# --------------------------------------------------------------------------
+# force_remove_worktree (single ephemeral-worktree removal site)
+# --------------------------------------------------------------------------
+
+
+def test_force_remove_worktree_removes_a_clean_worktree_and_prunes_metadata(
+    tmp_path,
+):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-f"
+    _git(repo, "worktree", "add", "-b", "task/f", str(workspace), "main")
+
+    wp.force_remove_worktree(repo, workspace)
+
+    assert not workspace.exists()
+    assert all(
+        entry.get("branch") != "task/f" for entry in git_info.get_worktrees(repo)
+    )
+
+
+def test_force_remove_worktree_falls_back_to_rmtree_when_git_refuses(tmp_path):
+    """A locked worktree makes a single `--force` refuse the removal outright
+    -- exactly the refusal that, at each of the eight hand-rolled call sites
+    this function replaced, could leave the directory (and some of the time
+    its `.git/worktrees/<name>` entry) behind forever."""
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-g"
+    _git(repo, "worktree", "add", "-b", "task/g", str(workspace), "main")
+    _git(repo, "worktree", "lock", str(workspace))
+
+    wp.force_remove_worktree(repo, workspace)
+
+    assert not workspace.exists()
+    assert all(
+        entry.get("branch") != "task/g" for entry in git_info.get_worktrees(repo)
+    )
+
+
+def test_force_remove_worktree_on_an_already_removed_path_does_not_raise(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+
+    wp.force_remove_worktree(repo, tmp_path / "never-existed")
+
+
 def test_read_agent_head_refuses_symlinked_head_without_leaking_secret(tmp_path):
     """A symlinked .git/HEAD must not let the publisher read (and echo) a file
     outside the workspace. The agent owns .git, so an lstat-then-read HEAD let
@@ -676,3 +758,135 @@ def test_read_agent_head_reads_a_real_head_via_pinned_fd(tmp_path):
     (refs / "x").write_text("0" * 40 + "\n", encoding="ascii")
 
     assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "../../../outside",
+        "/absolute",
+        "feature//x",
+        "feature/../x",
+        "feature/x.lock",
+        "feature/.hidden",
+        "feature/x..y",
+        "feature/x@{1}",
+        "feature/x y",
+        "feature\\x",
+    ],
+)
+def test_read_agent_head_rejects_unsafe_ref_names_before_path_access(
+    tmp_path, branch
+):
+    workspace = tmp_path / "ws"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/x\n", encoding="ascii")
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp._read_agent_head(workspace, branch)
+
+    assert exc_info.value.failed_step == "agent_head_branch"
+    assert not (tmp_path / "outside").exists()
+
+
+def test_dirty_checkpoint_fails_closed_before_writing_on_windows(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setattr(wp.os, "name", "nt")
+
+    with pytest.raises(wp.WorkspaceVerificationError) as exc_info:
+        wp.checkpoint_dirty_task_workspace(
+            workspace,
+            expected_branch="feature/x",
+            remote_url="https://example.invalid/repo.git",
+            start_sha="0" * 40,
+            trusted_base_sha="0" * 40,
+            expected_remote_sha=None,
+            expected_inode=(workspace.stat().st_dev, workspace.stat().st_ino),
+            message="checkpoint",
+        )
+
+    assert exc_info.value.failed_step == "dirty_checkpoint_platform"
+    assert list(workspace.iterdir()) == []
+
+
+def test_read_agent_head_handles_short_regular_file_reads(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/x\n", encoding="ascii")
+    refs = git_dir / "refs" / "heads" / "feature"
+    refs.mkdir(parents=True)
+    (refs / "x").write_text("0" * 40 + "\n", encoding="ascii")
+    real_read = wp.os.read
+
+    def short_read(descriptor: int, count: int) -> bytes:
+        return real_read(descriptor, min(count, 3))
+
+    monkeypatch.setattr(wp.os, "read", short_read)
+
+    assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
+
+
+def test_read_agent_head_handles_short_packed_refs_reads(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    git_dir = workspace / ".git"
+    git_dir.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/feature/x\n", encoding="ascii")
+    (git_dir / "packed-refs").write_text(
+        "# pack-refs with: peeled fully-peeled sorted\n"
+        + "0" * 40
+        + " refs/heads/feature/x\n",
+        encoding="ascii",
+    )
+    real_read = wp.os.read
+
+    def short_read(descriptor: int, count: int) -> bytes:
+        return real_read(descriptor, min(count, 5))
+
+    monkeypatch.setattr(wp.os, "read", short_read)
+
+    assert wp._read_agent_head(workspace, "feature/x") == "0" * 40
+
+
+def test_open_relative_regular_closes_pinned_fd_when_component_is_missing(
+    tmp_path, monkeypatch
+):
+    """A missing loose ref must not leak the duplicated directory fd.
+
+    The publisher can perform this lookup repeatedly in one long-lived
+    process, so even the normal packed-refs fallback must release the pinned
+    descriptor before returning ``None``.
+    """
+    base_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    duplicated: list[int] = []
+    closed: list[int] = []
+    real_dup = wp.os.dup
+    real_close = wp.os.close
+
+    def tracking_dup(fd: int) -> int:
+        duplicated_fd = real_dup(fd)
+        duplicated.append(duplicated_fd)
+        return duplicated_fd
+
+    def tracking_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(wp.os, "dup", tracking_dup)
+    monkeypatch.setattr(wp.os, "close", tracking_close)
+    try:
+        assert (
+            wp._open_relative_regular(
+                base_fd,
+                ("missing-ref",),
+                os.O_RDONLY,
+                getattr(os, "O_NOFOLLOW", 0),
+            )
+            is None
+        )
+        assert len(duplicated) == 1
+        assert closed == duplicated
+    finally:
+        real_close(base_fd)

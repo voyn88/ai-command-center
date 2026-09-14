@@ -62,6 +62,29 @@ def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
     assert scoped.repo_path == "/srv/aicc"
 
 
+def test_fleet_status_defaults_to_the_whole_fleet() -> None:
+    args = build_parser().parse_args(["fleet-status"])
+    assert args.command == "fleet-status"
+    assert args.state is None and args.limit == 100
+    scoped = build_parser().parse_args(
+        ["fleet-status", "--state", "suspended", "--limit", "5"]
+    )
+    assert scoped.state == "suspended" and scoped.limit == 5
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["fleet-status", "--state", "bogus"])
+
+
+def test_fleet_suspend_requires_the_principal_id_and_a_reason() -> None:
+    args = build_parser().parse_args(
+        ["fleet-suspend", "worker:edge-00", "--reason", "incident"]
+    )
+    assert args.principal_id == "worker:edge-00" and args.reason == "incident"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["fleet-suspend", "worker:edge-00"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["fleet-suspend"])
+
+
 def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
     """A review-class enqueue must outrank the priority=0 implementation
     dispatch enqueues (`backlog_dispatch`), or it queues FIFO behind runs
@@ -95,3 +118,49 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
         "priority": 100,
     }]
     assert calls[0]["priority"] > 0
+
+
+def test_backlog_pr_window_labels_without_opening_a_database(monkeypatch, capsys) -> None:
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL: the tick
+    reads and writes GitHub only. Requiring a database credential to run it
+    bought nothing and cost it a host -- it is what tied the labeller to the
+    one unit layout that had one, on a host the control plane is not, so the
+    tick was never deployed and every fleet PR opened with no CI. This runs
+    before `load_config`, and the deploy-managed unit therefore needs no
+    EnvironmentFile at all."""
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the PR-window tick must not reach the database")
+
+    monkeypatch.setattr(cli, "load_config", refuse)
+    monkeypatch.setattr(cli.pool, "open_pool", refuse)
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(
+            active=[(907, "deadbeef")], blocked=[(906, "checks_missing")]
+        ),
+    )
+
+    assert cli.main(["backlog-pr-window", "--repo-path", "/opt/aicc/current"]) == 0
+    out = capsys.readouterr().out
+    assert "ACTIVE    #907 -> deadbeef" in out
+    assert "BLOCKED   #906: checks_missing" in out
+
+
+def test_backlog_pr_window_reports_a_failed_listing_as_a_failed_tick(monkeypatch) -> None:
+    """A listing that failed labelled nothing; systemd must see a failed tick
+    rather than an empty, successful-looking report (the 500,000-node GraphQL
+    refusal did exactly that for days)."""
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(error="pr_list_failed: 403"),
+    )
+
+    assert cli.main(["backlog-pr-window"]) == 1

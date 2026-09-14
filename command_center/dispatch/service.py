@@ -166,10 +166,24 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # `enabled=False`. Dispatch must never launch while it is off.
     kill_switch_engaged = not settings.enabled
 
+    # Fail closed for real: when the trailing-24h spend can't be read, refuse
+    # dispatch outright via `budget_unknown` rather than *simulating* a spend
+    # figure. A simulated number is porous — it does nothing when the daily
+    # cap is 0/unset (the default, where the ceiling check is skipped
+    # entirely) and a free executor's $0 cost never pushes a simulated total
+    # past any ceiling either. Only an explicit gate, structurally checked in
+    # `plan_dispatch` before any assignment (like the kill switch), actually
+    # stops dispatch. `spend` is `None` on failure rather than a fabricated
+    # `0.0`, so the reported `daily_spend_usd`/`projected_spend_usd` in the
+    # plan also read as "unknown" rather than "nothing spent today" — the same
+    # fail-closed standard the assignment decision already gets.
+    budget_unknown = False
+    spend: float | None
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed (assume ceiling hit)
-        spend = settings.max_daily_spend_usd or 0.0
+    except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
+        spend = None
+        budget_unknown = True
 
     return plan_dispatch(
         collect_queued_tasks(root),
@@ -178,6 +192,7 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
         daily_spend_usd=spend,
         max_daily_spend_usd=settings.max_daily_spend_usd,
         kill_switch_engaged=kill_switch_engaged,
+        budget_unknown=budget_unknown,
         active_by_executor=active_by_executor(resolved_db),
     )
 
@@ -203,10 +218,10 @@ def assign(
     process — the existing pipeline does that on the recorded executor, so
     supervisor semantics are untouched.
 
-    Fail-closed: if the kill switch is engaged, nothing is applied even when
-    the caller passed `confirmed=True`. `confirmed` is a required explicit
-    opt-in for the *write*, mirroring every other mutating action in this
-    codebase.
+    Fail-closed: if the kill switch is engaged, or the trailing-24h spend
+    could not be read, nothing is applied even when the caller passed
+    `confirmed=True`. `confirmed` is a required explicit opt-in for the
+    *write*, mirroring every other mutating action in this codebase.
     """
     computed = plan(root, db_path=db_path)
 
@@ -220,6 +235,12 @@ def assign(
         return {
             "applied": False,
             "reason": "kill_switch_engaged",
+            "plan": computed.as_dict(),
+        }
+    if computed.budget_unknown:
+        return {
+            "applied": False,
+            "reason": "cost_data_unavailable",
             "plan": computed.as_dict(),
         }
 

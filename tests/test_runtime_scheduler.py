@@ -619,6 +619,8 @@ def _make_running_row(db_path, *, repository_path, provider_id="claude_code"):
     run = db.create_run(
         db_path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path=repository_path, prompt="p", is_resume=False, provider_id=provider_id,
+        finalization_owner_token="dead-owner", finalization_owner_pid=999_999_999,
+        finalization_owner_identity="dead-start|dead-command",
     )
     run = db.update_run_state(db_path, run["id"], expected_version=run["version"], new_state="QUEUED")
     run = db.update_run_state(

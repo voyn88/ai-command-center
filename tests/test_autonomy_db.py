@@ -153,10 +153,18 @@ def test_v6_to_v7_migration_backfills_parameters_and_preserves_proposal_children
         to_state=A.ProposalState.DRAFT,
     )
 
-    monkeypatch.setattr(runtime_db, "MIGRATIONS", all_migrations)
+    # This test proves the v6 -> v7 data migration only.  Crossing the later
+    # v24 -> v25 boundary deliberately requires the explicit offline cutover,
+    # so do not accidentally turn this historical migration test into an
+    # unconfirmed production cutover.
+    monkeypatch.setattr(
+        runtime_db,
+        "MIGRATIONS",
+        [migration for migration in all_migrations if migration[0] <= 7],
+    )
     runtime_db.migrate(db_path)
 
-    assert runtime_db.current_schema_version(db_path) == runtime_db.SCHEMA_VERSION
+    assert runtime_db.current_schema_version(db_path) == 7
     proposal = runtime_db.get_proposal(db_path, "proposal-v6")
     assert proposal["parameters_json"] == "{}"
     assert proposal["task_id"] == task["id"]

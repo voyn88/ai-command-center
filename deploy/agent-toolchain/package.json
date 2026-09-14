@@ -1,0 +1,11 @@
+{
+  "name": "aicc-agent-toolchain",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Exact provider CLI set production executes. Versions are pinned exactly, not with a caret: a caret would let a rebuild pick up a different minor and change the artifact digest, which is the artifact's identity.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.231",
+    "@openai/codex": "0.149.0",
+    "@github/copilot": "1.0.80"
+  }
+}

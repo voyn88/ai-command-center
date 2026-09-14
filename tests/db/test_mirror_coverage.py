@@ -70,12 +70,40 @@ class Exclusion:
 # ---------------------------------------------------------------------------
 
 UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
+    "run_finalization_claim": Exclusion(
+        reason=(
+            "The PostgreSQL target is reserved for a future native authority, "
+            "but the current SQLite claim is deliberately host-local: PID and "
+            "process identity have meaning only on that execution host and a "
+            "best-effort mirror cannot preserve its atomic fencing semantics. "
+            "Cutover requires zero open claims and unfinalized runs."
+        ),
+        task="VOYN-W0-AICC-SRV-09-FINALIZED-AT-REM-CANCEL-DURABILITY",
+    ),
     # The backlog store (0005, BO-S1) is PostgreSQL-native authority from
     # birth, like the work_item family below: there is no SQLite source to
     # dual-write from — the incumbent it replaces is a Markdown FILE, and its
     # reconciliation path is the importer (backlog_store.import_markdown),
     # not the mirror machinery. One exclusion per table so a future table in
     # the family still has to sign in on its own.
+    "monitor_finding": Exclusion(
+        reason=(
+            "PostgreSQL-native control-plane state from birth (0021): what a "
+            "fail-closed monitor measured, written only through the SECURITY "
+            "DEFINER pair and consumed by the planner tick that files a task; "
+            "there is no SQLite incumbent and nothing to dual-write."
+        ),
+        task="VOYN-W0-AICC-PLANNER-AUTO-SPLIT-PIPELINE-TASKS",
+    ),
+    "backlog_scan_cursor": Exclusion(
+        reason=(
+            "PostgreSQL-native tick-scheduler state from birth (0015): the "
+            "persisted scan cursor exists only so the review/publish/merge "
+            "tick windows advance atomically per invocation; there is no "
+            "SQLite incumbent and nothing to dual-write."
+        ),
+        task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
+    ),
     "backlog_task": Exclusion(
         reason=(
             "PostgreSQL-native authority from birth (BO-S1): the incumbent it "

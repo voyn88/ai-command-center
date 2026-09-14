@@ -12,7 +12,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/etc/aicc /etc/systemd/system /usr/lib/systemd/system-generators /usr/lib/sysusers.d /usr/lib/tmpfiles.d /usr/libexec /var/lib/aicc-agent /var/lib/aicc-principal-isolation
+ReadWritePaths=-/opt/aicc -/etc/aicc /etc/systemd/system /usr/lib/systemd/system-generators /usr/lib/sysusers.d /usr/lib/tmpfiles.d /usr/libexec -/var/lib/aicc-agent /var/lib/aicc-principal-isolation
 
 [Install]
 WantedBy=multi-user.target
