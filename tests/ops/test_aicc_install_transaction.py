@@ -2869,11 +2869,41 @@ def test_quiesce_worker_only_units_tolerates_a_host_that_never_ran_the_worker_pr
             return SimpleNamespace(returncode=0, stderr="", stdout="")
         if command[1] == "list-jobs":
             return SimpleNamespace(returncode=0, stderr="", stdout="")
-        if command[1] == "show":
+        if command[1] == "show" and "--value" in command:
             return SimpleNamespace(returncode=0, stderr="", stdout="not-found\n")
+        if command[1] == "show":
+            # `stop()` no longer takes `LoadState=not-found` on faith -- it
+            # also proves the unit genuinely drained before skipping it.
+            return SimpleNamespace(
+                returncode=0,
+                stderr="",
+                stdout=(
+                    "ActiveState=inactive\nMainPID=0\n"
+                    "ControlGroup=\nTasksCurrent=[not set]\n"
+                ),
+            )
         raise AssertionError(f"unexpected systemctl call: {command}")
 
     module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+
+
+def test_quiesce_worker_only_units_refuses_a_not_found_unit_that_is_still_active(
+    tmp_path,
+):
+    """`LoadState=not-found` names the unit file, not the manager's runtime
+    state: systemd can retain a unit it already started active in memory
+    after that file is deleted or made unavailable. `stop()` must prove the
+    unit is actually drained -- inactive, no main process, no tasks in its
+    cgroup -- before treating a not-found load state as nothing to do."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+    calls = []
+    run = _purge_runner(workers=(unit,), loaded=set(), busy={unit: 1}, calls=calls)
+
+    with pytest.raises(RuntimeError, match="not proven inactive before control purge"):
+        module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+
+    assert not any(call[1] == "disable" for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -2952,12 +2982,25 @@ def test_the_control_purge_drains_the_workers_before_it_closes_the_socket(tmp_pa
         "aicc-agent-launcher.socket"
     )
     assert "aicc-agent-launcher@7.service" not in disabled
-    assert any(
-        call[1] == "show"
+    socket_closed_at = next(
+        index
+        for index, call in enumerate(calls)
+        if call[1] == "disable" and call[3] == "aicc-agent-launcher.socket"
+    )
+    launcher_probes = [
+        index
+        for index, call in enumerate(calls)
+        if call[1] == "show"
         and call[2] == "aicc-agent-launcher@7.service"
         and "--property=ControlGroup" in call
-        for call in calls
-    ), "accepted sessions are observed to natural completion, never stopped"
+    ]
+    assert launcher_probes, "accepted sessions are observed to natural completion, never stopped"
+    assert min(launcher_probes) > socket_closed_at, (
+        "every accepted-session probe must come after admission closes, not just some of "
+        "them -- an implementation that enumerates or probes a launcher instance before "
+        "closing the socket reopens the accept-after-snapshot race this ordering exists "
+        "to close"
+    )
 
 
 def test_a_session_opened_during_the_drain_is_observed_after_admission_closes(
@@ -3021,7 +3064,9 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
     drain_probes = [
         index
         for index, call in enumerate(calls)
-        if call[1] == "show" and "--property=ControlGroup" in call
+        if call[1] == "show"
+        and call[2] == "aicc-agent-launcher@7.service"
+        and "--property=ControlGroup" in call
     ]
     closed = [
         index
@@ -3033,7 +3078,12 @@ def test_the_socket_closes_only_once_every_drained_cgroup_is_released(tmp_path):
         call[1] == "disable" and call[3] == "aicc-agent-launcher@7.service"
         for call in calls
     )
-    assert max(drain_probes) > closed[0]
+    assert min(drain_probes) > closed[0], (
+        "every cgroup drain probe, not merely the last one, must follow admission "
+        "closing -- an implementation that enumerates or probes launcher instances "
+        "before closing the socket and only waits for the outstanding ones afterward "
+        "would still leave `max(drain_probes) > closed[0]` true"
+    )
 
 
 def test_an_accepted_session_can_outlive_the_short_client_drain(tmp_path):
@@ -3211,14 +3261,18 @@ def test_apply_refuses_to_remove_a_target_whose_mode_drifted(tmp_path):
 def test_apply_refuses_to_remove_a_target_whose_owner_drifted(tmp_path):
     """uid and gid drift cannot be produced without privilege, so the
     recorded expectation is moved instead -- indistinguishable to apply()
-    from a chown between prepare() and apply()."""
+    from a chown between prepare() and apply(). Each field is tested from
+    the untouched manifest, not cumulatively: reusing the previous field's
+    already-drifted manifest would let an apply() that checks only uid keep
+    passing the gid case purely on the uid drift left over from before it."""
     module = _module()
     transaction, manifest, worker_only, installed = _control_shaped_generation(
         module, tmp_path
     )
+    pristine = json.loads(manifest.read_text(encoding="utf-8"))
 
     for field in ("original_uid", "original_gid"):
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload = json.loads(json.dumps(pristine))
         for record in payload["records"]:
             if record["remove"] and record["existed"]:
                 record[field] = record[field] + 1
@@ -4451,12 +4505,89 @@ def test_a_membership_journal_is_refused_against_another_generation(tmp_path):
     assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
 
 
-def test_a_group_in_neither_recorded_state_refuses_every_direction(tmp_path):
-    """The journal describes exactly two membership lists: the one before the
-    revocation and the one after it. A third -- a member added or removed by
-    something outside this transaction -- means `gpasswd` would be acting on
-    a list nobody here has seen, so both directions stop with the journal
-    retained rather than writing over it."""
+def test_an_unrelated_group_member_does_not_block_any_direction(tmp_path):
+    """This journal manages exactly the two legacy principals. A member
+    added -- or already present -- by something outside this transaction is
+    not a state the journal describes, and must not block restoring,
+    finalizing, or retrying the revocation it does (independent review)."""
+    module = _module()
+
+    state, live, _calls, run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin", "someone-else"}
+    )
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == {"someone-else"}
+    module.finalize_authority_membership(state, manifest, getgrnam=getgrnam)
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+    state, live, _calls, run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}, generation="generation-0002"
+    )
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    live.add("someone-else")
+    module.restore_legacy_authority_membership(
+        state, manifest=manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == {"aicc-worker", "voynadmin", "someone-else"}
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+    state, live, _calls, run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}, generation="generation-0003"
+    )
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    live.add("someone-else")
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == {"someone-else"}
+
+
+def test_a_revoked_principal_readded_outside_the_transaction_blocks_finalize_only(
+    tmp_path,
+):
+    """The journal describes exactly two membership states for the two
+    principals it manages: the one before the revocation and the one after
+    it. A revoked principal readded by something outside this transaction is
+    neither: `finalize_authority_membership` wants exactly "after" and
+    refuses to declare the revocation complete when a live look at the group
+    contradicts that, journal retained. Restoring and retrying the
+    revocation both drive the group toward a state that already includes the
+    externally-readded member, so both still reach their own target and
+    succeed instead -- self-healing past an unrelated change rather than
+    either trusting it silently or refusing forever."""
+    module = _module()
+    state, live, _calls, run, getgrnam, manifest = _publisher_group(
+        module, tmp_path, {"aicc-worker", "voynadmin"}
+    )
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+    assert live == set()
+
+    live.add("aicc-worker")
+
+    with pytest.raises(RuntimeError, match="revocation is incomplete"):
+        module.finalize_authority_membership(state, manifest, getgrnam=getgrnam)
+    assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+    module.revoke_legacy_authority_membership(
+        state, manifest, run=run, getgrnam=getgrnam
+    )
+
+    assert live == set()
+    module.finalize_authority_membership(state, manifest, getgrnam=getgrnam)
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+
+
+def test_a_revoked_principal_readded_outside_the_transaction_does_not_block_restore(
+    tmp_path,
+):
     module = _module()
     state, live, _calls, run, getgrnam, manifest = _publisher_group(
         module, tmp_path, {"aicc-worker", "voynadmin"}
@@ -4465,24 +4596,14 @@ def test_a_group_in_neither_recorded_state_refuses_every_direction(tmp_path):
         state, manifest, run=run, getgrnam=getgrnam
     )
 
-    live.add("someone-else")
+    live.add("aicc-worker")
 
-    for call in (
-        lambda: module.restore_legacy_authority_membership(
-            state, manifest=manifest, run=run, getgrnam=getgrnam
-        ),
-        lambda: module.finalize_authority_membership(
-            state, manifest, getgrnam=getgrnam
-        ),
-        lambda: module.revoke_legacy_authority_membership(
-            state, manifest, run=run, getgrnam=getgrnam
-        ),
-    ):
-        with pytest.raises(RuntimeError, match="drifted outside this transaction"):
-            call()
+    module.restore_legacy_authority_membership(
+        state, manifest=manifest, run=run, getgrnam=getgrnam
+    )
 
-    assert live == {"someone-else"}
-    assert (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
+    assert live == {"aicc-worker", "voynadmin"}
+    assert not (state / module.AUTHORITY_MEMBERSHIP_JOURNAL).exists()
 
 
 def _restoring_recover(module, monkeypatch, run, getgrnam):
@@ -5194,7 +5315,18 @@ def test_a_generation_with_nothing_version_three_still_loads_in_an_older_reader(
 ):
     """The version-3 fields are emitted only on the records that use them, so
     an ordinary install generation is still exactly what an already-deployed
-    exact-SHA reader expects."""
+    exact-SHA reader expects.
+
+    Field omission alone does not deliver that promise: an already-deployed
+    reader gates on the manifest's TOP-LEVEL version before it ever looks at a
+    record (`_generation_records` does exactly this in the current build, and
+    `UNINSTALL_JOURNAL_VERSION`/`RELEASE_MANIFEST_VERSION` show the same
+    pattern is used elsewhere for other journals). A manifest unconditionally
+    stamped `MANIFEST_VERSION` would fail that gate on every plain install,
+    regardless of which fields its records actually carry. So the stamp must
+    fall as low as the fields do -- checked here directly, because
+    `_older_reader` only ever models the field-decoding half of that
+    contract."""
     module = _module()
     source = tmp_path / "source"
     source.write_bytes(b"installed")
@@ -5203,7 +5335,29 @@ def test_a_generation_with_nothing_version_three_still_loads_in_an_older_reader(
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
 
-    assert payload["version"] == module.MANIFEST_VERSION
+    assert payload["version"] == 1, (
+        "a generation using none of the version-2 or version-3 fields must "
+        "not stamp a version an old reader would refuse on sight"
+    )
+    _older_reader(VERSION_TWO_RECORD_FIELDS)(payload)
+
+
+def test_a_generation_using_only_version_two_fields_stamps_version_two(tmp_path):
+    """A removal exercises `remove` (a version-2 field) but none of the
+    version-3 fields, so the manifest must stamp exactly the version that
+    introduced the field it actually uses -- not the newest one this build
+    knows, and not one field version older than what it needs either."""
+    module = _module()
+    root = tmp_path / "root"
+    existing = root / "etc/existing"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"before")
+    _transaction, manifest = _one_generation(
+        module, tmp_path, (module.removal_spec("/etc/existing"),)
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+
+    assert payload["version"] == 2
     _older_reader(VERSION_TWO_RECORD_FIELDS)(payload)
 
 
