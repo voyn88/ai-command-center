@@ -2300,3 +2300,88 @@ def test_review_head_refresh_fetches_the_pull_ref_before_isolated_pin(
     assert (failure, retryable) == (None, False) and target is not None
     assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pin
     handlers_module._remove_read_only_isolated_checkout(target)
+
+
+def _commit_on_pr_ref(source, number: int, filename: str) -> str:
+    """A commit reachable ONLY through refs/remotes/origin/pr/<number>/head,
+    the layout the host source mirror produces for review heads."""
+    (source / filename).write_text(f"{filename}\n")
+    assert _git("-C", str(source), "add", filename).returncode == 0
+    assert _git("-C", str(source), "commit", "-q", "-m", filename).returncode == 0
+    sha = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git(
+            "-C", str(source), "update-ref", f"refs/remotes/origin/pr/{number}/head", sha
+        ).returncode
+        == 0
+    )
+    assert _git("-C", str(source), "reset", "-q", "--hard", "HEAD~1").returncode == 0
+    return sha
+
+
+def test_read_only_isolated_checkout_fetches_only_the_pinned_pr_ref(
+    tmp_path, monkeypatch
+) -> None:
+    """Real git: the pin lives only under a mirrored pr ref. The clone must
+    reach it by fetching THAT ref, not every pr ref -- ~900 loose
+    `refs/remotes/source-pr/<N>/head` directories put the clone past the
+    launcher's 256-pending-directory walk budget (worker-01, 2026-09-14)."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(source)
+    pinned = _commit_on_pr_ref(source, 7, "seven.txt")
+    for number in range(100, 140):
+        _commit_on_pr_ref(source, number, f"pr-{number}.txt")
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=pinned
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pinned
+    loose = target / ".git" / "refs" / "remotes" / "source-pr"
+    loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
+    assert loose_dirs == [], loose_dirs
+    handlers_module._remove_read_only_isolated_checkout(target)
+
+
+def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
+    tmp_path, monkeypatch
+) -> None:
+    """When no ref points at the pin exactly (an older head still reachable
+    from a pr ref) the wholesale fetch is the fallback -- and its loose ref
+    directories must be packed away before the launcher walks the clone."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(source)
+    older = _commit_on_pr_ref(source, 7, "seven.txt")
+    assert _git("-C", str(source), "checkout", "-q", older).returncode == 0
+    (source / "eight.txt").write_text("eight\n")
+    assert _git("-C", str(source), "add", "eight.txt").returncode == 0
+    assert _git("-C", str(source), "commit", "-q", "-m", "newer").returncode == 0
+    newer = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git("-C", str(source), "update-ref", "refs/remotes/origin/pr/7/head", newer)
+        .returncode
+        == 0
+    )
+    assert _git("-C", str(source), "checkout", "-q", "-").returncode == 0
+    for number in range(100, 130):
+        _commit_on_pr_ref(source, number, f"pr-{number}.txt")
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=older
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == older
+    loose = target / ".git" / "refs" / "remotes" / "source-pr"
+    loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
+    assert loose_dirs == [], loose_dirs
+    handlers_module._remove_read_only_isolated_checkout(target)
