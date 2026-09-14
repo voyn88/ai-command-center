@@ -229,10 +229,13 @@ from command_center.runtime.db.council import (  # noqa: F401
     get_decision,
     get_motion,
     get_motion_by_source_ref,
+    get_vote,
     list_decisions,
     list_events,
     list_motions,
+    list_voter_ids,
     list_votes,
+    list_votes_with_outcomes,
     record_decision,
     withdraw_motion,
 )
