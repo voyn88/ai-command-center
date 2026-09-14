@@ -175,13 +175,37 @@ def _refresh_read_only_source(
     """Bring the bound source clone current before a read-only checkout uses it.
 
     The isolated reviewer clones from this source, not from GitHub.  A stale
-    source therefore means every review runs against yesterday's tree until an
-    operator manually fetches it.  The source is read-only to agents, but the
-    worker owns the clone and may update it before handing a detached copy to
-    the privileged launcher.
+    source therefore means every review runs against yesterday's tree.  The
+    worker namespace binds the Projects clone read-only, so this must not
+    write FETCH_HEAD: host `voyn-aicc-source-clone-refresh` is the writer,
+    and a read-only fetch is skipped (VOYN-W0-AICC-ISOLATED-WORKER-FETCHES-
+    READONLY-SOURCE-CLONE).
     """
     result = refresh_source_clone(repository, pr_number=pr_number)
     return result.ok, result.error
+
+
+def _source_ref_pointing_at(repository: Path, sha: str) -> str | None:
+    """The mirrored pull-request ref (preferred) or branch in ``repository``
+    whose tip is exactly ``sha``, or None when nothing points at it."""
+    listed = agent_runner._run_git(
+        [
+            "for-each-ref",
+            "--format=%(refname)",
+            f"--points-at={sha}",
+            "refs/remotes/origin/pr/",
+            "refs/heads/",
+        ],
+        repository,
+    )
+    if listed is None or listed.returncode != 0:
+        return None
+    refs = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    for prefix in ("refs/remotes/origin/pr/", "refs/heads/"):
+        for ref in refs:
+            if ref.startswith(prefix):
+                return ref
+    return None
 
 
 def _read_only_isolated_checkout(
@@ -264,6 +288,7 @@ def _read_only_isolated_checkout(
                 True,
             )
         sha = pin_sha
+        pin_ref = _source_ref_pointing_at(repository, pin_sha)
     target = root / f"ro-{repository.name}-{uuid.uuid4().hex[:12]}"
     steps = [
         (
@@ -279,17 +304,46 @@ def _read_only_isolated_checkout(
         ),
     ]
     if pin_sha is not None:
-        steps.append(
-            (
-                [
-                    "fetch",
-                    "--quiet",
-                    "origin",
-                    "+refs/remotes/origin/pr/*:refs/remotes/source-pr/*",
-                ],
-                target,
+        # `git clone` copies the source's branches and tags only; a review
+        # head mirrored under refs/remotes/origin/pr/N/head has to be
+        # fetched into the throwaway clone explicitly. Fetch exactly the one
+        # ref that points at the pin when there is one: the wholesale
+        # `+refs/remotes/origin/pr/*` fetch wrote ~900 loose refs as
+        # `.git/refs/remotes/source-pr/<N>/head`, one directory each, and
+        # the launcher's workspace walk refused the clone with "workspace
+        # directory fan-out exceeds supported budget" (max 256 pending
+        # directories) -- every review of ai-command-center on worker-01
+        # died that way on 2026-09-14. When no ref points at the pin
+        # exactly (an older head still reachable from a pr ref) fall back to
+        # the wholesale fetch, then `pack-refs --all` so the loose ref
+        # directories are gone before the launcher ever walks the tree.
+        if pin_ref is not None:
+            steps.append(
+                (
+                    [
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "origin",
+                        f"+{pin_ref}:refs/remotes/source-pr/pinned",
+                    ],
+                    target,
+                )
             )
-        )
+        else:
+            steps.append(
+                (
+                    [
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "origin",
+                        "+refs/remotes/origin/pr/*:refs/remotes/source-pr/*",
+                    ],
+                    target,
+                )
+            )
+        steps.append((["pack-refs", "--all"], target))
     steps.extend(
         [
             (["checkout", "--quiet", "--detach", sha], target),

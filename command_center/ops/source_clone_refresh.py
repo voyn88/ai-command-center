@@ -38,22 +38,73 @@ def _failure(
     return RefreshResult(ok=False, path=str(repo), error=f"{prefix}: {detail}")
 
 
+_READONLY_FETCH_MARKERS = (
+    "read-only file system",
+    "erofs",
+)
+
+
+def _fetch_failed_because_clone_is_read_only(
+    result: subprocess.CompletedProcess[str],
+) -> bool:
+    """The isolated worker binds the Projects clone read-only. A fetch
+    there cannot write FETCH_HEAD; the host-side refresh unit is the
+    writer (VOYN-W0-AICC-ISOLATED-WORKER-FETCHES-READONLY-SOURCE-CLONE)."""
+    detail = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+    return any(marker in detail for marker in _READONLY_FETCH_MARKERS)
+
+
+def _pr_ref_is_present(repo: Path, pr_number: str) -> bool:
+    probed = _git(
+        repo, ["rev-parse", "--verify", f"refs/remotes/origin/pr/{pr_number}/head"]
+    )
+    return probed.returncode == 0
+
+
 def refresh_source_clone(
     repository: Path, *, pr_number: str | None = None
 ) -> RefreshResult:
-    """Fetch and fast-forward the source clone before a reviewer clones from it."""
+    """Fetch and fast-forward the source clone before a reviewer clones from it.
+
+    When the clone is mounted read-only, fetch/merge are skipped and the
+    already-mirrored objects are used. A requested PR ref that is not
+    already present stays a failure so the tick retries after the host
+    mirror catches up -- it must not try to write the bound `.git`.
+    """
     repo = repository.resolve()
     if not repo.is_dir():
         return RefreshResult(ok=False, path=str(repo), error="source clone is absent")
 
-    fetch_args = ["fetch", "--prune", "origin"]
-    if pr_number:
-        fetch_args.append(
-            f"refs/pull/{pr_number}/head:refs/remotes/origin/pr/{pr_number}/head"
-        )
-    fetch = _git(repo, fetch_args)
+    # Two fetches: a command-line refspec replaces the remote's default
+    # (`git fetch origin refs/pull/...` would not update origin/main).
+    fetch = _git(repo, ["fetch", "--prune", "origin"])
+    read_only = False
     if fetch.returncode != 0:
-        return _failure(repo, "source clone fetch failed", fetch)
+        if not _fetch_failed_because_clone_is_read_only(fetch):
+            return _failure(repo, "source clone fetch failed", fetch)
+        read_only = True
+        if pr_number and not _pr_ref_is_present(repo, pr_number):
+            return RefreshResult(
+                ok=False,
+                path=str(repo),
+                error=(
+                    "source clone is read-only and PR ref is absent: "
+                    f"refs/remotes/origin/pr/{pr_number}/head"
+                ),
+            )
+    else:
+        pull_args = [
+            "fetch",
+            "origin",
+            "+refs/pull/*/head:refs/remotes/origin/pr/*/head",
+        ]
+        if pr_number:
+            pull_args.append(
+                f"refs/pull/{pr_number}/head:refs/remotes/origin/pr/{pr_number}/head"
+            )
+        pull = _git(repo, pull_args)
+        if pull.returncode != 0 and not _fetch_failed_because_clone_is_read_only(pull):
+            return _failure(repo, "source clone fetch failed", pull)
 
     upstream_result = _git(
         repo, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]
@@ -61,7 +112,7 @@ def refresh_source_clone(
     upstream = (
         upstream_result.stdout.strip() if upstream_result.returncode == 0 else None
     )
-    if upstream:
+    if upstream and not read_only:
         merge = _git(repo, ["merge", "--ff-only", upstream])
         if merge.returncode != 0:
             return _failure(repo, "source clone fast-forward failed", merge)

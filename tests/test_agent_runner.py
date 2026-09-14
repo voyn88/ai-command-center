@@ -1216,3 +1216,54 @@ def test_codex_development_sandbox_is_danger_full_access_only_under_principal_is
     monkeypatch.setenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
     assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "danger-full-access"
     assert _sandbox_argument(ar.build_codex_command("p", task_type="review")) == "read-only"
+
+
+def _provider_error_run(status="failed", exit_code=1, stdout="", stderr=""):
+    return agent_runner.RunResult(
+        status=status,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=1.0,
+        started_at="t0",
+        completed_at="t1",
+    )
+
+
+def test_codex_usage_limit_is_a_provider_error_not_a_result():
+    """Live incident 2026-09-02 / 2026-09-11: Codex exited 1 with "You've hit
+    your usage limit" and an empty result, the review work item completed
+    successfully with that error as its entire payload, and every review
+    stalled until the quota window. The account failed, not the task."""
+    run = _provider_error_run(
+        stderr=(
+            "ERROR: You've hit your usage limit. Visit "
+            "https://chatgpt.com/codex/settings/usage to purchase more credits "
+            "or try again at Sep 15th, 2026 1:24 AM."
+        )
+    )
+    assert run.is_executor_provider_error("codex") is True
+
+
+def test_a_successful_codex_review_discussing_limits_is_not_a_provider_error():
+    """Free text is consulted only for a failed, non-zero process, so a
+    completed review whose findings mention a usage limit cannot be
+    reclassified as infrastructure."""
+    run = _provider_error_run(
+        status="completed",
+        exit_code=0,
+        stdout="FINDING: the retry loop ignores the API usage limit entirely.",
+    )
+    assert run.is_executor_provider_error("codex") is False
+
+
+def test_a_codex_task_failure_without_a_signature_stays_a_task_failure():
+    """A run that failed on its own merits must never be retried as
+    infrastructure -- retrying a mutating run re-applies its side effects."""
+    run = _provider_error_run(stderr="tests failed: 3 assertions did not hold")
+    assert run.is_executor_provider_error("codex") is False
+
+
+def test_an_unknown_executor_never_matches_free_text_signatures():
+    run = _provider_error_run(stderr="unauthorized")
+    assert run.is_executor_provider_error("claude") is False

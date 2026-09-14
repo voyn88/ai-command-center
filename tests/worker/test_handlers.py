@@ -586,6 +586,86 @@ def test_copilot_provider_failure_switches_inside_the_same_attempt(
     ]
 
 
+def test_codex_usage_limit_switches_inside_the_same_attempt(handler, monkeypatch):
+    """Live 2026-09-11: Codex quota used to complete the review as succeeded
+    with an empty result. It must failover like Copilot, not publish."""
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        if kwargs["executor"] == "codex":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    "ERROR: You've hit your usage limit. Visit "
+                    "https://chatgpt.com/codex/settings/usage to purchase more "
+                    "credits or try again at Sep 15th, 2026 1:24 AM."
+                ),
+                duration_seconds=0.1,
+                started_at="2026-09-11T12:00:00+00:00",
+                completed_at="2026-09-11T12:00:03+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-11T12:00:03+00:00",
+            completed_at="2026-09-11T12:00:04+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert runs[-1]["executor"] == "claude"
+    assert outcome.result["cascade_step"] == 2
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "reason": "provider_auth_or_quota",
+        }
+    ]
+
+
+def test_codex_usage_limit_on_the_last_link_is_infra_not_success(handler, monkeypatch):
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr=(
+                "ERROR: You've hit your usage limit. Visit "
+                "https://chatgpt.com/codex/settings/usage to purchase more "
+                "credits or try again at Sep 15th, 2026 1:24 AM."
+            ),
+            duration_seconds=0.1,
+            started_at="2026-09-11T12:00:00+00:00",
+            completed_at="2026-09-11T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert [run["executor"] for run in runs] == ["codex"]
+    assert "provider/auth/quota" in outcome.reason
+
+
 @pytest.mark.parametrize("workspace_unchanged", [True, False])
 def test_mutating_provider_failover_requires_unchanged_workspace(
     handler, monkeypatch, workspace_unchanged
@@ -2481,3 +2561,86 @@ def test_lease_lost_during_quarantine_restores_the_clone(handler, monkeypatch) -
     assert not outcome.ok and outcome.retryable and not outcome.infra_wait
     assert "clone restored" in outcome.reason
     assert len(restored) == 1 and runs == []
+def _commit_on_pr_ref(source, number: int, filename: str) -> str:
+    """A commit reachable ONLY through refs/remotes/origin/pr/<number>/head,
+    the layout the host source mirror produces for review heads."""
+    (source / filename).write_text(f"{filename}\n")
+    assert _git("-C", str(source), "add", filename).returncode == 0
+    assert _git("-C", str(source), "commit", "-q", "-m", filename).returncode == 0
+    sha = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git(
+            "-C", str(source), "update-ref", f"refs/remotes/origin/pr/{number}/head", sha
+        ).returncode
+        == 0
+    )
+    assert _git("-C", str(source), "reset", "-q", "--hard", "HEAD~1").returncode == 0
+    return sha
+
+
+def test_read_only_isolated_checkout_fetches_only_the_pinned_pr_ref(
+    tmp_path, monkeypatch
+) -> None:
+    """Real git: the pin lives only under a mirrored pr ref. The clone must
+    reach it by fetching THAT ref, not every pr ref -- ~900 loose
+    `refs/remotes/source-pr/<N>/head` directories put the clone past the
+    launcher's 256-pending-directory walk budget (worker-01, 2026-09-14)."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(source)
+    pinned = _commit_on_pr_ref(source, 7, "seven.txt")
+    for number in range(100, 140):
+        _commit_on_pr_ref(source, number, f"pr-{number}.txt")
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=pinned
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pinned
+    loose = target / ".git" / "refs" / "remotes" / "source-pr"
+    loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
+    assert loose_dirs == [], loose_dirs
+    handlers_module._remove_read_only_isolated_checkout(target)
+
+
+def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
+    tmp_path, monkeypatch
+) -> None:
+    """When no ref points at the pin exactly (an older head still reachable
+    from a pr ref) the wholesale fetch is the fallback -- and its loose ref
+    directories must be packed away before the launcher walks the clone."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(source)
+    older = _commit_on_pr_ref(source, 7, "seven.txt")
+    assert _git("-C", str(source), "checkout", "-q", older).returncode == 0
+    (source / "eight.txt").write_text("eight\n")
+    assert _git("-C", str(source), "add", "eight.txt").returncode == 0
+    assert _git("-C", str(source), "commit", "-q", "-m", "newer").returncode == 0
+    newer = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git("-C", str(source), "update-ref", "refs/remotes/origin/pr/7/head", newer)
+        .returncode
+        == 0
+    )
+    assert _git("-C", str(source), "checkout", "-q", "-").returncode == 0
+    for number in range(100, 130):
+        _commit_on_pr_ref(source, number, f"pr-{number}.txt")
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=older
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == older
+    loose = target / ".git" / "refs" / "remotes" / "source-pr"
+    loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
+    assert loose_dirs == [], loose_dirs
+    handlers_module._remove_read_only_isolated_checkout(target)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from command_center.ops import infra_monitor
 from command_center.ops.infra_monitor import (
@@ -241,6 +244,9 @@ def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
     assert "EnvironmentFile=/home/voynadmin/aicc-preprod/.env" in queue_unit
     assert "command_center.ops.source_clone_refresh" in refresh_unit
     assert "ReadWritePaths=/home/voynadmin/aicc-preprod/repo" in refresh_unit
+    assert "ReadWritePaths=/home/voynadmin/Projects/ai-command-center" in refresh_unit
+    assert "ReadWritePaths=-/home/voynadmin/Projects/aios" in refresh_unit
+    assert "--repo /home/voynadmin/Projects/ai-command-center" in refresh_unit
     assert "Unit=voyn-aicc-source-clone-refresh.service" in refresh_timer
 
 
@@ -838,4 +844,425 @@ def test_main_reports_the_source_clone_probe_when_a_repo_is_given(
     assert payload["source_clone"]["path"] == "/repo"
     assert payload["source_clone"]["stale"] is True
     assert any(f.startswith("source_clone_stale:") for f in payload["failures"])
+    assert result == 1
+
+
+# --- host unit health: crash loops and failed units -------------------------
+#
+# worker-01, 2026-09-02..14: `ollama.service` restarted every 3 s for twelve
+# days (315 891 restarts) and `voyn-canary.service` every 15 s for eighteen
+# (70 305) while every monitor stayed green, because each probe only asked
+# `is-active` of its own hand-picked units. The host probe reads every service
+# unit's NRestarts and active state so a crash loop anywhere on the host is a
+# finding, not a symptom the owner reports.
+
+
+def _show_block(unit: str, restarts: int, active: str) -> str:
+    return f"Id={unit}\nNRestarts={restarts}\nActiveState={active}\n"
+
+
+SHOW_HEALTHY = _show_block("voyn-ollama.service", 0, "active")
+SHOW_LOOP = _show_block("ollama.service", 315891, "activating")
+SHOW_LAUNCHER_A = _show_block("aicc-agent-launcher@2079-27636-984.service", 0, "failed")
+SHOW_LAUNCHER_B = _show_block("aicc-agent-launcher@2080-27700-984.service", 0, "failed")
+SHOW_FEW_RESTARTS = _show_block("voyn-crm.service", 2, "active")
+SHOW_OUTPUT = f"{SHOW_HEALTHY}\n{SHOW_LOOP}\n{SHOW_LAUNCHER_A}\n{SHOW_LAUNCHER_B}\n{SHOW_FEW_RESTARTS}"
+
+# Real `systemctl list-units --type=service --all` output WITHOUT --plain and
+# --no-legend: header, the `●` marker on failed rows, a legend footer.
+LIST_UNITS_REAL = """  UNIT                                            LOAD   ACTIVE     SUB     DESCRIPTION
+  aicc-agent-launcher@2079-27636-984.service      loaded failed     failed  AICC launcher
+● aicc-agent-launcher@2080-27700-984.service      loaded failed     failed  AICC launcher
+  ollama.service                                  loaded activating auto-restart Ollama Service
+  voyn-crm.service                                loaded active     running VOYN CRM
+  voyn-ollama.service                             loaded active     running VOYN Ollama
+
+Legend: LOAD   → Reflects whether the unit definition was properly loaded.
+
+5 loaded units listed.
+"""
+
+
+def test_unit_health_parses_systemctl_show_blocks() -> None:
+    units = infra_monitor.parse_unit_show(SHOW_OUTPUT)
+    assert units["ollama.service"].restarts == 315891
+    assert units["ollama.service"].active_state == "activating"
+    assert units["voyn-crm.service"].restarts == 2
+    assert len(units) == 5
+
+
+def test_service_names_survive_headers_markers_and_the_legend() -> None:
+    assert infra_monitor.parse_service_names(LIST_UNITS_REAL) == [
+        "aicc-agent-launcher@2079-27636-984.service",
+        "aicc-agent-launcher@2080-27700-984.service",
+        "ollama.service",
+        "voyn-crm.service",
+        "voyn-ollama.service",
+    ]
+
+
+def test_a_crash_looping_unit_is_a_finding_and_instances_collapse_by_template() -> None:
+    snapshot = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(SHOW_OUTPUT), crash_loop_restarts=5
+    )
+    assert snapshot.crash_loops == (("ollama.service", 315891),)
+    # Per-connection template instances are one failed template with a count,
+    # not one finding per connection.
+    assert snapshot.failed_units == (("aicc-agent-launcher@*.service", 2),)
+    report = infra_monitor.evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        unit_health=snapshot,
+    )
+    assert set(report.failures) == {
+        "crash_loop:1:ollama.service=315891",
+        "failed_units:1:aicc-agent-launcher@*.service=2",
+    }
+    assert {infra_monitor.finding_key(f) for f in report.failures} == {
+        "crash_loop",
+        "failed_units",
+    }
+
+
+def test_crash_looping_template_instances_collapse_to_the_highest_count() -> None:
+    show = "\n".join(
+        [
+            _show_block("aicc-agent-launcher@1-1-984.service", 7, "activating"),
+            _show_block("aicc-agent-launcher@2-2-984.service", 12, "activating"),
+            _show_block("aicc-agent-launcher@3-3-984.service", 5, "activating"),
+        ]
+    )
+    snapshot = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+    )
+    assert snapshot.crash_loops == (("aicc-agent-launcher@*.service", 12),)
+
+
+def test_the_finding_detail_is_capped_not_unbounded() -> None:
+    show = "\n".join(
+        _show_block(f"svc{i}.service", 9, "activating")
+        for i in range(infra_monitor.UNIT_LISTING_CAP + 3)
+    )
+    snapshot = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+    )
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    (failure,) = report.failures
+    assert failure.startswith(f"crash_loop:{infra_monitor.UNIT_LISTING_CAP + 3}:")
+    assert failure.endswith(",+3_more")
+    assert failure.count("=9") == infra_monitor.UNIT_LISTING_CAP
+
+
+def test_the_threshold_boundary_is_inclusive_and_a_few_restarts_are_not_a_loop() -> None:
+    show = "\n".join(
+        [
+            SHOW_HEALTHY,
+            SHOW_FEW_RESTARTS,
+            _show_block("exactly.service", 5, "active"),
+            _show_block("almost.service", 4, "active"),
+        ]
+    )
+    snapshot = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+    )
+    assert snapshot.crash_loops == (("exactly.service", 5),)
+    assert snapshot.failed_units == ()
+
+    quiet = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(f"{SHOW_HEALTHY}\n{SHOW_FEW_RESTARTS}"),
+        crash_loop_restarts=5,
+    )
+    assert quiet.crash_loops == () and quiet.failed_units == ()
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=quiet,
+    )
+    assert report.ok
+
+    with pytest.raises(ValueError):
+        infra_monitor.evaluate_unit_health({}, crash_loop_restarts=0)
+
+
+def test_unit_health_probe_failure_fails_closed() -> None:
+    snapshot = infra_monitor.UnitHealthSnapshot(
+        crash_loops=(), failed_units=(), error="RuntimeError: systemctl failed"
+    )
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert any(f.startswith("unit_health_probe_failed:") for f in report.failures)
+
+
+def test_unit_health_snapshot_asks_systemctl_for_every_service_and_never_raises(
+    monkeypatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def _run(args, **_kwargs):
+        calls.append(args)
+        if args[1] == "list-units":
+            return subprocess.CompletedProcess(args, 0, stdout=LIST_UNITS_REAL, stderr="")
+        assert args[1] == "show"
+        requested = args[args.index("--") + 1 :]
+        # Answer only for what was asked, with only the requested properties,
+        # so a wrong property list or a dropped unit is visible here.
+        properties = next(a for a in args if a.startswith("--property=")).split("=", 1)[1]
+        assert set(properties.split(",")) >= {"Id", "NRestarts", "ActiveState"}
+        blocks = {
+            "voyn-ollama.service": SHOW_HEALTHY,
+            "ollama.service": SHOW_LOOP,
+            "aicc-agent-launcher@2079-27636-984.service": SHOW_LAUNCHER_A,
+            "aicc-agent-launcher@2080-27700-984.service": SHOW_LAUNCHER_B,
+            "voyn-crm.service": SHOW_FEW_RESTARTS,
+        }
+        return subprocess.CompletedProcess(
+            args, 0, stdout="\n".join(blocks[u] for u in requested), stderr=""
+        )
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
+    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+    assert snapshot.error is None
+    assert snapshot.crash_loops == (("ollama.service", 315891),)
+    assert snapshot.failed_units == (("aicc-agent-launcher@*.service", 2),)
+    listing, show = calls
+    assert listing[:2] == ["systemctl", "list-units"]
+    assert {"--type=service", "--all", "--plain", "--no-legend", "--no-pager"} <= set(listing)
+    assert show[:2] == ["systemctl", "show"] and "--" in show
+    assert set(show[show.index("--") + 1 :]) == set(
+        infra_monitor.parse_service_names(LIST_UNITS_REAL)
+    )
+
+    def _boom(args, **_kwargs):
+        raise OSError("no systemctl")
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _boom)
+    failed = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+    assert failed.error is not None and "no systemctl" in failed.error
+
+
+def test_a_unit_that_show_silently_drops_is_a_failed_measurement(monkeypatch) -> None:
+    def _run(args, **_kwargs):
+        if args[1] == "list-units":
+            return subprocess.CompletedProcess(args, 0, stdout=LIST_UNITS_REAL, stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout=SHOW_HEALTHY, stderr="")
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
+    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+    assert snapshot.error is not None and "1 of 5" in snapshot.error
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert any(f.startswith("unit_health_probe_failed:") for f in report.failures)
+
+
+# --- deploy lag: green main versus what production actually runs ----------
+#
+# worker-01, 2026-09-13 14:48 .. 09-14 18:49: six merged PRs sat behind a
+# refused promotion for 28 hours while test and preprod advanced. Nothing
+# compared the branch head with the SHA production reports, so "green main"
+# said nothing about what customers were running. The clock is the oldest
+# undeployed commit, not the head: a busy branch must not hide its lag by
+# merging often.
+
+
+def _lag(**overrides):
+    base = {
+        "repo": "voyn88/voyn-logistics-crm", "branch": "main",
+        "branch_head": "a" * 40, "deployed_sha": "b" * 40,
+        "undeployed_commits": 6, "lag_seconds": 100_000.0, "grace_seconds": 2700.0,
+    }
+    base.update(overrides)
+    return infra_monitor.DeployLagSnapshot(**base)
+
+
+def test_deploy_lag_is_a_finding_once_the_oldest_undeployed_commit_passes_grace() -> None:
+    snapshot = _lag()
+    assert snapshot.lagging is True
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, deploy_lag=snapshot,
+    )
+    assert set(report.failures) == {
+        "deploy_lag:voyn88/voyn-logistics-crm:bbbbbbbb!=aaaaaaaa_6_commits_100000s>2700s"
+    }
+    assert {infra_monitor.finding_key(f) for f in report.failures} == {"deploy_lag"}
+
+
+def test_a_young_backlog_or_a_deployed_head_is_not_deploy_lag() -> None:
+    assert _lag(lag_seconds=60.0).lagging is False
+    assert _lag(deployed_sha="a" * 40, undeployed_commits=0, lag_seconds=0.0).lagging is False
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True,
+        deploy_lag=_lag(deployed_sha="a" * 40, undeployed_commits=0, lag_seconds=0.0),
+    )
+    assert report.ok
+
+
+def test_deploy_lag_probe_failure_fails_closed() -> None:
+    snapshot = _lag(
+        branch_head=None, deployed_sha=None, undeployed_commits=None, lag_seconds=None,
+        error="RuntimeError: gh api failed",
+    )
+    assert snapshot.lagging is False
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, deploy_lag=snapshot,
+    )
+    assert any(f.startswith("deploy_lag_probe_failed:") for f in report.failures)
+
+
+def _gh_stub(responses: dict[str, str], calls: list[list[str]]):
+    def _run(args, **_kwargs):
+        calls.append(args)
+        assert args[:2] == ["gh", "api"]
+        return subprocess.CompletedProcess(args, 0, stdout=responses[args[2]], stderr="")
+
+    return _run
+
+
+HEAD_JSON = '{"sha": "' + "a" * 40 + '", "commit": {"committer": {"date": "2026-09-14T12:00:00Z"}}}'
+
+
+def test_deploy_lag_snapshot_dates_the_oldest_undeployed_commit(monkeypatch) -> None:
+    calls: list[list[str]] = []
+    compare = (
+        '{"status": "ahead", "commits": ['
+        '{"sha": "c1", "commit": {"committer": {"date": "2026-09-13T16:00:00Z"}}},'
+        '{"sha": "c2", "commit": {"committer": {"date": "2026-09-14T12:00:00Z"}}}]}'
+    )
+    monkeypatch.setattr(
+        infra_monitor.subprocess, "run",
+        _gh_stub({
+            "repos/voyn88/voyn-logistics-crm/commits/main": HEAD_JSON,
+            "repos/voyn88/voyn-logistics-crm/compare/" + "b" * 40 + "..." + "a" * 40: compare,
+        }, calls),
+    )
+    monkeypatch.setattr(infra_monitor, "_fetch_json", lambda url, timeout=5: {"release_sha": "b" * 40})
+    # now = 2026-09-14T13:00:00Z: the head is 1 h old, the oldest undeployed commit 21 h.
+    monkeypatch.setattr(infra_monitor.time, "time", lambda: 1789390800.0)
+    snapshot = infra_monitor.read_deploy_lag_snapshot(
+        "voyn88/voyn-logistics-crm", "http://127.0.0.1:8089/version",
+        branch="main", grace_seconds=2700.0,
+    )
+    assert snapshot.error is None
+    assert snapshot.branch_head == "a" * 40 and snapshot.deployed_sha == "b" * 40
+    assert snapshot.undeployed_commits == 2
+    assert abs(snapshot.lag_seconds - 21 * 3600) < 1
+    assert snapshot.lagging is True
+    assert len(calls) == 2
+
+
+def test_deploy_lag_snapshot_makes_one_request_when_production_runs_the_head(monkeypatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        infra_monitor.subprocess, "run",
+        _gh_stub({"repos/r/commits/main": HEAD_JSON}, calls),
+    )
+    monkeypatch.setattr(infra_monitor, "_fetch_json", lambda url, timeout=5: {"release_sha": "a" * 40})
+    snapshot = infra_monitor.read_deploy_lag_snapshot(
+        "r", "http://127.0.0.1:8089/version", branch="main", grace_seconds=2700.0
+    )
+    assert snapshot.error is None and snapshot.lagging is False
+    assert snapshot.undeployed_commits == 0
+    assert len(calls) == 1
+
+
+def test_production_ahead_of_the_branch_is_not_deploy_lag(monkeypatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        infra_monitor.subprocess, "run",
+        _gh_stub({
+            "repos/r/commits/main": HEAD_JSON,
+            "repos/r/compare/" + "b" * 40 + "..." + "a" * 40: '{"status": "behind", "commits": []}',
+        }, calls),
+    )
+    monkeypatch.setattr(infra_monitor, "_fetch_json", lambda url, timeout=5: {"release_sha": "b" * 40})
+    snapshot = infra_monitor.read_deploy_lag_snapshot(
+        "r", "http://127.0.0.1:8089/version", branch="main", grace_seconds=2700.0
+    )
+    assert snapshot.error is None and snapshot.lagging is False
+
+
+@pytest.mark.parametrize(
+    "breakage",
+    ["gh_nonzero", "gh_raises", "version_raises", "no_release_sha", "compare_no_dates"],
+)
+def test_deploy_lag_snapshot_never_raises(monkeypatch, breakage) -> None:
+    def _run(args, **_kwargs):
+        if breakage == "gh_nonzero":
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="HTTP 404")
+        if breakage == "gh_raises":
+            raise OSError("no gh")
+        if args[2].startswith("repos/r/compare/"):
+            return subprocess.CompletedProcess(
+                args, 0, stdout='{"status": "ahead", "commits": [{"sha": "x"}]}', stderr=""
+            )
+        return subprocess.CompletedProcess(args, 0, stdout=HEAD_JSON, stderr="")
+
+    def _version(url, timeout=5):
+        if breakage == "version_raises":
+            raise TimeoutError("version endpoint timed out")
+        if breakage == "no_release_sha":
+            return {"version": "0.2.0"}
+        return {"release_sha": "b" * 40}
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
+    monkeypatch.setattr(infra_monitor, "_fetch_json", _version)
+    snapshot = infra_monitor.read_deploy_lag_snapshot(
+        "r", "http://127.0.0.1:8089/version", branch="main", grace_seconds=2700.0
+    )
+    assert snapshot.error is not None
+    assert snapshot.lagging is False
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, deploy_lag=snapshot,
+    )
+    assert any(f.startswith("deploy_lag_probe_failed:") for f in report.failures)
+
+
+def test_a_half_configured_deploy_lag_probe_is_a_usage_error() -> None:
+    with pytest.raises(SystemExit):
+        infra_monitor.parse_args(
+            ["--prometheus-url", "http://m/ready", "--deploy-lag-repo", "voyn88/x"]
+        )
+    with pytest.raises(SystemExit):
+        infra_monitor.parse_args(["--prometheus-url", "http://m/ready", "--crash-loop-restarts", "0"])
+
+
+def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor, "read_unit_health_snapshot",
+        lambda crash_loop_restarts: infra_monitor.UnitHealthSnapshot(
+            crash_loops=(("ollama.service", 315891),), failed_units=()
+        ),
+    )
+    monkeypatch.setattr(
+        infra_monitor, "read_deploy_lag_snapshot",
+        lambda repo, url, branch, grace_seconds: _lag(repo=repo, branch=branch, grace_seconds=grace_seconds),
+    )
+    result = infra_monitor.main(
+        [
+            "--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
+            "--prometheus-url", "http://m/ready",
+            "--unit-health",
+            "--deploy-lag-repo", "voyn88/voyn-logistics-crm",
+            "--deploy-lag-version-url", "http://127.0.0.1:8089/version",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unit_health"]["crash_loops"] == [["ollama.service", 315891]]
+    assert payload["deploy_lag"]["lagging"] is True
+    assert payload["deploy_lag"]["undeployed_commits"] == 6
+    assert any(f.startswith("crash_loop:") for f in payload["failures"])
+    assert any(f.startswith("deploy_lag:") for f in payload["failures"])
     assert result == 1
