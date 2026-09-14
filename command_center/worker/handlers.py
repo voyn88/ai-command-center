@@ -583,15 +583,36 @@ def _run_agent(
         return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
+    unknown_executors: list[str] = []
     if not available and link is not None:
         # An open Codex circuit is a routing fact, not a consumed model
         # attempt. Select the next healthy cascade link inside this already
         # claimed delivery instead of returning it just to increment the
         # queue attempt counter.
-        for candidate_step in range(cascade_step + 1, len(request.cascade) + 1):
+        #
+        # Walk EVERY other link, starting after this delivery's own and
+        # wrapping to the head of the cascade: attempt 2 lands on the second
+        # link by construction (`_cascade_step`), and when that executor is
+        # the one that is down (Codex out of quota / logged out for days on
+        # worker-01, 2026-09-14) a later-links-only search finds nothing.
+        # Wrapping to an earlier, healthy link is deliberate even though it
+        # may have served attempt 1: an attempt's failure is overwhelmingly a
+        # fact about the run (checkpoint mismatch, launch refusal, a wrong
+        # diff), not about the executor, and the queue's own single-executor
+        # retry re-runs the same executor for exactly that reason. Waiting
+        # out a dead link instead would park the task for days.
+        # Eligibility: the delivery's own executor was membership-checked
+        # above; candidates must have a command builder and share the
+        # mutability class. A different-class link is not a misconfiguration
+        # -- review cascades legitimately mix classes -- it is simply not a
+        # substitute for this delivery.
+        cascade_len = len(request.cascade)
+        for offset in range(1, cascade_len):
+            candidate_step = ((cascade_step - 1 + offset) % cascade_len) + 1
             candidate = request.cascade[candidate_step - 1]
             candidate_executor = str(candidate.get("executor"))
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
+                unknown_executors.append(candidate_executor)
                 continue
             candidate_task_type = str(candidate.get("task_type", request.task_type))
             if not _same_mutability_class(task_type, candidate_task_type):
@@ -617,8 +638,30 @@ def _run_agent(
             )
             break
     if not available:
+        # No link of the cascade can run right now. When every link named a
+        # real executor that merely failed preflight (auth, quota, sandbox,
+        # missing CLI) that is a fact about the substrate, not about this
+        # task: refund the attempt through the bounded infra-wait budget so
+        # the item is retried once an executor is back, instead of being
+        # dead-lettered after `max_attempts` provider outages
+        # (VOYN-W0-AICC-INFRA-FAILURES-BURN-TASK-ATTEMPTS). A cascade that
+        # names an executor nobody can build is a fact about the task's own
+        # payload that no waiting cures -- that one keeps spending the
+        # attempt budget so the misconfiguration surfaces.
+        if unknown_executors:
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    f"{unavailable_reason}: {detail}; cascade names unknown "
+                    f"executor(s) {sorted(set(unknown_executors))!r}"
+                ),
+                retryable=True,
+            )
         return HandlerOutcome(
-            ok=False, reason=f"{unavailable_reason}: {detail}", retryable=True
+            ok=False,
+            reason=f"{unavailable_reason}: {detail}",
+            retryable=True,
+            infra_wait=True,
         )
 
     if lease_lost.is_set():
@@ -881,8 +924,66 @@ def _run_agent(
                 with _provision_lock(str(isolated_workspace)):
                     evidence = workspace_provisioning.provision_and_verify(spec)
             except workspace_provisioning.WorkspaceVerificationError as exc:
-                # A verification failure here (branch already checked out
-                # elsewhere, base branch missing, dirty leftover worktree
+                if exc.failed_step == "task_workspace_checkpoint":
+                    # The saved clone ran ahead of its signed checkpoint: an
+                    # earlier delivery committed and was then killed before
+                    # `checkpoint_task_workspace` (launcher refusal, timeout,
+                    # lane restart -- worker-01, 2026-09-11..14 left 6 such
+                    # clones and every resume died here twice, burning both
+                    # attempts). This lane holds the only claim on the item,
+                    # so nobody is writing that clone now: preserve it for
+                    # inspection under `.aicc-quarantine` and let the next
+                    # delivery provision a fresh clone. The attempt is
+                    # refunded -- the task never got to run.
+                    if lease_lost.is_set():
+                        return HandlerOutcome(
+                            ok=False,
+                            reason=(
+                                f"workspace isolation failed at {exc.failed_step}: "
+                                f"{exc.detail}; lease lost, clone left in place"
+                            ),
+                            retryable=True,
+                        )
+                    # Same per-path lock as the provisioning above: a sibling
+                    # caller racing to (re)provision this path must never
+                    # have its in-progress clone moved out from under it.
+                    with _provision_lock(str(isolated_workspace)):
+                        quarantined = workspace_provisioning.quarantine_task_workspace(
+                            isolated_workspace
+                        )
+                        # The lease is an async fact: re-check it after the
+                        # move. If it went away meanwhile a successor lane
+                        # may already own this item, so put the clone back
+                        # rather than strand whatever it commits next.
+                        if quarantined is not None and lease_lost.is_set():
+                            workspace_provisioning.restore_quarantined_task_workspace(
+                                quarantined, isolated_workspace
+                            )
+                            return HandlerOutcome(
+                                ok=False,
+                                reason=(
+                                    f"workspace isolation failed at {exc.failed_step}: "
+                                    f"{exc.detail}; lease lost during quarantine, "
+                                    "clone restored"
+                                ),
+                                retryable=True,
+                            )
+                    return HandlerOutcome(
+                        ok=False,
+                        reason=(
+                            f"workspace isolation failed at {exc.failed_step}: "
+                            f"{exc.detail}; uncheckpointed clone "
+                            + (
+                                f"quarantined at {quarantined}"
+                                if quarantined
+                                else "could not be quarantined"
+                            )
+                        ),
+                        retryable=True,
+                        infra_wait=quarantined is not None,
+                    )
+                # Any other verification failure here (branch already checked
+                # out elsewhere, base branch missing, dirty leftover worktree
                 # under a stricter policy, ...) is a fact about repository
                 # state that a later moment can genuinely cure -- redelivery
                 # retries once whatever blocked it clears, bounded by
