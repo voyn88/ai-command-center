@@ -2338,6 +2338,165 @@ def _pr_is_mergeable(repo_path: str, pr_url: str) -> tuple[bool, str]:
     return True, head
 
 
+# The live contents of one branch's merge queue. Deliberately the same query
+# shape `scripts/assert_independent_acceptance.py` runs on every `merge_group`
+# event, so the fleet reads the queue through a surface that is already
+# exercised against the live repository on every queued build.
+_MERGE_QUEUE_ENTRIES_QUERY = """
+query($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    mergeQueue(branch: $branch) {
+      entries(first: 100) {
+        nodes { position state pullRequest { number } }
+      }
+    }
+  }
+}
+"""
+
+
+def _pr_base_ref(repo_path: str, pr_url: str) -> str:
+    """The branch the PR targets -- i.e. WHICH merge queue it would sit in.
+    "" when the lookup fails or says nothing."""
+    view = _gh(
+        ["pr", "view", pr_url, "--json", "baseRefName", "--jq", ".baseRefName"],
+        repo_path,
+    )
+    if view.returncode != 0:
+        return ""
+    return view.stdout.strip()
+
+
+def _merge_queue_entries(
+    repo_path: str, owner: str, repo: str, branch: str
+) -> dict[int, tuple[str, int | None]] | None:
+    """``{pr_number: (state, position)}`` for `branch`'s merge queue, ``{}``
+    when the branch has no queue, and None when the answer is unknown (a
+    failed, unparseable or errored lookup).
+
+    Only the first 100 entries are read. A queue longer than that is far past
+    anything `maximumEntriesToBuild` builds at once, and a PR beyond the page
+    simply reads as "not queued", which is the pre-queue behaviour -- never a
+    wrong claim that something IS queued.
+    """
+    result = _gh(
+        [
+            "api", "graphql",
+            "-f", f"query={_MERGE_QUEUE_ENTRIES_QUERY}",
+            "-f", f"owner={owner}",
+            "-f", f"name={repo}",
+            "-f", f"branch={branch}",
+        ],
+        repo_path,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    # GraphQL reports a rejected query with HTTP 200 + `errors`, which `gh`
+    # may or may not turn into a non-zero exit. An errored response says
+    # nothing about queue membership: unknown, not "not queued".
+    if not isinstance(payload, dict) or payload.get("errors"):
+        return None
+    data = payload.get("data")
+    repository = data.get("repository") if isinstance(data, dict) else None
+    if not isinstance(repository, dict):
+        return None
+    queue = repository.get("mergeQueue")
+    if queue is None:
+        return {}  # no merge queue on this branch -- merge as before
+    connection = queue.get("entries") if isinstance(queue, dict) else None
+    nodes = connection.get("nodes") if isinstance(connection, dict) else None
+    if not isinstance(nodes, list):
+        return None
+    entries: dict[int, tuple[str, int | None]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            return None
+        pull = node.get("pullRequest")
+        number = pull.get("number") if isinstance(pull, dict) else None
+        if not isinstance(number, int):
+            continue
+        state = node.get("state")
+        position = node.get("position")
+        entries[number] = (
+            state if isinstance(state, str) else "",
+            position if isinstance(position, int) else None,
+        )
+    return entries
+
+
+def _merge_queue_wait(
+    repo_path: str,
+    pr_url: str,
+    cache: dict[tuple[str, str, str], dict[int, tuple[str, int | None]] | None]
+    | None = None,
+) -> str | None:
+    """A skip reason when the PR is ALREADY sitting in its base branch's merge
+    queue, else None -- meaning "not queued, or unknown; act on it as before"
+    (VOYN-W0-AICC-MERGE-QUEUE-ENABLE).
+
+    The queue landed on `main` on 2026-08-23 (squash, five entries built at
+    once). A queued entry is not idle work: GitHub is building the prospective
+    merged result of this PR on top of everything ahead of it, and the only
+    correct move is to wait. The merge tick could not tell that state apart
+    from "accepted, green, unmerged", so it treated every queued entry as work
+    on every tick, which costs two things this loop cannot afford:
+
+    * A merge action out of `max_per_tick` per queued PR per tick, spent on
+      `gh pr merge` for a PR already in the queue. With five entries building
+      and a budget of eight, most of a tick's mutation budget went on
+      re-enqueueing PRs that were already queued, starving the accepted PRs
+      behind them -- the merge stage idling while work waits.
+    * Worse, `gh pr update-branch` on a queued-but-BEHIND entry, which pushes
+      a new head. A new head evicts the entry from the queue AND invalidates
+      its head-keyed review (`review:<task>:<pr>:<head_sha>:<policy>`), so the
+      tick tore out entries the queue was already testing and paid for a full
+      re-review plus a full CI run to get back to where it started.
+
+    `cache` is one tick's queue snapshots keyed by (owner, repo, branch): with
+    several entries queued on the same branch, the queue is read once per tick
+    rather than once per PR.
+
+    Fail-open by construction: a failed lookup, an errored or malformed
+    response, and a branch with no merge queue at all all return None, which
+    is exactly the pre-queue behaviour -- merge as before. Queue awareness can
+    only ever remove redundant actions, never block a merge that would
+    otherwise happen.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return None
+    owner, repo, number = parsed
+    branch = _pr_base_ref(repo_path, pr_url)
+    if not branch:
+        return None
+    key = (owner, repo, branch)
+    if cache is not None and key in cache:
+        entries = cache[key]
+    else:
+        entries = _merge_queue_entries(repo_path, owner, repo, branch)
+        if cache is not None:
+            cache[key] = entries
+    if not entries:
+        return None
+    entry = entries.get(int(number))
+    if entry is None:
+        return None
+    state, position = entry
+    detail = ",".join(
+        part
+        for part in (
+            f"state={state}" if state else "",
+            f"position={position}" if position is not None else "",
+        )
+        if part
+    )
+    return f"awaiting_merge_queue:{detail}" if detail else "awaiting_merge_queue"
+
+
 def _merge_state(repo_path: str, pr_url: str) -> str:
     """The PR's GitHub mergeStateStatus for the merge-train coordinator.
 
@@ -2476,7 +2635,11 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
     as evidence, only once GitHub reports the PR actually MERGED (see
-    `_merged_target_sha`; a queued merge is a wait, not a completion)."""
+    `_merged_target_sha`; a queued merge is a wait, not a completion).
+
+    A PR the merge queue is already building is a free wait: it spends no
+    merge action and is never branch-updated, so the queue can serialize
+    integration without the tick fighting it (`_merge_queue_wait`)."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
@@ -2504,6 +2667,12 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     last_processed = None
     branch_updates = 0
     actions = 0
+    # One tick's merge-queue snapshots, keyed by (owner, repo, base branch):
+    # several entries queued on the same branch read the queue once, not once
+    # each. Tick-local on purpose -- queue membership changes between ticks.
+    queue_snapshots: dict[
+        tuple[str, str, str], dict[int, tuple[str, int | None]] | None
+    ] = {}
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
@@ -2542,7 +2711,19 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
                         detail = f"{detail}; {rerun}"
                 report.skipped.append((task_id, detail))
                 continue
-            # Merge-ready. If it has merely fallen BEHIND main since it was
+            # Merge-ready -- but an entry the merge queue is ALREADY building
+            # is not this tick's work. It costs no action and, above all, no
+            # branch update: updating a queued branch pushes a new head, which
+            # evicts the entry from the queue and invalidates its head-keyed
+            # review. Checked before the BEHIND handling below for exactly that
+            # reason -- a queued entry is routinely BEHIND, because the queue,
+            # not the branch, is where it is being tested against the
+            # prospective merged result (VOYN-W0-AICC-MERGE-QUEUE-ENABLE).
+            queue_wait = _merge_queue_wait(repo_path, pr_url, queue_snapshots)
+            if queue_wait is not None:
+                report.skipped.append((task_id, queue_wait))
+                continue
+            # If it has merely fallen BEHIND main since it was
             # accepted, bring its branch current with a GitHub-side base merge
             # (no local writer lease) so it can land; the new head re-runs CI
             # and review head-keyed. The cap counts ATTEMPTS -- incremented

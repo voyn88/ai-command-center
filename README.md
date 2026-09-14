@@ -471,7 +471,10 @@ uses a read-only token, pins actions to commit SHAs, and cancels superseded runs
 (`strict: true`, so a queued branch must be current with `main`); force-push and branch deletion are
 denied. A GitHub merge queue is enabled on `main` (squash, `maximumEntriesToBuild: 5`): entries build
 and test the prospective merged result in batches, and a conflicting entry is dropped without
-stalling the rest of the queue — see `.github/workflows/ci.yml`'s `merge_group` trigger.
+stalling the rest of the queue — see `.github/workflows/ci.yml`'s `merge_group` trigger. The merge
+tick treats an entry the queue is already building as a free wait: it spends no merge action and
+never branch-updates it (that would push a new head and evict it from the queue), so serialized
+integration costs the fleet no parallelism. `docs/operations/MERGE_QUEUE.md` is the operator page.
 
 ## Current limitations and risks
 

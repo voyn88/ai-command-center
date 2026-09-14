@@ -457,7 +457,9 @@ acceptance comes from the independent-review marker keyed to the exact head SHA 
 authors and review agents share an account. A GitHub merge queue is enabled on `main` (squash,
 `maximumEntriesToBuild: 5`) so batches of parallel-developed PRs are tested against their prospective
 merged result before landing, and a conflicting entry is dropped without stalling the rest of the
-queue; `.github/workflows/ci.yml`'s `merge_group` trigger exists for this.
+queue; `.github/workflows/ci.yml`'s `merge_group` trigger exists for this. `merge_once` reads queue
+membership before acting, so an entry already being built costs no merge action and is never
+branch-updated out of the queue (`docs/operations/MERGE_QUEUE.md`).
 
 ## 13. Current risks and boundaries
 

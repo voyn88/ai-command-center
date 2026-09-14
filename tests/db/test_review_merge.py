@@ -1879,6 +1879,299 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
         assert cur.fetchone()[0] == merge_oid
 
 
+def _queue_payload(*numbers, position=1, state="QUEUED"):
+    """A `gh api graphql` response holding `numbers` as the live queue."""
+    return json.dumps({"data": {"repository": {"mergeQueue": {"entries": {
+        "nodes": [
+            {"position": position + offset, "state": state,
+             "pullRequest": {"number": number}}
+            for offset, number in enumerate(numbers)
+        ],
+    }}}}})
+
+
+def _open_accepted(head, merge_state="CLEAN"):
+    """An OPEN PR carrying an independent ACCEPT marker on `head`, green."""
+    return json.dumps({
+        "state": "OPEN", "headRefOid": head, "mergeStateStatus": merge_state,
+        "author": {"login": "writer-bot"},
+        "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                     "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+        "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+    })
+
+
+def _merged(head, merge_oid):
+    return json.dumps({
+        "state": "MERGED", "mergeCommit": {"oid": merge_oid}, "headRefOid": head,
+        "author": {"login": "writer-bot"},
+        "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                     "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+        "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+    })
+
+
+def test_a_pr_the_queue_is_already_building_is_a_free_wait(rig, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-MERGE-QUEUE-ENABLE: an entry already in the merge queue is
+    being tested against the prospective merged result. The tick waits: no
+    second `gh pr merge`, no branch update, no action spent -- and the task
+    stays READY_TO_REVIEW until the queue itself lands it."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MQ-WAIT", "https://github.com/x/y/pull/60")
+    head = "e" * 40
+    calls = []
+
+    def fake_gh(argv, repo):
+        calls.append(argv[:2])
+        if argv[:2] == ["pr", "view"]:
+            if "baseRefName" in argv:
+                return sp.CompletedProcess(argv, 0, "main\n", "")
+            return sp.CompletedProcess(argv, 0, _open_accepted(head), "")
+        if argv[:2] == ["api", "graphql"]:
+            return sp.CompletedProcess(
+                argv, 0, _queue_payload(60, position=2, state="AWAITING_CHECKS"), ""
+            )
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ["pr", "merge"] not in calls
+    assert ["pr", "update-branch"] not in calls
+    assert (
+        "VOYN-W0-MQ-WAIT",
+        "awaiting_merge_queue:state=AWAITING_CHECKS,position=2",
+    ) in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MQ-WAIT",)
+        )
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_a_queued_entry_is_never_torn_out_of_the_queue_by_a_branch_update(rig, monkeypatch):  # noqa: F811, E501
+    """A queued entry is routinely BEHIND -- the queue, not the branch, is
+    where it is tested against everything ahead of it. `gh pr update-branch`
+    here would push a new head, evict it from the queue and invalidate its
+    head-keyed review, paying for a full re-review and re-run to get back to
+    where it already was. The queue check therefore precedes the BEHIND
+    handling (VOYN-W0-AICC-MERGE-QUEUE-ENABLE)."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-MQ-BEHIND", "https://github.com/x/y/pull/61")
+    head = "f" * 40
+    calls = []
+
+    def fake_gh(argv, repo):
+        calls.append(argv[:2])
+        if argv[:2] == ["pr", "view"]:
+            if "baseRefName" in argv:
+                return sp.CompletedProcess(argv, 0, "main\n", "")
+            return sp.CompletedProcess(argv, 0, _open_accepted(head, "BEHIND"), "")
+        if argv[:2] == ["api", "graphql"]:
+            return sp.CompletedProcess(argv, 0, _queue_payload(61), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ["pr", "update-branch"] not in calls
+    assert not any(r == "branch_updated_behind_main" for _, r in report.skipped)
+    assert any(
+        t == "VOYN-W0-MQ-BEHIND" and r.startswith("awaiting_merge_queue")
+        for t, r in report.skipped
+    )
+
+
+def test_a_queued_entry_leaves_the_merge_budget_to_the_next_task(rig, monkeypatch):  # noqa: F811, E501
+    """The anti-starvation half: waiting on the queue costs no action, so a
+    one-action tick still lands the next merge-ready PR behind it. Before the
+    queue check, each queued entry burned a `gh pr merge` out of
+    `max_per_tick` every tick -- with five entries building and a budget of
+    eight, the tick mostly re-enqueued PRs that were already queued."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    queued_pr = "https://github.com/x/y/pull/62"
+    ready_pr = "https://github.com/x/y/pull/63"
+    # Scanned in task_id order: the queued one is examined FIRST, so it is the
+    # one that would have consumed the single available action.
+    _ready(store, app_factory, "VOYN-W0-MQ-A-QUEUED", queued_pr)
+    _ready(store, app_factory, "VOYN-W0-MQ-B-READY", ready_pr)
+    head, merge_oid = "1" * 40, "2" * 40
+    landed = {"b": False}
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["api", "graphql"]:
+            # Only the first PR is in the queue.
+            return sp.CompletedProcess(argv, 0, _queue_payload(62), "")
+        if argv[:2] == ["pr", "view"]:
+            if "baseRefName" in argv:
+                return sp.CompletedProcess(argv, 0, "main\n", "")
+            if argv[2] == ready_pr and landed["b"]:
+                return sp.CompletedProcess(argv, 0, _merged(head, merge_oid), "")
+            return sp.CompletedProcess(argv, 0, _open_accepted(head), "")
+        if argv[:2] == ["pr", "merge"]:
+            assert argv[2] == ready_pr, "a queued entry must never be re-merged"
+            landed["b"] = True
+            return sp.CompletedProcess(argv, 0, "merged", "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp", review_merge.ReviewConfig(max_per_tick=1))
+    assert ("VOYN-W0-MQ-B-READY", merge_oid) in report.merged
+    assert any(
+        t == "VOYN-W0-MQ-A-QUEUED" and r.startswith("awaiting_merge_queue")
+        for t, r in report.skipped
+    )
+
+
+def test_the_ejected_half_of_a_conflicting_pair_neither_lands_nor_completes(rig, monkeypatch):  # noqa: F811, E501
+    """The acceptance scenario for VOYN-W0-AICC-MERGE-QUEUE-ENABLE, as the
+    fleet sees it.
+
+    Two accepted PRs from different states of `main` enter the queue together.
+    GitHub builds their prospective merged result, lands the first and EJECTS
+    the second (its merge is dirty against what just landed). Tick 1: both are
+    queued, so both are free waits. Tick 2: the winner is MERGED and completes
+    DONE with the target-branch merge commit; the ejected one is out of the
+    queue, DIRTY, and must stay READY_TO_REVIEW with no sha evidence -- the
+    queue dropped it instead of letting it break `main`, and dropping it did
+    not stall the entry ahead of it."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    winner_pr = "https://github.com/x/y/pull/64"
+    loser_pr = "https://github.com/x/y/pull/65"
+    _ready(store, app_factory, "VOYN-W0-MQ-WINNER", winner_pr)
+    _ready(store, app_factory, "VOYN-W0-MQ-LOSER", loser_pr)
+    head, merge_oid = "3" * 40, "4" * 40
+    queue = {"winner": True, "loser": True}
+    calls = []
+
+    def fake_gh(argv, repo):
+        calls.append(tuple(argv[:3]))
+        if argv[:2] == ["api", "graphql"]:
+            numbers = [n for n, q in ((64, queue["winner"]), (65, queue["loser"])) if q]
+            return sp.CompletedProcess(argv, 0, _queue_payload(*numbers), "")
+        if argv[:2] == ["pr", "view"]:
+            if "baseRefName" in argv:
+                return sp.CompletedProcess(argv, 0, "main\n", "")
+            if argv[2] == winner_pr and not queue["winner"]:
+                return sp.CompletedProcess(argv, 0, _merged(head, merge_oid), "")
+            state = "DIRTY" if argv[2] == loser_pr and not queue["loser"] else "CLEAN"
+            return sp.CompletedProcess(argv, 0, _open_accepted(head, state), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    first = merge_once(app_factory, "/tmp")
+    assert not first.merged
+    assert sum(1 for _, r in first.skipped if r.startswith("awaiting_merge_queue")) == 2
+    assert all(call[:2] != ("pr", "merge") for call in calls)
+
+    # The queue builds the pair: the winner lands, the loser is ejected.
+    queue["winner"] = queue["loser"] = False
+    second = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MQ-WINNER", merge_oid) in second.merged
+    assert ("VOYN-W0-MQ-LOSER", "branch_dirty_needs_rebase") in second.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MQ-LOSER",)
+        )
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+        cur.execute(
+            "SELECT count(*) FROM backlog_evidence WHERE task_id=%s AND kind='sha'",
+            ("VOYN-W0-MQ-LOSER",),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MQ-WINNER",)
+        )
+        assert cur.fetchone()[0] == "DONE"
+
+
+@pytest.mark.parametrize(
+    "returncode,stdout",
+    [
+        (1, ""),                                               # lookup failed
+        (0, "not json <html>"),                                # unparseable
+        (0, json.dumps({"errors": [{"message": "rejected"}]})),  # query refused
+        (0, json.dumps({"data": {"repository": None}})),       # no repository
+        (0, json.dumps({"data": {"repository": {"mergeQueue": None}}})),  # no queue
+        (0, json.dumps({"data": {"repository": {"mergeQueue": {
+            "entries": {"nodes": []}}}}})),                    # queue is empty
+        (0, json.dumps({"data": {"repository": {"mergeQueue": {"entries": {
+            "nodes": [{"position": 1, "state": "QUEUED",
+                       "pullRequest": {"number": 10}}]}}}}})),  # someone else
+    ],
+)
+def test_an_inconclusive_queue_lookup_merges_exactly_as_before(monkeypatch, returncode, stdout):  # noqa: E501
+    """Fail-open by construction: a failed, unparseable, errored or
+    queue-less answer is "not queued", which is the pre-queue behaviour --
+    queue awareness can only remove redundant actions, never block a merge
+    that would otherwise happen."""
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, "main\n", "")
+        return sp.CompletedProcess(argv, returncode, stdout, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._merge_queue_wait("/tmp", "https://github.com/x/y/pull/9") is None
+
+
+def test_an_unreadable_base_branch_asks_the_queue_nothing(monkeypatch):
+    """Without the base branch there is no queue to ask about: a failed
+    `baseRefName` lookup is inconclusive, so the PR is merged as before."""
+    import subprocess as sp
+
+    calls = []
+
+    def fake_gh(argv, repo):
+        calls.append(argv[:2])
+        return sp.CompletedProcess(argv, 1, "", "no such pr")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._merge_queue_wait("/tmp", "https://github.com/x/y/pull/9") is None
+    assert ["api", "graphql"] not in calls
+
+
+def test_one_tick_reads_each_branch_queue_once(monkeypatch):
+    """Several entries queued on one branch share a single queue read: the
+    snapshot cache is what keeps queue awareness cheap when the whole batch
+    the queue is building belongs to this fleet."""
+    import subprocess as sp
+
+    graphql_calls = []
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, "main\n", "")
+        graphql_calls.append(argv)
+        return sp.CompletedProcess(argv, 0, _queue_payload(1, 2), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    cache = {}
+    first = review_merge._merge_queue_wait("/tmp", "https://github.com/x/y/pull/1", cache)
+    second = review_merge._merge_queue_wait("/tmp", "https://github.com/x/y/pull/2", cache)
+    assert first == "awaiting_merge_queue:state=QUEUED,position=1"
+    assert second == "awaiting_merge_queue:state=QUEUED,position=2"
+    assert len(graphql_calls) == 1
+
+
+def test_an_unparseable_pr_url_is_never_reported_as_queued(monkeypatch):
+    """No owner/repo/number means no queue question to ask; the merge path
+    stays exactly as it was for such a URL."""
+    def fake_gh(argv, repo):  # pragma: no cover - must not be reached
+        raise AssertionError("no lookup without a parseable PR URL")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    assert review_merge._merge_queue_wait("/tmp", "not-a-pr-url") is None
+
+
 def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatch):  # noqa: F811, E501
     """VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN: a red required check on a PR that
     already carries the ACCEPT marker triggers `gh run rerun --failed` for
