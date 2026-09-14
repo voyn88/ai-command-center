@@ -1,0 +1,22 @@
+# Schedule for voyn-aicc-lease-reap.service (VOYN-W0-AICC-REAPER-NOT-RUNNING).
+#
+# Five minutes is the number #358 already promised operators ("a cron-based
+# reap sweep clears any future stuck row within 5 minutes") -- this unit is
+# what makes that sentence true of a host built from this repository rather
+# than of one hand-configured host. The cadence bounds recovery latency only:
+# an expired row blocks acquires either way, and the sweep clears it whenever
+# it next runs.
+
+[Unit]
+Description=Run the AICC writer-lease reaper every five minutes
+
+[Timer]
+# A host that power-cycled reaps shortly after it comes back, no human
+# involved -- the reboot half of the recovery contract.
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
