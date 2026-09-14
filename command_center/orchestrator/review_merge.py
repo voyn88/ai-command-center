@@ -6,6 +6,13 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
 - ``review_once``: for each READY_TO_REVIEW task carrying pr evidence and no
   verdict yet, enqueue one adversarial review run (read-only profile) whose
   prompt names the PR. The verdict lands in the work result like any outcome.
+- ``reconcile_review_once``: the bounded counterpart to the refusals below.
+  A chunk of a bounded exact-SHA manifest whose review is missing, or whose
+  terminal result carries no usable verdict for the current head, gets one
+  fresh review identity (its own, or a bounded ``:retry:N``) -- so a
+  manifest cannot stall forever with its marker reachable only by a human
+  posting it by hand. Nothing is rewritten, inferred, or accepted on less
+  evidence than before.
 - ``publish_review_verdicts``: for each READY_TO_REVIEW task whose review
   work item has a result *for the PR's current head sha* but whose PR head
   has no marker yet, parse the agent's own ``VERDICT: ACCEPT|REJECT`` /
@@ -52,9 +59,10 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
 
-All three are refusal-as-data, driven by oneshot timers, and idempotent: a
-task already reviewed is skipped, a marker already posted is skipped, an
-already-merged PR closes the task once.
+All four are refusal-as-data, driven by oneshot timers, and idempotent: a
+task already reviewed is skipped, a chunk that already concluded is never
+re-reviewed, a marker already posted is skipped, an already-merged PR
+closes the task once.
 """
 
 from __future__ import annotations
