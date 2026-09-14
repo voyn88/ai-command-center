@@ -9,9 +9,26 @@ This is a fail-closed deployment gate. Do not set
    move their Git metadata in place. The task-local clone dependency must
    create/reconcile each active task under `/srv/aicc-workspaces`; archive a
    legacy clone only after its branch/HEAD is durable and exact-SHA matched.
-2. Install root-owned provider CLIs at `/usr/local/bin/{claude,codex,copilot}`.
-   Every resolved executable and its package files must be owned by root and not
-   group/world-writable. Never point at `/home/voynadmin/.local`.
+2. Nothing to do: the provider CLIs install themselves. The installer runs
+   `ops/aicc_toolchain_install.py`, which downloads the artifact pinned by
+   `deploy/agent-toolchain.lock.json`, proves its sha256, extracts it root-owned
+   and selects it at `/opt/aicc/toolchains/current`
+   (VOYN-W0-AICC-TOOLCHAIN-CONTENT-ADDRESSED, merged `91c7718`).
+   **Do not install the CLIs by hand**, and in particular never with
+   `npm install --global`: that is the finding this gate exists to close --
+   it resolves packages online and runs their lifecycle scripts as root. An
+   executable under `/usr/local/bin` or an operator's home is now ignored;
+   the installer refuses any executor that resolves outside the selected
+   release. To change a CLI version, edit the lock, run the
+   `build-agent-toolchain` workflow, and record the digest it reports -- a
+   reviewed change, never an ambient `latest`.
+   The release venv also needs the accepted AIOS wheels (`aios-sdk.lock.json`,
+   `aios-db.lock.json`), which CI fetches with a read-only token a root
+   installer must not hold. Stage them once per digest, root-owned and
+   immutable, at `/var/lib/aicc-artifacts/<wheel_sha256>/<wheel_filename>`
+   (`install -D -m 0644 -o root -g root`); the installer verifies each wheel
+   against the release's lock file and refuses a missing, writable or
+   mismatched artifact.
 3. Put only model credentials in `/etc/aicc/agent-claude.env` and
    `/etc/aicc/agent-codex.env` (root:`aicc-agent`, `0640`), or provider config
    below `/var/lib/aicc-agent` (`root:root`, `0600`). The broker uses only an
@@ -25,12 +42,66 @@ This is a fail-closed deployment gate. Do not set
    `hex:` or `base64:` explicitly; the decoded key must be at least 32 bytes.
    Publisher/gh/SSH state remains below `/var/lib/aicc-worker` `0700`.
    Never place the key in the rotator-managed DSN file or lane environments.
-5. Review `/etc/aicc/agent-workspace-roots`, then run
-   `deploy/install-agent-principal-isolation.sh` from the exact merged SHA.
-   The installer validates all inputs before mutation, installs the versioned
+5. Review `/etc/aicc/agent-workspace-roots`, then run only the root-owned
+   exact-SHA bootstrap. **Never execute**
+   `deploy/install-agent-principal-isolation.sh` from an operator's home
+   directory or any other operator/agent-writable checkout: that would execute
+   mutable Python and shell as root before the immutable release exists. For the first
+   installation, do not execute any file from a checkout. From the Hetzner
+   root console, set `expected_sha` to the independently accepted merged SHA,
+   then use only host binaries to fetch `main`, prove that it still equals that
+   SHA, and extract the bootstrap blob directly from the authenticated Git
+   object into a new private root-owned file:
+
+   ```sh
+   expected_sha=<40-hex-merged-main-sha>
+   umask 077
+   install -d -m 0700 -o root -g root /var/lib/aicc-stage0
+   rm -rf /var/lib/aicc-stage0/repo
+   /usr/bin/env -i HOME=/var/lib/aicc-stage0 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+     GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git init --initial-branch=bootstrap \
+     /var/lib/aicc-stage0/repo
+   /usr/bin/env -i HOME=/var/lib/aicc-stage0 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+     GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -C /var/lib/aicc-stage0/repo remote \
+     add origin https://github.com/voyn88/ai-command-center.git
+   /usr/bin/env -i HOME=/var/lib/aicc-stage0 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+     GIT_NO_REPLACE_OBJECTS=1 /usr/bin/git -C /var/lib/aicc-stage0/repo \
+     -c protocol.file.allow=never fetch --no-tags origin \
+     refs/heads/main:refs/remotes/origin/main
+   test "$(/usr/bin/env -i HOME=/var/lib/aicc-stage0 \
+     PATH=/usr/sbin:/usr/bin:/sbin:/bin GIT_CONFIG_NOSYSTEM=1 \
+     GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+     /usr/bin/git -C /var/lib/aicc-stage0/repo rev-parse \
+     refs/remotes/origin/main^{commit})" = "$expected_sha"
+   /usr/bin/env -i HOME=/var/lib/aicc-stage0 PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+     GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+     /usr/bin/git -C /var/lib/aicc-stage0/repo cat-file blob \
+     "$expected_sha:ops/aicc_exact_sha_bootstrap.py" \
+     >/var/lib/aicc-stage0/voyn-aicc-bootstrap
+   chown root:root /var/lib/aicc-stage0/voyn-aicc-bootstrap
+   chmod 0700 /var/lib/aicc-stage0/voyn-aicc-bootstrap
+   /usr/bin/python3 /var/lib/aicc-stage0/voyn-aicc-bootstrap \
+     --expected-sha "$expected_sha"
+   ```
+
+   The bootstrap fetches the fixed remote again under a scrubbed environment,
+   requires remote `main` to equal the supplied SHA, verifies every checked-out
+   blob and executable mode, writes a root-owned attestation, creates the
+   dedicated workspace-authority key when absent, and only then runs the
+   principal installer. The root-owned provider toolchain is a separate
+   integrity-pinned generation and must already pass the installer boundary
+   checks; the bootstrap never runs an online global package installation. A
+   successful generation installs the
+   same verifier as `/usr/local/sbin/voyn-aicc-bootstrap`; use that immutable
+   command for later exact-SHA upgrades. The installer refuses direct use
+   without a matching attestation. It installs the versioned
    `voyn-aicc-worker@.service` and boundary files atomically, and restores the
    previous files/service enablement if any later verification fails. Use the
-   same script with `--uninstall` for the recorded reversible uninstall.
+   installed command with `uninstall --expected-sha <merged-main-sha>` for the
+   recorded reversible uninstall.
    The production allowlist contains only `/srv/aicc-workspaces`; do not add
    the publisher checkout or a home directory. The task-local Git metadata
    dependency must be deployed first.

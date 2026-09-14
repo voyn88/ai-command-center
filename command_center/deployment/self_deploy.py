@@ -37,7 +37,10 @@ from __future__ import annotations
 
 import datetime as _datetime
 import json
+import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -64,6 +67,23 @@ class SelfDeployConfig:
     #: Host-local provenance record (sha, outcome, timestamp per line).
     provenance_path: str = "~/.aicc-self-deploy-provenance.jsonl"
     command_timeout: int = 300
+    #: Marker file the staged worker rollout (ops/aicc_staged_worker_rollout.py)
+    #: holds for its entire duration. A restart issued by this tick while the
+    #: rollout is mid-drain is exactly what raced the rollout's own `stop` of
+    #: the canary lane on worker-01 (live 2026-09-08); refusing while the
+    #: marker exists means the next tick (5 minutes later, after the rollout
+    #: has finished and removed it) picks the deploy back up instead.
+    rollout_lock_path: str = "/run/aicc-staged-rollout.lock"
+    #: Optional immutable release root. When set, self-deploy stages tracked
+    #: files into `<release_root>/releases/<sha>` and atomically points
+    #: `<release_root>/current` at that release instead of asking systemd units
+    #: to execute directly from the mutable source clone.
+    release_root: str | None = None
+    #: Runtime venv to expose inside each immutable release. The venv itself is
+    #: still provisioned by the installer; release staging only binds it into
+    #: the immutable source tree so units can keep using
+    #: `/opt/aicc/current/.venv/bin/python`.
+    release_venv: str | None = None
 
 
 @dataclass(slots=True)
@@ -121,14 +141,115 @@ def _import_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess[s
     modules every tick and worker imports must import from the NEW tree."""
     return _run_bounded(
         [
-            sys.executable, "-c",
-            "import command_center.orchestrator.review_merge, "
-            "command_center.orchestrator.planner, "
-            "command_center.worker.handlers",
+            sys.executable,
+            "-c",
+            (
+                "import command_center.orchestrator.review_merge, "
+                "command_center.orchestrator.planner, "
+                "command_center.worker.handlers"
+            ),
         ],
         timeout,
         cwd=repo_path,
     )
+
+
+def _dispatch_smoke(repo_path: str, timeout: int) -> subprocess.CompletedProcess[str]:
+    """`backlog_dispatch_smoke()` (0021) through the deployed code and the
+    control plane's own role: a read of `backlog_eligible` and the wave
+    candidate under the same SECURITY DEFINER the planner's dispatch uses."""
+    return _run_bounded(
+        [sys.executable, "-m", "command_center.db", "backlog-plan", "--smoke"],
+        timeout,
+        cwd=repo_path,
+    )
+
+
+def _selector_for_sha(sha: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise RuntimeError("release sha is invalid")
+    return f"releases/{sha}"
+
+
+def _current_selector(current_link: Path) -> str:
+    try:
+        info = current_link.lstat()
+    except FileNotFoundError:
+        return "ABSENT"
+    if not stat.S_ISLNK(info.st_mode):
+        raise RuntimeError("release selector is not a symlink")
+    selector = os.readlink(current_link)
+    if not re.fullmatch(r"releases/[0-9a-f]{40}", selector):
+        if os.path.isabs(selector):
+            return selector
+        raise RuntimeError("release selector is invalid")
+    return selector
+
+
+def _point_current_at(current_link: Path, selector: str) -> None:
+    if (
+        selector != "ABSENT"
+        and not os.path.isabs(selector)
+        and not re.fullmatch(r"releases/[0-9a-f]{40}", selector)
+    ):
+        raise RuntimeError("release selector is invalid")
+    tmp = current_link.with_name(f".{current_link.name}.next")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    if selector == "ABSENT":
+        try:
+            current_link.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    tmp.symlink_to(selector)
+    os.replace(tmp, current_link)
+
+
+def _tracked_files(repo_path: str, timeout: int) -> list[str]:
+    listed = _git(repo_path, ["ls-files", "-z"], timeout)
+    if listed.returncode != 0:
+        raise RuntimeError("release file listing failed")
+    return [name for name in listed.stdout.split("\0") if name]
+
+
+def _stage_immutable_release(
+    repo_path: str, cfg: SelfDeployConfig, sha: str
+) -> tuple[Path, str]:
+    if cfg.release_root is None:
+        return Path(repo_path), "ABSENT"
+    release_root = Path(cfg.release_root)
+    selector = _selector_for_sha(sha)
+    release_dir = release_root / selector
+    current_link = release_root / "current"
+    previous_selector = _current_selector(current_link)
+    if release_dir.exists():
+        return release_dir, previous_selector
+
+    staging = release_root / "releases" / f".{sha}.staging-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, mode=0o755)
+    try:
+        for name in _tracked_files(repo_path, cfg.command_timeout):
+            source = Path(repo_path) / name
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target, follow_symlinks=False)
+        if cfg.release_venv is not None:
+            venv = Path(cfg.release_venv)
+        else:
+            venv = Path(repo_path) / ".venv"
+        if venv.exists():
+            (staging / ".venv").symlink_to(venv)
+        (staging / ".aicc-release-sha").write_text(sha + "\n", encoding="ascii")
+        os.rename(staging, release_dir)
+    except (OSError, RuntimeError, shutil.Error):
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return release_dir, previous_selector
 
 
 def _record_provenance(cfg: SelfDeployConfig, report: SelfDeployReport) -> None:
@@ -176,6 +297,9 @@ def self_deploy_once(
             _record_provenance(cfg, report)
         return report
 
+    if cfg.rollout_lock_path and Path(cfg.rollout_lock_path).expanduser().exists():
+        return finish("refused", "staged_rollout_in_progress")
+
     fetched = _git(repo_path, ["fetch", cfg.remote, cfg.branch], timeout)
     if fetched.returncode != 0:
         return finish("failed", f"fetch_failed: {fetched.stderr.strip()[:100]}")
@@ -185,16 +309,30 @@ def self_deploy_once(
         return finish("failed", "rev_parse_failed")
     report.previous_sha = current.stdout.strip()
     report.target_sha = target.stdout.strip()
-    if report.previous_sha == report.target_sha:
+    same_sha = report.previous_sha == report.target_sha
+    if same_sha and cfg.release_root is None:
         return finish("noop", report.target_sha)
 
-    ff = _git(
-        repo_path,
-        ["merge-base", "--is-ancestor", "HEAD", report.target_sha],
-        timeout,
-    )
-    if ff.returncode != 0:
-        return finish("refused", "non_fast_forward_checkout_diverged")
+    if same_sha and cfg.release_root is not None:
+        release_root = Path(cfg.release_root)
+        try:
+            current_selector = _current_selector(release_root / "current")
+        except (OSError, RuntimeError) as exc:
+            return finish("failed", f"release_selector_read_failed: {exc}")
+        release_selector = _selector_for_sha(report.target_sha)
+        if (
+            current_selector == release_selector
+            and (release_root / release_selector).is_dir()
+        ):
+            return finish("noop", report.target_sha)
+    if not same_sha:
+        ff = _git(
+            repo_path,
+            ["merge-base", "--is-ancestor", "HEAD", report.target_sha],
+            timeout,
+        )
+        if ff.returncode != 0:
+            return finish("refused", "non_fast_forward_checkout_diverged")
     dirty = _git(repo_path, ["status", "--porcelain"], timeout)
     if dirty.returncode != 0 or dirty.stdout.strip():
         return finish("refused", "checkout_dirty")
@@ -214,10 +352,24 @@ def self_deploy_once(
             "refused", f"dependency_change_requires_manual_deploy: {manifests[:3]}"
         )
 
-    moved = _git(repo_path, ["reset", "--hard", report.target_sha], timeout)
-    if moved.returncode != 0:
-        return finish("failed", f"reset_failed: {moved.stderr.strip()[:100]}")
-    report.steps.append(f"checkout_moved:{report.target_sha}")
+    if not same_sha:
+        moved = _git(repo_path, ["reset", "--hard", report.target_sha], timeout)
+        if moved.returncode != 0:
+            return finish("failed", f"reset_failed: {moved.stderr.strip()[:100]}")
+        report.steps.append(f"checkout_moved:{report.target_sha}")
+    else:
+        report.steps.append(f"checkout_already_current:{report.target_sha}")
+
+    try:
+        runtime_path, previous_selector = _stage_immutable_release(
+            repo_path, cfg, report.target_sha
+        )
+    except (OSError, RuntimeError, shutil.Error) as exc:
+        _git(repo_path, ["reset", "--hard", report.previous_sha], timeout)
+        return finish("failed", f"release_stage_failed: {exc}")
+    selector_flipped = False
+    if cfg.release_root is not None:
+        report.steps.append(f"release_staged:{runtime_path}")
 
     def rollback(reason: str, *, services_touched: bool) -> SelfDeployReport:
         """VERIFIED restoration (review of 8d1f967: an unchecked
@@ -231,6 +383,14 @@ def self_deploy_once(
         at = _git(repo_path, ["rev-parse", "HEAD"], timeout)
         if at.returncode != 0 or at.stdout.strip() != report.previous_sha:
             return finish("failed", f"rollback_incomplete_checkout: after {reason}")
+        if selector_flipped and cfg.release_root is not None:
+            try:
+                _point_current_at(Path(cfg.release_root) / "current", previous_selector)
+            except (OSError, RuntimeError) as exc:
+                return finish(
+                    "failed",
+                    f"rollback_incomplete_release_selector: {exc}; after {reason}",
+                )
         if services_touched:
             restore_failure = _restart_services(cfg, report)
             if restore_failure is not None:
@@ -243,7 +403,7 @@ def self_deploy_once(
     # Smoke BEFORE migrations (review of cff672a): a broken tree must be
     # discovered while the database is still untouched -- the cheapest
     # failure order is the one with nothing to unwind.
-    smoke = _import_smoke(repo_path, timeout)
+    smoke = _import_smoke(str(runtime_path), timeout)
     if smoke.returncode != 0:
         return rollback(
             f"import_smoke_failed: {smoke.stderr.strip()[:150]}",
@@ -252,7 +412,7 @@ def self_deploy_once(
     report.steps.append("import_smoke_passed")
 
     if cfg.migrate:
-        migrated = _run_migrations(repo_path, timeout)
+        migrated = _run_migrations(str(runtime_path), timeout)
         if migrated.returncode != 0:
             # The checkout is restored, but earlier PENDING migrations may
             # have committed before the failing one (each migration is its
@@ -263,16 +423,49 @@ def self_deploy_once(
                 f"{(migrated.stderr or migrated.stdout).strip()[:130]}",
                 services_touched=False,
             )
-        report.steps.append("migrations_applied")
+        # `db upgrade` runs the pending migrations AND unconditionally
+        # re-asserts the grant matrix (roles.apply_table_grants) even when
+        # no migration was pending -- so a clean exit is never provably a
+        # no-op (review of 5eb6f62: "ran once" isn't "mutated"; review of
+        # 15774a77: an "already up to date" schema can still see its grants
+        # change). Rather than guess from exit code or stdout, every
+        # successful invocation is recorded as a write that will NOT be
+        # rolled back, which is true whether or not anything actually
+        # changed.
+        report.steps.append("database_upgrade_ran_not_rolled_back")
+        # A migration can leave the schema importable yet unusable by the
+        # control plane (0019 recreated a view under the wrong owner; every
+        # planner tick died for 18 minutes while import-smoke was green).
+        # Exercise exactly the privileges dispatch needs before any service
+        # restarts; a refusal rolls the checkout and services back.
+        dispatch_smoke = _dispatch_smoke(str(runtime_path), timeout)
+        if dispatch_smoke.returncode != 0:
+            return rollback(
+                "dispatch_smoke_failed_after_migration: "
+                f"{(dispatch_smoke.stderr or dispatch_smoke.stdout).strip()[:150]}",
+                services_touched=False,
+            )
+        report.steps.append("dispatch_smoke_passed")
 
-    # Applied migrations are deliberately NOT rolled back on a later restart
-    # failure: this codebase's migration policy is expand-contract (each
-    # migration is backward-compatible with the previous code, and the
+    if cfg.release_root is not None:
+        try:
+            _point_current_at(
+                Path(cfg.release_root) / "current", _selector_for_sha(report.target_sha)
+            )
+        except (OSError, RuntimeError) as exc:
+            return rollback(f"release_selector_failed: {exc}", services_touched=False)
+        selector_flipped = True
+        report.steps.append(f"release_selected:{report.target_sha}")
+
+    # A completed `db upgrade` is deliberately NOT rolled back on a later
+    # restart failure: this codebase's migration policy is expand-contract
+    # (each migration is backward-compatible with the previous code, and the
     # legacy path is removed only by a separately accepted change), so the
-    # PREVIOUS code running against the migrated schema is the supported
-    # state by design. An automatic `downgrade` here would be the opposite
-    # of safety: it is the one operation that can DROP data, which is why
-    # the CLI gates it behind --yes-i-understand-this-drops-data.
+    # PREVIOUS code running against the upgraded database (schema and
+    # grants) is the supported state by design. An automatic `downgrade`
+    # here would be the opposite of safety: it is the one operation that can
+    # DROP data, which is why the CLI gates it behind
+    # --yes-i-understand-this-drops-data.
     failure = _restart_services(cfg, report)
     if failure is not None:
         # Half old, half new is the state rollback exists to prevent -- so

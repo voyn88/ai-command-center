@@ -42,15 +42,14 @@ host has configured, rather than adding a standalone reconciler here — the
 prune primitive belongs beside `remove_workspace`'s own use of it, the
 scheduling loop does not.
 
-Git-write surface: the only mutating git subcommands this module ever runs
-are `git worktree add` (from `provision_workspace`, only when the target path
-does not already exist) and `git worktree remove` / `git worktree prune`
-(from `remove_workspace`, only on a path already proven pipeline-owned, and
-from `prune_repository`, scoped to a repository path the caller already
-verified is configured on this host). It never runs
-`commit`/`push`/`merge`/`reset`/`rebase`/`clean`/`checkout`/branch-delete,
-and never touches a worktree it did not itself create or cannot prove it
-owns. All other git access is read-only, via `command_center.git_info`.
+Git-write surface: provisioning owns `git worktree add/remove/prune`.  The
+guarded publisher additionally materialises a dirty executor result through a
+fresh credential-free clone using `add`, `write-tree`, and `commit-tree`; the
+agent-controlled `.git` is never passed to those commands, and only verified
+content-addressed objects plus the exact task ref cross back.  This module
+never runs `push`/`merge`/`reset`/`rebase`/`clean`/branch-delete and never
+touches a worktree it did not create and verify. All other Git access is
+read-only, via `command_center.git_info`.
 """
 
 from __future__ import annotations
@@ -80,12 +79,39 @@ _MARKER_READ_ERRORS = (OSError, ValueError, TypeError)
 # PEP 758's bare `except OSError, UnicodeDecodeError:`, which is a
 # SyntaxError on the Python 3.12/3.13 runtimes this code actually ships on.
 _HEAD_READ_ERRORS = (OSError, UnicodeDecodeError)
+_GITHUB_SCP_REMOTE = re.compile(r"^git@github\.com:(?P<path>[^?#]+)$", re.IGNORECASE)
+_GITHUB_URL_REMOTE = re.compile(
+    r"^(?:https://github\.com/|ssh://git@github\.com/)(?P<path>[^?#]+)$",
+    re.IGNORECASE,
+)
 
 # Branch names that denote a repository's main line rather than isolated
 # feature/audit work. A task whose expected branch is one of these (or equals
 # its own base branch) is treated as main-line work that may legitimately run
 # in the primary working tree; anything else must run in an isolated worktree.
 MAIN_BRANCH_NAMES = frozenset({"main", "master"})
+
+
+def _repository_remote_identity(value: str) -> tuple[str, str]:
+    """Return the repository identity used by task-local ownership checks.
+
+    Git may rewrite an HTTPS GitHub URL to its SSH form through ``insteadOf``
+    before ``remote get-url`` returns it. Those spellings identify the same
+    repository and must not invalidate an otherwise correctly signed task
+    marker. Only the three credential-free canonical GitHub forms are
+    collapsed; every other remote remains byte-for-byte distinct.
+    """
+    match = _GITHUB_SCP_REMOTE.fullmatch(value) or _GITHUB_URL_REMOTE.fullmatch(value)
+    if match is None:
+        return "literal", value
+    path = match.group("path").strip("/")
+    if path.lower().endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) != 2 or not all(parts):
+        return "literal", value
+    return "github", "/".join(part.lower() for part in parts)
+
 
 # Working-tree cleanliness policies a caller can require before launch.
 STATUS_POLICY_ALLOW_DIRTY = "allow_dirty"  # default — never blocks on dirtiness
@@ -412,7 +438,7 @@ def is_feature_task(
 
 
 # --------------------------------------------------------------------------
-# Provisioning (the only git-write path: `git worktree add`)
+# Provisioning and trusted task-checkpoint Git writes
 # --------------------------------------------------------------------------
 
 
@@ -423,6 +449,7 @@ def _run_provision_git(
     spec: WorkspaceSpec,
     failed_step: str,
     timeout: int = 120,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -432,6 +459,7 @@ def _run_provision_git(
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
     except _GIT_OPERATION_ERRORS as exc:
         raise WorkspaceVerificationError(
@@ -1117,11 +1145,16 @@ def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
         "expected_branch": spec.expected_branch,
         "base_branch": spec.base_branch,
     }
-    static_failed = {
-        key: (marker.get(key), expected)
-        for key, expected in static_expected.items()
-        if marker.get(key) != expected
-    }
+    static_failed = {}
+    for key, expected in static_expected.items():
+        observed = marker.get(key)
+        matches = observed == expected
+        if key == "remote_url" and isinstance(observed, str):
+            matches = _repository_remote_identity(
+                observed
+            ) == _repository_remote_identity(expected)
+        if not matches:
+            static_failed[key] = (observed, expected)
     marker_base = str(marker.get("base_sha") or "").lower()
     marker_start = str(marker.get("start_sha") or "").lower()
     if (
@@ -1453,6 +1486,37 @@ _MAX_REF_BYTES = 4096
 _MAX_PACKED_REFS_BYTES = 16 * 1024 * 1024
 
 
+def _validate_task_branch_ref(expected_branch: str, workspace: Path) -> None:
+    """Apply Git's ref-name restrictions before any raw path operation."""
+    components = expected_branch.split("/")
+    forbidden = set(" ~^:?*[\\")
+    invalid = (
+        not expected_branch
+        or len(expected_branch.encode("utf-8", "surrogatepass")) > _MAX_REF_BYTES
+        or expected_branch == "@"
+        or expected_branch.startswith(('/', '.'))
+        or expected_branch.endswith(('/', '.'))
+        or ".." in expected_branch
+        or "@{" in expected_branch
+        or any(
+            part in {"", ".", ".."}
+            or part.startswith(".")
+            or part.endswith(".lock")
+            for part in components
+        )
+        or any(ord(char) < 32 or ord(char) == 127 or char in forbidden for char in expected_branch)
+    )
+    if invalid:
+        raise WorkspaceVerificationError(
+            failed_step="agent_head_branch",
+            remediation="Use a valid Git branch name below refs/heads.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="branch name is not a safe Git heads ref",
+        )
+
+
 def _read_pinned_regular(
     descriptor: int, initial: os.stat_result, *, max_bytes: int
 ) -> bytes:
@@ -1503,15 +1567,7 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
     # symlink, nor a hardlink can redirect any read.
     open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if any(part in {"", ".", ".."} for part in expected_branch.split("/")):
-        raise WorkspaceVerificationError(
-            failed_step="agent_head_branch",
-            remediation="Use a branch name without empty or dot path components.",
-            expected_workspace=str(workspace),
-            actual_workspace=str(workspace),
-            expected_branch=expected_branch,
-            detail="branch name would escape .git/refs/heads",
-        )
+    _validate_task_branch_ref(expected_branch, workspace)
     expected_ref = f"refs/heads/{expected_branch}"
     dir_fd: int | None = None
     head_fd: int | None = None
@@ -1577,9 +1633,7 @@ def _read_agent_head(workspace: Path, expected_branch: str) -> str:
                 ref_fd, ref_stat = opened
                 try:
                     candidate = (
-                        _read_pinned_regular(
-                            ref_fd, ref_stat, max_bytes=_MAX_REF_BYTES
-                        )
+                        _read_pinned_regular(ref_fd, ref_stat, max_bytes=_MAX_REF_BYTES)
                         .decode("ascii", "strict")
                         .strip()
                     )
@@ -1812,6 +1866,7 @@ def trusted_publish_clone(
         )
     with tempfile.TemporaryDirectory(prefix="aicc-trusted-publisher-") as raw:
         publisher = Path(raw) / "repo"
+        trusted_git_environment = _trusted_git_environment(Path(raw))
         spec = WorkspaceSpec(
             workspace_path=str(publisher), expected_branch=expected_branch
         )
@@ -1828,6 +1883,7 @@ def trusted_publish_clone(
             spec=spec,
             failed_step="provision_trusted_publisher_clone",
             timeout=180,
+            env=trusted_git_environment,
         )
         if trusted_base_sha is not None:
             _run_provision_git(
@@ -1835,6 +1891,7 @@ def trusted_publish_clone(
                 cwd=publisher,
                 spec=spec,
                 failed_step="trusted_base_present",
+                env=trusted_git_environment,
             )
         if current_base_sha is not None:
             _run_provision_git(
@@ -1842,6 +1899,7 @@ def trusted_publish_clone(
                 cwd=publisher,
                 spec=spec,
                 failed_step="current_base_present",
+                env=trusted_git_environment,
             )
         if trusted_base_sha is not None and current_base_sha is not None:
             _run_provision_git(
@@ -1849,6 +1907,7 @@ def trusted_publish_clone(
                 cwd=publisher,
                 spec=spec,
                 failed_step="trusted_base_ancestry",
+                env=trusted_git_environment,
             )
         if expected_remote_sha is not None:
             _run_provision_git(
@@ -1856,6 +1915,7 @@ def trusted_publish_clone(
                 cwd=publisher,
                 spec=spec,
                 failed_step="expected_remote_present",
+                env=trusted_git_environment,
             )
         _copy_agent_objects(workspace, publisher)
         checks = [
@@ -1884,20 +1944,19 @@ def trusted_publish_clone(
                 )
             )
         for argv, step in checks:
-            _run_provision_git(argv, cwd=publisher, spec=spec, failed_step=step)
+            _run_provision_git(
+                argv,
+                cwd=publisher,
+                spec=spec,
+                failed_step=step,
+                env=trusted_git_environment,
+            )
         _run_provision_git(
             ["switch", "-c", expected_branch, candidate_sha],
             cwd=publisher,
             spec=spec,
             failed_step="checkout_trusted_candidate",
-        )
-        safe_env = dict(os.environ)
-        safe_env.update(
-            {
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": "/dev/null",
-                "GIT_TERMINAL_PROMPT": "0",
-            }
+            env=trusted_git_environment,
         )
         clean = subprocess.run(
             [
@@ -1917,7 +1976,7 @@ def trusted_publish_clone(
             text=True,
             timeout=120,
             check=False,
-            env=safe_env,
+            env=trusted_git_environment,
         )
         if clean.returncode != 0 or (require_clean and clean.stdout.strip()):
             detail = (
@@ -1934,6 +1993,576 @@ def trusted_publish_clone(
                 detail=detail,
             )
         yield publisher
+
+
+def _trusted_git_environment(trusted_root: Path) -> dict[str, str]:
+    """Return an environment that cannot redirect trusted Git operations.
+
+    The worker environment is allowed to carry credentials for the later push,
+    but checkpoint materialisation is deliberately credential-free.  In
+    particular, inherited ``GIT_*`` variables must not replace the trusted
+    clone's object database, index, work tree, configuration, or executable.
+    """
+    config_home = trusted_root / ".aicc-git-home"
+    config_home.mkdir(mode=0o700, exist_ok=True)
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update(
+        {
+            # HOME/XDG are pinned as well as GIT_CONFIG_GLOBAL so Git versions
+            # predating that variable cannot fall back to worker-controlled
+            # ~/.gitconfig or $XDG_CONFIG_HOME/git/config.
+            "HOME": str(config_home),
+            "XDG_CONFIG_HOME": str(config_home),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_AUTHOR_NAME": "AI Command Center Worker",
+            "GIT_AUTHOR_EMAIL": "aicc-worker@localhost",
+            "GIT_COMMITTER_NAME": "AI Command Center Worker",
+            "GIT_COMMITTER_EMAIL": "aicc-worker@localhost",
+        }
+    )
+    environment.update(_trusted_system_gitconfig())
+    return environment
+
+
+#: Indirection so tests can present a root-owned file without being root.
+_system_gitconfig_stat = os.stat
+
+
+def _trusted_system_gitconfig() -> dict[str, str]:
+    """Return the Git config variables selecting the operator's system config.
+
+    Under principal isolation the lane's unit pins ``GIT_CONFIG_SYSTEM`` to a
+    root-owned file (``/etc/aicc/gitconfig``) carrying the fleet credential
+    helper and the ssh->https URL rewrite; without it the trusted publisher
+    clone cannot authenticate against private repositories at all
+    (VOYN-W0-AICC-FLEET-LAST-MILE-PUBLISH).  That file is operator authority,
+    not worker authority, so it is honoured only when it is owned by root and
+    writable by nobody else; any other value (worker-writable, missing,
+    relative, unset) disables the system config entirely, as before.
+    """
+    candidate = os.environ.get("GIT_CONFIG_SYSTEM", "")
+    if candidate and os.path.isabs(candidate):
+        try:
+            info = _system_gitconfig_stat(candidate)
+        except OSError:
+            info = None
+        if (
+            info is not None
+            and stat.S_ISREG(info.st_mode)
+            and info.st_uid == 0
+            and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            return {"GIT_CONFIG_SYSTEM": candidate}
+    return {"GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def _run_trusted_worktree_git(
+    publisher: Path,
+    workspace: Path,
+    argv: list[str],
+    *,
+    expected_branch: str,
+    failed_step: str,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run Git with only the fresh publisher's metadata and the task tree as data."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                f"--git-dir={publisher / '.git'}",
+                f"--work-tree={workspace}",
+                *argv,
+            ],
+            cwd=publisher,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env=_trusted_git_environment(publisher),
+        )
+    except _GIT_OPERATION_ERRORS as exc:
+        raise WorkspaceVerificationError(
+            failed_step=failed_step,
+            remediation="Preserve the dirty task clone and retry checkpointing.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"trusted Git operation could not run: {exc}",
+        ) from exc
+    if result.returncode != 0:
+        raise WorkspaceVerificationError(
+            failed_step=failed_step,
+            remediation="Preserve the dirty task clone and retry checkpointing.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=(result.stderr or result.stdout).strip() or "trusted Git operation failed",
+        )
+    return result
+
+
+def _open_standalone_agent_git_dir(
+    workspace: Path, *, expected_branch: str
+) -> int:
+    """Open the task clone's real `.git` directory without following pointers.
+
+    Mutating AICC tasks are provisioned by `_provision_task_local_clone` as
+    standalone clones.  A linked-worktree `gitdir:` file is deliberately not
+    followed: its target is workspace-controlled data and would widen every
+    descriptor-relative write outside the verified clone root.
+    """
+    git_path = workspace / ".git"
+    try:
+        path_stat = git_path.lstat()
+        if not stat.S_ISDIR(path_stat.st_mode):
+            raise OSError("expected a standalone task clone; .git is not a directory")
+        descriptor = os.open(
+            git_path,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_stat = os.fstat(descriptor)
+        if (
+            opened_stat.st_dev != path_stat.st_dev
+            or opened_stat.st_ino != path_stat.st_ino
+        ):
+            os.close(descriptor)
+            raise OSError("task clone .git directory changed while opening")
+        return descriptor
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_workspace_layout",
+            remediation="Re-provision the task as an AICC standalone task-local clone.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot open standalone task-clone Git directory: {exc}",
+        ) from exc
+
+
+def _copy_trusted_loose_object_to_agent(
+    publisher: Path, workspace: Path, oid: str, *, expected_branch: str
+) -> None:
+    """Copy one content-addressed object through no-follow directory fds."""
+    if len(oid) != 40 or any(char not in "0123456789abcdef" for char in oid):
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_object_id",
+            remediation="Preserve the dirty task clone for object-integrity inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="trusted Git returned a malformed object id",
+        )
+    if os.name == "nt":
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_platform",
+            remediation="Preserve the clone and checkpoint it on a Linux worker.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="secure no-follow object persistence is unavailable on Windows",
+        )
+    source = publisher / ".git" / "objects" / oid[:2] / oid[2:]
+    source_fd: int | None = None
+    try:
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        source_stat = os.fstat(source_fd)
+        payload = _read_pinned_regular(
+            source_fd, source_stat, max_bytes=_MAX_OBJECT_TRANSFER_BYTES
+        )
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_object_read",
+            remediation="Preserve the dirty task clone and retry checkpointing.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot read trusted loose object {oid}: {exc}",
+        ) from exc
+    finally:
+        if source_fd is not None:
+            os.close(source_fd)
+
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    git_fd = objects_fd = prefix_fd = target_fd = None
+    temporary = f".aicc-object-{secrets.token_hex(16)}"
+    try:
+        git_fd = _open_standalone_agent_git_dir(
+            workspace, expected_branch=expected_branch
+        )
+        objects_fd = os.open("objects", os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=git_fd)
+        try:
+            os.mkdir(oid[:2], mode=0o755, dir_fd=objects_fd)
+        except FileExistsError:
+            pass
+        prefix_fd = os.open(oid[:2], os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=objects_fd)
+        try:
+            target_fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                0o444,
+                dir_fd=prefix_fd,
+            )
+            view = memoryview(payload)
+            while view:
+                written = os.write(target_fd, view)
+                if written <= 0:
+                    raise OSError("object write made no progress")
+                view = view[written:]
+            os.fsync(target_fd)
+            os.close(target_fd)
+            target_fd = None
+            os.link(
+                temporary,
+                oid[2:],
+                src_dir_fd=prefix_fd,
+                dst_dir_fd=prefix_fd,
+                follow_symlinks=False,
+            )
+            os.unlink(temporary, dir_fd=prefix_fd)
+        except FileExistsError:
+            existing = os.open(oid[2:], os.O_RDONLY | nofollow, dir_fd=prefix_fd)
+            try:
+                existing_stat = os.fstat(existing)
+                if (
+                    not stat.S_ISREG(existing_stat.st_mode)
+                    or _read_pinned_regular(
+                        existing, existing_stat, max_bytes=_MAX_OBJECT_TRANSFER_BYTES
+                    )
+                    != payload
+                ):
+                    raise OSError(f"object collision for {oid}")
+            finally:
+                os.close(existing)
+            try:
+                os.unlink(temporary, dir_fd=prefix_fd)
+            except FileNotFoundError:
+                pass
+        os.fsync(prefix_fd)
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_object_write",
+            remediation="Preserve the dirty task clone for object-integrity inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot persist trusted object {oid}: {exc}",
+        ) from exc
+    finally:
+        if prefix_fd is not None:
+            try:
+                os.unlink(temporary, dir_fd=prefix_fd)
+            except FileNotFoundError:
+                pass
+        for descriptor in (target_fd, prefix_fd, objects_fd, git_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+
+
+@contextmanager
+def _lock_agent_branch_ref(
+    workspace: Path, *, expected_branch: str
+):
+    """Hold Git's conventional branch lock through index + ref persistence."""
+    _validate_task_branch_ref(expected_branch, workspace)
+    if os.name == "nt":
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_platform",
+            remediation="Preserve the clone and checkpoint it on a Linux worker.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="secure descriptor-relative ref persistence is unavailable on Windows",
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd: int | None = None
+    lock_name = f"{expected_branch.split('/')[-1]}.lock"
+    lock_fd: int | None = None
+    try:
+        directory_fd = _open_standalone_agent_git_dir(
+            workspace, expected_branch=expected_branch
+        )
+        for component in ("refs", "heads", *expected_branch.split("/")[:-1]):
+            try:
+                os.mkdir(component, mode=0o755, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | nofollow,
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        try:
+            lock_fd = os.open(
+                lock_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_ref_lock",
+                remediation="Retry after the existing task-branch writer finishes.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"task branch lock is already held: {exc}",
+            ) from exc
+    except WorkspaceVerificationError:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise
+    except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_lock",
+            remediation="Preserve the task clone for ref-integrity inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot securely lock the task branch: {exc}",
+        ) from exc
+    assert directory_fd is not None and lock_fd is not None
+    try:
+        yield directory_fd, lock_fd, lock_name
+    finally:
+        os.close(lock_fd)
+        try:
+            os.unlink(lock_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+
+
+def _advance_agent_branch_ref(
+    workspace: Path,
+    *,
+    expected_branch: str,
+    previous_sha: str,
+    checkpoint_sha: str,
+    directory_fd: int,
+    lock_fd: int,
+    lock_name: str,
+) -> None:
+    """Advance the task ref while its conventional Git lock is held."""
+    if _read_agent_head(workspace, expected_branch) != previous_sha:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_race",
+            remediation="Stop the remaining writer and retry from the preserved clone.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="task branch changed before checkpoint ref update",
+        )
+    try:
+        payload = f"{checkpoint_sha}\n".encode("ascii")
+        view = memoryview(payload)
+        while view:
+            written = os.write(lock_fd, view)
+            if written <= 0:
+                raise OSError("ref write made no progress")
+            view = view[written:]
+        os.fsync(lock_fd)
+        # Re-check while the shared Git lock excludes another ref writer.
+        if _read_agent_head(workspace, expected_branch) != previous_sha:
+            raise OSError("task branch changed during checkpoint ref update")
+        os.replace(
+            lock_name,
+            expected_branch.split("/")[-1],
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except OSError as exc:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_write",
+            remediation="Preserve the task clone for ref-integrity inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail=f"cannot atomically advance task ref: {exc}",
+        ) from exc
+    if _read_agent_head(workspace, expected_branch) != checkpoint_sha:
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_ref_verify",
+            remediation="Preserve the task clone for ref-integrity inspection.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="task branch did not retain the trusted checkpoint",
+        )
+
+
+def checkpoint_dirty_task_workspace(
+    workspace_path: str | Path,
+    *,
+    expected_branch: str,
+    remote_url: str,
+    start_sha: str,
+    trusted_base_sha: str,
+    expected_remote_sha: str | None,
+    expected_inode: tuple[int, int],
+    message: str,
+) -> tuple[str, bool]:
+    """Turn dirty agent output into one trusted commit without using agent Git metadata.
+
+    Candidate files are treated strictly as data.  The fresh publisher clone
+    owns configuration, hooks, index and object creation; only verified loose
+    objects and one exact branch ref are copied back into the task clone so a
+    failed push remains retryable.
+    """
+    workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
+    if os.name == "nt":
+        raise WorkspaceVerificationError(
+            failed_step="dirty_checkpoint_platform",
+            remediation="Preserve the clone and checkpoint it on a Linux worker.",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            expected_branch=expected_branch,
+            detail="automatic dirty-worktree checkpointing is fail-closed on Windows",
+        )
+    candidate_sha = task_workspace_candidate_sha(
+        workspace, expected_branch=expected_branch, expected_inode=expected_inode
+    )
+    with trusted_publish_clone(
+        workspace,
+        expected_branch=expected_branch,
+        remote_url=remote_url,
+        start_sha=start_sha,
+        trusted_base_sha=trusted_base_sha,
+        expected_remote_sha=expected_remote_sha,
+        expected_inode=expected_inode,
+        expected_candidate_sha=candidate_sha,
+        require_clean=False,
+    ) as publisher:
+        status = _run_trusted_worktree_git(
+            publisher,
+            workspace,
+            ["status", "--porcelain", "--untracked-files=all"],
+            expected_branch=expected_branch,
+            failed_step="dirty_checkpoint_status",
+        )
+        if not status.stdout.strip():
+            return candidate_sha, False
+        _run_trusted_worktree_git(
+            publisher,
+            workspace,
+            ["add", "-A"],
+            expected_branch=expected_branch,
+            failed_step="dirty_checkpoint_stage",
+        )
+        tree_sha = _run_trusted_worktree_git(
+            publisher,
+            workspace,
+            ["write-tree"],
+            expected_branch=expected_branch,
+            failed_step="dirty_checkpoint_tree",
+        ).stdout.strip()
+        parent_tree = _run_trusted_worktree_git(
+            publisher,
+            workspace,
+            ["rev-parse", f"{candidate_sha}^{{tree}}"],
+            expected_branch=expected_branch,
+            failed_step="dirty_checkpoint_parent_tree",
+        ).stdout.strip()
+        if tree_sha == parent_tree:
+            return candidate_sha, False
+        checkpoint_sha = _run_trusted_worktree_git(
+            publisher,
+            workspace,
+            ["commit-tree", tree_sha, "-p", candidate_sha],
+            expected_branch=expected_branch,
+            failed_step="dirty_checkpoint_commit",
+            input_text=message.rstrip() + "\n",
+        ).stdout.strip()
+        object_lines = _run_trusted_worktree_git(
+            publisher,
+            workspace,
+            ["rev-list", "--objects", f"{candidate_sha}..{checkpoint_sha}"],
+            expected_branch=expected_branch,
+            failed_step="dirty_checkpoint_object_list",
+        ).stdout.splitlines()
+        object_ids = [line.split(" ", 1)[0] for line in object_lines]
+        for oid in object_ids:
+            _copy_trusted_loose_object_to_agent(
+                publisher, workspace, oid, expected_branch=expected_branch
+            )
+        # Re-open and compare every destination object after the complete copy
+        # set is durable, before either index or branch ref can move.  The
+        # helper's existing-object path uses descriptor-pinned no-follow reads
+        # and compares through EOF, so a partial/corrupt copy fails here while
+        # the original dirty ref and index are still untouched.
+        for oid in object_ids:
+            _copy_trusted_loose_object_to_agent(
+                publisher, workspace, oid, expected_branch=expected_branch
+            )
+        # The task clone must remain internally clean if the later push or PR
+        # handoff fails and the workspace is preserved for retry.  This index
+        # was generated by the fresh trusted clone from the same exact tree;
+        # replacing the agent index as an opaque private file invokes no Git
+        # config, hooks, filters, or candidate code.
+        try:
+            trusted_index = (publisher / ".git" / "index").read_bytes()
+        except OSError as exc:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_index_read",
+                remediation="Preserve the dirty task clone and retry checkpointing.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail=f"cannot read trusted checkpoint index: {exc}",
+            ) from exc
+        # Serialize the index/ref pair with every Git-compatible ref writer.
+        # A second checkpoint can build concurrently, but it must acquire the
+        # same `<branch>.lock` and re-check the old SHA before touching either.
+        with _lock_agent_branch_ref(
+            workspace, expected_branch=expected_branch
+        ) as (directory_fd, lock_fd, lock_name):
+            if _read_agent_head(workspace, expected_branch) != candidate_sha:
+                raise WorkspaceVerificationError(
+                    failed_step="dirty_checkpoint_ref_race",
+                    remediation="Stop the remaining writer and retry from the preserved clone.",
+                    expected_workspace=str(workspace),
+                    actual_workspace=str(workspace),
+                    expected_branch=expected_branch,
+                    detail="task branch changed before checkpoint persistence",
+                )
+            _atomic_write_private(workspace / ".git" / "index", trusted_index)
+            _advance_agent_branch_ref(
+                workspace,
+                expected_branch=expected_branch,
+                previous_sha=candidate_sha,
+                checkpoint_sha=checkpoint_sha,
+                directory_fd=directory_fd,
+                lock_fd=lock_fd,
+                lock_name=lock_name,
+            )
+    # Re-open a fresh publisher after the ref update: this proves the copied
+    # object graph is complete and the task tree is now exactly clean.
+    with trusted_publish_clone(
+        workspace,
+        expected_branch=expected_branch,
+        remote_url=remote_url,
+        start_sha=start_sha,
+        trusted_base_sha=trusted_base_sha,
+        expected_remote_sha=expected_remote_sha,
+        expected_inode=expected_inode,
+        expected_candidate_sha=checkpoint_sha,
+        require_clean=True,
+    ):
+        pass
+    return checkpoint_sha, True
 
 
 def task_workspace_candidate_sha(
@@ -2283,3 +2912,75 @@ def prune_repository(repository_path: str | Path) -> str:
     except _GIT_OPERATION_ERRORS:
         return "prune_failed"
     return "pruned" if result.returncode == 0 else "prune_failed"
+
+
+def force_remove_worktree(repo_root: str | Path, worktree_path: str | Path) -> None:
+    """The one force-removal site for an ephemeral worktree the caller
+    itself created and unconditionally owns (VOYN-W0-AICC-WORKTREE-LEAK-
+    RETRY: an audit of leaked worktree checkouts traced 44 of them to eight
+    independent hand-rolled `git worktree remove --force` call sites --
+    `command_center.portfolio_launch`'s launch-rollback, `command_center.
+    worker.handlers`'s review-head verification checkout, and `scripts.
+    mirror_slice_checks`'s throwaway probe tree among them -- each with its
+    own, inconsistent idea of what to do when the `remove` itself fails.
+    Some left the directory *and* its `.git/worktrees/<name>` metadata
+    behind forever with no fallback and nothing else ever revisiting the
+    path; unlike those, this is the single implementation all of them call.
+
+    This is deliberately unlike `remove_workspace`: this function trusts the
+    caller's ownership claim completely (no `is_pipeline_owned_worktree`
+    gate) and always forces the removal, because every caller here already
+    knows unconditionally that the path is a worktree it just created for a
+    single throwaway use (a launch attempt being rolled back, a detached
+    verification checkout, a probe tree) -- never a long-lived, possibly
+    agent-modified workspace someone might still want to inspect after a
+    failure, which is what `remove_workspace`'s caution is for.
+
+    Best-effort and never raises: `git worktree remove --force` first: if
+    that fails (the path was already gone, a lock, or any other refusal),
+    unlock it (a single `--force` does not override a lock -- git demands
+    either `-f -f` or an explicit unlock first, and `git worktree prune`
+    below will not touch a locked entry no matter how long its directory has
+    been gone), then fall back to `shutil.rmtree` so the directory never
+    lingers just because git refused; then `git worktree prune` in the same
+    repo unconditionally, since a `--force` removal on some git versions can
+    succeed on the directory while leaving the `.git/worktrees/<name>` entry
+    dangling."""
+    repo = _resolve(repo_root)
+    target = Path(worktree_path)
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(target)],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        removed = result.returncode == 0
+    except _GIT_OPERATION_ERRORS:
+        removed = False
+    if not removed:
+        try:
+            subprocess.run(
+                ["git", "worktree", "unlock", str(target)],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except _GIT_OPERATION_ERRORS:
+            pass
+        shutil.rmtree(target, ignore_errors=True)
+    try:
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except _GIT_OPERATION_ERRORS:
+        pass

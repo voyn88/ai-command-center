@@ -51,6 +51,28 @@ import Testing
     #expect(DeviceTokenStore.load() == nil)
 }
 
+@Test func deviceCredentialAuditLogRecordsEveryAccessWithoutTheSecret() throws {
+    let url = FileManager.default.temporaryDirectory
+        .appending(path: "aicc-test-\(UUID().uuidString)/device-credential-audit.jsonl")
+    defer { DeviceCredentialAuditLog.clear(at: url) }
+
+    DeviceCredentialAuditLog.record(action: .save, outcome: .success, to: url)
+    DeviceCredentialAuditLog.record(action: .load, outcome: .success, to: url)
+    DeviceCredentialAuditLog.record(action: .delete, outcome: .success, to: url)
+    DeviceCredentialAuditLog.record(action: .load, outcome: .absent, to: url)
+
+    let entries = DeviceCredentialAuditLog.readAll(from: url)
+    #expect(entries.map(\.action) == [.save, .load, .delete, .load])
+    #expect(entries.map(\.outcome) == [.success, .success, .success, .absent])
+
+    // The audit trail must never contain the credential value itself.
+    let raw = try String(contentsOf: url, encoding: .utf8)
+    #expect(!raw.contains("round-trip-token"))
+
+    #expect(DeviceCredentialAuditLog.clear(at: url))
+    #expect(DeviceCredentialAuditLog.readAll(from: url).isEmpty)
+}
+
 /// Live end-to-end proof against a running Gateway v1 (opt-in via environment):
 /// AICC_ITEST_URL, AICC_ITEST_TOKEN, AICC_ITEST_PIN (path to the DER pin).
 @Test func liveGatewayConnectsOverHTTPSWithTokenAndPin() async throws {
@@ -86,6 +108,104 @@ import Testing
     #expect(SnapshotCache.load(from: url) == nil)
 }
 
+@Test func widgetSnippetsCoverAllThreeFlowsInOrderEveryTime() throws {
+    let snapshot = try Fixture.healthySnapshot()
+    let snippets = snapshot.widgetSnippets()
+    #expect(snippets.map(\.flow) == [.work, .dialogues, .decisions])
+}
+
+@Test func workSnippetSurfacesTheBlockedTaskBeforeAnyActiveTask() throws {
+    let snapshot = try Fixture.healthySnapshot()
+    let work = snapshot.widgetSnippets().first { $0.flow == .work }
+    #expect(work?.destination == .task(id: "VOYN-EXAMPLE-002"))
+    #expect(work?.statusLine == "Canary has not been verified")
+}
+
+@Test func workSnippetFallsBackToACalmInboxWhenNothingNeedsTheOwner() {
+    let empty = Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: [], lanes: [], events: [])
+    let work = empty.widgetSnippets().first { $0.flow == .work }
+    #expect(work?.destination == .flowInbox(.work))
+}
+
+@Test func dialoguesSnippetPicksTheMostRecentlyActiveDialogue() {
+    let older = DialogSummary(id: "d1", title: "Older", state: "open", lastActivityAt: Date(timeIntervalSince1970: 0), messageCount: 2, lastSummary: nil)
+    let newer = DialogSummary(id: "d2", title: "Newer", state: "open", lastActivityAt: Date(timeIntervalSince1970: 1000), messageCount: 5, lastSummary: nil)
+    let empty = Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: [], lanes: [], events: [])
+    let dialogues = empty.widgetSnippets(dialogs: [older, newer]).first { $0.flow == .dialogues }
+    #expect(dialogues?.destination == .dialogue(id: "d2"))
+    #expect(dialogues?.statusLine == "Newer · сообщений: 5")
+}
+
+@Test func decisionsSnippetStaysHonestAboutMissingBackingData() {
+    let empty = Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: [], lanes: [], events: [])
+    let decisions = empty.widgetSnippets().first { $0.flow == .decisions }
+    #expect(decisions?.destination == .flowInbox(.decisions))
+
+@Test func criticalSnapshotExposesExactlyOneOpenEscalation() throws {
+    let snapshot = try Fixture.criticalSnapshot()
+    #expect(snapshot.criticalEscalations.count == 1)
+    #expect(snapshot.criticalEscalations[0].severity == .critical)
+    #expect(snapshot.openCriticalEscalations().count == 1)
+}
+
+@Test func criticalEscalationCompletesWithOneTapAcknowledgement() throws {
+    let suiteName = "aicc-test-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let snapshot = try Fixture.criticalSnapshot()
+    let escalation = try #require(snapshot.criticalEscalations.first)
+
+    #expect(snapshot.openCriticalEscalations(acknowledged: EscalationAcknowledgementStore.acknowledgedIDs(defaults: defaults)).count == 1)
+
+    // The one tap.
+    let acknowledged = EscalationAcknowledgementStore.acknowledge(escalation.id, defaults: defaults)
+
+    #expect(acknowledged.contains(escalation.id))
+    #expect(snapshot.openCriticalEscalations(acknowledged: acknowledged).isEmpty)
+
+@Test func impactStoryDecodesTimelineChainAndRiskFromFixture() throws {
+    let snapshot = try Fixture.healthySnapshot()
+    let withStory = try #require(snapshot.tasks.first { $0.id == "VOYN-EXAMPLE-002" })
+    let story = try #require(withStory.story)
+    #expect(story.timeline.count == 3)
+    #expect(story.causeChain.count == 2)
+    #expect(story.risk == .medium)
+    #expect(snapshot.tasks.first { $0.id == "VOYN-EXAMPLE-001" }?.story == nil)
+}
+
+@Test func impactStoryNarrativeOrdersTimelineBeforeCauseChain() {
+    let story = ImpactStory(
+        timeline: [
+            ImpactTimelineStep(id: "b", occurredAt: Date(timeIntervalSince1970: 200), headline: "Second"),
+            ImpactTimelineStep(id: "a", occurredAt: Date(timeIntervalSince1970: 100), headline: "First")
+        ],
+        causeChain: [ImpactCauseLink(cause: "X failed", effect: "Y is blocked")],
+        risk: .high,
+        riskExplanation: "Customers may notice a delay."
+    )
+    #expect(story.narrative == ["First", "Second", "Because X failed, Y is blocked."])
+}
+
+@Test func impactRiskLevelOrdersFromLowToCritical() {
+    #expect(ImpactRiskLevel.low < .medium)
+    #expect(ImpactRiskLevel.medium < .high)
+    #expect(ImpactRiskLevel.high < .critical)
+}
+
+@Test func taskToleratesMissingOrMalformedStoryWithoutFailing() throws {
+    let missing = Data("""
+    {"id":"X","title":"T","blocker":null,"evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
+    """.utf8)
+    let taskWithoutStory = try JSONDecoder().decode(AICCNativeCore.Task.self, from: missing)
+    #expect(taskWithoutStory.story == nil)
+
+    let malformed = Data("""
+    {"id":"X","title":"T","blocker":null,"evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null},"story":{"risk":"unheard-of"}}
+    """.utf8)
+    let taskWithBadStory = try JSONDecoder().decode(AICCNativeCore.Task.self, from: malformed)
+    #expect(taskWithBadStory.story == nil)
+}
+
 @Test func taskStateDecodesKnownAndTolatesUnknown() throws {
     let known = Data("""
     {"id":"X","title":"T","blocker":null,"state":"deferred","evidence":{"headSHA":null,"pullRequest":null,"ci":"unknown","acceptance":"unknown","mergedSHA":null,"deployedSHA":null}}
@@ -98,4 +218,46 @@ import Testing
     """.utf8)
     let tolerant = try JSONDecoder().decode(AICCNativeCore.Task.self, from: future)
     #expect(tolerant.state == nil)
+}
+
+@Test func taskCriticalityRanksBlockerAboveAmbiguousAboveRoutine() {
+    let evidence = DeliveryEvidence(headSHA: nil, pullRequest: nil, ci: .unknown, acceptance: .unknown, mergedSHA: nil, deployedSHA: nil)
+    let blocked = AICCNativeCore.Task(id: "1", title: "T", blocker: "Waiting on owner", evidence: evidence)
+    #expect(blocked.criticality == .critical)
+
+    let ambiguous = AICCNativeCore.Task(id: "2", title: "T", blocker: nil, evidence: evidence)
+    #expect(ambiguous.evidence.derivedStatus == .unknown)
+    #expect(ambiguous.criticality == .high)
+
+    let awaitingAcceptance = DeliveryEvidence(headSHA: "abc", pullRequest: "#1", ci: .verified, acceptance: .pending, mergedSHA: nil, deployedSHA: nil)
+    #expect(awaitingAcceptance.derivedStatus == .awaitingAcceptance)
+    let pendingReview = AICCNativeCore.Task(id: "3", title: "T", blocker: nil, evidence: awaitingAcceptance)
+    #expect(pendingReview.criticality == .medium)
+
+    let routine = DeliveryEvidence(headSHA: "abc", pullRequest: "#1", ci: .verified, acceptance: .verified, mergedSHA: "def", deployedSHA: "fed")
+    #expect(routine.derivedStatus == .completed)
+    let done = AICCNativeCore.Task(id: "4", title: "T", blocker: nil, evidence: routine)
+    #expect(done.criticality == .low)
+}
+
+@Test func hapticPatternsAreDistinctAndEscalateWithCriticality() {
+    let patterns = Criticality.allCases.map(HapticSignal.pattern(for:))
+    // Every level maps to a pattern nobody else shares — pulse count and/or
+    // style differ, so the signal survives even if one dimension is missed.
+    for i in patterns.indices {
+        for j in patterns.indices where i != j {
+            #expect(patterns[i] != patterns[j])
+        }
+    }
+    // Longer or heavier as criticality rises: critical is never shorter than
+    // low, and it is the only level that carries the sharp `.error` pulse.
+    #expect(HapticSignal.pattern(for: .critical).pulses.count >= HapticSignal.pattern(for: .low).pulses.count)
+    #expect(HapticSignal.pattern(for: .critical).pulses.contains(.error))
+    #expect(!HapticSignal.pattern(for: .low).pulses.contains(.error))
+}
+
+@Test func criticalityOrdersLowToCritical() {
+    #expect(Criticality.low < .medium)
+    #expect(Criticality.medium < .high)
+    #expect(Criticality.high < .critical)
 }

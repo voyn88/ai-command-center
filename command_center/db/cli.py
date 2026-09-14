@@ -9,6 +9,8 @@ every deploy as the migrator. The application credential does neither.
     AICC_PG_USER=postgres       ... python -m command_center.db bootstrap
     AICC_PG_USER=aicc_migrator  ... python -m command_center.db upgrade
     AICC_PG_USER=aicc_app       ... python -m command_center.db status
+    AICC_PG_USER=aicc_app       ... python -m command_center.db fleet-status
+    AICC_PG_USER=aicc_operator  ... python -m command_center.db fleet-suspend <id> --reason ...
 """
 
 from __future__ import annotations
@@ -103,6 +105,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    export = sub.add_parser(
+        "backlog-export",
+        help=(
+            "Render the canonical store as the master-file markdown "
+            "projection (the read format of backlog_client / the console's "
+            "Master Backlog panel)."
+        ),
+    )
+    export.add_argument(
+        "--output",
+        required=True,
+        help="Destination path; written atomically (tmp + rename), whole file.",
+    )
     plan = sub.add_parser(
         "backlog-plan",
         help="One planner tick (BO-S2): release finished lanes, dispatch "
@@ -113,6 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Report the eligible set without dispatching.",
+    )
+    plan.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Deploy preflight: run backlog_dispatch_smoke() (0021) -- the read-only "
+        "probe with exactly dispatch's privileges -- and exit non-zero on refusal.",
     )
     review = sub.add_parser(
         "backlog-review",
@@ -127,6 +148,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Review and publish a verdict only for this exact backlog task id.",
     )
+    remediate = sub.add_parser(
+        "backlog-remediate",
+        help="One autonomy remediation tick: drain blocked READY_TO_REVIEW PRs "
+        "by refreshing stale exact-head review, rerunning bounded stale/red "
+        "checks, or spawning capped follow-up remediation tasks. Never merges "
+        "or posts acceptance directly. Needs --repo-path.",
+    )
+    remediate.add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    remediate.add_argument(
+        "--task-id",
+        default=None,
+        help="Remediate only this exact backlog task id.",
+    )
     sub.add_parser(
         "backlog-merge",
         help="One merge tick (BO-S3b): merge every reviewed PR whose ACCEPT "
@@ -140,6 +174,19 @@ def build_parser() -> argparse.ArgumentParser:
         "ancestor of the default branch (pre-fix rows recorded the PR head, "
         "not the merge commit). Never changes a task's status.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    sub.add_parser(
+        "backlog-pr-window",
+        help="One PR-window tick: label every open PR active/waiting/"
+        "blocked in a bounded rotation (voyn-aicc-pr-window.timer). "
+        "Only ever relabels -- never merges, approves, or weakens a gate. "
+        "GitHub only: opens no database connection, so it runs on any host "
+        "with a gh identity. Needs --repo-path.",
+    ).add_argument(
+        "--repo-path",
+        default=".",
+        help="Directory to run gh in. A clone, or any directory when GH_REPO "
+        "names the repository (the deploy-managed unit uses the release tree).",
+    )
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -171,6 +218,57 @@ def build_parser() -> argparse.ArgumentParser:
         "--branch",
         default="main",
         help="Remote branch to deploy from (the repository's default branch).",
+    )
+    self_deploy.add_argument(
+        "--rollout-lock",
+        default="/run/aicc-staged-rollout.lock",
+        help="Marker file the staged worker rollout holds for its duration; "
+        "a tick that finds it present refuses rather than racing the "
+        "rollout's own lane mutations.",
+    )
+    self_deploy.add_argument(
+        "--release-root",
+        default=None,
+        help="Optional immutable release root. When set, stage tracked source "
+        "under RELEASE_ROOT/releases/<sha> and atomically update "
+        "RELEASE_ROOT/current.",
+    )
+    self_deploy.add_argument(
+        "--release-venv",
+        default=None,
+        help="Runtime venv to expose as .venv inside each immutable release "
+        "(defaults to REPO_PATH/.venv when --release-root is set).",
+    )
+
+    # The fleet's single-panel view over enrolled worker-host devices
+    # (VOYN-MIN-FARM: "10 devices managed by one operational panel"). Reads
+    # run as whichever role connects (`aicc_app` or `aicc_operator`); suspend
+    # is `aicc_operator`-only, enforced by the grant on
+    # `identity_revoke_principal`, not by this CLI.
+    fleet_status = sub.add_parser(
+        "fleet-status",
+        help="List every enrolled worker-host device: state, host, live "
+        "credential expiry, and last audit event, in one query.",
+    )
+    fleet_status.add_argument(
+        "--state",
+        default=None,
+        choices=("active", "suspended", "retired"),
+        help="Restrict to one lifecycle state.",
+    )
+    fleet_status.add_argument(
+        "--limit", type=int, default=100, help="Rows to show (default 100)."
+    )
+    fleet_suspend = sub.add_parser(
+        "fleet-suspend",
+        help="Suspend a worker-host device and revoke its live credential(s) "
+        "(operator-only: an incident decision, not a routine one).",
+    )
+    fleet_suspend.add_argument(
+        "principal_id", help="The worker-host principal id from fleet-status."
+    )
+    fleet_suspend.add_argument(
+        "--reason", required=True, help="Audited reason for the suspension."
     )
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
@@ -214,6 +312,9 @@ def main(argv: list[str] | None = None) -> int:
                 branch=args.branch,
                 services=tuple(args.restart),
                 migrate=args.migrate,
+                rollout_lock_path=args.rollout_lock,
+                release_root=args.release_root,
+                release_venv=args.release_venv,
             ),
         )
         print(f"{deploy_report.outcome.upper():10} {deploy_report.detail}")
@@ -222,6 +323,44 @@ def main(argv: list[str] | None = None) -> int:
         # A refusal or rollback exits non-zero so systemd surfaces the
         # failed tick to the operator; noop/deployed is success.
         return 0 if deploy_report.outcome in ("noop", "deployed") else 1
+
+    if args.command == "backlog-pr-window":
+        # Deliberately BEFORE any database configuration or pool, like
+        # self-deploy above and for a sharper reason: the PR-window
+        # reconciler reads and writes GitHub and nothing else -- it takes no
+        # connection factory and touches no table -- so a database credential
+        # was a requirement that bought the tick nothing and cost it a host.
+        # It is what tied the tick to the one layout that had one
+        # (User=aicc-worker, /etc/ai-command-center.env), which the control
+        # plane does not have, which is why the labeller was never deployed
+        # there at all and every fleet PR opened without CI
+        # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL). The
+        # deploy-managed unit needs no EnvironmentFile, and the tick keeps
+        # labelling while the database is down.
+        from command_center.orchestrator.review_merge import reconcile_pr_window
+
+        window = reconcile_pr_window(args.repo_path)
+        if window.error is not None:
+            print(f"pr-window tick failed: {window.error}", file=sys.stderr)
+            if window.quota is not None:
+                # The quota line is exactly what tells an operator whether a
+                # failed listing was a rate limit, and under whose identity
+                # -- print it on the way out, not only on the happy path.
+                print(window.quota.line())
+            return 1
+        for number, head in window.active:
+            print(f"ACTIVE    #{number} -> {head}")
+        for number, head in window.waiting:
+            print(f"WAITING   #{number} -> {head}")
+        for number, reason in window.blocked:
+            print(f"BLOCKED   #{number}: {reason}")
+        for number, head in window.age_fallback:
+            print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+        for number, head in window.unreadable:
+            print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
+        if window.quota is not None:
+            print(window.quota.line())
+        return 0
 
     try:
         config = load_config()
@@ -296,6 +435,54 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 1
 
+            if args.command == "fleet-status":
+                from command_center.db.fleet_admin import FleetAdmin
+
+                devices = FleetAdmin(lambda: nullcontext(conn)).list_devices(
+                    state=args.state, limit=args.limit
+                )
+                if not devices:
+                    print("no worker-host devices enrolled")
+                    return 0
+                for device in devices:
+                    credential = device.credential_expires_at or "none issued"
+                    event = (
+                        f"{device.last_event_type}/{device.last_event_outcome}"
+                        f"@{device.last_event_at}"
+                        if device.last_event_type
+                        else "(no events)"
+                    )
+                    print(
+                        f"{device.principal_id}  state={device.state}  "
+                        f"host={device.host}  credential_expires={credential}  "
+                        f"last_event={event}"
+                    )
+                print(f"{len(devices)} device(s)")
+                return 0
+
+            if args.command == "fleet-suspend":
+                from command_center.db.fleet_admin import (
+                    FleetAdmin,
+                    UnknownDeviceError,
+                )
+
+                try:
+                    revoked = FleetAdmin(lambda: nullcontext(conn)).suspend(
+                        args.principal_id, args.reason
+                    )
+                except UnknownDeviceError:
+                    print(
+                        f"refused: {args.principal_id} is not an enrolled "
+                        "worker-host device",
+                        file=sys.stderr,
+                    )
+                    return 1
+                print(
+                    f"suspended {args.principal_id}; revoked {revoked} live "
+                    "credential(s)"
+                )
+                return 0
+
             if args.command == "backlog-import":
                 from pathlib import Path
 
@@ -332,11 +519,34 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{status}: {count}")
                 return 0
 
+            if args.command == "backlog-export":
+                from pathlib import Path as _Path
+
+                from command_center import projection_writer
+                from command_center.db import backlog_export
+
+                rows = backlog_export.fetch_rows(conn)
+                # Atomic whole-file replace lives in projection_writer — a
+                # reader (the console) must never see a half-written
+                # projection, and durable-write calls must stay out of this
+                # frozen-category module (AIOS boundary gate).
+                projection_writer.write_atomically(
+                    _Path(args.output), backlog_export.render_projection(rows)
+                )
+                print(f"rendered {len(rows)} records -> {args.output}")
+                return 0
+
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc
 
                 from command_center.orchestrator.planner import PlanLimits, plan_once
 
+                if args.smoke:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT backlog_dispatch_smoke()")
+                        (ok,) = cur.fetchone()
+                    print(f"SMOKE     backlog_dispatch_smoke={'ok' if ok else 'refused'}")
+                    return 0 if ok else 1
                 if args.dry_run:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -355,6 +565,23 @@ def main(argv: list[str] | None = None) -> int:
                 if report.planner_busy:
                     print("planner lease held elsewhere; nothing done")
                     return 0
+                if report.review_window_full is not None:
+                    print(
+                        "implementation dispatch paused: review backlog at "
+                        f"{report.review_window_full} "
+                        "(PlanLimits.review_backlog_limit)"
+                        + (
+                            "; lanes idle, dispatching this tick anyway"
+                            if report.idle_trickle
+                            else f"; {report.fenced} functional candidate(s) held"
+                        )
+                    )
+                for task_id in report.pipeline_bypass:
+                    print(f"PIPELINE  {task_id}: dispatched past the review fence")
+                for task_id in report.split_dispatched:
+                    print(f"SPLIT     {task_id}: dispatched in decomposition mode")
+                for task_id, failure in report.monitor_tasks:
+                    print(f"MONITOR   {task_id}: task for finding {failure}")
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
@@ -373,36 +600,98 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
+                    reconcile_pr_evidence,
+                    reconcile_review_once,
                     review_once,
                 )
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
-                report = review_once(
+                # One quota scope for the WHOLE tick: the four steps below
+                # all call `gh`, so counting them separately would tell an
+                # operator nothing about what the tick as a whole spent --
+                # and the identity is resolved once, here, rather than four
+                # times (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+                with gh_access.tick(args.repo_path) as quota:
+                    # Before selecting anything: a task whose PR exists but
+                    # was never recorded is invisible to every gate
+                    # downstream. This derives that evidence from the task's
+                    # own branch, so a pull request opened outside
+                    # `publish_run` still reaches review.
+                    evidence = reconcile_pr_evidence(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                    )
+                    for evidence_task_id, pr in evidence.recorded:
+                        print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                    for evidence_task_id, reason in evidence.skipped:
+                        print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    report = review_once(
+                        lambda: _nc(conn),
+                        enqueue,
+                        args.repo_path,
+                        task_id=args.task_id,
+                    )
+                    for task_id, pr in report.reviewed:
+                        print(f"REVIEW    {task_id} -> {pr}")
+                    for task_id, reason in report.skipped:
+                        print(f"SKIP      {task_id}: {reason}")
+                    retry_report = reconcile_review_once(
+                        lambda: _nc(conn),
+                        enqueue,
+                        args.repo_path,
+                        task_id=args.task_id,
+                    )
+                    for task_id, retry_key in retry_report.retried:
+                        print(f"RETRY     {task_id} -> {retry_key}")
+                    for task_id, reason in retry_report.skipped:
+                        print(f"RETRY-SKIP {task_id}: {reason}")
+                    marker_report = publish_review_verdicts(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id,
+                        # The same queue writer review_once uses: a REJECT
+                        # enqueues one finding-verification run before it may
+                        # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
+                        enqueue=enqueue,
+                    )
+                    for task_id, pr in marker_report.reviewed:
+                        print(f"MARKER    {task_id} -> {pr}")
+                    for task_id, new_task_id in marker_report.remediated:
+                        print(f"REMEDIATE {task_id} -> {new_task_id}")
+                    for task_id, reason in marker_report.skipped:
+                        print(f"SKIP      {task_id}: {reason}")
+                # Printed AFTER the scope closes: the remaining-budget half
+                # of the line is read on the way out (`gh api rate_limit`,
+                # which does not itself consume quota).
+                print(quota.line())
+                return 0
+
+            if args.command == "backlog-remediate":
+                from contextlib import nullcontext as _nc
+
+                from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.review_merge import (
+                    autonomy_remediate_once,
+                )
+
+                store = WorkQueueStore(lambda: _nc(conn))
+                report = autonomy_remediate_once(
                     lambda: _nc(conn),
-                    enqueue,
+                    _review_enqueue(store),
                     args.repo_path,
                     task_id=args.task_id,
                 )
-                for task_id, pr in report.reviewed:
-                    print(f"REVIEW    {task_id} -> {pr}")
+                for task_id, pr in report.refreshed:
+                    print(f"REFRESH   {task_id} -> {pr}")
+                for task_id, reason in report.rerun:
+                    print(f"RERUN     {task_id}: {reason}")
+                for task_id, new_task_id in report.remediated:
+                    print(f"REMEDIATE {task_id} -> {new_task_id}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
-                marker_report = publish_review_verdicts(
-                    lambda: _nc(conn), args.repo_path, task_id=args.task_id,
-                    # The same queue writer review_once uses: a REJECT
-                    # enqueues one finding-verification run before it may
-                    # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
-                    enqueue=enqueue,
-                )
-                for task_id, pr in marker_report.reviewed:
-                    print(f"MARKER    {task_id} -> {pr}")
-                for task_id, new_task_id in marker_report.remediated:
-                    print(f"REMEDIATE {task_id} -> {new_task_id}")
-                for task_id, reason in marker_report.skipped:
-                    print(f"SKIP      {task_id}: {reason}")
+                if report.quota is not None:
+                    print(report.quota.line())
                 return 0
 
             if args.command == "backlog-merge":
@@ -415,6 +704,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                if report.quota is not None:
+                    print(report.quota.line())
                 return 0
 
             if args.command == "backlog-merge-reconcile":

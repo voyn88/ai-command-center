@@ -26,7 +26,13 @@ The read-only inspection subcommands (`list-sessions`, `list-runs`,
 `run-status`, `events`, `reconcile`) have no such problem — they only read
 (or, for `reconcile`, conservatively reclassify) rows in the shared SQLite
 db, which genuinely is persistent cross-process state — and remain safe to
-call from any number of separate invocations at any time.
+call from any number of separate invocations at any time. `run-status` on a
+terminal-but-unfinalized run additionally waits on the durable
+`run.finalized_at` marker (`db.wait_for_run_finalized`) before printing, so a
+status query from a process that did not launch the run cannot read a
+"finished" run whose report and auto-commit are not durable yet — the same
+race `launch`'s foreground wait closes via `Supervisor.wait_for_run`, which
+only works within the launching process.
 
 Usage:
     python scripts/execution_center_debug.py list-sessions [--task-id ID]
@@ -420,7 +426,33 @@ def main() -> int:
     elif args.command == "list-runs":
         _print(api.list_runs(session_id=args.session_id, task_id=args.task_id, state=args.state))
     elif args.command == "run-status":
-        _print(api.get_run(args.run_id))
+        run = api.get_run(args.run_id)
+        if run is not None and run["state"] in db.TERMINAL_STATES and not run.get("finalized_at"):
+            # A terminal row read from a process that did not launch this run:
+            # `Supervisor.wait_for_run` would return instantly (`_active` is
+            # private to the launching process), reporting a run whose report
+            # and auto-commit may not exist yet as if it were finished. Poll
+            # the durable marker itself instead — the same one
+            # `count_unfinalized_runs` reads — which works from any process.
+            db.wait_for_run_finalized(
+                api.db_path,
+                args.run_id,
+                timeout=_FINALIZATION_TIMEOUT_SECONDS,
+                poll_interval=_POLL_INTERVAL_SECONDS,
+            )
+            run = api.get_run(args.run_id)
+            if run is not None and not run.get("finalized_at"):
+                print(
+                    f"WARNING: run {args.run_id} reached a terminal state but its "
+                    f"supervisor did not finish finalizing within "
+                    f"{_FINALIZATION_TIMEOUT_SECONDS:.0f}s — the process_exited "
+                    "event, the auto-commit of the agent's work and the run report "
+                    "may all be missing.",
+                    file=sys.stderr,
+                )
+                _print(run)
+                return _EXIT_CODE_UNFINALIZED
+        _print(run)
     elif args.command == "events":
         _print(api.get_events(args.run_id, after_seq=args.after_seq))
     elif args.command == "launch":
