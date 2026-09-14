@@ -901,6 +901,7 @@ def test_quarantine_task_workspace_moves_clone_and_marker_aside(tmp_path) -> Non
     parent = tmp_path / "root"
     clone = parent / "backlog-TASK-abc"
     (clone / "src").mkdir(parents=True)
+    (clone / ".git").mkdir()
     (clone / "src" / "file.py").write_text("x = 1\n")
     marker_dir = parent / ".aicc-task-metadata"
     marker_dir.mkdir()
@@ -948,3 +949,33 @@ def test_quarantine_task_workspace_never_raises(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(wp, "_task_local_marker_path", boom)
     assert wp.quarantine_task_workspace(clone) is None
     assert clone.exists()
+
+
+def test_quarantine_task_workspace_refuses_a_registered_worktree(tmp_path) -> None:
+    """A worktree carries a `.git` pointer file; renaming it would leave the
+    repository's `.git/worktrees/<name>` entry pointing at the old path."""
+    from command_center import workspace_provisioning as wp
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")
+    assert wp.quarantine_task_workspace(worktree) is None
+    assert worktree.exists()
+
+
+def test_restore_quarantined_task_workspace_puts_clone_and_marker_back(
+    tmp_path,
+) -> None:
+    from command_center import workspace_provisioning as wp
+
+    parent = tmp_path / "root"
+    clone = parent / "backlog-TASK-abc"
+    (clone / ".git").mkdir(parents=True)
+    (parent / ".aicc-task-metadata").mkdir()
+    marker = parent / ".aicc-task-metadata" / "backlog-TASK-abc.aicc-task-workspace.json"
+    marker.write_text("{}")
+    target = wp.quarantine_task_workspace(clone)
+    assert target is not None and not clone.exists() and not marker.exists()
+    assert wp.restore_quarantined_task_workspace(target, clone)
+    assert (clone / ".git").is_dir() and marker.is_file()
+    assert not Path(target).exists()

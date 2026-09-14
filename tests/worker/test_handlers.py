@@ -2457,3 +2457,27 @@ def test_uncheckpointed_clone_is_left_in_place_when_the_lease_is_lost(
     assert not outcome.ok and outcome.retryable and not outcome.infra_wait
     assert "lease lost" in outcome.reason
     assert called == [] and runs == []
+
+
+def test_lease_lost_during_quarantine_restores_the_clone(handler, monkeypatch) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    lost = _event()
+    restored: list[tuple[str, str]] = []
+
+    def quarantine(workspace):
+        lost.set()  # the lease evaporates while the move is in flight
+        return f"{workspace}.quarantined"
+
+    monkeypatch.setattr(workspace_provisioning, "quarantine_task_workspace", quarantine)
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "restore_quarantined_task_workspace",
+        lambda q, w: restored.append((str(q), str(w))) or True,
+    )
+    outcome = run_agent(_payload(task_type="implementation"), lost, 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "clone restored" in outcome.reason
+    assert len(restored) == 1 and runs == []

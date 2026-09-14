@@ -2734,6 +2734,28 @@ def _is_pipeline_owned_standalone_clone(
 # --------------------------------------------------------------------------
 
 
+def restore_quarantined_task_workspace(
+    quarantined_path: str | Path, workspace_path: str | Path
+) -> bool:
+    """Best-effort inverse of `quarantine_task_workspace` for the caller that
+    learns, right after the move, that it no longer owns the item. Returns
+    True when the clone (and its marker, if it was moved) is back."""
+    try:
+        quarantined = Path(os.path.abspath(Path(quarantined_path).expanduser()))
+        workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
+        if workspace.exists() or not quarantined.is_dir():
+            return False
+        os.rename(quarantined, workspace)
+        marker = quarantined.parent / f"{quarantined.name}.{_TASK_LOCAL_MARKER}"
+        if marker.is_file():
+            target = _task_local_marker_path(workspace)
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.rename(marker, target)
+        return True
+    except Exception:  # noqa: BLE001 - documented never-raises boundary
+        return False
+
+
 def quarantine_task_workspace(workspace_path: str | Path) -> str | None:
     """Move an uncheckpointed task clone (and its task-local marker) aside so
     the next delivery provisions a fresh clone while the work an agent left
@@ -2755,6 +2777,19 @@ def _quarantine_task_workspace(workspace_path: str | Path) -> str | None:
     workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
     info = workspace.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return None
+    # Only a STANDALONE clone can be moved by renaming its directory. A
+    # registered worktree carries a `.git` pointer FILE and an administrative
+    # entry under the repository's `.git/worktrees/<name>` that would keep
+    # naming the old path -- the next provisioning would then fail with
+    # "branch already checked out" instead of starting fresh. Refuse those:
+    # the caller keeps the ordinary bounded retry path.
+    git_entry = workspace / ".git"
+    try:
+        git_info = git_entry.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(git_info.st_mode):
         return None
     quarantine_root = workspace.parent / ".aicc-quarantine"
     quarantine_root.mkdir(mode=0o700, exist_ok=True)

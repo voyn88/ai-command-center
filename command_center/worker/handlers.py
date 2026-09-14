@@ -540,9 +540,18 @@ def _run_agent(
         # wrapping to the head of the cascade: attempt 2 lands on the second
         # link by construction (`_cascade_step`), and when that executor is
         # the one that is down (Codex out of quota / logged out for days on
-        # worker-01, 2026-09-14) a later-links-only search finds nothing and
-        # spends the task's attempt on a routing fact. The first link being
-        # healthy is exactly the case a second attempt exists to serve.
+        # worker-01, 2026-09-14) a later-links-only search finds nothing.
+        # Wrapping to an earlier, healthy link is deliberate even though it
+        # may have served attempt 1: an attempt's failure is overwhelmingly a
+        # fact about the run (checkpoint mismatch, launch refusal, a wrong
+        # diff), not about the executor, and the queue's own single-executor
+        # retry re-runs the same executor for exactly that reason. Waiting
+        # out a dead link instead would park the task for days.
+        # Eligibility: the delivery's own executor was membership-checked
+        # above; candidates must have a command builder and share the
+        # mutability class. A different-class link is not a misconfiguration
+        # -- review cascades legitimately mix classes -- it is simply not a
+        # substitute for this delivery.
         cascade_len = len(request.cascade)
         for offset in range(1, cascade_len):
             candidate_step = ((cascade_step - 1 + offset) % cascade_len) + 1
@@ -888,6 +897,23 @@ def _run_agent(
                         quarantined = workspace_provisioning.quarantine_task_workspace(
                             isolated_workspace
                         )
+                        # The lease is an async fact: re-check it after the
+                        # move. If it went away meanwhile a successor lane
+                        # may already own this item, so put the clone back
+                        # rather than strand whatever it commits next.
+                        if quarantined is not None and lease_lost.is_set():
+                            workspace_provisioning.restore_quarantined_task_workspace(
+                                quarantined, isolated_workspace
+                            )
+                            return HandlerOutcome(
+                                ok=False,
+                                reason=(
+                                    f"workspace isolation failed at {exc.failed_step}: "
+                                    f"{exc.detail}; lease lost during quarantine, "
+                                    "clone restored"
+                                ),
+                                retryable=True,
+                            )
                     return HandlerOutcome(
                         ok=False,
                         reason=(
