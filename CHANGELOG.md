@@ -8,6 +8,42 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — The writer-lease reaper actually runs, and can recover its own working directory (`VOYN-W0-AICC-REAPER-NOT-RUNNING`)
+- "Death of a connection does not release a claim": a `voyn-lease` row
+  outlives the process and the connection that took it, and nothing in the
+  protocol releases it — only expiry plus `ops/lease_reap.sh` does. That
+  sweep had no unit in this repository: "a cron-based reap sweep clears any
+  future stuck row within 5 minutes" (#358) described one hand-configured
+  host, so a stuck row still refused every later acquire with
+  `VOYN_LEASE_REFUSED` until a human noticed.
+  `deploy/systemd/voyn-aicc-lease-reap.{service,timer}` is that sweep as a
+  versioned, five-minute timer, and the script now logs an `OK: scanned N
+  row(s), reaped M` line per tick so "the reaper is running" is something an
+  operator can read rather than infer from silence.
+- The sweep no longer runs from the shared preprod clone. `voyn-lease`
+  resolves its working directory to a repository, and that clone is a tree
+  agents check out, detach and rewrite — a detached HEAD there (routine
+  during worktree work) made every sweep die on `invalid branch` exactly
+  when the fleet was busiest. It runs from a disposable identity repository
+  it owns outright, under the unit's own `StateDirectory` rather than in
+  anyone's home (`AICC_LEASE_REAP_REPO`, with `AICC_LEASE_REAP_LOG`,
+  `AICC_LEASE_REAP_ROOT`, `VOYN_LEASE_TOOL`, `PGPASSFILE` and
+  `VOYN_LEASE_DSN` all overridable by the unit instead of by editing the
+  script, and a `$HOME`-derived default that keeps the legacy hand-installed
+  cron entry pointing where it always did). The unit runs the copy inside
+  the immutable release, so the sweep a rebuilt host runs is the sweep this
+  commit describes.
+- That identity repository is validated against disk on *every* run — a work
+  tree, HEAD on a branch, the branch pointing at a real commit — rather than
+  inferred from the existence of `.git`, and it is built to completion in a
+  sibling scratch directory that is renamed into place only once it is
+  valid. An interrupted or failed bootstrap therefore publishes nothing,
+  and a repository that went bad by any route (unborn HEAD, deleted branch,
+  detached HEAD, missing `.git`) is rebuilt on the next tick instead of
+  poisoning every tick after it. A directory the script does not own — one
+  holding any file or any commit — is refused and left untouched, never
+  replaced.
+
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
   merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
