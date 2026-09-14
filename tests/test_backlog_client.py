@@ -10,6 +10,10 @@ degrades to an empty-but-usable projection when the master store is absent.
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
 import pytest
 
 from command_center import backlog_client as bc
@@ -89,6 +93,17 @@ def test_resolve_backlog_path_prefers_arg_then_env(monkeypatch, tmp_path):
     assert bc.resolve_backlog_path(explicit) == explicit  # arg wins over env
 
 
+def test_resolve_backlog_path_expands_tilde(monkeypatch):
+    # A "~"-relative path is a natural thing to put in the env var; a literal
+    # "~" path can never exist, which would otherwise silently read as
+    # "not connected" instead of the misconfiguration it actually is.
+    monkeypatch.delenv(bc.MASTER_BACKLOG_ENV, raising=False)
+    home = Path.home()
+    assert bc.resolve_backlog_path("~/VOYN_TASKS_BACKLOG.md") == home / "VOYN_TASKS_BACKLOG.md"
+    monkeypatch.setenv(bc.MASTER_BACKLOG_ENV, "~/env-backlog.md")
+    assert bc.resolve_backlog_path() == home / "env-backlog.md"
+
+
 def test_load_projection_reads_and_parses_the_master_store(tmp_path):
     f = tmp_path / "VOYN_TASKS_BACKLOG.md"
     f.write_text("\n".join([_TEMPLATE, _REC]), encoding="utf-8")
@@ -111,6 +126,45 @@ def test_unconfigured_backlog_is_empty_projection(monkeypatch):
     proj = bc.load_projection()
     assert proj.exists is False
     assert proj.records == []
+
+
+def test_broken_utf8_master_store_is_reported_not_raised(tmp_path):
+    f = tmp_path / "broken.md"
+    f.write_bytes(b"- VOYN_RECOMMENDATION | ts=\xff\xfe broken bytes")
+    proj = bc.load_projection(f)  # must not raise UnicodeDecodeError
+    assert proj.exists is False
+    assert proj.records == []
+    assert proj.read_error is not None
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores file permission bits",
+)
+@pytest.mark.skipif(sys.platform == "win32", reason="posix permission bits only")
+def test_permission_denied_master_store_is_reported_not_raised(tmp_path):
+    f = tmp_path / "secret.md"
+    f.write_text(_REC, encoding="utf-8")
+    f.chmod(0o000)
+    try:
+        proj = bc.load_projection(f)  # must not raise PermissionError
+        assert proj.exists is False
+        assert proj.records == []
+        assert proj.read_error is not None
+    finally:
+        f.chmod(0o644)
+
+
+def test_load_projection_has_no_toctou_gap_between_check_and_read(tmp_path):
+    # Absence must be reported as "not connected", not surfaced as a crash,
+    # even though the file existed a moment before the read (the pattern a
+    # preceding `is_file()` check cannot protect against).
+    f = tmp_path / "vanishes.md"
+    f.write_text(_REC, encoding="utf-8")
+    f.unlink()
+    proj = bc.load_projection(f)
+    assert proj.exists is False
+    assert proj.read_error is None
 
 
 def test_approved_recommendations_filters_to_executable(tmp_path):
@@ -143,14 +197,61 @@ def test_client_exposes_no_write_surface():
         ), f"backlog_client must stay read-only; found {banned!r}-like attribute"
 
 
+def test_client_module_never_calls_a_filesystem_write_api():
+    # A name-substring scan over `dir(bc)` only catches a *symbol* that sounds
+    # like a writer; it would happily miss, say, a helper named `_persist`
+    # that calls `Path.write_text` under the hood, or a bare `open(..., "w")`
+    # inline in an existing function. Scan the actual source for the write
+    # APIs a Path/file-based module could use instead.
+    import inspect
+
+    source = inspect.getsource(bc)
+    write_calls = (
+        "write_text(",
+        "write_bytes(",
+        ".mkdir(",
+        ".rmdir(",
+        ".unlink(",
+        ".touch(",
+        ".chmod(",
+        "os.remove",
+        "os.unlink",
+        "os.rename",
+        "os.replace",
+        "os.mkdir",
+        "os.makedirs",
+        "shutil.",
+    )
+    found = [call for call in write_calls if call in source]
+    assert not found, f"backlog_client must stay read-only; found {found!r} in source"
+    # Every current caller reads via `Path.read_text`; a bare `open(path, "w")`
+    # would not trip any of the calls above, so flag `open(` outright too.
+    assert "open(" not in source, "backlog_client must stay read-only; found open("
+
+
 def test_summarize_counts_by_facet():
     draft = _REC.replace("PO-Approved", "AI-Reco").replace("priority=P0", "priority=P1")
     summary = bc.summarize(bc.parse_recommendations("\n".join([_REC, draft])))
     assert summary.total == 2
     assert summary.approved == 1
-    assert summary.by_priority == {"P0": 1, "P1": 1}
+    # Every declared priority is listed, even at zero — a blank P2 column is
+    # itself information (nothing urgent-but-not-critical is pending).
+    assert summary.by_priority == {"P0": 1, "P1": 1, "P2": 0}
     assert summary.by_status == {"AI-Reco": 1, "PO-Approved": 1}
     assert summary.by_wave == {"W1": 2}
+
+
+def test_wave_breakdown_and_queue_sort_naturally_not_lexicographically():
+    # W10 must not land between W1 and W2 (plain string sort would do that).
+    w1 = _REC.replace("VOYN-W1-UI", "A")
+    w2 = _REC.replace("VOYN-W1-UI", "B").replace("proposed_wave=W1", "proposed_wave=W2")
+    w10 = _REC.replace("VOYN-W1-UI", "C").replace("proposed_wave=W1", "proposed_wave=W10")
+    records = bc.parse_recommendations("\n".join([w10, w1, w2])).records
+    summary = bc.summarize(bc.Projection(records=records))
+    assert list(summary.by_wave.keys()) == ["W1", "W2", "W10"]
+
+    queue = bc.execution_queue(bc.Projection(records=records))
+    assert [r.issue_id for r in queue] == ["A", "B", "C"]
 
 
 def test_execution_queue_is_approved_only_and_priority_ordered():
@@ -224,6 +325,100 @@ def test_page_explains_when_backlog_not_connected(monkeypatch, tmp_path):
     assert any(bc.MASTER_BACKLOG_ENV in str(w.value) for w in at.warning)
     # An unconnected page must not have rendered the records table metrics.
     assert "Всего записей" not in [m.label for m in at.metric]
+
+
+def test_page_reports_unreadable_source_instead_of_crashing(monkeypatch, tmp_path):
+    f = tmp_path / "broken.md"
+    f.write_bytes(b"- VOYN_RECOMMENDATION | ts=\xff\xfe broken")
+    at = _run_page(monkeypatch, f)
+    assert not at.exception  # the old bug let UnicodeDecodeError reach the page
+    assert at.error  # surfaced as an explicit error, not silence or a crash
+    assert any(str(f) in str(e.value) for e in at.error)
+    # Must not be conflated with the plain "not connected" warning copy.
+    assert not any(bc.MASTER_BACKLOG_ENV in str(w.value) for w in at.warning)
+
+
+def test_page_queue_table_matches_the_execution_queue(monkeypatch, tmp_path):
+    p1 = _REC.replace("VOYN-W1-UI", "SECOND").replace("priority=P0", "priority=P1")
+    f = tmp_path / "b.md"
+    f.write_text("\n".join([_REC, p1]), encoding="utf-8")
+    at = _run_page(monkeypatch, f)
+    assert not at.exception
+    queue_rows = at.dataframe[0].value
+    assert list(queue_rows["id"]) == ["VOYN-W1-UI", "SECOND"]  # P0 before P1
+    assert list(queue_rows["приоритет"]) == ["P0", "P1"]
+
+
+def test_page_truncates_queue_table_with_a_visible_notice(monkeypatch, tmp_path):
+    many = "\n".join(
+        _REC.replace("VOYN-W1-UI", f"VOYN-W1-{i:03d}") for i in range(60)
+    )
+    f = tmp_path / "b.md"
+    f.write_text(many, encoding="utf-8")
+    at = _run_page(monkeypatch, f)
+    assert not at.exception
+    metric_values = {m.label: m.value for m in at.metric}
+    assert metric_values["В очереди исполнения"] == "60"  # the full count
+    assert len(at.dataframe[0].value) == 50  # display cap
+    assert any("50" in str(c.value) and "60" in str(c.value) for c in at.caption)
+
+
+def test_page_breakdown_tables_match_summary_counts(monkeypatch, tmp_path):
+    at = _run_page(monkeypatch, _backlog_fixture(tmp_path))
+    assert not at.exception
+    # _backlog_fixture writes 2 records (both wave=W1, priority=P0, domain=ux),
+    # one PO-Approved and one AI-Reco draft.
+    # Column order: wave, priority, status, domain (see render_master_backlog_page).
+    wave_table, priority_table, status_table, domain_table = at.table
+    assert dict(zip(wave_table.value[""], wave_table.value["n"])) == {"W1": 2}
+    assert list(priority_table.value[""]) == ["P0", "P1", "P2"]  # declared order, incl. zero
+    assert list(priority_table.value["n"]) == [2, 0, 0]
+    assert dict(zip(status_table.value[""], status_table.value["n"])) == {
+        "AI-Reco": 1,
+        "PO-Approved": 1,
+    }
+    assert dict(zip(domain_table.value[""], domain_table.value["n"])) == {"ux": 2}
+
+
+def test_page_search_and_facet_filters_narrow_the_records_table(monkeypatch, tmp_path):
+    other = (
+        _REC.replace("VOYN-W1-UI", "OTHER")
+        .replace("task=build_dashboard_desktop_on_api_and_tokens", "task=fix_login_bug")
+        .replace("parallel_domain=ux", "parallel_domain=api")
+    )
+    f = tmp_path / "b.md"
+    f.write_text("\n".join([_REC, other]), encoding="utf-8")
+    at = _run_page(monkeypatch, f)
+    assert not at.exception
+    assert len(at.dataframe[1].value) == 2  # unfiltered: both records
+
+    at.text_input(key="mb_query").set_value("login").run()
+    assert len(at.dataframe[1].value) == 1
+    assert at.dataframe[1].value["id"].iloc[0] == "OTHER"
+    assert "Показано 1 из 2" in at.caption[-1].value
+
+    at.text_input(key="mb_query").set_value("").run()
+    at.selectbox(key="mb_domain").select("ux").run()  # select() takes the raw value
+    assert list(at.dataframe[1].value["id"]) == ["VOYN-W1-UI"]
+
+
+def test_page_shows_parse_error_disclosure_expander(monkeypatch, tmp_path):
+    bad = "- VOYN_RECOMMENDATION | ts=x | garbage-not-enough-fields"
+    f = tmp_path / "b.md"
+    f.write_text("\n".join([_REC, bad]), encoding="utf-8")
+    at = _run_page(monkeypatch, f)
+    assert not at.exception
+    metric_values = {m.label: m.value for m in at.metric}
+    assert metric_values["Ошибок парсинга"] == "1"
+    assert len(at.expander) == 1
+    expander_text = " ".join(str(t.value) for t in at.expander[0].text)
+    assert "стр. 2" in expander_text
+
+
+def test_page_hides_error_expander_when_nothing_failed_to_parse(monkeypatch, tmp_path):
+    at = _run_page(monkeypatch, _backlog_fixture(tmp_path))
+    assert not at.exception
+    assert at.expander == []
 
 
 def test_rich_records_parse_exact_statuses_and_slug():
