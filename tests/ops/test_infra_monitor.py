@@ -1263,3 +1263,190 @@ def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
     assert any(f.startswith("crash_loop:") for f in payload["failures"])
     assert any(f.startswith("deploy_lag:") for f in payload["failures"])
     assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# Systemd drift (VOYN-W0-AICC-SYSTEMD-DRIFT-VERSIONED-UNITS).
+#
+# The 2026-08-29 audit found that not one unit on either host came from the
+# repository -- 22 versioned units unused, the fleet running hand-made copies,
+# some of them symlinks into an operator's home. The cost was not the units:
+# it was that every unit fix merged through the pipeline was inert, and only
+# a human audit could tell. These tests are the measurement that was missing.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).parents[2]
+
+
+def _fake_host(root: Path, profile: str, *, skip: tuple[str, ...] = ()) -> None:
+    """Install every unit the profile owns, byte-for-byte, under `root`."""
+    for spec in infra_monitor.load_install_specs(str(REPO_ROOT), profile=profile):
+        if not spec.target.startswith(infra_monitor.SYSTEM_UNIT_DIR + "/"):
+            continue
+        if spec.remove or spec.target in skip:
+            continue
+        installed = root / spec.target.lstrip("/")
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_bytes(Path(spec.source).read_bytes())
+
+
+@pytest.mark.parametrize("profile", ("worker", "control"))
+def test_a_host_running_the_repository_units_reports_no_drift(
+    tmp_path, profile
+) -> None:
+    root = tmp_path / "root"
+    _fake_host(root, profile)
+
+    snapshot = infra_monitor.read_unit_drift_snapshot(
+        str(REPO_ROOT), profile=profile, root=str(root)
+    )
+
+    assert snapshot.error is None
+    assert snapshot.judged > 0
+    assert not (
+        snapshot.absent
+        or snapshot.diverged
+        or snapshot.unmanaged
+        or snapshot.retired
+    )
+    assert evaluate({}, None, minimum_active_workers=0, max_stalled_seconds=900,
+                    prometheus_ready=True, unit_drift=snapshot).ok
+
+
+def test_the_fleets_actual_shape_is_four_separate_findings(tmp_path) -> None:
+    """A symlink into an operator's home, a merged unit fix that never
+    reached the host, a unit nothing ever installed, and a retired unit still
+    in place -- the four states the audit found, each its own finding class
+    because each has a different fix."""
+    root = tmp_path / "root"
+    absent_target = "/etc/systemd/system/voyn-aicc-github-token.timer"
+    _fake_host(root, "worker", skip=(absent_target,))
+    units = root / "etc/systemd/system"
+
+    home_unit = tmp_path / "operator-home/voyn-aicc-self-deploy.service"
+    home_unit.parent.mkdir(parents=True)
+    home_unit.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
+    (units / "voyn-aicc-self-deploy.service").unlink()
+    (units / "voyn-aicc-self-deploy.service").symlink_to(home_unit)
+    (units / "voyn-aicc-worker@.service").write_text(
+        "[Service]\n# the fix that merged and never arrived\n", encoding="utf-8"
+    )
+
+    snapshot = infra_monitor.read_unit_drift_snapshot(
+        str(REPO_ROOT), profile="worker", root=str(root)
+    )
+
+    assert snapshot.error is None
+    assert snapshot.unmanaged == ("/etc/systemd/system/voyn-aicc-self-deploy.service",)
+    assert snapshot.diverged == ("/etc/systemd/system/voyn-aicc-worker@.service",)
+    assert snapshot.absent == (absent_target,)
+    assert snapshot.retired == ()
+
+    report = evaluate({}, None, minimum_active_workers=0, max_stalled_seconds=900,
+                      prometheus_ready=True, unit_drift=snapshot)
+    assert not report.ok
+    assert report.failures == (
+        "unit_hand_made:1:voyn-aicc-self-deploy.service",
+        "unit_drift:1:voyn-aicc-worker@.service",
+        "unit_absent:1:voyn-aicc-github-token.timer",
+    )
+    # Four classes, four planner tasks -- the identity is the code before the
+    # first ':', so a second drifted unit does not open a second task.
+    assert [infra_monitor.finding_key(f) for f in report.failures] == [
+        "unit_hand_made",
+        "unit_drift",
+        "unit_absent",
+    ]
+
+
+def test_a_control_host_still_carrying_the_worker_agent_layer_is_drift(
+    tmp_path,
+) -> None:
+    """The control profile does not merely decline to install the agent
+    layer, it removes it. A worker-only unit still present on a control host
+    is a conversion that did not happen, and the probe says so rather than
+    counting the file as fine because nothing claims to own it."""
+    root = tmp_path / "root"
+    _fake_host(root, "control")
+    launcher = root / "etc/systemd/system/aicc-agent-launcher.socket"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_text("[Socket]\n", encoding="utf-8")
+
+    snapshot = infra_monitor.read_unit_drift_snapshot(
+        str(REPO_ROOT), profile="control", root=str(root)
+    )
+
+    assert snapshot.retired == ("/etc/systemd/system/aicc-agent-launcher.socket",)
+    report = evaluate({}, None, minimum_active_workers=0, max_stalled_seconds=900,
+                      prometheus_ready=True, unit_drift=snapshot)
+    assert report.failures == (
+        "unit_retired_present:1:aicc-agent-launcher.socket",
+    )
+
+
+def test_the_probe_reads_the_installers_own_spec_list_not_a_second_copy() -> None:
+    """A drift probe with its own list of unit names is a second thing to
+    drift. The authority is `default_specs`, so the self-deploy tick the
+    installer now owns -- the crutch the audit named -- is judged without
+    anyone adding it here."""
+    worker = {
+        spec.target
+        for spec in infra_monitor.load_install_specs(str(REPO_ROOT), profile="worker")
+        if not spec.remove
+    }
+    control = {
+        spec.target
+        for spec in infra_monitor.load_install_specs(str(REPO_ROOT), profile="control")
+        if not spec.remove
+    }
+
+    assert "/etc/systemd/system/voyn-aicc-self-deploy.service" in worker & control
+    assert "/etc/systemd/system/voyn-aicc-self-deploy.timer" in worker & control
+    assert "/etc/systemd/system/voyn-infra-monitor.timer" in worker - control
+    assert "/etc/systemd/system/voyn-queue-monitor.timer" in control - worker
+
+
+def test_a_probe_that_cannot_measure_fails_closed(tmp_path) -> None:
+    snapshot = infra_monitor.read_unit_drift_snapshot(
+        str(tmp_path / "no-checkout-here"), profile="worker", root=str(tmp_path)
+    )
+
+    assert snapshot.error is not None
+    assert snapshot.judged == 0
+    report = evaluate({}, None, minimum_active_workers=0, max_stalled_seconds=900,
+                      prometheus_ready=True, unit_drift=snapshot)
+    assert not report.ok
+    assert report.failures[0].startswith("unit_drift_probe_failed:")
+
+
+def test_a_half_configured_drift_probe_is_a_usage_error(monkeypatch) -> None:
+    """Guessing the profile would report every unit of the other role as
+    missing, so the repo and the profile are given together or not at all."""
+    monkeypatch.delenv("AICC_UNIT_DRIFT_PROFILE", raising=False)
+    monkeypatch.delenv("AICC_UNIT_DRIFT_REPO", raising=False)
+    with pytest.raises(SystemExit):
+        infra_monitor.parse_args(
+            ["--prometheus-url", "http://m/ready", "--unit-drift-repo", "."]
+        )
+    with pytest.raises(SystemExit):
+        infra_monitor.parse_args(
+            ["--prometheus-url", "http://m/ready", "--unit-drift-profile", "worker"]
+        )
+
+
+def test_both_deploy_managed_probes_watch_their_own_profile() -> None:
+    """The probe is only a measurement if the fleet runs it."""
+    worker_unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
+    queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
+
+    assert "Environment=AICC_UNIT_DRIFT_REPO=." in worker_unit
+    assert "Environment=AICC_UNIT_DRIFT_PROFILE=worker" in worker_unit
+    assert "Environment=AICC_UNIT_DRIFT_REPO=." in queue_unit
+    assert "Environment=AICC_UNIT_DRIFT_PROFILE=control" in queue_unit
+    # Neither new line names an absolute home path: a public repository
+    # cannot restate one (scripts/ci/prepush/leak_guard.sh), which is exactly
+    # why both knobs are environment defaults rather than ExecStart flags.
+    for unit in (worker_unit, queue_unit):
+        for line in unit.splitlines():
+            if line.startswith("Environment=AICC_UNIT_DRIFT_REPO="):
+                assert line == "Environment=AICC_UNIT_DRIFT_REPO=."
