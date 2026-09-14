@@ -671,3 +671,28 @@ def test_verdictless_chunk_reaches_a_marker_without_a_human(monkeypatch):
 
     report = review_merge.publish_review_verdicts(None, "/repo")
     assert posted == [("ACCEPT", HEAD)] and report.reviewed == [(TASK, PR)]
+
+
+def test_reconcile_is_idempotent_across_ticks(monkeypatch):
+    """Two flavours of idempotence the queue's dedup depends on: a tick that
+    re-runs before its enqueue landed must derive the SAME retry key (so the
+    upsert on (queue, idempotency_key) resolves it to one item), and a tick
+    that runs after it landed must dispatch nothing at all while that
+    attempt is still live."""
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    verdict = f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"
+    rows_before = attempts_for(
+        snapshot,
+        [("succeeded", verdict), ("succeeded", verdict), ("succeeded", "transcript")],
+    )
+
+    _report, first = reconcile(monkeypatch, snapshot, rows_before)
+    _report, second = reconcile(monkeypatch, snapshot, rows_before)
+    assert [call[1] for call in first] == [call[1] for call in second]
+    assert [call[2] for call in first] == [call[2] for call in second]
+
+    retry_key = first[0][1]
+    report, third = reconcile(
+        monkeypatch, snapshot, [*rows_before, (retry_key, "ready", None)]
+    )
+    assert not third and report.skipped == [(TASK, "no_review_chunk_eligible_for_retry")]
