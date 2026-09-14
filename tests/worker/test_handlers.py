@@ -19,6 +19,7 @@ import pytest
 
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
+from command_center.worker import writer_lease
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
 
@@ -866,6 +867,91 @@ def test_lease_lost_mid_run_discards_outcome_and_never_publishes(
     assert publish_calls == []
 
 
+def test_lease_lost_during_dirty_checkpoint_is_never_signed_or_published(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-DEAD-QUEUE-THREE-WRITER-CONTENTION-CLASSES: the post-run
+    `lease_lost.is_set()` check (test above) only proves the agent
+    subprocess exited -- it says nothing about the checkpoint/publish work
+    that follows, which can itself run long enough (a trusted-clone network
+    fetch, an `fsck`) for the writer-lease renewal thread to lose the lease.
+    A redelivered second attempt is then free to acquire the now-unheld
+    lease and verify/write the SAME workspace while this attempt's
+    checkpoint code is still running -- the exact race behind the
+    `task_workspace_checkpoint` and `agent_worktree_clean` dead-letter
+    classes. `checkpoint_dirty_task_workspace` here sets `lease_lost` as a
+    side effect, simulating the renewal thread losing the lease mid-call;
+    the handler must refuse to sign a new checkpoint or publish afterward."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    publish_calls: list = []
+
+    def fake_publish(repository, cfg):
+        publish_calls.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    event = _event()
+
+    def dirty_checkpoint_then_lose_lease(workspace, **kwargs):
+        event.set()
+        return "0" * 40, False
+
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_dirty_task_workspace",
+        dirty_checkpoint_then_lose_lease,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda *a, **kw: pytest.fail("must not sign a checkpoint after lease loss"),
+    )
+
+    outcome = run_agent(_payload(task_type="implementation"), event, 1)
+
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "lease lost" in outcome.reason
+    assert publish_calls == []
+
+
+def test_lease_lost_before_local_only_checkpoint_is_never_signed(
+    handler, monkeypatch
+) -> None:
+    """Same race as the guarded-publish case above, in the no-deploy-key
+    ("local commit only") path: `checkpoint_task_workspace` there is the
+    last remaining mutation, and it must not run once the lease is gone."""
+    run_agent, _runs = handler
+    monkeypatch.delenv("AICC_PUBLISH_DEPLOY_KEY", raising=False)
+
+    event = _event()
+
+    def candidate_sha_then_lose_lease(workspace, **kwargs):
+        event.set()
+        return "0" * 40
+
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        candidate_sha_then_lose_lease,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda *a, **kw: pytest.fail("must not sign a checkpoint after lease loss"),
+    )
+
+    outcome = run_agent(_payload(task_type="implementation"), event, 1)
+
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "lease lost" in outcome.reason
+
+
 def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
     run_agent, _ = handler
 
@@ -1605,12 +1691,59 @@ def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
     binary.chmod(0o755)
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
     monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+    # A lease that is refused on every single try (as opposed to the
+    # transient-then-clears case covered below) must still fail once the
+    # retry budget elapses -- pinned at 0 here so this test observes that
+    # outcome without paying the production default's real wall-clock wait.
+    monkeypatch.setenv("AICC_LEASE_ACQUIRE_WAIT_SECONDS", "0")
 
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok
     assert outcome.retryable
     assert "writer lease unavailable" in outcome.reason
     assert runs == [], "the agent must not run without the writer lease held"
+
+
+def test_writer_lease_acquire_retries_transient_contention_then_dispatches(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-DEAD-QUEUE-THREE-WRITER-CONTENTION-CLASSES class 3 (161 of
+    712 dead `work_item`s): `writer lease unavailable: acquire_failed`. This
+    lease is task-scoped, so "another writer" refusing the first acquire is
+    routinely the SAME task's own still-running previous attempt -- not a
+    permanent conflict. The queue's own redelivery backoff (2s/4s for a short
+    cascade) is far shorter than a run that can hold the lease for minutes,
+    so a single-shot acquire dead-letters ordinary overlap. The fix retries
+    the initial acquire for a bounded budget; a lease that clears within it
+    must let dispatch proceed instead of refusing the whole delivery."""
+    run_agent, runs = handler
+    calls = tmp_path / "calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire)\n"
+        f"    n=$(grep -c . {calls} 2>/dev/null || echo 0)\n"
+        f'    echo "$*" >> {calls}\n'
+        '    if [ "$n" -lt 2 ]; then echo "lease held by prior attempt" >&2; exit 1; fi\n'
+        "    exit 0 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+    # A budget generous enough that two retries comfortably fit; the retry
+    # interval itself is shrunk so the test doesn't pay real wall-clock time
+    # for it.
+    monkeypatch.setenv("AICC_LEASE_ACQUIRE_WAIT_SECONDS", "5")
+    monkeypatch.setattr(writer_lease, "_ACQUIRE_RETRY_INTERVAL_SECONDS", 0.01)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+    assert calls.read_text().count("acquire") >= 3, "expected retries before success"
 
 
 def test_no_configured_authority_leaves_the_writer_lease_inert_too(
