@@ -122,6 +122,7 @@ def _decision_from_row(row: dict) -> models.Decision:
         roles=[models.VoterRole(**r) for r in (row.get("roles") or [])],
         quorum=int(row.get("quorum") or 1),
         decided_at=row.get("decided_at"),
+        impact=row.get("impact"),
     )
 
 
@@ -279,9 +280,14 @@ def _roles_snapshot(votes: list[dict]) -> list[dict]:
     ]
 
 
-def close_motion(motion_id: str) -> s.DecisionRecord | None:
+def close_motion(motion_id: str, *, impact: dict | None = None) -> s.DecisionRecord | None:
     """Close an open motion: tally its votes and record the immutable decision —
     but only if quorum is met.
+
+    ``impact``, when given, is recorded on the decision as its estimated
+    financial/time impact (the Decision P&L pillar of the client-facing proof
+    package, VOYN-MIN-WOW-1) — optional, since most decisions never carry one
+    and a decision has no update path to add it later.
 
     Raises :class:`QuorumNotMetError` (→ 409) when fewer than ``quorum`` votes
     were cast, and :class:`db.MotionNotOpenError` (→ 409) when the motion is
@@ -314,6 +320,7 @@ def close_motion(motion_id: str) -> s.DecisionRecord | None:
         roles=roles,
         rationale=rationale,
         quorum=quorum,
+        impact=impact,
     )
     journal = [_journal_from_row(e) for e in db.list_events(path, motion_id)]
     return s.DecisionRecord(

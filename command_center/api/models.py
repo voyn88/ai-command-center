@@ -27,7 +27,7 @@ timestamps are ISO-8601 strings to match the rest of the read surface.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -147,6 +147,7 @@ class Decision(BaseModel):
     roles: list[VoterRole] = Field(default_factory=list)
     quorum: int = 1
     decided_at: str | None = None
+    impact: dict[str, Any] | None = None
 
 
 # --------------------------------------------------------------------------

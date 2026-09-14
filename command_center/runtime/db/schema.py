@@ -22,7 +22,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -367,6 +367,25 @@ def _migration_25_add_finalization_claim(conn: sqlite3.Connection) -> None:
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (25, db.iso_now()),
         )
+
+
+def _migration_26_add_decision_impact(conn: sqlite3.Connection) -> None:
+    """Give ``council_decision`` an explicit, nullable ``impact_json`` — the
+    Decision P&L pillar of the client-facing proof package
+    (VOYN-MIN-WOW-1) needs a place to record a decision's estimated financial
+    or time impact, and a decision, once recorded, has no update path — so the
+    field must exist at insert time rather than be patched on afterward.
+
+    Additive and optional: ``impact_json`` defaults to ``NULL`` (no impact
+    recorded), so every pre-existing decision and every write that does not
+    name an impact reads exactly as before. Same idempotent
+    check-then-``ALTER TABLE ADD COLUMN`` shape as the earlier callable
+    migrations, in one ``BEGIN IMMEDIATE`` transaction.
+    """
+    with db.transaction(conn):
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(council_decision)").fetchall()}
+        if "impact_json" not in cols:
+            conn.execute("ALTER TABLE council_decision ADD COLUMN impact_json TEXT")
 
 
 def bootstrap_finalization_claim_cutover(
@@ -1394,4 +1413,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
     (25, _migration_25_add_finalization_claim),
+    (26, _migration_26_add_decision_impact),
 ]
