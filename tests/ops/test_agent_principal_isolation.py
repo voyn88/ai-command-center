@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
 import math
 import os
+import socket
 import stat
 import struct
 import subprocess
@@ -228,6 +230,80 @@ def test_only_publisher_group_or_root_can_call_broker(launcher, monkeypatch):
     assert launcher._authorised_peer(0)
     assert launcher._authorised_peer(123)
     assert not launcher._authorised_peer(124)
+
+
+def test_a_refused_connection_is_answered_without_failing_its_unit(
+    launcher, monkeypatch
+):
+    """The connection unit's exit status is the BROKER's verdict on itself.
+
+    Returning the answer's exit code as the process status made PID 1 mark
+    `aicc-agent-launcher@<connection>.service` failed for outcomes the broker
+    handled perfectly -- a refused launch here, an agent whose tests went red
+    below -- and a failed instance is never reaped. Their accumulated count is
+    what the host unit-health probe reported as `failed_units` (worker-01,
+    monitor_finding 2051).
+    """
+    monkeypatch.setattr(launcher, "_authorised_peer", lambda uid: False)
+    server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with server, client:
+        status = launcher._serve_connected_socket(server)
+        answer = json.loads(client.makefile("rb", buffering=0).readline())
+    # The refusal still reaches the caller in full: it is reported, not hidden.
+    assert answer["exit_code"] == 125
+    assert launcher.FAILURE in base64.b64decode(answer["stderr_b64"]).decode()
+    assert status == 0
+
+
+def test_an_agent_exit_code_travels_in_the_payload_not_the_unit_status(launcher):
+    server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with server, client:
+        status = launcher._deliver_response(
+            server,
+            {
+                "version": 1,
+                "exit_code": 1,
+                "stdout_b64": "",
+                "stderr_b64": base64.b64encode(b"1 test failed\n").decode("ascii"),
+            },
+        )
+        answer = json.loads(client.makefile("rb", buffering=0).readline())
+    assert answer["exit_code"] == 1
+    assert status == 0
+
+
+def test_a_client_that_hung_up_is_journalled_and_is_not_a_broker_fault(
+    launcher, capsys
+):
+    """A worker that abandoned its launch (deadline, kill) leaves nobody to
+    answer. Nothing on this host is broken, so nothing may stay failed."""
+    server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.close()
+    with server:
+        status = launcher._deliver_response(
+            server,
+            {"version": 1, "exit_code": 0, "stdout_b64": "", "stderr_b64": ""},
+        )
+    assert status == 0
+    assert "response undeliverable" in capsys.readouterr().err
+
+
+def test_per_connection_units_are_reaped_and_the_old_corpses_are_cleared():
+    """Even a genuine broker fault must not be permanent systemd state: the
+    probe counts units that are failed NOW, and an unreaped instance makes a
+    one-off event a standing finding no repair can clear."""
+    root = Path(__file__).parents[2]
+    launcher_unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text()
+    installer = (root / "deploy/install-agent-principal-isolation.sh").read_text()
+    directives = [
+        line.strip()
+        for line in launcher_unit.splitlines()
+        if not line.lstrip().startswith("#")
+    ]
+    assert "CollectMode=inactive-or-failed" in directives
+    # CollectMode governs instances started after the reload; the ones already
+    # failed on the host are only cleared by asking for it.
+    assert "systemctl reset-failed 'aicc-agent-launcher@*.service'" in installer
 
 
 def test_outer_unit_is_exact_workspace_and_cgroup_sealed(

@@ -1914,11 +1914,34 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             os.close(workspace_lock)
         if workspace_fd is not None:
             os.close(workspace_fd)
+    return _deliver_response(sock, response)
+
+
+def _deliver_response(sock: socket.socket, response: dict[str, Any]) -> int:
+    """Answer the client, then report whether THIS BROKER served the connection.
+
+    The per-connection unit's exit status is not the agent's. The agent's code
+    travels inside the response payload (``exit_code``), and ``_client``
+    returns that to the worker; returning it here as well made PID 1 mark
+    ``aicc-agent-launcher@<connection>.service`` *failed* for every ordinary
+    non-zero agent run -- a red test suite, a refused launch, an agent that
+    exited 125. A failed per-connection instance is never retried and never
+    reaped, so it lingers in the unit table until someone runs `reset-failed`;
+    they accumulated for days until the host unit-health probe read them as
+    `failed_units` (worker-01, monitor_finding 2051) and every ordinary agent
+    failure was reported as broken infrastructure.
+
+    A client that hung up before the answer arrived is not a broker fault
+    either -- the worker already abandoned this launch -- so it is journalled
+    and the status stays 0. The unit therefore fails only when the broker
+    itself broke (a crash, an OOM kill, a namespace that would not build),
+    which is precisely the class the monitor exists to see.
+    """
     try:
         sock.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
-    except OSError:
-        return 125
-    return int(response["exit_code"] or 0)
+    except OSError as exc:
+        print(f"response undeliverable: {exc}", file=sys.stderr, flush=True)
+    return 0
 
 
 def _client() -> int:

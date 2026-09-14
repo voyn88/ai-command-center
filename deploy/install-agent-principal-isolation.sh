@@ -599,6 +599,14 @@ systemctl daemon-reload
 # principals, the rollout drives worker lanes, and the boundary verifier
 # asserts an agent/publisher separation a control host has no parties for.
 if [ "$install_profile" = "worker" ]; then
+  # Connection instances that died before CollectMode= reached this host are
+  # still sitting in the unit table as `failed`, and nothing else ever reaps
+  # them: the reaping rule only applies to instances started after the reload
+  # above. Their count is what the host unit-health probe reports as
+  # `failed_units` (worker-01, monitor_finding 2051), so the fix is not
+  # deployed until the corpses it stops producing are gone. Idempotent, and a
+  # host with none of them says nothing.
+  systemctl reset-failed 'aicc-agent-launcher@*.service' >/dev/null 2>&1 || true
   systemctl enable --now aicc-agent-launcher.socket
   systemctl enable --now voyn-aicc-source-clone-refresh.timer
 fi
