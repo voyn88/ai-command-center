@@ -2734,6 +2734,54 @@ def _is_pipeline_owned_standalone_clone(
 # --------------------------------------------------------------------------
 
 
+def quarantine_task_workspace(workspace_path: str | Path) -> str | None:
+    """Move an uncheckpointed task clone (and its task-local marker) aside so
+    the next delivery provisions a fresh clone while the work an agent left
+    behind stays inspectable.
+
+    Returns the quarantine path, or ``None`` when nothing safe could be done
+    (not a directory, a symlink, or the quarantine root is not ours). Never
+    raises and never deletes: the clone may hold commits nobody reviewed yet.
+    The layout mirrors `remove_workspace`'s quarantine: a sibling
+    ``.aicc-quarantine`` directory, mode 0700, owned by root or this uid.
+    """
+    workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
+    try:
+        info = workspace.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return None
+    quarantine_root = workspace.parent / ".aicc-quarantine"
+    try:
+        quarantine_root.mkdir(mode=0o700, exist_ok=True)
+        root_stat = quarantine_root.lstat()
+        if (
+            stat.S_ISLNK(root_stat.st_mode)
+            or not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid not in {0, os.geteuid()}
+        ):
+            return None
+        if stat.S_IMODE(root_stat.st_mode) != 0o700:
+            os.chmod(quarantine_root, 0o700)
+    except OSError:
+        return None
+    target = quarantine_root / (
+        f"{workspace.name}.uncheckpointed.{os.getpid()}.{time.time_ns()}"
+    )
+    marker = _task_local_marker_path(workspace)
+    try:
+        os.rename(workspace, target)
+    except OSError:
+        return None
+    if marker.is_file():
+        try:
+            os.rename(marker, quarantine_root / f"{target.name}.{_TASK_LOCAL_MARKER}")
+        except OSError:
+            pass
+    return str(target)
+
+
 def remove_workspace(
     workspace_path: str | Path,
     repository_path: str | Path,

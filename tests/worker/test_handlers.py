@@ -2300,3 +2300,121 @@ def test_review_head_refresh_fetches_the_pull_ref_before_isolated_pin(
     assert (failure, retryable) == (None, False) and target is not None
     assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pin
     handlers_module._remove_read_only_isolated_checkout(target)
+
+
+# -- infra-class failures refund the attempt --------------------------------
+# (VOYN-W0-AICC-INFRA-FAILURES-BURN-TASK-ATTEMPTS, worker-01 2026-09-14)
+
+
+def _implementation_cascade_payload():
+    payload = _payload(task_type="implementation")
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "implementation"},
+        {"executor": "codex", "task_type": "implementation"},
+    ]
+    return payload
+
+
+def test_preflight_failover_wraps_back_to_an_earlier_healthy_link(
+    handler, monkeypatch
+) -> None:
+    """Attempt 2 selects the second link by construction; when THAT executor
+    is the one that is down, the healthy first link must still serve the
+    delivery instead of the attempt being spent on a routing fact."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    outcome = run_agent(_implementation_cascade_payload(), _event(), 2)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 1
+    assert runs[0]["executor"] == "claude"
+
+
+def test_no_healthy_cascade_link_is_an_infra_wait_not_a_spent_attempt(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (False, "expired")
+    )
+    outcome = run_agent(_implementation_cascade_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert "unavailable" in outcome.reason
+    assert runs == []
+
+
+def _checkpoint_mismatch(spec):
+    raise workspace_provisioning.WorkspaceVerificationError(
+        failed_step="task_workspace_checkpoint",
+        remediation="Recover the uncheckpointed branch through trusted operator review.",
+        expected_workspace=str(spec.workspace_path),
+        actual_workspace=str(spec.workspace_path),
+        expected_branch=spec.expected_branch,
+        detail="saved HEAD 1111111 differs from signed checkpoint 2222222",
+    )
+
+
+def test_uncheckpointed_clone_is_quarantined_and_the_attempt_refunded(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    quarantined: list[str] = []
+
+    def fake_quarantine(workspace):
+        quarantined.append(str(workspace))
+        return f"{workspace}.quarantined"
+
+    monkeypatch.setattr(
+        workspace_provisioning, "quarantine_task_workspace", fake_quarantine
+    )
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert "task_workspace_checkpoint" in outcome.reason
+    assert "quarantined at" in outcome.reason
+    assert len(quarantined) == 1
+    assert runs == []
+
+
+def test_uncheckpointed_clone_that_cannot_be_quarantined_still_spends_the_attempt(
+    handler, monkeypatch
+) -> None:
+    """Fail closed: if the clone could not be moved aside, the next delivery
+    would hit the same mismatch, so the bounded attempt budget must apply."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "quarantine_task_workspace", lambda workspace: None
+    )
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "could not be quarantined" in outcome.reason
+    assert runs == []
+
+
+def test_other_verification_failures_keep_the_ordinary_retry_path(
+    handler, monkeypatch
+) -> None:
+    def branch_missing(spec):
+        raise workspace_provisioning.WorkspaceVerificationError(
+            failed_step="base_branch_present",
+            remediation="Create the base branch.",
+            expected_workspace=str(spec.workspace_path),
+            actual_workspace=str(spec.workspace_path),
+            expected_branch=spec.expected_branch,
+            detail="base branch is missing",
+        )
+
+    run_agent, runs = handler
+    monkeypatch.setattr(workspace_provisioning, "provision_and_verify", branch_missing)
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert runs == []

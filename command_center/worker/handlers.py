@@ -534,7 +534,17 @@ def _run_agent(
         # attempt. Select the next healthy cascade link inside this already
         # claimed delivery instead of returning it just to increment the
         # queue attempt counter.
-        for candidate_step in range(cascade_step + 1, len(request.cascade) + 1):
+        #
+        # Walk EVERY other link, starting after this delivery's own and
+        # wrapping to the head of the cascade: attempt 2 lands on the second
+        # link by construction (`_cascade_step`), and when that executor is
+        # the one that is down (Codex out of quota / logged out for days on
+        # worker-01, 2026-09-14) a later-links-only search finds nothing and
+        # spends the task's attempt on a routing fact. The first link being
+        # healthy is exactly the case a second attempt exists to serve.
+        cascade_len = len(request.cascade)
+        for offset in range(1, cascade_len):
+            candidate_step = ((cascade_step - 1 + offset) % cascade_len) + 1
             candidate = request.cascade[candidate_step - 1]
             candidate_executor = str(candidate.get("executor"))
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
@@ -563,8 +573,17 @@ def _run_agent(
             )
             break
     if not available:
+        # No link of the cascade can run right now. That is a fact about the
+        # executor substrate (auth, quota, sandbox, missing CLI), not about
+        # this task: refund the attempt through the bounded infra-wait budget
+        # so the item is retried once an executor is back, instead of being
+        # dead-lettered after `max_attempts` provider outages
+        # (VOYN-W0-AICC-INFRA-FAILURES-BURN-TASK-ATTEMPTS).
         return HandlerOutcome(
-            ok=False, reason=f"{unavailable_reason}: {detail}", retryable=True
+            ok=False,
+            reason=f"{unavailable_reason}: {detail}",
+            retryable=True,
+            infra_wait=True,
         )
 
     if lease_lost.is_set():
@@ -827,8 +846,36 @@ def _run_agent(
                 with _provision_lock(str(isolated_workspace)):
                     evidence = workspace_provisioning.provision_and_verify(spec)
             except workspace_provisioning.WorkspaceVerificationError as exc:
-                # A verification failure here (branch already checked out
-                # elsewhere, base branch missing, dirty leftover worktree
+                if exc.failed_step == "task_workspace_checkpoint":
+                    # The saved clone ran ahead of its signed checkpoint: an
+                    # earlier delivery committed and was then killed before
+                    # `checkpoint_task_workspace` (launcher refusal, timeout,
+                    # lane restart -- worker-01, 2026-09-11..14 left 6 such
+                    # clones and every resume died here twice, burning both
+                    # attempts). This lane holds the only claim on the item,
+                    # so nobody is writing that clone now: preserve it for
+                    # inspection under `.aicc-quarantine` and let the next
+                    # delivery provision a fresh clone. The attempt is
+                    # refunded -- the task never got to run.
+                    quarantined = workspace_provisioning.quarantine_task_workspace(
+                        isolated_workspace
+                    )
+                    return HandlerOutcome(
+                        ok=False,
+                        reason=(
+                            f"workspace isolation failed at {exc.failed_step}: "
+                            f"{exc.detail}; uncheckpointed clone "
+                            + (
+                                f"quarantined at {quarantined}"
+                                if quarantined
+                                else "could not be quarantined"
+                            )
+                        ),
+                        retryable=True,
+                        infra_wait=quarantined is not None,
+                    )
+                # Any other verification failure here (branch already checked
+                # out elsewhere, base branch missing, dirty leftover worktree
                 # under a stricter policy, ...) is a fact about repository
                 # state that a later moment can genuinely cure -- redelivery
                 # retries once whatever blocked it clears, bounded by

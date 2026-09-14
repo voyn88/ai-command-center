@@ -890,3 +890,47 @@ def test_open_relative_regular_closes_pinned_fd_when_component_is_missing(
         assert closed == duplicated
     finally:
         real_close(base_fd)
+
+
+# -- quarantine_task_workspace ------------------------------------------------
+
+
+def test_quarantine_task_workspace_moves_clone_and_marker_aside(tmp_path) -> None:
+    from command_center import workspace_provisioning as wp
+
+    parent = tmp_path / "root"
+    clone = parent / "backlog-TASK-abc"
+    (clone / "src").mkdir(parents=True)
+    (clone / "src" / "file.py").write_text("x = 1\n")
+    marker_dir = parent / ".aicc-task-metadata"
+    marker_dir.mkdir()
+    marker = marker_dir / "backlog-TASK-abc.aicc-task-workspace.json"
+    marker.write_text("{}")
+
+    target = wp.quarantine_task_workspace(clone)
+
+    assert target is not None
+    moved = Path(target)
+    assert moved.parent == parent / ".aicc-quarantine"
+    assert moved.name.startswith("backlog-TASK-abc.uncheckpointed.")
+    assert (moved / "src" / "file.py").read_text() == "x = 1\n"
+    assert not clone.exists()
+    assert not marker.exists()
+    assert (
+        parent / ".aicc-quarantine" / f"{moved.name}.aicc-task-workspace.json"
+    ).exists()
+    import stat as _stat
+
+    assert _stat.S_IMODE((parent / ".aicc-quarantine").stat().st_mode) == 0o700
+
+
+def test_quarantine_task_workspace_refuses_symlinks_and_missing_paths(tmp_path) -> None:
+    from command_center import workspace_provisioning as wp
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert wp.quarantine_task_workspace(link) is None
+    assert real.exists()
+    assert wp.quarantine_task_workspace(tmp_path / "absent") is None
