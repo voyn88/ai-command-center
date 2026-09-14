@@ -2418,3 +2418,42 @@ def test_other_verification_failures_keep_the_ordinary_retry_path(
     outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert not outcome.ok and outcome.retryable and not outcome.infra_wait
     assert runs == []
+
+
+def test_unknown_executor_name_in_cascade_is_a_task_fact_not_an_infra_wait(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    payload = _payload(task_type="implementation")
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "no-such-executor", "task_type": "implementation"},
+    ]
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "no-such-executor" in outcome.reason
+    assert runs == []
+
+
+def test_uncheckpointed_clone_is_left_in_place_when_the_lease_is_lost(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    called: list[str] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "quarantine_task_workspace",
+        lambda workspace: called.append(str(workspace)) or "q",
+    )
+    lost = _event()
+    lost.set()
+    outcome = run_agent(_payload(task_type="implementation"), lost, 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "lease lost" in outcome.reason
+    assert called == [] and runs == []

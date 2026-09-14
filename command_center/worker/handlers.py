@@ -529,6 +529,7 @@ def _run_agent(
         return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
+    unknown_executors: list[str] = []
     if not available and link is not None:
         # An open Codex circuit is a routing fact, not a consumed model
         # attempt. Select the next healthy cascade link inside this already
@@ -548,6 +549,7 @@ def _run_agent(
             candidate = request.cascade[candidate_step - 1]
             candidate_executor = str(candidate.get("executor"))
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
+                unknown_executors.append(candidate_executor)
                 continue
             candidate_task_type = str(candidate.get("task_type", request.task_type))
             if not _same_mutability_class(task_type, candidate_task_type):
@@ -573,12 +575,25 @@ def _run_agent(
             )
             break
     if not available:
-        # No link of the cascade can run right now. That is a fact about the
-        # executor substrate (auth, quota, sandbox, missing CLI), not about
-        # this task: refund the attempt through the bounded infra-wait budget
-        # so the item is retried once an executor is back, instead of being
+        # No link of the cascade can run right now. When every link named a
+        # real executor that merely failed preflight (auth, quota, sandbox,
+        # missing CLI) that is a fact about the substrate, not about this
+        # task: refund the attempt through the bounded infra-wait budget so
+        # the item is retried once an executor is back, instead of being
         # dead-lettered after `max_attempts` provider outages
-        # (VOYN-W0-AICC-INFRA-FAILURES-BURN-TASK-ATTEMPTS).
+        # (VOYN-W0-AICC-INFRA-FAILURES-BURN-TASK-ATTEMPTS). A cascade that
+        # names an executor nobody can build is a fact about the task's own
+        # payload that no waiting cures -- that one keeps spending the
+        # attempt budget so the misconfiguration surfaces.
+        if unknown_executors:
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    f"{unavailable_reason}: {detail}; cascade names unknown "
+                    f"executor(s) {sorted(set(unknown_executors))!r}"
+                ),
+                retryable=True,
+            )
         return HandlerOutcome(
             ok=False,
             reason=f"{unavailable_reason}: {detail}",
@@ -857,9 +872,22 @@ def _run_agent(
                     # inspection under `.aicc-quarantine` and let the next
                     # delivery provision a fresh clone. The attempt is
                     # refunded -- the task never got to run.
-                    quarantined = workspace_provisioning.quarantine_task_workspace(
-                        isolated_workspace
-                    )
+                    if lease_lost.is_set():
+                        return HandlerOutcome(
+                            ok=False,
+                            reason=(
+                                f"workspace isolation failed at {exc.failed_step}: "
+                                f"{exc.detail}; lease lost, clone left in place"
+                            ),
+                            retryable=True,
+                        )
+                    # Same per-path lock as the provisioning above: a sibling
+                    # caller racing to (re)provision this path must never
+                    # have its in-progress clone moved out from under it.
+                    with _provision_lock(str(isolated_workspace)):
+                        quarantined = workspace_provisioning.quarantine_task_workspace(
+                            isolated_workspace
+                        )
                     return HandlerOutcome(
                         ok=False,
                         reason=(

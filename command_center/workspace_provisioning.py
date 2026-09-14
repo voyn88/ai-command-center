@@ -2745,35 +2745,33 @@ def quarantine_task_workspace(workspace_path: str | Path) -> str | None:
     The layout mirrors `remove_workspace`'s quarantine: a sibling
     ``.aicc-quarantine`` directory, mode 0700, owned by root or this uid.
     """
-    workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
     try:
-        info = workspace.lstat()
-    except OSError:
+        return _quarantine_task_workspace(workspace_path)
+    except Exception:  # noqa: BLE001 - documented never-raises boundary
         return None
+
+
+def _quarantine_task_workspace(workspace_path: str | Path) -> str | None:
+    workspace = Path(os.path.abspath(Path(workspace_path).expanduser()))
+    info = workspace.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         return None
     quarantine_root = workspace.parent / ".aicc-quarantine"
-    try:
-        quarantine_root.mkdir(mode=0o700, exist_ok=True)
-        root_stat = quarantine_root.lstat()
-        if (
-            stat.S_ISLNK(root_stat.st_mode)
-            or not stat.S_ISDIR(root_stat.st_mode)
-            or root_stat.st_uid not in {0, os.geteuid()}
-        ):
-            return None
-        if stat.S_IMODE(root_stat.st_mode) != 0o700:
-            os.chmod(quarantine_root, 0o700)
-    except OSError:
+    quarantine_root.mkdir(mode=0o700, exist_ok=True)
+    root_stat = quarantine_root.lstat()
+    if (
+        stat.S_ISLNK(root_stat.st_mode)
+        or not stat.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid not in {0, os.geteuid()}
+    ):
         return None
+    if stat.S_IMODE(root_stat.st_mode) != 0o700:
+        os.chmod(quarantine_root, 0o700)
     target = quarantine_root / (
         f"{workspace.name}.uncheckpointed.{os.getpid()}.{time.time_ns()}"
     )
     marker = _task_local_marker_path(workspace)
-    try:
-        os.rename(workspace, target)
-    except OSError:
-        return None
+    os.rename(workspace, target)
     if marker.is_file():
         try:
             os.rename(marker, quarantine_root / f"{target.name}.{_TASK_LOCAL_MARKER}")

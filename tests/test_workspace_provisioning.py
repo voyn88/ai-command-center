@@ -934,3 +934,17 @@ def test_quarantine_task_workspace_refuses_symlinks_and_missing_paths(tmp_path) 
     assert wp.quarantine_task_workspace(link) is None
     assert real.exists()
     assert wp.quarantine_task_workspace(tmp_path / "absent") is None
+
+
+def test_quarantine_task_workspace_never_raises(tmp_path, monkeypatch) -> None:
+    from command_center import workspace_provisioning as wp
+
+    clone = tmp_path / "clone"
+    clone.mkdir()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("marker path computation exploded")
+
+    monkeypatch.setattr(wp, "_task_local_marker_path", boom)
+    assert wp.quarantine_task_workspace(clone) is None
+    assert clone.exists()
