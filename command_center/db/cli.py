@@ -86,9 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     review = sub.add_parser(
         "backlog-review",
         help="One review tick (BO-S3b): enqueue an adversarial review run for "
-        "each READY_TO_REVIEW task carrying a PR, then publish the ACCEPT "
-        "marker for any task whose review already returned a verdict "
-        "(aicc-backlog-review.timer). Needs --repo-path.",
+        "each READY_TO_REVIEW task carrying a PR, give each chunk whose "
+        "review is missing or ended without a verdict one bounded fresh "
+        "identity, then publish the ACCEPT marker for any task whose review "
+        "already returned a verdict (aicc-backlog-review.timer). Needs "
+        "--repo-path.",
     )
     review.add_argument("--repo-path", default=".", help="Local clone for gh calls.")
     review.add_argument(
@@ -277,22 +279,43 @@ def main(argv: list[str] | None = None) -> int:
                 from command_center.db.work_queue_store import WorkQueueStore
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
+                    reconcile_review_once,
                     review_once,
                 )
 
                 store = WorkQueueStore(lambda: _nc(conn))
-                report = review_once(
-                    lambda: _nc(conn),
-                    lambda q, k, pl, tid, attempts: store.enqueue(
+
+                def enqueue(q, k, pl, tid, attempts):
+                    return store.enqueue(
                         q, idempotency_key=k, payload=pl, task_id=tid,
                         max_attempts=attempts,
-                    ),
+                    )
+
+                report = review_once(
+                    lambda: _nc(conn),
+                    enqueue,
                     args.repo_path,
                     task_id=args.task_id,
                 )
                 for task_id, pr in report.reviewed:
                     print(f"REVIEW    {task_id} -> {pr}")
                 for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
+                # Between dispatch and publication: a chunk whose review is
+                # missing, or whose terminal result carries no verdict for
+                # this head, gets one bounded fresh identity. Without this
+                # the tick below can only report the same
+                # `review_chunk_verdict_missing` refusal forever (PR #606,
+                # 2026-09-04) and the marker can only come from a human.
+                retry_report = reconcile_review_once(
+                    lambda: _nc(conn),
+                    enqueue,
+                    args.repo_path,
+                    task_id=args.task_id,
+                )
+                for task_id, retry_key in retry_report.retried:
+                    print(f"RETRY     {task_id} -> {retry_key}")
+                for task_id, reason in retry_report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
                 marker_report = publish_review_verdicts(
                     lambda: _nc(conn), args.repo_path, task_id=args.task_id

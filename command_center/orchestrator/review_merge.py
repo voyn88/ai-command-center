@@ -79,6 +79,7 @@ __all__ = [
     "ReviewConfig",
     "merge_once",
     "publish_review_verdicts",
+    "reconcile_review_once",
     "review_once",
 ]
 
@@ -101,6 +102,13 @@ class LoopReport:
     #: publish_review_verdicts' docstring for why this is a new task, not a
     #: cycle back into the rejected task's own state machine.
     remediated: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, idempotency_key) — a review identity `reconcile_review_once`
+    #: dispatched for a chunk whose own review is missing, or whose terminal
+    #: result carries no usable verdict for the current head. The key is the
+    #: audit trail: it is either the chunk's original identity (never
+    #: dispatched) or a fresh bounded `:retry:N` one, never a rewrite of an
+    #: existing immutable result.
+    retried: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
@@ -454,6 +462,144 @@ def _chunk_key_prefix(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str |
     return f"{base}:chunk:" if base else None
 
 
+# -- bounded retry identities for reviews that ended without a verdict -------
+#
+# Live regression (2026-09-04, PR #606 at c5ff68c9): six independent chunks,
+# four of which reached queue state `succeeded` while their immutable result
+# stopped at the tool transcript -- no VERDICT/HEAD_SHA lines at all. The
+# aggregation below correctly refused to publish a marker
+# (`review_chunk_verdict_missing:1`), but nothing anywhere could move that
+# manifest forward again, so the PR could only be accepted by a human posting
+# the marker by hand. Two structural facts make a *new identity* the only
+# lawful remedy:
+#
+# - A terminal queue item cannot be redelivered. `queue_enqueue` is an upsert
+#   on (queue, idempotency_key) that returns the EXISTING item, and both
+#   `succeeded` and `dead` are terminal -- so re-enqueuing the chunk's own key
+#   is a no-op, not a re-run.
+# - A work result is immutable. Rewriting the verdict-less result in place, or
+#   synthesizing a verdict for it, would forge exactly the evidence the whole
+#   exact-SHA manifest exists to prove.
+#
+# So a chunk whose latest attempt is TERMINAL and carries no valid verdict for
+# the expected head gets a fresh `:retry:N` identity -- same task, same PR,
+# same base/head sha, same policy version, same manifest and content hash,
+# only a new attempt ordinal. The budget is small and absolute: once it is
+# spent the chunk stays verdict-less and the aggregate stays fail-closed,
+# which is the correct end state (a systematically refusing executor must not
+# become an unbounded dispatch loop, and a review that never concludes must
+# never become an ACCEPT).
+_MAX_RESULT_RETRY_ATTEMPTS = 2
+_RETRY_KEY_SUFFIX = re.compile(r":retry:([0-9]+)\Z")
+#: `work_item.state` values from 0002_queue_claim that can never change again:
+#: `succeeded` (result recorded) and `dead` (attempt budget exhausted, e.g.
+#: every attempt SIGTERM'd by a host rotation -- the PR #380 failure). `ready`
+#: and `claimed` are live attempts and are never given a second identity.
+_TERMINAL_REVIEW_STATES = frozenset({"succeeded", "dead"})
+
+
+def _retry_attempt(key: str) -> tuple[str, int]:
+    """Split a review identity into (base identity, attempt ordinal). The
+    original identity is attempt 0, so every attempt of one chunk collapses
+    onto the same base key -- which is what keeps a retry from presenting
+    itself to the aggregator as an extra, unmanifested chunk."""
+    match = _RETRY_KEY_SUFFIX.search(key)
+    return (key, 0) if match is None else (key[: match.start()], int(match.group(1)))
+
+
+def _attempt_pattern(base_key: str) -> re.Pattern[str]:
+    return re.compile(rf"\A{re.escape(base_key)}(?::retry:[0-9]+)?\Z")
+
+
+def _review_attempt_rows(
+    factory: Any, task_id: str, base_key: str
+) -> list[tuple[int, str, Any]]:
+    """Every attempt of one review identity as (attempt, state, result
+    payload). The SQL prefix match is deliberately wider than the identity
+    (for a single-chunk review it also matches that review's chunk keys);
+    the exact-fullmatch filter here, not the query, defines membership."""
+    pattern = _attempt_pattern(base_key)
+    rows = _rows(
+        factory,
+        "SELECT i.idempotency_key, i.state, wr.payload "
+        "FROM work_item i LEFT JOIN work_result wr ON wr.result_id = i.result_id "
+        "WHERE i.task_id = %s AND left(i.idempotency_key, char_length(%s)) = %s",
+        (task_id, base_key, base_key),
+    )
+    return [
+        (_retry_attempt(str(key))[1], str(state), result)
+        for key, state, result in rows
+        if pattern.fullmatch(str(key))
+    ]
+
+
+def _valid_verdict(result_value: Any, expected_head: str) -> tuple[str, str] | None:
+    """The result's own VERDICT/HEAD_SHA pair, but only when it speaks for
+    `expected_head`. A verdict for any other sha is not a verdict for this
+    review identity -- never a reason to stop retrying, never a reason to
+    publish."""
+    result = _json_object(result_value)
+    parsed = _parse_verdict((result or {}).get("result_text") or "")
+    return parsed if parsed is not None and parsed[1] == expected_head else None
+
+
+def _authoritative_attempt(
+    attempts: list[tuple[int, Any]], expected_head: str
+) -> int | None:
+    """Which attempt of one review identity speaks for it: the EARLIEST one
+    whose immutable result carries a valid verdict for `expected_head`, else
+    the newest attempt. Returns an index into `attempts`, or None if empty.
+
+    Earliest-valid-wins is the immutability rule in selection form: once a
+    real reviewer has concluded on this exact chunk at this exact head, a
+    later attempt (one a racing tick enqueued before that verdict landed)
+    can never overturn it -- otherwise a retry would be a way to launder a
+    REJECT into an ACCEPT. Falling back to the newest attempt is what makes
+    the retry visible at all while no verdict exists yet."""
+    best_valid: int | None = None
+    newest: int | None = None
+    for position, (attempt, result_value) in enumerate(attempts):
+        if newest is None or attempt > attempts[newest][0]:
+            newest = position
+        if _valid_verdict(result_value, expected_head) is not None and (
+            best_valid is None or attempt < attempts[best_valid][0]
+        ):
+            best_valid = position
+    return best_valid if best_valid is not None else newest
+
+
+def _next_review_identity(
+    factory: Any, task_id: str, base_key: str, expected_head: str
+) -> str | None:
+    """The identity `reconcile_review_once` should dispatch for this review,
+    or None if there is nothing lawful to dispatch.
+
+    - no attempt at all -> the ORIGINAL identity (the chunk's review is
+      missing: an enqueue that never landed, or a manifest widened by a
+      re-split), never a retry ordinal;
+    - any attempt already carrying a valid verdict for `expected_head` ->
+      None: that result is immutable and final, ACCEPT or REJECT alike;
+    - latest attempt still `ready`/`claimed` -> None: a live attempt is not
+      a failed one, and a second identity beside it would double-dispatch;
+    - latest attempt terminal (`succeeded` with no usable verdict, or
+      `dead`) and budget remaining -> a fresh `:retry:N`;
+    - budget spent -> None, and the aggregate stays fail-closed."""
+    attempts = _review_attempt_rows(factory, task_id, base_key)
+    if not attempts:
+        return base_key
+    if any(
+        _valid_verdict(result, expected_head) is not None
+        for _attempt, _state, result in attempts
+    ):
+        return None
+    attempt, state, _result = max(attempts, key=lambda entry: entry[0])
+    if state not in _TERMINAL_REVIEW_STATES:
+        return None
+    if attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+        return None
+    return f"{base_key}:retry:{attempt + 1}"
+
+
 def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
@@ -501,6 +647,63 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
         sum(line.startswith("-") and not line.startswith("--- ") for line in lines),
     )
     return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
+
+
+def _prepare_review_items(
+    task_id: str,
+    pr_url: str,
+    snapshot: _PRSnapshot,
+    chunks: tuple[_DiffChunk, ...],
+    key: str,
+    project_id: str,
+    repository_path: str,
+    cascade: list[dict[str, Any]],
+    cfg: ReviewConfig,
+) -> list[tuple[str, dict[str, Any]]]:
+    """(identity, payload) for every chunk of this manifest, or [] if any
+    chunk's rendered prompt breaks the byte budget (the caller fails closed
+    on the whole manifest rather than reviewing part of a diff).
+
+    Both `review_once` and `reconcile_review_once` build their dispatch
+    through here, which is what makes a reconciliation a genuine re-run of
+    the SAME review rather than a new one: identical manifest identity,
+    index, count, content and manifest hash, base/head sha and policy
+    version, re-derived from the snapshot the reconciler just fetched. Only
+    the idempotency key the caller enqueues it under may differ, and only by
+    an attempt ordinal."""
+    prepared: list[tuple[str, dict[str, Any]]] = []
+    for chunk in chunks:
+        prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
+        if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
+            return []
+        payload: dict[str, Any] = {
+            "kind": "agent_run", "v": 1, "project_id": project_id,
+            "repository_path": repository_path,
+            "task_type": "independent_review",
+            "prompt": prompt,
+            "timeout_seconds": cfg.review_timeout,
+            "untrusted": True,
+            "cascade": cascade,
+        }
+        if chunk.count == 1:
+            prepared.append((key, payload))
+            continue
+        chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
+        if chunk_key is None:
+            raise RuntimeError("validated PR URL produced no chunk key")
+        payload["review_chunk"] = {
+            "version": 3,
+            "index": chunk.index,
+            "count": chunk.count,
+            "content_bytes": len(chunk.text.encode("utf-8")),
+            "content_hash": chunk.content_hash,
+            "manifest_hash": chunk.manifest_hash,
+            "base_sha": snapshot.base,
+            "head_sha": snapshot.head,
+            "diff_hash": snapshot.digest,
+        }
+        prepared.append((chunk_key, payload))
+    return prepared
 
 
 def review_once(
@@ -576,45 +779,140 @@ def review_once(
             report.skipped.append((task_id, f"review_prompt_budget_invalid: {exc}"))
             continue
 
-        prepared: list[tuple[str, dict[str, Any]]] = []
-        for chunk in chunks:
-            prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
-            if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
-                prepared = []
-                break
-            payload = {
-                "kind": "agent_run", "v": 1, "project_id": project_id,
-                "repository_path": repository_path,
-                "task_type": "independent_review",
-                "prompt": prompt,
-                "timeout_seconds": cfg.review_timeout,
-                "untrusted": True,
-                "cascade": cascade,
-            }
-            if chunk.count == 1:
-                prepared.append((key, payload))
-            else:
-                chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
-                if chunk_key is None:
-                    raise RuntimeError("validated PR URL produced no chunk key")
-                payload["review_chunk"] = {
-                    "version": 3,
-                    "index": chunk.index,
-                    "count": chunk.count,
-                    "content_bytes": len(chunk.text.encode("utf-8")),
-                    "content_hash": chunk.content_hash,
-                    "manifest_hash": chunk.manifest_hash,
-                    "base_sha": snapshot.base,
-                    "head_sha": snapshot.head,
-                    "diff_hash": snapshot.digest,
-                }
-                prepared.append((chunk_key, payload))
+        prepared = _prepare_review_items(
+            task_id, pr_url, snapshot, chunks, key,
+            project_id, repository_path, cascade, cfg,
+        )
         if not prepared:
             report.skipped.append((task_id, "review_prompt_budget_invariant_failed"))
             continue
         for review_key, payload in prepared:
             enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
         report.reviewed.append((task_id, pr_url))
+    return report
+
+
+# -- Part 2a: reconcile chunks whose review ended without a verdict ---------
+
+
+def reconcile_review_once(
+    factory: Any,
+    enqueue: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
+) -> LoopReport:
+    """Give every chunk of a still-unpublished manifest a lawful way forward
+    when its own review is missing or ended terminally without a verdict --
+    the bounded, auditable half of the fail-closed aggregation below.
+
+    `publish_review_verdicts` refuses to publish a marker while any chunk is
+    missing, unfinished, verdict-less or bound to a different head. That
+    refusal is correct and is never relaxed here; what it lacked was a
+    counterpart that can actually clear the refusal. Live on PR #606
+    (2026-09-04) four of six chunks reached `succeeded` with nothing but a
+    tool transcript in their immutable result, so publication reported
+    `review_chunk_verdict_missing:1` on every tick forever and the only way
+    to accept the PR was a human posting the marker by hand -- exactly what
+    this pipeline exists to make unnecessary. Earlier, on PR #380, two
+    chunks were SIGTERM'd by a live host rotation and dead-lettered: same
+    dead end, different cause.
+
+    This tick re-derives the CURRENT snapshot and its manifest from scratch
+    and dispatches, per chunk, at most one of:
+
+    - the chunk's own original identity, when no attempt of it exists at all;
+    - a fresh `:retry:N` identity, when its latest attempt is terminal
+      (`succeeded` without a usable verdict, or `dead`) and the bounded
+      attempt budget still has room.
+
+    What it never does: synthesize or infer a verdict, overwrite or reuse an
+    immutable result, re-run a chunk that already concluded (ACCEPT or
+    REJECT alike), dispatch beside a live attempt, or widen the aggregate's
+    acceptance rule. Because the payload is rebuilt by
+    `_prepare_review_items` from the snapshot, a retry carries the identical
+    manifest identity -- index, count, content hash, manifest hash, base and
+    head sha, policy version -- so a head that moved in the meantime simply
+    produces a different key space and leaves the superseded manifest behind
+    untouched, and a chunk that exhausts its budget stays verdict-less with
+    the aggregate fail-closed."""
+    from command_center.orchestrator.planner import repo_route
+
+    cfg = cfg or ReviewConfig()
+    report = LoopReport()
+    where_task = " AND t.task_id = %s" if task_id is not None else ""
+    params: tuple[Any, ...] = (
+        (task_id, cfg.max_per_tick) if task_id is not None else (cfg.max_per_tick,)
+    )
+    tasks = _rows(
+        factory,
+        "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
+        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+        "WHERE t.status = 'READY_TO_REVIEW'" + where_task + " "
+        "ORDER BY t.task_id LIMIT %s",
+        params,
+    )
+    cascade = _model_only_review_cascade()
+    for current_task_id, pr_url in tasks:
+        if not cascade:
+            report.skipped.append((current_task_id, "no_review_executor_route"))
+            continue
+        repo = _repo_from_pr_url(pr_url)
+        route = repo_route(repo) if repo else None
+        if route is None:
+            report.skipped.append((current_task_id, f"no_repo_route: {pr_url!r}"))
+            continue
+        already, current_head = _has_accept_marker(repo_path, pr_url)
+        if already:
+            report.skipped.append((current_task_id, "marker_already_posted"))
+            continue
+        if not current_head:
+            report.skipped.append((current_task_id, "pr_view_failed"))
+            continue
+        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        # The same exact-head binding publication uses: a snapshot that
+        # already disagrees with the PR's head belongs to a superseded
+        # manifest, and dispatching more reviews of it would spend the
+        # attempt budget on a diff nobody is waiting on.
+        if snapshot is None or snapshot.head != current_head:
+            report.skipped.append((current_task_id, "pr_diff_snapshot_failed"))
+            continue
+        key = _review_key(current_task_id, pr_url, snapshot)
+        if key is None:
+            report.skipped.append((current_task_id, f"no_repo_route: {pr_url!r}"))
+            continue
+        project_id, repository_path = route
+        try:
+            chunks = _review_chunks(snapshot, current_task_id, pr_url)
+        except (RuntimeError, ValueError) as exc:
+            report.skipped.append(
+                (current_task_id, f"review_prompt_budget_invalid: {exc}")
+            )
+            continue
+        prepared = _prepare_review_items(
+            current_task_id, pr_url, snapshot, chunks, key,
+            project_id, repository_path, cascade, cfg,
+        )
+        if not prepared:
+            report.skipped.append(
+                (current_task_id, "review_prompt_budget_invariant_failed")
+            )
+            continue
+        dispatched = 0
+        for base_key, payload in prepared:
+            identity = _next_review_identity(
+                factory, current_task_id, base_key, snapshot.head
+            )
+            if identity is None:
+                continue
+            enqueue(cfg.queue, identity, payload, current_task_id, len(cascade))
+            report.retried.append((current_task_id, identity))
+            dispatched += 1
+        if dispatched == 0:
+            report.skipped.append(
+                (current_task_id, "no_review_chunk_eligible_for_retry")
+            )
     return report
 
 
@@ -650,7 +948,9 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict_match.group(1), sha_match.group(1)
 
 
-def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any] | None:
+def _latest_review_result(
+    factory: Any, task_id: str, key: str, head_sha: str
+) -> dict[str, Any] | None:
     """The succeeded review-class work result for this exact review-cycle
     key (task, PR, head sha, policy version), or None if no review has
     completed for exactly this state yet -- covers both "still running" and
@@ -659,19 +959,22 @@ def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any
     CURRENT head sha's key (computed via `_review_key`); nothing here
     guesses or falls back to "the most recent review for this task_id",
     which is what let a stale, superseded verdict be read as current before
-    the review-cycle key existed."""
-    rows = _rows(
-        factory,
-        "SELECT wr.payload FROM work_item i "
-        "JOIN work_result wr ON wr.result_id = i.result_id "
-        "WHERE i.task_id = %s AND i.idempotency_key = %s AND i.state = 'succeeded' "
-        "ORDER BY wr.created_at DESC LIMIT 1",
-        (task_id, key),
+    the review-cycle key existed.
+
+    Attempts of that one identity (the original plus any bounded `:retry:N`
+    `reconcile_review_once` added for a terminal result with no usable
+    verdict) are collapsed by `_authoritative_attempt`: the earliest valid
+    verdict for this head wins, so a retry can never overturn a conclusion
+    a reviewer already reached, and the newest attempt otherwise -- which is
+    None here unless it succeeded, keeping a live retry a wait rather than a
+    publishable state."""
+    attempts = _review_attempt_rows(factory, task_id, key)
+    chosen = _authoritative_attempt(
+        [(attempt, result) for attempt, _state, result in attempts], head_sha
     )
-    if not rows:
+    if chosen is None or attempts[chosen][1] != "succeeded":
         return None
-    payload = rows[0][0]
-    return json.loads(payload) if isinstance(payload, str) else payload
+    return _json_object(attempts[chosen][2])
 
 
 def _json_object(value: Any) -> dict[str, Any] | None:
@@ -700,7 +1003,28 @@ def _chunk_review_rows(
         "ORDER BY i.idempotency_key",
         (task_id, prefix, prefix),
     )
-    return prefix, rows
+    # Collapse every attempt of a chunk onto the chunk's own identity before
+    # the aggregator sees it. A `:retry:N` row is another attempt at ONE
+    # manifest entry, never an extra entry: presented raw it would fail the
+    # aggregator's exact key-to-index binding and wedge the whole manifest at
+    # `review_chunk_manifest_invalid`. `_authoritative_attempt` picks the
+    # earliest attempt carrying a valid verdict for this head (an immutable
+    # conclusion a later retry must never overturn), else the newest attempt
+    # -- so an unfinished or still verdict-less retry keeps the aggregate
+    # waiting exactly as the original did.
+    grouped: dict[str, list[tuple[int, tuple[Any, ...]]]] = {}
+    for row in rows:
+        base_key, attempt = _retry_attempt(str(row[0]))
+        grouped.setdefault(base_key, []).append((attempt, (base_key, *row[1:])))
+    collapsed: list[tuple[Any, ...]] = []
+    for base_key in sorted(grouped):
+        attempts = grouped[base_key]
+        chosen = _authoritative_attempt(
+            [(attempt, row[3]) for attempt, row in attempts], snapshot.head
+        )
+        if chosen is not None:
+            collapsed.append(attempts[chosen][1])
+    return prefix, collapsed
 
 
 def _aggregate_chunk_verdict(
@@ -1029,7 +1353,7 @@ def publish_review_verdicts(
                 continue
             sha = current_head
         else:
-            result = _latest_review_result(factory, task_id, key)
+            result = _latest_review_result(factory, task_id, key, current_head)
             if result is None:
                 report.skipped.append((task_id, "no_review_result_yet"))
                 continue
