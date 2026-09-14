@@ -8,6 +8,96 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
+- `command_center/orchestrator/gh_access.py`: every `gh` call the review,
+  merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
+  installation token (`/var/lib/aicc/github/gh`, minted by
+  `voyn-aicc-github-token.timer` and readable by the `aicc-worker` principal
+  the ticks run as) instead of whatever human credential is ambient on
+  control-01. On 2026-09-09 21:15-22:10 UTC that human's shared GraphQL quota
+  was exhausted (`API rate limit already exceeded for user ID 297853521`) and
+  all three ticks failed for an hour. A host without the store falls back to
+  the ambient credential and says so; a refusal from the App falls back per
+  call so a scope it was never granted cannot break a tick.
+- The PR-window tick -- the only loop that touches every open pull request --
+  moved from `gh pr list`/`gh pr view`/`gh pr edit` (GraphQL) to the REST
+  endpoints (`gh api repos/...`), with per-`(repo, PR, head sha)` caching of
+  the details, so an unchanged head costs no API call at all. Its timer went
+  from 5 to 15 minutes; labelling is advisory and no gate reads it.
+- Each tick reports a `QUOTA` line: identity, REST/GraphQL call counts, cache
+  hits, ambient fallbacks, rate-limited calls, and the identity's remaining
+  core/GraphQL budget (read with `gh api rate_limit`, which is exempt from
+  rate limiting).
+- `ops/aicc_github_app_token.py` requests the ticks' additional read scopes
+  (`checks`, `statuses`, `actions`) on top of the lanes' git set, and falls
+  back to the lane set alone if the installation was never granted them --
+  GitHub refuses the whole token otherwise, which would leave the fleet with
+  no credential at all.
+
+
+### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
+- `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`
+  (`clients/aicc-native/apple/Sources/AICCNativeCore/AICCNativeCore.swift`):
+  a one-status, one-action snapshot for each of the three flows with a single
+  next action on iPhone — Work, Dialogues, Decisions. `Snapshot.
+  widgetSnippets(dialogs:)` always returns exactly three, one per flow, and
+  a widget's one action is always a deep link into the exact item, never a
+  mutation — `POST /v1/commands` is still out of the v1 read-only contract.
+  See `docs/aicc_native/WIDGET_SNIPPETS.md`.
+
+### Added — Decision-memory graph (`VOYN-MIN-GRAPH-SQL`)
+- `command_center/decision_graph_store.py`: a standalone SQLite store for a
+  semantic graph of decisions, errors, dependencies and effects — nodes typed
+  by kind, directed/typed edges, and `path_to_failure()`, one `WITH RECURSIVE`
+  query finding the shortest cycle-safe chain from any node to the nearest
+  reachable failure.
+- `command_center/decision_graph_render.py`: a hand-rolled layered-DAG-to-SVG
+  renderer (no `graphviz`/`pydot`/`networkx` dependency exists in this repo)
+  that highlights the path-to-failure edges in red and draws each incident's
+  corrective decision as a dashed `mitigates` arrow rather than a step on the
+  road to its own fix.
+- `scripts/seed_decision_graph_incidents.py` /
+  `scripts/render_decision_graph.py`: seed the graph from six real incidents
+  mined from this repository's own migration comments, docstrings and commit
+  messages, and render it. The rendered artifact —
+  [`docs/operations/decision_memory_graph.svg`](docs/operations/decision_memory_graph.svg)
+  — is the acceptance criterion: one visual graph with a path-to-failure for
+  past incidents. See `docs/operations/DECISION_MEMORY_GRAPH.md`.
+
+### Added — Executive Time-Machine (`VOYN-MIN-EXEC`)
+- `command_center/decision_time_machine.py`: for a critical decision or
+  incident, one executable `decision package` — hypothesis, alternatives
+  considered (with why each was passed over), the decision and its
+  rationale — created with a pending effect checkpoint already scheduled at
+  each of 1/7/30/90 days out. `record_effect` fills in the actual outcome at
+  a horizon (in any order); `due_checkpoints` surfaces whichever check-ins
+  have passed their due date without being asked; `build_post_mortem`
+  assembles the package into a post-mortem view with a verdict
+  (`validated`/`invalidated`/`mixed`/`pending_data`) computed from the
+  checkpoints recorded so far; `find_similar_packages` matches a new
+  critical event's framing against past packages' actual outcomes (the
+  "application in similar scenarios" acceptance), and
+  `missing_decision_packages` flags any critical event with no package on
+  file yet.
+- `tests/test_decision_time_machine.py`: coverage for checkpoint scheduling,
+  out-of-order effect recording, post-mortem verdict derivation, similar-
+  scenario matching and the critical-event coverage gap check.
+
+### Added — SRV-04b two-host acceptance record (`VOYN-W0-AICC-CLAIM-TWO-HOST-ACCEPTED`)
+- `docs/srv04b-two-host-acceptance.md`: records a separate, two-physical-host
+  acceptance pass of the `0002_queue_claim` protocol against
+  `origin/main@f9bb889` — exclusivity under real network jitter (192 attempts
+  across 8 runs, exactly 8 winners); a real userspace network blackhole that
+  forces `queue_reap()` to expire and requeue the stale owner's attempt
+  (`attempt_expired` after 27.45s) followed by a genuine second, winning
+  claim, with the old and new owners confirmed never simultaneously valid
+  (the stale owner's post-reap token use was rejected `attempt_expired` only
+  *after* the second claim had already won); cross-host token theft/
+  `SET ROLE` laundering refused by the `session_user` claimant check; and
+  clock independence (0 of 11 protocol functions take a timestamp parameter).
+  Named limit: the database host's OS was not Linux in this pass.
+  `docs/AIOS_BOUNDARY.md` cross-references it from the SRV-04b exception note.
+
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
   over enrolled worker-host devices — one query joins `principal`,
@@ -187,6 +277,19 @@ need reconciliation.
 
 Both FastAPI applications served no authentication at all. Every mutating route
 now requires a verified platform principal and an explicit AICC-local grant.
+
+This delivery also fulfils `VOYN-W0-AICC-SRV-02` ("principal-and-permission-model").
+`SRV-02` was filed in the `SRV` sequence between `SRV-01`/`SRV-01a`/`SRV-01b`
+(PostgreSQL foundation) and `SRV-03` (worker host admission), but every
+dispatch of it was refused by the writer-lease bug fixed in
+`VOYN-W0-AICC-LEASE-STUCK-EXPIRED-NO-RECLAIM` (PR #358) — so it never ran, and
+this AUTH-HTTP-01 delivery (filed and completed independently) covers its
+intended scope in full: `command_center/http_auth/` is the HTTP-layer
+principal-and-permission model, and `command_center/db/roles.py` (`SRV-01a`)
+is its database-layer counterpart. `SRV-02` needs no further code and should
+not be re-attempted; this note is the closure record for anyone who finds the
+gap in the `SRV` numbering, the same gap that prompted its retry
+(`VOYN-W0-AICC-SRV-02-RETRY`) on 2026-08-26.
 
 #### Added
 - **`command_center/http_auth/`** — `identity.py` (forwards the caller's platform

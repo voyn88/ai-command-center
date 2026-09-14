@@ -356,6 +356,15 @@ The decision was made and executed: `command_center/workspace_context.py`,
 Git: `552f2d6` / `b798bf2` ("Remove the dead workspace/panel-registry cluster; fix the autonomy-UI
 docs (audit H7/H8)").
 
+**Executable gate added (VOYN-W0-AICC-CLOSURE-WITHOUT-A-GATE-REM).** This closure originally
+shipped without a test, so a later import of any of the three removed names would have gone
+unnoticed until run. `tests/architecture/test_workspace_scaffolding_removed_fitness.py` (scanner
+in `tests/architecture/workspace_scaffolding.py`) now statically walks every `*.py` file and fails
+on any import that resolves onto `command_center.workspace_context`,
+`command_center.workspace_service` or `command_center.ui.panel_registry`, in every import form
+`ast` can express — including the alias form (`from command_center import workspace_context`)
+that an earlier draft of this same gate missed by reading only `ast.ImportFrom.module`.
+
 ### AUDIT-W2-006 — ahead/behind и `git fetch` в `git_info.py` — **Still Open**
 
 `git_info.py` exposes exactly `run_git_command`, `get_status`, `get_log`, `get_diff_stat`,
@@ -386,6 +395,16 @@ The row is now headed **"Ручной статус (метка плана, не 
 caption states that a synchronous Claude Code run cannot be paused mid-flight and that real
 cancellation lives on the Execution Center run card (`app.py:1211-1229`). The labels now match
 the effect, which is the DoD.
+
+**Executable gate added (VOYN-W0-AICC-CLOSURE-WITHOUT-A-GATE-REM).** This closure originally
+shipped no test for the "only" in "only setting a planning label" — a regression that made a
+button also cancel, kill or restart the underlying process would have passed any test that just
+read the resulting `launch_status`/timeline text. `tests/test_task_cards_manual_status.py` patches
+every real process-control seam reachable from the UI (`ExecutionCenterAPI.request_cancel`/
+`start_run`, `Supervisor.cancel`, `subprocess.Popen`, `agent_runner`'s `subprocess.run`,
+`execution_queue.enqueue_and_persist`) to fail loudly, drives each button through a real
+`AppTest` click, and asserts none of those seams fired — with a mutation test proving the spies
+themselves fire when a patched seam is actually called.
 
 ---
 

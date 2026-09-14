@@ -806,3 +806,23 @@ def current_schema_version(db_path: Path) -> int:
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether `name` is a table in `conn`'s database, via `sqlite_master`.
+
+    Centralizes a `sqlite_master` lookup that was duplicated, each time
+    re-typed by hand, across the schema/provenance/execution guards that let
+    `create_run` and its migrations work against a database migrated only
+    part-way (see `create_run`'s `provenance_table`/`provider_route_table`
+    guards and `_migration_25_add_finalization_claim`'s preexisting-table
+    check) — those tables do not exist yet on such a database, and an
+    unguarded read against them raises instead of finding nothing.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        is not None
+    )

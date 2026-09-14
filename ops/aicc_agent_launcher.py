@@ -93,7 +93,13 @@ MAX_PROMPT_BYTES = 128 * 1024
 # combined encoded size below MAX_MANIFEST_BYTES, which is also the client's
 # bounded line-reader limit; oversized output becomes retryable infrastructure
 # while its potentially modified task workspace is preserved.
-MAX_OUTPUT_BYTES = 512 * 1024
+# Per-stream retention bound for agent stdout/stderr held in root memory. An
+# agent that writes more keeps running; only the oldest bytes are dropped and
+# the retained tail is prefixed with a marker (the final report is at the end
+# of the stream for both providers). Refusing the whole run on overflow cost 12
+# of the first 68 isolated implementation runs on 2026-09-09.
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+OUTPUT_TRUNCATED_MARKER = b"[aicc-agent-launcher: earlier agent output dropped; tail retained]\n"
 MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
@@ -161,6 +167,7 @@ SENSITIVE_AUTHORITY_TREES = (
     "/run/aicc-agent-workspace-binds",
     "/run/credentials",
     "/run/voyn-aicc-worker",
+    "/run/aicc-worker-lanes",
     "/srv/aicc-quarantine",
 )
 SYSTEMD_RUN_ENVIRONMENT = {
@@ -413,13 +420,90 @@ def _validate_binary(path: str) -> None:
                     f"executor path component is not immutable root-owned: {parent}"
                 )
     link_info = candidate.lstat()
-    if link_info.st_uid != 0 or link_info.st_mode & 0o022:
+    if not _node_is_immutable_root_owned(link_info):
         raise LaunchRefused(f"executor link is not immutable root-owned: {path}")
-    info = resolved.stat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
-        raise LaunchRefused(f"executor is not an immutable root-owned file: {path}")
+    target_info = resolved.stat()
+    if not stat.S_ISREG(target_info.st_mode):
+        raise LaunchRefused(f"executor is not a regular file: {resolved}")
+    if not _node_is_immutable_root_owned(target_info):
+        raise LaunchRefused(f"executor binary is not immutable root-owned: {resolved}")
     if not os.access(resolved, os.X_OK):
         raise LaunchRefused(f"executor is not executable: {path}")
+
+
+def _node_is_immutable_root_owned(info: os.stat_result) -> bool:
+    """Root-owned and not group/other-writable. A symlink's mode bits are
+    always 0777 on Linux and carry no permission meaning, so only its owner
+    is judged -- the old check applied `& 0o022` to the link itself and
+    refused EVERY executor (the toolchain exposes them as root-owned
+    symlinks), so no isolated agent ever launched (worker-01 2026-09-08:
+    "executor link is not immutable root-owned: .../bin/claude"). The
+    resolved target is judged with its real mode bits."""
+    if info.st_uid != 0:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return not (info.st_mode & 0o022)
+
+
+def _write_back_model_auth(executor: str, home: Path) -> bool:
+    """Persist a provider credential the model process refreshed during the
+    run back into the root-owned store the next run is staged from.
+
+    Claude and Codex rotate their refresh token when they refresh: the new
+    token lands in the per-run ephemeral home and the old one in the store
+    is revoked. Without this, the FIRST isolated run succeeds and every
+    later one fails with "OAuth session expired and could not be refreshed"
+    (worker-01, 2026-09-08: 48 dead attempts in 25 minutes). The broker,
+    still root, copies the file back only when it is a regular file the run
+    left in place, parses as a JSON object whose top-level keys equal the
+    staged copy's (a token refresh changes values, never the shape -- a
+    different shape is not a refresh and is not trusted), and differs from
+    the store; the write is atomic (temp + rename in the store directory,
+    0600 root). Returns True when the store was updated."""
+    source = MODEL_AUTH_SOURCES.get(executor)
+    if source is None:
+        return False
+    target = home / MODEL_AUTH_TARGETS[executor]
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MODEL_AUTH_BYTES:
+        raise LaunchRefused("refreshed model auth is not a plain regular file")
+    refreshed = target.read_bytes()
+    current = _read_exact_protected_file(
+        source, expected_uid=0, expected_gid=0, exact_mode=0o600
+    )
+    if refreshed == current:
+        return False
+    try:
+        refreshed_doc = json.loads(refreshed.decode("utf-8"))
+        current_doc = json.loads(current.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise LaunchRefused("refreshed model auth is not JSON") from exc
+    if (
+        not isinstance(refreshed_doc, dict)
+        or not isinstance(current_doc, dict)
+        or set(refreshed_doc) != set(current_doc)
+    ):
+        raise LaunchRefused("refreshed model auth changed shape; not a token refresh")
+    temporary = source.with_name(f".{source.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        if os.geteuid() == 0:
+            os.fchown(descriptor, 0, 0)
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(refreshed)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, source)
+    print(f"model auth write-back: {executor} credential refreshed by the run", file=sys.stderr, flush=True)
+    return True
 
 
 def _prepare_agent_home(executor: str, run_id: str) -> Path:
@@ -842,7 +926,18 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
             binary,
             "exec",
             "--sandbox",
-            "read-only" if profile == "read_only" else "workspace-write",
+            # Inside THIS unit the boundary is systemd's: a dynamic uid, only
+            # /workspace and /agent-home writable, ProtectSystem=strict, no
+            # capabilities. Codex's own workspace-write sandbox (bubblewrap)
+            # on top of it mounts .git read-only, so the commit the fleet
+            # contract requires could never land ("Unable to create
+            # .git/index.lock: Read-only file system", worker-01 2026-09-09).
+            # The development profile therefore runs Codex without its inner
+            # sandbox HERE ONLY (owner decision 2026-09-09); outside the
+            # broker, agent_runner.build_codex_command keeps workspace-write.
+            # The read-only profile keeps Codex's read-only sandbox: it is a
+            # second, cheaper enforcement of the same promise.
+            "read-only" if profile == "read_only" else "danger-full-access",
             "--color",
             "never",
         ]
@@ -947,6 +1042,17 @@ def _systemd_command(
         "--setenv=PATH=/usr/local/bin:/usr/bin:/bin",
         "--setenv=GIT_CONFIG_NOSYSTEM=1",
         "--setenv=GIT_CONFIG_GLOBAL=/dev/null",
+        # The bound workspace is owned by the WORKER (a foreign uid inside the
+        # agent's dynamic-user view -- it reads as nobody), and git refuses a
+        # repository owned by someone else unless a protected config trusts
+        # it. With system and global config disabled above, the command-line
+        # form is the only protected scope left: trust exactly /workspace,
+        # the one tree the agent is meant to work in. Without it every git
+        # command the agent ran failed with "dubious ownership" and no Codex
+        # commit could ever land (worker-01 2026-09-09).
+        "--setenv=GIT_CONFIG_COUNT=1",
+        "--setenv=GIT_CONFIG_KEY_0=safe.directory",
+        "--setenv=GIT_CONFIG_VALUE_0=/workspace",
         "--setenv=GIT_TERMINAL_PROMPT=0",
         "--setenv=GCM_INTERACTIVE=never",
         "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
@@ -1017,10 +1123,18 @@ def _authorised_peer(uid: int) -> bool:
 def _bounded_collect(
     proc: subprocess.Popen[bytes], on_limit: Any
 ) -> tuple[bytes, bytes]:
-    """Incrementally drain both pipes without letting root memory grow unbounded."""
+    """Incrementally drain both pipes without letting root memory grow unbounded.
+
+    Each stream keeps at most ``MAX_OUTPUT_BYTES`` of its most recent output;
+    overflow drops the oldest bytes and records the stream as truncated so the
+    returned bytes start with ``OUTPUT_TRUNCATED_MARKER``.  ``on_limit`` is
+    invoked once per stream on first overflow (observability hook; it must not
+    kill the agent).
+    """
     if proc.stdout is None or proc.stderr is None:
         raise LaunchRefused("agent output pipes are unavailable")
     collected = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    truncated: set[int] = set()
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ)
     selector.register(proc.stderr, selectors.EVENT_READ)
@@ -1032,16 +1146,23 @@ def _bounded_collect(
                     selector.unregister(key.fileobj)
                     continue
                 buffer = collected[key.fd]
-                if len(buffer) + len(chunk) > MAX_OUTPUT_BYTES:
-                    on_limit()
-                    raise LaunchRefused("agent output exceeded the bounded transport")
                 buffer.extend(chunk)
+                if len(buffer) > MAX_OUTPUT_BYTES:
+                    if key.fd not in truncated:
+                        truncated.add(key.fd)
+                        on_limit()
+                    del buffer[: len(buffer) - MAX_OUTPUT_BYTES]
     finally:
         selector.close()
     proc.wait(timeout=25)
-    return bytes(collected[proc.stdout.fileno()]), bytes(
-        collected[proc.stderr.fileno()]
-    )
+
+    def finish(fd: int) -> bytes:
+        data = bytes(collected[fd])
+        if fd in truncated:
+            return OUTPUT_TRUNCATED_MARKER + data
+        return data
+
+    return finish(proc.stdout.fileno()), finish(proc.stderr.fileno())
 
 
 def _systemctl(
@@ -1385,7 +1506,7 @@ def _cleanup_workspace_bind(binding: WorkspaceBind) -> None:
     binding.path.rmdir()
 
 
-def _open_pinned_workspace(workspace: Path) -> int:
+def _open_pinned_workspace(workspace: Path, client_uid: int = 0) -> int:
     """Pin the validated directory inode until PID 1 consumes the bind source."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
@@ -1405,15 +1526,27 @@ def _open_pinned_workspace(workspace: Path) -> int:
     # 52ced1f). A rename can only happen if the PARENT directory is writable
     # by a non-root principal; require it rename-proof so the untrusted agent
     # cannot swap the workspace entry between here and PID 1's resolution.
-    if not _parent_is_rename_proof(workspace):
+    if not _parent_is_rename_proof(workspace, client_uid):
         os.close(descriptor)
         raise LaunchRefused("task workspace parent is renamable by non-root")
     return descriptor
 
 
-def _parent_is_rename_proof(workspace: Path) -> bool:
-    """True iff the workspace's parent is root-owned and not group/other-
-    writable -- i.e. no non-root principal can rename the workspace entry."""
+def _parent_is_rename_proof(workspace: Path, client_uid: int = 0) -> bool:
+    """True iff no principal other than root or the connecting client can
+    rename the workspace entry: the parent is owned by root or by the client
+    and carries no group/other write bit.
+
+    The client is the worker lane that provisioned the workspace -- the
+    trusted side of this socket (``_authorised_peer``); the threat is the
+    untrusted agent (DynamicUser, SupplementaryGroups=aicc-workspace)
+    swapping the entry between the pin and PID 1's path resolution. The old
+    rule demanded a ROOT-owned parent, which no directory a non-root worker
+    can create inside ever satisfies -- every isolated launch on worker-01
+    was refused with "task workspace parent is renamable by non-root"
+    (2026-09-08); and the workspace root itself was 2770 with the agents'
+    group, so the threat was real there. The root is 2750 now (tmpfiles):
+    agents reach only their bound /workspace, never the root."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -1425,7 +1558,7 @@ def _parent_is_rename_proof(workspace: Path) -> bool:
         parent = os.fstat(parent_fd)
     finally:
         os.close(parent_fd)
-    return parent.st_uid == 0 and not (parent.st_mode & 0o022)
+    return parent.st_uid in (0, client_uid) and not (parent.st_mode & 0o022)
 
 
 def _workspace_is_quarantined(workspace: Path) -> bool:
@@ -1645,7 +1778,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         workspace_lock = _open_workspace_lock(workspace)
-        workspace_fd = _open_pinned_workspace(workspace)
+        workspace_fd = _open_pinned_workspace(workspace, peer)
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         _prepare_reusable_workspace(workspace, workspace_fd)
@@ -1681,7 +1814,15 @@ def _serve_connected_socket(sock: socket.socket) -> int:
 
         def collect() -> None:
             try:
-                result["value"] = _bounded_collect(proc, lambda: _seal_unit(unit))
+                result["value"] = _bounded_collect(
+                    proc,
+                    lambda: print(
+                        f"agent output exceeded {MAX_OUTPUT_BYTES} bytes; "
+                        f"retaining tail (unit {unit})",
+                        file=sys.stderr,
+                        flush=True,
+                    ),
+                )
             except (LaunchRefused, OSError, subprocess.SubprocessError) as exc:
                 result["error"] = exc
 
@@ -1752,6 +1893,10 @@ def _serve_connected_socket(sock: socket.socket) -> int:
                     ).decode("ascii"),
                 }
         if agent_home is not None:
+            try:
+                _write_back_model_auth(manifest["executor"], agent_home)
+            except (LaunchRefused, OSError, ValueError) as exc:
+                print(f"model auth write-back skipped: {exc}", file=sys.stderr, flush=True)
             shutil.rmtree(agent_home, ignore_errors=True)
         if workspace_bind is not None:
             try:

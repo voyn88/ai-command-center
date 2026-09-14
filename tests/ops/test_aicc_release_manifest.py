@@ -402,6 +402,30 @@ def test_writable_release_cannot_be_recorded_either(release, tmp_path):
         _record(module, release, tmp_path / "manifest.json")
 
 
+def test_untraversable_release_root_cannot_be_recorded(release, tmp_path):
+    """0500 root (mktemp -d + chmod -R a-w) is exactly what killed the lane
+    with 200/CHDIR on worker-01; recording it must fail closed."""
+    module = _module()
+    release.chmod(0o500)
+    try:
+        with pytest.raises(module.ReleaseRefused, match="not traversable"):
+            _record(module, release, tmp_path / "manifest.json")
+    finally:
+        release.chmod(0o755)
+
+
+def test_untraversable_release_directory_is_refused_at_verify(release, tmp_path):
+    module = _module()
+    manifest = tmp_path / "manifest.json"
+    _record(module, release, manifest)
+    (release / "command_center").chmod(0o500)
+    try:
+        with pytest.raises(module.ReleaseRefused, match="not traversable"):
+            _trusted(module, release, manifest)
+    finally:
+        (release / "command_center").chmod(0o755)
+
+
 def test_mode_change_alone_is_refused(release, tmp_path):
     module = _module()
     manifest = tmp_path / "manifest.json"

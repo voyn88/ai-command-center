@@ -2015,7 +2015,6 @@ def _trusted_git_environment(trusted_root: Path) -> dict[str, str]:
             # ~/.gitconfig or $XDG_CONFIG_HOME/git/config.
             "HOME": str(config_home),
             "XDG_CONFIG_HOME": str(config_home),
-            "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_AUTHOR_NAME": "AI Command Center Worker",
@@ -2024,7 +2023,40 @@ def _trusted_git_environment(trusted_root: Path) -> dict[str, str]:
             "GIT_COMMITTER_EMAIL": "aicc-worker@localhost",
         }
     )
+    environment.update(_trusted_system_gitconfig())
     return environment
+
+
+#: Indirection so tests can present a root-owned file without being root.
+_system_gitconfig_stat = os.stat
+
+
+def _trusted_system_gitconfig() -> dict[str, str]:
+    """Return the Git config variables selecting the operator's system config.
+
+    Under principal isolation the lane's unit pins ``GIT_CONFIG_SYSTEM`` to a
+    root-owned file (``/etc/aicc/gitconfig``) carrying the fleet credential
+    helper and the ssh->https URL rewrite; without it the trusted publisher
+    clone cannot authenticate against private repositories at all
+    (VOYN-W0-AICC-FLEET-LAST-MILE-PUBLISH).  That file is operator authority,
+    not worker authority, so it is honoured only when it is owned by root and
+    writable by nobody else; any other value (worker-writable, missing,
+    relative, unset) disables the system config entirely, as before.
+    """
+    candidate = os.environ.get("GIT_CONFIG_SYSTEM", "")
+    if candidate and os.path.isabs(candidate):
+        try:
+            info = _system_gitconfig_stat(candidate)
+        except OSError:
+            info = None
+        if (
+            info is not None
+            and stat.S_ISREG(info.st_mode)
+            and info.st_uid == 0
+            and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            return {"GIT_CONFIG_SYSTEM": candidate}
+    return {"GIT_CONFIG_NOSYSTEM": "1"}
 
 
 def _run_trusted_worktree_git(
@@ -2880,3 +2912,75 @@ def prune_repository(repository_path: str | Path) -> str:
     except _GIT_OPERATION_ERRORS:
         return "prune_failed"
     return "pruned" if result.returncode == 0 else "prune_failed"
+
+
+def force_remove_worktree(repo_root: str | Path, worktree_path: str | Path) -> None:
+    """The one force-removal site for an ephemeral worktree the caller
+    itself created and unconditionally owns (VOYN-W0-AICC-WORKTREE-LEAK-
+    RETRY: an audit of leaked worktree checkouts traced 44 of them to eight
+    independent hand-rolled `git worktree remove --force` call sites --
+    `command_center.portfolio_launch`'s launch-rollback, `command_center.
+    worker.handlers`'s review-head verification checkout, and `scripts.
+    mirror_slice_checks`'s throwaway probe tree among them -- each with its
+    own, inconsistent idea of what to do when the `remove` itself fails.
+    Some left the directory *and* its `.git/worktrees/<name>` metadata
+    behind forever with no fallback and nothing else ever revisiting the
+    path; unlike those, this is the single implementation all of them call.
+
+    This is deliberately unlike `remove_workspace`: this function trusts the
+    caller's ownership claim completely (no `is_pipeline_owned_worktree`
+    gate) and always forces the removal, because every caller here already
+    knows unconditionally that the path is a worktree it just created for a
+    single throwaway use (a launch attempt being rolled back, a detached
+    verification checkout, a probe tree) -- never a long-lived, possibly
+    agent-modified workspace someone might still want to inspect after a
+    failure, which is what `remove_workspace`'s caution is for.
+
+    Best-effort and never raises: `git worktree remove --force` first: if
+    that fails (the path was already gone, a lock, or any other refusal),
+    unlock it (a single `--force` does not override a lock -- git demands
+    either `-f -f` or an explicit unlock first, and `git worktree prune`
+    below will not touch a locked entry no matter how long its directory has
+    been gone), then fall back to `shutil.rmtree` so the directory never
+    lingers just because git refused; then `git worktree prune` in the same
+    repo unconditionally, since a `--force` removal on some git versions can
+    succeed on the directory while leaving the `.git/worktrees/<name>` entry
+    dangling."""
+    repo = _resolve(repo_root)
+    target = Path(worktree_path)
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(target)],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        removed = result.returncode == 0
+    except _GIT_OPERATION_ERRORS:
+        removed = False
+    if not removed:
+        try:
+            subprocess.run(
+                ["git", "worktree", "unlock", str(target)],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except _GIT_OPERATION_ERRORS:
+            pass
+        shutil.rmtree(target, ignore_errors=True)
+    try:
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except _GIT_OPERATION_ERRORS:
+        pass

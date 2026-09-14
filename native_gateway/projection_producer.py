@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +38,8 @@ from command_center import backlog_client, read_model, storage, tasks_repository
 from command_center.runtime import runs_read
 
 from .task_titles import load_cache, title_for
+
+_LOG = logging.getLogger(__name__)
 
 PROJECTION_VERSION = "1"
 _EVENT_LIMIT = 50
@@ -301,6 +304,16 @@ def build_projection(
     except Exception:  # noqa: BLE001 -- any journal failure degrades, never breaks the artifact
         # The run journal is optional context for the calm overview; its
         # unavailability degrades freshness, it must not hide the task list.
+        # Logged (not silenced) because "no journal file yet" and "journal
+        # exists but the read raised" render identically as empty
+        # lanes/events otherwise — the traceback is the only way to tell a
+        # genuinely empty journal from a schema/query bug on a live db.
+        _LOG.warning(
+            "Run journal unavailable for projection (root=%s, db=%s)",
+            root,
+            resolved_db,
+            exc_info=True,
+        )
         degraded = True
 
     payload = {

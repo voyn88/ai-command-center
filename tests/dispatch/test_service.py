@@ -151,6 +151,7 @@ def test_plan_prefers_free_local_executor(monkeypatch, pool):
 
     assert plan.assignments[0].assigned_executor == "ollama"
     assert plan.kill_switch_engaged is False
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_ACTUAL
 
 
 def test_plan_reports_kill_switch_when_master_switch_off(monkeypatch, pool):
@@ -207,8 +208,15 @@ def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
     # `0.0` that a caller could mistake for "nothing spent today".
     assert plan.daily_spend_usd is None
     assert plan.projected_spend_usd is None
+    assert plan.budget_remaining_usd is None
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_UNAVAILABLE
     assert plan.as_dict()["daily_spend_usd"] is None
     assert plan.as_dict()["projected_spend_usd"] is None
+    assert plan.as_dict()["budget_remaining_usd"] is None
+    assert plan.as_dict()["spend_measurement"] == {
+        "status": "unavailable",
+        "kind": "unknown",
+    }
 
 
 def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):

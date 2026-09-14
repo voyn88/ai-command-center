@@ -5,8 +5,11 @@
   ([`FINAL_GOAL_AND_ROADMAP_AUTHORITY.md`](FINAL_GOAL_AND_ROADMAP_AUTHORITY.md)) and the completed
   backlog reconciliation
   ([`FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md`](../audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md)).
-- **Machine-readable companion**: [`MASTER_ROADMAP_TASKS.json`](MASTER_ROADMAP_TASKS.json) — 34 rows,
+- **Machine-readable companion**: [`MASTER_ROADMAP_TASKS.json`](MASTER_ROADMAP_TASKS.json) — 40 rows,
   every derived field computed, not hand-typed.
+- **Autonomous backlog import package**:
+  [`AICC_AUTONOMY_P00_BACKLOG.md`](AICC_AUTONOMY_P00_BACKLOG.md) — the executable P00/P1 layer
+  to import before running the backlog unattended.
 - **Reconciled against**: `main` @ `bd9f05b`, branch `docs/canonical-master-roadmap`, 2026-07-28.
 - **Scope of this document**: planning only. **Nothing was imported and nothing was launched.**
   No runtime code, no `data/tasks.json`, no worktree and no branch was created. The only validation
@@ -121,12 +124,15 @@ ADR (§7 R4), and writing that ADR is row `AICC-GOV-F3`.
 The program roadmap's `P0/P1/P2` scale is not a live vocabulary and was **not** mechanically mapped.
 Priorities were assigned from evidence:
 
-- **Critical** — `AICC-GOV-F2` only. §2.3 records the data-integrity success gate as *currently
-  failing*, and §7 **A3** puts the registry/import-integrity Blocker ahead of every feature row.
-  It is the one row that outranks the critical path in the schedule.
-- **High** — the H1 desktop track through `AICC-D2-GATE` (the next implementation stage), the
-  registry ADR, and the two audit rows carrying safety/containment findings (`W0-006`, `W1-002`)
-  plus the schema row `W2-001`.
+- **Critical** — only the five P00 hands-off autonomy hardening rows:
+  `AICC-AUTO-P00-SUPERVISOR`, `AICC-AUTO-P00-FAILURE-CLASSIFIER`,
+  `AICC-AUTO-P00-SMOKE-ROLLBACK`, `AICC-AUTO-P00-AUTO-SPLIT`, and
+  `AICC-AUTO-P00-BUDGETS`. These are the minimum guardrails before launching the backlog
+  unattended.
+- **High** — the AICC desktop/mobile command-surface epic, the H1 desktop track through
+  `AICC-D2-GATE`, the registry/import-integrity task `AICC-GOV-F2`, the registry ADR, and the two
+  audit rows carrying safety/containment findings (`W0-006`, `W1-002`) plus the schema row
+  `W2-001`.
 - **Medium / Low** — carried verbatim from the audit reconciliation for the 13 audit rows, and
   assigned by horizon distance for D3/D4 and the documentation follow-ups.
 
@@ -269,15 +275,18 @@ change available (16 → 11 waves); going past 4 is wasted.
   and reclaim finished worktrees **before** scheduling a wave, or provisioning competes for disk
   with abandoned trees.
 
-### 6.3 Parallel schedule — 16 waves at the live cap of 2
+### 6.3 Parallel schedule — 19 waves at the live cap of 2
 
-Waves are a greedy topological schedule honouring, in order: `Critical` precedence
-(§7 A3), longest remaining chain, priority, then id for determinism — subject to hard deps, soft
+Waves are a greedy topological schedule honouring, in order: the P00 autonomy cleanup founder
+override, longest remaining chain, priority, then id for determinism — subject to hard deps, soft
 precedence, file conflicts and the concurrency cap of 2.
 
 | Wave | Slot 1 | Slot 2 | Bound by |
 |---|---|---|---|
-| P01 | `AICC-GOV-F2` *(Critical)* | `AICC-D1-GATE` *(CP head)* | capacity |
+| P00A | `AICC-AUTO-P00-SUPERVISOR` *(Critical)* | `AICC-AUTO-P00-FAILURE-CLASSIFIER` *(Critical)* | capacity |
+| P00B | `AICC-AUTO-P00-SMOKE-ROLLBACK` *(Critical)* | `AICC-AUTO-P00-AUTO-SPLIT` *(Critical)* | dependencies and capacity |
+| P00C | `AICC-AUTO-P00-BUDGETS` *(Critical)* | `AICC-APP-H1-COMMAND-SURFACE` *(High)* | autonomy cleanup dependency |
+| P01 | `AICC-GOV-F2` | `AICC-D1-GATE` *(CP head)* | capacity |
 | P02 | `AICC-AUDIT-W2-004` | `AICC-GOV-F3` | capacity |
 | P03 | `AICC-D2A` *(CP)* | `AICC-GOV-F5` | capacity |
 | P04 | `AICC-D2B` *(CP)* | `AICC-AUDIT-W2-001` | capacity |
@@ -294,8 +303,9 @@ precedence, file conflicts and the concurrency cap of 2.
 | P15 | `AICC-GOV-F1` | `AICC-GOV-F4A` | capacity |
 | P16 | `AICC-GOV-F4B` | — | dependencies — nothing else is eligible |
 
-Desktop Increment 1 closes at **P14**; the audit-closure gate at **P16**. Each row's assignment is
-also carried in the JSON as `parallel_group` / `parallel_slot`.
+The P00 autonomy cleanup and the app command-surface seed close before the previous P01 wave starts.
+Desktop Increment 1 still closes at **P14**; the audit-closure gate at **P16**. Each row's assignment
+is also carried in the JSON as `parallel_group` / `parallel_slot`.
 
 ---
 
@@ -334,11 +344,27 @@ untracked "what's next" list — that is exactly the condition Reconciliation Co
 Full field detail — prompts, definitions of done, forbidden scope, per-row evidence and every
 computed field — is in [`MASTER_ROADMAP_TASKS.json`](MASTER_ROADMAP_TASKS.json).
 
+### Autonomy P00 (5)
+
+| Id | Title | Status | Priority | Ready |
+|---|---|---|---|---|
+| `AICC-AUTO-P00-SUPERVISOR` | Backlog supervisor selects and advances the next safest work | Backlog | **Critical** | yes |
+| `AICC-AUTO-P00-FAILURE-CLASSIFIER` | Failure classifier separates flaky infra from real code defects | Backlog | **Critical** | yes |
+| `AICC-AUTO-P00-SMOKE-ROLLBACK` | Post-merge smoke with automatic stop or rollback path | Backlog | **Critical** | no (P00 supervisor/classifier) |
+| `AICC-AUTO-P00-AUTO-SPLIT` | Auto-split oversized backlog items into safe slices | Backlog | **Critical** | no (P00 supervisor) |
+| `AICC-AUTO-P00-BUDGETS` | Autonomy budgets, rate limits, and kill switches | Backlog | **Critical** | no (P00 supervisor/classifier) |
+
+### AICC App Command Surface (1)
+
+| Id | Title | Status | Priority | Ready |
+|---|---|---|---|---|
+| `AICC-APP-H1-COMMAND-SURFACE` | AICC desktop and mobile command surface for all operational data | Backlog | High | no (P00 autonomy controls) |
+
 ### Governance (6)
 
 | Id | Title | Status | Priority | Ready |
 |---|---|---|---|---|
-| `AICC-GOV-F2` | Restore `data/tasks.json` project-id integrity | Backlog | **Critical** | yes |
+| `AICC-GOV-F2` | Restore `data/tasks.json` project-id integrity | Backlog | High | yes |
 | `AICC-GOV-F3` | Write the missing project-registry ADR | Backlog | High | yes |
 | `AICC-GOV-F1` | Refresh `README.md` / `CHANGELOG.md` against `main` | Backlog | Medium | no (F3) |
 | `AICC-GOV-F4A` | Triage ADR 0001 Tier B + program-roadmap H2 concepts | Backlog | Medium | yes |
