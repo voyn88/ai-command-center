@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, tzinfo
+from pathlib import Path
 from typing import Any, Iterable
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "ColumnCodec",
     "divergence",
     "render_authority_timestamp",
+    "resolve_authority_zone",
     "to_instant",
 ]
 
@@ -38,7 +40,7 @@ __all__ = [
 MIRROR_UNAVAILABLE = "__mirror_unavailable__"
 
 
-def to_instant(value: str) -> datetime:
+def to_instant(value: str, *, zone: tzinfo | None = None) -> datetime:
     """Attach the writer's zone to a naive timestamp bound for `timestamptz`.
 
     `models.iso_now()` returns *naive local time* — its docstring says every
@@ -47,25 +49,33 @@ def to_instant(value: str) -> datetime:
     error: PostgreSQL stamps it with the *session* time zone, so every mirrored
     row is silently offset by the gap between the writing machine and the
     server. Interpreting it in the local zone is the only reading consistent
-    with what the authority means by it, and the mirror runs in the writer's
-    own process, so "local" is the zone that produced the string.
+    with what the authority means by it.
 
-    The limit is inherent to the naive format rather than to this code, and
-    reconciliation is **blind** to a violation of it: the render below converts
-    back through the same zone, so a mirror running in the wrong one reproduces
-    the original wall clock and `divergence` reports agreement it never
-    verified. Independent review demonstrated this — the same row mirrored from
-    an MSK and a UTC process stored instants three hours apart and both
-    reconciled clean. Until `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS` closes — by
-    making the authority timezone-aware *or* by giving reconciliation its own
-    zone check — the mirror must run in the writer's process, and that is an
-    operational constraint rather than something any gate enforces.
+    `zone` names that local zone explicitly. Omitting it falls back to the
+    *calling process's own* zone (`datetime.astimezone()`), which is only
+    correct when the mirror runs in the writer's own process — the assumption
+    slice 1 shipped with, silently, and got wrong: the same naive string
+    converted by an MSK process and by a UTC process produced instants three
+    hours apart, and `render_authority_timestamp` round-tripped each back to
+    the same wall clock it started from, so reconciliation reported both
+    clean. It could not have reported otherwise — both conversions used
+    "whichever zone is asking," so there was nothing to compare it against.
+
+    `resolve_authority_zone` is the fix: it reads the zone the authority
+    *declares* its own timestamps are on, independent of whoever calls this
+    function, and callers that pass it here close that gap
+    (`VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`). `zone=None` is kept as the default
+    rather than resolved implicitly, because that resolution is I/O — a SQLite
+    read — and this module promises to run with no driver and no side effect
+    for every existing caller that has not opted in.
     """
     parsed = datetime.fromisoformat(value)
-    return parsed if parsed.tzinfo is not None else parsed.astimezone()
+    if parsed.tzinfo is not None:
+        return parsed
+    return parsed.replace(tzinfo=zone) if zone is not None else parsed.astimezone()
 
 
-def render_authority_timestamp(value: datetime) -> str:
+def render_authority_timestamp(value: datetime, *, zone: tzinfo | None = None) -> str:
     """Render `timestamptz` back into exactly what `models.iso_now()` emits.
 
     Naive local, second precision, no offset. An earlier version rendered UTC
@@ -80,8 +90,52 @@ def render_authority_timestamp(value: datetime) -> str:
     later waves, and copying this onto them reproduces the same class of defect
     in reverse. Tracked as `VOYN-W0-AICC-MIRROR-RENDER-SHARED`, a declared
     blocker on the first such table.
+
+    `zone` is `to_instant`'s counterpart: render into the authority's declared
+    zone rather than the *reading* process's own (the default, via bare
+    `astimezone()`). Two processes in different zones passing the same `zone`
+    here render the same instant to the same string; left at the default, each
+    renders it into its own wall clock and neither can tell the other is wrong.
     """
-    return value.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+    localized = value.astimezone(zone) if zone is not None else value.astimezone()
+    return localized.replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def resolve_authority_zone(db_path: Path | None = None) -> tuple[tzinfo | None, str]:
+    """The zone `models.iso_now()` timestamps in `db_path` are declared to be
+    on, and where that answer came from (`"env"`, `"database"`,
+    `"process-local"`) — the `zone` to pass `to_instant`/`render_authority_timestamp`
+    (via `ColumnCodec.zone`) so a mirror write or a reconciliation run gives the
+    same answer regardless of which zone the calling process happens to be in.
+
+    Delegates to `command_center.runtime.db.resolve_timestamp_zone`, which
+    already solved this for retention (`VOYN-W0-AICC-RETENTION-TZ`): a zone
+    stamped once, on first migration, onto the authority database's own
+    `schema_version` ledger — by a process that was also writing the naive
+    timestamps it describes — and read back from there rather than trusted from
+    whichever machine is asking. `AICC_RUNTIME_TZ` still wins, for the same
+    reason it does there: an operator can state the truth for a database
+    stamped on the wrong machine.
+
+    Imported lazily, not at module load: `command_center.runtime.db` is a
+    SQLite module (no PostgreSQL driver, so no promise here is broken by
+    importing it), but doing so unconditionally would mean every importer of
+    this file pays for a package this function's callers alone need — and some
+    of those callers, like this file's own tests, run one process at a time
+    with no authority database on disk at all, where "process-local" (`None`)
+    is the only honest answer.
+
+    `db_path` defaults to the installation's own `runtime.db`. A caller with a
+    different database in hand — a test fixture, a snapshot under
+    reconciliation — passes its own path instead of the ambient default.
+    """
+    from zoneinfo import ZoneInfo
+
+    import command_center.runtime.db as runtime_db
+
+    path = db_path if db_path is not None else runtime_db.resolve_db_path()
+    name, source = runtime_db.resolve_timestamp_zone(path)
+    return (ZoneInfo(name) if name else None), source
 
 
 @dataclass(frozen=True)
@@ -117,6 +171,11 @@ class ColumnCodec:
     flags: frozenset[str] = field(default_factory=frozenset)
     #: Columns PostgreSQL declares `jsonb` while the authority stores JSON text.
     json_values: frozenset[str] = field(default_factory=frozenset)
+    #: The zone `timestamps` columns convert through — see `to_instant`. `None`
+    #: (the default) keeps every existing table on the calling process's own
+    #: zone, unchanged; a caller reconciling from a process other than the
+    #: writer's should pass `resolve_authority_zone()`'s result instead.
+    zone: tzinfo | None = None
 
     def to_column(self, name: str, value: Any) -> Any:
         """The authority's shape -> the PostgreSQL column's type.
@@ -139,7 +198,7 @@ class ColumnCodec:
             # psycopg will not coerce SQLite's 0/1 into a boolean column.
             return None if value is None else bool(value)
         if name in self.timestamps and isinstance(value, str) and value:
-            return to_instant(value)
+            return to_instant(value, zone=self.zone)
         if name in self.json_values and isinstance(value, str) and value:
             try:
                 json.loads(value)
@@ -160,7 +219,7 @@ class ColumnCodec:
         if name in self.flags:
             return None if value is None else int(bool(value))
         if name in self.timestamps and isinstance(value, datetime):
-            return render_authority_timestamp(value)
+            return render_authority_timestamp(value, zone=self.zone)
         return value
 
     def comparable(self, name: str, value: Any) -> Any:
