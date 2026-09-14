@@ -1290,6 +1290,72 @@ def test_a_no_fault_refusal_refunds_the_attempt_it_was_handed(
         assert _waits(admin_conn, item_id) == 1, "counted on its own budget instead"
 
 
+def test_a_refunded_item_can_be_claimed_again(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH: the refund is only a fix
+    if the item it returns to the pool can actually be delivered again.
+
+    Until 0025 it could not. `queue_claim` numbered the new attempt
+    `attempt_count + 1` -- the same column the refund had just decremented --
+    so the next claim re-used an `attempt_no` the item's own history already
+    held and `UNIQUE (work_item_id, attempt_no)` raised *out of* the
+    SECURITY DEFINER function. The worker calls `claim()` from its main loop,
+    so the lane died on the exception and systemd restarted it into the same
+    still-ready, still-highest-priority row: one refunded item stopped the
+    whole fleet from claiming anything.
+
+    The delivery number now comes from the attempt history and the budget from
+    `attempt_count`, so the second delivery is `attempt_no` 2 with the model
+    budget still whole. `attempt_no` is also what selects the executor cascade
+    link (`worker.handlers._cascade_step`), which is why the refund must not
+    hand the same number out twice even though it gives the budget back.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "refunded-then-claimed", max_attempts=2, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            first = _claim(worker, token_hash)
+            assert first[0] and first[4] == 1
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (first[3], token, "lease_unavailable: held by a sibling lane", 20),
+            ) == (True, "lease_wait_requeued")
+            assert _item(admin_conn, item_id)[1] == 0, "the attempt was refunded"
+
+            # The claim that used to raise `duplicate key value violates unique
+            # constraint "idx_work_attempt_item_no"`.
+            token, token_hash = _token()
+            second = _claim(worker, token_hash)
+            assert second[0], second[1]
+            assert second[2] == item_id
+            assert second[4] == 2, "a fresh delivery number, not the refunded one"
+
+            # And it is a real, ownable claim: the delivery reports its own
+            # outcome rather than colliding with the attempt before it.
+            assert _call(
+                worker,
+                "SELECT ok FROM queue_complete(%s, %s, %s::jsonb)",
+                (second[3], token, json.dumps({"done": True})),
+            ) == (True,)
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT attempt_no, state FROM work_attempt WHERE work_item_id = %s "
+            "ORDER BY attempt_no",
+            (item_id,),
+        )
+        assert cur.fetchall() == [(1, "failed"), (2, "succeeded")]
+    state = _item(admin_conn, item_id)
+    assert state[0] == "succeeded"
+    assert state[1] == 1, "one delivery spent the budget; the refunded one did not"
+
+
 def test_the_no_fault_budget_is_bounded_and_names_its_own_cause(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
@@ -1308,11 +1374,18 @@ def test_the_no_fault_budget_is_bounded_and_names_its_own_cause(
     reason = "executor infrastructure failure (provider/auth/quota): session limit"
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         with psycopg.connect(host_dsns[0], autocommit=True) as worker:
-            for expected in ("lease_wait_requeued", "lease_wait_requeued",
-                             "lease_wait_dead_lettered"):
+            for delivery, expected in enumerate(
+                ("lease_wait_requeued", "lease_wait_requeued",
+                 "lease_wait_dead_lettered"),
+                start=1,
+            ):
                 token, token_hash = _token()
                 verdict = _claim(worker, token_hash)
                 assert verdict[0], verdict[1]
+                # Each refusal returns the BUDGET and keeps the DELIVERY
+                # number moving (0025); a delivery number that came back with
+                # the budget would collide with the attempt row just written.
+                assert verdict[4] == delivery
                 ok, got = _call(
                     worker,
                     "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
@@ -1326,6 +1399,9 @@ def test_the_no_fault_budget_is_bounded_and_names_its_own_cause(
     # infra_monitor buckets a DLQ row by its `dead_reason`; the refusal text
     # has to survive into it or a quota outage lands in the generic class.
     assert re.search(r"(?i)session limit", state[5])
+    # 0026: the refusal that exhausts the wait budget refunds its attempt like
+    # every refusal before it, so the DLQ row an operator reads says plainly
+    # that this item never spent a model attempt of its own.
     assert state[1] == 0, "not one model attempt was ever spent on this item"
 
 
@@ -1364,14 +1440,21 @@ def test_redrive_clears_the_no_fault_budget_it_widens_the_attempts_for(
                 "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
                 (verdict[3], token, "a real failure"),
             )
-            token, token_hash = _token()
-            verdict = _claim(worker, token_hash)
-            ok, got = _call(
-                worker,
-                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
-                (verdict[3], token, "writer lease unavailable", 1),
-            )
-            assert ok is True and got == "lease_wait_dead_lettered"
+            # Then two no-fault refusals against a cap of one: the first is
+            # inside the budget and requeues, the second exceeds it. The
+            # dead-letter branch is `waits > cap`, so a cap of one takes two
+            # refusals to reach -- and the item has to survive the first one,
+            # which is the delivery the pre-0025 claim could not even hand out.
+            for expected in ("lease_wait_requeued", "lease_wait_dead_lettered"):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                ok, got = _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, "writer lease unavailable", 1),
+                )
+                assert ok is True and got == expected
 
         assert _item(admin_conn, item_id)[0] == "dead"
         assert _waits(admin_conn, item_id) == 2, "the cap was exceeded, not merely met"
@@ -1381,7 +1464,7 @@ def test_redrive_clears_the_no_fault_budget_it_widens_the_attempts_for(
 
         state = _item(admin_conn, item_id)
         assert state[0] == "ready"
-        assert state[1] == 1, "the attempt history is still not reset"
+        assert state[1] == 1, "the real failure's attempt is still not reset"
         assert state[2] == 4, "the attempt budget is still widened explicitly"
         assert state[5] is None
         assert _waits(admin_conn, item_id) == 0, "the wait budget starts over"
